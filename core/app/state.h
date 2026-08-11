@@ -302,7 +302,20 @@ int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);   // defined in 
 
 inline std::string srcIdentityKey(const FrameSource& s) {
     char t[160];
-    const int fileFr = s.fileFrame, peerFr = s.remoteFrame;
+    // WHICH FRAME OF THAT FILE, said once. The pair exists because a LOCAL file
+    // counts its frames in fileFrame and a PEER's counts them in remoteFrame -
+    // two files, two counts, two slots. A local:// source fills the remote slot
+    // only because the peer process did the reading, and the file it read is on
+    // THIS disk: keeping the slots apart there is the path half of this key's
+    // defect one field over, and it leaves frame 0 of a multi-frame .npy shared
+    // between the two doors while frames 1..N-1 stay split. Nothing ever writes
+    // both slots (fileFrame has two writers, both local decoders; remoteFrame
+    // has two, both remote), so folding to (frame, 0) loses nothing.
+    int fileFr = s.fileFrame, peerFr = s.remoteFrame;
+    if (!s.remoteUrl.empty() && !localDiskPathOfUrl(s.remoteUrl).empty()) {
+        fileFr = std::max(fileFr, peerFr);
+        peerFr = 0;
+    }
     if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
         snprintf(t, sizeof t, "\n%d|%d\nraw%d,%d,%d,%d,%dx%d\n%lld,%llu",
                  fileFr, peerFr, s.rawDtype, s.rawInterp, s.rawOffset,

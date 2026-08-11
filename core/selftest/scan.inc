@@ -371,6 +371,27 @@
                       srcKeyPath("ssh://trc2:2222/data/x.npy") ==
                           "ssh://trc2:2222/data/x.npy",
                       "S4e srcKeyPath leaves a named host's path exactly as it found it");
+
+                // WHICH FRAME OF IT - the same defect one field over, and the
+                // reason S4d alone is not the whole claim. A multi-frame .npy
+                // counts its frames in fileFrame through the local door and in
+                // remoteFrame through the local:// one, so frame 0 agreed
+                // (both slots 0) and every other frame did not. Hand-derived
+                // from srcIdentityKey's format string: the local door's frame 3
+                // is "...\n3|0\nnr0\n<mtime>,<fsize>" and the local:// door's
+                // was "...\n0|3\n..." - one file, two keys, off a field the two
+                // doors do not disagree about the MEANING of.
+                FrameSource lf3 = S, uf3 = asUrl, pf3 = asPeer;
+                lf3.fileFrame = 3;
+                uf3.remoteFrame = 3;
+                pf3.remoteFrame = 3;
+                check(srcIdentityKey(lf3) == srcIdentityKey(uf3),
+                      "S4f ...frame 3 of that file is one key through both doors too");
+                // ...and the fold did not flatten the field it folded: frame 3
+                // is not frame 0, and the peer's frame 3 is still the peer's.
+                check(srcIdentityKey(lf3) != kLocal &&
+                      srcIdentityKey(pf3) != srcIdentityKey(lf3),
+                      "S4f ...and frame 3 is still neither frame 0 nor the peer's");
             }
         }
 

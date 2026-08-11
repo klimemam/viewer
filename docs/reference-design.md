@@ -331,10 +331,15 @@ tuple** であり、決して共有しない (reload selftest R21b)。
     逐語、§2.1)。したがって `local://` の綴りで書かれた**既存のセッション行**も、
     ローカルの戸から書かれた行も、復元すれば**同じ tuple** に着く —— 形式変更も
     移行も無く、復元が2つ目の identity を生むことも無い。
-  - これは「**このディスクの1ファイルは、どの戸から開いても1つの identity**」
-    という本節の主張そのもの。証拠は `--scan-selftest` の S4d/S4e (鍵の文字列、
-    peer の url は逐語のまま別鍵) と S5d-S5g (registry を数える: 2 doc /
-    1 source / refs=2、別ファイルは別 source のまま)。
+- **「そのファイルの何フレーム目か」も1回だけ言う (同上)。** `fileFrame` は
+  ローカルファイル内の、`remoteFrame` は peer のファイル内のフレーム番号で、
+  **別のファイル**の話だから欄が2つある。画素がこのディスクに在る source
+  (`local://`) では同じ話なので `(frame, 0)` に畳む。畳まないと multi-frame
+  .npy は frame 0 だけが2つの戸で共有され、1..N-1 は割れたままになる。
+- 上2点はどちらも「**このディスクの1ファイルは、どの戸から開いても1つの
+  identity**」という本節の主張そのもの。証拠は `--scan-selftest` の
+  S4d/S4e/S4f (鍵の文字列、peer の url は逐語のまま別鍵) と S5d-S5g
+  (registry を数える: 2 doc / 1 source / refs=2、別ファイルは別 source のまま)。
 - registry は弱参照 (source が全 membership を失えば消える)。
 - **入らないものが1つあり、それは形式ではなく tuple の都合。** reader
   (アダプタ) が作った画素は登録しない — tuple はファイルを名乗る欄しか持たず、
