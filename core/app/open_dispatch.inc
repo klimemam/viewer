@@ -2393,10 +2393,11 @@ static void openPath(const std::string& path) {
         // Headerless. This session's binding first (#166): a byte count the
         // user has already answered for opens with that answer and says which
         // one it was; everything else - the first file of a session included -
-        // goes through the dialog exactly as it always did.
-        // The stack offer belongs to the branch that actually opened something,
-        // the same way the dialog's own Load makes it after a fresh open.
-        openRawDialogFor(path);   // RED: the binding is not consulted yet
+        // goes through the dialog exactly as it always did. The stack offer
+        // belongs to the branch that actually opened something, the same way
+        // the dialog's own Load makes it after a fresh open.
+        if (openRawFromSessionRecipe(path)) maybeOfferSequence(app.current);
+        else openRawDialogFor(path);
     }
 }
 

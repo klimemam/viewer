@@ -473,8 +473,7 @@ static const SKeyDef SETTING_KEYS[] = {
     // pixels differently, applied to a file that cannot contradict it. A
     // recipe here is the opposite: it is inert until somebody picks it, so it
     // is not a default at all and does not wait on the measuring section.
-    { SK_None,        "loading.rawRecipes",      SS_Later,   // RED: not read yet
-      "the recipe library is not read by this version",
+    { SK_rawRecipes,  "loading.rawRecipes",      SS_Read, nullptr,
       "[{\"name\": \"sample\", \"dtype\": \"u16\", \"interpretation\": \"bayer\", "
       "\"size\": [4096, 3000], \"bayerPattern\": \"RGGB\"}]" },
 
@@ -728,8 +727,9 @@ static void sjApplyRawRecipes(SjApply& A, const SjVal& v, const char* path) {
                 if (n != floor(n) || n < 0 || n > 1e9) {
                     A.rangeErr(val, kp.c_str(), "a whole number of bytes from 0");
                     ok = false;
+                } else {
+                    r.offset = (int)n;
                 }
-                else r.offset = (int)n;
             } else if (kv.first == "size" || kv.first == "crop") {
                 const bool isCrop = kv.first == "crop";
                 const size_t want = isCrop ? 4 : 2;
@@ -885,11 +885,7 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
                 A.setI(app.seqLoadMode, idx, path);
             break;
         }
-        // Unreachable in this commit: the table row above is SS_Later, so the
-        // key is named as "not read yet" and never gets here. The reader it
-        // would call is written and sitting above, deliberately unused - this
-        // commit is the RED half and carries no decision.
-        case SK_rawRecipes: break;
+        case SK_rawRecipes: sjApplyRawRecipes(A, v, path); break;
         case SK_peerExe: { std::string s; if (A.wantStr(v, path, s)) A.setS(app.remoteExe, s, path); break; }
         case SK_policy: {
             int idx = 0;
@@ -1206,7 +1202,20 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_stackPrompt:
             return app.seqLoadMode == 0 ? "" :
                    (app.seqLoadMode == 1 ? "\"always\"" : "\"never\"");
-        case SK_rawRecipes: return "";
+        // The library the app is holding right now, which - since nothing but
+        // this file ever fills it - is the library the file already had. That
+        // is the point: --settings-template is the MIGRATION, and a template
+        // that silently dropped the recipes out of the file it was generated
+        // beside would be a migration that loses them. Empty is the default and
+        // is written as a comment, exactly like every other key at its default.
+        case SK_rawRecipes: {
+            if (g_rawLibrary.empty()) return "";
+            std::string s = "[\n";
+            for (size_t k = 0; k < g_rawLibrary.size(); k++)
+                s += "      " + rawRecipeJsonc(g_rawLibrary[k]) +
+                     (k + 1 < g_rawLibrary.size() ? ",\n" : "\n");
+            return s + "    ]";
+        }
         case SK_peerExe: return app.remoteExe.empty() ? "" : sjQuote(app.remoteExe);
         case SK_policy: return app.procPolicy == App::PolLocalFetch ? "\"local-fetch\"" : "";
         case SK_lowBandwidth: return app.lowBandwidth ? "true" : "";

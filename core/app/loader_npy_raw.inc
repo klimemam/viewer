@@ -294,12 +294,9 @@ static void rawRecipeIntoDialog(const RawRecipe& r, RawDialog& d) {
     d.cropX = r.cropX; d.cropY = r.cropY; d.cropW = r.cropW; d.cropH = r.cropH;
 }
 
-// The reverse, and the NAME is decided here rather than remembered as UI state.
-// If the fields the user is about to load with are field-for-field a library
-// recipe, that recipe's name is what gets recorded; otherwise the recipe is
-// anonymous and names itself after what it is. Deciding it from the VALUES
-// means a user who picks "MyCam" and then nudges the height is no longer
-// holding "MyCam" - which is exactly what they would otherwise be told later.
+// Two recipes that would decode the same bytes the same way. The NAME is
+// deliberately not part of it: this is what "the user is holding that recipe"
+// means, and a recipe is what its fields are.
 static bool rawRecipeSameFields(const RawRecipe& a, const RawRecipe& b) {
     return a.w == b.w && a.h == b.h && a.offset == b.offset &&
            rawClampIdx(a.dtype, RD_COUNT) == rawClampIdx(b.dtype, RD_COUNT) &&
@@ -310,6 +307,13 @@ static bool rawRecipeSameFields(const RawRecipe& a, const RawRecipe& b) {
                           a.cropW == b.cropW && a.cropH == b.cropH));
 }
 
+// The reverse, and the NAME is decided HERE, from the values, rather than
+// remembered as UI state. If the fields the user is about to load with are
+// field-for-field a library recipe, that recipe's name is what gets recorded;
+// otherwise the recipe is anonymous and names itself after what it is.
+// Deciding it from the values is what makes "picked MyCam, then nudged the
+// height" stop being MyCam - which is what the applied line would otherwise
+// claim, three files later, about a geometry MyCam does not have.
 static RawRecipe rawRecipeFromDialog(const RawDialog& d) {
     RawRecipe r;
     r.w = d.w; r.h = d.h; r.offset = d.offset;
@@ -502,7 +506,9 @@ static std::string loadRaw(const RawDialog& d) {
 // a failed attempt would arm the next open of that size with settings already
 // known not to work.
 static std::string rawDialogAccept(RawDialog& d) {
-    return loadRaw(d);   // RED: the binding is not made yet
+    std::string err = loadRaw(d);
+    if (err.empty()) rawRecipeBindSize(d.fileSize, rawRecipeFromDialog(d));
+    return err;
 }
 
 // The recipe panel's "Apply": re-read the document that is already open with
@@ -523,7 +529,9 @@ static std::string rawRecipeReinterpretCurrent(const RawRecipe& r) {
     st.path = d.path;
     statSourceFile(st);
     d.fileSize = (size_t)st.fsize;
-    return loadRaw(d);   // RED: the binding does not follow the choice yet
+    std::string err = loadRaw(d);
+    if (err.empty()) rawRecipeBindSize(d.fileSize, rawRecipeFromDialog(d));
+    return err;
 }
 
 // ---------------------------------------------------------------- dynamic crop
