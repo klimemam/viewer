@@ -179,6 +179,31 @@
                   "F3 local: an unreadable row names ITS reason, not the peer's");
         }
 
+        // ---- F3b: the mirror of the line above, which nobody was watching ----
+        // F3 asserts that a LOCAL row keeps its own measured reason instead of
+        // the peer's. The same row over the LINK had lost it: peerRefusal fell
+        // through to "the peer serves .npy, PNG, ..." - a list the operator can
+        // already see this file is not in - and with it went the measurement
+        // (8-bit lossy destroys sigma_t) and the ffmpeg line that converts the
+        // file honestly. Same file, same defect, facing the other way
+        // (verify-matrix G7).
+        //
+        // And the fall-through itself: whatever lands there is refused with the
+        // first two parts of docs/input-adapters.md §3.2 and, until G9, without
+        // the third. A refusal with no way out is where an operator stops.
+        {
+            const std::string rw = rbRowWhyNot("trc2", "capture.mp4");
+            const std::string gen = rbRowWhyNot("trc2", "capture.raw");
+            fprintf(stderr, "fmtgateselftest:   peer reason for capture.mp4: \"%s\"\n"
+                            "fmtgateselftest:   peer reason for capture.raw: \"%s\"\n",
+                    rw.c_str(), gen.c_str());
+            check(!rbRowOpenable("trc2", "capture.mp4") && has(rw, "codec") &&
+                  has(rw, "ffmpeg"),
+                  "F3b over the link too, .mp4 keeps the measured reason and the way out");
+            check(!gen.empty() && has(gen, "the peer serves") && has(gen, "copy the file"),
+                  "F3b the fall-through refusal names a way out as well");
+        }
+
         // ---- F4: the two predicates cannot silently re-merge ------------------
         // The property the fix is FOR, stated as an invariant rather than as a
         // list of five extensions: everything the peer serves, this viewer also

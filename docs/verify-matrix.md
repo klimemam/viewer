@@ -489,7 +489,7 @@ remote の open (`openRemote`、`:2583` から frame 0 固定) は残りのフ�
 
 ---
 
-### G7. `.mp4` が peer 一覧では「測った理由」を失う
+### G7. `.mp4` が peer 一覧では「測った理由」を失う —— **修正済 (PR #176)**
 
 **実測 `[P]`:**
 
@@ -509,6 +509,14 @@ a.mp4  peerRefusal  = "the peer serves .npy, PNG, JPEG, TIFF, OpenEXR and y4m"
 **選択肢。** (a) `peerRefusal` の頭で `videoRefusal` を先に返す (3行)。
 (b) 「リンク越しの断りは link の限界だけを言う」と決めて記録する——ただしそれは
 F3 の local 側の理屈と逆になる。
+
+**採ったのは (a)。** 置いたのは頭ではなく **fall-through の直前**——表の行と
+`.npz` は「ここでは読めるが link が運ばない」という link の話で、そちらが先に
+答えるべきだから。動画コンテナは表の行ではないので順序は実際には競合しない。
+
+**試験 F3b** が F3 の鏡像を据える: 同じ `capture.mp4` を `rbRowWhyNot("trc2", ...)`
+で訊き、`codec` と `ffmpeg` を含むことを主張する。**F3 は local 側だけを見ていた**
+——だから link 側でこの文が消えても誰も気付かなかった。
 
 ---
 
@@ -563,7 +571,7 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 
 ---
 
-### G9. generic な peer 拒否文に逃げ道が無い
+### G9. generic な peer 拒否文に逃げ道が無い —— **修正済 (PR #176)**
 
 **どこ。** `core/imagefile.cpp:425` — `return "the peer serves " + servedList();`
 分岐の上 2つ (表の行 / `.npz`) は `WAY_OUT` を付けているのに、最後の return だけ
@@ -573,6 +581,17 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 **選択肢。** (a) `WAY_OUT` を付ける。(b) `CHOOSE_A_READER` を付ける
 (§4.13.1 で「adapter は peer 側で走る」と決めてあるので、逃げ道としては
 そちらが本筋——ただし G11)。
+
+**採ったのは (a)。ただし `WAY_OUT` そのものではない。** 上2つの `WAY_OUT` は
+「browse it locally」と言っていて、それは**この分岐に落ちてくる名前について真とは
+限らない**——ヘッダ無しの `.raw` はローカルなら開くが、正体不明の名前は開かない。
+そして `core/imagefile.cpp` は **peer 側のバイナリにもリンクされる**ので、
+`core/main.cpp` 自身の戸 (`SELFDESC_EXTS` / `HEADERLESS_EXTS`) を見て区別する
+ことができない。だから逃げ道は**リンクの限界**を述べる:「この link はその形式
+しか運ばない —— このマシンにコピーすれば、この viewer が読む残り全部で開ける」。
+どちらの名前についても真で、しかも実際にファイルを動かす事実である。
+
+(b) は G11 が決まってから。
 
 ---
 

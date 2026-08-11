@@ -422,7 +422,32 @@ std::string peerRefusal(const std::string& path) {
     if (lowerExt(path) == ".npz")
         return ".npz is read on this machine, but the peer serves one array per "
                "file, not a container" + std::string(WAY_OUT);
-    return "the peer serves " + servedList();
+    // A container this build refuses BY NAME already has a measured sentence,
+    // and it answers the question the operator actually has. Asked first,
+    // because the fall-through below can only say what the peer serves - and
+    // for an .mp4 that is a list the operator can already see this file is not
+    // in. `selftest.fmtgate` F3 asserts that a LOCAL unreadable row names its
+    // own reason rather than the peer's; a remote row losing the same reason is
+    // the same defect facing the other way (verify-matrix G7).
+    {
+        std::string vid = videoRefusal(path);
+        if (!vid.empty()) return vid;
+    }
+    // The fall-through: a name with no row, no decoder here, and no measured
+    // refusal of its own - headerless RAW today, whatever is unrecognised
+    // tomorrow. It got the first two parts of docs/input-adapters.md §3.2 and
+    // not the third, so it was the one refusal in this function that left the
+    // operator with nowhere to go (verify-matrix G9).
+    //
+    // NOT the WAY_OUT above. That one says "browse it locally", which is true
+    // of a file this build can read and false of the ones that land here - a
+    // headerless .raw does open locally, an unrecognised name does not, and
+    // this branch cannot tell them apart (core/main.cpp's own doors are not
+    // compiled into the peer). So the way out states the LINK's limit, which
+    // is true either way and is the fact that actually moves the file.
+    return "the peer serves " + servedList() +
+           "\n  this link carries those formats only - copy the file to this "
+           "machine to open it with everything else this viewer reads";
 }
 
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,
