@@ -163,8 +163,8 @@ doc には**構造上あり得ない**。したがって操作の表は 2枚に�
 | **F8 ベンダ RAW** | ○ `[T:fmtreg]` | ○ `[C:seq:1383]` 無試験 | ○ | — | ○ 無試験 | ○ `[T:fmtreg F2]` | ○ |
 | **F9 ヘッダ無し RAW** | ○ `[T:srcmap M3]` | ○ `[C:seq:1524]` 無試験 | ○ | — | ○ `[T:srcmap M3]` (baseline) | ○ `[C:od:690]` **無試験** | ○ |
 | **F10 `.rggb`** | ○ 同 F9 | ○ 同 F9 | ○ | — | ○ | ○ **無試験** | ○ |
-| **F11 動画** | — 入れない (表A) | — | — | — | — | — | — |
-| **F12 `.vsession`** | — 画像ではない | — | — | — | — | — | — |
+| **F11 動画** | — doc にならない (表A の D1–D8 が全部 × 。reader 経由で開いた場合は F13 の行になる) | — | — | — | — | — | — |
+| **F12 `.vsession`** | — 画像ではない (セッションは状態であって doc ではない) | — | — | — | — | — | — |
 | **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ `stack` 層 → 2 doc `[T:fmtreg F6]` | ○ | — | ○ 起点ファイルを見る `[C:watch:32]` | ×決 `[T:fmtreg F6/F8]` `[C:od:610]` | ○ |
 
 `O4` の列が丸ごと「—」なのは欠落ではなく**設計**である: 直接の戸から入った doc は
@@ -183,7 +183,11 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 
 ## 4. 表C — 形式 × 操作 (Browse 経由の doc, 91セル)
 
-`local://` と `ssh://` で答えが割れるセルは `local:// | ssh://` と書く。
+記号が 2つ入っているセルの読み方:
+
+- `A | B` — **由来で割れる**。左が `local://`、右が `ssh://`
+- `A / B` — **フレームの状態で割れる**。左が全解像度が着地したあと、右が
+  間引かれた preview のあいだ (O7 の列だけ)
 
 | | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
 |---|---|---|---|---|---|---|---|
@@ -281,9 +285,10 @@ a.raw   forPath=-  viewerReadsName=0  peerServes=0
         "the peer serves .npy, PNG, JPEG, TIFF, OpenEXR and y4m"
 ```
 
-**何が問題か。** 断ること自体ではない。**断り方**である。この文は
-(a) ファイルを名指ししていない、(b) 理由が「表に無いから」であって形式について
-何も言っていない、(c) **逃げ道が無い** (§3.2 の三部構成のうち三つ目が欠ける)。
+**何が問題か。** 断ること自体ではない。**断り方**である。名指しは呼び出し側が
+やっている (`open_dispatch.inc:1748` が `baseName(rpath) + ": "` を前置する) が、
+残りの2つが無い —— (a) **理由が「表に無いから」であって、この形式について
+何も言っていない**、(b) **逃げ道が無い** (§3.2 の三部構成のうち三つ目)。
 ベンダ RAW の断り (`vendor RAW is read on this machine, but the peer does not
 serve it: LibRaw is CDDL-1.0 …` + `browse it locally, or copy it here first`) と
 並べると差が分かる——あれは**決めてある**。
