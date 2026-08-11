@@ -670,7 +670,21 @@ static bool extIsOneOf(const std::string& n, std::initializer_list<const char*> 
 // quietly missing from a listing tells them nothing. dialogPattern() makes the
 // same call for the OS file dialog, and for the same reason.
 bool viewerReadsName(const std::string& n) {
-    if (extIsOneOf(n, { ".npy", ".npz" })) return true;
+    // core/main.cpp's OWN doors, which were never rows in the format table.
+    // .npy and .npz carry their own shape; the five after them carry none and
+    // reach the headerless dialog, where the user states it - a different door,
+    // but a door. Leaving them out told a Browse row on THIS MACHINE that the
+    // viewer cannot read a file that File > Open reads without complaint, and
+    // the refusal beside it then named a reason that was not the reason
+    // (verify-matrix G2).
+    //
+    // This is the same set `isLoadableExt` walks for Open Folder, and it is the
+    // same question - "can this build open a file with this name" - so the two
+    // must not be two lists. `.vsession` is a door as well (a session is
+    // opened, not decoded), and is here for the same reason: what Browse greys
+    // out has to match what happens if you go around it.
+    if (extIsOneOf(n, { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb",
+                        ".vsession" })) return true;
     return imagefile::forPath(n) != nullptr;
 }
 
@@ -713,7 +727,8 @@ std::string viewerRefusalFor(const std::string& n) {
     if (viewerReadsName(n)) return {};
     std::string vid = imagefile::videoRefusal(n);
     if (!vid.empty()) return vid;
-    return "not a name this viewer reads (*.npy *.npz " + imagefile::dialogPattern() + ")"
+    return "not a name this viewer reads (*.npy *.npz *.bin *.raw *.yuv *.dat *.rggb "
+           + imagefile::dialogPattern() + ")"
            "\n  choose a reader to read it another way";
 }
 

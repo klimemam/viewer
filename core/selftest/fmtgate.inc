@@ -219,6 +219,43 @@
                   "F4 every table row reads locally; .npy answers both; case-insensitive");
         }
 
+        // ---- F4b: the doors OUTSIDE the table are inside an invariant too ----
+        // F4 above walks every row of the format table. That is exactly what it
+        // was written to do, and it is also why it never saw this: the formats
+        // that are core/main.cpp's own doors have no row. `.bin` and friends
+        // reach the headerless dialog and `.npy`/`.npz` reach the npy loader,
+        // so Open Folder accepts all seven - but `viewerReadsName` listed only
+        // two of them, and a Browse row on THIS MACHINE was greyed out for a
+        // file File > Open opens without complaint, with a refusal naming a
+        // reason that was not the reason (verify-matrix G2).
+        //
+        // Stated as the equality between the two predicates rather than as a
+        // list of seven: an extension added to SEQ_EXTS tomorrow is checked
+        // here without anybody editing this test, which is the property F4 has
+        // for the table and this half was missing.
+        {
+            static const char* PROBE[] = { ".npy", ".npz", ".bin", ".raw", ".yuv",
+                                           ".dat", ".rggb", ".png", ".tif", ".exr" };
+            bool agree = true;
+            std::string disagreed;
+            for (const char* e : PROBE) {
+                if (isLoadableExt(e) && !viewerReadsName(std::string("x") + e)) {
+                    agree = false;
+                    disagreed += std::string(disagreed.empty() ? "" : " ") + e;
+                }
+            }
+            // anti-vacuity: the probe has to contain something isLoadableExt
+            // actually accepts, or "they agree" is a statement about nothing
+            int accepted = 0;
+            for (const char* e : PROBE) if (isLoadableExt(e)) accepted++;
+            fprintf(stderr, "fmtgateselftest:   Open Folder accepts %d of %d probed; "
+                            "Browse disagrees on [%s]\n",
+                    accepted, (int)(sizeof PROBE / sizeof PROBE[0]),
+                    disagreed.empty() ? "-" : disagreed.c_str());
+            check(accepted >= 7, "F4b the probe really covers the loadable set");
+            check(agree, "F4b what Open Folder loads, Browse says it can open");
+        }
+
         // ---- P: the PEER, and the same file opened both ways ------------------
         //
         // Everything above this line is the CLIENT's gate. It could be made to
