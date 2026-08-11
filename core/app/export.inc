@@ -72,10 +72,36 @@ static bool clipboardPutImage(const std::vector<uint8_t>& rgba, int w, int h,
 }
 #endif
 
+// "" when this document may be exported; otherwise the sentence saying why not.
+// Same shape as peerRefusalFor / reloadUnavailable: one predicate, so the menu,
+// the clipboard and the file cannot come to disagree about what is allowed.
+//
+// A DECIMATED PREVIEW is the case this exists for. `remoteStep > 1` means
+// "still the preview" (state.h:130), and every analysis path in the tree
+// already refuses one BY NAME - preprocess.inc, setanalysis.inc,
+// panel_projection.inc and panel_temporal.inc all carry the same test under the
+// comment `previews lie`. Export was the one surface outside that agreement,
+// and it is also the one that makes an explicit CLAIM about the mapping: the
+// menu item says "dot by dot", i.e. one output pixel per source pixel, which at
+// step 4 is false by a factor of sixteen. The PNG is the worse half - a file
+// outlives whatever sentence might have qualified it, and nothing in the file
+// says it was a preview.
+//
+// The refusal is actionable rather than final: the full frame arrives on its
+// own (pumpRemoteFetch swaps preview -> full), so the answer is "not yet".
+static std::string exportRefusalFor(const ImageDoc* im) {
+    if (!im || im->w < 1 || im->h < 1) return "nothing to export";
+    if (im->src && im->src->remoteStep > 1)
+        return "this is the decimated preview (every " +
+               std::to_string(im->src->remoteStep) + "th pixel), not the frame - "
+               "wait for the full frame to land, then export";
+    return {};
+}
+
 // The ONE place an export is produced, so the file and the clipboard can never
 // disagree about what the picture is.
 static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int& h) {
-    if (!im || im->w < 1 || im->h < 1) return false;
+    if (!exportRefusalFor(im).empty()) return false;
     w = im->w; h = im->h;
     renderDocRGBA(*im, rgba);
     return true;
@@ -84,7 +110,7 @@ static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int&
 static void copyViewDotByDot() {
     ImageDoc* im = cur();
     std::vector<uint8_t> rgba; int w = 0, h = 0;
-    if (!exportDocRGBA(im, rgba, w, h)) { toast("nothing to copy", true); return; }
+    if (!exportDocRGBA(im, rgba, w, h)) { toast(exportRefusalFor(im), true); return; }
     std::vector<uint8_t> png = encodePng(rgba, w, h);
 #ifdef _WIN32
     std::string err;
@@ -108,7 +134,7 @@ static void copyViewDotByDot() {
 static void saveViewPng(const std::string& path) {
     ImageDoc* im = cur();
     std::vector<uint8_t> rgba; int w = 0, h = 0;
-    if (!exportDocRGBA(im, rgba, w, h)) { toast("nothing to save", true); return; }
+    if (!exportDocRGBA(im, rgba, w, h)) { toast(exportRefusalFor(im), true); return; }
     std::vector<uint8_t> png = encodePng(rgba, w, h);
     if (png.empty()) { toast("PNG encode failed", true); return; }
     std::ofstream f(pathFromUtf8(path), std::ios::binary);

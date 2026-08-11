@@ -57,6 +57,42 @@
             check(a2 != b2, "E4 the display range reaches the export");
         }
 
+        {   // E5: a DECIMATED PREVIEW is not an export.
+            //
+            // `remoteStep > 1` means "still the preview" (state.h:130), and
+            // every analysis path in the tree already refuses one by name:
+            // preprocess.inc, setanalysis.inc, panel_projection.inc and
+            // panel_temporal.inc all carry the same line with the comment
+            // `previews lie`. Export was outside that agreement, and it is the
+            // one surface that makes an explicit claim about the mapping: the
+            // menu item says "dot by dot", i.e. one output pixel per source
+            // pixel, which at step 4 is false by a factor of sixteen. The PNG
+            // is worse than the clipboard, because a file outlives the sentence
+            // that would have qualified it.
+            //
+            // Anti-vacuity: the SAME document exports once the step is 1, so
+            // this cannot pass by refusing everything.
+            const int wasStep = im->src->remoteStep;
+            std::vector<uint8_t> r1; int w1 = 0, h1 = 0;
+            im->src->remoteStep = 4;
+            bool prev = exportDocRGBA(im, r1, w1, h1);
+            std::string whyPrev = exportRefusalFor(im);
+            im->src->remoteStep = 1;
+            std::vector<uint8_t> r2; int w2 = 0, h2 = 0;
+            bool full = exportDocRGBA(im, r2, w2, h2);
+            std::string whyFull = exportRefusalFor(im);
+            im->src->remoteStep = wasStep;
+            fprintf(stderr, "exportselftest: E5 step 4 -> exported=%d why=\"%s\"; "
+                            "step 1 -> exported=%d why=\"%s\"\n",
+                    prev ? 1 : 0, whyPrev.c_str(), full ? 1 : 0, whyFull.c_str());
+            check(!prev, "E5 a decimated preview is not exported");
+            check(whyPrev.find("preview") != std::string::npos &&
+                  whyPrev.find("4") != std::string::npos,
+                  "E5 ...and the refusal names it a preview, and says the step");
+            check(full && whyFull.empty(),
+                  "E5 the same document exports at step 1 (anti-vacuity)");
+        }
+
         {   // montage: geometry, count, CFA phase, and n-of-N honesty
             std::string err;
             check(!montageROI(true, err), "E5 no ROI selected -> refused");
