@@ -659,12 +659,37 @@ if(UNIX AND NOT APPLE AND GLFW_BUILD_X11)
 endif()
 if(MSVC)
   # /bigobj: core/main.cpp is ONE translation unit that #includes the whole
-  # spine plus every selftest, and MSVC's default COFF object has a 65,536
+  # spine plus every selftest, and MSVC's default COFF object has a ~65k
   # section ceiling that it crossed (error C1128, on the Windows runner only -
   # gcc and clang have no such limit, so a build that is green on two of the
   # three matrix faces can still stop here). The flag raises the ceiling to
-  # 2^31 and costs nothing else: the object format is the same one, and no
+  # 2^32 and costs nothing else: the object format is the same one, and no
   # other toolchain has an equivalent to keep in step.
+  #
+  # This flag is PERMANENT, and that is measured rather than assumed - see
+  # docs/split-plan.md 10, which carries the numbers and the method. The short
+  # version, because the obvious structural fix looks so much better than it is:
+  #
+  #   - giving every selftest its own TU removes 34.7% of this object's
+  #     sections (2,780 of 8,007). It does not halve anything: the spine is the
+  #     other 65.3%;
+  #   - the object gained 1,070 sections PER DAY over 2026-08-09..11. That
+  #     34.7% is therefore under three days of headroom, after which /bigobj
+  #     comes straight back;
+  #   - the price of it is stripping `static` off the 369 internal-linkage
+  #     symbols the selftests reach, which is the one change that would push
+  #     these tests toward asserting against a re-declaration instead of
+  #     against the real thing.
+  #
+  # (Counts are gcc -ffunction-sections on the MinGW dev box, standing in for
+  # MSVC's COMDAT count - there is no MSVC here, so the ratios carry over and
+  # the absolute numbers do not. MSVC's own verdict is the CI run: 31410335072,
+  # windows-latest, step Build, while Linux and macOS passed the same commit.)
+  #
+  # At 1,070 sections/day the 2^32 ceiling is centuries away. There is no next
+  # section limit; the limit that will actually bite is compile TIME, which is
+  # single-threaded and on the critical path of every build (64s -> 96s over
+  # those same two days). Do not re-open the split for section count alone.
   target_compile_options(viewer PRIVATE /W3 /utf-8 /bigobj ${VIEWER_STRICT})
 else()
   target_compile_options(viewer PRIVATE -Wall -Wextra ${VIEWER_STRICT})
