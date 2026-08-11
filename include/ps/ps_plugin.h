@@ -29,9 +29,9 @@ extern "C" {
  *       (§5: frames PULLED one at a time, +min_frames) through
  *       psHostApi::register_stack_analyzer3. V1/V2 structs and their two
  *       register slots stay loadable forever; psHostApi does not change size.
- *       The rest of v3 (psSeriesAnalyzerV3 §7, emit_number_u / emit_map §8)
- *       arrives in the reserved seats below and needs NO further version
- *       bump - see the probe rule. */
+ *       The rest of v3 (psSeriesAnalyzerV3 §7, emit_number_u §8.2) arrives
+ *       in the reserved seats below and needs NO further version bump - see
+ *       the probe rule. (emit_map §8.3 was withdrawn, #49.) */
 
 /* THE PROBE RULE (docs/abi-v3.md §2.2) - why v3 is meant to be the last bump.
  *
@@ -180,9 +180,16 @@ typedef struct psAnalyzeSink3 {
                         const char* y_label, const float* x, const float* y,
                         uint32_t n);
     /* Reserved seats (probe rule above), zero-filled. docs/abi-v3.md §8 spends
-     * the first two on the declared-unit scalar and the pixel-shaped result;
-     * until a host implements them they read NULL and emit_number carries the
-     * unit in the key name, which §8.2 keeps as the documented fallback. */
+     * the FIRST on the declared-unit scalar (emit_number_u); until a host
+     * implements it the seat reads NULL and emit_number carries the unit in
+     * the key name, which §8.2 keeps as the documented fallback.
+     *
+     * The pixel-shaped result (emit_map) was withdrawn on 2026-08-11 (#49):
+     * an analyzer cannot hand back pixels in this version, and the seat is
+     * NOT reserved for one - it is simply unnamed, like the six after it.
+     * Withdrawing cost nothing here, which is the probe rule doing its job:
+     * a seat that was never NAMED promises nothing to undo. What the return
+     * of that feature needs is not an address but a decision - see §8.3. */
     void* reserved[8];
 } psAnalyzeSink3;
 
