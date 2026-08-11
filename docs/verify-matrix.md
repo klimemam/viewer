@@ -279,9 +279,9 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
 | G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **未** |
 | G6 | reader で開いた doc の復元が memo 頼み | **未** |
-| G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **未** |
+| G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **済** PR #176 — 試験 F3b |
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
-| G9 | generic な peer 拒否文に逃げ道が無い | **未** |
+| G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
 | G10 | 間引かれた doc の crop が復元で黙って落ちる | **未** |
 | G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **未** |
 
