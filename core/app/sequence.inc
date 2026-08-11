@@ -1451,7 +1451,21 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             // may be sent to the RAW dialog - a folder of .exr would otherwise
             // open a width/height/dtype prompt for files that already say all
             // three.
-            g.isRaw = ext != ".npy" && !imagefile::forPath(g.files[0]);
+            //
+            // Named POSITIVELY, and that is the fix rather than an accident of
+            // style. The test used to read "not .npy and not in the picture
+            // table", which is a list of everything that carries its own shape
+            // - and .npz was missing from it. A .npz is a container of arrays
+            // that each state their own shape, and it is in no picture table,
+            // so a folder of them opened the geometry prompt and the zip bytes
+            // were read as pixels (verify-matrix G3). A negative list has to be
+            // complete to be right and nothing makes it complete; this one is
+            // exactly the five extensions that carry no header, so a format
+            // added tomorrow is self-describing by default and cannot fall in
+            // here by being forgotten.
+            static const char* HEADERLESS_EXTS[] = { ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+            g.isRaw = false;
+            for (const char* he : HEADERLESS_EXTS) if (ext == he) g.isRaw = true;
             groups.push_back(std::move(g));
         };
         std::vector<std::string> leftover;

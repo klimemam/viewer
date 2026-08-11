@@ -249,6 +249,56 @@
             npyWriteFile((sdir / "shape_4.npy").u8string(), "<u2",
                          { 8, 8 }, ramp.data(), 64 * 2);
 
+            {   // UC8: which folders may reach the HEADERLESS dialog.
+                //
+                // The rule is stated where isRaw is set: a format that carries
+                // its own shape may not be sent to a width/height/dtype prompt.
+                // The test there was written as "not .npy and not in the
+                // picture table", and .npz satisfies the RULE while failing the
+                // TEST - it is a container of arrays, each with its own shape,
+                // and it is in no picture table. A folder of them therefore
+                // opened the geometry prompt and the zip bytes were read as
+                // pixels (verify-matrix G3).
+                //
+                // Asserted as a PAIR, because "isRaw is false" alone passes on
+                // an implementation that never sets it: the .raw folder beside
+                // it must still be true.
+                std::error_code zec;
+                std::filesystem::path zdir =
+                    std::filesystem::temp_directory_path(zec) / "viewer_isRaw_npz";
+                std::filesystem::path rdir =
+                    std::filesystem::temp_directory_path(zec) / "viewer_isRaw_raw";
+                for (const auto& d : { zdir, rdir }) {
+                    std::filesystem::remove_all(d, zec);
+                    std::filesystem::create_directories(d, zec);
+                }
+                // content is irrelevant: isRaw is decided from the NAME, which
+                // is the whole point of the defect
+                auto put = [&](const std::filesystem::path& d, const char* nm) {
+                    std::ofstream f(pathFromUtf8((d / nm).u8string()), std::ios::binary);
+                    f << "PK";
+                };
+                put(zdir, "cap_001.npz"); put(zdir, "cap_002.npz");
+                put(rdir, "cap_001.raw"); put(rdir, "cap_002.raw");
+                auto zg = scanFolderGroups(zdir.u8string());
+                auto rg = scanFolderGroups(rdir.u8string());
+                bool zOk = zg.size() == 1 && !zg[0].isRaw;
+                bool rOk = rg.size() == 1 && rg[0].isRaw;
+                fprintf(stderr, "pickerselftest: UC8 .npz -> %zu group(s) isRaw=%d; "
+                                ".raw -> %zu group(s) isRaw=%d: %s\n",
+                        zg.size(), zg.empty() ? -1 : (zg[0].isRaw ? 1 : 0),
+                        rg.size(), rg.empty() ? -1 : (rg[0].isRaw ? 1 : 0),
+                        (zOk && rOk) ? "ok" : "FAIL");
+                if (!zOk || !rOk) {
+                    fprintf(stderr, "pickerselftest: UC8 FAILED - .npz carries its own "
+                                    "shape and must not reach the headerless dialog; "
+                                    ".raw must still reach it\n");
+                    ok = false;
+                }
+                std::filesystem::remove_all(zdir, zec);
+                std::filesystem::remove_all(rdir, zec);
+            }
+
             auto grp = scanFolderGroups(sdir.u8string());
             fprintf(stderr, "pickerselftest: UC7 scan -> %zu group(s), %zu file(s)\n",
                     grp.size(), grp.empty() ? (size_t)0 : grp[0].files.size());
