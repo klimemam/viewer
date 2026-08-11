@@ -95,6 +95,15 @@ static bool g_roiStatsSelftest = false;
 // fixtures, and every assertion is a string. See roiExportSelftest().
 static bool g_roiExportSelftest = false;
 
+// --settings-selftest: settings.jsonc (issue #50 stage 1) - the JSONC dialect,
+// the load order, and the two refusals (whole file / one key). It takes no
+// directory because it writes its own fixtures into its OWN temp dir: the
+// subject of this test IS a settings file, and VIEWER_TEST_HOME is one folder
+// shared by every selftest, so a fixture written there would be read by all of
+// them. Windowless for the --roistats-selftest reasons: every assertion is a
+// value or a string. See settingsSelftest().
+static bool g_settingsSelftest = false;
+
 // --abeq-selftest: A and B (and a letter past B) on ONE document - the
 // comparison people set up on purpose, to confirm the two sides agree. Takes no
 // directory for the same reason as --roistats-selftest, and is windowless for
@@ -502,6 +511,10 @@ static void printUsage() {
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
+        "  --settings-template         print a settings.jsonc carrying the settings\n"
+        "                              that differ from the defaults, and exit. It\n"
+        "                              writes nothing: redirect it to the file (see\n"
+        "                              docs/settings-inventory.md)\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n"
@@ -541,6 +554,8 @@ static void printUsage() {
         "                              the rectangle carried as x/y/w/h columns\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
         "                              coinciding, through the real panel\n"
+        "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
+        "                              (prefs < file < flag) and the two refusals\n"
         "  --anaprov-selftest          analyzer results name the plugin dll that\n"
         "                              computed them (the host's ledger, #46)\n"
         "  --bundled-selftest          the five shipped analyzers on ABI v3: each\n"
@@ -694,6 +709,8 @@ static void parseCli(int argc, char** argv) {
             g_fstatSelftest = true;                // handled in main() after loading
         } else if (a == "--export-tsv-selftest") {
             g_exportTsvSelftest = next();          // handled in main()
+        } else if (a == "--settings-selftest") {
+            g_settingsSelftest = true;             // handled in main()
         } else if (a == "--roistats-selftest") {
             g_roiStatsSelftest = true;             // handled in main()
         } else if (a == "--roi-export-selftest") {

@@ -52,8 +52,25 @@ Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
 std::string findPython(const std::string& configured, std::string& why);
 void forgetPython();                      // re-probe (the configured path changed)
 
-// $EDITOR, then `code -g <file>`, then the OS association (§4.13). `how` names
-// the one that answered, for a message that can be checked against reality.
+// readers.editor from settings.jsonc, or "" for not set. This TU is free of the
+// viewer's state by design, so the setting is pushed in rather than read out.
+void setSettingsEditor(const std::string& cmd);
+
+// WHICH command "open in editor" would run, and why, RESOLVED WITHOUT STARTING
+// ANYTHING. Empty = neither a setting nor $EDITOR named one, and openInEditor
+// falls through to `code -g` and then the OS association.
+//
+// It exists as its own function so the ORDER can be asserted: docs/
+// settings-inventory.md 判断18, rewritten 2026-08-11, is that precedence is
+// "specific beats general" rather than "env vs file", and $EDITOR is the
+// GENERIC variable - git's own order (GIT_EDITOR > core.editor > VISUAL >
+// EDITOR) is the model. Asserting that by launching an editor is not something
+// a selftest can do.
+std::string editorCommand(std::string& why);
+
+// settings.jsonc readers.editor, then $EDITOR, then `code -g <file>`, then the
+// OS association (§4.13). `how` names the one that answered, for a message that
+// can be checked against reality.
 bool openInEditor(const std::string& path, std::string& how);
 
 // The command exactly as it will be run, for showing it BEFORE running it.

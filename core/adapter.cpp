@@ -307,19 +307,43 @@ std::string findPython(const std::string& configured, std::string& why) {
     return {};
 }
 
-bool openInEditor(const std::string& path, std::string& how) {
-    // §4.13: $EDITOR, then `code -g`, then the OS association. No built-in
-    // editor - writing Python in an ImGui text box is not a job this tool wants.
+// settings.jsonc readers.editor. "" = the key is absent, which is what 判断9
+// means by "not set": there is no third state and no null.
+static std::string g_settingsEditor;
+void setSettingsEditor(const std::string& cmd) { g_settingsEditor = cmd; }
+
+std::string editorCommand(std::string& why) {
+    // SPECIFIC BEATS GENERAL (判断18, rewritten 2026-08-11). readers.editor is a
+    // setting this application owns; EDITOR is a variable every program on the
+    // machine shares. git resolves the same collision the same way round -
+    // GIT_EDITOR > core.editor > VISUAL > EDITOR - and the day a VIEWER_EDITOR
+    // exists it goes ABOVE this line, because an app-specific env var is more
+    // specific still.
+    if (!g_settingsEditor.empty()) {
+        why = "settings.jsonc readers.editor";
+        return g_settingsEditor;
+    }
     const char* ed = std::getenv("EDITOR");
-    if (ed && *ed) {
-        // $EDITOR may carry flags ("code -w"); the first word is the program.
+    if (ed && *ed) { why = "$EDITOR"; return ed; }
+    why.clear();
+    return {};
+}
+
+bool openInEditor(const std::string& path, std::string& how) {
+    // §4.13: readers.editor, then $EDITOR, then `code -g`, then the OS
+    // association. No built-in editor - writing Python in an ImGui text box is
+    // not a job this tool wants.
+    std::string why;
+    std::string ed = editorCommand(why);
+    if (!ed.empty()) {
+        // The command may carry flags ("code -w"); the first word is the program.
         std::istringstream ss(ed);
         std::vector<std::string> av;
         std::string tok;
         while (ss >> tok) av.push_back(tok);
         av.push_back(path);
         Run r = run(av, -1);
-        if (r.started) { how = "$EDITOR (" + std::string(ed) + ")"; return true; }
+        if (r.started) { how = why + " (" + ed + ")"; return true; }
     }
     {
         Run r = run({ "code", "-g", path }, 20000);
@@ -336,7 +360,8 @@ bool openInEditor(const std::string& path, std::string& how) {
     Run r = run({ "xdg-open", path }, 20000);
     if (r.started && r.exit == 0) { how = "xdg-open"; return true; }
 #endif
-    how = "nothing would open it: set $EDITOR, or install the 'code' command";
+    how = "nothing would open it: set readers.editor in settings.jsonc or "
+          "$EDITOR, or install the 'code' command";
     return false;
 }
 

@@ -112,6 +112,13 @@ App app;
 
 #include "app/session.inc"
 
+// settings.jsonc (issue #50 stage 1, docs/settings-inventory.md). AFTER
+// session.inc, which owns viewerConfigDir() - the settings file deliberately
+// does NOT resolve the config directory a third time (§3.4 already carries two
+// copies of that rule, board row 185). BEFORE open_dispatch.inc, which asks it
+// for the peer's repo URL (判断17).
+#include "app/settings.inc"
+
 #include "app/sequence.inc"
 
 #include "app/temporal_model.inc"
@@ -599,6 +606,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 #include "selftest/util.inc"
 
+// settings.jsonc (issue #50 stage 1). Here rather than in the block inside
+// main() because it is a function like roiStatsSelftest(), and it needs
+// bootstrapScript() (判断17) and prefsPath(), both of which exist by now.
+#include "selftest/settings.inc"
+
 #include "selftest/roi-export.inc"
 
 #include "selftest/anaprov.inc"
@@ -768,7 +780,27 @@ int main(int argc, char** argv) {
         atexit(releaseAutosaveLock);
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
+    // ...and settings.jsonc immediately after it, which IS the precedence
+    // (docs/settings-inventory.md 判断13/18, and --settings-selftest L2/L5):
+    //
+    //     built-in defaults  <  prefs.txt  <  settings.jsonc  <  command line
+    //
+    // The file the user wrote for THIS application beats what the application
+    // happened to be in when it last quit; a flag on this one run beats the
+    // file. Nothing between these two lines and the cliFrame line below may
+    // set a preference, or that order stops being true.
+    loadSettings();
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
+    // --settings-template: print a settings.jsonc carrying THIS user's current
+    // non-default values, and exit. It is the migration path off prefs.txt and
+    // it writes nothing - 判断3 is that the app never writes this file, and a
+    // file the app created behind the user's back is not a file the user wrote.
+    // Placed here so that what it prints is the resolved state, flags included.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--settings-template")) {
+            fputs(settingsTemplateText().c_str(), stdout);
+            return 0;
+        }
     // Installed before anything can fail, so the two messages below can quote
     // GLFW instead of shrugging. Storing only - it prints nothing by itself.
     GLFWwindow* win = nullptr;
@@ -1010,6 +1042,12 @@ int main(int argc, char** argv) {
     #include "selftest/rwatch.inc"
 
     #include "selftest/media.inc"
+
+    // settings.jsonc: the dialect, the load order and the two refusals.
+    // Windowless because every assertion is a value or a string, and it takes
+    // no fixture directory because it writes its own into its per-test TMP -
+    // which for THIS test is the point, not the housekeeping (see the file).
+    if (g_settingsSelftest) return settingsSelftest();
 
     // The ROI table's numbers. Windowless, so it runs on every runner in the
     // matrix rather than only on the one that has a GL context - see

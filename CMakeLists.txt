@@ -1130,6 +1130,18 @@ viewer_selftest(roi-export  NOGL --roi-export-selftest)
 # roistats - it asserts what the panel prints, not where it landed - and the
 # same analytic in-memory fixtures, so it needs no fixture directory either.
 viewer_selftest(abeq        NOGL --abeq-selftest)
+# settings.jsonc (issue #50 stage 1, docs/settings-inventory.md): the JSONC
+# dialect it accepts and the JSON5 forms it refuses, the load order
+# (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of
+# refusal - a whole file that will not parse, and one key with a bad value.
+#
+# NOGL for the roistats reason: every assertion is a value or a string. It
+# takes NO fixture directory, and that is a decision rather than a convenience:
+# the fixtures it needs ARE settings files, VIEWER_TEST_HOME is one folder
+# shared by every selftest, and a settings.jsonc left there would be read by
+# every test that ran afterwards (a9b7973 is the recorded case, with prefs).
+# So it writes them into the per-test TMP this function already gives it.
+viewer_selftest(settings    NOGL --settings-selftest)
 # Which dll computed the Analysis grid (#46 stage 1): the host ledger's file
 # name must reach the provenance line and the Copy-table TSV, and builtin
 # statistics must never wear a plugin tag. Same NOGL reasoning as roistats -

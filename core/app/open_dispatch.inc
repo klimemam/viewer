@@ -122,6 +122,11 @@ static bool readWholeFile(const std::string& path, std::string& out) {
 static std::string bootstrapScript() {
     // POSIX sh, delivered over stdin so no quoting layer can mangle it.
     // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
+    // 判断17: the build-time VIEWER_REPO_URL is the DEFAULT, not the answer.
+    // Somebody running a fork has no reason to rebuild this program in order to
+    // change where its peer is fetched from, so settings.jsonc remote.repoUrl
+    // may say otherwise; repoUrlInUse() is empty-means-unset (判断9).
+    const std::string repo = repoUrlInUse();
     return
         // Everything the script says reaches the user: runSshCommand wires the
         // child's stderr to the PARENT's, so cp's "Text file busy" went to the
@@ -144,7 +149,7 @@ static std::string bootstrapScript() {
         "  $T git -C \"$d/bin\" fetch --depth 1 origin binaries 2>&1 || { echo \"git fetch failed\"; exit 1; }\n"
         "  git -C \"$d/bin\" reset --hard origin/binaries >/dev/null 2>&1\n"
         "else\n"
-        "  $T git clone --depth 1 -b binaries " VIEWER_REPO_URL " \"$d/bin\" 2>&1 || { echo \"git clone failed (private repo or no network on this server?)\"; exit 1; }\n"
+        "  $T git clone --depth 1 -b binaries " + repo + " \"$d/bin\" 2>&1 || { echo \"git clone failed (private repo or no network on this server?)\"; exit 1; }\n"
         "fi\n"
         "u=$(uname -s)\n"
         "case \"$u\" in\n"
