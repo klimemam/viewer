@@ -1725,6 +1725,39 @@ struct App {
                         std::string axisName, axisUnit;
                         std::vector<double> axisVals; };
     std::vector<SeqRestore> seqRestore;
+    // A session line that named something the doc had not finished BEING yet.
+    //
+    // A remote open lands ONE frame and streams the rest (openRemote), and it
+    // lands that frame DECIMATED and swaps the full resolution in later
+    // (pumpRemoteFetch). The session parser runs to the end of the file in
+    // between, so two of its lines had nothing to act on:
+    //
+    //   seqframe  the frame the stack was left on. framesOfSeq() held only the
+    //             head, the loop matched nothing, and the stack came back on
+    //             frame 0 (verify-matrix G5).
+    //   crop      cropInPlace REFUSES at remoteStep > 1, because the
+    //             full-resolution landing replaces data/w/h wholesale and knows
+    //             nothing of crop bookkeeping. The restore ignored that `false`,
+    //             so above the preview threshold the saved crop vanished
+    //             (verify-matrix G10).
+    //
+    // Neither said anything, which is what made them the same defect: a restore
+    // that quietly does less than the session asked for. Parked here and
+    // drained by pumpRestoreWaits() once the doc is what the line was written
+    // about - the same answer the interactive path already gives the operator
+    // ("still fetching the full frame - crop after it lands"). The work waits;
+    // it does not disappear.
+    //
+    // GIVING UP IS AN EVENT TOO. A fetch that errored, a stack that stopped
+    // growing without the frame in it, a doc closed meanwhile: each drops the
+    // entry, and the first two SAY so, by name.
+    struct RestoreWait {
+        uint64_t uid = 0;                      // the doc the line was read against
+        int seqFrame = -1;                     // "seqframe"; -1 = not waiting for one
+        int cx = 0, cy = 0, cw = 0, ch = 0;    // "crop"; cw == 0 = not waiting for one
+        std::string doc;                       // the doc's name, for the message
+    };
+    std::vector<RestoreWait> restoreWait;
     // "Open as frame average" (or sum) on a stack that is not here yet. Browse
     // opens are asynchronous - the first frame shows and the rest stream in -
     // so the fold cannot be taken at click time; the request is parked on the
