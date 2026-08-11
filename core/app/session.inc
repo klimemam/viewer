@@ -2717,13 +2717,41 @@ static std::string loadSession(const std::string& path) {
                     if (app.images.size() > docsBefore) {
                         // it opened something: the line's doc is among what IT
                         // added, never among the docs already here (a file may
-                        // legitimately be opened twice in one session). No
-                        // match means this door landed the pixels under
-                        // another name - leave cur() where the loader put it,
-                        // which is what every restore did before this branch
-                        // existed: never worse than today.
+                        // legitimately be opened twice in one session).
                         int at = sessionDocAt(p, pendingMember, docsBefore);
                         if (at >= 0) selectImage(at);
+                        else if (!pendingMember.empty()) {
+                            // The line NAMED a member and that member is not
+                            // among what this door produced. "Leave cur() where
+                            // the loader put it" was the old answer and it is
+                            // not good enough: everything below applies to
+                            // cur(), so the line's range, LUT, mosaic reading
+                            // and crop land on SOME OTHER DOCUMENT, and nothing
+                            // says so. It is the same loss the branch below
+                            // already reports; the two doors differ only in
+                            // whether the file happened to be open already.
+                            //
+                            // The way this happens in practice (verify-matrix
+                            // G6): the file was read by an ADAPTER, whose
+                            // members are named __pixels_N, and the record of
+                            // which adapter lives in prefs.txt - a bounded LRU
+                            // on THIS machine. Move the session to another
+                            // machine, or open 64 other files first, and the
+                            // .npz behind it opens natively instead: real
+                            // arrays, no __pixels_N, no error. So the reason
+                            // is named when the member says so, because "that
+                            // member is missing" would send the reader looking
+                            // inside a file that is not the problem.
+                            const bool fromReader =
+                                pendingMember.rfind("__pixels_", 0) == 0;
+                            err = "member " + pendingMember + " is not in what " +
+                                  p + " rebuilt";
+                            if (fromReader)
+                                err += " - it was read by an input adapter, and this "
+                                       "build has no record of which one (that record "
+                                       "is per-machine and bounded). Open it with the "
+                                       "reader again, and this session will find it";
+                        }
                     } else {
                         // it opened NOTHING and did not fail: the already-here
                         // dedupe. Only a doc that is already open can be meant.
