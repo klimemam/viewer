@@ -274,18 +274,23 @@
         }
 
         // ---- S4: identity (§6.2) ---------------------------------------------
-        // What the two doors leave behind is not the same string, so both are
-        // PRINTED here every run. A local:// open sets FrameSource::path to the URL,
-        // and srcKeyPath passes anything with "://" through untouched - no
-        // weakly_canonical, no Windows case fold. The local loader stores the
-        // on-disk path, which srcKeyPath canonicalises. Same file, same
-        // mtime/fsize, two different registry keys - so before this change,
-        // opening a .npy folder through the menu and the same folder by drop
-        // produced two residents, and a session written by one door named the
-        // file differently from a session written by the other.
+        // ONE FILE ON THIS DISK HAS ONE IDENTITY, WHICHEVER DOOR OPENED IT.
         //
-        // Routing the LOCAL door to the local scan is what makes them agree:
-        // this entry point now writes the same identity as a dropped folder.
+        // This used to be two fprintf lines and no assertion, and the two lines
+        // did not match: a local:// open sets FrameSource::path to the URL, and
+        // srcKeyPath passed anything holding "://" through untouched - no
+        // weakly_canonical, no Windows case fold - while the local loader stores
+        // the on-disk path, which srcKeyPath canonicalises. Same file, same
+        // mtime/fsize, two §6.2 registry keys:
+        //
+        //   identity via the local scan   c:\users\...\openfolder\dark_001.png
+        //   identity via a local:// open  local://tools/testdata/openfolder\dark_001.png
+        //
+        // Two keys is two residents that can be reloaded independently and can
+        // disagree about the same bytes - and since 項目20 it is also two Watch
+        // subjects and two recordRemoteRule records. The print is an assertion
+        // now, and S5 below carries it through to the registry, because two
+        // keys that MATCH would still be two rows if nothing shared.
         {
             pickerAccept();
             double ts = nowSec();
@@ -301,19 +306,160 @@
                     d->src->path.find("://") != std::string::npos) local = false;
             fprintf(stderr, "scanselftest: opened %d stack(s) / %d frame(s)\n",
                     (int)app.seqs.size(), (int)app.images.size());
-            if (!app.images.empty() && app.images[0]->src) {
-                const FrameSource& S = *app.images[0]->src;
-                FrameSource asUrl = S;               // the SAME file through the
-                asUrl.path = "local://" + S.path;    // local:// door, for the record
-                asUrl.remoteUrl = asUrl.path;
-                fprintf(stderr, "scanselftest: identity via the local scan   : %s\n"
-                                "scanselftest: identity via a local:// open  : %s\n",
-                        srcIdentityKey(S).c_str(), srcIdentityKey(asUrl).c_str());
-            }
             check(app.seqs.size() == 2 && app.images.size() == 6,
                   "S4a the picker's Load opens both stacks, six frames");
             check(local,
                   "S4b ...as LOCAL sources: path on disk, no remoteUrl (§6.2 identity)");
+            if (!app.images.empty() && app.images[0]->src) {
+                const FrameSource& S = *app.images[0]->src;
+                // WHICH file this is, hand-derived: S3d fixed the group order
+                // (dark_ before 暗電流, UTF-8 bytes) and the frames within a
+                // group are file-number order, so images[0] is dark_001.png.
+                // Asserted rather than assumed - every string below is built
+                // from that name, and a different frame here would compare two
+                // different files and pass for the wrong reason.
+                const std::string base = baseName(S.path);
+                check(base == "dark_001.png",
+                      "S4c the frame these keys are about is dark_001.png");
+
+                // The SAME file through the local:// door, spelled the way that
+                // door really spells it - relative, as the Browse panel's own
+                // url is (the measured line above), because that is the case
+                // weakly_canonical has to resolve. A SESSION WRITTEN BEFORE THIS
+                // CHANGE HOLDS EXACTLY THIS STRING: writeSessionTo records
+                // FrameSource::path verbatim and the restore hands it back to
+                // openRemote, so this doubles as the old-session line and S4d
+                // is the statement that restoring one does not mint a second
+                // identity for a file the new code keys from the local door.
+                FrameSource asUrl = S;
+                asUrl.path = "local://" + nonpy + "/" + base;
+                asUrl.remoteUrl = asUrl.path;
+                // ...and the same fields with a REAL peer's url, which must NOT
+                // collapse: "/data/cap/dark_001.png on trc2" is not a path on
+                // this disk and weakly_canonical would answer about the wrong
+                // machine. This is the anti-vacuity half of S4d - a comparison
+                // that cannot tell a peer from this disk would pass by
+                // canonicalising everything, which is the wrong fix.
+                FrameSource asPeer = S;
+                asPeer.path = "ssh://trc2/data/cap/" + base;
+                asPeer.remoteUrl = asPeer.path;
+                const std::string kLocal = srcIdentityKey(S);
+                const std::string kUrl   = srcIdentityKey(asUrl);
+                const std::string kPeer  = srcIdentityKey(asPeer);
+                fprintf(stderr, "scanselftest: identity via the local scan   : %s\n"
+                                "scanselftest: identity via a local:// open  : %s\n"
+                                "scanselftest: identity via a PEER's url     : %s\n",
+                        kLocal.c_str(), kUrl.c_str(), kPeer.c_str());
+                // Anti-vacuity: neither side may be empty, and both must still
+                // name the file - a srcKeyPath that returned "" or "/" for
+                // everything would make the equality below trivially true.
+                check(!kLocal.empty() && !kUrl.empty() &&
+                      kLocal.find(base) != std::string::npos &&
+                      kUrl.find(base) != std::string::npos,
+                      "S4d both keys are non-empty and name dark_001.png");
+                check(kUrl.find("local://") == std::string::npos,
+                      "S4d ...the url spelling was RESOLVED, not compared verbatim");
+                check(kLocal == kUrl,
+                      "S4d ...and the two doors write ONE §6.2 key for one file");
+                check(kPeer != kLocal && kPeer.find("ssh://trc2/data/cap/") == 0,
+                      "S4d ...while a PEER's url stays verbatim and stays different");
+                // srcKeyPath itself, on strings alone: the reason the "://"
+                // test exists, stated as a test. A peer's path is never
+                // resolved against this machine's filesystem.
+                check(srcKeyPath("ssh://trc2/data/cap/x.npy") ==
+                          "ssh://trc2/data/cap/x.npy" &&
+                      srcKeyPath("ssh://trc2:2222/data/x.npy") ==
+                          "ssh://trc2:2222/data/x.npy",
+                      "S4e srcKeyPath leaves a named host's path exactly as it found it");
+            }
+        }
+
+        // ---- S5: two doors, ONE resident (§6.2's consequence) -----------------
+        // S4d compares STRINGS, and a key that reads the same would still leave
+        // two rows in the registry if nothing consulted it. So the same file is
+        // opened for real through both doors and the registry is counted:
+        // shareOrRegisterSource has to hand the second door the FIRST door's
+        // source, which is one source with two holders, not two sources.
+        //
+        // .npy and not one of the .png above, on purpose: peerServesName is true
+        // for .npy, so openRemote really crosses the protocol and mints a
+        // local:// source. A .png url is routed straight back to openPath by
+        // #111 and would test the routing, not the identity.
+        //
+        // The fixture is a COPY under this test's own TMP, with a name holding
+        // no digit run (no siblings, so openPath opens exactly one document and
+        // the count below is arithmetic). Not a subdirectory of the shared
+        // fixture folder: a subdirectory there is a ROW there, and
+        // --browse-keys navigates by position (ad2d4fc).
+        {
+            closeAll();
+            std::error_code sec;
+            std::string scratch =
+                (std::filesystem::temp_directory_path(sec) / "viewer_ident").u8string();
+            std::replace(scratch.begin(), scratch.end(), '\\', '/');
+            std::filesystem::remove_all(pathFromUtf8(scratch), sec);
+            std::filesystem::create_directories(pathFromUtf8(scratch), sec);
+            const std::string solo = scratch + "/solo.npy";
+            std::filesystem::copy_file(pathFromUtf8(dir + "/80lx/frame_000.npy"),
+                                       pathFromUtf8(solo),
+                                       std::filesystem::copy_options::overwrite_existing, sec);
+            check(!sec && std::filesystem::exists(pathFromUtf8(solo), sec),
+                  "S5a the fixture: one .npy under this test's own TMP");
+
+            // Door 1: File > Open, which stores the path on disk.
+            openPath(solo);
+            check(app.images.size() == 1 && !app.images.empty() &&
+                  app.images[0]->src && app.images[0]->src->remoteUrl.empty(),
+                  "S5b the local door opens it: one document, no url");
+            // Door 2: the same bytes through the local peer, which stores the
+            // url. Registered (not a preview) - a preview never registers or
+            // adopts, and asserting on one would prove nothing about §6.2.
+            const bool opened = openRemote("local://" + solo);
+            fprintf(stderr, "scanselftest: S5 local://%s opened=%d docs=%d "
+                            "sources=%d toast=\"%s\"\n",
+                    solo.c_str(), opened ? 1 : 0, (int)app.images.size(),
+                    srcMapSources(), app.toast.c_str());
+            check(opened && app.images.size() == 2,
+                  "S5c ...and the local:// door opens it too: two documents");
+            srcMapDump("S5 two doors, one file");
+            std::vector<SrcMapRow> rows = srcMapRows();
+            bool one = rows.size() == 2 && rows[0].src == rows[1].src;
+            bool two = rows.size() == 2 && rows[0].refs == 2 && rows[1].refs == 2;
+            check(srcMapSources() == 1 && one,
+                  "S5d TWO documents over ONE source: the second door SHARED");
+            // refs is src.use_count(): the two documents and nothing else (the
+            // registry holds a weak_ptr on purpose). A "2" that came from one
+            // document holding its own source twice is excluded by S5c's count.
+            check(two, "S5e ...and both say two holders (refcount 2, §6.2)");
+
+            // ...and the other way round, because a one-sided fix passes the
+            // test above: whichever door is FIRST owns the resident, and the
+            // second adopts it (§6.2, "first resident wins").
+            closeAll();
+            const bool opened2 = openRemote("local://" + solo);
+            openPath(solo);
+            rows = srcMapRows();
+            bool rone = rows.size() == 2 && rows[0].src == rows[1].src &&
+                        rows[0].refs == 2 && rows[1].refs == 2;
+            fprintf(stderr, "scanselftest: S5 reversed: opened=%d docs=%d sources=%d\n",
+                    opened2 ? 1 : 0, (int)app.images.size(), srcMapSources());
+            check(opened2 && app.images.size() == 2 && srcMapSources() == 1 && rone,
+                  "S5f local:// first, then the local door: still one source, two holders");
+
+            // ANTI-VACUITY for S5d/S5f: a registry that collapsed everything
+            // onto one row would pass both. A DIFFERENT file must still be a
+            // different source.
+            closeAll();
+            const std::string other = scratch + "/other.npy";
+            std::filesystem::copy_file(pathFromUtf8(dir + "/160lx/frame_000.npy"),
+                                       pathFromUtf8(other),
+                                       std::filesystem::copy_options::overwrite_existing, sec);
+            openPath(solo);
+            openPath(other);
+            check(app.images.size() == 2 && srcMapSources() == 2,
+                  "S5g two DIFFERENT files are still two sources");
+            closeAll();
+            std::filesystem::remove_all(pathFromUtf8(scratch), sec);
         }
 
         fprintf(stderr, "scanselftest: %s\n", ok ? "ok" : "FAILED");

@@ -168,6 +168,21 @@ inline void statSourceFile(FrameSource& s) {
     auto sz = std::filesystem::file_size(p, ec);
     s.fsize = ec ? 0 : (uint64_t)sz;
 }
+// WHICH FILE ON THIS DISK a url names, and "" when it names a peer's.
+//
+// "An empty host means this machine" is the rule the remote layer already runs
+// on - makeRemoteUrl mints "local://<path>" for an empty host and
+// remote::parseUrl is its inverse (docs/watch-design.md §13.7) - so it is asked
+// HERE, once, through that inverse, rather than by yet another literal prefix
+// test. The two callers that used to spell it themselves (statLocalUrl below
+// and watchLocalPathOf, the FrameSource-level form) now come through this, and
+// srcKeyPath is the third: identity has to ask exactly the question Watch and
+// Reload ask, or one file gets two answers about whose disk it is on.
+inline std::string localDiskPathOfUrl(const std::string& url) {
+    std::string host, path;
+    if (!remote::parseUrl(url, host, path)) return std::string();
+    return host.empty() ? path : std::string();
+}
 // The local:// twin of statSourceFile: the url EMBEDS a path on this disk, so
 // unlike a true remote the disk baseline is knowable - and it has to be known,
 // because a local:// tuple with mtime/fsize 0 never moves: an overwrite on
@@ -175,9 +190,10 @@ inline void statSourceFile(FrameSource& s) {
 // and silently show the old pixels. ssh:// urls stay 0/0 on purpose (a peer's
 // disk cannot be statted from here; change detection there is Watch's).
 inline void statLocalUrl(FrameSource& s) {
-    if (s.remoteUrl.rfind("local://", 0) != 0) return;
+    const std::string onDisk = localDiskPathOfUrl(s.remoteUrl);
+    if (onDisk.empty()) return;
     std::error_code ec;
-    auto p = pathFromUtf8(s.remoteUrl.substr(8));
+    auto p = pathFromUtf8(onDisk);
     auto t = std::filesystem::last_write_time(p, ec);
     s.mtime = ec ? 0 : (int64_t)t.time_since_epoch().count();
     auto sz = std::filesystem::file_size(p, ec);
@@ -218,7 +234,8 @@ inline std::shared_ptr<FrameSource> cloneSource(const FrameSource& s) {
 // fresh decode BEFORE locking for the swap.
 // And NO IO under it: srcIdentityKey canonicalizes the path (srcKeyPath =
 // weakly_canonical = filesystem round-trips - seconds on a UNC path with a
-// slow or dead server), so every key is computed BEFORE the lock is taken;
+// slow or dead server, and a local:// url reaches that round trip too since it
+// names this disk), so every key is computed BEFORE the lock is taken;
 // while it is held, only map and field operations happen. Identity fields are
 // only ever written by the UI thread (load, reload swap, crop) or on a source
 // no other thread can see yet, so a pre-lock read of them is never torn.
@@ -228,9 +245,7 @@ inline std::unordered_map<std::string, std::weak_ptr<FrameSource>> g_srcRegistry
 // The same file reached as "C:\data\F.npy" and "c:/data/f.npy" is ONE tuple:
 // canonicalize exactly once, HERE, where the key is built. The stored path is
 // provenance (reload and sessions read it verbatim) and is never rewritten.
-// URLs (ssh://, local://) pass through - they are not filesystem paths.
-inline std::string srcKeyPath(const std::string& p) {
-    if (p.empty() || p.find("://") != std::string::npos) return p;
+inline std::string srcKeyCanonical(const std::string& p) {
     std::error_code ec;
     std::filesystem::path c = std::filesystem::weakly_canonical(pathFromUtf8(p), ec);
     if (ec) return p;
@@ -244,6 +259,37 @@ inline std::string srcKeyPath(const std::string& p) {
 #endif
     return s;
 }
+// A PEER's path passes through untouched, and that is why this function has
+// always looked for "://": weakly_canonical is a question about THIS
+// filesystem, and asking it about "/data/cap/f.npy on trc2" answers with this
+// machine's symlinks, this machine's current directory and this machine's case
+// rules - it would rewrite, or silently absolutize, a name that never touches
+// this disk. A url is not a filesystem path.
+//
+// local:// IS this disk, though (docs/watch-design.md §13.7 - the same "empty
+// host means this machine" every other consumer runs on), so it was never one
+// of those, and passing it through was the defect: the local:// url EMBEDS an
+// on-disk path, so the file it names is the same file the local door opens,
+// and the two doors were minting two §6.2 keys for it -
+//
+//   the local scan   c:\users\...\openfolder\dark_001.png
+//   a local:// open  local://tools/testdata/openfolder\dark_001.png
+//
+// - which is two registry rows, two residents and two independently reloadable
+// entries for one set of bytes. Resolving the EMBEDDED path is what makes them
+// one, and it is deliberately done HERE rather than at the doors: the key is
+// computed, never stored, so every session line already written under the url
+// spelling lands on the same tuple as one written under the path spelling, with
+// no migration and no second identity for a restored session (--scan-selftest
+// S4d asserts exactly that line).
+inline std::string srcKeyPath(const std::string& p) {
+    if (p.empty()) return p;
+    if (p.find("://") != std::string::npos) {
+        const std::string onDisk = localDiskPathOfUrl(p);
+        return onDisk.empty() ? p : srcKeyCanonical(onDisk);   // "" = a peer's
+    }
+    return srcKeyCanonical(p);
+}
 
 // The reading that names this source's tuple (defined by npyLayout's §3.1
 // machinery, below): NR_NATIVE stays 0 whatever the shape - a pre-decode
@@ -256,9 +302,10 @@ int npyKeyRead(const std::vector<int64_t>& shape, int npyRead);   // defined in 
 
 inline std::string srcIdentityKey(const FrameSource& s) {
     char t[160];
+    const int fileFr = s.fileFrame, peerFr = s.remoteFrame;
     if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
         snprintf(t, sizeof t, "\n%d|%d\nraw%d,%d,%d,%d,%dx%d\n%lld,%llu",
-                 s.fileFrame, s.remoteFrame, s.rawDtype, s.rawInterp, s.rawOffset,
+                 fileFr, peerFr, s.rawDtype, s.rawInterp, s.rawOffset,
                  (int)s.rawLE, s.srcW, s.srcH,
                  (long long)s.mtime, (unsigned long long)s.fsize);
     else                    // npy/npz: the file bytes decide, mtime+fsize name
@@ -266,7 +313,7 @@ inline std::string srcIdentityKey(const FrameSource& s) {
                             // file from collapsing onto one key - two readings
                             // are two different sets of pixels
         snprintf(t, sizeof t, "\n%d|%d\nnr%d\n%lld,%llu",
-                 s.fileFrame, s.remoteFrame, npyKeyRead(s.npyShape, s.npyRead),
+                 fileFr, peerFr, npyKeyRead(s.npyShape, s.npyRead),
                  (long long)s.mtime, (unsigned long long)s.fsize);
     // member is LENGTH-PREFIXED: a zip may name a member anything, newlines
     // included, and an unescaped name could forge the field boundaries of this

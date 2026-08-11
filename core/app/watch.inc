@@ -24,9 +24,13 @@
 // counts as local for the reason reloadUnavailable gives: a Browse-panel local
 // open carries the path inside its url, and those pixels really are on this
 // disk. A peer's pixels, a montage and a plugin result have no file here.
+//
+// The url half is localDiskPathOfUrl (state.h), which is the same question
+// asked through remote::parseUrl's "empty host means this machine". It used to
+// be spelled out here; §6.2's identity key needs the identical answer, and two
+// spellings of one predicate differ exactly once, in the place nobody reads.
 static std::string watchLocalPathOf(const FrameSource& s) {
-    if (!s.remoteUrl.empty())
-        return s.remoteUrl.rfind("local://", 0) == 0 ? s.remoteUrl.substr(8) : std::string();
+    if (!s.remoteUrl.empty()) return localDiskPathOfUrl(s.remoteUrl);
     return s.path;
 }
 

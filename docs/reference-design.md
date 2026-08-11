@@ -317,6 +317,24 @@ tuple** であり、決して共有しない (reload selftest R21b)。
   ディスクを読み直す」という今日の意味論を壊さない。変わっていなければ
   RAM の画素と同一なので共有してよい (同じフォルダを2回開けば、2つの batch の
   2つの stack が同じ source 群を指し、メモリは1倍になる)。
+- **第1欄は「どのファイルか」であって綴りではない (2026-08-11 追記、実装から)。**
+  `srcKeyPath` が `weakly_canonical` と (Windows では) ASCII 小文字化を
+  **鍵を作るその一箇所で1回だけ**掛ける — `C:\data\F.npy` と `c:/data/f.npy`
+  は1つの tuple。**`local://` はこのディスクである**ので、url に埋まった実パス
+  まで解決してから同じ正規化を掛ける。判定は `localDiskPathOfUrl`
+  (= `remote::parseUrl` の逆、「空 host = この機械」: watch-design.md §13.7、
+  `watchLocalPathOf` と同じ述語)。**名前のある host の path は逐語のまま** ——
+  `weakly_canonical` は*この*ファイルシステムへの問いなので、peer のパスに
+  当てればこの機械の symlink・カレントディレクトリ・大小文字規則で別名に
+  書き換わる。url は path ではない。
+  - 正規化は**鍵の計算時**に行い `FrameSource::path` は書き換えない (出自は
+    逐語、§2.1)。したがって `local://` の綴りで書かれた**既存のセッション行**も、
+    ローカルの戸から書かれた行も、復元すれば**同じ tuple** に着く —— 形式変更も
+    移行も無く、復元が2つ目の identity を生むことも無い。
+  - これは「**このディスクの1ファイルは、どの戸から開いても1つの identity**」
+    という本節の主張そのもの。証拠は `--scan-selftest` の S4d/S4e (鍵の文字列、
+    peer の url は逐語のまま別鍵) と S5d-S5g (registry を数える: 2 doc /
+    1 source / refs=2、別ファイルは別 source のまま)。
 - registry は弱参照 (source が全 membership を失えば消える)。
 - **入らないものが1つあり、それは形式ではなく tuple の都合。** reader
   (アダプタ) が作った画素は登録しない — tuple はファイルを名乗る欄しか持たず、
