@@ -789,7 +789,12 @@ static void drawCanvas(ImVec2 avail) {
             ImGui::Separator();
             {   // out of the tool and into a report
                 ImageDoc* ci = cur();
-                if (ImGui::MenuItem("Copy image (dot by dot)", "Ctrl+Shift+C", false, ci != nullptr))
+                // The label is the CHORD, printed by ImGui from the same
+                // constant core/main.cpp tests for. It used to be the string
+                // "Ctrl+Shift+C", and nothing anywhere listened for it.
+                if (ImGui::MenuItem("Copy image (dot by dot)",
+                                    ImGui::GetKeyChordName(CHORD_COPY_DOT),
+                                    false, ci != nullptr))
                     copyViewDotByDot();
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("one image pixel per copied pixel, with the range,\n"

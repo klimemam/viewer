@@ -87,6 +87,15 @@ inline std::filesystem::path pathFromUtf8(const std::string& s) {
   inline constexpr ImGuiKeyChord MODK = ImGuiMod_Ctrl;
 #endif
 
+// Copy the view dot by dot. Named here, next to the pair above, because the
+// context menu advertised "Ctrl+Shift+C" as a literal string and NOTHING in the
+// program listened for that chord: a shortcut that had been typed into a label
+// and never bound. The menu item now takes its label FROM this constant
+// (ImGui::GetKeyChordName), so the advertisement and the binding are one fact
+// and cannot come apart - which is the same argument the SC_MOD / MODK pair
+// above is making, one step further along.
+inline constexpr ImGuiKeyChord CHORD_COPY_DOT = MODK | ImGuiMod_Shift | ImGuiKey_C;
+
 inline std::atomic<uint64_t> g_nextSrcId{ 1 };
 struct FrameSource {
     std::vector<float> data;          // raw values, size w*h*ch

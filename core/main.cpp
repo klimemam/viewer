@@ -1278,6 +1278,12 @@ static bool g_watchSuppressed = false;
             // keys to both actions made one press do the two at once.
             if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_C))
                 showCompareSlots();
+            // ...and the chord the context menu has been advertising. Tested
+            // BEFORE the Shift+C above would ever see it - IsKeyChordPressed
+            // matches the modifier set exactly, so the two do not overlap - and
+            // it is the same constant the menu prints, so there is no second
+            // place for the two to disagree (core/app/state.h CHORD_COPY_DOT).
+            if (ImGui::IsKeyChordPressed(CHORD_COPY_DOT)) copyViewDotByDot();
         }
         if (!io.WantTextInput && !popupOpen && io.KeyMods == ImGuiMod_None) {   // plain keys
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
