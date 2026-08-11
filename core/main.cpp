@@ -611,6 +611,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // bootstrapScript() (判断17) and prefsPath(), both of which exist by now.
 #include "selftest/settings.inc"
 
+// Named recipes for headerless RAW (issue #166). Here, beside the settings
+// test, for the same two reasons: it is a function like settingsSelftest(), and
+// its subject is half a settings file - the recipe LIBRARY - and half a thing
+// that must never reach one, the session's size -> recipe binding.
+#include "selftest/rawrecipe.inc"
+
 #include "selftest/roi-export.inc"
 
 #include "selftest/anaprov.inc"
@@ -1053,6 +1059,13 @@ int main(int argc, char** argv) {
     // no fixture directory because it writes its own into its per-test TMP -
     // which for THIS test is the point, not the housekeeping (see the file).
     if (g_settingsSelftest) return settingsSelftest();
+
+    // Named recipes for headerless RAW (#166): the library in settings.jsonc,
+    // the session's size -> recipe binding, and the two negatives - a saved
+    // recipe never applies on its own, and a binding survives nothing.
+    // Windowless for the settings reasons: every assertion is a pixel value, a
+    // width or a string. It writes its own fixtures into its own temp dir.
+    if (g_rawRecipeSelftest) return rawRecipeSelftest();
 
     // The ROI table's numbers. Windowless, so it runs on every runner in the
     // matrix rather than only on the one that has a GL context - see
@@ -1792,6 +1805,7 @@ static bool g_watchSuppressed = false;
         drawNpzPickModal();
         drawReaderPanel();
         drawReaderList();
+        drawRawRecipePanel();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
         drawHelpAbout();

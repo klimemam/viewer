@@ -1897,6 +1897,11 @@ struct App {
     bool readerPanelOpen = false;
     bool readerPanelRaise = false;          // an entrance asked for focus
     bool readerListOpen = false;            // §4.12's visible, removable list
+    // #166: the named-recipe panel for headerless RAW. Beside the reader list
+    // because it answers the same question one door along - "why does THIS file
+    // open the way it does" - and because a lab's own formats are consulted,
+    // not answered once and dismissed.
+    bool rawRecipeListOpen = false;
     char readerPickFile[512] = "";
     char readerPickFunc[128] = "load";
     // §4.13.2 (issue #51): the places readers are looked for, in the order the

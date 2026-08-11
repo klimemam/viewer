@@ -410,7 +410,7 @@ enum SKey {
     SK_theme, SK_accent, SK_compact, SK_titleBar, SK_showFps, SK_pixelGrid, SK_gamma,
     SK_dragPans, SK_wheelZoom, SK_fitOnSwitch,
     SK_grouped, SK_tree, SK_naturalSort,
-    SK_stackPrompt,
+    SK_stackPrompt, SK_rawRecipes,
     SK_peerExe, SK_policy, SK_lowBandwidth, SK_repoUrl,
     SK_pythonExe, SK_searchPath, SK_editor,
     SK_defaultUnit
@@ -465,7 +465,18 @@ static const SKeyDef SETTING_KEYS[] = {
     { SK_stackPrompt, "loading.stackPrompt",     SS_Read, nullptr, "\"never\"" },
     { SK_None,        "loading.raw",             SS_Later,
       "the raw defaults are the measuring class and move in their own change "
-      "(settings-inventory 5.5, judgment 10)", nullptr },
+      "(settings-inventory 5.5, judgment 10) - a NAMED recipe goes in "
+      "\"rawRecipes\" beside this, which is a library and not a default", nullptr },
+    // issue #166. NOT the same key as "raw" above and deliberately next to it:
+    // "raw" is what the dialog COMES UP WITH when nothing has been said, and it
+    // is measuring-class for judgment 10's reason - a default that decodes
+    // pixels differently, applied to a file that cannot contradict it. A
+    // recipe here is the opposite: it is inert until somebody picks it, so it
+    // is not a default at all and does not wait on the measuring section.
+    { SK_None,        "loading.rawRecipes",      SS_Later,   // RED: not read yet
+      "the recipe library is not read by this version",
+      "[{\"name\": \"sample\", \"dtype\": \"u16\", \"interpretation\": \"bayer\", "
+      "\"size\": [4096, 3000], \"bayerPattern\": \"RGGB\"}]" },
 
     { SK_peerExe,     "remote.peerExecutable",   SS_Read, nullptr, "\"/opt/viewer-serve\"" },
     { SK_policy,      "remote.policy",           SS_Read, nullptr, "\"local-fetch\"" },
@@ -657,6 +668,164 @@ struct SjApply {
 
 }  // namespace
 
+// ---- loading.rawRecipes -----------------------------------------------------
+// The named-recipe LIBRARY (issue #166). It is the one key in this file whose
+// value is a list of objects, and it is here rather than in a file of its own
+// because a recipe is the textbook thing a person wants to write by hand and
+// keep their comments next to: "うちの 4096x3000 u16 RGGB". 判断3's split is
+// exactly right for it - the app reads it and never writes it.
+//
+// THE WORDS ARE NOT NEW. dtype / interpretation / size / byteOrder /
+// headerBytes / bayerPattern / crop are the settings-inventory §5.5 sketch's
+// own spelling, and the VALUES are RAW_DTYPE_NAMES, RAW_INTERP_CLI and
+// CFA_PATTERNS - the same three tables --raw-dtype, --raw-interp and
+// --bayer-pattern take. A second vocabulary for the same seven fields is how
+// the same file comes to mean two things.
+//
+// GRANULARITY, one level below 判断8: a recipe that cannot be read is skipped
+// BY NAME and the others in the array still load. The array is one key, so a
+// user with six good recipes and a typo in the seventh keeps six.
+static void sjApplyRawRecipes(SjApply& A, const SjVal& v, const char* path) {
+    if (v.kind != SjVal::Arr) {
+        A.typeErr(v, path, "an array of recipe objects");
+        return;
+    }
+    // The same shape of cap readers.searchPath carries, and stated for the same
+    // reason: a limit applied in silence is a list whose end the user cannot see.
+    if (v.arr.size() > 64) {
+        A.rangeErr(v, path, "at most 64 recipes (this one has " +
+                            std::to_string(v.arr.size()) + ")");
+        return;
+    }
+    std::vector<const char*> dtypeWords(RAW_DTYPE_NAMES, RAW_DTYPE_NAMES + RD_COUNT);
+    std::vector<const char*> interpWords(RAW_INTERP_CLI, RAW_INTERP_CLI + RI_COUNT);
+    std::vector<const char*> cfaWords(CFA_PATTERNS, CFA_PATTERNS + 4);
+    for (size_t i = 0; i < v.arr.size(); i++) {
+        const SjVal& e = v.arr[i];
+        const std::string base = std::string(path) + "[" + std::to_string(i) + "]";
+        if (e.kind != SjVal::Obj) { A.typeErr(e, base.c_str(), "a recipe object"); continue; }
+        RawRecipe r;
+        r.fromLibrary = true;
+        bool ok = true, haveSize = false;
+        for (const auto& kv : e.obj) {
+            const std::string kp = base + "." + kv.first;
+            const SjVal& val = kv.second;
+            if (kv.first == "name") {
+                if (!A.wantStr(val, kp.c_str(), r.name)) { ok = false; continue; }
+            } else if (kv.first == "dtype") {
+                if (!A.wantEnum(val, kp.c_str(), dtypeWords, r.dtype)) ok = false;
+            } else if (kv.first == "interpretation") {
+                if (!A.wantEnum(val, kp.c_str(), interpWords, r.interp)) ok = false;
+            } else if (kv.first == "bayerPattern") {
+                if (!A.wantEnum(val, kp.c_str(), cfaWords, r.cfaPattern)) ok = false;
+            } else if (kv.first == "byteOrder") {
+                int idx = 0;
+                if (A.wantEnum(val, kp.c_str(), { "little", "big" }, idx)) r.littleEndian = idx == 0;
+                else ok = false;
+            } else if (kv.first == "headerBytes") {
+                double n = 0;
+                if (!A.wantNum(val, kp.c_str(), n)) { ok = false; continue; }
+                if (n != floor(n) || n < 0 || n > 1e9) {
+                    A.rangeErr(val, kp.c_str(), "a whole number of bytes from 0");
+                    ok = false;
+                }
+                else r.offset = (int)n;
+            } else if (kv.first == "size" || kv.first == "crop") {
+                const bool isCrop = kv.first == "crop";
+                const size_t want = isCrop ? 4 : 2;
+                if (val.kind != SjVal::Arr || val.arr.size() != want) {
+                    A.rangeErr(val, kp.c_str(), isCrop ? "[x, y, width, height]"
+                                                       : "[width, height]");
+                    ok = false;
+                    continue;
+                }
+                int got[4] = { 0, 0, 0, 0 };
+                bool good = true;
+                for (size_t k = 0; k < want; k++) {
+                    const SjVal& n = val.arr[k];
+                    if (n.kind != SjVal::Num || n.num != floor(n.num) || n.num < 0 ||
+                        n.num > 32768) {
+                        A.rangeErr(n, kp.c_str(), "whole numbers from 0 to 32768");
+                        good = false;
+                        break;
+                    }
+                    got[k] = (int)n.num;
+                }
+                if (!good) { ok = false; continue; }
+                if (isCrop) {
+                    if (got[2] < 1 || got[3] < 1) {
+                        A.rangeErr(val, kp.c_str(), "a crop width and height of at least 1");
+                        ok = false;
+                        continue;
+                    }
+                    r.cropOn = true;
+                    r.cropX = got[0]; r.cropY = got[1]; r.cropW = got[2]; r.cropH = got[3];
+                } else {
+                    if (got[0] < 1 || got[1] < 1) {
+                        A.rangeErr(val, kp.c_str(), "a width and height of at least 1");
+                        ok = false;
+                        continue;
+                    }
+                    r.w = got[0]; r.h = got[1];
+                    haveSize = true;
+                }
+            } else {
+                A.rep->unknown++;
+                A.note(A.at(val) + "\"" + kp + "\" is not a field of a raw recipe "
+                       "(name, dtype, interpretation, size, byteOrder, headerBytes, "
+                       "bayerPattern, crop) - the field is skipped");
+            }
+        }
+        // A recipe with no NAME cannot be picked and cannot be reported, and one
+        // with no SIZE is not a recipe for a headerless file at all: the whole
+        // reason the dialog exists is that nothing else states the geometry.
+        // Both are refused BY NAME rather than defaulted, because a default here
+        // is a picture of the wrong shape that nobody can tell is wrong.
+        if (r.name.empty()) {
+            A.rangeErr(e, base.c_str(), "a \"name\" - a recipe is picked by its name");
+            ok = false;
+        }
+        if (!haveSize) {
+            A.rangeErr(e, base.c_str(), "a \"size\": [width, height] - nothing else "
+                                        "states the geometry of a headerless file");
+            ok = false;
+        }
+        if (ok) g_rawLibrary.push_back(r);
+    }
+    // ONE key applied, whatever its length - the same accounting readers.
+    // searchPath keeps, and what --settings-selftest S1 counts. Nothing goes on
+    // `overrode`: that list means "prefs.txt held this differently", and there
+    // is no prefs.txt layer under the library for it to have overridden.
+    A.rep->applied++;
+}
+
+// Defined with the template generator further down - the only other place in
+// this file that PRODUCES JSONC - and declared here so both users share one
+// escaper rather than each growing their own.
+static std::string sjQuote(const std::string& s);
+
+// A recipe as the text a user would paste into settings.jsonc. The panel's
+// "Copy as JSONC" hands this to the clipboard, because 判断3 means the app does
+// not write that file and "save this recipe" therefore has to be "here is what
+// to paste" - see drawRawRecipePanel(). It is emitted through sjQuote and read
+// back by the parser above, which is what --rawrecipe-selftest asserts as a
+// round trip rather than as a string comparison.
+static std::string rawRecipeJsonc(const RawRecipe& r) {
+    const int dt = rawClampIdx(r.dtype, RD_COUNT), in = rawClampIdx(r.interp, RI_COUNT);
+    std::string o = "{ \"name\": " + sjQuote(r.name);
+    o += ", \"size\": [" + std::to_string(r.w) + ", " + std::to_string(r.h) + "]";
+    o += ", \"dtype\": " + sjQuote(RAW_DTYPE_NAMES[dt]);
+    o += ", \"interpretation\": " + sjQuote(RAW_INTERP_CLI[in]);
+    if (r.offset != 0) o += ", \"headerBytes\": " + std::to_string(r.offset);
+    if (!r.littleEndian) o += ", \"byteOrder\": \"big\"";
+    if (in == RI_BAYER || in == RI_QUAD)
+        o += ", \"bayerPattern\": " + sjQuote(CFA_PATTERNS[r.cfaPattern & 3]);
+    if (r.cropOn && r.cropW > 0 && r.cropH > 0)
+        o += ", \"crop\": [" + std::to_string(r.cropX) + ", " + std::to_string(r.cropY) +
+             ", " + std::to_string(r.cropW) + ", " + std::to_string(r.cropH) + "]";
+    return o + " }";
+}
+
 static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
     const char* path = d.path;
     switch (d.id) {
@@ -716,6 +885,11 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
                 A.setI(app.seqLoadMode, idx, path);
             break;
         }
+        // Unreachable in this commit: the table row above is SS_Later, so the
+        // key is named as "not read yet" and never gets here. The reader it
+        // would call is written and sitting above, deliberately unused - this
+        // commit is the RED half and carries no decision.
+        case SK_rawRecipes: break;
         case SK_peerExe: { std::string s; if (A.wantStr(v, path, s)) A.setS(app.remoteExe, s, path); break; }
         case SK_policy: {
             int idx = 0;
@@ -908,6 +1082,12 @@ static SettingsReport loadSettingsRead(const std::string& path) {
     // previous read would be a setting you can enter and never leave.
     g_settingsRepoUrl.clear();
     g_settingsEditorCmd.clear();
+    // ...and the recipe library, for the same reason and one more. It has no
+    // prefs.txt layer under it either, so "absent" here means "empty"; and a
+    // recipe left over from a previous read would be a named recipe the user
+    // has deleted from their file and can still pick, which is the one thing a
+    // library that never applies by itself must not be able to do.
+    g_rawLibrary.clear();
     if (path.empty()) return rep;
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return rep;      // absent is not an error
@@ -1026,6 +1206,7 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_stackPrompt:
             return app.seqLoadMode == 0 ? "" :
                    (app.seqLoadMode == 1 ? "\"always\"" : "\"never\"");
+        case SK_rawRecipes: return "";
         case SK_peerExe: return app.remoteExe.empty() ? "" : sjQuote(app.remoteExe);
         case SK_policy: return app.procPolicy == App::PolLocalFetch ? "\"local-fetch\"" : "";
         case SK_lowBandwidth: return app.lowBandwidth ? "true" : "";

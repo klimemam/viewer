@@ -1,4 +1,8 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ImageView
+// The recipe panel below owns this; the dialog uses it too, because the moment
+// a user has just typed a geometry in is the moment they want to keep it.
+static void rawRecipeCopy(const RawRecipe& r);
+
 static void drawRawModal() {
     // LEVEL-triggered, like the picker / sequence-ask / Start-remote dialogs.
     // It used to be one-shot (`rawDlg.open` consumed on the frame it opened),
@@ -22,6 +26,21 @@ static void drawRawModal() {
     if (rawDlg.forQueue)
         ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
                            "these settings apply to all %d queued stack(s)", rawDlg.queueCount);
+    // The library, at the moment it is useful (#166). It fills the fields in and
+    // stops there: Load is where the choice is made, so a mis-click is one
+    // combo away from being undone and nothing has been decoded yet.
+    if (!g_rawLibrary.empty()) {
+        if (ImGui::BeginCombo("recipe", "pick a saved recipe...")) {
+            for (const RawRecipe& r : g_rawLibrary) {
+                const std::string lb = r.name + "   (" + rawRecipeSummary(r) + ")";
+                if (ImGui::Selectable(lb.c_str())) {
+                    rawRecipeIntoDialog(r, rawDlg);
+                    rawGuessDims(rawDlg);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
     ImGui::Separator();
     int prevDt = rawDlg.dtype, prevIn = rawDlg.interp, prevOff = rawDlg.offset;
     // axis 1: how one sample is stored
@@ -87,6 +106,18 @@ static void drawRawModal() {
     ImGui::Separator();
     bool ok = ImGui::Button(rawDlg.replaceIdx >= 0 ? "Reload" : "Load", ImVec2(120 * app.uiScale, 0));
     ImGui::SameLine();
+    if (ImGui::Button("Copy as JSONC", ImVec2(140 * app.uiScale, 0))) {
+        // The app does not write settings.jsonc (判断3), so keeping a recipe is
+        // "here is the line, and here is the file to paste it into".
+        RawRecipe r = rawRecipeFromDialog(rawDlg);
+        if (!r.fromLibrary) r.name = baseName(rawDlg.path) + " " + rawRecipeSummary(r);
+        rawRecipeCopy(r);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("keep these settings as a NAMED recipe: this copies the\n"
+                          "JSONC line to paste into settings.jsonc (the app never\n"
+                          "writes that file - it is yours). Rename it there.");
+    ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         rawDlg.replaceIdx = -1;
         if (rawDlg.forQueue) {
@@ -108,7 +139,11 @@ static void drawRawModal() {
         ImGui::CloseCurrentPopup();
     }
     if (ok) {
-        std::string err = loadRaw(rawDlg);
+        // rawDialogAccept, not loadRaw: the Load button is also the moment the
+        // user STATES how files of this byte count are read this session (#166),
+        // and that statement is made in one place so the headless test drives
+        // the same code the button does.
+        std::string err = rawDialogAccept(rawDlg);
         if (!err.empty()) toast(err, true);
         else if (rawDlg.forQueue) {
             // first frame of the first queued stack: reuse these settings for the rest
@@ -135,6 +170,123 @@ static void drawRawModal() {
         }
     }
     ImGui::EndPopup();
+}
+
+// ---------------------------------------------------------- RAW recipes panel
+// Issue #166, and it is a PANEL rather than a second modal for the reason the
+// issue was filed: headerless files are the frequent case here, and the dialog
+// is a thing you answer and dismiss. A panel can sit beside Readers and be
+// consulted, which is what a list of "our formats" is for.
+//
+// It shows two lists that must never be confused with each other, so they are
+// drawn apart, headed differently, and each says its own lifetime:
+//
+//   LIBRARY        from settings.jsonc. Persistent, hand-written, INERT - a
+//                  recipe here does nothing until it is picked.
+//   THIS SESSION   byte count -> the recipe picked for it. Process-only,
+//                  written to no file, gone at exit.
+//
+// Nothing in this panel writes settings.jsonc: 判断3 is that the app never
+// writes that file, so "save this recipe" is "here is the line to paste", and
+// the button says exactly that.
+static void rawRecipeCopy(const RawRecipe& r) {
+    const std::string line = rawRecipeJsonc(r) + ",";
+    ImGui::SetClipboardText(line.c_str());
+    // Both, because the clipboard is not a record: the Messages panel is where
+    // the user finds it again after the next copy, and the PATH is half the
+    // instruction - "paste it where" is the question a clipboard cannot answer.
+    logMsg("recipe to paste under \"loading\": { \"rawRecipes\": [ ... ] } in " +
+           (settingsPath().empty() ? std::string("settings.jsonc") : settingsPath()) +
+           "\n    " + line);
+    toast("copied - paste it into settings.jsonc under loading.rawRecipes");
+}
+
+static void drawRawRecipePanel() {
+    if (!app.rawRecipeListOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 46, ImGui::GetFontSize() * 24),
+                             ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("RAW recipes", &app.rawRecipeListOpen)) {
+        ImGui::TextDisabled("Headerless files (.bin .raw .yuv .dat .rggb) carry no shape, so "
+                            "somebody has to state it.");
+        ImGui::TextDisabled("A saved recipe NEVER applies on its own - you pick it.");
+
+        ImGui::SeparatorText("Library (settings.jsonc)");
+        if (g_rawLibrary.empty()) {
+            ImGui::TextDisabled("no named recipes yet.");
+            ImGui::TextDisabled("Set a file up in the RAW dialog, press \"Copy as JSONC\", "
+                                "and paste the line into");
+            ImGui::TextDisabled("  %s", settingsPath().empty() ? "settings.jsonc"
+                                                               : settingsPath().c_str());
+            ImGui::TextDisabled("  under  \"loading\": { \"rawRecipes\": [ ... ] }");
+        }
+        const bool dlgOpen = rawDlg.open;
+        ImageDoc* im = cur();
+        const bool canReinterpret = im && im->src->rawDtype >= 0 && !im->src->path.empty();
+        for (size_t i = 0; i < g_rawLibrary.size(); i++) {
+            const RawRecipe& r = g_rawLibrary[i];
+            ImGui::PushID((int)i);
+            ImGui::BeginDisabled(!dlgOpen && !canReinterpret);
+            if (ImGui::SmallButton(dlgOpen ? "Use" : "Apply")) {
+                if (dlgOpen) {
+                    // The dialog is the thing being answered: fill it in and let
+                    // the user press Load, which is where the choice is made.
+                    rawRecipeIntoDialog(r, rawDlg);
+                    rawGuessDims(rawDlg);
+                    toast("\"" + r.name + "\" filled in - press Load to use it");
+                } else {
+                    std::string err = rawRecipeReinterpretCurrent(r);
+                    if (!err.empty()) toast(err, true);
+                    else toast("re-read " + baseName(im->src->path) + " as \"" + r.name + "\"");
+                }
+            }
+            ImGui::EndDisabled();
+            if (!dlgOpen && !canReinterpret && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("open a headerless file first - a recipe is applied\n"
+                                  "to the RAW dialog, or to a file already read that way");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy")) rawRecipeCopy(r);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("copy this recipe as the JSONC line it is written as");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", rawRecipeSummary(r).c_str());
+            ImGui::PopID();
+        }
+
+        ImGui::SeparatorText("This session, by file size");
+        ImGui::TextDisabled("What you have already told this viewer, and the ONLY thing that "
+                            "opens a file without asking.");
+        ImGui::TextDisabled("It is in no file - not settings.jsonc, not prefs.txt, not the "
+                            "session - and ends with this process.");
+        if (g_rawSizeRecipe.empty()) {
+            ImGui::TextDisabled("nothing yet: the first headerless file of a session always asks.");
+        }
+        size_t forget = 0;
+        int rowId = 0;
+        for (const auto& kv : g_rawSizeRecipe) {
+            ImGui::PushID(rowId++);
+            if (ImGui::SmallButton("Forget")) forget = kv.first;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("the next file of this size asks again");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy as JSONC")) rawRecipeCopy(kv.second);
+            ImGui::SameLine();
+            ImGui::Text("%zu bytes", kv.first);
+            ImGui::SameLine();
+            if (kv.second.fromLibrary) {
+                ImGui::TextUnformatted(kv.second.name.c_str());
+                ImGui::SameLine();
+            }
+            ImGui::TextDisabled("%s", rawRecipeSummary(kv.second).c_str());
+            ImGui::PopID();
+        }
+        if (forget) g_rawSizeRecipe.erase(forget);
+        if (!g_rawSizeRecipe.empty()) {
+            if (ImGui::SmallButton("Forget all")) g_rawSizeRecipe.clear();
+        }
+    }
+    ImGui::End();
 }
 
 // ---------------- side-by-side tiles: the pane geometry --------------------
