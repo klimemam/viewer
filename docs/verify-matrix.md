@@ -277,12 +277,12 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G2 | ローカル Browse が偽の拒否理由を出す | **済** PR #174 — 試験 F4b |
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
-| G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **未** |
+| G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **済** PR #177 — 試験 browse restore-wait |
 | G6 | reader で開いた doc の復元が memo 頼み | **未** |
 | G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **済** PR #176 — 試験 F3b |
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
-| G10 | 間引かれた doc の crop が復元で黙って落ちる | **未** |
+| G10 | 間引かれた doc の crop が復元で黙って落ちる | **済** PR #177 — 試験 browse restore-wait |
 | G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **未** |
 
 ---
@@ -455,7 +455,7 @@ static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int&
 
 ---
 
-### G5. remote のファイル内フレーム軸が session 復元でフレーム 0 に戻る
+### G5. remote のファイル内フレーム軸が session 復元でフレーム 0 に戻る —— **修正済 (PR #177)**
 
 **どこ。** `writeSessionTo` は `seqframe <seqIndex>` を書く
 (`core/app/session.inc:192`)。復元側 (`:2451-2457`) は**同期的に**走るが、
@@ -467,6 +467,13 @@ remote の open (`openRemote`、`:2583` から frame 0 固定) は残りのフ�
 **選択肢。** (a) remote の stack が揃ってから適用する遅延キュー (ローカルの
 `app.seqRestore` と同じ形)。(b) remote では `seqframe` を書かないと決め、
 「リンク越しの stack は頭から戻る」と文書に書く。
+
+**採ったのは (a)、G10 と共通の 1つの park で。** 2件は同じ形の欠陥である ——
+「session の行が、doc がまだなっていない状態について書かれている」。
+`App::RestoreWait` に uid で park し、`pumpRestoreWaits()` が frame loop で
+drain する。**諦めることも出来事にした**: fetch が失敗した / stack がその
+フレームを含まないまま伸びるのをやめた場合は名指しで言う。黙って session より
+少なくやることが、この2件の欠陥そのものだったので。
 
 ---
 
@@ -595,7 +602,7 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 
 ---
 
-### G10. 間引かれた remote doc の crop が session 復元で黙って落ちる
+### G10. 間引かれた remote doc の crop が session 復元で黙って落ちる —— **修正済 (PR #177)**
 
 **どこ。** `session.inc:2653` は `cropInPlace(...)` の**戻り値を見ていない**。
 `cropInPlace` は `remoteStep > 1` で false を返す (`loader_npy_raw.inc:374`、
@@ -605,6 +612,13 @@ crop が黙って消える。**
 
 **選択肢。** (a) 戻り値を見て、落ちたら失敗行として報告する。
 (b) 全解像度が着地してから適用する (G5 と同じ遅延キューに載る)。
+
+**採ったのは (b)。** (a) は黙らなくなるだけで crop は失われたままで、しかも
+**対話側は既に (b) の答えを返している** (`cropCurrentToSelectedRoi` の
+「still fetching the full frame - crop after it lands」)。同じアプリの中で
+同じ状況に 2つの答えがあってはならない。待つ条件は G5 と違って `rfPending`
+ではなく **`remoteStep <= 1`**: crop が拒否される理由はそれ 1つで、
+fetcher の暇を待つと混んだキューの中で「もう少しで着く doc」を諦めてしまう。
 
 ---
 
