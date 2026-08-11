@@ -278,12 +278,12 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
 | G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **済** PR #177 — 試験 browse restore-wait |
-| G6 | reader で開いた doc の復元が memo 頼み | **未** |
+| G6 | reader で開いた doc の復元が memo 頼み | **一部** PR #181 — 黙らなくなった。試験 V25p。(a) session に spec を書くかは信頼の問い(#179)
 | G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **済** PR #176 — 試験 F3b |
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
 | G10 | 間引かれた doc の crop が復元で黙って落ちる | **済** PR #177 — 試験 browse restore-wait |
-| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **未** |
+| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **裁定待ち #180** |
 
 ---
 
@@ -477,7 +477,7 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 
 ---
 
-### G6. reader で開いた doc の session 復元が prefs.txt 頼み
+### G6. reader で開いた doc の session 復元が prefs.txt 頼み —— **半分修正 (PR #181)**
 
 **どこ。** session 行は path しか持たない (`session.inc:186`)。復元は
 `readerFor(p)` (`:2591` → `:1178`) で `app.readerMemo` を引く——これは
@@ -493,6 +493,21 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 **選択肢。** (a) session 行に reader spec を書く (`member` の隣に 1キー)。
 (b) memo が無いときは**失敗として報告する** (`sessionDocAt` が -1 のとき
 `err` を立てる) ——直すのは 1行で、少なくとも黙らなくなる。
+
+**(b) を実装した (PR #181)。** 「開いたが名指しされたメンバは無かった」枝は
+コメントに「never worse than today」と書いてあったが、**worse である** ——
+以降の range / LUT / モザイク読み / crop はすべて `cur()` に当たるので、
+その行の設定が**別の document に着地する**。既に報告している隣の枝
+(already-here dedupe) と揃えた。メンバ名が `__pixels_` で始まるときは理由も
+名乗る —— 「そのメンバが無い」だけだと、問題ではないファイルの中を探させる
+ことになるので。
+
+**(a) は実装していない。信頼の問いだから。** `docs/input-adapters.md §4.12`
+の信頼モデルは「viewer は adapter を探しに行かないし、言われていない adapter を
+適用しない —— ユーザが選んだ spec か、以前選んだ記録から」である。memo は
+**このマシンのこのユーザ自身の選択**の記録だが、**session は旅をする文書**で
+ある。session 行に spec を書くと「.vsession が、開いた時に走る Python を
+名指しできる」ことになる。これは私の判断ではないので **#179 で裁定を仰ぐ**。
 
 ---
 

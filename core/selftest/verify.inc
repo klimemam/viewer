@@ -2528,6 +2528,65 @@
                 check(capped && cappedOnRead, "V25k the memory is bounded at 64 (LRU)");
                 check(lru, "V25k the least recently chosen entry is the one dropped");
             }
+            // ---- V25p: the memo is per-machine, and a session is not ---------
+            // V25k just established that the record of WHICH adapter read a
+            // file is a bounded LRU in prefs.txt. A session carries no such
+            // record - only the path and the member - so a session opened on
+            // another machine, or after 64 other files, finds nothing there.
+            //
+            // What happened then was the bad part. The native door opens the
+            // file perfectly well (a real .npy is a real .npy), produces no
+            // member called __pixels_1, and REPORTED NOTHING - so the line's
+            // range, LUT, mosaic reading and crop were applied to whatever
+            // document the loader had left current. The user came back to a
+            // session that looked restored and had one image wearing another
+            // image's settings (verify-matrix G6).
+            //
+            // No Python here on purpose: the defect is in the restore, not in
+            // the adapter, and the session file is written by hand so the test
+            // says exactly what state it is reproducing.
+            {
+                closeAll();
+                std::error_code mec;
+                std::vector<uint16_t> px(64);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(i * 3);
+                const std::string mp = (adir / "adapter_source.npy").u8string();
+                npyWriteFile(mp, "<u2", { 8, 8 }, px.data(), px.size() * 2);
+                const std::string ms = (adir / "forgotten_reader.vsession").u8string();
+                {
+                    std::ofstream sf(pathFromUtf8(ms), std::ios::binary);
+                    sf << "viewer-session 1\n"
+                       << "member __pixels_1\n"
+                       << "lut 3\n"
+                       << "image 111 222 npy3 0 0 0 0 0 8 8 " << mp << "\n";
+                }
+                forgetReader(mp);                 // ...the machine this is not
+                const size_t logBefore = app.msgLog.size();
+                const std::string serr = loadSession(ms);
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].err &&
+                        app.msgLog[i].text.find("__pixels_1") != std::string::npos &&
+                        app.msgLog[i].text.find("input adapter") != std::string::npos)
+                        said = true;
+                // ...and the settings must NOT have landed on the doc that did
+                // come back. 111/222 is a range nothing else in this suite
+                // uses, so finding it is finding the leak itself.
+                bool leaked = false;
+                for (const auto& d : app.images)
+                    if (d->black == 111.0f && d->white == 222.0f) leaked = true;
+                fprintf(stderr, "verifyselftest: V25p forgotten reader: err=\"%s\" "
+                                "%zu doc(s), reported=%d, settings leaked onto another "
+                                "doc=%d\n",
+                        serr.c_str(), app.images.size(), (int)said, (int)leaked);
+                check(said, "V25p a member the restore could not find is REPORTED, "
+                            "and the adapter is named as the reason");
+                check(!leaked, "V25p ...and that line's range does not land on some "
+                               "other document");
+                closeAll();
+                std::filesystem::remove(pathFromUtf8(ms), mec);
+                std::filesystem::remove(pathFromUtf8(mp), mec);
+            }
             // ---- V25o: the search path itself (§4.13.2, issue #51) -----------
             // Everything here is filesystem and string work, so it runs on every
             // machine whether or not V25h found a Python. Four questions, and
