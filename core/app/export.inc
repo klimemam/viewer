@@ -131,8 +131,18 @@ static void copyViewDotByDot() {
 #endif
 }
 
-static void saveViewPng(const std::string& path) {
-    ImageDoc* im = cur();
+// `uid` is the document the SAVE DIALOG was opened for, not whatever is current
+// when it closes. 0 means "the current one" (the CLI and the selftests, which
+// have no dialog between the choice and the write).
+static void saveViewPng(const std::string& path, uint64_t uid = 0) {
+    ImageDoc* im = nullptr;
+    if (uid) {
+        for (const auto& d : app.images) if (d->uid == uid) { im = d.get(); break; }
+        if (!im) {
+            toast("the image this was going to save has been closed", true);
+            return;
+        }
+    } else im = cur();
     std::vector<uint8_t> rgba; int w = 0, h = 0;
     if (!exportDocRGBA(im, rgba, w, h)) { toast(exportRefusalFor(im), true); return; }
     std::vector<uint8_t> png = encodePng(rgba, w, h);
