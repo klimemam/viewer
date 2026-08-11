@@ -470,6 +470,48 @@ static int rawRecipeSelftest() {
               "S3 ...and every recipe comes back exactly as it went in");
     }
 
+    // ======================================================================
+    //  M — THE READ DECLARES ITSELF (docs/settings-inventory.md §4.1 M1)
+    //
+    //  Everything a headerless read uses is a measuring-class setting: the
+    //  file states none of it, so every number taken off the picture depends
+    //  on choices somebody made. M1 says such a setting has to appear in its
+    //  own results. The note said "Bayer RGGB u16" and stopped - the two
+    //  fields already visible on screen - and left out the three that are
+    //  dangerous BECAUSE they are not visible: a transposed size, a wrong
+    //  header offset and a swapped byte order each draw a picture that looks
+    //  entirely normal.
+    //
+    //  Stated as "the note contains each field", not as one string equality,
+    //  so re-wording the sentence does not fail this and dropping a field
+    //  does.
+    // ======================================================================
+    {
+        reset();
+        loadSettingsFrom(libPath);
+        openPath(A);
+        rawRecipeIntoDialog(libAt(1), rawDlg);      // "MyCam transposed", 16x48
+        rawDlg.offset = 0;
+        rawDlg.littleEndian = false;                // ...and the field nothing shows
+        rawDialogAccept(rawDlg);
+        rawDlg.open = false;
+        const ImageDoc* m = app.images.empty() ? nullptr : app.images.back().get();
+        const std::string note = m ? m->note : std::string();
+        auto has = [&](const char* s) { return note.find(s) != std::string::npos; };
+        const bool size = has("16x48"), hdr = has("header 0 B"),
+                   order = has("big-endian"), what = has("declared");
+        fprintf(stderr, "rawrecipeselftest: M1 note = \"%s\"\n", note.c_str());
+        check(m != nullptr, "M1 the fixture opened under a known recipe");
+        check(size, "M1 the note carries the SIZE that was declared");
+        check(hdr, "M1 ...the header offset, written even when it is zero");
+        check(order, "M1 ...and the byte order, which nothing on screen shows");
+        check(what, "M1 ...and says the shape was declared, not read");
+        // anti-vacuity: a note that contained every substring by accident
+        // would also contain one that is not true of this read
+        check(!has("little-endian") && !has("32x24"),
+              "M1 the note is about THIS read and not a template");
+    }
+
     reset();
     g_rawLibrary.clear();
     std::filesystem::remove_all(root, ec);

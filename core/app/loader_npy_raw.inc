@@ -214,6 +214,51 @@ static RawDialog g_folderRecipe;
 static bool g_rawPopupAlive = false;
 static void openRawDialogFor(const std::string& path);
 
+// The whole recipe, as the sentence that travels with the numbers it produced.
+//
+// docs/settings-inventory.md §4.1 M1: a measuring-class setting has to appear
+// in its own results, and a headerless read is nothing BUT measuring-class
+// settings - the file states none of it. The note used to say "Bayer RGGB u16"
+// and stop, which named the two fields already visible on screen and left out
+// the three that are dangerous precisely because they are not:
+//
+//   the SIZE          4096x3000 and 3000x4096 are the same byte count. A
+//                     transposed frame looks perfectly normal.
+//   the HEADER offset  a wrong one shifts every pixel by a constant and the
+//                     picture still looks like a picture.
+//   the BYTE ORDER    swapped u16 is noise on some sensors and a plausible
+//                     gradient on others.
+//
+// Each changes the numbers. None of them was anywhere a report could cite, so
+// a figure taken off a .raw could not be checked against the read that made it.
+// This is the precondition §10.7 names for putting `loading.raw` into
+// settings.jsonc at all: defaults that do not declare themselves break M1 on
+// the first day.
+static std::string rawRecipeNote(const RawDialog& d, int cfa, int cfaPattern) {
+    const int dt = std::clamp(d.dtype, 0, RD_COUNT - 1);
+    const int in = std::clamp(d.interp, 0, RI_COUNT - 1);
+    std::string s;
+    if (in == RI_BAYER || in == RI_QUAD)
+        s = std::string(cfa == 2 ? "Quad Bayer " : "Bayer ") + CFA_PATTERNS[cfaPattern & 3];
+    else
+        s = RAW_INTERP_NAMES[in];
+    s += std::string(" ") + RAW_DTYPE_NAMES[dt];
+    s += ", " + std::to_string(d.w) + "x" + std::to_string(d.h);
+    // Written even when it is zero and even when it is the common one: "no
+    // header" is a claim about the file, and a field that disappears when it
+    // holds the ordinary value cannot be read as a claim at all - the reader
+    // cannot tell it from a note written before the field existed.
+    s += ", header " + std::to_string(d.offset) + " B";
+    s += d.littleEndian ? ", little-endian" : ", big-endian";
+    if (d.cropOn && d.cropW > 0 && d.cropH > 0)
+        s += ", read window " + std::to_string(d.cropW) + "x" + std::to_string(d.cropH) +
+             " at (" + std::to_string(d.cropX) + "," + std::to_string(d.cropY) + ")";
+    // ...and what all of it IS. The fields above are a declaration, not a
+    // measurement, and the difference is the reason this line exists.
+    s += " - headerless: this shape was declared, not read from the file";
+    return s;
+}
+
 // ---------------------------------------------------------------- raw recipes
 // Issue #166. A NAMED RECIPE is exactly the fields the dialog above already
 // carries, minus everything that is about ONE open (the path, the file size,
@@ -451,13 +496,11 @@ static std::unique_ptr<ImageDoc> decodeRawFrame(const RawDialog& d, std::string&
         }
     S.srcW = d.w; S.srcH = d.h;
     S.cropX = cx; S.cropY = cy;
-    im->note = std::string(RAW_INTERP_NAMES[d.interp]) + " " + RAW_DTYPE_NAMES[d.dtype];
     if (d.interp == RI_BAYER || d.interp == RI_QUAD) {
         im->cfa = d.interp == RI_QUAD ? 2 : 1;
         im->cfaPattern = d.cfaPattern & 3;
-        im->note = std::string(d.interp == RI_QUAD ? "Quad Bayer " : "Bayer ")
-                 + CFA_PATTERNS[im->cfaPattern] + " " + RAW_DTYPE_NAMES[d.dtype];
     }
+    im->note = rawRecipeNote(d, im->cfa, im->cfaPattern);
     S.f32loss = loss;                 // the f64 raw dtype's census; see decodeNpyBuffer
     S.rawDtype = d.dtype;             // remember raw params: sessions + reinterpret
     S.rawInterp = d.interp;
