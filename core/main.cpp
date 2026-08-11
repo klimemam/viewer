@@ -978,6 +978,11 @@ int main(int argc, char** argv) {
         io.Fonts->AddFontDefault(&cfg);
         toast("CJK font not found - Japanese filenames may not display correctly", true);
     }
+    // ...and the settings file's refusal, held since loadSettings() because
+    // that ran before there was a context to draw a toast in (see the function).
+    // After the font toast, so that "your settings file would not parse" is the
+    // one left on screen if both happened.
+    settingsToastIfAny();
 #if defined(__APPLE__)
     io.FontGlobalScale = 1.0f / fontScale;
 #endif

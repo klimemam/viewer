@@ -643,6 +643,77 @@ static int settingsSelftest() {
               "R12 displayGamma 1.8 is refused, not rounded to 2.2");
     }
 
+    {
+        // R13: the refusal has to reach THE SCREEN (§5.3), and the startup
+        // path makes that harder than it looks: loadSettings() runs before
+        // ImGui::CreateContext(), because the settings decide the title bar
+        // and the title bar is chosen while the window is being made. toast()
+        // guards itself against a null context - it has to, or every windowless
+        // selftest would segfault on one - and that guard silently turns an
+        // early toast into a message with a deadline already in the past. So
+        // the sentence is HELD and raised later, and this is where that is
+        // asserted, through the real loadSettings() and the real settingsPath().
+        auto setEnv = [](const char* k, const std::string& v) {
+#if defined(_WIN32)
+            _putenv_s(k, v.c_str());
+#else
+            if (v.empty()) unsetenv(k); else setenv(k, v.c_str(), 1);
+#endif
+        };
+        auto getEnvCopy = [](const char* k) {
+            const char* v = getenv(k);
+            return v ? std::string(v) : std::string();
+        };
+        const std::string oldAppdata = getEnvCopy("APPDATA");
+        const std::string oldHome = getEnvCopy("HOME");
+        std::filesystem::path h = root / "toasthome";
+        std::filesystem::create_directories(h, ec);
+        setEnv("APPDATA", h.u8string());
+        setEnv("HOME", h.u8string());
+        baseline();
+        g_settingsToast.clear();
+        app.toast.clear();
+        const size_t logWas = app.msgLog.size();
+        {
+            std::ofstream f(pathFromUtf8(viewerConfigDir() + "/settings.jsonc"),
+                            std::ios::binary);
+            f << "{ \"appearance\": { \"compact\": }\n";
+        }
+        loadSettings();                       // the REAL startup entry point
+        setEnv("APPDATA", oldAppdata);        // before any assertion can return
+        setEnv("HOME", oldHome);
+        // Column derived by hand from `{ "appearance": { "compact": }`:
+        //   1 {   2 sp   3 "   4-13 appearance   14 "   15 :   16 sp   17 {
+        //   18 sp   19 "   20-26 compact   27 "   28 :   29 sp   30 }
+        // so the value that never arrived is asked for at column 30, and the
+        // '}' sitting there is what cannot start one.
+        say("held toast: " + g_settingsToast);
+        check(g_settingsToast.find("settings.jsonc:1:30") != std::string::npos,
+              "R13 loadSettings holds the refusal for the screen, with its position");
+        check(app.toast.empty(),
+              "R13 ...and does not spend it before there is a context to draw it");
+        // Both lines land in the log: the position, and the promise that the
+        // file was not overwritten. The second is the one that stops a user
+        // deleting their own file to make the message go away.
+        bool saidUntouched = false;
+        for (size_t k = logWas; k < app.msgLog.size(); k++)
+            if (app.msgLog[k].text.find("nothing was written") != std::string::npos)
+                saidUntouched = true;
+        check(app.msgLog.size() >= logWas + 2 && saidUntouched,
+              "R13 ...and Messages carries both the reason and 'not written back'");
+        // Cleared FIRST: without this, a build that spent the toast at load
+        // time leaves its message sitting in app.toast, and the assertion
+        // below reads that leftover as though settingsToastIfAny had raised it.
+        app.toast.clear();
+        settingsToastIfAny();
+        const std::string raised = app.toast;
+        app.toast.clear();
+        settingsToastIfAny();                 // ...and only once
+        check(raised.find("settings.jsonc:1:30") != std::string::npos && app.toast.empty(),
+              "R13 ...raised exactly once when a context exists, then consumed");
+        g_settingsToast.clear();
+    }
+
     // ======================================================================
     //  S — THE SCHEMA TABLE
     //

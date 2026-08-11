@@ -553,6 +553,15 @@ struct SettingsReport {
 };
 
 static SettingsReport g_settings;     // what the last load said
+// The one sentence that has to reach THE SCREEN (§5.3), held until a screen
+// exists. loadSettings() runs before ImGui does - it has to, because the
+// settings decide the title bar and the title bar is chosen while the window is
+// being created - and toast() guards itself against a null context (it must:
+// the windowless selftests would segfault otherwise). That guard turns an early
+// toast into one whose deadline is already past, i.e. a message that lands in
+// the log and is never drawn. The log alone is not "on screen": nobody opens
+// Messages to find out why the file they just wrote did nothing.
+static std::string g_settingsToast;
 // remote.repoUrl (判断17): the build-time VIEWER_REPO_URL stays the default,
 // and a fork's user has no reason to rebuild to change where the peer comes
 // from. Empty = not set, which is 判断9 in one variable.
@@ -937,7 +946,7 @@ static void loadSettings() {
         logMsg("settings.jsonc was left exactly as it is - nothing was written "
                "back over it. This run uses prefs.txt and the built-in defaults.",
                true);
-        toast("settings.jsonc was not read: " + r.parseError, true);
+        g_settingsToast = "settings.jsonc was NOT read: " + r.parseError;
         return;
     }
     for (const std::string& n : r.notes) logMsg(n, true);
@@ -953,8 +962,18 @@ static void loadSettings() {
         logMsg(s);
     }
     if (r.rejected || r.unknown || r.notHere)
-        toast("settings.jsonc: " + std::to_string(r.rejected + r.unknown + r.notHere) +
-              " line(s) were not used - see Messages", true);
+        g_settingsToast = "settings.jsonc: " +
+            std::to_string(r.rejected + r.unknown + r.notHere) +
+            " line(s) were not used - see Messages";
+}
+
+// Raised once the context can carry it. Called from main() beside the CJK-font
+// toast - the same kind of news at the same moment - and LAST of the two on
+// purpose: a settings file that would not parse outranks a font substitution.
+static void settingsToastIfAny() {
+    if (g_settingsToast.empty()) return;
+    toast(g_settingsToast, true);
+    g_settingsToast.clear();
 }
 
 // ---- the template -----------------------------------------------------------
