@@ -348,7 +348,7 @@ vendor 化や CI キャッシュはこれを完全に消すが、それは持ち
 
 **フォルダ = stack**: `.exr` が並んだフォルダは 1 stack になる。判定は
 `imagefile::forPath` で行うので、この表に足された形式は自動的にそうなる
-(`SEQ_EXTS` に名前を書き足す必要は無い)。**1ファイルが複数の絵を持つ場合は
+(`core/app/sequence.inc` の `SELFDESC_EXTS` / `HEADERLESS_EXTS` に書き足す必要は無い)。**1ファイルが複数の絵を持つ場合は
 frame として断る** —— 複数ページ TIFF の並びは「stack の stack」であり、
 黙って 1ページ目だけ取るのは §3.2 に反する。
 

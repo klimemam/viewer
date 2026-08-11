@@ -230,9 +230,14 @@
         // reason that was not the reason (verify-matrix G2).
         //
         // Stated as the equality between the two predicates rather than as a
-        // list of seven: an extension added to SEQ_EXTS tomorrow is checked
-        // here without anybody editing this test, which is the property F4 has
-        // for the table and this half was missing.
+        // list of seven: an extension added to sequence.inc's arrays tomorrow
+        // is checked here without anybody editing this test, which is the
+        // property F4 has for the table and this half was missing.
+        //
+        // Since G8 the two predicates share their body, so this equality now
+        // holds by construction - which is the END STATE it was written to
+        // reach, not a reason to retire it. It fails again the day somebody
+        // re-types the list here.
         {
             static const char* PROBE[] = { ".npy", ".npz", ".bin", ".raw", ".yuv",
                                            ".dat", ".rggb", ".png", ".tif", ".exr" };
@@ -254,6 +259,56 @@
                     disagreed.empty() ? "-" : disagreed.c_str());
             check(accepted >= 7, "F4b the probe really covers the loadable set");
             check(agree, "F4b what Open Folder loads, Browse says it can open");
+        }
+
+        // ---- F4c: ...and the FILE DIALOG offers every one of them -------------
+        // The third door onto the same set, and the one that had drifted: File >
+        // Open's "Images" filter was a typed string, and `.rggb` was in the other
+        // three lists and not in that one. Nothing failed loudly - the file was
+        // simply not there, and the way out was to know that "All files" exists
+        // (verify-matrix G8).
+        //
+        // Stated over the arrays and the table rather than over a probe, so
+        // there is no list in this test at all: an extension added to either
+        // side tomorrow is checked here by construction. The dot-token has to
+        // match WHOLE (" *.raw " never satisfies ".rggb"), because a substring
+        // test is how a missing extension hides behind a longer one.
+        {
+            const std::string pat = " " + openImagesFilter() + " ";
+            auto offered = [&](const std::string& e) {
+                return pat.find(" *" + e + " ") != std::string::npos;
+            };
+            std::string missing;
+            auto want = [&](const std::string& e) {
+                if (!offered(e)) missing += std::string(missing.empty() ? "" : " ") + e;
+            };
+            int checked = 0;
+            for (const char* e : SELFDESC_EXTS)   { want(e); checked++; }
+            for (const char* e : HEADERLESS_EXTS) { want(e); checked++; }
+            for (const imagefile::Backend& b : imagefile::backends()) {
+                std::string all = b.exts;             // ".tif .tiff" - every one
+                size_t i = 0;
+                while (i < all.size()) {
+                    size_t sp = all.find(' ', i);
+                    want(all.substr(i, sp == std::string::npos ? sp : sp - i));
+                    checked++;
+                    if (sp == std::string::npos) break;
+                    i = sp + 1;
+                }
+            }
+            // ...and the refusal sentence names that same set plus the session
+            // door, because it is what an operator reads before going to look.
+            const std::string why = viewerRefusalFor("notes.txt");
+            const bool refusalAgrees = has(why, openImagesFilter().c_str()) &&
+                                       has(why, "*.vsession");
+            fprintf(stderr, "fmtgateselftest:   dialog filter covers %d extensions, "
+                            "missing [%s]; refusal names the same set=%d\n",
+                    checked, missing.empty() ? "-" : missing.c_str(), refusalAgrees ? 1 : 0);
+            // anti-vacuity: an empty pattern would satisfy an empty want-list
+            check(checked >= 12 && pat.size() > 20,
+                  "F4c there really is a set of extensions and a filter to check it against");
+            check(missing.empty(), "F4c every extension a door accepts is offered by File > Open");
+            check(refusalAgrees, "F4c the refusal names the set the file dialog offers");
         }
 
         // ---- P: the PEER, and the same file opened both ways ------------------

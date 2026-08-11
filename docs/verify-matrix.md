@@ -267,8 +267,23 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 
 ## 7. 落穂 (fall-through) — 見つかったもの
 
-**噛みやすい順。** どれもこの PR では**直していない**。各件について「決めて記録する」
-と「道を開く」の両方を書く。
+**噛みやすい順。** 各件について「決めて記録する」と「道を開く」の両方を書く。
+**§1–§6 のセルは測定の記録なので、直した後も書き換えない**——下の一覧が現況で、
+セルは「2026-08-11 に何が出荷されていたか」である。
+
+| | 件 | 状態 |
+|---|---|---|
+| G1 | ヘッダ無し RAW が peer 越しに開けない | **未** (#166 リモート半分・Fable 待ち) |
+| G2 | ローカル Browse が偽の拒否理由を出す | **済** PR #174 — 試験 F4b |
+| G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
+| G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
+| G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **未** |
+| G6 | reader で開いた doc の復元が memo 頼み | **未** |
+| G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **未** |
+| G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
+| G9 | generic な peer 拒否文に逃げ道が無い | **未** |
+| G10 | 間引かれた doc の crop が復元で黙って落ちる | **未** |
+| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **未** |
 
 ---
 
@@ -319,7 +334,7 @@ serve it: LibRaw is CDDL-1.0 …` + `browse it locally, or copy it here first`) 
 
 ---
 
-### G2. ヘッダ無し RAW と `.vsession` が「このマシンの」Browse でも淡色になり、偽の理由を言う
+### G2. ヘッダ無し RAW と `.vsession` が「このマシンの」Browse でも淡色になり、偽の理由を言う —— **修正済 (PR #174)**
 
 **どこ。** `viewerReadsName` (`core/ui/menus.inc:668`) は `.npy` / `.npz` と
 **形式表の行**しか true にしない。`rbRowOpenable(host, name)` は host が空なら
@@ -360,7 +375,7 @@ not a name this viewer reads (*.npy *.npz *.png *.jpg ... *.y4m)
 
 ---
 
-### G3. `.npz` のフォルダが RAW ダイアログに送られる
+### G3. `.npz` のフォルダが RAW ダイアログに送られる —— **修正済 (PR #173)**
 
 **どこ。** `core/app/sequence.inc:1454`:
 
@@ -401,7 +416,7 @@ File ▸ Open で 1本開けば正しく開き、フォルダごと開くと RAW
 
 ---
 
-### G4. 間引かれた preview がそのまま export される
+### G4. 間引かれた preview がそのまま export される —— **修正済 (PR #170)**
 
 **どこ。** `exportDocRGBA` (`core/app/export.inc:77-82`) に `remoteStep` の項が無い。
 
@@ -497,7 +512,7 @@ F3 の local 側の理屈と逆になる。
 
 ---
 
-### G8. `.rggb` が File ▸ Open の「Images」フィルタに無い
+### G8. `.rggb` が File ▸ Open の「Images」フィルタに無い —— **修正済 (PR #175)**
 
 **どこ。** `core/app/open_dispatch.inc:2369`:
 
@@ -514,6 +529,37 @@ const std::string pat = "*.npy *.npz *.bin *.raw *.yuv *.dat " + media;
 2つある状態を残すのは駄目である**——この表の隣で 絵の形式は
 `imagefile::dialogPattern()` から計算されていて、そちらは割れようがない。
 ヘッダ無し RAW の拡張子も同じように 1箇所から出すのが筋。
+
+**採ったのは (a) の一般形。** 数えたらリテラルは 2つではなく **4つ**あった
+(`SEQ_EXTS` / `HEADERLESS_EXTS`(関数内) / ダイアログのフィルタ / `viewerReadsName`)
+——さらに拒否文と RAW パネルの説明文が同じ 5つを日本語で名乗っていて **6箇所**。
+`.rggb` が落ちていたのは 1箇所だけなので、足すだけでは「次に足す拡張子が
+どこかで落ちる」状態が残る。
+
+配置は**戸ごとに 2配列**、`core/app/sequence.inc` の頭:
+
+```cpp
+static const char* SELFDESC_EXTS[]   = { ".npy", ".npz" };                        // 形を自分で述べる
+static const char* HEADERLESS_EXTS[] = { ".bin", ".raw", ".yuv", ".dat", ".rggb" }; // 述べない
+static std::string ownDoorPattern();      // "*.npy *.npz *.bin ..." —— dialogPattern() と同じ作り方
+static std::string headerlessExtList();   // ".bin .raw ..." —— 散文用
+static bool extIsHeaderless(const std::string&);
+static bool isLoadableName(const std::string&);   // 拡張子ではなく名前で訊く版
+```
+
+これで 6箇所すべてが計算になる。`viewerReadsName` は `isLoadableName` を**呼ぶ**
+(F4b の等式が構造的に真になる —— それが F4b の目的だった)。`.vsession` だけは
+その2配列に**入れない**: Open Folder がセッションを stack に束ねてはならず、
+ダイアログでも別エントリだから、「この名前で viewer は何かできるか」を訊く
+1箇所 (`viewerReadsName`) にだけ足す。
+
+**試験 F4c** (`core/selftest/fmtgate.inc`): 2配列と表の全行を歩き、**各拡張子が
+`openImagesFilter()` に出ること**を主張する。この試験の中に拡張子のリストは無い
+(明日どちらかに足した拡張子は誰も試験を編集せずに検査される)。トークン一致で
+見る —— 部分一致だと短い拡張子が長い方の陰に隠れる。拒否文が同じ集合を名乗る
+ことも同時に主張する。反空虚は「12個以上を検査し、フィルタが空でない」。
+
+赤: `missing [.rggb]` / 緑: `missing [-]`。
 
 ---
 

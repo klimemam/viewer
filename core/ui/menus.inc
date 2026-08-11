@@ -680,12 +680,18 @@ bool viewerReadsName(const std::string& n) {
     //
     // This is the same set `isLoadableExt` walks for Open Folder, and it is the
     // same question - "can this build open a file with this name" - so the two
-    // must not be two lists. `.vsession` is a door as well (a session is
-    // opened, not decoded), and is here for the same reason: what Browse greys
-    // out has to match what happens if you go around it.
-    if (extIsOneOf(n, { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb",
-                        ".vsession" })) return true;
-    return imagefile::forPath(n) != nullptr;
+    // must not be two lists. They now literally are not: that predicate is
+    // called here rather than re-typed, which is what G8 asked for after the
+    // fourth copy of the list turned out to be missing an extension.
+    //
+    // `.vsession` is a door as well (a session is opened, not decoded) but it
+    // is NOT one of theirs: Open Folder must not bundle sessions into a stack,
+    // and File > Open gives it its own filter entry. So it is added here, at
+    // the one door that asks "can the viewer do something with this name",
+    // and nowhere else - what Browse greys out has to match what happens if
+    // you go around it.
+    if (isLoadableName(n)) return true;              // both own doors + the table
+    return extIsOneOf(n, { ".vsession" });
 }
 
 // Will the PEER serve it? One call, and deliberately not a list of extensions
@@ -727,8 +733,11 @@ std::string viewerRefusalFor(const std::string& n) {
     if (viewerReadsName(n)) return {};
     std::string vid = imagefile::videoRefusal(n);
     if (!vid.empty()) return vid;
-    return "not a name this viewer reads (*.npy *.npz *.bin *.raw *.yuv *.dat *.rggb "
-           + imagefile::dialogPattern() + ")"
+    // The list it prints is the File > Open filter itself, plus the session
+    // door that filter keeps separate. A refusal that names a set the operator
+    // can then go and check has to name the SAME set, or the next thing they
+    // try contradicts the sentence that sent them there.
+    return "not a name this viewer reads (" + openImagesFilter() + " *.vsession)"
            "\n  choose a reader to read it another way";
 }
 

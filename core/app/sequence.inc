@@ -1372,16 +1372,71 @@ static void gotoStack(int delta) {
     selectImage(pick);
 }
 
-// ---- open a whole folder tree: every numbered group becomes its own stack ----
-// The headerless ones are listed here by name because nothing else can say what
-// they are. The picture formats are NOT listed: they are asked of
-// core/imagefile.h, so a format gained or lost there is gained or lost here
-// with it, and this list cannot come to disagree with the file dialog's.
-static const char* SEQ_EXTS[] = { ".npy", ".npz", ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+// ---- the extensions core/main.cpp opens through its OWN doors ----------------
+// Listed here by name because nothing else can say what they are. The picture
+// formats are NOT listed: they are asked of core/imagefile.h, so a format
+// gained or lost there is gained or lost here with it, and this list cannot
+// come to disagree with the file dialog's.
+//
+// Two arrays because there are two doors, and the split is the same one the
+// rest of the file already makes: a self-describing file states its own shape
+// and lands in a document; a headerless one states nothing and lands in the
+// dialog where the OPERATOR states it. Nothing is in both.
+//
+// Everything that has to name these - Open Folder's walk, the File > Open
+// filter, Browse's "does this viewer read it", the refusal sentence beside a
+// dimmed row, the headerless-dialog caption - reads THESE arrays through the
+// helpers below. It used to be four literals of the same list, and one of them
+// had lost .rggb: File > Open's "Images" filter hid a file that Open Folder
+// bundles, that drag-and-drop opens, and that the raw dialog is happy to take
+// (verify-matrix G8). The picture half of that same filter line has never been
+// able to go stale, because it is computed by imagefile::dialogPattern() from
+// the table's own rows - this is that discipline applied to our own doors.
+static const char* SELFDESC_EXTS[]   = { ".npy", ".npz" };
+static const char* HEADERLESS_EXTS[] = { ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+
+// Does this extension reach the geometry prompt? (lower-cased, with the dot)
+static bool extIsHeaderless(const std::string& extLower) {
+    for (const char* e : HEADERLESS_EXTS) if (extLower == e) return true;
+    return false;
+}
+
+// "*.npy *.npz *.bin *.raw *.yuv *.dat *.rggb" - the filter line for our own
+// doors, built the way imagefile::dialogPattern() builds the pictures'.
+static std::string ownDoorPattern() {
+    std::string s;
+    for (const char* e : SELFDESC_EXTS)   { if (!s.empty()) s += ' '; s += '*'; s += e; }
+    for (const char* e : HEADERLESS_EXTS) { s += " *"; s += e; }
+    return s;
+}
+
+// ".bin .raw .yuv .dat .rggb" - the same five for prose, without the globs.
+static std::string headerlessExtList() {
+    std::string s;
+    for (const char* e : HEADERLESS_EXTS) { if (!s.empty()) s += ' '; s += e; }
+    return s;
+}
+
 static bool isLoadableExt(const std::string& extLower) {
-    for (const char* e : SEQ_EXTS) if (extLower == e) return true;
+    for (const char* e : SELFDESC_EXTS)   if (extLower == e) return true;
+    for (const char* e : HEADERLESS_EXTS) if (extLower == e) return true;
     return imagefile::forPath("x" + extLower) != nullptr;
 }
+
+// The same question asked of a NAME rather than an extension. The dot has to be
+// in the last component - "C:/set.npy/notes" is a file called notes - which is
+// the rule core/imagefile.cpp's own lowerExt() follows, and the two doors have
+// to answer alike or Browse dims what File > Open opens.
+static bool isLoadableName(const std::string& name) {
+    size_t dot = name.find_last_of('.'), slash = name.find_last_of("/\\");
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return false;
+    std::string ext = name.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return isLoadableExt(ext);
+}
+
+// ---- open a whole folder tree: every numbered group becomes its own stack ----
 
 // Walk root recursively; each directory yields one group per numeric pattern.
 static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) {
@@ -1462,10 +1517,10 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             // complete to be right and nothing makes it complete; this one is
             // exactly the five extensions that carry no header, so a format
             // added tomorrow is self-describing by default and cannot fall in
-            // here by being forgotten.
-            static const char* HEADERLESS_EXTS[] = { ".bin", ".raw", ".yuv", ".dat", ".rggb" };
-            g.isRaw = false;
-            for (const char* he : HEADERLESS_EXTS) if (ext == he) g.isRaw = true;
+            // here by being forgotten. The five live at the top of this file,
+            // with the other door's two, because the file dialog and Browse
+            // need the same answer (verify-matrix G8).
+            g.isRaw = extIsHeaderless(ext);
             groups.push_back(std::move(g));
         };
         std::vector<std::string> leftover;

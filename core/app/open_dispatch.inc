@@ -2401,17 +2401,27 @@ static void openPath(const std::string& path) {
     }
 }
 
+// The "Images" filter of File > Open, as one string. Neither half is a literal:
+// the pictures come from the format table and our own doors from the arrays at
+// the top of sequence.inc, so a format gained or lost on either side cannot
+// leave the dialog offering - or HIDING - something this build's other doors
+// disagree about. A hidden name is the worse of the two: File > Open silently
+// omitted .rggb while Open Folder bundled it, and the operator's way out was to
+// know that "All files" existed (verify-matrix G8).
+//
+// A function so the selftest can read what ships, rather than a second copy of
+// the same concatenation asserting against itself.
+static std::string openImagesFilter() {
+    return ownDoorPattern() + " " + imagefile::dialogPattern();
+}
+
 static void openFileDialog() {
     if (!pfd::settings::available()) {   // e.g. Linux without zenity/kdialog
         toast("no file-dialog backend found (install zenity or kdialog) - drag & drop files instead", true);
         return;
     }
     if (app.openDlg) return;             // one dialog at a time
-    // The picture formats come from the format table rather than from a literal
-    // here, so a format gained or lost in core/imagefile.cpp cannot leave the
-    // dialog offering (or hiding) something the viewer no longer does.
-    const std::string media = imagefile::dialogPattern();
-    const std::string pat = "*.npy *.npz *.bin *.raw *.yuv *.dat " + media;
+    const std::string pat = openImagesFilter();
     app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
         std::vector<std::string>{ "Images (" + pat + ")", pat,
           "Session (*.vsession)", "*.vsession",

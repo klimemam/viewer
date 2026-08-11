@@ -206,8 +206,11 @@ static void drawRawRecipePanel() {
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 46, ImGui::GetFontSize() * 24),
                              ImGuiCond_FirstUseEver);
     if (ImGui::Begin("RAW recipes", &app.rawRecipeListOpen)) {
-        ImGui::TextDisabled("Headerless files (.bin .raw .yuv .dat .rggb) carry no shape, so "
-                            "somebody has to state it.");
+        // The five come from sequence.inc's array, not from a sentence typed
+        // here: this panel exists to explain which files reach it, so it must
+        // not be able to name a different five than the ones that do.
+        ImGui::TextDisabled("Headerless files (%s) carry no shape, so somebody has to state it.",
+                            headerlessExtList().c_str());
         ImGui::TextDisabled("A saved recipe NEVER applies on its own - you pick it.");
 
         ImGui::SeparatorText("Library (settings.jsonc)");
