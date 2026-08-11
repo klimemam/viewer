@@ -961,6 +961,7 @@ static void closeAll() {
     app.seqLoadingId = 0;
     app.seqQueue.clear();
     app.seqRestore.clear();
+    app.restoreWait.clear();          // ...and lines waiting on docs being closed
     app.pendingAvg.clear();           // they name stacks being thrown away...
     app.avgRestore.clear();           // ...and paths that will not be open either
     app.dtRestore.clear();            // ...and the preprocessor recipes with them

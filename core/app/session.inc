@@ -1997,6 +1997,86 @@ static int sessionDocAt(const std::string& path, const std::string& member, size
     return -1;
 }
 
+// ---- session lines that have to wait for the doc they describe --------------
+// See App::RestoreWait. One entry per doc, because both lines are about the
+// same arrival: a second line for a doc already waiting fills in its other
+// half rather than queueing behind it.
+static App::RestoreWait& restoreWaitFor(const ImageDoc& im) {
+    for (auto& w : app.restoreWait) if (w.uid == im.uid) return w;
+    App::RestoreWait w;
+    w.uid = im.uid;
+    w.doc = im.name;
+    app.restoreWait.push_back(std::move(w));
+    return app.restoreWait.back();
+}
+static void parkRestoreWait(const ImageDoc& im, int seqFrame) {
+    restoreWaitFor(im).seqFrame = seqFrame;
+}
+static void parkRestoreWait(const ImageDoc& im, int x, int y, int w, int h) {
+    App::RestoreWait& e = restoreWaitFor(im);
+    e.cx = x; e.cy = y; e.cw = w; e.ch = h;
+}
+
+// Drained from the frame loop, right after the remote fetch pump - so a frame
+// that landed this frame is acted on in the same one, and a headless run
+// (which advances only while something is pending) keeps turning until these
+// are gone. See the `working |=` list in core/main.cpp.
+static void pumpRestoreWaits() {
+    for (size_t i = 0; i < app.restoreWait.size();) {
+        App::RestoreWait& w = app.restoreWait[i];
+        ImageDoc* im = nullptr;
+        for (auto& q : app.images) if (q->uid == w.uid) { im = q.get(); break; }
+        if (!im) { app.restoreWait.erase(app.restoreWait.begin() + i); continue; }  // closed: nothing to say
+        // "nothing more is coming" is the fetcher's own idle, which is what
+        // watch.inc's busy test already uses. Asked ONCE per entry and applied
+        // to both halves, so a stack that stopped growing and a fetch that
+        // never completed are given up on in the same frame rather than one
+        // pump apart.
+        const bool quiet = app.rfPending <= 0;
+        bool done = true;
+
+        if (w.seqFrame >= 0) {
+            bool found = false;
+            if (im->seqId != 0)
+                for (int idx : framesOfSeq(im->seqId))
+                    if (app.images[idx]->seqIndex == w.seqFrame) {
+                        selectImage(idx); found = true; break;
+                    }
+            if (found) w.seqFrame = -1;
+            else if (quiet) {
+                toast(w.doc + ": this session was left on frame " +
+                      std::to_string(w.seqFrame) + ", and that frame did not come "
+                      "back - showing what did", true);
+                w.seqFrame = -1;
+            } else done = false;
+        }
+
+        if (w.cw > 0) {
+            // Not `quiet`: this one has a precise signal of its own. The crop
+            // is refused for exactly one reason (remoteStep > 1) and the fetch
+            // that clears it either lands or records remoteErr, so waiting on
+            // the fetcher's idle would give up on a doc whose frame arrives a
+            // moment later in a busy queue.
+            if (im->src->remoteStep <= 1) {
+                if (cropInPlace(*im, w.cx, w.cy, w.cw, w.ch)) {
+                    if (im == cur()) app.fitRequested = true;
+                } else {
+                    toast(w.doc + ": the crop this session saved could not be "
+                          "put back", true);
+                }
+                w.cw = 0;
+            } else if (!im->src->remoteErr.empty()) {
+                toast(w.doc + ": the full frame never arrived, so the crop this "
+                      "session saved was not put back", true);
+                w.cw = 0;
+            } else done = false;
+        }
+
+        if (done) app.restoreWait.erase(app.restoreWait.begin() + i);
+        else i++;
+    }
+}
+
 static std::string loadSession(const std::string& path) {
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read session file";
@@ -2451,8 +2531,17 @@ static std::string loadSession(const std::string& path) {
         else if (key == "seqframe") {   // select the frame this stack was left on
             int want = 0; ls >> want;
             if (lastImageOk && cur() && cur()->seqId != 0) {
+                bool found = false;
                 for (int idx : framesOfSeq(cur()->seqId))
-                    if (app.images[idx]->seqIndex == want) { selectImage(idx); break; }
+                    if (app.images[idx]->seqIndex == want) { selectImage(idx); found = true; break; }
+                // A stack whose frames live on a peer has ONE of them here: the
+                // rest were enqueued by openRemote and arrive over the next
+                // seconds, and this parser runs to the end of the file long
+                // before they do. So the frame this session was left on was
+                // simply not among the frames that existed when the line was
+                // read, the loop matched nothing, and the stack came back on
+                // frame 0 with nothing said (verify-matrix G5).
+                if (!found) parkRestoreWait(*cur(), want);
             }
         }
         else if (key == "seqload") {   // applies to the image loaded just above
@@ -2650,7 +2739,16 @@ static std::string loadSession(const std::string& path) {
                     cur()->cfaPattern = pat & 3;
                     cur()->cfaColorize = col != 0;
                     if (ccw > 0 && cch > 0 && (ccx != 0 || ccy != 0 || ccw != cur()->w || cch != cur()->h))
-                        cropInPlace(*cur(), ccx, ccy, ccw, cch);
+                        // The return value MATTERS. cropInPlace refuses while
+                        // the source is the decimated preview - the
+                        // full-resolution landing replaces data/w/h wholesale
+                        // and knows nothing of crop bookkeeping - and a remote
+                        // image over 1600 px IS that preview at this moment.
+                        // Ignoring the `false` meant the saved crop disappeared
+                        // with no message, on exactly the large images where a
+                        // crop is worth saving (verify-matrix G10).
+                        if (!cropInPlace(*cur(), ccx, ccy, ccw, cch))
+                            parkRestoreWait(*cur(), ccx, ccy, ccw, cch);
                 }
             } else {                          // legacy "npy"
                 std::string p = restOfLine(ls);

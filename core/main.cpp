@@ -2028,6 +2028,9 @@ static bool g_watchSuppressed = false;
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();
+                // ...and the session lines still waiting for a remote frame to
+                // land or a stack to finish streaming (App::RestoreWait)
+                working |= !app.restoreWait.empty();
                 // a session's series wait for their stacks, then need one frame
                 working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
                 working |= !app.seriesPending.empty();   // ...and so do the picker's
@@ -2092,6 +2095,7 @@ static bool g_watchSuppressed = false;
         app.uiFrame++;
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
+        pumpRestoreWaits();           // session lines waiting for a remote arrival
         pumpMeasure();                // integrate server-side measurement results
         pumpRemoteBrowse();           // connect/list results from the browse worker
         pumpBrowseWatch(nowSec());    // ...and re-list a DRAWN panel's own dir (§2)

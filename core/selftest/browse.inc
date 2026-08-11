@@ -552,6 +552,163 @@
                 closeAll();
             }
         }
+        {   // ---- A SESSION LINE ABOUT A DOC THAT HAS NOT FINISHED ARRIVING ---
+            // Two lines of a session are written about a state a remote doc
+            // does not reach until seconds after the parser has run to the end
+            // of the file, and both of them used to be dropped in silence.
+            //
+            //   seqframe  an in-file frame axis reached over the link is ONE
+            //             resident frame plus N enqueued fetches (openRemote),
+            //             so framesOfSeq() held only the head and the loop that
+            //             looks for "the frame this was left on" matched
+            //             nothing. The stack came back on frame 0
+            //             (verify-matrix G5).
+            //   crop      the first view of a remote image wider than 1600 px
+            //             is DECIMATED, and cropInPlace refuses a decimated
+            //             source on purpose - the full-resolution landing
+            //             replaces data/w/h wholesale and would revert the crop
+            //             while leaving srcW stamped with preview dimensions.
+            //             The restore ignored that `false`, so the saved crop
+            //             disappeared on exactly the large images where a crop
+            //             is worth saving (verify-matrix G10).
+            //
+            // Both are asserted end-to-end - save a real session, close
+            // everything, load it, drain - because what was broken is the
+            // ORDER of two asynchronous things, and no smaller test can have an
+            // order to get wrong.
+            //
+            // Per-test TMP for the reason the block below gives: no other
+            // selftest scans this directory, so nothing here can shift a row
+            // out from under a test that navigates by position.
+            closeAll();
+            std::error_code wec;
+            std::filesystem::path wdir =
+                std::filesystem::temp_directory_path(wec) / "viewer_restorewait";
+            std::filesystem::remove_all(wdir, wec);
+            std::filesystem::create_directories(wdir, wec);
+            const std::string wroot = [&] {
+                std::string s = wdir.u8string();
+                std::replace(s.begin(), s.end(), '\\', '/');
+                return s;
+            }();
+            // FOUR frames in ONE file: an in-file frame axis, which is the case
+            // openRemote streams. Frame k is filled with k, so the frame on
+            // screen is readable as a number and "came back on frame 0" is not
+            // a thing this can mistake for success.
+            {
+                std::vector<float> px(4 * 8 * 8);
+                for (int k = 0; k < 4; k++)
+                    for (int i = 0; i < 64; i++) px[(size_t)k * 64 + i] = (float)k;
+                npyWriteFile(wroot + "/inframe.npy", "<f4", { 4, 8, 8 },
+                             px.data(), px.size() * sizeof(float));
+            }
+            // ...and one WIDE frame. 2000 px is over the 1600 the first view
+            // decimates to (openRemote: step = ceil(max(w,h)/1600)), so this
+            // file arrives as a preview and is the only shape that reproduces
+            // G10 at all. 8 rows keep it to 64 kB.
+            {
+                std::vector<float> px(8 * 2000);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (float)(i % 251);
+                npyWriteFile(wroot + "/wide.npy", "<f4", { 8, 2000 },
+                             px.data(), px.size() * sizeof(float));
+            }
+            // The drain a frame loop would do. pumpRestoreWaits is in it for
+            // the same reason the others are: it is a frame-loop pump, and a
+            // test that left it out would be draining a different program.
+            auto drainW = [&](double budget) {
+                double t = nowSec();
+                while (nowSec() - t < budget) {
+                    pumpRemoteBrowse();
+                    pumpRemoteFetch();
+                    pumpRestoreWaits();
+                    pumpRemoteOpenQueue();
+                    pumpSequenceAndQueue();
+                    if (loadingSettled() && app.rfPending == 0 &&
+                        app.seqRestore.empty() && app.restoreWait.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            std::error_code wrec;
+            const std::string wsess =
+                (std::filesystem::temp_directory_path(wrec) /
+                 "viewer_restorewait.vsession").u8string();
+
+            {   // ---- G5: the frame the stack was left on -----------------
+                closeAll();
+                bool opened = openRemote("local://" + wroot + "/inframe.npy", false, 0);
+                drainW(120.0);
+                const int sid = app.seqs.empty() ? 0 : app.seqs.back().id;
+                std::vector<int> fr = sid ? framesOfSeq(sid) : std::vector<int>();
+                bool set = false;
+                for (int idx : fr) if (app.images[idx]->seqIndex == 2) { selectImage(idx); set = true; }
+                saveSession(wsess, true);
+                closeAll();
+                const std::string err = loadSession(wsess);
+                drainW(120.0);
+                const ImageDoc* c = cur();
+                // The pixel value IS the frame number, so this asserts the
+                // frame that came back rather than an index bookkeeping could
+                // agree with itself about.
+                float v = (c && !c->src->data.empty()) ? c->src->data[0] : -1.0f;
+                fprintf(stderr, "browseselftest: restore-wait G5: opened=%d %zu frame(s), "
+                                "left on 2 (%d), err=\"%s\" -> back on frame %d, "
+                                "pixel %.1f\n",
+                        opened ? 1 : 0, fr.size(), set ? 1 : 0, err.c_str(),
+                        c ? c->seqIndex : -1, v);
+                if (!opened || fr.size() != 4 || !set) {
+                    fprintf(stderr, "browseselftest: restore-wait G5: the fixture did "
+                                    "not give a 4-frame remote stack FAIL\n");
+                    ok = false;
+                } else if (!err.empty() || !c || c->seqIndex != 2 || v != 2.0f) {
+                    fprintf(stderr, "browseselftest: a remote stack must come back on "
+                                    "the frame the session was left on FAIL\n");
+                    ok = false;
+                }
+            }
+
+            {   // ---- G10: the crop, on a doc that is still the preview ----
+                closeAll();
+                bool opened = openRemote("local://" + wroot + "/wide.npy", false, 0);
+                // BEFORE the drain: the doc is the decimated preview right now,
+                // and this asserts that - if it were not, the restore below
+                // would have nothing to wait for and the test would pass while
+                // proving nothing.
+                const int stepAtOpen = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+                drainW(120.0);
+                ImageDoc* d = cur();
+                bool cropped = d && cropInPlace(*d, 100, 2, 400, 4);
+                saveSession(wsess, true);
+                closeAll();
+                const std::string err = loadSession(wsess);
+                // ...and the same assertion on the RESTORED doc, before the
+                // drain: this is the moment the crop line was read at, and it
+                // is the moment cropInPlace refuses.
+                const int stepAtRestore = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+                drainW(120.0);
+                ImageDoc* r = cur();
+                fprintf(stderr, "browseselftest: restore-wait G10: opened=%d step %d "
+                                "at open / %d at restore, cropped=%d, err=\"%s\" -> "
+                                "%dx%d at (%d,%d)\n",
+                        opened ? 1 : 0, stepAtOpen, stepAtRestore, cropped ? 1 : 0,
+                        err.c_str(), r ? r->w : -1, r ? r->h : -1,
+                        r ? r->src->cropX : -1, r ? r->src->cropY : -1);
+                if (!opened || stepAtOpen <= 1 || stepAtRestore <= 1 || !cropped) {
+                    fprintf(stderr, "browseselftest: restore-wait G10: the fixture must "
+                                    "arrive DECIMATED both times, or this proves "
+                                    "nothing FAIL\n");
+                    ok = false;
+                } else if (!err.empty() || !r || r->w != 400 || r->h != 4 ||
+                           r->src->cropX != 100 || r->src->cropY != 2) {
+                    fprintf(stderr, "browseselftest: a saved crop must survive a doc "
+                                    "that arrives as a preview FAIL\n");
+                    ok = false;
+                }
+            }
+            closeAll();
+            std::filesystem::remove(std::filesystem::u8path(wsess), wrec);
+            std::filesystem::remove_all(wdir, wec);
+        }
+
         {   // ---- A REMOTE FOLDER WHOSE SHAPES DISAGREE IS NOT ONE STACK ------
             // The local twin of this is --picker-selftest UC7 (PR #116): four
             // numbered siblings group into one row, their shapes do not agree,
