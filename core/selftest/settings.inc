@@ -66,6 +66,13 @@ static int settingsSelftest() {
         app.showGrid = false;
         app.dispGamma = 1.0f;
         app.dragPans = false;
+        // 段2d/2e: three fields the file can now set, so they belong in the
+        // state every block starts from. Without them R8's `memoryBudgetGB: 8`
+        // survived into T3 and the template carried a seventh key - the
+        // shared-state hazard this suite already knows about, one scope in.
+        app.memBudgetGB = 0;
+        app.watchEnabled = true;
+        app.watchAutoReload = false;
         app.wheelZoomPlain = false;
         app.fitOnSwitch = false;
         app.rbFlat = false;
@@ -591,12 +598,17 @@ static int settingsSelftest() {
             "  \"panels\": { \"messages\": true } }\n");
         SettingsReport r = loadSettingsFrom(p);
         dumpNotes(r);
-        check(r.later == 4 && r.unknown == 0,
-              "R8 measuring/raw/keyBindings/panels are named as 'not yet'");
-        check(r.later == 4 && app.memBudgetGB == 0,
-              "R8 ...and memoryBudgetGB really is not read (judgment 10/11)");
-        check(anyNote(r, "judgment 14") && anyNote(r, "judgment 10/11"),
-              "R8 ...each pointing at the ruling that deferred it");
+        // THREE now, not four: measuring.memoryBudgetGB was the fourth and it
+        // is READ since 段2d - its M1 declaration ("n of N" on a short stack)
+        // was already required by the canon, which is what let the section
+        // open. The assertion moves with the fact rather than being relaxed:
+        // the key it used to name is now asserted to LAND.
+        check(r.later == 3 && r.unknown == 0,
+              "R8 raw/keyBindings/panels are named as 'not yet'");
+        check(app.memBudgetGB == 8.0f,
+              "R8 ...and memoryBudgetGB IS read now (judgment 10/11 discharged)");
+        check(anyNote(r, "judgment 14"),
+              "R8 ...each deferred key still points at the ruling that deferred it");
     }
     {
         // R9: THE SECOND CONTROL. An absent file produces no note of any kind,
@@ -937,7 +949,12 @@ static int settingsSelftest() {
         // yet = 19; `theme` splits into theme + accent = 20; plus the 3 that
         // exist only in settings.jsonc (remote.repoUrl, loading.rawRecipes,
         // readers.editor) = 23.
-        check(readable == 23, "W1 ...and 23 of them are editable today");
+        // 23 was the count before 段2d/2e. Those promoted the three keys stage 1
+        // could not read - measuring.memoryBudgetGB (its M1 declaration, "n of
+        // N", was already required by the canon) and the two watch keys (ruled
+        // 2026-08-13) - so the reconciliation closes at 26 and the table at 33.
+        check(readable == 26, "W1 ...and 26 of them are editable today");
+        check(rows.size() == 33, "W1 ...over 33 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1020,6 +1037,43 @@ static int settingsSelftest() {
         check(dr.parsed && dr.applied == 0 &&
               dtxt.find("// \"dragPans\"") != std::string::npos,
               "W5 a key at its default copies as a comment, and applies nothing");
+    }
+
+    // ---- M1..M3: the measuring section, and the two watch keys --------------
+    // 判断10/11 in the flesh. The measuring class is read now because its
+    // declaration exists: this budget's consequence is FEWER FRAMES, and a
+    // short stack already says "n of N" wherever sigma_t is printed
+    // (docs/analysis-layers.md §8). A measuring setting that changed a number
+    // and left no trace on it is what M1 forbids - this one leaves the trace
+    // the canon already required, which is why it could be opened at all.
+    {
+        baseline();
+        app.memBudgetGB = 0;                       // automatic
+        loadSettingsFrom(writeFix("{ \"measuring\": { \"memoryBudgetGB\": 8 } }\n"));
+        const float got = app.memBudgetGB;
+        // ...and a value outside the window is REFUSED, not clamped. A file
+        // that asked for 0.1 GB meant something, and quietly giving it 0.5
+        // would answer a question it did not ask (判断8, the gamma precedent).
+        baseline();
+        app.memBudgetGB = 2.0f;
+        const SettingsReport rr =
+            loadSettingsFrom(writeFix("{ \"measuring\": { \"memoryBudgetGB\": -1 } }\n"));
+        fprintf(stderr, "settingsselftest: M budget: 8 -> %.9g | -1 rejected=%d value=%.9g\n",
+                got, rr.rejected, app.memBudgetGB);
+        check(got == 8.0f, "M1 measuring.memoryBudgetGB is read (the section is open)");
+        check(rr.rejected == 1 && app.memBudgetGB == 2.0f,
+              "M2 ...and a value outside 0 or 0.5..4096 is refused, never clamped");
+        // 段2e: the two keys the inventory left un-adjudicated, ruled on
+        // 2026-08-13. They are loading-class: whether a file that moved on disk
+        // is noticed at all is a question about how this build LOADS.
+        baseline();
+        app.watchEnabled = true; app.watchAutoReload = false;
+        const SettingsReport wr = loadSettingsFrom(writeFix(
+            "{ \"loading\": { \"watchFiles\": false, \"watchAutoReload\": true } }\n"));
+        fprintf(stderr, "settingsselftest: M3 watch: enabled=%d auto=%d unknown=%d\n",
+                app.watchEnabled ? 1 : 0, app.watchAutoReload ? 1 : 0, wr.unknown);
+        check(!app.watchEnabled && app.watchAutoReload && wr.unknown == 0,
+              "M3 the watch keys are read, and are no longer 'unknown key'");
     }
 
     baseline();

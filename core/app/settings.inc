@@ -413,7 +413,9 @@ enum SKey {
     SK_stackPrompt, SK_rawRecipes,
     SK_peerExe, SK_policy, SK_lowBandwidth, SK_repoUrl,
     SK_pythonExe, SK_searchPath, SK_editor,
-    SK_defaultUnit
+    SK_defaultUnit,
+    // 段2d/2e: the three prefs keys stage 1 could not read yet.
+    SK_memBudget, SK_watchFiles, SK_watchAuto
 };
 
 enum SStatus {
@@ -502,9 +504,19 @@ static const SKeyDef SETTING_KEYS[] = {
     // there, and the session beats it. None of that is built yet, so the key is
     // named as "later" rather than read - a measuring setting that is read but
     // does not declare itself on the result would break M1 on its first day.
-    { SK_None,        "measuring.memoryBudgetGB", SS_Later,
-      "the measuring section moves in its own change: it has to declare itself "
-      "on the results it changed (judgment 10/11, M1)", nullptr },
+    // 判断10/11: the measuring class gets its own section and the session beats
+    // it. It is READ now, and the precondition M1 asks for is already met: the
+    // consequence of this budget is FEWER FRAMES, and a short stack declares
+    // itself as "n of N" wherever sigma_t is printed (docs/analysis-layers.md
+    // §8, 判断record 5). A measuring setting that changed a number and left no
+    // trace on it is what M1 forbids; this one leaves the trace the canon
+    // already required.
+    { SK_memBudget,   "measuring.memoryBudgetGB", SS_Read, nullptr, "8" },
+    // 段2e (裁定 2026-08-13). Watch is loading-class: it decides whether a file
+    // that moved on disk is noticed at all, which is a question about how this
+    // build LOADS rather than about how it looks.
+    { SK_watchFiles,  "loading.watchFiles",       SS_Read, nullptr, "true" },
+    { SK_watchAuto,   "loading.watchAutoReload",  SS_Read, nullptr, "false" },
 };
 static const size_t SETTING_KEY_COUNT = sizeof SETTING_KEYS / sizeof SETTING_KEYS[0];
 
@@ -1001,6 +1013,30 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             A.setS(g_settingsEditorCmd, s, path);
             break;
         }
+        case SK_memBudget: {
+            double n = 0;
+            if (!A.wantNum(v, path, n)) break;
+            // 0 = automatic; otherwise the same window the menu clamps to.
+            // REFUSED rather than clamped, exactly as displayGamma is: a file
+            // that asked for 0.1 GB meant something, and silently giving it 0.5
+            // would answer a question it did not ask (判断8).
+            if (n != 0 && (n < 0.5 || n > 4096)) {
+                A.rangeErr(v, path, "0 (automatic) or 0.5 .. 4096");
+                break;
+            }
+            A.setF(app.memBudgetGB, (float)n, path);
+            break;
+        }
+        case SK_watchFiles: {
+            bool b2 = false;
+            if (A.wantBool(v, path, b2)) A.setB(app.watchEnabled, b2, path);
+            break;
+        }
+        case SK_watchAuto: {
+            bool b2 = false;
+            if (A.wantBool(v, path, b2)) A.setB(app.watchAutoReload, b2, path);
+            break;
+        }
         case SK_defaultUnit: {
             std::string s;
             if (!A.wantStr(v, path, s)) break;
@@ -1307,14 +1343,18 @@ struct PrefRow {
 // itself rejects.
 static SWidget settingsWidgetFor(SKey id) {
     switch (id) {
+        // browse.grouped is an ENUM and not a bool: the key is "grouped" while
+        // the field is rbFlat, so a checkbox would be inverted against its own
+        // name. Two words beat a negated tick.
         case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
-        case SK_gamma:
+        case SK_gamma: case SK_grouped:
             return SW_Enum;
         case SK_compact: case SK_showFps: case SK_pixelGrid: case SK_dragPans:
-        case SK_wheelZoom: case SK_fitOnSwitch: case SK_grouped: case SK_tree:
+        case SK_wheelZoom: case SK_fitOnSwitch: case SK_tree:
         case SK_naturalSort: case SK_lowBandwidth:
+        case SK_watchFiles: case SK_watchAuto:
             return SW_Bool;
-        case SK_accent:
+        case SK_accent: case SK_memBudget:
             return SW_Int;
         // series.defaultUnit is a free string, not an enumeration: the
         // applier accepts any name that fits (a lab measures in whatever it
@@ -1360,6 +1400,8 @@ static bool* prefBoolField(SKey id) {
         case SK_tree:         return &app.rbTree;
         case SK_naturalSort:  return &app.rbNatural;
         case SK_lowBandwidth: return &app.lowBandwidth;
+        case SK_watchFiles:   return &app.watchEnabled;
+        case SK_watchAuto:    return &app.watchAutoReload;
         default: return nullptr;
     }
 }
@@ -1525,6 +1567,14 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_grouped: return app.rbFlat ? "false" : "";
         case SK_tree: return app.rbTree ? "true" : "";
         case SK_naturalSort: return app.rbNatural ? "" : "false";
+        // 0 is the default AND a meaningful value ("automatic"), so the empty
+        // string here means "not set" exactly as it does everywhere else - the
+        // two coincide, which is why the panel prints the RESOLVED figure
+        // beside the row instead of leaving "0" to explain itself (M3).
+        case SK_memBudget:
+            return app.memBudgetGB == 0 ? "" : fmtExact(app.memBudgetGB);
+        case SK_watchFiles: return app.watchEnabled ? "" : "false";
+        case SK_watchAuto:  return app.watchAutoReload ? "true" : "";
         case SK_stackPrompt:
             return app.seqLoadMode == 0 ? "" :
                    (app.seqLoadMode == 1 ? "\"always\"" : "\"never\"");
