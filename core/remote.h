@@ -169,7 +169,14 @@ public:
     // to the peer. Both calls take it, and both refuse from peerVersion() before
     // sending when the peer predates protocol 9 - see rp::npyReReadTooOldText
     // for why that refusal cannot be left to the peer.
-    bool meta(const std::string& path, Meta& out, std::string& err, int read = 0);
+    // `rw` (optional) is the DECLARED GEOMETRY of a headerless file (protocol
+    // 11). It is not a hint and not a fallback: for .bin/.raw/... there is no
+    // other source of a shape, so a request without one is refused rather than
+    // guessed at - by this client when the peer is too old (rp::rawTooOldText),
+    // by the peer otherwise. Passing one for a file that states its own shape
+    // is refused too, at the peer, for the reason a dropped trailer always is.
+    bool meta(const std::string& path, Meta& out, std::string& err, int read = 0,
+              const rp::RawWire* rw = nullptr);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
     // (converted from the source dtype) plus the decimated dimensions. The rect
     // and the frame index are coordinates INSIDE `read`, so it must be the same
@@ -181,7 +188,8 @@ public:
     // nothing where the local door says how many samples it could not hold.
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-              std::string& err, int read = 0, rp::F32Loss* loss = nullptr);
+              std::string& err, int read = 0, rp::F32Loss* loss = nullptr,
+              const rp::RawWire* rw = nullptr);
     // run analysis where the data is; only the emitted results travel
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
 
@@ -199,6 +207,12 @@ private:
     // refuse a .png on a v9 peer with the same sentence, and none of them may
     // let it through to come back as "not a .npy file".
     bool formatServable(const std::string& path, std::string& err) const;
+    // "can this peer carry a recipe at all" - the protocol-11 gate, in one
+    // place for the reason the two above are: meta() and tile() must refuse a
+    // headerless file on a v10 peer with the same sentence, and neither may let
+    // it through to come back as "not a .npy file".
+    bool recipeServable(const std::string& path, const rp::RawWire* rw,
+                        std::string& err) const;
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
     bool recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& err);
 

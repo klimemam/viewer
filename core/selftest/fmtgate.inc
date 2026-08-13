@@ -612,6 +612,126 @@
                       has(gs[0].entry.name, ".png"),
                       "P7 the peer folds frame_001..004.png into ONE stack group");
             }
+            // ---- P8: a HEADERLESS file, read under a carried recipe ---------
+            // verify-matrix G1, and the user report behind it. Everything
+            // before this line is a format that states its own shape; this one
+            // states nothing, so the geometry travels with the request
+            // (protocol 11, docs/remote-headerless-design.md).
+            //
+            // The fixture is written HERE, byte by byte, and the expected
+            // samples are the ones this test wrote - not a second decoder's
+            // opinion of them. For a headerless file that is the only honest
+            // reference: there is no header to disagree with.
+            if (up) {
+                std::error_code rec;
+                std::filesystem::path rdir =
+                    std::filesystem::temp_directory_path(rec) / "viewer_rawwire";
+                std::filesystem::remove_all(rdir, rec);
+                std::filesystem::create_directories(rdir, rec);
+                const int RW_W = 8, RW_H = 6, HDR = 12;
+                std::vector<uint16_t> px((size_t)RW_W * RW_H);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(i * 7 + 3);
+                const std::string rpath = (rdir / "probe.raw").u8string();
+                {   // HDR bytes of junk in front, so the offset field is doing work
+                    std::ofstream rf(pathFromUtf8(rpath), std::ios::binary);
+                    const std::vector<uint8_t> junk(HDR, 0xA5);
+                    rf.write((const char*)junk.data(), HDR);
+                    rf.write((const char*)px.data(), (std::streamsize)(px.size() * 2));
+                }
+                rp::RawWire rw{};
+                rw.dtype = 1;                 // u16
+                rw.interp = 0;                // gray
+                rw.w = RW_W; rw.h = RW_H;
+                rw.offset = HDR;
+                rw.flags = rp::RW_LITTLE_ENDIAN;
+
+                remote::Meta m{};
+                std::string e2;
+                const bool gotMeta = S.meta(rpath, m, e2, 0, &rw);
+                std::vector<float> got;
+                int gw = 0, gh = 0, gc = 0;
+                std::string gdt;
+                std::string e3;
+                const bool gotTile = gotMeta &&
+                    S.tile(rpath, 0, 0, 0, RW_W, RW_H, 1, got, gw, gh, gc, gdt, e3, 0,
+                           nullptr, &rw);
+                bool same = gotTile && got.size() == px.size();
+                if (same)
+                    for (size_t i = 0; i < px.size(); i++)
+                        if (got[i] != (float)px[i]) same = false;
+                // anti-vacuity: the fixture is not a flat field, so "equal"
+                // cannot be satisfied by two runs of zeros
+                bool varied = false;
+                for (size_t i = 1; i < px.size(); i++) if (px[i] != px[0]) varied = true;
+                fprintf(stderr, "fmtgateselftest:   P8 raw over the wire: meta=%d "
+                                "%dx%d ch%d %s frames=%d | tile=%d %dx%d ch%d %s | "
+                                "samples equal=%d varied=%d%s%s\n",
+                        gotMeta ? 1 : 0, m.w, m.h, m.ch, m.dtype.c_str(), m.frames,
+                        gotTile ? 1 : 0, gw, gh, gc, gdt.c_str(), same ? 1 : 0,
+                        varied ? 1 : 0, e2.empty() ? "" : "  metaErr=", e2.c_str());
+                check(gotMeta && m.w == RW_W && m.h == RW_H && m.ch == 1 &&
+                      m.frames == 1 && m.dtype == "u16",
+                      "P8 the peer answers META for a headerless file under a recipe");
+                check(varied && same,
+                      "P8 ...and TILE returns the bytes that were written, sample for sample");
+
+                // ...and the three ways to be wrong, each refused BY NAME.
+                {
+                    remote::Meta m2{};
+                    std::string noRec, badSize, onNpy;
+                    // (i) no recipe: nothing on either end can supply a shape
+                    S.meta(rpath, m2, noRec);
+                    // (ii) a recipe the file cannot satisfy - both numbers, and
+                    // the arithmetic that produced the second
+                    rp::RawWire big = rw; big.w = 4096; big.h = 4096;
+                    S.meta(rpath, m2, badSize, 0, &big);
+                    // (iii) a recipe on a file that states its own shape
+                    S.meta(B.dir + "/capture.npy", m2, onNpy, 0, &rw);
+                    fprintf(stderr, "fmtgateselftest:   P8 refusals:\n"
+                                    "fmtgateselftest:     no recipe : \"%s\"\n"
+                                    "fmtgateselftest:     too small : \"%s\"\n"
+                                    "fmtgateselftest:     on a .npy : \"%s\"\n",
+                            noRec.c_str(), badSize.c_str(), onNpy.c_str());
+                    check(has(noRec, "headerless"),
+                          "P8 a headerless request with no recipe is refused by name");
+                    check(has(badSize, "this recipe needs") && has(badSize, "bytes"),
+                          "P8 a recipe the file cannot satisfy quotes both numbers");
+                    check(has(onNpy, "states its own shape"),
+                          "P8 a recipe on a self-describing file is refused, not dropped");
+                }
+                // ---- P9: a peer that predates the carried recipe ------------
+                // Not a thought experiment: a v10 peer, on this disk, refused
+                // BEFORE the request is sent, from the number it announced.
+                // The reason this cannot be left to the peer is sharper here
+                // than anywhere else in this header's history - a v10 peer
+                // answers a .raw with "not a .npy file", a sentence about the
+                // FILE, while silently ignoring the trailer that would have
+                // made the request answerable.
+                {
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", "10");
+                    remote::Session old;
+                    std::string eo;
+                    if (!old.start("", exe, eo)) {
+                        fprintf(stderr, "fmtgateselftest:   P9 old peer: %s\n", eo.c_str());
+                        check(false, "P9 the second peer starts");
+                    } else {
+                        remote::Meta m3{};
+                        std::string e4;
+                        const bool got = old.meta(rpath, m3, e4, 0, &rw);
+                        fprintf(stderr, "fmtgateselftest:   P9 peer speaks %d, meta=%d\n"
+                                        "fmtgateselftest:   P9 refusal: \"%s\"\n",
+                                old.peerVersion(), got ? 1 : 0, e4.c_str());
+                        check(old.peerVersion() == 10, "P9 the second peer really speaks 10");
+                        check(!got && has(e4, "protocol 10") && has(e4, "needs 11") &&
+                              has(e4, "Nothing was opened") && has(e4, "File > Open"),
+                              "P9 ...and the client refuses from the number, naming the "
+                              "mismatch and the door that works");
+                        old.stop();
+                    }
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+                }
+                std::filesystem::remove_all(rdir, rec);
+            }
             S.stop();
         }
         closeAll();

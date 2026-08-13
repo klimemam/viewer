@@ -140,7 +140,25 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // without OpenEXR, say - a number stops being enough and a list becomes
 // necessary; there is no such build today (#53 made OpenEXR unconditional), so
 // there is nothing for a list to say that the number does not.
-static const uint32_t VERSION = 10;
+// 11: the peer serves HEADERLESS RAW - .bin .raw .yuv .dat .rggb - when the
+// request carries the geometry. This is the first op family whose answer
+// depends on something the FILE does not contain: every format before it
+// declared its own shape, and a headerless one declares none, so the shape
+// travels with the request as a RawWire trailer (below).
+//
+// It has to be a number, for this header's usual two reasons and a third that
+// is sharper here. A v10 peer handed a .raw answers META with "not a .npy
+// file" - a sentence about the file, for a limit that belongs to the peer -
+// and the trailer it never reads is exactly the declaration that would have
+// made the request answerable. Worse than #124's case: there the peer returned
+// the wrong reading of real pixels; here it would return nothing while blaming
+// the file. The third reason is that the client must ALSO be able to tell "this
+// peer will not carry a recipe" from "this request forgot to carry one", and
+// only a version separates those.
+//
+// The trailer is APPENDED, so a v10 peer's parse of a v10 request does not move
+// by one byte - the discipline every append in this header has kept.
+static const uint32_t VERSION = 11;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -337,6 +355,61 @@ struct TileReq {
     uint32_t step;              // 1 = full resolution, n = every nth sample
     uint32_t flags;             // bit0: compress payload (deflate)
 };
+
+// The declared geometry of a headerless file (protocol 11). ONE definition,
+// included by both binaries, for the reason NpyRead is one definition: "a
+// second copy in serve.cpp is a copy that drifts" (#71).
+//
+// dtype / interp are the INDICES of the client's RAW_DTYPE_NAMES and
+// RAW_INTERP_CLI tables, frozen here. APPEND, NEVER RENUMBER: session files
+// already carry these numbers (`raw3` lines) and so does this wire now, so a
+// renumbering would make one build's u16 the next one's i16 - the same hazard
+// the DType note below spells out.
+//
+// What is NOT here, each with its reason (docs/remote-headerless-design.md §3.2):
+//   cfaPattern - RGGB vs BGGR changes no sample, only the planes' NAMES. It
+//                rides on MeasureReqHead where it already does, and it is not
+//                part of §6.2 identity locally either.
+//   crop       - a crop re-scopes a frame rather than being one; the local
+//                registry already refuses to share a cropped raw source.
+//   frames     - a headerless file has no in-file frame axis (§6.1): there is
+//                no door to one locally, so inventing one over the link would
+//                give the same file two shapes depending on where it was
+//                opened.
+struct RawWire {
+    uint32_t dtype;             // index into RAW_DTYPE_NAMES: 0 u8, 1 u16, 2 f32, 3 f64
+    uint32_t interp;            // index into RAW_INTERP_CLI: 0 gray .. 6 quad-bayer
+    uint32_t w, h;              // 1..32768, checked by the peer, never clamped
+    uint32_t offset;            // bytes to skip before the frame
+    uint32_t flags;             // bit0: little-endian. Rest 0 - room to append.
+};
+static const uint32_t RW_LITTLE_ENDIAN = 1u;
+// What those two indices MEAN in bytes and channels. Here rather than only in
+// core/app/loader_npy_raw.inc because the peer has to size the same read and
+// does not compile that file - the RawWire note's "one definition" applies to
+// the meaning of the numbers as much as to their layout. The client keeps its
+// own tables (they also carry the NAMES, which are UI), and
+// --rawrecipe-selftest asserts the two agree over every index: a wrapper would
+// have hidden a disagreement, an assertion catches one.
+static inline uint32_t rawDtypeSize(uint32_t dtype) {   // u8, u16, f32, f64
+    static const uint32_t SZ[] = { 1, 2, 4, 8 };
+    return dtype < 4 ? SZ[dtype] : 0;                   // 0 = not a dtype
+}
+static inline uint32_t rawInterpCh(uint32_t interp) {   // gray rgb bgr rgba bgra bayer quad
+    static const uint32_t CH[] = { 1, 3, 3, 4, 4, 1, 1 };
+    return interp < 7 ? CH[interp] : 0;                 // 0 = not an interpretation
+}
+// The two that put channel 2 where channel 0 was: the local decoder stores the
+// swapped order in the document, so a peer that did not swap would give one
+// file two colours depending on which end opened it (#148, one step down).
+static inline bool rawInterpSwapsRB(uint32_t interp) { return interp == 2 || interp == 4; }
+static const uint32_t RAW_MAX_DIM = 32768;
+// MeasureReqHead::flags bit0: a RawWire follows the ROI array. A bit rather
+// than "read it if bytes remain", because MEASURE already has op-dependent
+// blocks after the ROIs - fixing the POSITION and declaring the PRESENCE in the
+// head is the cheapest thing for the parsers that already exist. The field was
+// declared "reserved, 0", so a v10 or older client writes 0 there.
+static const uint32_t MRF_RAW_RECIPE = 1u;
 
 // TILE reply header; the pixel blob follows, possibly deflate-compressed.
 struct TileRep {
@@ -679,6 +752,24 @@ inline std::string pictureTooOldText(int peerVersion, const std::string& name) {
            std::to_string(peerVersion) + ", and the picture formats need 10 "
            "(update viewer-serve). Nothing was opened: this file IS readable "
            "here, so browsing it locally or copying it here both work today.";
+}
+
+// The peer predates the carried recipe (verify-matrix G1). Same discipline as
+// the two sentences above: written BEFORE anything is sent, from the number the
+// peer announced in HELLO, because a v10 peer does not refuse this request
+// usefully - it answers "not a .npy file", which blames the file for a limit
+// that belongs to the peer's build, and silently ignores the very trailer that
+// would have made the request answerable.
+//
+// The way out is the LINK's limit (the rule G9 / PR #176 settled) plus the door
+// that does work - and here that door can be NAMED, because a headerless file
+// is one this build definitely opens locally.
+inline std::string rawTooOldText(int peerVersion, const std::string& name) {
+    return name + ": this file states no shape of its own, so the read has to "
+           "carry one - and the remote peer speaks protocol " +
+           std::to_string(peerVersion) + ", which has no field for it (a recipe "
+           "needs 11; update viewer-serve). Nothing was opened: copy the file "
+           "here and open it with File > Open, which does carry the recipe.";
 }
 
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.

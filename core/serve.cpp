@@ -553,8 +553,81 @@ static bool readPictureRegion(ServedFile& n, const TileReq& r, std::vector<uint8
 // neither of them claims falls to the .npy branch, which opens it and says
 // "not a .npy file" - unchanged, and still the right sentence for a file whose
 // bytes nothing here recognises.
+// A HEADERLESS file, read under a geometry the request carried (protocol 11).
+//
+// Simpler than openNpy, and that is the shape of the whole feature: there is no
+// header to parse, because the client already parsed a human. Every field comes
+// from the RawWire, the strides are plain C-order, and readNpyRegion therefore
+// reads it with no raw-specific loop at all - the row-contiguous fast path, the
+// endian normalisation and the step decimation are the code that was already
+// there.
+//
+// The checks below REFUSE rather than clamp, for getRead's reason: a value this
+// peer does not recognise means the two ends disagree about what the numbers
+// mean, and the one answer that must not come back from that is a picture.
+static bool openRaw(ServedFile& n, const std::string& path, std::string& err,
+                    const RawWire& rw) {
+    const uint32_t esz = rawDtypeSize(rw.dtype), ch = rawInterpCh(rw.interp);
+    if (!esz) { err = "unknown raw dtype " + std::to_string(rw.dtype); return false; }
+    if (!ch)  { err = "unknown raw interpretation " + std::to_string(rw.interp); return false; }
+    if (rw.w < 1 || rw.h < 1 || rw.w > RAW_MAX_DIM || rw.h > RAW_MAX_DIM) {
+        err = "raw size " + std::to_string(rw.w) + "x" + std::to_string(rw.h) +
+              " is outside 1..32768";
+        return false;
+    }
+    n.f.open(std::filesystem::u8path(path), std::ios::binary);
+    if (!n.f) { err = "cannot open " + path; return false; }
+    n.f.seekg(0, std::ios::end);
+    const std::streamoff sz = n.f.tellg();
+    if (sz < 0) { err = "cannot read " + path; return false; }
+    // Both numbers, and the arithmetic that produced the second. The local
+    // door's "file too small for this size/format" is enough when the operator
+    // is looking at the file; over a link the LIST size can be stale, so the
+    // figures are the diagnosis.
+    const uint64_t need = (uint64_t)rw.offset + (uint64_t)rw.w * rw.h * ch * esz;
+    if (need > (uint64_t)sz) {
+        err = "file is " + std::to_string((uint64_t)sz) + " bytes: this recipe needs " +
+              std::to_string(need) + " (offset " + std::to_string(rw.offset) + " + " +
+              std::to_string(rw.w) + "x" + std::to_string(rw.h) + " x " +
+              std::to_string(ch) + " ch x " + std::to_string(esz) + " B/sample)";
+        return false;
+    }
+    static const uint32_t DT[] = { DT_U8, DT_U16, DT_F32, DT_F64 };
+    n.dtype = DT[rw.dtype];
+    n.elemSize = esz;
+    n.w = (int)rw.w; n.h = (int)rw.h; n.ch = (int)ch;
+    n.frames = 1;
+    n.fortran = false;
+    n.bigEndian = !(rw.flags & RW_LITTLE_ENDIAN);
+    n.dataOffset = rw.offset;
+    n.sCh = 1; n.sX = ch; n.sY = (uint64_t)rw.w * ch; n.sFrame = 0;
+    // ndim stays 0: this file declares no shape of its own, so META carries no
+    // MR_SHAPE and the Inspector offers no "read as" menu - the same reason a
+    // picture keeps ndim 0. Restating a recipe is the recipe panel's job (#166),
+    // not the .npy reading menu's.
+    n.ndim = 0;
+    n.ok = true;
+    return true;
+}
+
 static bool openServed(ServedFile& n, const std::string& path, std::string& err,
-                       int read = NR_NATIVE) {
+                       int read = NR_NATIVE, const RawWire* rw = nullptr) {
+    // A recipe is a claim about a file that states nothing. Applying one to a
+    // file that DOES state its shape would be answering a question nobody
+    // asked, so it is refused - the mirror of openPicture's declared-reading
+    // refusal, and for the identical reason.
+    if (!isNpySuffix(path) && imagefile::isHeaderless(path)) {
+        if (!rw) { err = imagefile::peerRefusal(path); return false; }
+        if (read != NR_NATIVE) {
+            err = "a declared .npy reading does not apply to a headerless file";
+            return false;
+        }
+        return openRaw(n, path, err, *rw);
+    }
+    if (rw) {
+        err = "a raw recipe does not apply to a file that states its own shape";
+        return false;
+    }
     if (!isNpySuffix(path) && imagefile::forPath(path)) return openPicture(n, path, err, read);
     return openNpy(n, path, err, read);
 }
@@ -1183,14 +1256,29 @@ static bool getRead(Buf& in, int& read, std::string& err) {
     return true;
 }
 
+// The RawWire trailing a META or TILE request (protocol 11). Absent = no
+// recipe, which is what every v10 and older client sends. Read the same way
+// getRead reads its reading: if the bytes are there, they were meant.
+static bool getRecipe(Buf& in, RawWire& rw, bool& have, std::string& err) {
+    have = false;
+    if (in.rd >= in.b.size()) return true;                 // an older client
+    if (in.rd + sizeof rw > in.b.size()) { err = "truncated raw recipe"; return false; }
+    memcpy(&rw, in.b.data() + in.rd, sizeof rw);
+    in.rd += sizeof rw;
+    have = true;
+    return true;
+}
+
 static void handleMeta(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad META"); return; }
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
+    RawWire rw{}; bool haveRw = false;
+    if (!getRecipe(in, rw, haveRw, err)) { sendErr(err); return; }
     ServedFile n;
-    if (!openServed(n, path, err, read)) { sendErr(err); return; }
+    if (!openServed(n, path, err, read, haveRw ? &rw : nullptr)) { sendErr(err); return; }
     MetaRep m{};
     m.w = (uint32_t)n.w; m.h = (uint32_t)n.h; m.ch = (uint32_t)n.ch;
     m.dtype = n.dtype; m.frames = (uint32_t)n.frames; m.flags = 0;
@@ -1221,8 +1309,10 @@ static void handleTile(Buf& in) {
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
+    RawWire rw{}; bool haveRw = false;
+    if (!getRecipe(in, rw, haveRw, err)) { sendErr(err); return; }
     ServedFile n;
-    if (!openServed(n, path, err, read)) { sendErr(err); return; }
+    if (!openServed(n, path, err, read, haveRw ? &rw : nullptr)) { sendErr(err); return; }
     std::vector<uint8_t> pix;
     uint32_t ow = 0, oh = 0;
     if (!readRegion(n, r, pix, ow, oh, err)) { sendErr(err); return; }

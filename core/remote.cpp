@@ -595,10 +595,38 @@ bool Session::formatServable(const std::string& path, std::string& err) const {
     return false;
 }
 
-bool Session::meta(const std::string& path, Meta& out, std::string& err, int read) {
-    if (!readServable(read, err) || !formatServable(path, err)) return false;
+// The protocol-11 gate. Two ways to be wrong and both are refused HERE:
+//
+//   a headerless file with no recipe   nothing on either end can supply a
+//                                      shape, so the request is unanswerable -
+//                                      and it must not reach a peer that would
+//                                      say "not a .npy file" about it.
+//   a headerless file, peer below 11   the peer will not read the trailer. It
+//                                      would answer with a sentence about the
+//                                      FILE for a limit that belongs to its
+//                                      build - the illegibility this header
+//                                      keeps paying to avoid.
+//
+// A recipe for a file that DOES state its shape is refused by the peer, not
+// here: that one is a claim about the file, the peer is the side holding the
+// file, and its refusal names what it actually found.
+bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
+                             std::string& err) const {
+    if (!imagefile::isHeaderless(path)) return true;
+    const size_t slash = path.find_last_of("/\\");
+    const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (peerVersion_ < 11) { err = rp::rawTooOldText(peerVersion_, name); return false; }
+    if (!rw) { err = imagefile::peerRefusal(path); return false; }
+    return true;
+}
+
+bool Session::meta(const std::string& path, Meta& out, std::string& err, int read,
+                   const rp::RawWire* rw) {
+    if (!readServable(read, err) || !formatServable(path, err) ||
+        !recipeServable(path, rw, err)) return false;
     W w; w.str(serverPath(path));
     if (peerVersion_ >= 9) w.u32((uint32_t)read);
+    if (rw && peerVersion_ >= 11) w.blob(rw, sizeof *rw);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -691,8 +719,10 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-                   std::string& err, int read, rp::F32Loss* loss) {
-    if (!readServable(read, err) || !formatServable(path, err)) return false;
+                   std::string& err, int read, rp::F32Loss* loss,
+                   const rp::RawWire* rw) {
+    if (!readServable(read, err) || !formatServable(path, err) ||
+        !recipeServable(path, rw, err)) return false;
     W wr;
     wr.str(serverPath(path));
     rp::TileReq q{};
@@ -703,6 +733,10 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     q.flags = 1;                        // ask for deflate: the link is the cost
     wr.blob(&q, sizeof q);
     if (peerVersion_ >= 9) wr.u32((uint32_t)read);
+    // Appended after the reading, in the order handleTile reads them. A peer
+    // below 11 never gets one - recipeServable refused above, so this is the
+    // v11 path only and the older wire does not move by a byte.
+    if (rw && peerVersion_ >= 11) wr.blob(rw, sizeof *rw);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_TILE, wr.b, err) || !recv(type, reply, err)) return false;
