@@ -145,6 +145,31 @@ static void drawPreferencesPanel() {
 
     ImGui::TextDisabled("Changes here are written to prefs.txt. settings.jsonc is yours to "
                         "edit; keys it sets win at every start.");
+    // The migration, in two buttons. The app does not write settings.jsonc
+    // (判断3 - a writer would eat the user's comments on the first toggle), so
+    // "make this permanent" is "here is exactly what to paste", and the editor
+    // chain opens the file for them to paste INTO.
+    if (ImGui::SmallButton("Copy template")) {
+        ImGui::SetClipboardText(settingsTemplateText().c_str());
+        toast("settings.jsonc template copied - paste it into the file");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The whole file, with every key at its current value.\n"
+                          "Keys at their default are written as comments (判断9:\n"
+                          "an unset key and a key written at the default are\n"
+                          "different the day the default moves).");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open settings.jsonc")) {
+        const std::string sp = settingsPath();
+        if (sp.empty()) toast("no config directory on this machine", true);
+        else {
+            std::string err;
+            if (!adapter::openInEditor(sp, err)) toast(err, true);
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("readers.editor, then $EDITOR, then the OS default.\n"
+                          "The file may not exist yet - Copy template first.");
     static char filter[96] = "";
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##preffilter", "filter", filter, sizeof filter);
@@ -186,6 +211,16 @@ static void drawPreferencesPanel() {
             ImGui::TextDisabled("%s", r->path);
             ImGui::TableNextColumn();
             if (r->status == SS_Read) prefWidget(*r);
+            // The row's own right-click. "Copy as JSONC" is how a change made
+            // here becomes permanent, since this panel writes prefs.txt and the
+            // file is the user's to write (判断3).
+            if (r->status == SS_Read && ImGui::BeginPopupContextItem(r->path)) {
+                if (ImGui::MenuItem("Copy as JSONC")) {
+                    ImGui::SetClipboardText(settingsKeyAsJsonc(r->id).c_str());
+                    toast(std::string(r->path) + " copied as JSONC");
+                }
+                ImGui::EndPopup();
+            }
             else ImGui::TextDisabled("%s", r->note ? r->note : "");
             ImGui::TableNextColumn();
             if (r->status == SS_Read) prefBadge(*r);

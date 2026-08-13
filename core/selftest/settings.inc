@@ -982,6 +982,46 @@ static int settingsSelftest() {
               "W4 ...and a key the file decides names the file and the line");
     }
 
+    // ---- W5: "Copy as JSONC" is the parser's inverse -----------------------
+    // Asserted as a ROUND TRIP, not as a string comparison. The copy is written
+    // as the reverse of the stage-1 parser, so composing the two has to be the
+    // identity - and a string test would pin today's spacing instead of the
+    // property (--rawrecipe-selftest S3 set the precedent).
+    //
+    // A COMPLETE document, because a fragment pasted into an empty file is a
+    // parse error, and a copy button whose output must be edited first is a
+    // copy button that does not work. That is what makes the round trip
+    // possible to write at all: loadSettingsFrom takes a file, and this text
+    // has to be one.
+    {
+        baseline();
+        app.themeVariant = ui_theme::VariantLight;      // not the default
+        const std::string txt = settingsKeyAsJsonc(SK_theme);
+        const std::string rp = writeFix(txt);
+        baseline();                                     // back to dark
+        const SettingsReport rr = loadSettingsFrom(rp);
+        fprintf(stderr, "settingsselftest: W5 copy -> \"%s\" applied=%d rejected=%d "
+                        "unknown=%d theme=%d\n",
+                txt.c_str(), rr.applied, rr.rejected, rr.unknown,
+                app.themeVariant == ui_theme::VariantLight ? 1 : 0);
+        check(rr.parsed && rr.rejected == 0 && rr.unknown == 0,
+              "W5 the copied text is a document this build reads");
+        check(rr.applied == 1 && app.themeVariant == ui_theme::VariantLight,
+              "W5 ...and it puts the value back, exactly (parse o emit = identity)");
+        // A key at its DEFAULT is copied as a COMMENT, not as a line: writing a
+        // default and leaving it unset are different acts the day the default
+        // moves (判断9). So the round trip of a defaulted key applies nothing -
+        // which is the correct identity for "this key is not set".
+        baseline();
+        const std::string dtxt = settingsKeyAsJsonc(SK_dragPans);
+        const SettingsReport dr = loadSettingsFrom(writeFix(dtxt));
+        fprintf(stderr, "settingsselftest: W5 default key -> \"%s\" applied=%d\n",
+                dtxt.c_str(), dr.applied);
+        check(dr.parsed && dr.applied == 0 &&
+              dtxt.find("// \"dragPans\"") != std::string::npos,
+              "W5 a key at its default copies as a comment, and applies nothing");
+    }
+
     baseline();
     std::filesystem::remove_all(root, ec);
     fprintf(stderr, "settingsselftest: %s\n", ok ? "ok" : "FAILED");

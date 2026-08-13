@@ -1457,6 +1457,42 @@ static std::string prefLinkSummary(SKey id) {
     return {};
 }
 
+// One key, as the complete JSONC document a user would paste. The panel's
+// "Copy as JSONC" hands this to the clipboard, because 判断3 means the app does
+// not write settings.jsonc and "make this permanent" therefore has to be "here
+// is what to paste" - the same answer #166's recipe panel already gives.
+//
+// A COMPLETE document, not a fragment: pasting `"theme": "light"` into an empty
+// file produces a parse error, and a copy button whose output has to be edited
+// before it works is a copy button that does not work. The nesting is rebuilt
+// from the path, so a key that moves section moves here with it.
+//
+// The value is settingsCurrentValue(), which is empty at the default - and a
+// key at its default is written as a COMMENT rather than as a line, because
+// 判断9 says writing a default is a different act from leaving it unset (the
+// day the default moves, the two people get different values). The comment
+// still gives the reader the spelling.
+static std::string settingsKeyAsJsonc(SKey id) {
+    const SKeyDef* def = nullptr;
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++)
+        if (SETTING_KEYS[k].id == id && SETTING_KEYS[k].status == SS_Read)
+            def = &SETTING_KEYS[k];
+    if (!def) return {};
+    const std::string path = def->path;
+    const size_t dot = path.find('.');
+    if (dot == std::string::npos) return {};
+    const std::string sec = path.substr(0, dot), leaf = path.substr(dot + 1);
+    const std::string val = settingsCurrentValue(id);
+    std::string o = "{\n  \"" + sec + "\": {\n";
+    if (val.empty())
+        o += "    // \"" + leaf + "\": " + (def->sample ? def->sample : "...") +
+             "   // currently the default; delete the key to keep it that way\n";
+    else
+        o += "    \"" + leaf + "\": " + val + "\n";
+    o += "  }\n}\n";
+    return o;
+}
+
 static std::vector<PrefRow> settingsPrefRows() {
     std::vector<PrefRow> rows;
     rows.reserve(SETTING_KEY_COUNT);
