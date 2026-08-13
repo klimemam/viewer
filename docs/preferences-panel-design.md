@@ -389,7 +389,7 @@ prefs.txt を書くテストが共有 home を汚してはならない。
   `-1` は rejected 1 / 値不変 (導出: 判断8、キー単位で断る)。
 - **単独の意味**: measuring 節が初めて読まれ、判断10/11 の形が実物になる。
 
-### 段2e — watch の2キー (要裁定 P11)
+### 段2e — watch の2キー (**裁定済 2026-08-13: 昇格する**)
 
 - 入るもの: `loading.watchFiles` / `loading.watchAutoReload` を
   `SETTING_KEYS` に `SS_Read` で追加し、パネルの loading 節に行を足す。
