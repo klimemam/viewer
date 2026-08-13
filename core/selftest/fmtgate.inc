@@ -863,6 +863,51 @@
                     check(has(onNpy, "states its own shape"),
                           "P8 a recipe on a self-describing file is refused, not dropped");
                 }
+                // ---- P7b: SCAN folds a headerless folder too (#148) ----------
+                // The other half of "one folder, two answers depending on the
+                // door". The single-file door opened for headerless at
+                // protocol 11; the LISTING still asked peerServes, so a folder
+                // of thirty .raw files that Open Folder bundles came back from
+                // the peer as nothing at all - the very defect this issue is
+                // named after, surviving in the one format that had just been
+                // taught to cross.
+                //
+                // Gated on the CLIENT's number, so P9's v10 peer is not the
+                // test for it: what has to be checked is that a client which
+                // cannot send a recipe is not offered a group it cannot open.
+                {
+                    std::error_code sec;
+                    std::filesystem::path sdir =
+                        std::filesystem::temp_directory_path(sec) / "viewer_rawscan";
+                    std::filesystem::remove_all(sdir, sec);
+                    std::filesystem::create_directories(sdir, sec);
+                    std::vector<uint16_t> sp((size_t)8 * 6, 1000);
+                    for (int f = 1; f <= 4; f++) {
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "shot_%03d.raw", f);
+                        std::ofstream sf(pathFromUtf8((sdir / nm).u8string()),
+                                         std::ios::binary);
+                        sf.write((const char*)sp.data(), (std::streamsize)(sp.size() * 2));
+                    }
+                    std::string sroot = sdir.u8string();
+                    std::replace(sroot.begin(), sroot.end(), '\\', '/');
+                    std::vector<remote::ScanGroup> gs;
+                    bool trunc = false;
+                    int skipped = 0;
+                    std::string e5;
+                    const bool got = S.scan(sroot, 4, 64, gs, trunc, skipped, e5);
+                    fprintf(stderr, "fmtgateselftest:   P7b SCAN a .raw folder: ok=%d "
+                                    "groups=%zu%s%s\n",
+                            got ? 1 : 0, gs.size(), e5.empty() ? "" : " err=", e5.c_str());
+                    for (const auto& g : gs)
+                        fprintf(stderr, "fmtgateselftest:     group \"%s\" x%zu\n",
+                                g.entry.name.c_str(), g.entry.members.size());
+                    check(got && gs.size() == 1 && gs[0].entry.members.size() == 4 &&
+                          has(gs[0].entry.name, ".raw"),
+                          "P7b the peer folds shot_001..004.raw into ONE stack group");
+                    std::filesystem::remove_all(sdir, sec);
+                }
+
                 // ---- P8b: MEASURE over a headerless STACK --------------------
                 // The remote's whole reason, applied to raw: 8 frames' worth of
                 // statistics cross as a few hundred bytes instead of as pixels.

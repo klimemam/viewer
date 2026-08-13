@@ -650,6 +650,22 @@ static bool readRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& ou
 // that never said hello (none of ours) on the safe format.
 static uint32_t g_clientVersion = 2;
 
+// ...and the set a SCAN may fold into stacks, which is wider since protocol 11:
+// a headerless file has an answer here as soon as the request that opens it
+// carries a recipe, so a listing that hid it would say "there is nothing here"
+// about a folder the very next double-click opens (verify-matrix G1 / #148).
+//
+// GATED ON THE CLIENT'S OWN NUMBER, not on this peer's. A v10 client cannot
+// send a recipe, so a group row of .raw files would arrive somewhere it cannot
+// be opened - a listing offering an open that is refused is the defect this
+// gate exists to avoid, pointed the other way. g_clientVersion is what HELLO
+// left behind, so no new plumbing is needed: the fact was already here.
+static bool isScannableSuffix(const std::string& name) {
+    if (isServedSuffix(name)) return true;
+    return g_clientVersion >= 11 && imagefile::isHeaderless(name);
+}
+
+
 // VIEWER_SERVE_PROTOCOL: serve as an OLDER peer. The same kind of seam
 // VIEWER_SERVE_LAG_MS already is - "a real link's latency, on demand" - and it
 // is not a claim but a behaviour: this peer announces the lower number in HELLO
@@ -734,7 +750,7 @@ struct SeqGroup {
 // complaint). Matches the client's segment-based sibling scan in spirit;
 // '?' in the pattern because the client renders it in ImGui labels.
 static bool seqSegKey(const std::string& name, std::string& key, std::string& pattern) {
-    if (!isServedSuffix(name)) return false;
+    if (!isScannableSuffix(name)) return false;
     // The EXTENSION rides in the key, so two formats in one folder never land
     // in one group: dark_001.png and dark_001.npy are different files of the
     // same scene, and a stack that mixed them would average two readings of it.
@@ -1165,7 +1181,7 @@ static void handleScan(Buf& in) {
     [&](ScanState& files, const std::filesystem::directory_entry& it, bool isDir) {
         std::error_code fec;
         if (!isDir && it.is_regular_file(fec) &&
-            isServedSuffix(it.path().filename().u8string())) {
+            isScannableSuffix(it.path().filename().u8string())) {
             files.push_back({ it.path().filename().u8string(), it.path() });
         }
     }, [&](const std::filesystem::path& curDir, ScanState& files) {
