@@ -1479,12 +1479,20 @@ struct FrameSource {
     bool perFile = false;
     uint32_t count = 0;
     std::string err;
+    // The declared geometry, when the frames are headerless (protocol 11). One
+    // recipe for the whole request: every frame of a stack is the same picture
+    // measured again (docs/terminology.md), so a per-frame geometry would not
+    // be a stack at all. A SET names several stacks and is refused for exactly
+    // that reason, on the client, before it is sent.
+    const RawWire* recipe = nullptr;
 
-    bool init(const MeasureReqHead& h, const std::vector<std::string>& p) {
+    bool init(const MeasureReqHead& h, const std::vector<std::string>& p,
+              const RawWire* rec) {
         head = &h;
         paths = &p;
+        recipe = rec;
         perFile = p.size() > 1;
-        if (!openServed(n, p[0], err)) return false;
+        if (!openServed(n, p[0], err, NR_NATIVE, recipe)) return false;
         if (perFile) {
             count = (uint32_t)p.size();
         } else {
@@ -1511,7 +1519,7 @@ struct FrameSource {
         r.x = rx; r.y = ry; r.w = rw; r.h = rh; r.step = 1;
         if (perFile) {
             ServedFile f;
-            if (!openServed(f, (*paths)[i], err)) return false;
+            if (!openServed(f, (*paths)[i], err, NR_NATIVE, recipe)) return false;
             if (f.w != n.w || f.h != n.h || f.ch != n.ch || f.dtype != n.dtype) {
                 err = "frame " + std::to_string(i) + " differs in shape/dtype";
                 return false;
@@ -1596,9 +1604,9 @@ static void sendMeasureReply(uint32_t framesUsed,
 // the two on the same stack rather than trusting that they look alike.
 static void runTemporalStats(const MeasureReqHead& head,
                              const std::vector<std::string>& paths,
-                             const std::vector<RoiRect>& rois) {
+                             const std::vector<RoiRect>& rois, const RawWire* rec) {
     FrameSource src;
-    if (!src.init(head, paths)) { sendErr(src.err); return; }
+    if (!src.init(head, paths, rec)) { sendErr(src.err); return; }
     if (src.count < 2) { sendErr("temporal stats needs at least 2 frames"); return; }
     if (head.cfaType && src.n.ch != 1) {
         sendErr("CFA planes need a 1-channel frame");   // planes over RGB = nonsense
@@ -1727,9 +1735,9 @@ static void runTemporalStats(const MeasureReqHead& head,
 // linearity curves, ~50 KB for 300 frames x 5 ROIs instead of gigabytes.
 static void runFrameRoiStats(const MeasureReqHead& head,
                              const std::vector<std::string>& paths,
-                             const std::vector<RoiRect>& rois) {
+                             const std::vector<RoiRect>& rois, const RawWire* rec) {
     FrameSource src;
-    if (!src.init(head, paths)) { sendErr(src.err); return; }
+    if (!src.init(head, paths, rec)) { sendErr(src.err); return; }
     if (head.cfaType && src.n.ch != 1) {
         sendErr("CFA planes need a 1-channel frame");
         return;
@@ -1838,7 +1846,7 @@ static bool foldOneRole(const MeasureReqHead& head, const std::vector<std::strin
     h.frame0 = rq.frame0;              // and a set's roles each have their own
     h.frameCount = rq.frameCount;
     FrameSource src;
-    if (!src.init(h, paths)) { err = "\"" + rq.role + "\": " + src.err; return false; }
+    if (!src.init(h, paths, nullptr)) { err = "\"" + rq.role + "\": " + src.err; return false; }
     F.role = rq.role;
     F.frames = src.count;
     F.w = (int)src.n.w; F.h = (int)src.n.h; F.ch = (int)src.n.ch;
@@ -2245,7 +2253,7 @@ static bool runStackAnalyzerOn(const StackAnalyzerPluginInfo& sa,
                                uint32_t& framesUsed, uint32_t& expected,
                                std::string& err) {
     FrameSource src;
-    if (!src.init(head, paths)) { err = src.err; return false; }
+    if (!src.init(head, paths, nullptr)) { err = src.err; return false; }
     const uint32_t n = src.count;
     // N is what the PEER can count, and nothing more: the frames the file
     // declares it holds (or the files it was handed). §10 says the partial-load
@@ -2449,8 +2457,21 @@ static void handleMeasure(Buf& in) {
         r.x = v[0]; r.y = v[1]; r.w = v[2]; r.h = v[3];
     }
 
-    if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois); return; }
-    if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois); return; }
+    // The recipe, read AFTER the rois so nothing an older op parses moved, and
+    // announced by a BIT rather than by "bytes remain" - MEASURE already has
+    // op-dependent blocks back here (the parity block, the role block), so the
+    // position is fixed and the presence is declared. `flags` was reserved-0,
+    // which is what every v10 and older client writes.
+    RawWire mrw{}; bool haveMrw = false;
+    if (head.flags & MRF_RAW_RECIPE) {
+        if (in.rd + sizeof mrw > in.b.size()) { sendErr("bad MEASURE raw recipe"); return; }
+        memcpy(&mrw, in.b.data() + in.rd, sizeof mrw);
+        in.rd += sizeof mrw;
+        haveMrw = true;
+    }
+    const RawWire* mrwp = haveMrw ? &mrw : nullptr;
+    if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois, mrwp); return; }
+    if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois, mrwp); return; }
     if (head.op == MOP_PLUGIN_ANALYZE) {
         // The parity block, read AFTER the rois so that nothing an older op
         // parses moved. A truncated one is a bad request, not a parity failure:

@@ -281,7 +281,7 @@ struct MeasureReqHead {
     uint32_t cfaType, cfaPattern;// psCfaType / psCfaPattern values
     float    black, white;       // display-range hint handed to the analyzer
     uint32_t nPaths, nRois;
-    uint32_t flags;              // reserved, 0
+    uint32_t flags;              // MRF_RAW_RECIPE: a RawWire follows the rois
 };
 
 // Reply (MSG_OK): a serialization of exactly what the plugin sink emitted, so

@@ -781,6 +781,24 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     // and not measure it would be the same two-answers defect one level down.
     for (const auto& p : q.paths)
         if (!formatServable(p, err)) return false;
+    // A headerless stack: the same two ways to be wrong the open door refuses,
+    // asked once for the request rather than per path (one recipe, one stack).
+    if (!q.paths.empty() && !recipeServable(q.paths.front(),
+                                            q.hasRecipe ? &q.recipe : nullptr, err))
+        return false;
+    // ...and the ops this grammar cannot carry a recipe FOR. Refused before it
+    // is sent, and by name, because the peer's own answer would be "not a .npy
+    // file" about a file that is not the problem. The plugin ops put their own
+    // block behind the rois and a set names several stacks - one recipe per
+    // request cannot say either, and approximating it is how a measurement gets
+    // made over the wrong bytes and looks perfectly normal.
+    if (q.hasRecipe && q.op != rp::MOP_TEMPORAL_STATS && q.op != rp::MOP_FRAME_ROI_STATS) {
+        err = "this measurement names several stacks or carries its own block, and "
+              "this build sends ONE raw recipe per request - so a headerless file "
+              "cannot be measured this way yet. Run it on copied files, or use the "
+              "per-frame and temporal statistics, which do carry a recipe.";
+        return false;
+    }
     for (const auto& r : q.roles)                 // MOP_SET_FOLD ignores q.paths
         for (const auto& p : r.paths)
             if (!formatServable(p, err)) return false;
@@ -824,6 +842,7 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
         for (const auto& r : q.roles) total += r.paths.size();
         head.nPaths = (uint32_t)total;
     }
+    if (q.hasRecipe) head.flags |= rp::MRF_RAW_RECIPE;
     w.blob(&head, sizeof head);
     if (q.op == rp::MOP_SET_FOLD) {
         for (const auto& r : q.roles)
@@ -837,6 +856,10 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
         w.u32((uint32_t)std::max(0, r.x)); w.u32((uint32_t)std::max(0, r.y));
         w.u32((uint32_t)std::max(0, r.w)); w.u32((uint32_t)std::max(0, r.h));
     }
+    // the recipe, right after the rois - the position handleMeasure reads it
+    // from, and declared by the head's bit rather than by "bytes remain",
+    // because two other blocks already live back here.
+    if (q.hasRecipe) w.blob(&q.recipe, sizeof q.recipe);
     // the parity block, last, so that the three older ops send the same bytes
     // they always sent (remote_proto.h)
     if (q.op == rp::MOP_PLUGIN_ANALYZE) {

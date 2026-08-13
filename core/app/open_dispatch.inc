@@ -486,6 +486,22 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     } else {
         j.url = si->remoteUrl;        // already carries its port
     }
+    // A headerless stack declares its geometry on every request, so the
+    // measurement carries the SAME six numbers the open did - read off the
+    // stack's own head document, which is where they were recorded (§6.2). A
+    // measurement made under a different recipe than the picture on screen
+    // would be a number about other pixels, wearing this stack's name.
+    for (const auto& d : app.images)
+        if (d->seqId == seqId && d->src->rawDtype >= 0) {
+            RawDialog rd;
+            rd.dtype = d->src->rawDtype; rd.interp = d->src->rawInterp;
+            rd.w = d->src->srcW > 0 ? d->src->srcW : d->w;
+            rd.h = d->src->srcH > 0 ? d->src->srcH : d->h;
+            rd.offset = d->src->rawOffset; rd.littleEndian = d->src->rawLE;
+            j.recipe = rawWireFrom(rd);
+            j.hasRecipe = true;
+            break;
+        }
     mEnqueue(std::move(j));
 }
 static void maybeRequestServerTemporal(int seqId) {

@@ -450,6 +450,8 @@ static void mWorker() {
                 else                   q.paths = job.files;   // one file per frame
                 if (job.rw > 0 && job.rh > 0)
                     q.rois.push_back({ job.rx, job.ry, job.rw, job.rh });
+                q.hasRecipe = job.hasRecipe;
+                q.recipe = job.recipe;
                 if (!ses.measure(q, d.res, err)) d.err = err;
                 else d.ok = true;
             }

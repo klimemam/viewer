@@ -1335,9 +1335,14 @@ struct App {
     // (main.cpp: "how the peer is invoked, frozen NOW: the UI thread edits
     // remoteExe freely"). A worker reading app.remoteExe while the Start Remote
     // dialog assigns it is a data race on a std::string.
+    // hasRecipe/recipe: the declared geometry of a HEADERLESS stack (protocol
+    // 11). Carried on the job rather than looked up on the worker thread,
+    // because the stack's documents live on the UI thread and the worker holds
+    // no pointer into app state - the same rule the rest of this struct follows.
     struct MJob { std::string url; int op; uint64_t token; std::vector<std::string> files;
                   int cfaType = 0, cfaPattern = 0; float black = 0, white = 1;
-                  int rx = 0, ry = 0, rw = 0, rh = 0; std::string exe; };
+                  int rx = 0, ry = 0, rw = 0, rh = 0; std::string exe;
+                  bool hasRecipe = false; rp::RawWire recipe{}; };
     struct MDone { uint64_t token; bool ok = false; std::string err, host;
                    remote::MeasureResult res; };
     std::thread mThread;

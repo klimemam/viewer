@@ -863,6 +863,71 @@
                     check(has(onNpy, "states its own shape"),
                           "P8 a recipe on a self-describing file is refused, not dropped");
                 }
+                // ---- P8b: MEASURE over a headerless STACK --------------------
+                // The remote's whole reason, applied to raw: 8 frames' worth of
+                // statistics cross as a few hundred bytes instead of as pixels.
+                // The frames are written HERE so sigma_t has a closed form -
+                // pixel (x,y) alternates mean+d, mean-d, so with ddof=1 (#57
+                // item 3, and the same estimator the local model uses)
+                //
+                //   var = sum (v - mean)^2 / (N-1) = N*d^2/(N-1)
+                //   sigma_t = d * sqrt(N/(N-1)) = 8 * sqrt(8/7) = 8.5523597...
+                //
+                // and every pixel has the same one, so no sampling grid or
+                // plane split can move it.
+                {
+                    const int MW = 8, MH = 6, MN = 8, MD = 8;
+                    std::vector<std::string> frames;
+                    for (int f = 0; f < MN; f++) {
+                        std::vector<uint16_t> fp((size_t)MW * MH);
+                        for (size_t i = 0; i < fp.size(); i++)
+                            fp[i] = (uint16_t)(1000 + (f % 2 ? -MD : MD));
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "m_%03d.raw", f);
+                        const std::string fpath = (rdir / nm).u8string();
+                        std::ofstream mf(pathFromUtf8(fpath), std::ios::binary);
+                        mf.write((const char*)fp.data(), (std::streamsize)(fp.size() * 2));
+                        frames.push_back(fpath);
+                    }
+                    remote::MeasureReq q;
+                    q.op = rp::MOP_TEMPORAL_STATS;
+                    q.paths = frames;
+                    q.hasRecipe = true;
+                    q.recipe = rw;
+                    q.recipe.offset = 0;            // these carry no header
+                    remote::MeasureResult res;
+                    std::string me;
+                    const bool got = S.measure(q, res, me);
+                    double sigT = -1;
+                    for (const auto& col : res.cols)
+                        for (const auto& it : col)
+                            if (it.key.find("sigma_t") != std::string::npos ||
+                                it.key == "sigma_temporal") sigT = it.num;
+                    const double want = (double)MD * sqrt((double)MN / (MN - 1.0));
+                    fprintf(stderr, "fmtgateselftest:   P8b MEASURE over raw: ok=%d "
+                                    "frames=%d sigma_t=%.9g (want %.9g)%s%s\n",
+                            got ? 1 : 0, res.framesUsed, sigT, want,
+                            me.empty() ? "" : "  err=", me.c_str());
+                    check(got && res.framesUsed == MN,
+                          "P8b the peer measures a headerless stack under one recipe");
+                    check(sigT > 0 && fabs(sigT - want) < 1e-4,
+                          "P8b ...and sigma_t is the closed form (ddof=1)");
+                    // ...and the ops this grammar cannot carry a recipe for are
+                    // refused BEFORE the request goes out. A set names several
+                    // stacks; one recipe per request cannot say that, and
+                    // approximating it measures the wrong bytes convincingly.
+                    remote::MeasureReq bad = q;
+                    bad.op = rp::MOP_SET_FOLD;
+                    std::string be;
+                    const bool sent = S.measure(bad, res, be);
+                    fprintf(stderr, "fmtgateselftest:   P8b set fold: sent=%d \"%s\"\n",
+                            sent ? 1 : 0, be.c_str());
+                    check(!sent && has(be, "recipe"),
+                          "P8b an op that cannot carry a recipe is refused before sending");
+                    for (const auto& f : frames)
+                        std::filesystem::remove(pathFromUtf8(f), rec);
+                }
+
                 // ---- P9: a peer that predates the carried recipe ------------
                 // Not a thought experiment: a v10 peer, on this disk, refused
                 // BEFORE the request is sent, from the number it announced.

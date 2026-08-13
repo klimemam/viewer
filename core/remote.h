@@ -105,6 +105,14 @@ struct MeasureReq {
     int target = 0;                   // rp::MeasureTarget: frame or stack
     struct Roi { int x = 0, y = 0, w = 0, h = 0; };
     std::vector<Roi> rois;            // empty = whole frame
+    // The declared geometry, when the frames are HEADERLESS (protocol 11). One
+    // recipe for the whole request: every frame of a stack is the same picture
+    // measured again (docs/terminology.md), so a per-frame geometry would not
+    // be a stack. A SET names several stacks and could need one per role, which
+    // this grammar cannot say - so it is refused rather than approximated
+    // (docs/remote-headerless-design.md §7.3).
+    bool hasRecipe = false;
+    rp::RawWire recipe{};
     // MOP_SET_FOLD only. A set is {role: stack}, and the flat `paths` list
     // above cannot say where one stack stops - so the roles carry their own
     // paths and their own frame range, and `paths` is IGNORED for this op
