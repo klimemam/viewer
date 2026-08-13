@@ -841,6 +841,69 @@ static int settingsSelftest() {
               "T4 reading settings.jsonc writes nothing to prefs.txt");
     }
 
+    // ---- O1..O4: WHO decides this value (docs/preferences-panel-design.md §5)
+    // #50's symptom is "I set it and it did not take". Four layers can decide a
+    // key and until now nothing could say which one did - so the Preferences
+    // panel's first requirement is not a widget, it is an answer.
+    //
+    // Only the two SPEAKING layers are recorded. A file line and a flag NAME a
+    // key; "the default" and "this machine" are what is LEFT and are told apart
+    // by the value. Asserting all four here is what pins that split.
+    {
+        baseline();
+        // the file names exactly one key, at a line this test controls
+        const std::string op = writeFix("// a comment, so the line number is not 1\n"
+                                        "{ \"appearance\": { \"showFps\": true } }\n");
+        loadSettingsFrom(op);
+        // ...and a flag names another. parseCli is not run here (it would eat
+        // this process's argv), so the ledger call it makes is made directly -
+        // the same one line, from the same helper.
+        settingsOriginCli(SK_policy, "--remote-policy");
+        // compact: baseline() is the state prefs.txt would leave, and it holds
+        // false while the built-in default is true. Derivation: no speaking
+        // layer + settingsCurrentValue non-empty = this machine.
+        app.compactUi = false;
+        const OriginEntry& oFps  = settingsOriginOf(SK_showFps);
+        const OriginEntry& oPol  = settingsOriginOf(SK_policy);
+        const OriginEntry& oComp = settingsOriginOf(SK_compact);
+        const OriginEntry& oDrag = settingsOriginOf(SK_dragPans);
+        fprintf(stderr, "settingsselftest: O showFps=%d line=%d | policy=%d flag=%s | "
+                        "compact=%d value=\"%s\" | dragPans=%d value=\"%s\"\n",
+                (int)oFps.who, oFps.line, (int)oPol.who,
+                oPol.cliFlag ? oPol.cliFlag : "-",
+                (int)oComp.who, settingsCurrentValue(SK_compact).c_str(),
+                (int)oDrag.who, settingsCurrentValue(SK_dragPans).c_str());
+        check(oFps.who == SetOrigin::File && oFps.line == 2,
+              "O1 a key the file set names the FILE and the line it is on");
+        check(oPol.who == SetOrigin::Cli && oPol.cliFlag &&
+              std::string(oPol.cliFlag) == "--remote-policy",
+              "O2 a key a flag set names the FLAG (a flag beats the file)");
+        check(oComp.who == SetOrigin::None && !settingsCurrentValue(SK_compact).empty(),
+              "O3 a key only prefs.txt moved has no speaker, and is not the default");
+        check(oDrag.who == SetOrigin::None && settingsCurrentValue(SK_dragPans).empty(),
+              "O3 ...and an untouched key has no speaker AND is the default");
+        // A key the file NAMES and this build REFUSES decided nothing. Without
+        // this the panel would badge a row "settings.jsonc decides it" and send
+        // the operator to edit a line that did not take.
+        baseline();
+        const std::string bad = writeFix("{ \"appearance\": { \"accent\": \"purple\" } }\n");
+        const SettingsReport br = loadSettingsFrom(bad);
+        const OriginEntry& oAcc = settingsOriginOf(SK_accent);
+        fprintf(stderr, "settingsselftest: O4 refused key: rejected=%d origin=%d\n",
+                br.rejected, (int)oAcc.who);
+        check(br.rejected == 1 && oAcc.who == SetOrigin::None,
+              "O4 a key the file named and this build refused claims nothing");
+        // ...and the ledger is about THIS read: a second load whose file is
+        // silent about showFps must not leave the old claim standing.
+        loadSettingsFrom(writeFix("{ \"appearance\": { \"pixelGrid\": true } }\n"));
+        fprintf(stderr, "settingsselftest: O4 after a second read: showFps=%d grid=%d\n",
+                (int)settingsOriginOf(SK_showFps).who,
+                (int)settingsOriginOf(SK_pixelGrid).who);
+        check(settingsOriginOf(SK_showFps).who == SetOrigin::None &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::File,
+              "O4 a reload forgets what the previous file said");
+    }
+
     baseline();
     std::filesystem::remove_all(root, ec);
     fprintf(stderr, "settingsselftest: %s\n", ok ? "ok" : "FAILED");

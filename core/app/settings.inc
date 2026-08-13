@@ -563,6 +563,83 @@ struct SettingsReport {
 };
 
 static SettingsReport g_settings;     // what the last load said
+
+// ---- the origin ledger (docs/preferences-panel-design.md §5.2) --------------
+// WHO decided the value this key currently has. Four layers can
+// (defaults < prefs.txt < settings.jsonc < CLI), and #50's symptom is exactly
+// that a user cannot see which one won: they change a thing, it works, they
+// restart, it is back, and nothing ever said why.
+//
+// Only the two SPEAKING layers are recorded. A file or a flag NAMES a key -
+// that is a fact about the request and it is knowable. "The default" and "this
+// machine" are not statements anybody made; they are what is left, and they are
+// told apart by the VALUE (settingsCurrentValue() empty = the default). Storing
+// them here would be storing a derivation, which goes stale the moment the
+// value moves.
+//
+// This is NOT SettingsReport::overrode, which stays. That list answers "what
+// did the file CHANGE" (prefs held something else); this answers "who decides
+// it now". A key the file sets to the value prefs already had is absent from
+// one and present in the other, and both are right.
+enum class SetOrigin { None, File, Cli };
+struct OriginEntry {
+    SetOrigin who = SetOrigin::None;
+    int line = 0;                     // settings.jsonc line, File only
+    const char* cliFlag = nullptr;    // "--frame", Cli only
+};
+static OriginEntry g_settingsOrigin[SK_defaultUnit + 1];
+
+static void settingsOriginClear() {
+    for (auto& e : g_settingsOrigin) e = OriginEntry{};
+}
+// The FILE spoke. Recorded where the key is applied, so a key the file names
+// and this build refuses (判断8) leaves no claim behind - a refused key did not
+// decide anything.
+static void settingsOriginFile(SKey id, int line) {
+    if (id > SK_None && id <= SK_defaultUnit) {
+        g_settingsOrigin[id].who = SetOrigin::File;
+        g_settingsOrigin[id].line = line;
+        g_settingsOrigin[id].cliFlag = nullptr;
+    }
+}
+// ...and a FLAG spoke, which beats the file (判断13: a temporary override is
+// what the command line is for, and there must not be two truths).
+static void settingsOriginCli(SKey id, const char* flag) {
+    if (id > SK_None && id <= SK_defaultUnit) {
+        g_settingsOrigin[id].who = SetOrigin::Cli;
+        g_settingsOrigin[id].cliFlag = flag;
+        g_settingsOrigin[id].line = 0;
+    }
+}
+static const OriginEntry& settingsOriginOf(SKey id) {
+    static const OriginEntry NONE;
+    return (id > SK_None && id <= SK_defaultUnit) ? g_settingsOrigin[id] : NONE;
+}
+
+// A GUI change to a key the FILE decides is temporary, and the operator has to
+// learn that NOW rather than after the next restart.
+//
+// Stage 1 already says "settings.jsonc overrode N key(s)" once, at startup -
+// but that is a statement about the run that just began, and the toggle whose
+// state will spring back has not been touched yet. By the time the lesson is
+// available the user has restarted, seen the switch return, and concluded the
+// program is broken. This is #50's own symptom ("I set it and it does not
+// stick") produced by the very mechanism that was supposed to end it.
+//
+// Once per key per run: the sentence is a fact about the file, and repeating it
+// on every toggle would train the operator to dismiss it.
+static bool g_stickySaid[SK_defaultUnit + 1];
+static void settingsWarnIfSticky(SKey id, const char* path) {
+    const OriginEntry& e = settingsOriginOf(id);
+    if (e.who != SetOrigin::File) return;
+    if (id > SK_None && id <= SK_defaultUnit) {
+        if (g_stickySaid[id]) return;
+        g_stickySaid[id] = true;
+    }
+    toast("settings.jsonc:" + std::to_string(e.line) + " sets " + path +
+          " - this change is for now only; the file wins at the next start. "
+          "To make it permanent, change or delete that key.", true);
+}
 // The one sentence that has to reach THE SCREEN (§5.3), held until a screen
 // exists. loadSettings() runs before ImGui does - it has to, because the
 // settings decide the title bar and the title bar is chosen while the window is
@@ -1039,6 +1116,7 @@ static void sjApplyDocument(const SjVal& doc, SettingsReport& rep,
                     def->note);
                 continue;
             }
+            const int rejectedBefore = rep.rejected;
             if (def->status == SS_NotHere) {
                 rep.notHere++;
                 rep.notes.push_back(pos(kv.second) + "\"" + path +
@@ -1046,6 +1124,11 @@ static void sjApplyDocument(const SjVal& doc, SettingsReport& rep,
                 continue;
             }
             sjApplyKey(A, *def, kv.second);
+            // ...and WHO said so. After the apply, not before: a value this
+            // build refuses (判断8) decided nothing, and a ledger that claimed
+            // otherwise would put a "settings.jsonc decides this" badge on a
+            // row the file failed to set.
+            if (rep.rejected == rejectedBefore) settingsOriginFile(def->id, kv.second.line);
         }
     }
 }
@@ -1100,6 +1183,12 @@ static SettingsReport loadSettingsRead(const std::string& path) {
 }
 
 static SettingsReport loadSettingsFrom(const std::string& path) {
+    // The ledger is about THIS read. A second load (the selftests do several)
+    // must not leave a key claiming a file that no longer names it - a stale
+    // "settings.jsonc decides this" badge is worse than no badge, because it
+    // sends the operator to edit a line that is not there.
+    settingsOriginClear();
+    for (bool& b : g_stickySaid) b = false;
     SettingsReport r = loadSettingsRead(path);
     // adapter.cpp holds no viewer state on purpose, so it is TOLD rather than
     // reaching in. Told on every path through the read, the refusals included:

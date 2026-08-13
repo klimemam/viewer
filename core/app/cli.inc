@@ -700,6 +700,12 @@ static void parseCli(int argc, char** argv) {
             else if (v == "never") app.seqLoadMode = 2;
             else if (v == "ask") app.seqLoadMode = 0;
             else fprintf(stderr, "--stack expects ask|always|never\n");
+            // ...and the ledger: this flag DECIDES loading.stackPrompt for this
+            // run (判断13 - the command line is the temporary override, and the
+            // Preferences panel has to be able to say so rather than show a
+            // value whose source the operator cannot see).
+            if (v == "always" || v == "never" || v == "ask")
+                settingsOriginCli(SK_stackPrompt, "--stack");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
                    a == "--window-offset") {
             next();                                // consumed in main(), not an error
@@ -814,8 +820,10 @@ static void parseCli(int argc, char** argv) {
             }
             else if (v == "local-fetch" || v == "local") app.procPolicy = App::PolLocalFetch;
             else fprintf(stderr, "--remote-policy expects auto|local-fetch\n");
+            settingsOriginCli(SK_policy, "--remote-policy");
         } else if (a == "--remote-exe") {          // how to invoke the peer over ssh
             app.remoteExe = next();
+            settingsOriginCli(SK_peerExe, "--remote-exe");
         } else if (a == "--mem-budget") {          // GB the stack loader may use
             app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
         } else if (a == "--compare") {
