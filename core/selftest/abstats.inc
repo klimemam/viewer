@@ -287,6 +287,81 @@
         check(app.hist[1].img == B && app.proj[1].img == B,
               "A1 slot 1 names B, not A");
 
+        // ---- A1p: a POI is a region of ONE PIXEL, and Temporal follows it ----
+        // The user report (2026-08-12): "ROI で P をやった場合に Temporal が
+        // ROI 選択のように切り替わらない。一画素の時間遷移を見たいときに困る。"
+        // recomputeTemporalIfNeeded read `a->type == 0` and nothing else, so a
+        // selected POI left the region at the whole frame: pressing P changed
+        // no number on the panel and the trace of one pixel could not be seen
+        // at all.
+        //
+        // The expected values are derived HERE, from the same frames, and the
+        // derivation is the point: for a one-pixel region the per-frame mean IS
+        // the pixel, with no averaging to hide an off-by-one - so an
+        // implementation that quietly kept the whole frame produces a visibly
+        // different series rather than a slightly different one.
+        {
+            const int PX = 5, PY = 3;             // inside every fixture frame
+            const int savedSel = app.selectedAnn;
+            addAnn(1, PX, PY, 0, 0);              // a POI, selected by addAnn
+            App::TemporalState TP;
+            recomputeTemporalIfNeeded(cur(), TP);
+            // what the panel must be plotting: this pixel, frame by frame
+            std::vector<double> want;
+            for (int idx : framesOfSeq(sidA)) {
+                const ImageDoc& fr = *app.images[idx];
+                if (fr.px().empty()) continue;
+                want.push_back(fr.px()[((size_t)PY * fr.w + PX) * fr.ch]);
+            }
+            // sigma_t of one pixel, ddof=1 - the same estimator the model uses
+            // (#57 item 3), written out so this test does not inherit the bug
+            // it is checking for.
+            double mean = 0;
+            for (double v : want) mean += v;
+            mean /= (double)std::max<size_t>(1, want.size());
+            double var = 0;
+            for (double v : want) var += (v - mean) * (v - mean);
+            var = want.size() > 1 ? var / (double)(want.size() - 1) : 0.0;
+            const double wantSigT = sqrt(var);
+            bool traceEq = TP.frameMean.size() == want.size();
+            if (traceEq)
+                for (size_t i = 0; i < want.size(); i++)
+                    if (!relEq(TP.frameMean[i], want[i], 1e-6)) traceEq = false;
+            fprintf(stderr, "abstatsselftest: A1p POI (%d,%d): region %dx%d at (%d,%d) "
+                            "poi=%d roiUsed=%d, %zu point(s) (want %zu), trace equal=%d, "
+                            "sigma_t=%.9g (want %.9g), splitValid=%d sigma_fpn=%.9g\n",
+                    PX, PY, TP.rw, TP.rh, TP.rx, TP.ry, TP.poi ? 1 : 0,
+                    TP.roiUsed ? 1 : 0, TP.frameMean.size(), want.size(),
+                    traceEq ? 1 : 0, TP.tempNoise[0], wantSigT,
+                    TP.splitValid ? 1 : 0, TP.fixedPattern[0]);
+            check(TP.valid && TP.poi && TP.roiUsed && TP.rw == 1 && TP.rh == 1 &&
+                  TP.rx == PX && TP.ry == PY,
+                  "A1p a selected POI makes Temporal's region that one pixel");
+            check(traceEq, "A1p ...and the series IS that pixel, frame by frame");
+            check(relEq(TP.tempNoise[0], wantSigT, 1e-6),
+                  "A1p ...with the pixel's own sigma_t (ddof=1)");
+            // The other half, and the reason this is not just "accept type 1":
+            // sigma_fpn is the SPATIAL spread of the time-averaged frame, so
+            // one pixel has nothing for it to be a spread over. The arithmetic
+            // would hand back a clamped 0, which reads as a finding about the
+            // sensor. It is refused instead.
+            check(!TP.splitValid && TP.fixedPattern[0] == 0 && TP.totalNoise[0] == 0,
+                  "A1p one pixel has no fixed-pattern split, and does not fake one");
+            // anti-vacuity: splitValid is not simply always false. The same
+            // stack with a real rectangle still produces the split.
+            deleteAnn(app.selectedAnn);
+            addAnn(0, 0, 0, 8, 8);
+            App::TemporalState TR;
+            recomputeTemporalIfNeeded(cur(), TR);
+            fprintf(stderr, "abstatsselftest: A1p 8x8 ROI: poi=%d splitValid=%d "
+                            "region %dx%d\n",
+                    TR.poi ? 1 : 0, TR.splitValid ? 1 : 0, TR.rw, TR.rh);
+            check(TR.valid && !TR.poi && TR.splitValid && TR.rw == 8 && TR.rh == 8,
+                  "A1p a rectangle still gets the split (the flag means something)");
+            deleteAnn(app.selectedAnn);
+            app.selectedAnn = savedSel;
+        }
+
         // ---- A2: B's numbers recomputed here, from B's pixels ----
         {
             RefHist R = refHistogram(*B);

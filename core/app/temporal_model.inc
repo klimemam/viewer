@@ -10,12 +10,27 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     std::vector<int> f = framesOfSeq(im->seqId);
     if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
-    bool roiUsed = false;
+    bool roiUsed = false, poi = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) {
             int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
             int cw = std::clamp(a->w, 0, im->w - cx), chh = std::clamp(a->h, 0, im->h - cy);
             if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; roiUsed = true; }
+        } else if (a->type == 1) {
+            // A POI is a region of one pixel, and this panel is the one place
+            // where that is a QUANTITY rather than a degenerate rectangle: a
+            // pixel's value over frames is its time trace, which is what a P is
+            // put down to look at. It used to fall through here and leave the
+            // region at the whole frame, so pressing P changed nothing and the
+            // trace of one pixel had no way to be seen at all.
+            //
+            // Everything downstream already works per region, so a POI needs no
+            // second path - only a rect. What it does need is the sentence
+            // below: one pixel has a sigma_t and does NOT have a fixed-pattern
+            // split, and the difference is not a detail (see splitValid).
+            int cx = std::clamp(a->x, 0, im->w - 1), cy = std::clamp(a->y, 0, im->h - 1);
+            rx = cx; ry = cy; rw = 1; rh = 1;
+            roiUsed = true; poi = true;
         }
     }
     // keyed on the resolved rect; this pass costs samples x frames, so it must
@@ -26,12 +41,12 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     const App::SeqInfo* ksi = seqInfo(im->seqId);
     const int kStackRev = ksi ? ksi->stackRev : 0;
     if (T.seqId == im->seqId && T.frames == (int)f.size() && T.stackRev == kStackRev &&
-        T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh &&
+        T.rx == rx && T.ry == ry && T.rw == rw && T.rh == rh && T.poi == poi &&
         T.cfa == im->cfa && T.cfaPattern == im->cfaPattern)
         return;
     if (app.annBusy && T.seqId == im->seqId) return;
     T.seqId = im->seqId; T.frames = (int)f.size();
-    T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed;
+    T.rx = rx; T.ry = ry; T.rw = rw; T.rh = rh; T.roiUsed = roiUsed; T.poi = poi;
     T.cfa = im->cfa; T.cfaPattern = im->cfaPattern; T.stackRev = kStackRev;
     T.idx.clear(); T.frameMean.clear(); T.frameStd.clear();
     for (int p = 0; p < 4; p++) {
@@ -140,6 +155,22 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     }
     T.nonFinite = nonFinite;
     T.dropped = offs.size() - (plc[0] + plc[1] + plc[2] + plc[3]);
+    // IS THERE A SPLIT TO REPORT? sigma_fpn is the SPATIAL spread of the
+    // time-averaged frame (docs/flat-field-stats.md (b)), so it needs a region
+    // with spatial extent. One pixel has none - and the arithmetic below does
+    // not say so: with a single sample the ddof=1 spatial variance is 0, the
+    // correction is subtracted from it, the result goes negative and is clamped,
+    // and the panel would print "sigma_fpn = 0, clamped". That sentence means
+    // "no fixed pattern resolvable above this stack's temporal floor", which is
+    // a MEASUREMENT. Here there is no measurement to make. The two are refused
+    // differently on purpose (docs/stats-taxonomy.md: a quantity is named by
+    // what it is a spread OVER).
+    //
+    // Stated over the SAMPLE COUNT, not over the annotation type: a 1x1
+    // rectangle ROI is in exactly the same position as a POI and has always
+    // been, so one rule covers both and neither can drift.
+    T.splitValid = true;
+    for (int p = 0; p < T.nPl; p++) if (plc[p] < 2) T.splitValid = false;
     for (int p = 0; p < T.nPl; p++) {
         if (!plc[p]) continue;
         double n = (double)plc[p];
@@ -168,9 +199,10 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         // BOUND after the quantity. At N=16, sigma_t=10 DN a true 5 DN pattern
         // reads 5.59 DN uncorrected.
         double fvar = pvar - corr;
+        T.tempNoise[p] = sqrt(tvar);
+        if (!T.splitValid) continue;    // sigma_t stands; the split does not exist
         T.fpnClamped[p] = fvar < 0.0;   // said out loud below; never a silent 0
         if (fvar < 0.0) fvar = 0.0;
-        T.tempNoise[p] = sqrt(tvar);
         T.fpnCorr[p] = sqrt(corr);      // in DN, so it reads beside sigma_fpn
         T.fixedPattern[p] = sqrt(fvar);
         // sigma_tot's DEFINITION is unchanged (flat-field-stats.md (b)): it is

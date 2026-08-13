@@ -2038,6 +2038,20 @@ struct App {
         // (flat-field-stats.md (a) "0 でクランプし、クランプしたことを結果に出す").
         double fpnCorr[4] = {};
         bool fpnClamped[4] = {};
+        // The region is ONE PIXEL (a POI, or a 1x1 rectangle - the same thing
+        // to every number here). Part of the KEY, not only of the result: a
+        // POI and a 1x1 ROI resolve to the same rect, and without this the
+        // cache would answer one with the other's label.
+        bool poi = false;
+        // Is the temporal / fixed-pattern SPLIT a thing here at all? sigma_fpn
+        // is the spatial spread of the time-averaged frame, so it needs a
+        // region with spatial extent; sigma_t does not. Over a single sample
+        // the arithmetic produces a clamped 0, and "sigma_fpn = 0, clamped"
+        // says "no fixed pattern above this stack's temporal floor" - a
+        // measurement. There is no measurement to make. false means the panel
+        // prints sigma_t and REFUSES the other two by name, rather than
+        // printing zeros that read as findings.
+        bool splitValid = true;
         bool valid = false;
         bool roiUsed = false;
     } temporal[2];                    // 0 = A, 1 = B (compare)

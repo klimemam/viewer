@@ -23,15 +23,34 @@ static const char* FPN_TIP =
 // The four rows every Temporal table prints, with sigma_fpn's declaration.
 // A clamped plane says so IN ITS CELL: the canon's guard rule is that a clamp
 // is never a silent 0 (flat-field-stats.md (a)).
+// `splitValid` false = the region is one pixel, which has a sigma_t and no
+// spatial extent for a fixed-pattern spread to be a spread OVER. The two rows
+// that need one are refused BY NAME instead of printing the zeros the
+// arithmetic produces - a "0 (clamped)" there would read as a finding about
+// the sensor when it is the absence of a measurable quantity.
 static void temporalNoiseRows(int nPl, const double* sigT, const double* fpn,
                               const double* corr, const bool* clamped,
-                              const double* tot) {
+                              const double* tot, bool splitValid = true) {
     auto row = [&](const char* k, const double* v) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
         for (int p = 0; p < nPl; p++) { ImGui::TableNextColumn(); textNum("%.6g", v[p]); }
     };
     row("temporal noise (sigma_t)", sigT);
+    if (!splitValid) {
+        auto absent = [&](const char* k) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k);
+            for (int p = 0; p < nPl; p++) {
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("-");
+            }
+        };
+        absent("fixed pattern (sigma_fpn)");
+        absent("  temporal residual subtracted (fpn_corr)");
+        absent("total (quadrature)");
+        return;
+    }
     ImGui::TableNextRow();
     ImGui::TableNextColumn(); ImGui::TextDisabled("fixed pattern (sigma_fpn)");
     bool hov = ImGui::IsItemHovered();
@@ -47,6 +66,18 @@ static void temporalNoiseRows(int nPl, const double* sigT, const double* fpn,
 }
 
 // ...and the sentence a clamped plane owes the reader, under the table.
+// ...and the sentence a ONE-PIXEL region owes the reader, in place of it.
+static void temporalPointNote() {
+    ImGui::TextColored(AB_AMBER,
+        "one pixel: sigma_t is this pixel's own temporal noise and stands. The "
+        "fixed-pattern\n"
+        "split is the SPATIAL spread of the time-averaged frame "
+        "(docs/flat-field-stats.md (b)),\n"
+        "and one pixel has no spatial extent for it to be a spread over - so it "
+        "is not 0,\n"
+        "it is not measured. Draw a rectangle ROI to get the split back.");
+}
+
 static void temporalClampNote(int nPl, const bool* clamped) {
     std::string pl;
     for (int p = 0; p < nPl; p++)
@@ -409,14 +440,22 @@ static std::string expNum(double v) {
 struct PerFrameBlock {
     int rows = 0, skipped = 0;
     bool roiUsed = false;
+    bool poi = false;                     // the region is one pixel
     int rx = 0, ry = 0, rw = 0, rh = 0;   // the region the rows describe
 };
 static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
     PerFrameBlock res;
     // the ROI convention every other measurement uses: selected rect, else full
     int rx = 0, ry = 0, rw = 0, rh = 0;
-    if (App::Ann* a = findAnn(app.selectedAnn))
+    // ...and a POI is that region with rw = rh = 1. It has to be read here as
+    // well as in recomputeTemporalIfNeeded: the panel and the file it exports
+    // describing different regions is exactly the defect docs/verify-matrix.md
+    // was built to find, and this is the same question asked at two doors.
+    if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; res.roiUsed = true; }
+        else if (a->type == 1) { rx = a->x; ry = a->y; rw = 1; rh = 1;
+                                 res.roiUsed = true; res.poi = true; }
+    }
     std::vector<int> fr = framesOfSeq(seqId);
     // the custom per-frame x axis rides along as its own column, name and unit
     // in the header - the frame column stays: the mapping is BY frame number,
@@ -531,7 +570,7 @@ static void copyPerFrameStats(int seqId) {
     ImGui::SetClipboardText(doc.out.c_str());
     char b[160];
     snprintf(b, sizeof b, "copied %d frame row(s) (%s)%s%s",
-             r.rows, r.roiUsed ? "selected ROI" : "whole frame",
+             r.rows, r.poi ? "selected point" : r.roiUsed ? "selected ROI" : "whole frame",
              r.skipped ? " - " : "",
              r.skipped ? (std::to_string(r.skipped) + " not resident").c_str() : "");
     toast(b, r.skipped != 0);
@@ -546,6 +585,11 @@ struct AbTemporal {
     // the REGION this side measured. A delta between a whole-frame A and an
     // ROI-restricted B is a difference of two different measurements.
     bool roiUsed = false;
+    // ...and whether it is ONE PIXEL. A side measuring a point has a sigma_t
+    // and no fixed-pattern split (see TemporalState::splitValid), so a table
+    // that put a number in that row for it would be inventing one - and a
+    // delta against the other side's real sigma_fpn would be worse.
+    bool poi = false, splitValid = true;
     int rx = 0, ry = 0, rw = 0, rh = 0;
     int nPl = 1;                      // CFA planes are never mixed, on either side
     // sigS is sigma_fpn - the CORRECTED one (#57 judgment 2). sigCorr is what
@@ -582,7 +626,7 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
     if (T.valid && T.seqId == d->seqId) {
         o.valid = true;
         o.nPl = T.nPl;
-        o.roiUsed = T.roiUsed;
+        o.roiUsed = T.roiUsed; o.poi = T.poi; o.splitValid = T.splitValid;
         o.rx = T.rx; o.ry = T.ry; o.rw = T.roiUsed ? T.rw : 0; o.rh = T.roiUsed ? T.rh : 0;
         for (int p = 0; p < T.nPl; p++) {
             o.sigT[p] = T.tempNoise[p]; o.sigS[p] = T.fixedPattern[p];
@@ -681,7 +725,8 @@ static std::vector<TExpSide> temporalExportSides() {
 static std::string expRegionTemporal(const TExpSide& s) {
     if (!s.t.valid) return "-";
     char b[96];
-    if (s.t.roiUsed) snprintf(b, sizeof b, "ROI (%d,%d) %dx%d", s.t.rx, s.t.ry, s.t.rw, s.t.rh);
+    if (s.t.poi)     snprintf(b, sizeof b, "point (%d,%d)", s.t.rx, s.t.ry);
+    else if (s.t.roiUsed) snprintf(b, sizeof b, "ROI (%d,%d) %dx%d", s.t.rx, s.t.ry, s.t.rw, s.t.rh);
     else snprintf(b, sizeof b, "whole image (%dx%d)", s.doc->w, s.doc->h);
     return b;
 }
@@ -818,8 +863,11 @@ static std::string buildTemporalExport(char delim) {
             doc.row({ s.letter, s.t.nPl > 1 ? LIN_PLANES[p] : "all",
                       std::to_string(s.t.frames),
                       std::to_string(std::max(s.t.expected, s.t.frames)),
-                      expNum(s.t.sigT[p]), expNum(s.t.sigS[p]), expNum(s.t.sigTot[p]),
-                      expNum(s.t.sigCorr[p]), s.t.clamped[p] ? "yes" : "no",
+                      expNum(s.t.sigT[p]),
+                      s.t.splitValid ? expNum(s.t.sigS[p]) : std::string("-"),
+                      s.t.splitValid ? expNum(s.t.sigTot[p]) : std::string("-"),
+                      s.t.splitValid ? expNum(s.t.sigCorr[p]) : std::string("-"),
+                      s.t.splitValid ? (s.t.clamped[p] ? "yes" : "no") : "-",
                       src });
         }
     }
@@ -1330,12 +1378,28 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             snprintf(k3, sizeof k3, "  temporal residual subtracted (fpn_corr) %s", sfx);
             snprintf(k4, sizeof k4, "total (quadrature) %s", sfx);
             row(k1, A.sigT[p], B.sigT[p], false);
-            row(k2, A.sigS[p], B.sigS[p], false);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FPN_TIP);
-            row(k3, A.sigCorr[p], B.sigCorr[p], false);
-            row(k4, A.sigTot[p], B.sigTot[p], false);
+            // A side measuring ONE PIXEL has no fixed-pattern split, and its
+            // zeros are not a number to put in a column or to subtract in a
+            // delta. Both sides have to have one, or these three rows are not
+            // comparing the same quantity (TemporalState::splitValid).
+            if (A.splitValid && B.splitValid) {
+                row(k2, A.sigS[p], B.sigS[p], false);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", FPN_TIP);
+                row(k3, A.sigCorr[p], B.sigCorr[p], false);
+                row(k4, A.sigTot[p], B.sigTot[p], false);
+            }
         }
         ImGui::EndTable();
+    }
+    if (!A.splitValid || !B.splitValid) {
+        char pb[192];
+        snprintf(pb, sizeof pb,
+                 "no fixed-pattern rows: %s measured ONE PIXEL, which has a "
+                 "sigma_t and no\nspatial extent for a fixed-pattern spread to "
+                 "be a spread over. sigma_t above stands.",
+                 !A.splitValid && !B.splitValid ? "both sides"
+                                                : (!A.splitValid ? "A" : "B"));
+        ImGui::TextColored(AB_AMBER, "%s", pb);
     }
     // A clamp is a property of ONE side's measurement, so it is named with its
     // side - a delta column beside a clamped 0 is a difference against a bound,
@@ -1703,6 +1767,7 @@ static void drawPanelTemporal() {
                                T.frames, expected);
         else
             ImGui::TextDisabled("[local, %d frames, %s, %s]", T.frames,
+                                T.poi ? "selected point" :
                                 T.roiUsed ? "selected ROI" : "whole image",
                                 T.nPl > 1 ? "CFA planes" : "plane=all");
         ImGui::SameLine();
@@ -1729,10 +1794,11 @@ static void drawPanelTemporal() {
                 // §3.2 asks the NAMES to prevent. One name, and it is the
                 // canon's (docs/terminology.md).
                 temporalNoiseRows(T.nPl, T.tempNoise, T.fixedPattern, T.fpnCorr,
-                                  T.fpnClamped, T.totalNoise);
+                                  T.fpnClamped, T.totalNoise, T.splitValid);
                 ImGui::EndTable();
             }
-            temporalClampNote(T.nPl, T.fpnClamped);
+            if (!T.splitValid) temporalPointNote();
+            else               temporalClampNote(T.nPl, T.fpnClamped);
             // the same row the server emits: excluded, and how many. A silent
             // exclusion is only half of not folding them in.
             if (T.nonFinite || T.dropped)
@@ -1772,7 +1838,8 @@ static void drawPanelTemporal() {
             // the per-frame mean is a LEVEL, not a noise statistic, so it is
             // legitimately pooled - but it still has to say so next to a table
             // that is split by plane
-            snprintf(yl, sizeof yl, "%s mean value (%s%s)", T.roiUsed ? "ROI" : "frame",
+            snprintf(yl, sizeof yl, "%s value (%s%s)",
+                     T.poi ? "pixel" : T.roiUsed ? "ROI mean" : "frame mean",
                      abValueUnit(im->dtype).c_str(), T.nPl > 1 ? ", plane=all" : "");
             float tAvail = ImGui::GetContentRegionAvail().y
                          - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
