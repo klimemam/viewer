@@ -399,6 +399,18 @@ static std::string servedList() {
     return s;
 }
 
+// ---- headerless RAW: the files that state nothing about themselves ---------
+// See imagefile.h. One array, in the home both binaries compile.
+const std::vector<std::string>& headerlessExts() {
+    static const std::vector<std::string> E = { ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+    return E;
+}
+bool isHeaderless(const std::string& path) {
+    const std::string e = lowerExt(path);
+    for (const std::string& x : headerlessExts()) if (e == x) return true;
+    return false;
+}
+
 std::string peerRefusal(const std::string& path) {
     if (peerServes(path)) return {};
     // Named, reasoned, way out attached - docs/input-adapters.md §3.2's three
@@ -422,6 +434,27 @@ std::string peerRefusal(const std::string& path) {
     if (lowerExt(path) == ".npz")
         return ".npz is read on this machine, but the peer serves one array per "
                "file, not a container" + std::string(WAY_OUT);
+    // A headerless RAW. It reaches the fall-through below today and gets the
+    // generic list, which is the defect verify-matrix G1 named: nobody DECIDED
+    // that headerless files cannot cross the link, they fell off the end of a
+    // table they were correctly never in.
+    //
+    // What is true right now is narrower and more useful than "the peer serves
+    // these formats": the shape of this file is a DECLARATION that lives on
+    // this machine, and this protocol has no field to carry it. Say that, and
+    // name the door that does work. This is one step more specific than the
+    // fall-through, which is the whole reason this branch exists - and it is
+    // still the LINK's limit rather than a claim about the file, which is the
+    // rule G9 (PR #176) settled.
+    //
+    // The wording changes the day the wire can carry a recipe
+    // (docs/remote-headerless-design.md §4.4, stage 2): then the fact is "this
+    // request carried no recipe", not "this link cannot carry one".
+    if (isHeaderless(path))
+        return "a headerless " + lowerExt(path) + " states its shape in a recipe on "
+               "this machine, and this link cannot yet carry that declaration"
+               "\n  copy the file here and open it with File > Open, or update both "
+               "ends when a recipe-carrying build ships";
     // A container this build refuses BY NAME already has a measured sentence,
     // and it answers the question the operator actually has. Asked first,
     // because the fall-through below can only say what the peer serves - and

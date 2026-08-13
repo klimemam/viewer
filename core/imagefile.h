@@ -223,4 +223,21 @@ std::string dialogPattern();
 // because the two halves of that decision only make sense together.
 std::string videoRefusal(const std::string& path);
 
+// The headerless RAW extensions - the files that state NOTHING about their own
+// shape, so a person has to. Not rows in the table above and never will be: a
+// row means "these bytes decide", and for these the bytes do not (the reason is
+// written out beside the table itself, core/imagefile.cpp).
+//
+// They live HERE, in the one format home BOTH BINARIES compile, rather than in
+// core/app/sequence.inc where PR #175 folded six literals into one. The peer
+// asks the same question - its SCAN grouping and its openServed dispatch both
+// need to know what a headerless name is - and it does not compile
+// sequence.inc. A list only the client can see is the defect #148 removed
+// ("one folder, two answers depending on the door") waiting to be re-made.
+//
+// `.npy` / `.npz` do NOT move with them: those are core/main.cpp's own doors,
+// the peer reads .npy inline and refuses .npz, and that split is unchanged.
+bool isHeaderless(const std::string& path);
+const std::vector<std::string>& headerlessExts();   // ".bin", ".raw", ...
+
 }  // namespace imagefile
