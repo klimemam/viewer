@@ -384,6 +384,89 @@
             check(!generic, "F4d ...instead of the generic list it used to fall to");
         }
 
+        // ---- F4e: the DOOR - a headerless file opened over the link ----------
+        // P8 proved the wire; this proves the door every caller uses. It is the
+        // call the CLI branch makes (`viewer local://.../x.raw --raw-dtype u16
+        // --raw-size 8x6`) and the one stage 4's Browse dialog will make, so
+        // what is asserted here is what a user gets, not what a protocol can do.
+        //
+        // Three things have to be true at once, and the second and third are
+        // the ones a working-pixels test would miss:
+        //   the PIXELS are the bytes that were written;
+        //   the SOURCE carries the recipe - srcIdentityKey's raw branch keys on
+        //     exactly those fields, so two recipes over one url must be two
+        //     residents (docs/reference-design.md §6.2);
+        //   the NOTE declares the whole read - M1, and it has to be the SAME
+        //     sentence the local door writes or one file describes itself two
+        //     ways depending on which end opened it.
+        {
+            closeAll();
+            std::error_code dec;
+            std::filesystem::path ddir =
+                std::filesystem::temp_directory_path(dec) / "viewer_rawdoor";
+            std::filesystem::remove_all(ddir, dec);
+            std::filesystem::create_directories(ddir, dec);
+            const int DW = 8, DH = 6, DHDR = 12;
+            std::vector<uint16_t> px((size_t)DW * DH);
+            for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(i * 7 + 3);
+            const std::string dpath = (ddir / "probe.raw").u8string();
+            {
+                std::ofstream df(pathFromUtf8(dpath), std::ios::binary);
+                const std::vector<uint8_t> junk(DHDR, 0xA5);
+                df.write((const char*)junk.data(), DHDR);
+                df.write((const char*)px.data(), (std::streamsize)(px.size() * 2));
+            }
+            RawDialog rd;
+            rd.dtype = RD_U16; rd.interp = RI_GRAY;
+            rd.w = DW; rd.h = DH; rd.offset = DHDR; rd.littleEndian = true;
+            const rp::RawWire rw = rawWireFrom(rd);
+            std::string url = "local://" + dpath;
+            std::replace(url.begin(), url.end(), '\\', '/');
+            const bool opened = openRemote(url, false, 0, 0, &rw);
+            const ImageDoc* d = app.images.empty() ? nullptr : app.images.front().get();
+            bool same = d && d->w == DW && d->h == DH && d->ch == 1 &&
+                        d->px().size() == px.size();
+            if (same)
+                for (size_t i = 0; i < px.size(); i++)
+                    if (d->px()[i] != (float)px[i]) same = false;
+            const bool keyed = d && d->src->rawDtype == RD_U16 &&
+                               d->src->rawInterp == RI_GRAY &&
+                               d->src->rawOffset == DHDR && d->src->rawLE &&
+                               d->src->srcW == DW && d->src->srcH == DH;
+            const std::string note = d ? d->note : std::string();
+            const bool declared = has(note, "8x6") && has(note, "header 12 B") &&
+                                  has(note, "little-endian") && has(note, "declared");
+            fprintf(stderr, "fmtgateselftest:   F4e remote raw door: opened=%d %dx%d ch%d "
+                            "pixels equal=%d keyed=%d\n"
+                            "fmtgateselftest:   F4e note: \"%s\"\n",
+                    opened ? 1 : 0, d ? d->w : 0, d ? d->h : 0, d ? d->ch : 0,
+                    same ? 1 : 0, keyed ? 1 : 0, note.c_str());
+            check(opened && same,
+                  "F4e a headerless file opens over the link, sample for sample");
+            check(keyed, "F4e ...and the source carries the recipe (identity keys on it)");
+            check(declared, "F4e ...and the note declares the whole read (M1)");
+            // ...and the same url with NO recipe does not quietly open
+            // anything. Over local:// it goes where #111 sends every file this
+            // disk can read - the local door - which for a headerless name is
+            // the dialog that ASKS for the geometry. That is the way out, and
+            // asserting it keeps the two halves of one rule together: a recipe
+            // crosses the link, and the absence of one is a question rather
+            // than a guess. (Over ssh:// there is no local door and the refusal
+            // is F4d's sentence, asserted there.)
+            closeAll();
+            app.toast.clear();
+            rawDlg.open = false;
+            const bool bare = openRemote(url, false, 0, 0, nullptr);
+            fprintf(stderr, "fmtgateselftest:   F4e without a recipe: opened=%d "
+                            "docs=%zu dialog=%d\n",
+                    bare ? 1 : 0, app.images.size(), rawDlg.open ? 1 : 0);
+            check(!bare && app.images.empty() && rawDlg.open,
+                  "F4e ...and with no recipe it asks for the geometry, never guesses");
+            rawDlg.open = false;
+            closeAll();
+            std::filesystem::remove_all(ddir, dec);
+        }
+
         // ---- P: the PEER, and the same file opened both ways ------------------
         //
         // Everything above this line is the CLIENT's gate. It could be made to

@@ -848,7 +848,19 @@ static void parseCli(int argc, char** argv) {
                            // dimensions and dtype: --raw-* on the same command
                            // line is for the files that carry none
                            imagefile::forPath(a) != nullptr;
-            if (!special && rawReady) {   // raw params given: load directly, no dialog
+            const bool isUrl = low.rfind("ssh://", 0) == 0 || low.rfind("local://", 0) == 0;
+            if (!special && rawReady && isUrl) {
+                // A headerless file on a PEER, declared on the command line.
+                // The same six numbers the local branch below would decode
+                // with, put on the wire (protocol 11) instead of applied here:
+                // "run the analysis where the data is" is this tool's whole
+                // shape, and a raw file is exactly the case where copying it
+                // first would be the largest thing anybody moves.
+                if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
+                const rp::RawWire rw = rawWireFrom(d);
+                if (!openRemote(a, false, 0, 0, &rw))
+                    fprintf(stderr, "could not open %s\n", a.c_str());
+            } else if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;
                 std::string err = loadRaw(d);

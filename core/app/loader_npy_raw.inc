@@ -259,6 +259,27 @@ static std::string rawRecipeNote(const RawDialog& d, int cfa, int cfaPattern) {
     return s;
 }
 
+// The same declaration, in the shape the wire carries (protocol 11). One
+// converter, because every door that can open a headerless file over a link -
+// the CLI here, the Browse dialog in stage 4, a session restore after it -
+// has to put the SAME six numbers on the wire that the local decode used, or
+// one file reads two ways depending on which end opened it.
+//
+// crop is deliberately absent: it re-scopes a frame rather than being one, and
+// the local registry already refuses to share a cropped raw source
+// (docs/remote-headerless-design.md §3.2). A crop asked for on the command line
+// therefore applies to what came back, not to what was fetched.
+static rp::RawWire rawWireFrom(const RawDialog& d) {
+    rp::RawWire w{};
+    w.dtype = (uint32_t)std::clamp(d.dtype, 0, RD_COUNT - 1);
+    w.interp = (uint32_t)std::clamp(d.interp, 0, RI_COUNT - 1);
+    w.w = (uint32_t)std::max(1, d.w);
+    w.h = (uint32_t)std::max(1, d.h);
+    w.offset = (uint32_t)std::max(0, d.offset);
+    w.flags = d.littleEndian ? rp::RW_LITTLE_ENDIAN : 0u;
+    return w;
+}
+
 // ---------------------------------------------------------------- raw recipes
 // Issue #166. A NAMED RECIPE is exactly the fields the dialog above already
 // carries, minus everything that is about ONE open (the path, the file size,

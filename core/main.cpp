@@ -240,7 +240,12 @@ const BrowseHost g_browseHost = {
     &toast,
     &savePrefs,
     &browseWakeUi,
-    &openRemote,
+    // The Browse panel's door takes no recipe: a headerless row needs one and
+    // the panel does not have one to give yet (that is stage 4 of
+    // docs/remote-headerless-design.md, where the double-click raises the RAW
+    // dialog). A trampoline rather than widening core/browse/host.h now, so
+    // the panel's ABI moves once, when it has something to put in the field.
+    &browseOpenRemote,
     &openRemoteStack,
     &openStackForAverage,
     &requestBrowseTemporal,

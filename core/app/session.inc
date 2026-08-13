@@ -1,5 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: session/prefs
-static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead);   // fwd (defaults: first decl)
+static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead,
+                       const rp::RawWire* rw);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
 // the two halves of restoring a REMOTE folder stack: ask the peer which files

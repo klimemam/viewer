@@ -1747,7 +1747,13 @@ int UiThreadStall::depth = 0;
 // so a failed open left a scrub bar with 2+ entries and previewUid == 0 - a
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
-static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
+// The 4-argument shape core/browse/host.h binds. See the note at that binding.
+static bool browseOpenRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
+    return openRemote(url, asPreview, frame, npyRead, nullptr);
+}
+
+static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead,
+                       const rp::RawWire* rw) {
     UiThreadStall stallCredit;      // see above: a blocked frame is not the user's
     std::string host, rpath;
     int port = 0;
@@ -1768,7 +1774,13 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // search hit, Enter over a multi-selection, the row menu - mints a url with
     // makeRemoteUrl and comes through here, so routing at the door means none
     // of them had to learn the rule and none of them can drift from it.
-    if (!peerServesName(rpath)) {
+    // A headerless file crosses the link only WITH a declaration (protocol 11,
+    // docs/remote-headerless-design.md). peerServesName is still the predicate
+    // for "answerable with nothing else said" - it is what the listing and the
+    // one-click preview ask - so the door adds the second half here rather than
+    // widening that predicate underneath them.
+    const bool headerlessOk = imagefile::isHeaderless(rpath) && rw != nullptr;
+    if (!headerlessOk && !peerServesName(rpath)) {
         if (host.empty() && viewerReadsName(rpath)) {
             // A PREVIEW is a decimated tile and only the peer path makes one.
             // The Browse click does not ask for one on these rows (see
@@ -1807,7 +1819,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // with nothing checking they agree - which is what #71 cost a release.
     // Session::meta refuses a declaration a v8 peer cannot serve BEFORE sending.
     remote::Meta m;
-    if (!app.uiSession.meta(rpath, m, err, npyRead)) { toast("remote: " + err, true); return false; }
+    if (!app.uiSession.meta(rpath, m, err, npyRead, rw)) { toast("remote: " + err, true); return false; }
     // The peer fell back to native because the declaration does not fit this
     // shape - a session line against a file whose rank changed under it. The
     // local decoder's answer is a note and nothing else: the DECLARATION is
@@ -1829,7 +1841,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     std::string dt;
     rp::F32Loss tloss;                        // what float32 cost these pixels
     if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err,
-                            npyRead, &tloss)) {
+                            npyRead, &tloss, rw)) {
         toast("remote: " + err, true);
         return false;
     }
@@ -1863,6 +1875,27 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     S.npyShape = m.shape;
     S.npyRead = npyRead;
     S.remoteProto = app.uiSession.peerVersion();
+    // The recipe this open was made under, recorded on the SOURCE. Two reasons
+    // and both are load-bearing:
+    //
+    //   IDENTITY (§6.2). srcIdentityKey's raw branch keys on exactly these
+    //   fields, so two recipes over one url are two residents and never
+    //   silently share pixels - the same rule two readings of one .npy follow.
+    //   The fields were already there for the local door; a remote raw doc
+    //   simply fills the same ones, which is why this feature needed no new
+    //   identity machinery at all.
+    //
+    //   M1 (docs/settings-inventory.md §4.1). A headerless read is nothing but
+    //   measuring-class settings, so it declares itself in the note - and the
+    //   note has to be the SAME sentence the local door writes, or one file
+    //   would describe itself two ways depending on which end opened it.
+    if (rw) {
+        S.rawDtype = (int)rw->dtype;
+        S.rawInterp = (int)rw->interp;
+        S.rawOffset = (int)rw->offset;
+        S.rawLE = (rw->flags & rp::RW_LITTLE_ENDIAN) != 0;
+        S.srcW = (int)rw->w; S.srcH = (int)rw->h;
+    }
     // The Inspector prints a non-empty note as a LINE OF ITS OWN, directly above
     // the Interpret combo. A note the head frame carries and its siblings do not
     // makes that line appear and vanish as the user steps the stack, and every
@@ -1877,6 +1910,21 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // the "opened X" toast at the end of this function makes.
     doc->note = "remote";
     if (!host.empty()) doc->note += " " + host;
+    // ...and, for a headerless file, the DECLARATION the numbers were read
+    // under (M1, docs/settings-inventory.md §4.1). The same sentence the local
+    // door writes, from the same helper: a size, a header offset and a byte
+    // order each change every number on the screen, and a file that described
+    // itself one way from disk and another over a link would be the "two
+    // answers for one file" defect one level below where #148 removed it.
+    if (rw) {
+        RawDialog rd;
+        rd.dtype = (int)rw->dtype; rd.interp = (int)rw->interp;
+        rd.w = (int)rw->w; rd.h = (int)rw->h; rd.offset = (int)rw->offset;
+        rd.littleEndian = (rw->flags & rp::RW_LITTLE_ENDIAN) != 0;
+        const int cfa = rd.interp == RI_QUAD ? 2 : rd.interp == RI_BAYER ? 1 : 0;
+        doc->cfa = cfa;
+        doc->note += "  -  " + rawRecipeNote(rd, cfa, doc->cfaPattern);
+    }
     if (m.frames > 1) doc->note += "  -  " + std::to_string(m.frames) + " frames";
     // ...and it is stack-constant like the rest of this line, which is why the
     // fallback notice goes HERE rather than into a toast: it describes the

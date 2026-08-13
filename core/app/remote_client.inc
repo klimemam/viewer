@@ -23,8 +23,17 @@ static const char* peerTag(const std::string& host) {
 std::string peerLabel(const std::string& host) {
     return host.empty() ? std::string(PEER_HERE) : host;
 }
+// `rw` is the DECLARED GEOMETRY of a headerless file (protocol 11). Optional
+// because every other format states its own; REQUIRED for .bin/.raw/... - the
+// door refuses one without it rather than guessing, which is the whole reason
+// those files have no row in the format table.
+//
+// A defaulted parameter rather than a second function: this is the ONE door
+// every Browse open, the CLI and the session restore come through (see the
+// "#111: WHOSE READER" block), and a second door is a second place for the
+// rule to be different.
 static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0,
-                       int npyRead = 0 /*rp::NR_NATIVE*/);
+                       int npyRead = 0 /*rp::NR_NATIVE*/, const rp::RawWire* rw = nullptr);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
