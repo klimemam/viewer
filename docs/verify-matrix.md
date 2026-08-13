@@ -273,7 +273,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 
 | | 件 | 状態 |
 |---|---|---|
-| G1 | ヘッダ無し RAW が peer 越しに開けない | **未** (#166 リモート半分・Fable 待ち) |
+| G1 | ヘッダ無し RAW が peer 越しに開けない | **済** PR #185/#186/#187/#188/#189 — protocol 11。試験 F4d F4e F4f P8 P8b P9 |
 | G2 | ローカル Browse が偽の拒否理由を出す | **済** PR #174 — 試験 F4b |
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
@@ -287,7 +287,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 
 ---
 
-### G1. ヘッダ無し RAW が peer 越しに開けない ← 2026-08-11 の報告
+### G1. ヘッダ無し RAW が peer 越しに開けない ← 2026-08-11 の報告 —— **修正済 (protocol 11)**
 
 **どこ。** `core/imagefile.cpp:213-283` の表に `.raw` の行が無い →
 `imagefile::peerServes()` (`:379`) が false → `peerRefusal()` (`:402`) の最後の
