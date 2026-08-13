@@ -1393,11 +1393,18 @@ static void gotoStack(int delta) {
 // able to go stale, because it is computed by imagefile::dialogPattern() from
 // the table's own rows - this is that discipline applied to our own doors.
 static const char* SELFDESC_EXTS[]   = { ".npy", ".npz" };
-static const char* HEADERLESS_EXTS[] = { ".bin", ".raw", ".yuv", ".dat", ".rggb" };
+// ...and the headerless five, which have MOVED to core/imagefile.h. The array
+// is one array still - it is simply in the only format home BOTH binaries
+// compile, because the peer asks the same question and does not compile this
+// file (docs/remote-headerless-design.md §4.2). Everything below reads it
+// through these helpers exactly as before, and F4c - which walks the array and
+// checks every extension reaches the file dialog - is unedited by this move,
+// which is what makes the move provable rather than merely plausible.
+#define HEADERLESS_EXTS imagefile::headerlessExts()
 
 // Does this extension reach the geometry prompt? (lower-cased, with the dot)
 static bool extIsHeaderless(const std::string& extLower) {
-    for (const char* e : HEADERLESS_EXTS) if (extLower == e) return true;
+    for (const std::string& e : HEADERLESS_EXTS) if (extLower == e) return true;
     return false;
 }
 
@@ -1406,20 +1413,20 @@ static bool extIsHeaderless(const std::string& extLower) {
 static std::string ownDoorPattern() {
     std::string s;
     for (const char* e : SELFDESC_EXTS)   { if (!s.empty()) s += ' '; s += '*'; s += e; }
-    for (const char* e : HEADERLESS_EXTS) { s += " *"; s += e; }
+    for (const std::string& e : HEADERLESS_EXTS) { s += " *"; s += e; }
     return s;
 }
 
 // ".bin .raw .yuv .dat .rggb" - the same five for prose, without the globs.
 static std::string headerlessExtList() {
     std::string s;
-    for (const char* e : HEADERLESS_EXTS) { if (!s.empty()) s += ' '; s += e; }
+    for (const std::string& e : HEADERLESS_EXTS) { if (!s.empty()) s += ' '; s += e; }
     return s;
 }
 
 static bool isLoadableExt(const std::string& extLower) {
     for (const char* e : SELFDESC_EXTS)   if (extLower == e) return true;
-    for (const char* e : HEADERLESS_EXTS) if (extLower == e) return true;
+    for (const std::string& e : HEADERLESS_EXTS) if (extLower == e) return true;
     return imagefile::forPath("x" + extLower) != nullptr;
 }
 

@@ -193,7 +193,13 @@
         // the third. A refusal with no way out is where an operator stops.
         {
             const std::string rw = rbRowWhyNot("trc2", "capture.mp4");
-            const std::string gen = rbRowWhyNot("trc2", "capture.raw");
+            // A name with NO row, no decoder, no measured refusal and - since
+            // G1 stage 1 - no headerless sentence either: the true
+            // fall-through. It used to be capture.raw, which now has a branch
+            // of its own (F4d), and a test whose subject has been given a
+            // better answer has to move to what is still unanswered rather
+            // than keep asserting the old sentence about the new one.
+            const std::string gen = rbRowWhyNot("trc2", "capture.unknownfmt");
             fprintf(stderr, "fmtgateselftest:   peer reason for capture.mp4: \"%s\"\n"
                             "fmtgateselftest:   peer reason for capture.raw: \"%s\"\n",
                     rw.c_str(), gen.c_str());
@@ -309,7 +315,7 @@
             };
             int checked = 0;
             for (const char* e : SELFDESC_EXTS)   { want(e); checked++; }
-            for (const char* e : HEADERLESS_EXTS) { want(e); checked++; }
+            for (const std::string& e : HEADERLESS_EXTS) { want(e); checked++; }
             for (const imagefile::Backend& b : imagefile::backends()) {
                 std::string all = b.exts;             // ".tif .tiff" - every one
                 size_t i = 0;
@@ -334,6 +340,48 @@
                   "F4c there really is a set of extensions and a filter to check it against");
             check(missing.empty(), "F4c every extension a door accepts is offered by File > Open");
             check(refusalAgrees, "F4c the refusal names the set the file dialog offers");
+        }
+
+        // ---- F4d: the headerless refusal is a DECISION, not a fall-through ---
+        // verify-matrix G1, the one gap left and the one the user reported:
+        // ".raw over the link does not open". Nobody ever decided that. The
+        // format table correctly has no row for a headerless file (a row means
+        // "the bytes decide", and for these they do not), so peerServes said
+        // false, and the refusal fell to the generic "the peer serves .npy,
+        // PNG, ..." - a list the operator can already see this file is not in.
+        //
+        // This stage does not open the door (that is protocol 11,
+        // docs/remote-headerless-design.md stage 2). It makes the refusal TRUE:
+        // the shape of this file is a declaration that lives on this machine
+        // and the wire has no field to carry it, which is one step more
+        // specific than the fall-through and names a door that does work.
+        //
+        // Walked over headerlessExts() rather than a list here, for F4c's
+        // reason: an extension added to that array tomorrow is checked without
+        // anybody editing this test.
+        {
+            bool served = false, said = true, generic = false;
+            std::string worst;
+            for (const std::string& e : imagefile::headerlessExts()) {
+                const std::string n = "capture" + e;
+                if (peerServesName(n)) served = true;          // stage 2 flips this
+                const std::string why = peerRefusalFor(n);
+                if (!has(why, "headerless") || !has(why, "File > Open") ||
+                    !has(why, e.c_str())) { said = false; if (worst.empty()) worst = why; }
+                // ...and it must not be the fall-through wearing a new coat
+                if (why.rfind("the peer serves", 0) == 0) generic = true;
+            }
+            const size_t n = imagefile::headerlessExts().size();
+            fprintf(stderr, "fmtgateselftest:   headerless: %zu ext(s), peerServes=%d "
+                            "named=%d generic=%d\n"
+                            "fmtgateselftest:   headerless reason: \"%s\"\n",
+                    n, served ? 1 : 0, said ? 1 : 0, generic ? 1 : 0,
+                    worst.empty() ? peerRefusalFor("capture.raw").c_str() : worst.c_str());
+            // anti-vacuity: there is a set to walk, and it is the whole one
+            check(n >= 5, "F4d there really is a headerless set to check");
+            check(!served, "F4d the peer still does not serve a headerless file");
+            check(said, "F4d ...and says so by NAME, with the door that does work");
+            check(!generic, "F4d ...instead of the generic list it used to fall to");
         }
 
         // ---- P: the PEER, and the same file opened both ways ------------------
