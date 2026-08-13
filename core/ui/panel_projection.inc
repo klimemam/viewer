@@ -663,7 +663,25 @@ static void drawPanelProjection() {
         // nothing to judge it against. The axis column already says which
         // profile the bare sigma belongs to, so it needs no letter of its own -
         // naming it "sigma h,v" would say both when each row is only one.
-        ImGui::TableSetupColumn("mean", ImGuiTableColumnFlags_WidthFixed, numColW());
+        // "(axis)", like the three columns below it, because this mean is the
+        // mean OF THE PROFILE named in the axis column - not the region's.
+        //
+        // The two are different measurements over different sample sets, and
+        // saying so is the whole fix (issue #145). The H pass visits every
+        // column of every step-th ROW, and the region moments are gathered from
+        // exactly those visits, so the H row's mean equals the region mean by
+        // construction (--precision-selftest P7c asserts it). The V pass visits
+        // every row of every step-th COLUMN - different pixels - and measured
+        // on a 4000x3000 frame at ~3000 DN the two differ by 12 ppm. That is
+        // larger than the float-accumulator defect PR #144 removed (4.9 ppm)
+        // and it survives at %.6g on screen and %.9g in the TSV.
+        //
+        // Nothing was computed wrongly. Two honest numbers were sharing one
+        // header, and which one you read depended on the layout the panel
+        // happened to be in - the failure the WIDE table's own comment names
+        // ("a number that differs by where it is shown"). The wide table keeps
+        // its one region mean; this one now says whose mean it prints.
+        ImGui::TableSetupColumn("mean (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(SIGMA " (frame)", ImGuiTableColumnFlags_WidthFixed, numColW());
         // A bare sigma here means "of the means named in the axis column", and
         // nothing on the header said so. Each row IS one axis, so the header
