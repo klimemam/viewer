@@ -2579,6 +2579,75 @@
                       "V25q ...and a forward parent, in the npz gate's own words");
                 check(!e3.empty() && e3.find("not a layer") != std::string::npos,
                       "V25q ...and a layer this build does not know");
+
+                // ---- V25s: the wire is LITTLE-ENDIAN, and says so (F3) ------
+                // A SPEC LOCK, and it is labelled one: it cannot be made red on
+                // this machine, because every machine anyone has run this on is
+                // little-endian and "native" therefore agrees with "<" by
+                // coincidence. What it locks is that the coincidence is not
+                // what the format relies on - writeNpyHeaderFor writes "<" for
+                // every dtype, and run_adapter.py now converts to "<" rather
+                // than to native. A change to either side breaks this line.
+                {
+                    static const char* DT[] = { "u1", "i1", "b1", "u2", "i2",
+                                                "u4", "i4", "f4", "f8" };
+                    int le = 0;
+                    std::string first;
+                    for (const char* d : DT) {
+                        std::vector<uint8_t> buf;
+                        writeNpyHeaderFor(buf, d, { 2, 2 });
+                        const std::string hdr((const char*)buf.data(), buf.size());
+                        if (hdr.find(std::string("'<") + d + "'") != std::string::npos) le++;
+                        else if (first.empty()) first = std::string(d) + ": " + hdr.substr(10, 40);
+                    }
+                    fprintf(stderr, "verifyselftest: V25s wire endianness: %d of %d dtypes "
+                                    "declare '<'%s%s\n",
+                            le, (int)(sizeof DT / sizeof DT[0]),
+                            first.empty() ? "" : "  first that did not: ", first.c_str());
+                    check(le == (int)(sizeof DT / sizeof DT[0]),
+                          "V25s every streamed dtype is declared little-endian (spec lock)");
+                }
+
+                // ---- V25r: a note holding a newline arrives WHOLE (F1) ------
+                // "the value is the rest of the line" and a value containing a
+                // newline cannot both hold. Before the escape, the second half
+                // landed on a line of its own: an unknown key, silently
+                // skipped, so the note came back TRUNCATED with nothing said -
+                // and a note beginning with a key this format knows moved the
+                // frame itself. The npz carrier never had the problem, so it
+                // was one format whose two carriers disagreed about what a note
+                // is (#44 F1).
+                //
+                // The escaped form is written by hand for V25q's reason: the
+                // point is what the READER does with it, and going through the
+                // writer would test the pair rather than the half that has to
+                // survive a file already on disk.
+                {
+                    closeAll();
+                    // note = "danger" NEWLINE "layer 0 sandwich" - escaped. If
+                    // the reader did not unescape, the second half would be a
+                    // LAYER LINE and node 0 would stop being a frame.
+                    const std::string inj = write("inj.vstream",
+                        "VIEWERSTREAM 2\nn 1\nlayer 0 frame\nparent 0 -1\n"
+                        "note 0 danger\\nlayer 0 sandwich\n"
+                        "pixels 0 u1 2 2 2 4\nend\n"
+                        "\x01\x02\x03\x04");
+                    const std::string e4 = loadViewerStream(inj, "", "inj.vstream", st);
+                    const ImageDoc* d = app.images.empty() ? nullptr : app.images.front().get();
+                    const std::string note = d ? d->note : std::string();
+                    const bool whole = note.find("danger") != std::string::npos &&
+                                       note.find("layer 0 sandwich") != std::string::npos;
+                    const bool oneLine = note.find('\n') != std::string::npos;
+                    fprintf(stderr, "verifyselftest: V25r injected note: err=\"%s\" docs=%zu "
+                                    "note=\"%s\" whole=%d hasNewline=%d\n",
+                            e4.c_str(), app.images.size(), note.c_str(),
+                            whole ? 1 : 0, oneLine ? 1 : 0);
+                    check(e4.empty() && app.images.size() == 1,
+                          "V25r a stream whose note holds a newline still loads");
+                    check(whole && oneLine,
+                          "V25r ...and the note arrives WHOLE, newline and all");
+                    closeAll();
+                }
                 std::filesystem::remove_all(vdir, vec);
             }
 

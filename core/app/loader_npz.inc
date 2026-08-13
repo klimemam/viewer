@@ -1256,6 +1256,36 @@ static size_t writeNpyHeaderFor(std::vector<uint8_t>& buf, const std::string& dt
 
 struct VnzBlob { int node = 0; std::string dtype; std::vector<int64_t> shape; uint64_t nbytes = 0; };
 
+// The inverse of run_adapter.py's _esc(): free text came down ONE line, and the
+// two line terminators - and the backslash that introduces them - were escaped
+// so that it could.
+//
+// The header borrows the session format's rules and one of them is "the value is
+// the REST OF THE LINE". That rule and a value containing a newline cannot both
+// hold: the second half landed on a line of its own, where the reader met a key
+// it did not know and SKIPPED it, so the note came back truncated with nothing
+// said - and a note beginning with "layer" or "pixels" moved the frame itself.
+// The npz carrier has no such trouble (strings ride as npy members), so this was
+// one format whose two carriers disagreed about what a note IS.
+//
+// A backslash before ANYTHING ELSE is left alone rather than eaten. That is what
+// makes this safe on the .vstream caches already on disk: a note written before
+// the escape existed is still read as itself.
+static std::string vnsUnescape(const std::string& s) {
+    if (s.find('\\') == std::string::npos) return s;
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] != '\\' || i + 1 >= s.size()) { o += s[i]; continue; }
+        const char c = s[i + 1];
+        if      (c == 'n')  { o += '\n'; i++; }
+        else if (c == 'r')  { o += '\r'; i++; }
+        else if (c == '\\') { o += '\\'; i++; }
+        else o += s[i];                 // not an escape this format defines
+    }
+    return o;
+}
+
 static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
                                     const std::string& origin,
                                     const FrameSource& originStat) {
@@ -1308,18 +1338,24 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
         };
         if      (key == "layer")  v->layer = val;
         else if (key == "parent") v->parent = atoi(val.c_str());
-        else if (key == "role")   v->role = val;        // set child (ras §4)
+        else if (key == "role")   v->role = vnsUnescape(val);   // set child (ras §4)
         else if (key == "refs")   v->refsJson = val;    // set node, one JSON line
-        else if (key == "name")   v->name = val;
-        else if (key == "note")   v->note = val;
-        else if (key == "cfa")    v->cfa = val;
+                                                        // (json.dumps emits no newline)
+        // FREE TEXT: unescaped, because it came down escaped. A note holding a
+        // newline used to put its second half on a line of its own, where the
+        // reader met an unknown key and SKIPPED it - the note came back
+        // truncated with nothing said, and a note beginning with "layer" moved
+        // the frame itself (#44 F1).
+        else if (key == "name")   v->name = vnsUnescape(val);
+        else if (key == "note")   v->note = vnsUnescape(val);
+        else if (key == "cfa")    v->cfa = vnsUnescape(val);
         else if (key == "range")  nums(val, v->range);
         else if (key == "timestamps") { nums(val, v->tsVals);   v->hasTs = true; }
         else if (key == "conditions") { nums(val, v->condVals); v->hasCond = true; }
-        else if (key == "timestamps_name") v->tsName = val;
-        else if (key == "timestamps_unit") v->tsUnit = val;
-        else if (key == "conditions_name") v->condName = val;
-        else if (key == "conditions_unit") v->condUnit = val;
+        else if (key == "timestamps_name") v->tsName = vnsUnescape(val);
+        else if (key == "timestamps_unit") v->tsUnit = vnsUnescape(val);
+        else if (key == "conditions_name") v->condName = vnsUnescape(val);
+        else if (key == "conditions_unit") v->condUnit = vnsUnescape(val);
         else if (key == "meta") {
             size_t s3 = val.find(' ');
             if (s3 != std::string::npos)

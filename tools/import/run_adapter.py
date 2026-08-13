@@ -151,8 +151,14 @@ def to_numpy(where, what, obj, notes):
                            "float (strings, objects and complex are refused)"
                            % (where, arr.dtype.name, what))
     arr = to_viewer_dtype(where, what, arr, notes)
-    if not arr.dtype.isnative:
-        arr = arr.astype(arr.dtype.newbyteorder("="))
+    # LITTLE-ENDIAN, not native.  The viewer writes "<" into the .npy header it
+    # synthesises for a streamed blob (writeNpyHeaderFor), so the wire IS little
+    # endian -- and "native" only happens to agree with that on the machines
+    # anyone has run this on.  Saying "<" here makes the format's own statement
+    # true rather than true-by-coincidence (#44 F3), and costs a copy on exactly
+    # the machines where the coincidence would have been a wrong picture.
+    if arr.dtype.itemsize > 1 and arr.dtype.byteorder != "<":
+        arr = arr.astype(arr.dtype.newbyteorder("<"))
     return np.ascontiguousarray(arr)
 
 
@@ -505,6 +511,32 @@ def carries_set(nodes):
     return False
 
 
+BACKSLASH = chr(92)
+
+
+# Free text on a header line, made safe to put on ONE line.
+#
+# The header borrows the session format's rules, and one of them is "the value
+# is the REST OF THE LINE".  That rule and a value containing a newline cannot
+# both hold: a note reading "line1<newline>line2" put the second half on a line
+# of its own, where the reader met a key it did not know and SKIPPED it -- so
+# the note came back silently truncated, and a note that happened to begin with
+# "layer" or "pixels" moved the frame itself.
+#
+# The npz carrier is immune to this (strings ride as npy members), so it was one
+# format whose two carriers disagreed about what a note is -- the same defect
+# #71 named, one level down.
+#
+# The escape is the smallest one that closes it and it is part of the frozen
+# format: the backslash first (so the two below are unambiguous), then the line
+# terminators.  Nothing else is touched -- spaces, quotes and UTF-8 are already
+# safe on a line whose value runs to its end.
+def _esc(text):
+    return (str(text).replace(BACKSLASH, BACKSLASH + BACKSLASH)
+                     .replace("\r", BACKSLASH + "r")
+                     .replace("\n", BACKSLASH + "n"))
+
+
 def _stream_line(fh, text):
     fh.write(text.encode("utf-8") + b"\n")
 
@@ -532,18 +564,18 @@ def stream_out(fh, nodes):
         _stream_line(fh, "layer %d %s" % (i, nd.layer))
         _stream_line(fh, "parent %d %d" % (i, nd.parent))
         if nd.role:
-            _stream_line(fh, "role %d %s" % (i, nd.role))
+            _stream_line(fh, "role %d %s" % (i, _esc(nd.role)))
         if nd.refs:                     # one line: json.dumps emits no newlines
             _stream_line(fh, "refs %d %s" % (i, json.dumps(dict(nd.refs))))
         if nd.name:
-            _stream_line(fh, "name %d %s" % (i, nd.name))
+            _stream_line(fh, "name %d %s" % (i, _esc(nd.name)))
         note = nd.full_note()
         if note:
-            _stream_line(fh, "note %d %s" % (i, note))
+            _stream_line(fh, "note %d %s" % (i, _esc(note)))
         if nd.layout:
-            _stream_line(fh, "layout %d %s" % (i, nd.layout))
+            _stream_line(fh, "layout %d %s" % (i, _esc(nd.layout)))
         if nd.cfa:
-            _stream_line(fh, "cfa %d %s" % (i, nd.cfa))
+            _stream_line(fh, "cfa %d %s" % (i, _esc(nd.cfa)))
         if nd.range is not None:
             r = np.asarray(nd.range).reshape(-1)
             _stream_line(fh, "range %d %d %s"
@@ -556,8 +588,8 @@ def stream_out(fh, nodes):
             v = np.asarray(values).reshape(-1)
             # name and unit on their own lines: both may contain spaces, and the
             # values line has to stay parseable by splitting on them
-            _stream_line(fh, "%s_name %d %s" % (field, i, name))
-            _stream_line(fh, "%s_unit %d %s" % (field, i, unit))
+            _stream_line(fh, "%s_name %d %s" % (field, i, _esc(name)))
+            _stream_line(fh, "%s_unit %d %s" % (field, i, _esc(unit)))
             _stream_line(fh, "%s %d %d %s"
                          % (field, i, v.size, " ".join(repr(float(x)) for x in v)))
         for k, val in nd.meta.items():
@@ -567,7 +599,7 @@ def stream_out(fh, nodes):
         if nd.pixels is not None:
             a = np.ascontiguousarray(nd.pixels)
             _stream_line(fh, "pixels %d %s %d %s %d"
-                         % (i, a.dtype.str.lstrip("<>|=").replace("f8", "f8"),
+                         % (i, a.dtype.str.lstrip("<>|="),
                             a.ndim, " ".join(str(d) for d in a.shape), a.nbytes))
             blobs.append(a)
     _stream_line(fh, "end")
