@@ -116,7 +116,11 @@ static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
 // all there is to the fix at this level, and that is the point - the panel asks
 // the question its host makes true, and neither branch names a format.
 bool rbRowOpenable(const std::string& host, const std::string& name) {
-    return host.empty() ? viewerReadsName(name) : peerServesName(name);
+    // The peer half is peerServesDECLARED since protocol 11: a headerless file
+    // IS openable from this panel, it just has to be told its shape first, and
+    // a row that dimmed for it would be saying "this cannot be opened" about a
+    // file the very next double-click opens (verify-matrix G1).
+    return host.empty() ? viewerReadsName(name) : peerServesDeclaredName(name);
 }
 std::string rbRowWhyNot(const std::string& host, const std::string& name) {
     return host.empty() ? viewerRefusalFor(name) : peerRefusalFor(name);
@@ -1143,6 +1147,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 }
         }
         g_browseHost.dropPreview();          // a stale preview is not this row's
+        // A headerless file states no shape, so this gesture cannot be "open
+        // it" - it is "open it HOW". The viewer side answers that (a binding
+        // this session already made, or the dialog); the panel's job ends at
+        // handing over the url and the byte count it already has.
+        if (!B.host.empty() && rbNameIsHeaderless(r.name())) {
+            g_browseHost.openRemoteRaw(u, r.e ? r.e->size : 0);
+            return;
+        }
         g_browseHost.openRemote(u, false, 0, 0);
     };
     // ---- row 2: the toolbar. Narrow the listing down, and say so when the

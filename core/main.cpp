@@ -246,6 +246,7 @@ const BrowseHost g_browseHost = {
     // dialog). A trampoline rather than widening core/browse/host.h now, so
     // the panel's ABI moves once, when it has something to put in the field.
     &browseOpenRemote,
+    &openRemoteRawRow,
     &openRemoteStack,
     &openStackForAverage,
     &requestBrowseTemporal,

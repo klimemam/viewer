@@ -411,6 +411,10 @@ bool isHeaderless(const std::string& path) {
     return false;
 }
 
+bool peerServesDeclared(const std::string& path) {
+    return peerServes(path) || isHeaderless(path);
+}
+
 std::string peerRefusal(const std::string& path) {
     if (peerServes(path)) return {};
     // Named, reasoned, way out attached - docs/input-adapters.md §3.2's three

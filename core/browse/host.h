@@ -28,6 +28,13 @@ struct BrowseHost {
     // already open (docs/input-adapters.md §3.3, Inspector). The parameter is
     // here only because the pointer has to have the function's type.
     bool (*openRemote)(const std::string& url, bool asPreview, int frame, int npyRead);
+    // A HEADERLESS row's double-click. Not openRemote with an extra argument:
+    // what happens here is a QUESTION - the file states no shape, so either
+    // this session has already been told one for a file of exactly this many
+    // bytes (#166's binding) or the operator is asked. The panel has the byte
+    // count (MSG_LIST has carried it since protocol 3) and nothing else it
+    // needs, so the whole decision lives on the viewer's side of the seam.
+    void (*openRemoteRaw)(const std::string& url, uint64_t sizeBytes);
     void (*openRemoteStack)(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);
     void (*openStackForAverage)(const std::string& host, const std::vector<std::string>& files,
@@ -79,6 +86,15 @@ std::string baseName(const std::string& p);
 // Definitions and the full argument live in core/ui/menus.inc.
 bool viewerReadsName(const std::string& n);          // ...this build can open
 bool peerServesName(const std::string& n);           // ...core/serve.cpp can serve
+// ...and can serve it IF the request declares its geometry (protocol 11). The
+// row gate asks this one; the one-click preview still asks the plain
+// peerServesName, because a preview cannot be made before the geometry exists
+// (docs/remote-headerless-design.md §5.3).
+bool peerServesDeclaredName(const std::string& n);
+// ...and which of those need the declaration. The panel routes a double-click
+// on one of these to openRemoteRaw instead of openRemote; it does not know why
+// (that is the viewer's business), only that this gesture is a question.
+bool rbNameIsHeaderless(const std::string& n);
 std::string peerRefusalFor(const std::string& n);    // "" when the peer serves it
 std::string viewerRefusalFor(const std::string& n);  // "" when this build reads it
 void sortFramesNumerically(std::vector<std::string>& files);

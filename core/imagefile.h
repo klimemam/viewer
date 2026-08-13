@@ -238,6 +238,13 @@ std::string videoRefusal(const std::string& path);
 // `.npy` / `.npz` do NOT move with them: those are core/main.cpp's own doors,
 // the peer reads .npy inline and refuses .npz, and that split is unchanged.
 bool isHeaderless(const std::string& path);
+// "will the peer answer for this file IF the request declares its geometry"
+// (protocol 11). peerServes stays what it was - "answerable with nothing else
+// said" - because that is what a LISTING and a one-click preview ask: widening
+// it would make a .raw row claim a preview it cannot make (the geometry has to
+// come first, docs/remote-headerless-design.md §5.3). This is the second half,
+// asked where a door is about to be opened rather than where a row is drawn.
+bool peerServesDeclared(const std::string& path);
 const std::vector<std::string>& headerlessExts();   // ".bin", ".raw", ...
 
 }  // namespace imagefile

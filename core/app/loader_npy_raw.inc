@@ -212,7 +212,7 @@ static RawDialog g_folderRecipe;
 // published by drawRawModal each frame: ImGui::IsPopupOpen(name) needs a live
 // frame, and --browse-keys-selftest's action list runs between frames
 static bool g_rawPopupAlive = false;
-static void openRawDialogFor(const std::string& path);
+static void openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
 
 // The whole recipe, as the sentence that travels with the numbers it produced.
 //
@@ -569,8 +569,33 @@ static std::string loadRaw(const RawDialog& d) {
 // recipe that has never decoded anything has not earned that claim; recording
 // a failed attempt would arm the next open of that size with settings already
 // known not to work.
+// Is this dialog about a file on a PEER? The path carries a url, which is the
+// only thing that distinguishes the two landings - everything above this line
+// (the guesses, the fields, the binding's key) is byte-count arithmetic and
+// does not care where the bytes are.
+static bool rawDialogIsRemote(const RawDialog& d) {
+    return d.path.rfind("ssh://", 0) == 0 || d.path.rfind("local://", 0) == 0;
+}
+
 static std::string rawDialogAccept(RawDialog& d) {
-    std::string err = loadRaw(d);
+    // ONE branch, at the landing. The dialog itself is not taught about peers:
+    // rawGuessDims works from a byte count, and a byte count is a byte count on
+    // either disk. A second dialog for remote files would be a second place for
+    // the same six fields to be asked for, and the two would drift.
+    std::string err;
+    if (rawDialogIsRemote(d)) {
+        const rp::RawWire rw = rawWireFrom(d);
+        // openRemote SAYS what it did (toasts on refusal), so a bare false is
+        // not silence - but this call site still needs a non-empty string to
+        // mean "the binding does not happen", which is the rule below.
+        err = openRemote(d.path, false, 0, 0, &rw) ? std::string()
+                                                   : std::string("could not open " + d.path);
+    } else {
+        err = loadRaw(d);
+    }
+    // A SUCCESSFUL read is what binds the size, on either side. #166's rule
+    // ("only a decode that worked makes a binding") is about the operator
+    // having seen the result, and that is as true of a peer's pixels.
     if (err.empty()) rawRecipeBindSize(d.fileSize, rawRecipeFromDialog(d));
     return err;
 }

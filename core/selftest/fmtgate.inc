@@ -378,6 +378,27 @@
                     n, served ? 1 : 0, said ? 1 : 0, generic ? 1 : 0,
                     worst.empty() ? peerRefusalFor("capture.raw").c_str() : worst.c_str());
             // anti-vacuity: there is a set to walk, and it is the whole one
+            // ...and the ROW is alive on a peer since protocol 11. A row that
+            // dimmed for a headerless file would be saying "this cannot be
+            // opened" about a file the very next double-click opens - the
+            // shape of the defect #111 and #148 each removed once.
+            //
+            // The one-click preview gate is deliberately NOT widened with it:
+            // a preview is a decimated tile and a tile needs a rect, which
+            // needs the geometry, which does not exist yet. Both halves are
+            // asserted together so neither can be changed alone.
+            bool rowsLive = true, previewsStillOff = false;
+            for (const std::string& e : imagefile::headerlessExts()) {
+                const std::string nm = "capture" + e;
+                if (!rbRowOpenable("trc2", nm)) rowsLive = false;
+                if (peerServesName(nm)) previewsStillOff = true;   // must stay false
+            }
+            fprintf(stderr, "fmtgateselftest:   headerless rows on a peer: live=%d, "
+                            "one-click preview gate widened=%d (must be 0)\n",
+                    rowsLive ? 1 : 0, previewsStillOff ? 1 : 0);
+            check(rowsLive, "F4d a headerless row is OPENABLE on a peer (protocol 11)");
+            check(!previewsStillOff,
+                  "F4d ...and the one-click preview gate was not widened with it");
             check(n >= 5, "F4d there really is a headerless set to check");
             check(!served, "F4d the peer still does not serve a headerless file");
             check(said, "F4d ...and says so by NAME, with the door that does work");
@@ -463,6 +484,66 @@
             check(!bare && app.images.empty() && rawDlg.open,
                   "F4e ...and with no recipe it asks for the geometry, never guesses");
             rawDlg.open = false;
+
+            // ---- F4f: the BROWSE gesture, end to end ---------------------
+            // What a user actually does. openRemoteRawRow is the door the
+            // panel's double-click reaches, and it takes only the url and the
+            // byte count - which is all a listing has.
+            //
+            // Two paths through it, and the difference is #166's rule applied
+            // to a peer: a session that has ALREADY been told how to read a
+            // file of exactly this many bytes applies that and says so; one
+            // that has not ASKS. A headerless file is the one shape that does
+            // not defend itself (4096x3000 and 3000x4096 are one byte count),
+            // so nothing may apply that the operator did not pick.
+            {
+                const uint64_t sz = (uint64_t)DHDR + px.size() * 2;
+                closeAll();
+                rawDlg.open = false;
+                app.toast.clear();
+                // (a) nothing bound yet: the gesture raises the dialog, on the
+                //     URL, with the byte count the listing carried
+                openRemoteRawRow(url, sz);
+                const bool asked = rawDlg.open && rawDlg.path == url &&
+                                   rawDlg.fileSize == (size_t)sz;
+                fprintf(stderr, "fmtgateselftest:   F4f unbound: dialog=%d path=%s "
+                                "size=%zu (want %llu)\n",
+                        rawDlg.open ? 1 : 0, rawDlg.path.c_str(), rawDlg.fileSize,
+                        (unsigned long long)sz);
+                check(asked, "F4f a headerless row asks for the geometry, on the url");
+                // (b) accept it: the dialog's Load lands on the PEER, and the
+                //     size binding is made by a read that worked
+                rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                rawDlg.littleEndian = true;
+                const std::string aerr = rawDialogAccept(rawDlg);
+                rawDlg.open = false;
+                const ImageDoc* ad = app.images.empty() ? nullptr : app.images.front().get();
+                bool landed = aerr.empty() && ad && ad->w == DW && ad->h == DH &&
+                              !ad->src->remoteUrl.empty();
+                fprintf(stderr, "fmtgateselftest:   F4f accept: err=\"%s\" %dx%d url=%s "
+                                "bound=%d\n", aerr.c_str(), ad ? ad->w : 0, ad ? ad->h : 0,
+                        ad ? ad->src->remoteUrl.c_str() : "-",
+                        rawRecipeForSize((size_t)sz) ? 1 : 0);
+                check(landed, "F4f ...and Load lands on the PEER, not on the local disk");
+                check(rawRecipeForSize((size_t)sz) != nullptr,
+                      "F4f ...and a read that worked binds the size for this session");
+                // (c) the same gesture again: the binding applies, no dialog
+                closeAll();
+                rawDlg.open = false;
+                app.toast.clear();
+                openRemoteRawRow(url, sz);
+                const ImageDoc* bd = app.images.empty() ? nullptr : app.images.front().get();
+                fprintf(stderr, "fmtgateselftest:   F4f bound: dialog=%d docs=%zu "
+                                "toast=\"%s\"\n",
+                        rawDlg.open ? 1 : 0, app.images.size(), app.toast.c_str());
+                check(!rawDlg.open && bd && bd->w == DW && bd->h == DH,
+                      "F4f the second time, this session's binding opens it without asking");
+                check(has(app.toast, "recipe") || has(app.toast, "bytes"),
+                      "F4f ...and says which recipe it applied, never silently");
+                g_rawSizeRecipe.clear();
+                closeAll();
+            }
             closeAll();
             std::filesystem::remove_all(ddir, dec);
         }

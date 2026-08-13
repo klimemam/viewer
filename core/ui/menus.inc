@@ -712,6 +712,11 @@ bool viewerReadsName(const std::string& n) {
 // which is the same place and the same discipline as the declared-reading gate
 // that came before it.
 bool peerServesName(const std::string& n) { return imagefile::peerServes(n); }
+// ...and the protocol-11 half. Same one-call discipline as above: the set of
+// names that cross the link with a declaration is the format table's business,
+// not a list here.
+bool peerServesDeclaredName(const std::string& n) { return imagefile::peerServesDeclared(n); }
+bool rbNameIsHeaderless(const std::string& n) { return imagefile::isHeaderless(n); }
 
 // Why the peer will NOT serve this file; "" when it will. A sentence and not a
 // bool, because #111's ruling is that a remote listing SHOWS what the peer

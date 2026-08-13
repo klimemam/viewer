@@ -7,12 +7,20 @@
 // answer is the first one.
 static void openPath(const std::string& path);
 
-static void openRawDialogFor(const std::string& path) {
-    std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
-    if (!f) { toast("cannot open: " + baseName(path), true); return; }
+// `knownSize` > 0: the bytes are not on this disk and the caller already has
+// the count (a peer's listing carries it - MSG_LIST has since protocol 3). The
+// rest of this function is filename hints and byte-count arithmetic, neither of
+// which needs the file open, so ONE dialog serves both disks.
+static void openRawDialogFor(const std::string& path, uint64_t knownSize) {
+    size_t sz = (size_t)knownSize;
+    if (!knownSize) {
+        std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
+        if (!f) { toast("cannot open: " + baseName(path), true); return; }
+        sz = (size_t)f.tellg();
+    }
     rawDlg.open = true;
     rawDlg.path = path;
-    rawDlg.fileSize = (size_t)f.tellg();
+    rawDlg.fileSize = sz;
     rawDlg.replaceIdx = -1;           // fresh open (reinterpret sets this explicitly after)
     // guess dtype/interpretation/pattern from filename hints
     std::string n = baseName(path);
@@ -1747,6 +1755,43 @@ int UiThreadStall::depth = 0;
 // so a failed open left a scrub bar with 2+ entries and previewUid == 0 - a
 // bar for a preview that does not exist, whose buttons and , / . keys each
 // re-ran the failing open, one toast per press, forever.
+// A headerless row on a PEER, double-clicked. The panel has the byte count and
+// nothing else it needs; every decision below is the viewer's.
+//
+// The order is #166's, unchanged, because it is the same question asked about a
+// different disk: has this SESSION already been told how to read a file of
+// exactly this many bytes? If yes it applies and says so; if no it asks. What
+// is NOT here is a guess - a headerless file is the one shape that does not
+// defend itself (4096x3000 and 3000x4096 are the same byte count), so the only
+// thing allowed to apply without being picked is a choice the operator made
+// minutes ago and still remembers.
+static void openRemoteRawRow(const std::string& url, uint64_t sizeBytes) {
+    std::string host, rpath;
+    int port = 0;
+    remote::parseUrl(url, host, rpath, &port);
+    // Before anything else: a peer that cannot carry a declaration. Said from
+    // the number it announced, not discovered by sending and being refused -
+    // and it has to be said HERE too, or the dialog would collect six fields
+    // and then throw them away (rp::rawTooOldText).
+    std::string cerr;
+    if (!ensureUiSession(host, cerr, port)) { toast("remote: " + cerr, true); return; }
+    if (app.uiSession.peerVersion() < 11) {
+        toast(rp::rawTooOldText(app.uiSession.peerVersion(), baseName(rpath)), true);
+        return;
+    }
+    if (const RawRecipe* r = rawRecipeForSize((size_t)sizeBytes)) {
+        RawDialog d;
+        rawRecipeIntoDialog(*r, d);
+        d.path = url;
+        d.fileSize = (size_t)sizeBytes;
+        const rp::RawWire rw = rawWireFrom(d);
+        if (openRemote(url, false, 0, 0, &rw))
+            toast(rawRecipeAppliedLine(*r, baseName(rpath), (size_t)sizeBytes));
+        return;
+    }
+    openRawDialogFor(url, sizeBytes);
+}
+
 // The 4-argument shape core/browse/host.h binds. See the note at that binding.
 static bool browseOpenRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
     return openRemote(url, asPreview, frame, npyRead, nullptr);
