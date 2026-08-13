@@ -1683,6 +1683,75 @@ struct PlotRect {
     }
 };
 
+// How far a curve swings over the part of it a plot is SHOWING, as a fraction
+// of its own level. The user's question, in their words: "the displayed graph's
+// displayed region - how many percent is it off, peak to peak".
+//
+// The quantity and the wording are NOT new. A detrend product's note already
+// says "p-p 12.3% -> 4.5% (p-p 100 -> 40 DN)", and its denominator is the
+// plane's mean LEVEL (docs/flat-field-stats.md). Using the same pair here means
+// a reader who has seen one has seen both, and nobody has to learn a second
+// spelling of "how flat is this".
+//
+// It is computed over the VISIBLE x range, so it changes when the plot is
+// zoomed or panned - which makes it presentation-dependent, and therefore
+// something that has to SAY what it was measured over. The line below prints
+// the range with the number for exactly that reason (the same discipline M1
+// applies to measuring-class settings: a number that depends on a choice
+// travels with the choice).
+struct PlotSpread {
+    bool ok = false;
+    int n = 0;                 // samples inside the range
+    double lo = 0, hi = 0;     // min and max of those samples
+    double pp = 0, mean = 0;   // hi - lo, and the level it is a fraction of
+    double pct = 0;            // 100 * pp / mean; 0 when there is no level
+    bool hasPct = false;       // a mean at or below 0 has no ratio to take
+    float x0 = 0, x1 = 0;      // the range it was measured over
+};
+// `xs` may be empty: then the series is indexed 0..n-1, which is what a profile
+// is (column x, row y) and what a frame plot falls back to.
+static PlotSpread plotSpreadIn(const std::vector<float>& xs, const std::vector<float>& ys,
+                               float x0, float x1) {
+    PlotSpread s;
+    s.x0 = x0; s.x1 = x1;
+    double sum = 0;
+    for (size_t i = 0; i < ys.size(); i++) {
+        const double x = xs.empty() ? (double)i : (i < xs.size() ? (double)xs[i] : 0.0);
+        if (x < x0 || x > x1) continue;
+        const double v = ys[i];
+        if (!std::isfinite(v)) continue;         // excluded, never folded in
+        if (!s.n || v < s.lo) s.lo = v;
+        if (!s.n || v > s.hi) s.hi = v;
+        sum += v;
+        s.n++;
+    }
+    if (s.n < 2) return s;                       // one sample has no spread
+    s.pp = s.hi - s.lo;
+    s.mean = sum / s.n;
+    // A ratio against a mean that is zero or negative is not a percentage of
+    // anything - it is a division by a level that does not exist. Said as a
+    // missing ratio rather than printed as a large or negative number, which is
+    // the same call the detrend report makes (`pctOk`).
+    if (s.mean > 0) { s.pct = 100.0 * s.pp / s.mean; s.hasPct = true; }
+    s.ok = true;
+    return s;
+}
+// ...and the sentence it owes the reader. Under the plot, in the plot's own
+// units, naming the window - because the number moves when the window does.
+static void plotSpreadLine(const PlotSpread& s, const char* what) {
+    if (!s.ok) return;
+    char b[224];
+    if (s.hasPct)
+        snprintf(b, sizeof b, "%s in view [%.6g .. %.6g]: p-p %.4g (%.4g%% of mean %.6g), "
+                              "%d point(s)",
+                 what, (double)s.x0, (double)s.x1, s.pp, s.pct, s.mean, s.n);
+    else
+        snprintf(b, sizeof b, "%s in view [%.6g .. %.6g]: p-p %.4g (no positive mean to "
+                              "take a ratio against), %d point(s)",
+                 what, (double)s.x0, (double)s.x1, s.pp, s.n);
+    ImGui::TextDisabled("%s", b);
+}
+
 // A drag rectangle in screen space -> the data ranges it spans. Pure, so the
 // selftest can pin the mapping without a mouse. Returns false for a drag too
 // small to be an intention (a click with jitter must not zoom into nothing).

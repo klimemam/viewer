@@ -1689,6 +1689,18 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
             if (A.isStack) marker(tp, im, 0);
             dl->PopClipRect();
             zoomUI(tp);
+            // ...and how far each curve swings over the part of it that is on
+            // screen, as a fraction of its own level. Per SLOT, because A and B
+            // are two measurements and one pooled number would belong to
+            // neither. The window is named with the number: it is a statement
+            // about what is being LOOKED at, so panning or zooming changes it
+            // and the reader has to be able to see that it did.
+            for (const TSlot& sl : slots) {
+                if (!sl.has || !sl.t || !sl.t->mean || !sl.t->idx) continue;
+                const PlotSpread sp = plotSpreadIn(*sl.t->idx, *sl.t->mean,
+                                                   tp.xmin, tp.xmax);
+                plotSpreadLine(sp, sl.letter.c_str());
+            }
         }
         slotLegendRow(leg, true);
     } else {

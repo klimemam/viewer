@@ -395,6 +395,56 @@
                   "E10 a click with jitter does not zoom into nothing");
         }
 
+        {   // ---- E12: how far the VISIBLE part of a curve swings ------------
+            // The user's question (2026-08-12): "the displayed graph's
+            // displayed region - how many percent is it off, peak to peak".
+            // Two things have to be true: the arithmetic, and the WINDOW - a
+            // number computed over everything would answer a question nobody
+            // asked the moment the plot is zoomed.
+            //
+            // Derivation, by hand and beside the assert. ys = 100, 110, 90,
+            // 105, 95 at x = 0..4.
+            //   whole range   lo 90, hi 110  -> p-p 20
+            //                 mean (100+110+90+105+95)/5 = 500/5 = 100
+            //                 pct 100*20/100 = 20
+            //   x in [1,3]    the three samples 110, 90, 105
+            //                 lo 90, hi 110 -> p-p 20
+            //                 mean (110+90+105)/3 = 305/3 = 101.666666...
+            //                 pct 100*20/(305/3) = 6000/305 = 19.672131...
+            // The two means differ, so a helper that ignored the window would
+            // print 20 in both places and pass a weaker test.
+            const std::vector<float> ys = { 100, 110, 90, 105, 95 };
+            const std::vector<float> xs = { 0, 1, 2, 3, 4 };
+            const PlotSpread all = plotSpreadIn(xs, ys, 0, 4);
+            const PlotSpread mid = plotSpreadIn(xs, ys, 1, 3);
+            fprintf(stderr, "exporttsvselftest: E12 all: n=%d p-p=%.9g mean=%.9g pct=%.9g | "
+                            "in [1,3]: n=%d p-p=%.9g mean=%.9g pct=%.9g\n",
+                    all.n, all.pp, all.mean, all.pct, mid.n, mid.pp, mid.mean, mid.pct);
+            check(all.ok && all.n == 5 && fabs(all.pp - 20) < 1e-9 &&
+                  fabs(all.mean - 100) < 1e-9 && fabs(all.pct - 20) < 1e-9,
+                  "E12 p-p and its percentage over the whole curve");
+            check(mid.ok && mid.n == 3 && fabs(mid.pp - 20) < 1e-9 &&
+                  fabs(mid.mean - 305.0 / 3.0) < 1e-9 &&
+                  fabs(mid.pct - 6000.0 / 305.0) < 1e-9,
+                  "E12 ...and over the VISIBLE range only, which is a different mean");
+            // an index-only series (a profile has no x array)
+            const PlotSpread byIdx = plotSpreadIn({}, ys, 1, 3);
+            check(byIdx.ok && byIdx.n == 3 && fabs(byIdx.mean - 305.0 / 3.0) < 1e-9,
+                  "E12 a series with no x array is indexed by position");
+            // ...and the two ways there is no answer, each said rather than
+            // printed as a number: one sample has no spread, and a mean at or
+            // below zero has no ratio to take (the detrend report's pctOk).
+            const PlotSpread one = plotSpreadIn(xs, ys, 2, 2);
+            const std::vector<float> zeroMean = { -5, 5, -5, 5 };
+            const PlotSpread zm = plotSpreadIn({}, zeroMean, 0, 3);
+            fprintf(stderr, "exporttsvselftest: E12 one sample ok=%d | zero mean ok=%d "
+                            "hasPct=%d p-p=%.9g\n",
+                    one.ok ? 1 : 0, zm.ok ? 1 : 0, zm.hasPct ? 1 : 0, zm.pp);
+            check(!one.ok, "E12 one sample is not a spread");
+            check(zm.ok && !zm.hasPct && fabs(zm.pp - 10) < 1e-9,
+                  "E12 a curve with no positive mean reports p-p and refuses the ratio");
+        }
+
         // ---- E8: the axis survives a session round-trip ----
         {
             std::error_code ec;

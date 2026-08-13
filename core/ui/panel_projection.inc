@@ -265,6 +265,22 @@ static void drawPanelProjection() {
         if (wantB && Bim) stroke(pr, PB, horizontal, true, overlaid, !overlaid);
         dl->PopClipRect();
         hoverReadout(pr, horizontal, wantA, wantB);
+        // How flat is what I am looking at? Per SERIES, because the canon
+        // forbids mixing CFA planes inside one statistic - four planes of a
+        // mosaic have four answers and one pooled number would be the
+        // inter-plane level difference wearing the profile's name. Over the
+        // VISIBLE x range, and it says so: the number moves when the window
+        // does, so the window is part of the statement.
+        if (wantA) {
+            const std::vector<float>* srcs = horizontal ? P.h : P.v;
+            const int nS = P.nSeries + (P.allRow ? 1 : 0);
+            for (int k = 0; k < nS && k < 5; k++) {
+                const PlotSpread sp = plotSpreadIn({}, srcs[k], pr.xmin, pr.xmax);
+                if (!sp.ok) continue;
+                const char* nm = P.seriesNames[k] ? P.seriesNames[k] : "value";
+                plotSpreadLine(sp, nm);
+            }
+        }
         if (wantA && wantB && Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
     };
 
