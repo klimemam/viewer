@@ -1273,6 +1273,91 @@ static std::string sjQuote(const std::string& s) {
 
 // One row per readable key: its path, and the value the app is in RIGHT NOW,
 // or "" when that value is the built-in default (and so must not be written).
+static std::string settingsCurrentValue(SKey id);   // fwd: defined below, one switch
+
+// ---- the Preferences panel's row model (docs/preferences-panel-design.md §8)
+// A pure function over SETTING_KEYS, so the panel is the table's FOURTH
+// consumer (after the applier, the schema walk and the template) rather than a
+// fifth list. browse-topbar-design.md §10.8's premise - "a second registration
+// always rots" - is the reason, and it is the same reason the template is
+// generated instead of typed.
+//
+// It touches no ImGui, so --prefspanel-selftest can assert every row without a
+// window: what a row SAYS is the part that can be wrong, and drawing it is not.
+enum SWidget {
+    SW_None = 0,   // SS_Later / SS_NotHere: the note replaces the control
+    SW_Bool, SW_Enum, SW_Int, SW_Float, SW_Text,
+    SW_Link        // a list this panel points at rather than edits (recipes, paths)
+};
+struct PrefRow {
+    SKey id = SK_None;
+    const char* path = nullptr;
+    SStatus status = SS_Read;
+    SWidget widget = SW_None;
+    std::string value;          // what the app holds now, as the panel prints it
+    std::string badge;          // WHO decides it (§5.1)
+    const char* note = nullptr; // SS_Later / SS_NotHere: the sentence
+};
+
+// The widget a key takes. A switch rather than a column on SKeyDef: the kind is
+// a fact about what the APPLIER accepts, and it belongs beside
+// settingsCurrentValue(), which is the other per-key fact this file keeps in
+// one place. displayGamma is an ENUM and not a range because sjApplyKey refuses
+// anything but 1.0 and 2.2 by name - a slider would offer values the file
+// itself rejects.
+static SWidget settingsWidgetFor(SKey id) {
+    switch (id) {
+        case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
+        case SK_gamma: case SK_defaultUnit:
+            return SW_Enum;
+        case SK_compact: case SK_showFps: case SK_pixelGrid: case SK_dragPans:
+        case SK_wheelZoom: case SK_fitOnSwitch: case SK_grouped: case SK_tree:
+        case SK_naturalSort: case SK_lowBandwidth:
+            return SW_Bool;
+        case SK_accent:
+            return SW_Int;
+        case SK_peerExe: case SK_repoUrl: case SK_pythonExe: case SK_editor:
+            return SW_Text;
+        case SK_rawRecipes: case SK_searchPath:
+            return SW_Link;
+        default:
+            return SW_None;
+    }
+}
+
+// WHO decides this key's value right now (§5.1). Four answers, and the
+// asymmetry between them is a fact about the formats rather than a choice:
+// settings.jsonc and the CLI NAME keys, so their claim is recorded (the
+// ledger); prefs.txt is rewritten whole on every save, so the presence of a key
+// there says nothing about whether a human chose it - only the VALUE can be
+// compared, against settingsCurrentValue()'s "empty means the built-in
+// default".
+static std::string settingsBadgeFor(SKey id) {
+    const OriginEntry& o = settingsOriginOf(id);
+    if (o.who == SetOrigin::Cli)
+        return std::string("command line (") + (o.cliFlag ? o.cliFlag : "?") + ")";
+    if (o.who == SetOrigin::File)
+        return "settings.jsonc:" + std::to_string(o.line);
+    return settingsCurrentValue(id).empty() ? "default" : "this machine";
+}
+
+static std::vector<PrefRow> settingsPrefRows() {
+    std::vector<PrefRow> rows;
+    rows.reserve(SETTING_KEY_COUNT);
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++) {
+        const SKeyDef& d = SETTING_KEYS[k];
+        PrefRow r;
+        r.id = d.id; r.path = d.path; r.status = d.status; r.note = d.note;
+        if (d.status == SS_Read) {
+            r.widget = settingsWidgetFor(d.id);
+            r.value = settingsCurrentValue(d.id);
+            r.badge = settingsBadgeFor(d.id);
+        }
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
 static std::string settingsCurrentValue(SKey id) {
     switch (id) {
         case SK_theme:  return app.themeVariant == ui_theme::VariantDark ? "" : "\"light\"";

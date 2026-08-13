@@ -904,6 +904,84 @@ static int settingsSelftest() {
               "O4 a reload forgets what the previous file said");
     }
 
+    // ---- W1..W4: the Preferences panel's ROW MODEL --------------------------
+    // The panel is SETTING_KEYS' fourth consumer, not a fifth list. What can be
+    // wrong is what a row SAYS - its widget, its value, who decides it - and
+    // none of that needs a window, so it is asserted here rather than drawn.
+    {
+        baseline();
+        loadSettingsFrom(missing);           // no file: the plain state
+        std::vector<PrefRow> rows = settingsPrefRows();
+        // STRUCTURAL, not a literal: the row count is the table's length, so a
+        // key added to the table appears here without anybody editing this test
+        // (判断16 - when a number stops matching, re-count the table).
+        int readable = 0, later = 0, notHere = 0, widgeted = 0, noted = 0;
+        for (const PrefRow& r : rows) {
+            if (r.status == SS_Read) {
+                readable++;
+                if (r.widget != SW_None) widgeted++;
+            } else {
+                if (r.status == SS_Later) later++; else notHere++;
+                if (r.note && *r.note) noted++;
+            }
+        }
+        fprintf(stderr, "settingsselftest: W rows=%zu (table %zu) read=%d later=%d "
+                        "notHere=%d widgeted=%d noted=%d\n",
+                rows.size(), SETTING_KEY_COUNT, readable, later, notHere,
+                widgeted, noted);
+        check(rows.size() == SETTING_KEY_COUNT,
+              "W1 the panel has exactly one row per table key");
+        // ...and the spot check the design derives by hand
+        // (docs/preferences-panel-design.md §3.1): prefs writes 27 keys, minus
+        // 5 history = 22 settings; membudget/watchfiles/watchauto are not read
+        // yet = 19; `theme` splits into theme + accent = 20; plus the 3 that
+        // exist only in settings.jsonc (remote.repoUrl, loading.rawRecipes,
+        // readers.editor) = 23.
+        check(readable == 23, "W1 ...and 23 of them are editable today");
+        // EVERY readable row has a control. This is S1's shape one level up: a
+        // key added to the table and forgotten in settingsWidgetFor() would
+        // otherwise draw a row with nothing in it.
+        check(widgeted == readable,
+              "W2 every readable key has a widget kind (none was forgotten)");
+        // ...and every row that is NOT readable says why, in the table's own
+        // words - the same sentence the template prints.
+        check(noted == later + notHere,
+              "W2 every 'later' / 'not here' row carries its sentence");
+        // Spot checks, each with its derivation:
+        //   displayGamma is an ENUM, not a range - sjApplyKey refuses anything
+        //   but 1.0 and 2.2 by name, so a slider would offer values the file
+        //   itself rejects.
+        //   rawRecipes is a LINK - it is a list with its own panel (#166), and
+        //   editing an array of objects in a row is not a control this panel has.
+        auto rowOf = [&](SKey id) -> const PrefRow* {
+            for (const PrefRow& r : rows) if (r.id == id) return &r;
+            return nullptr;
+        };
+        const PrefRow* rg = rowOf(SK_gamma);
+        const PrefRow* rr = rowOf(SK_rawRecipes);
+        const PrefRow* rb = rowOf(SK_compact);
+        fprintf(stderr, "settingsselftest: W3 gamma widget=%d | rawRecipes widget=%d | "
+                        "compact widget=%d\n",
+                rg ? (int)rg->widget : -1, rr ? (int)rr->widget : -1,
+                rb ? (int)rb->widget : -1);
+        check(rg && rg->widget == SW_Enum, "W3 displayGamma is a two-value enum");
+        check(rr && rr->widget == SW_Link, "W3 rawRecipes is a link, not an editor");
+        check(rb && rb->widget == SW_Bool, "W3 a boolean key gets a checkbox");
+        // ...and the badge, which is the whole reason this panel exists: the
+        // four layers have to be distinguishable ON THE ROW.
+        const std::string bDefault = rb ? rb->badge : std::string();
+        loadSettingsFrom(writeFix("{ \"appearance\": { \"compact\": false } }\n"));
+        rows = settingsPrefRows();
+        const PrefRow* rb2 = nullptr;
+        for (const PrefRow& r : rows) if (r.id == SK_compact) rb2 = &r;
+        fprintf(stderr, "settingsselftest: W4 compact badge: no file \"%s\" -> "
+                        "with file \"%s\"\n",
+                bDefault.c_str(), rb2 ? rb2->badge.c_str() : "-");
+        check(bDefault == "default", "W4 an untouched key's row says 'default'");
+        check(rb2 && rb2->badge.rfind("settings.jsonc:", 0) == 0,
+              "W4 ...and a key the file decides names the file and the line");
+    }
+
     baseline();
     std::filesystem::remove_all(root, ec);
     fprintf(stderr, "settingsselftest: %s\n", ok ? "ok" : "FAILED");
