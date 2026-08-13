@@ -371,6 +371,65 @@ if (!g_precisionSelftest.empty()) {
     // moments were gathered over, so its mean legitimately differs (0.037 DN
     // on a 4000x3000 frame, in double). Asserting it here would be asserting
     // something untrue - the comment in panel_histogram.inc used to.
+    //
+    // ...and THAT is what issue #145 was about: two honest numbers shared one
+    // column called "mean", so which one you read depended on the layout the
+    // panel happened to be in. The per-axis header now says "mean (axis)",
+    // matching the three columns beside it that already carried the same
+    // distinction. This assertion is the label's anti-vacuity: if the two
+    // means were interchangeable the rename would be decoration, and a later
+    // reader would be right to undo it.
+    {
+        // A frame BIG ENOUGH TO DECIMATE, which is the only condition under
+        // which the two sample sets differ at all. Below PROJ_MAX_SAMPLES
+        // (2 Mpx) both passes visit every pixel, the sets coincide, and the two
+        // means agree to a rounding - measuring the difference on a small
+        // fixture would find nothing and prove nothing. 2048x1024 is 2.10 Mpx,
+        // just over the cap, so the stride is 2 and the H pass (every 2nd ROW)
+        // and the V pass (every 2nd COLUMN) look at different pixels.
+        // ...and it needs STRUCTURE, not noise. Uniform noise averages to the
+        // same number over either set, so a noisy frame proves nothing however
+        // large it is (measured: 0.000465 ppm, well inside one ulp). The real
+        // 4000x3000 frame in the issue differed by 12 ppm because it had
+        // content. And "big" means big enough for the INTEGER division that
+        // sets the stride: step = rw*rh*cell / 2000000, so 2.10 Mpx still gives
+        // step 1. Four megapixels is the first size that strides.
+        //
+        // The smallest structure that separates the two sets exactly: ONE BRIGHT
+        // ROW AT AN ODD INDEX. The H pass takes every step-th row starting at 0,
+        // so with an even stride it never sees row 1; the V pass takes every row
+        // of every step-th column, so it always does.
+        //
+        // Derivation, by hand: W=H=2048 (4.19 Mpx, step 2), base B, row 1 is B+D.
+        // The region moments are gathered in the H pass ("if (toH)"), so the
+        // region and the H profile share one sample set by construction:
+        //   H set = all x, even y            -> mean = B                (row 1 absent)
+        //   V set = even x, all y            -> mean = B + D/H
+        // With B = 3000 and D = 2048 the V mean is B + 1 exactly, which is
+        // 333 ppm - three orders above the one-ulp bound, so the assertion is
+        // about the sample sets and not about rounding.
+        const int BW = 2048, BH = 2048;
+        auto big = std::make_unique<ImageDoc>();
+        big->name = "p7struct";
+        big->src->w = BW; big->src->h = BH; big->src->ch = 1;
+        big->src->dtype = "f32";
+        big->src->data.assign((size_t)BW * BH, 3000.0f);
+        for (int x = 0; x < BW; x++) big->src->data[(size_t)1 * BW + x] = 3000.0f + 2048.0f;
+        big->syncMirrors();
+        App::ProjState PB;
+        probe(big.get(), PB);
+        const double dv = fabs(PB.vStat[0].mean - PB.fStat[0].mean);
+        const double bound = ulpBound(PB.fStat[0].mean);
+        const App::ProjState& PN = PB;
+        fprintf(stderr, "precisionselftest: P7e V profile %s vs region %s | "
+                        "off by %s DN (%.3g ppm), one-ulp bound %.3g ppm\n",
+                rp::exactNum(PN.vStat[0].mean).c_str(),
+                rp::exactNum(PN.fStat[0].mean).c_str(),
+                rp::exactNum(PN.vStat[0].mean - PN.fStat[0].mean).c_str(),
+                dv / fabs(PN.fStat[0].mean) * 1e6, bound / fabs(PN.fStat[0].mean) * 1e6);
+        check(PN.vStat[0].valid && dv > bound,
+              "P7e the V profile mean is a DIFFERENT number - the axis label is not decoration");
+    }
     app.projMode = savedMode; app.projAllRow = savedAll;
     app.annBusy = savedBusy; app.selectedAnn = savedSel;
 
