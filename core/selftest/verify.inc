@@ -2528,6 +2528,60 @@
                 check(capped && cappedOnRead, "V25k the memory is bounded at 64 (LRU)");
                 check(lru, "V25k the least recently chosen entry is the one dropped");
             }
+            // ---- V25q: both carriers of one format check the same amount ----
+            // A .vstream is a CACHE that outlives the process, so truncation
+            // and corruption are things it WILL meet. The npz gate has always
+            // validated the tree before anything indexed into it; the stream
+            // gate took `parent` from atoi() and passed it on, so one corrupt
+            // line reached vnzCheckSets - which guards only `>= 0` - and
+            // indexed out of bounds. Two carriers of one format that check
+            // different amounts is #71's "a second copy is a copy that drifts"
+            // wearing a validator's clothes.
+            //
+            // Hand-written bytes, because the point is a file no writer of ours
+            // would produce: a corrupt cache is not a thing the harness emits.
+            {
+                std::error_code vec;
+                const std::filesystem::path vdir =
+                    std::filesystem::temp_directory_path(vec) / "viewer_vstream";
+                std::filesystem::remove_all(vdir, vec);
+                std::filesystem::create_directories(vdir, vec);
+                auto write = [&](const char* nm, const std::string& body) {
+                    const std::string fp = (vdir / nm).u8string();
+                    std::ofstream o(pathFromUtf8(fp), std::ios::binary);
+                    o.write(body.data(), (std::streamsize)body.size());
+                    return fp;
+                };
+                FrameSource st;
+                // parent out of range: 999999 with n = 2
+                const std::string bad = write("bad.vstream",
+                    "VIEWERSTREAM 2\nn 2\nlayer 0 batch\nparent 0 -1\n"
+                    "layer 1 frame\nparent 1 999999\nend\n");
+                const std::string e1 = loadViewerStream(bad, "", "bad.vstream", st);
+                // ...and a parent that is LATER than the node naming it, which
+                // the npz gate has always refused ("depth first, root 0")
+                const std::string fwd = write("fwd.vstream",
+                    "VIEWERSTREAM 2\nn 2\nlayer 0 batch\nparent 0 -1\n"
+                    "layer 1 frame\nparent 1 1\nend\n");
+                const std::string e2 = loadViewerStream(fwd, "", "fwd.vstream", st);
+                // ...and a layer nothing here knows
+                const std::string lay = write("lay.vstream",
+                    "VIEWERSTREAM 2\nn 1\nlayer 0 sandwich\nparent 0 -1\nend\n");
+                const std::string e3 = loadViewerStream(lay, "", "lay.vstream", st);
+                fprintf(stderr, "verifyselftest: V25q stream gate:\n"
+                                "  parent 999999 -> \"%s\"\n"
+                                "  parent 1 (forward) -> \"%s\"\n"
+                                "  layer sandwich -> \"%s\"\n",
+                        e1.c_str(), e2.c_str(), e3.c_str());
+                check(!e1.empty() && e1.find("parent") != std::string::npos,
+                      "V25q a .vstream whose parent is out of range is REFUSED, by name");
+                check(!e2.empty() && e2.find("earlier node") != std::string::npos,
+                      "V25q ...and a forward parent, in the npz gate's own words");
+                check(!e3.empty() && e3.find("not a layer") != std::string::npos,
+                      "V25q ...and a layer this build does not know");
+                std::filesystem::remove_all(vdir, vec);
+            }
+
             // ---- V25p: the memo is per-machine, and a session is not ---------
             // V25k just established that the record of WHICH adapter read a
             // file is a bounded LRU in prefs.txt. A session carries no such

@@ -1116,6 +1116,38 @@ static bool vnzParseRefs(const std::string& js, std::vector<VnzRef>& out,
 // the npz side would not guard the door most sets come through). A malformed
 // set is refused whole, by the member at fault, BEFORE anything lands: a
 // half-built set would be a binding record nobody declared.
+// The STRUCTURE a node tree must have before anything indexes into it: every
+// node names a layer this build knows, node 0 is the root, and every other node
+// names a parent that came BEFORE it (depth first). Nothing below may be
+// skipped, because everything after this walks the tree by index.
+//
+// ONE function, called by BOTH carriers. The npz gate has always checked this
+// inline; the stream gate did not - it took `parent` from atoi() and passed it
+// straight on, so `parent 1 999999` in a .vstream reached vnzCheckSets, which
+// guards only `>= 0`, and indexed out of bounds. A .vstream is a CACHE that
+// outlives the process: truncation and corruption are things it will meet, not
+// things it might. Two carriers of one format that check different amounts is
+// the defect #71 named ("a second copy is a copy that drifts") wearing a
+// validator's clothes.
+static std::string vnzCheckTree(const std::vector<VnzNode>& nodes, int n) {
+    if (n < 0 || (size_t)n > nodes.size()) return "the node count does not match the nodes";
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        const std::string si = std::to_string(i);
+        if (v.layer != "frame" && v.layer != "stack" && v.layer != "series" &&
+            v.layer != "batch" && v.layer != "analysisset")
+            return "node " + si + " is a \"" + v.layer + "\": not a layer "
+                   "(frame / stack / series / batch / analysisset)";
+        if (i == 0 && v.parent != -1)
+            return "node 0's parent is " + std::to_string(v.parent) +
+                   ": node 0 is the root (-1)";
+        if (i != 0 && (v.parent < 0 || v.parent >= i))
+            return "node " + si + "'s parent is " + std::to_string(v.parent) +
+                   ": a parent must be an earlier node (depth first, root 0)";
+    }
+    return {};
+}
+
 static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int version) {
     bool any = false;
     for (int i = 0; i < n; i++) {
@@ -1123,6 +1155,9 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
         const std::string si = std::to_string(i);
         if (v.layer == "analysisset") {
             any = true;
+            if (v.parent >= (int)nodes.size())
+                return "node " + si + "'s parent is " + std::to_string(v.parent) +
+                       ": there are only " + std::to_string(nodes.size()) + " nodes";
             if (v.parent >= 0 && nodes[(size_t)v.parent].layer != "batch")
                 return "node " + si + " is an analysisset inside a " +
                        nodes[(size_t)v.parent].layer + ": a set is a node of a "
@@ -1306,6 +1341,12 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
     }
     if (!sawEnd) return "the stream stopped before its header ended - the reader was cut short";
     if (n < 0) return "the stream never said how many nodes it has";
+    {   // the TREE first: vnzCheckSets indexes nodes[parent], so the parent has
+        // to be in range before it is used as one. The npz gate does this
+        // inside its read loop; this carrier had no equivalent (F2).
+        std::string terr = vnzCheckTree(nodes, n);
+        if (!terr.empty()) return terr;
+    }
     {   // the set structure, shared with the npz carrier (ras §4). This is the
         // door most sets arrive through - a reader's result comes down the pipe.
         std::string serr = vnzCheckSets(nodes, n, ver);
