@@ -149,6 +149,12 @@ static void drawMenuBar(GLFWwindow* win) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...")) openFileDialog();
+        // #50. File is where the application-level verbs live (the Watch
+        // toggle is already here). No shortcut in v1: there is no key map
+        // (settings-inventory §3.8), and adding hand-written chords is exactly
+        // what 判断14 is holding the door against - the palette will reach it
+        // from the same table when it lands.
+        ImGui::MenuItem("Preferences...", nullptr, &app.prefsOpen);
         if (ImGui::MenuItem("Open Folder...", SC_MOD "+Shift+O")) openFolderDialog();
         // §4.1: a reader must be reachable for a FOLDER as well as a file -
         // "one condition per folder" is a common way to store a sweep, so the

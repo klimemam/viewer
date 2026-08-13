@@ -1308,7 +1308,7 @@ struct PrefRow {
 static SWidget settingsWidgetFor(SKey id) {
     switch (id) {
         case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
-        case SK_gamma: case SK_defaultUnit:
+        case SK_gamma:
             return SW_Enum;
         case SK_compact: case SK_showFps: case SK_pixelGrid: case SK_dragPans:
         case SK_wheelZoom: case SK_fitOnSwitch: case SK_grouped: case SK_tree:
@@ -1316,7 +1316,11 @@ static SWidget settingsWidgetFor(SKey id) {
             return SW_Bool;
         case SK_accent:
             return SW_Int;
+        // series.defaultUnit is a free string, not an enumeration: the
+        // applier accepts any name that fits (a lab measures in whatever it
+        // measures in), so a combo would refuse units the file accepts.
         case SK_peerExe: case SK_repoUrl: case SK_pythonExe: case SK_editor:
+        case SK_defaultUnit:
             return SW_Text;
         case SK_rawRecipes: case SK_searchPath:
             return SW_Link;
@@ -1339,6 +1343,118 @@ static std::string settingsBadgeFor(SKey id) {
     if (o.who == SetOrigin::File)
         return "settings.jsonc:" + std::to_string(o.line);
     return settingsCurrentValue(id).empty() ? "default" : "this machine";
+}
+
+// Where a key's value LIVES, and what to do after it moves. Beside the widget
+// kinds and settingsCurrentValue() for the reason those two are here: this file
+// already holds the per-key knowledge, and a copy of it in the panel would be
+// the second place that has to be right (判断16).
+static bool* prefBoolField(SKey id) {
+    switch (id) {
+        case SK_compact:      return &app.compactUi;
+        case SK_showFps:      return &app.showFps;
+        case SK_pixelGrid:    return &app.showGrid;
+        case SK_dragPans:     return &app.dragPans;
+        case SK_wheelZoom:    return &app.wheelZoomPlain;
+        case SK_fitOnSwitch:  return &app.fitOnSwitch;
+        case SK_tree:         return &app.rbTree;
+        case SK_naturalSort:  return &app.rbNatural;
+        case SK_lowBandwidth: return &app.lowBandwidth;
+        default: return nullptr;
+    }
+}
+static int* prefIntField(SKey id) {
+    return id == SK_accent ? &app.themeAccent : nullptr;
+}
+static std::string* prefTextField(SKey id) {
+    switch (id) {
+        case SK_peerExe:   return &app.remoteExe;
+        case SK_repoUrl:   return &g_settingsRepoUrl;
+        case SK_pythonExe: return &app.pythonExe;
+        case SK_editor:    return &g_settingsEditorCmd;
+        // ...and the one text field that is a fixed buffer rather than a
+        // std::string. Handed back through the same door by the caller below.
+        default: return nullptr;
+    }
+}
+// The choices an enum key offers, and which one is current. The lists are the
+// applier's own vocabulary - sjApplyKey refuses anything outside them by name,
+// so a control that offered a fifth option would offer a value the file itself
+// rejects.
+static void prefEnumChoices(SKey id, std::vector<const char*>& out, int& cur) {
+    out.clear(); cur = 0;
+    switch (id) {
+        case SK_theme:
+            out = { "dark", "light" };
+            cur = app.themeVariant == ui_theme::VariantLight ? 1 : 0;
+            break;
+        case SK_titleBar:
+            out = { "integrated", "system" };
+            cur = app.frameMode == 1 ? 0 : 1;
+            break;
+        case SK_stackPrompt:
+            out = { "ask", "always", "never" };
+            cur = std::clamp(app.seqLoadMode, 0, 2);
+            break;
+        case SK_policy:
+            out = { "auto", "local-fetch" };
+            cur = app.procPolicy == App::PolLocalFetch ? 1 : 0;
+            break;
+        case SK_gamma:
+            // TWO values, not a range: sjApplyKey names 1.0 and 2.2 and refuses
+            // the rest, so this is an enumeration wearing a number's clothes.
+            out = { "1.0 (linear)", "2.2" };
+            cur = app.dispGamma > 1.5f ? 1 : 0;
+            break;
+        case SK_grouped:
+            out = { "grouped", "flat" };
+            cur = app.rbFlat ? 1 : 0;
+            break;
+        default: break;
+    }
+}
+static void prefEnumSet(SKey id, int idx) {
+    switch (id) {
+        case SK_theme:  app.themeVariant = idx ? ui_theme::VariantLight
+                                               : ui_theme::VariantDark; break;
+        case SK_titleBar: app.frameMode = idx ? 0 : 1; break;
+        case SK_stackPrompt: app.seqLoadMode = std::clamp(idx, 0, 2); break;
+        case SK_policy: app.procPolicy = idx ? App::PolLocalFetch : App::PolAuto; break;
+        case SK_gamma:  app.dispGamma = idx ? 2.2f : 1.0f; break;
+        case SK_grouped: app.rbFlat = idx != 0; break;
+        default: break;
+    }
+}
+// The side effect a change owes the rest of the program. The SAME helpers the
+// menu calls - the helper is the shared thing, and a panel that re-implemented
+// "apply the theme" would be a second theme applier.
+static void prefAfterChange(SKey id) {
+    switch (id) {
+        case SK_theme: case SK_accent: case SK_compact:
+            app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
+            ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
+            break;
+        case SK_gamma: markAllTexDirty(); break;
+        case SK_titleBar:
+            window_frame::setMode(app.frameMode == 1 ? window_frame::Integrated
+                                                     : window_frame::System);
+            break;
+        case SK_editor: adapter::setSettingsEditor(g_settingsEditorCmd); break;
+        default: break;
+    }
+    app.prefsDirty = true;             // prefs.txt is the GUI's only write target
+}
+// The two keys that are LISTS with panels of their own.
+static void prefOpenLink(SKey id) {
+    if (id == SK_rawRecipes) app.rawRecipeListOpen = true;
+    else if (id == SK_searchPath) app.readerListOpen = true;
+}
+static std::string prefLinkSummary(SKey id) {
+    if (id == SK_rawRecipes)
+        return std::to_string(g_rawLibrary.size()) + " named recipe(s)";
+    if (id == SK_searchPath)
+        return std::to_string(app.readerPlaces.size()) + " place(s)";
+    return {};
 }
 
 static std::vector<PrefRow> settingsPrefRows() {

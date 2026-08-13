@@ -1958,6 +1958,14 @@ struct App {
     // open the way it does" - and because a lab's own formats are consulted,
     // not answered once and dismissed.
     bool rawRecipeListOpen = false;
+    // #50: the one place a setting can be changed. Not modal - gamma, compact
+    // and the theme are judged by looking at the picture behind the window,
+    // which a modal takes away (docs/preferences-panel-design.md §8). Not in
+    // the session either: it is chrome for changing settings, not part of a
+    // workspace, and putting it in `panels` would add a resident to the
+    // "what should a clean start look like" argument that has nothing to do
+    // with it.
+    bool prefsOpen = false;
     char readerPickFile[512] = "";
     char readerPickFunc[128] = "load";
     // §4.13.2 (issue #51): the places readers are looked for, in the order the

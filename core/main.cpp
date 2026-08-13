@@ -207,6 +207,7 @@ static std::string fmtVal(float v, const std::string& dtype) {
 
 // ---------------------------------------------------------------- UI
 #include "ui/canvas.inc"
+#include "ui/panel_preferences.inc"
 #include "ui/inspector.inc"
 #include "ui/panel_histogram.inc"
 #include "ui/panel_projection.inc"
@@ -1818,6 +1819,7 @@ static bool g_watchSuppressed = false;
         drawReaderPanel();
         drawReaderList();
         drawRawRecipePanel();
+        drawPreferencesPanel();
         drawRemoteOpenModal();
         drawRemoteErrorWindow();
         drawHelpAbout();
