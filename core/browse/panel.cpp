@@ -550,8 +550,13 @@ static void rbGoTo(App::BrowseInstance& I, const std::string& dir) {
 static void drawRemotePlacesItems(App::BrowseInstance& I) {
     // display only: a local place reads better as "[local] path" than as the
     // url scheme (the stored prefs string stays the url)
+    // ...and a place with no path behind it ("local://" alone, which a
+    // hand-edited prefs line can hold) reads as ITSELF: the old form labelled
+    // it "[local] " and showed nothing, so a broken bookmark looked like a
+    // nameless folder instead of the string it is.
     auto placeLabel = [](const std::string& u) {
-        return u.rfind("local://", 0) == 0 ? "[local] " + u.substr(8) : u;
+        const std::string onDisk = localDiskPathOfUrl(u);
+        return onDisk.empty() ? u : "[local] " + onDisk;
     };
     int rm = -1;
     if (!app.rbBookmarks.empty()) ImGui::TextDisabled("bookmarks");

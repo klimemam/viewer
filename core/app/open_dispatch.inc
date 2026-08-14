@@ -546,7 +546,7 @@ static void seqMosaicChanged(const ImageDoc* im) {
 static std::string reloadUnavailable(const FrameSource& S) {
     // local:// is LOCAL: a Browse-panel local open carries the on-disk path
     // inside its url, so those pixels ARE reloadable off this disk.
-    const bool localUrl = !S.remoteUrl.empty() && S.remoteUrl.rfind("local://", 0) == 0;
+    const std::string onDisk = localDiskPathOfUrl(S.remoteUrl);
     // ...and the row that USED to be here - "remote-backed: these pixels come
     // from the peer, not from a local file" - is gone, because it stopped being
     // true (§16). reloadSource now has the peer's equivalent of "stat it and
@@ -561,7 +561,11 @@ static std::string reloadUnavailable(const FrameSource& S) {
     // round trip per repaint, and the answer would still be stale by the time
     // the click arrived. An unreachable peer is a reload that FAILS, with the
     // reason on the row and #56's mark saying nothing was re-read.
-    if ((localUrl ? S.remoteUrl.substr(8) : S.path).empty())
+    // WHICH string is the file: a local:// url carries it inside itself, and
+    // everything else - no url at all, or a peer's - keeps it in `path`. Not
+    // "url empty ? path : onDisk": a peer source has a non-empty url AND a
+    // non-empty path (the peer's), so that form refuses every peer by name.
+    if ((isPeerUrl(S.remoteUrl) || S.remoteUrl.empty() ? S.path : onDisk).empty())
         return "no file behind these pixels - they were composed\n"
                "here (montage / plugin result).";
     if (S.member.rfind("__pixels_", 0) == 0)
@@ -653,10 +657,9 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     // inside its url - the pixels are on this disk and reload reads that file,
     // which is strictly more than a peer can tell us about it (§13.7). A real
     // remote scheme goes through the peer's door, the FIRST of the four below.
-    const bool localUrl = !src->remoteUrl.empty() &&
-                          src->remoteUrl.rfind("local://", 0) == 0;
-    const bool peerUrl = !src->remoteUrl.empty() && !localUrl;
-    const std::string fpath = localUrl ? src->remoteUrl.substr(8) : src->path;
+    const std::string onDisk = localDiskPathOfUrl(src->remoteUrl);
+    const bool peerUrl = isPeerUrl(src->remoteUrl);
+    const std::string fpath = peerUrl || src->remoteUrl.empty() ? src->path : onDisk;
     if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
     // Container/reader members (__pixels_*) rebuild as a UNIT: one __viewer
     // line restores the whole tree, and a reader file re-runs its adapter.
@@ -1125,8 +1128,7 @@ static watch::Rebuild planStackMembership(int seqId,
         bool anyPeer = false, allPeer = true;
         for (int idx : fr) {
             const FrameSource& s = *app.images[idx]->src;
-            const bool p = !s.remoteUrl.empty() &&
-                           s.remoteUrl.rfind("local://", 0) != 0;
+            const bool p = isPeerUrl(s.remoteUrl);
             anyPeer |= p;
             allPeer &= p;
         }
@@ -1136,8 +1138,9 @@ static watch::Rebuild planStackMembership(int seqId,
     std::vector<std::string> paths;
     for (int idx : fr) {
         const FrameSource& s = *app.images[idx]->src;
-        const bool localUrl = !s.remoteUrl.empty() && s.remoteUrl.rfind("local://", 0) == 0;
-        const std::string p = localUrl ? s.remoteUrl.substr(8) : s.path;
+        const std::string onDisk = localDiskPathOfUrl(s.remoteUrl);
+        const std::string p = isPeerUrl(s.remoteUrl) || s.remoteUrl.empty()
+                                  ? s.path : onDisk;
         if (p.empty()) return none;                              // composed here
         paths.push_back(p);
         have.push_back(baseName(p));
@@ -1246,7 +1249,7 @@ static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
     // question every other door here is chosen by - what the REFERENCE frame is
     // - so a stack whose frames came over a link takes its new member over that
     // link too, and `path` is read as the peer's path rather than this disk's.
-    const bool refPeer = !R.remoteUrl.empty() && R.remoteUrl.rfind("local://", 0) != 0;
+    const bool refPeer = isPeerUrl(R.remoteUrl);
     std::unique_ptr<ImageDoc> doc;
     bool adopted = false;
     if (refPeer) {
@@ -2408,7 +2411,7 @@ static void promotePreview(ImageDoc* d) {
 }
 
 static void openPath(const std::string& path) {
-    if (path.compare(0, 6, "ssh://") == 0 || path.compare(0, 8, "local://") == 0) {
+    if (hasUrlScheme(path)) {
         // A url naming a file opens that file. A url naming a host or a
         // directory means "start here": connect and browse it, the same thing
         // File > Start Remote does - which is what a desktop shortcut to a

@@ -856,7 +856,7 @@ static void parseCli(int argc, char** argv) {
                            // dimensions and dtype: --raw-* on the same command
                            // line is for the files that carry none
                            imagefile::forPath(a) != nullptr;
-            const bool isUrl = low.rfind("ssh://", 0) == 0 || low.rfind("local://", 0) == 0;
+            const bool isUrl = hasUrlScheme(low);
             if (!special && rawReady && isUrl) {
                 // A headerless file on a PEER, declared on the command line.
                 // The same six numbers the local branch below would decode
