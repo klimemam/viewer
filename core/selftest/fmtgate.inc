@@ -269,27 +269,90 @@
         // holds by construction - which is the END STATE it was written to
         // reach, not a reason to retire it. It fails again the day somebody
         // re-types the list here.
+        //
+        // ...and it is now stated over the ARRAYS, the way F4c below already
+        // states its own claim. It used to walk a hand-typed probe of ten
+        // strings, which reproduced inside this test the very thing the
+        // G1-G3-G8 family is about: the invariant enumerated the complement of
+        // the table BY HAND, so an extension added to sequence.inc's array or
+        // to imagefile's tomorrow is a door no invariant sees, because the hand
+        // does not know. There is no list here now.
         {
-            static const char* PROBE[] = { ".npy", ".npz", ".bin", ".raw", ".yuv",
-                                           ".dat", ".rggb", ".png", ".tif", ".exr" };
+            int checked = 0;
             bool agree = true;
             std::string disagreed;
-            for (const char* e : PROBE) {
+            auto want = [&](const std::string& e) {
+                checked++;
                 if (isLoadableExt(e) && !viewerReadsName(std::string("x") + e)) {
                     agree = false;
                     disagreed += std::string(disagreed.empty() ? "" : " ") + e;
                 }
+            };
+            for (const char* e : SELFDESC_EXTS)          want(e);
+            for (const std::string& e : HEADERLESS_EXTS) want(e);
+            // ...and the table's own rows through the same predicate pair, so
+            // the two halves of "can this build open it" are asserted together
+            // rather than in two tests that could come to disagree.
+            for (const imagefile::Backend& b : imagefile::backends()) {
+                std::string all = b.exts;
+                size_t i = 0;
+                while (i < all.size()) {
+                    size_t sp = all.find(' ', i);
+                    want(all.substr(i, sp == std::string::npos ? sp : sp - i));
+                    if (sp == std::string::npos) break;
+                    i = sp + 1;
+                }
             }
-            // anti-vacuity: the probe has to contain something isLoadableExt
-            // actually accepts, or "they agree" is a statement about nothing
             int accepted = 0;
-            for (const char* e : PROBE) if (isLoadableExt(e)) accepted++;
-            fprintf(stderr, "fmtgateselftest:   Open Folder accepts %d of %d probed; "
-                            "Browse disagrees on [%s]\n",
-                    accepted, (int)(sizeof PROBE / sizeof PROBE[0]),
-                    disagreed.empty() ? "-" : disagreed.c_str());
-            check(accepted >= 7, "F4b the probe really covers the loadable set");
+            for (const char* e : SELFDESC_EXTS)          if (isLoadableExt(e)) accepted++;
+            for (const std::string& e : HEADERLESS_EXTS) if (isLoadableExt(e)) accepted++;
+            fprintf(stderr, "fmtgateselftest:   Open Folder accepts %d own-door of %d "
+                            "extensions walked; Browse disagrees on [%s]\n",
+                    accepted, checked, disagreed.empty() ? "-" : disagreed.c_str());
+            // anti-vacuity: the arrays have to be non-empty and the own doors
+            // have to be accepted, or "they agree" is a statement about nothing
+            check(accepted >= 7 && checked >= 12,
+                  "F4b the arrays really cover the loadable set");
             check(agree, "F4b what Open Folder loads, Browse says it can open");
+        }
+
+        // ---- F4b2: the ONE door that is in no array and no table row ----------
+        // `.vsession` is a door - a session is opened, not decoded - and it is
+        // the last name belonging to none of the three enumerations F4, F4b and
+        // F4c walk. Every invariant above is therefore true of it VACUOUSLY,
+        // and its contract has never been asserted anywhere. It is four
+        // answers, and three of them are NO:
+        //
+        //   viewerReadsName  yes - Browse must not grey out a file File > Open
+        //                          opens (the G2 shape)
+        //   isLoadableName   NO  - Open Folder must not bundle sessions into a
+        //                          stack, which is why menus.inc adds it at the
+        //                          one door and nowhere else
+        //   peerServesName   NO  - the peer serves pixels; a session names
+        //                          files on the machine that wrote it
+        //   isHeaderless     NO  - and it is not a geometry prompt either
+        //
+        // Asserted as the four TOGETHER because the value is in the
+        // disagreement: any one alone is satisfied by a predicate that says yes
+        // to everything or no to everything.
+        {
+            const std::string v = "restore.vsession";
+            const bool reads  = viewerReadsName(v);
+            const bool bundle = isLoadableName(v);
+            const bool served = peerServesName(v);
+            const bool hless  = imagefile::isHeaderless(v);
+            fprintf(stderr, "fmtgateselftest:   .vsession: browse-opens=%d "
+                            "folder-bundles=%d peer-serves=%d headerless=%d\n",
+                    reads ? 1 : 0, bundle ? 1 : 0, served ? 1 : 0, hless ? 1 : 0);
+            check(reads && !bundle && !served && !hless,
+                  "F4b2 .vsession opens from Browse and is refused by the other three doors");
+            // ...and the same four asked of a name that IS in the table, which
+            // is the anti-vacuity: it must answer differently, or the four
+            // predicates are not distinguishing anything.
+            const std::string n = "frame.npy";
+            check(viewerReadsName(n) && isLoadableName(n) && peerServesName(n),
+                  "F4b2b ...while a .npy answers yes to the first three - the "
+                  "four predicates are not one predicate");
         }
 
         // ---- F4c: ...and the FILE DIALOG offers every one of them -------------
