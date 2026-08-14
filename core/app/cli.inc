@@ -97,10 +97,13 @@ static bool g_roiExportSelftest = false;
 
 // --settings-selftest: settings.jsonc (issue #50 stage 1) - the JSONC dialect,
 // the load order, and the two refusals (whole file / one key). It takes no
-// directory because it writes its own fixtures into its OWN temp dir: the
-// subject of this test IS a settings file, and VIEWER_TEST_HOME is one folder
-// shared by every selftest, so a fixture written there would be read by all of
-// them. Windowless for the --roistats-selftest reasons: every assertion is a
+// directory because it writes its own fixtures into its OWN temp dir, and names
+// them explicitly: the subject of this test IS a settings file, so the
+// file it reads has to be one it placed at a path it stated, not whatever
+// the app happens to discover. (Until 2026-08-14 the reason was harsher -
+// APPDATA/HOME were ONE folder shared by every selftest, so a fixture left
+// there was read by all of them. Each test has its own now, but pointing
+// this test at the discovery path would still be testing discovery.) Windowless for the --roistats-selftest reasons: every assertion is a
 // value or a string. See settingsSelftest().
 static bool g_settingsSelftest = false;
 
@@ -108,9 +111,9 @@ static bool g_settingsSelftest = false;
 // library in settings.jsonc, the PROCESS-ONLY size -> recipe binding, and the
 // two things that must NOT happen (a saved recipe applying on its own; a
 // binding surviving anything). It takes no directory because it writes its own
-// headerless fixtures into its OWN temp dir, and it must: VIEWER_TEST_HOME is
-// one folder shared by every selftest and a settings.jsonc left there would be
-// read by all of them. Windowless for the --roistats-selftest reasons - every
+// headerless fixtures into its OWN temp dir, and names them explicitly, for
+// --settings-selftest's reason: one of the fixtures IS a settings.jsonc, and a
+// test about how that file is READ must place it where it says. Windowless for the --roistats-selftest reasons - every
 // assertion is a pixel value, a width or a string. See rawRecipeSelftest().
 static bool g_rawRecipeSelftest = false;
 

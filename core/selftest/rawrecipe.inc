@@ -15,11 +15,14 @@
 // allowed to apply unpicked is a choice the user made minutes ago and still
 // remembers - and "still remembers" is exactly what a restart ends.
 //
-// FIXTURES GO IN THIS TEST'S OWN TEMP DIRECTORY. VIEWER_TEST_HOME is ONE folder
-// shared by every selftest (only TMP/TEMP/TMPDIR are per-test, see
-// CMakeLists.txt), so a settings.jsonc written there would be read by every
-// test that ran afterwards and would survive the run - the a9b7973 shape. This
-// test writes a settings file, so it is the one that must never write it there.
+// FIXTURES GO IN THIS TEST'S OWN TEMP DIRECTORY, at paths this test states.
+// Its subject is how a settings.jsonc is READ, so the file it reads must be one
+// it placed, not one the app discovered. Until 2026-08-14 there was a second
+// reason and it was harsher: APPDATA/HOME were ONE folder shared by every
+// selftest (only TMP/TEMP/TMPDIR were per-test), so a settings.jsonc written
+// there was read by every test that ran afterwards AND survived the run - the
+// a9b7973 shape. CMakeLists.txt now mints a config dir per test, so that half
+// is gone; this half is not, and it is the one that made the rule.
 // It is also not built inside a shared fixture folder (ad2d4fc): a leftover
 // subdirectory of tools/testdata/rb is a ROW of that folder.
 //
