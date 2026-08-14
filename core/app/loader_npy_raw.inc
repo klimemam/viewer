@@ -574,7 +574,7 @@ static std::string loadRaw(const RawDialog& d) {
 // (the guesses, the fields, the binding's key) is byte-count arithmetic and
 // does not care where the bytes are.
 static bool rawDialogIsRemote(const RawDialog& d) {
-    return d.path.rfind("ssh://", 0) == 0 || d.path.rfind("local://", 0) == 0;
+    return hasUrlScheme(d.path);
 }
 
 static std::string rawDialogAccept(RawDialog& d) {

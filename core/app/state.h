@@ -192,6 +192,37 @@ inline std::string localDiskPathOfUrl(const std::string& url) {
     if (!remote::parseUrl(url, host, path)) return std::string();
     return host.empty() ? path : std::string();
 }
+// The OTHER half of the same question - and it is not the negation of the half
+// above, which is the whole reason it has its own name.
+//
+// Three strings, not two. A url can name this disk, or name a peer, or name
+// NEITHER: "local://" with nothing after it parses as no path at all
+// (remote::parseUrl returns false on an empty path), so it is not a file here
+// and it is not a file there. The literal-prefix form `rfind("local://", 0)`
+// answers "local, therefore mine" for that string and hands the caller an empty
+// path to open. Every door and every greyed menu item has to fail SAFE on it,
+// so the peer question is asked POSITIVELY - a peer url is one that parses AND
+// names a host - and the third case falls out of both halves as it should.
+inline bool isPeerUrl(const std::string& url) {
+    std::string host, path;
+    return remote::parseUrl(url, host, path) && !host.empty();
+}
+// ...and the third question, which looks like the first two and is not: does
+// this string carry a SCHEME we own, i.e. is it a url rather than a path on
+// this disk?
+//
+// This one cannot go through remote::parseUrl, which answers a WIDER question
+// on purpose: it also accepts the bare scp spelling `host:path`, because that
+// is what muscle memory types into a host field. Callers here are not reading a
+// host field - they are handed `FrameSource::path` or an argv word and must
+// decide whether it is a path on this disk, so the wider answer is wrong for
+// them. A file legally named "notes:2026/x.npy" is a path; parseUrl reads it as
+// host "notes" (the Windows "C:\\..." case it already excludes by hand, the
+// POSIX one it cannot). The scheme test is therefore literal, honestly, and it
+// is written HERE once so the honesty is in one place instead of four.
+inline bool hasUrlScheme(const std::string& p) {
+    return p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
+}
 // The local:// twin of statSourceFile: the url EMBEDS a path on this disk, so
 // unlike a true remote the disk baseline is knowable - and it has to be known,
 // because a local:// tuple with mtime/fsize 0 never moves: an overwrite on
@@ -353,8 +384,14 @@ inline bool srcShareable(const FrameSource& s) {
     // path is statLocalUrl-able, so a 0/0 local:// source is one that skipped
     // the stat - refusing it here fails SAFE (no sharing) instead of letting
     // an overwrite-then-reopen adopt stale pixels under a key that never moves
-    const bool localDisk = s.remoteUrl.empty() ||
-                           s.remoteUrl.rfind("local://", 0) == 0;
+    // isPeerUrl, NOT localDiskPathOfUrl: they differ on "local://" alone, and
+    // the difference is a real one here. That url has no path, so statLocalUrl
+    // skipped it and its mtime/fsize are 0/0; asking "has a disk path" would
+    // call it a peer, skip the 0/0 guard below, and make exactly the stale
+    // source shareable that the guard exists to refuse (M8e holds this down).
+    // Asking "is it the peer's" keeps it on the local side, where the guard
+    // catches it.
+    const bool localDisk = s.remoteUrl.empty() || !isPeerUrl(s.remoteUrl);
     if (localDisk && s.mtime == 0 && s.fsize == 0) return false;
     if (s.rawDtype >= 0)              // raw decodes always record srcW/srcH
         return s.w == s.srcW && s.h == s.srcH && s.cropX == 0 && s.cropY == 0;

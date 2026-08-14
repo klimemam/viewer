@@ -191,6 +191,60 @@
             a->src->rev = 0;
         }
 
+        // ---- M8: three questions about a url, and where they must differ ---
+        // "whose disk", "is it the peer's", and "is this a url at all" were
+        // asked at nine call sites with a literal prefix test. They are not the
+        // same question and they are not each other's negation, so the literal
+        // was answering whichever one the site meant BY COINCIDENCE.
+        {
+            // the ordinary two: each question answers, and they agree
+            check(localDiskPathOfUrl("local://d/x.npy") == "d/x.npy" &&
+                  !isPeerUrl("local://d/x.npy") && hasUrlScheme("local://d/x.npy"),
+                  "M8 local://<path>: on this disk, not the peer's, is a url");
+            check(localDiskPathOfUrl("ssh://kepler/d/x.npy").empty() &&
+                  isPeerUrl("ssh://kepler/d/x.npy") && hasUrlScheme("ssh://kepler/d/x.npy"),
+                  "M8b ssh://host/<path>: the peer's, no path here, is a url");
+            // ...and the string that is NEITHER. remote::parseUrl refuses an
+            // empty path, so "local://" names no file here and no file there.
+            // The literal form called it local and handed on substr(8) = "".
+            check(localDiskPathOfUrl("local://").empty() && !isPeerUrl("local://") &&
+                  hasUrlScheme("local://"),
+                  "M8c local:// alone is a url that is NEITHER - both halves say no");
+            // why hasUrlScheme cannot go through parseUrl: parseUrl answers a
+            // WIDER question (it takes the bare scp spelling too), and a
+            // caller holding a path field wants the narrow one. A POSIX file
+            // name may legally contain a colon - parseUrl calls it a host.
+            {
+                std::string h, pp;
+                const bool scpIsAUrlThere =
+                    remote::parseUrl("kepler:/d/x.npy", h, pp) && h == "kepler";
+                const bool colonNameIsAHostThere =
+                    remote::parseUrl("notes:2026/x.npy", h, pp) && h == "notes";
+                check(scpIsAUrlThere && colonNameIsAHostThere &&
+                      !hasUrlScheme("kepler:/d/x.npy") && !hasUrlScheme("notes:2026/x.npy"),
+                      "M8d parseUrl takes the scp spelling and so reads a colon "
+                      "in a FILE NAME as a host - the scheme test stays literal");
+                // ...and the drive letter, which parseUrl already excludes by
+                // hand: both say no, so Windows is not the reason.
+                check(!remote::parseUrl("C:/Users/me/x.npy", h, pp) &&
+                      !hasUrlScheme("C:/Users/me/x.npy"),
+                      "M8d2 a Windows drive letter is a path to BOTH");
+            }
+            // the sharing guard, which is where "not the peer's" and "has a
+            // disk path" would have parted company with a consequence: a 0/0
+            // local:// source skipped statLocalUrl, and sharing it lets an
+            // overwrite-then-reopen hand back stale pixels under a key that
+            // never moves. It must fail SAFE.
+            FrameSource neither;
+            neither.remoteUrl = "local://";
+            check(!srcShareable(neither),
+                  "M8e a local:// with no path is not shareable (0/0, unstattable)");
+            FrameSource real;
+            real.remoteUrl = "local://d/x.npy"; real.mtime = 1; real.fsize = 1;
+            check(srcShareable(real),
+                  "M8f ...and a stattable one still is - M8e is not vacuous");
+        }
+
         srcMapDump("M7 final");
         fprintf(stderr, "srcmapselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();

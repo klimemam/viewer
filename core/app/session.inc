@@ -2551,8 +2551,7 @@ static std::string loadSession(const std::string& path) {
             // stack (an in-file frame axis) - that would split it in two
             if (on && lastImageOk && cur() && !cur()->src->path.empty() && cur()->seqId == 0) {
                 const std::string p = cur()->src->path;
-                const bool isRemote = p.compare(0, 6, "ssh://") == 0 ||
-                                      p.compare(0, 8, "local://") == 0;
+                const bool isRemote = hasUrlScheme(p);
                 if (isRemote) {
                     // A folder stack whose frames live on a peer. Its siblings
                     // are a LISTING, and findSequenceSiblings below walks THIS
@@ -2660,7 +2659,7 @@ static std::string loadSession(const std::string& path) {
                 std::transform(lowp.begin(), lowp.end(), lowp.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
-                bool isRemote = p.compare(0, 6, "ssh://") == 0 || p.compare(0, 8, "local://") == 0;
+                bool isRemote = hasUrlScheme(p);
                 if (isRemote) {
                     // a remote image has no local file to decode: reconnect
                     // instead - carrying the §3.3 reading the line recorded,
