@@ -26,12 +26,16 @@
             }
         };
         std::error_code aec;
-        // ABSOLUTE on purpose: a Ref's path is what a reader writes, and the
-        // relative form is anchored at the origin (resolveSetRef) - these
-        // fixtures name exact places, so they say them exactly.
-        std::filesystem::path adir = std::filesystem::absolute(
-            std::filesystem::path(pathFromUtf8(g_asetSelftest)) / "aset-scratch", aec);
-        std::filesystem::remove_all(adir, aec);
+        // The folder this test was HANDED, counted before it runs a line: these
+        // fixtures used to be "aset-scratch" INSIDE it, which is tools/testdata
+        // itself - the root every other selftest is anchored at. A run that did
+        // not reach its cleanup left a directory there for the next test to walk.
+        const SharedFixture asetHanded(g_asetSelftest);
+        // ...so the fixtures go to the per-test TMP. Still ABSOLUTE, which was
+        // the point of the old std::filesystem::absolute: a Ref's path is what a
+        // reader writes, and the relative form is anchored at the origin
+        // (resolveSetRef), so these fixtures must name exact places.
+        std::filesystem::path adir = pathFromUtf8(selftestScratch("viewer_aset"));
         std::filesystem::create_directories(adir / "darks", aec);
         std::filesystem::create_directories(adir / "two", aec);
 
@@ -636,6 +640,8 @@
 
         closeAll();
         std::filesystem::remove_all(adir, aec);
+        // the folder this test was handed must be exactly as it was found
+        if (!asetHanded.intact("asetselftest")) ok = false;
         fprintf(stderr, "asetselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
