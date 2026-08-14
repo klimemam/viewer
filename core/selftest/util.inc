@@ -41,6 +41,49 @@ static bool needWindow(const char* what) {
 // what adding one more npz fixture would have cost, so it lives here instead.
 // Members are named WITHOUT the ".npy" the zip entry carries: that suffix is
 // the npz format's, not the array's, and every caller was appending it.
+// A directory a test was HANDED is not that test's to grow.
+//
+// The failure is positional and lands somewhere else: --browse-keys-selftest
+// walks tools/testdata/rb with `home` then N x `down`, so ONE extra entry
+// shifts every gesture and every check after it - measured 28 FAIL / 300.8 s,
+// in a different test, with nothing pointing at the cause. CI never sees it
+// (a fresh checkout every run); a developer's tree keeps it until someone
+// deletes the folder by hand.
+//
+// So: count on the way in, compare on the way out. Deliberately about the
+// DIRECTORY and not about any particular fixture - whatever a test grows next,
+// it cannot leak an entry into the folder the next test walks without saying so
+// where the cause is.
+struct SharedFixture {
+    std::string dir;
+    int before = 0;
+    explicit SharedFixture(const std::string& d) : dir(d) { before = count(); }
+    int count() const {
+        int n = 0;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), ec))
+            { (void)e; n++; }
+        return n;
+    }
+    bool intact(const char* who) const {
+        const int after = count();
+        fprintf(stderr, "%s: shared fixture %s: %d entr(ies) before, %d after: %s\n",
+                who, dir.c_str(), before, after, after == before ? "ok" : "FAIL");
+        return after == before;
+    }
+};
+// ...and where a test's OWN fixtures belong instead: the per-test TMP, which is
+// why CMake gives every selftest its own TMP/TEMP/TMPDIR. A folder no other test
+// can see whether this one reaches its cleanup or not. Returns an empty, freshly
+// created directory (absolute, forward slashes).
+static std::string selftestScratch(const char* name) {
+    std::error_code ec;
+    std::string s = (std::filesystem::temp_directory_path(ec) / name).u8string();
+    std::replace(s.begin(), s.end(), '\\', '/');
+    std::filesystem::remove_all(pathFromUtf8(s), ec);
+    std::filesystem::create_directories(pathFromUtf8(s), ec);
+    return s;
+}
 static std::vector<uint8_t> selftestNpyBytes(const char* descr,
                                              const std::vector<int64_t>& shape,
                                              const void* data, size_t nbytes) {

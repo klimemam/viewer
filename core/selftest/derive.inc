@@ -58,13 +58,14 @@
         // shared `multi` fixture it deleted it - every multi-based test then
         // failed with "picker did not open". A test may only destroy what it
         // made.
-        std::string root = g_deriveSelftest;
-        std::replace(root.begin(), root.end(), '\\', '/');
-        while (!root.empty() && root.back() == '/') root.pop_back();
-        root += "/derive-scratch";
+        // "derive-scratch" used to be a subdirectory of the handed folder,
+        // which is tools/testdata - shared with every other selftest. A run that
+        // did not reach its cleanup left a directory there for the next test to
+        // walk. Counted here, compared at the bottom, fixtures moved to TMP.
+        const SharedFixture deriveHanded(g_deriveSelftest);
+        std::string root = selftestScratch("viewer_derive");
         std::string rootA = root + "/A", rootB = root + "/B";
         std::error_code ec;
-        std::filesystem::remove_all(pathFromUtf8(root), ec);
         std::filesystem::create_directories(pathFromUtf8(rootA), ec);
         std::filesystem::create_directories(pathFromUtf8(rootB), ec);
         for (int i = 0; i < 8; i++) {
@@ -333,6 +334,8 @@
                   "D11 the close took the right stack and left the others");
         }
         std::filesystem::remove_all(pathFromUtf8(root), ec);
+        // the folder this test was handed must be exactly as it was found
+        if (!deriveHanded.intact("deriveselftest")) ok = false;
         fprintf(stderr, "deriveselftest: %s\n", ok ? "ok" : "FAILED");
         stopRbWorker();
         stopSequenceLoader();
