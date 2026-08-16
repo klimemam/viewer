@@ -482,9 +482,30 @@ std::string peerRefusal(const std::string& path) {
     // this branch cannot tell them apart (core/main.cpp's own doors are not
     // compiled into the peer). So the way out states the LINK's limit, which
     // is true either way and is the fact that actually moves the file.
+    //
+    // ...and the second half of the way out, which is the one that actually
+    // applies here: nothing that reaches this line is read natively on EITHER
+    // machine, so the door is a reader (docs/input-adapters.md §4.13), and what
+    // this refusal owes the operator is the state of that door. It was DECIDED
+    // on 2026-08-03 (§4.13.1: "adapter は peer 側で走る" - the file is where the
+    // data is, and shipping raw bytes here to convert them defeats the tool)
+    // and it is not built. Saying nothing made "decided and unbuilt" read
+    // exactly like "never considered" - verify-matrix G11, issue #180 ruling B,
+    // whose stage 0 (docs/remote-reader-design.md §8) is this sentence.
+    //
+    // Same discipline as the headerless branch above: the wording changes the
+    // day the door opens (that design's stage 2), when it becomes the local
+    // door's own `choose a reader` - a refusal is allowed to describe a
+    // decision, but never to imply a mechanism that is not there (§7: the dim
+    // row must not hint at readers waiting on the peer - there are none, and
+    // none are looked for by name).
     return "the peer serves " + servedList() +
            "\n  this link carries those formats only - copy the file to this "
-           "machine to open it with everything else this viewer reads";
+           "machine to open it with everything else this viewer reads"
+           "\n  a reader could read it, but readers do not yet run on the peer - "
+           "the decision (docs/input-adapters.md §4.13.1) is that they run where "
+           "the file lives, and that door is not built yet"
+           "\n  copy the file here to use a reader today";
 }
 
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,

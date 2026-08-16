@@ -468,6 +468,57 @@
             check(!generic, "F4d ...instead of the generic list it used to fall to");
         }
 
+        // ---- F4d2: the fall-through says what was DECIDED about readers ------
+        // verify-matrix G11 / issue #180 ruling B, stage 0 of
+        // docs/remote-reader-design.md. F4d moved headerless files OFF the
+        // fall-through; this is about what still lands on it - a name with no
+        // row, no decoder here, and no measured refusal of its own.
+        //
+        // For such a file the served list is true and useless: the operator can
+        // already see this name is not in it, and carrying the file over does
+        // not make this build read it natively either. The door that would read
+        // it is a READER (docs/input-adapters.md §4.13) - and §4.13.1 decided,
+        // on 2026-08-03, that readers run where the file lives. That decision
+        // has no implementation. Until this the refusal did not mention it, so
+        // "decided and not built" was indistinguishable from "never considered":
+        // neither a judged refusal nor an open door, which is all of G11.
+        //
+        // The sentence belongs to the LINK's refusal only. The local one offers
+        // a reader for real ("choose a reader") and must not start saying a door
+        // is missing - the missing door is the peer's.
+        //
+        // The wording changes the day readers do run there (stage 2 of that
+        // design): it becomes `choose a reader`, the same way F4d's sentence is
+        // written to be replaced when the wire can carry a recipe. This check is
+        // where that replacement gets noticed.
+        {
+            const std::string why  = peerRefusalFor("capture.unknownfmt");
+            const std::string here = viewerRefusalFor("capture.unknownfmt");
+            const bool decided  = has(why, "reader") && has(why, "4.13.1");
+            const bool unbuilt  = has(why, "not built yet");
+            const bool wayOut   = has(why, "copy the file here");
+            // ...and the Browse row is the surface an operator reads it on, so
+            // it has to be the same sentence and not a second one (F3/F3b's
+            // rule: one refusal, quoted wherever it is shown).
+            const bool panelSame = rbRowWhyNot("trc2", "capture.unknownfmt") == why;
+            const bool localIntact = has(here, "choose a reader") &&
+                                     !has(here, "not built yet");
+            fprintf(stderr, "fmtgateselftest:   reader ruling in the refusal: named=%d "
+                            "unbuilt=%d wayOut=%d panelSame=%d localIntact=%d\n"
+                            "fmtgateselftest:   fall-through reason: \"%s\"\n",
+                    decided ? 1 : 0, unbuilt ? 1 : 0, wayOut ? 1 : 0,
+                    panelSame ? 1 : 0, localIntact ? 1 : 0, why.c_str());
+            // anti-vacuity: the sentence is an ADDITION - what the peer does
+            // serve is still named (F3b reads that half)
+            check(!why.empty() && has(why, "the peer serves"),
+                  "F4d2 the fall-through still names what the peer does serve");
+            check(decided, "F4d2 ...and names the ruling that readers run on the peer");
+            check(unbuilt, "F4d2 ...and that the door is not built yet, not undecided");
+            check(wayOut,  "F4d2 ...with the way out that works today: copy it here");
+            check(panelSame, "F4d2 ...and the Browse row shows that same sentence");
+            check(localIntact, "F4d2 the LOCAL refusal is untouched: it offers a reader");
+        }
+
         // ---- F4e: the DOOR - a headerless file opened over the link ----------
         // P8 proved the wire; this proves the door every caller uses. It is the
         // call the CLI branch makes (`viewer local://.../x.raw --raw-dtype u16
