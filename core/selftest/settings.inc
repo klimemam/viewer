@@ -73,6 +73,10 @@ static int settingsSelftest() {
         app.memBudgetGB = 0;
         app.watchEnabled = true;
         app.watchAutoReload = false;
+        // #204, and here for the same reason the three above are: group D sets
+        // this key, and a value that survived into T3 would put a seventh key
+        // in the template and make T3's count measure the previous group.
+        app.folderScanDepth = 6;
         app.wheelZoomPlain = false;
         app.fitOnSwitch = false;
         app.rbFlat = false;
@@ -952,9 +956,13 @@ static int settingsSelftest() {
         // 23 was the count before 段2d/2e. Those promoted the three keys stage 1
         // could not read - measuring.memoryBudgetGB (its M1 declaration, "n of
         // N", was already required by the canon) and the two watch keys (ruled
-        // 2026-08-13) - so the reconciliation closes at 26 and the table at 33.
-        check(readable == 26, "W1 ...and 26 of them are editable today");
-        check(rows.size() == 33, "W1 ...over 33 rows, which is the whole table");
+        // 2026-08-13) - so the reconciliation closed at 26 and the table at 33.
+        // #204 adds loading.folderScanDepth, which is the first key here that
+        // was never a prefs.txt line before it was a setting (the ruling made
+        // it one; it is written to prefs.txt now because the panel edits it):
+        // 27 readable over 34 rows.
+        check(readable == 27, "W1 ...and 27 of them are editable today");
+        check(rows.size() == 34, "W1 ...over 34 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1074,6 +1082,157 @@ static int settingsSelftest() {
                 app.watchEnabled ? 1 : 0, app.watchAutoReload ? 1 : 0, wr.unknown);
         check(!app.watchEnabled && app.watchAutoReload && wr.unknown == 0,
               "M3 the watch keys are read, and are no longer 'unknown key'");
+    }
+
+    // ---- D1..D6: how far "all stacks below" reaches (#204) ------------------
+    // The defect this closes was not a wrong number, it was TWO numbers: the
+    // local walk used a literal 3 and the ask sent to the peer a literal 6, so
+    // the same folder answered differently depending on which door opened it.
+    // The ruling (2026-08-17) makes the depth a setting with 6 as its default,
+    // and the shape that keeps it settled is that there is ONE reader -
+    // scanDepthBelow() in core/app/state.h - which both doors call.
+    //
+    // So D5 does not assert "the local walk uses 6". It asserts that the local
+    // walk uses WHAT THE SETTING SAYS, at two depths on either side of a tree's
+    // boundary, which is the only thing a literal cannot do. The peer door needs
+    // no test of its own for the same reason a shared function needs no second
+    // test: nav.cpp passes scanDepthBelow() into session->scan(), so it cannot
+    // disagree with the local walk without that line being edited.
+    {
+        baseline();
+        loadSettingsFrom(missing);                  // no file: the plain state
+        // D1: the default is 6, and 6 is what the reader answers. Also 判断9:
+        // the default WRITES NOTHING, so "chose 6" and "never chose" stay
+        // different facts the day the default moves.
+        const int def = scanDepthBelow();
+        const bool defaultIsSilent = settingsCurrentValue(SK_scanDepth).empty();
+        // D2: ...and the file moves it. 2 is the opposite of the default in the
+        // only sense that matters here - it is a depth the old literals never
+        // had - so a loader that did nothing fails this line.
+        const SettingsReport dr =
+            loadSettingsFrom(writeFix("{ \"loading\": { \"folderScanDepth\": 2 } }\n"));
+        dumpNotes(dr);
+        fprintf(stderr, "settingsselftest: D default=%d silent=%d | file 2 -> "
+                        "field=%d reader=%d unknown=%d\n",
+                def, defaultIsSilent ? 1 : 0, app.folderScanDepth, scanDepthBelow(),
+                dr.unknown);
+        check(def == 6 && defaultIsSilent,
+              "D1 loading.folderScanDepth defaults to 6 and writes nothing at it");
+        check(dr.applied == 1 && dr.unknown == 0 && app.folderScanDepth == 2 &&
+              scanDepthBelow() == 2,
+              "D2 ...and the file sets it, through the one reader both doors use");
+
+        // D3: outside the window it is REFUSED, not clamped - the accent and
+        // displayGamma answer (判断8). A file that asked for 40 meant something,
+        // and quietly handing back 16 would answer a question it did not ask.
+        baseline();
+        const SettingsReport tooDeep =
+            loadSettingsFrom(writeFix("{ \"loading\": { \"folderScanDepth\": 40 } }\n"));
+        const int afterDeep = app.folderScanDepth;
+        baseline();
+        const SettingsReport fraction =
+            loadSettingsFrom(writeFix("{ \"loading\": { \"folderScanDepth\": 2.5 } }\n"));
+        const int afterFrac = app.folderScanDepth;
+        fprintf(stderr, "settingsselftest: D3 40 -> rejected=%d value=%d | 2.5 -> "
+                        "rejected=%d value=%d\n",
+                tooDeep.rejected, afterDeep, fraction.rejected, afterFrac);
+        check(tooDeep.rejected == 1 && afterDeep == 6 &&
+              fraction.rejected == 1 && afterFrac == 6,
+              "D3 a depth outside 1..16, or a fractional one, is refused not clamped");
+
+        // D4: the CLAMP, which is the reader's and not the file's. prefs.txt is
+        // plain text a user can edit and the panel's InputInt has no bounds, so
+        // a value that never passed the applier still has to reach a walk sane.
+        baseline();
+        app.folderScanDepth = 40;                  // as a hand-edited prefs.txt
+        const int clampedHigh = scanDepthBelow();
+        app.folderScanDepth = 0;                   // "all stacks below" is not "none"
+        const int clampedLow = scanDepthBelow();
+        fprintf(stderr, "settingsselftest: D4 reader clamp: 40 -> %d, 0 -> %d\n",
+                clampedHigh, clampedLow);
+        check(clampedHigh == 16 && clampedLow == 1,
+              "D4 the one reader clamps a value no applier vetted (1..16)");
+
+        // D5: THE SETTING MOVES THE LOCAL DOOR. A tree in this test's own TMP
+        // (never in VIEWER_TEST_HOME, and never inside a shared fixture folder:
+        // both are this suite's recorded ways to poison every test that runs
+        // after it), with two stacks - one just under the root and one five
+        // levels down - so that a scan is never asserted to return NOTHING. The
+        // shallow group is the anti-vacuity anchor: it has to be there at every
+        // depth, or "the deep one is missing" would also be produced by a
+        // fixture that never got written.
+        baseline();
+        const std::string tree = selftestScratch("viewer_settings_scandepth");
+        {
+            auto writeNpy = [](const std::string& path) {
+                std::vector<float> px(4, 1.0f);
+                std::vector<uint8_t> b = selftestNpyBytes("<f4", { 2, 2 }, px.data(),
+                                                          px.size() * sizeof(float));
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            };
+            std::error_code dec;
+            std::filesystem::create_directories(pathFromUtf8(tree + "/L1/L2/L3/L4/L5"), dec);
+            writeNpy(tree + "/L1/near_001.npy");
+            writeNpy(tree + "/L1/near_002.npy");
+            writeNpy(tree + "/L1/L2/L3/L4/L5/deep_001.npy");
+            writeNpy(tree + "/L1/L2/L3/L4/L5/deep_002.npy");
+        }
+        auto scanAt = [&](int depth, bool& sawDeep) {
+            app.folderScanDepth = depth;
+            std::vector<App::PendingGroup> gs = scanFolderGroups(tree);
+            sawDeep = false;
+            for (const App::PendingGroup& g : gs)
+                if (g.name.find("deep_") != std::string::npos) sawDeep = true;
+            return (int)gs.size();
+        };
+        bool deepAt2 = false, deepAt4 = false, deepAt5 = false, deepAtDefault = false;
+        const int n2 = scanAt(2, deepAt2);
+        const int n4 = scanAt(4, deepAt4);
+        const int n5 = scanAt(5, deepAt5);
+        app.folderScanDepth = 6;
+        const int nDef = scanAt(6, deepAtDefault);
+        fprintf(stderr, "settingsselftest: D5 local scan of a 5-deep tree: "
+                        "depth2 -> %d group(s) deep=%d | depth4 -> %d deep=%d | "
+                        "depth5 -> %d deep=%d | depth6 (default) -> %d deep=%d\n",
+                n2, deepAt2 ? 1 : 0, n4, deepAt4 ? 1 : 0, n5, deepAt5 ? 1 : 0,
+                nDef, deepAtDefault ? 1 : 0);
+        check(n2 == 1 && !deepAt2 && n4 == 1 && !deepAt4,
+              "D5 a shallow setting bundles only what is within it (the deep stack is unseen)");
+        // The boundary, and it is what the number MEANS: the stack lives five
+        // levels under the root, so depth 5 is the first that reaches it. The
+        // old local literal was 3 and could not, whatever the peer was told.
+        check(n5 == 2 && deepAt5 && nDef == 2 && deepAtDefault,
+              "D5 ...and 5 - the depth of the tree - reaches it, as does the default 6");
+        std::filesystem::remove_all(pathFromUtf8(tree), ec);
+
+        // D6: the badge on a key appended at the END of the enum. The origin
+        // ledger is an array indexed by SKey and its bound was SK_defaultUnit,
+        // the last id on the day it was written - so every key added after that
+        // line (memoryBudgetGB and the two watch keys) silently lost its badge
+        // and its "this change springs back" warning, which is #50's own
+        // symptom inside the mechanism built to end it. The bound is SK_Count
+        // now. Asserted on the NEW key because a key at the end of the enum is
+        // the case that was broken, and the next one will be added there too.
+        baseline();
+        loadSettingsFrom(missing);
+        auto badgeOf = [&](SKey id) {
+            for (const PrefRow& r : settingsPrefRows()) if (r.id == id) return r.badge;
+            return std::string("<no row>");
+        };
+        const std::string bNone = badgeOf(SK_scanDepth);
+        loadSettingsFrom(writeFix("{ \"loading\": { \"folderScanDepth\": 4 } }\n"));
+        const std::string bFile = badgeOf(SK_scanDepth);
+        const std::string bWatch = badgeOf(SK_watchAuto);   // the same bug's other victim
+        loadSettingsFrom(writeFix("{ \"loading\": { \"watchAutoReload\": true } }\n"));
+        const std::string bWatch2 = badgeOf(SK_watchAuto);
+        fprintf(stderr, "settingsselftest: D6 folderScanDepth badge: \"%s\" -> \"%s\" | "
+                        "watchAutoReload: \"%s\" -> \"%s\"\n",
+                bNone.c_str(), bFile.c_str(), bWatch.c_str(), bWatch2.c_str());
+        check(bNone == "default" && bFile.rfind("settings.jsonc:", 0) == 0,
+              "D6 a key at the end of the enum still names the file that decides it");
+        check(bWatch2.rfind("settings.jsonc:", 0) == 0,
+              "D6 ...and so do the three keys the old ledger bound had dropped");
     }
 
     baseline();

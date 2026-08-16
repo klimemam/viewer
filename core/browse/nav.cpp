@@ -104,7 +104,13 @@ static void rbWorker(App::BrowseInstance* ip) {
                 rbSetPhase(I, "scanning " + job.dir + " for stacks...");
                 bool trunc = false;
                 int skipped = 0;
-                if (I.session->scan(job.dir, 6, 256, r.scanGroups,
+                // The depth is scanDepthBelow()'s and not this call site's
+                // (#204): the local walk in scanFolderGroups asks the same
+                // function, so the two doors cannot answer the same folder
+                // differently again. The 256 is still a literal here because
+                // the peer's cap and the local one have never disagreed and
+                // neither is a setting.
+                if (I.session->scan(job.dir, scanDepthBelow(), 256, r.scanGroups,
                                     trunc, skipped, err)) {
                     r.ok = true;
                     r.truncated = trunc;
@@ -746,15 +752,19 @@ void remoteStartSearch(App::BrowseInstance& I,
 // oversight. Whether the peer should serve more than .npy is #148's open
 // question and is not answered here.
 //
-// ONE difference this hands over with the extensions, stated rather than left
-// to be found: the two walks do not reach as far. The peer is asked for depth 6
-// (the `scan(job.dir, 6, 256, ...)` above); scanFolderGroups walks depth 3.
-// Both cap at 256 groups and both report the cap. So a local tree deeper than
-// three levels now yields what a DROP of that folder yields, which is the point
-// of the change - the local doors agree - but it is less than the peer used to
-// return through this one door. Which depth "all stacks below" should mean is a
-// question about the local scan and is asked of every door at once; it is not
-// answered by making this door disagree with the drop again.
+// HOW FAR DOWN both walks reach is one number, and it is a setting (#204,
+// ruled 2026-08-17). #148 handed this file a discrepancy it could not settle
+// alone: the peer was asked for depth 6 and scanFolderGroups walked 3, so a
+// tree four levels deep read one way over ssh and another way off this disk -
+// the very thing the paragraph above says must not happen, in the one dimension
+// the extension fix did not cover. The answer is not a literal agreed between
+// two call sites (that is what drifted): both doors ask scanDepthBelow()
+// (core/app/state.h), which answers loading.folderScanDepth, default 6. 6
+// because it is the depth that has already shipped through this door, so the
+// ruling narrows nobody's reach; the operator with a deeper capture tree - or a
+// shallower one they want scanned faster - now says so in settings.jsonc or in
+// Preferences instead of asking for a code change. Both walks still cap at 256
+// groups and both still report the cap.
 void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
     if (I.b.host.empty()) {
         // Bump the token first: an earlier peer scan still in flight would

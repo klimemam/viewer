@@ -1467,7 +1467,15 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
     // Manual breadth-first walk: recursive_directory_iterator aborts the whole
     // scan when a single entry cannot be read (a permission error or a dangling
     // link would silently truncate the folder list).
+    //
+    // HOW DEEP is not this walk's decision (#204). It was a literal 3 here and
+    // a literal 6 in the ask sent to the peer, and the two drifted apart
+    // exactly as #71 says a second copy does; both doors now read
+    // scanDepthBelow() (core/app/state.h), which answers loading.folderScanDepth
+    // - 6 by default. Read ONCE, before the loop: a walk whose limit could move
+    // between two directories would visit siblings to different depths.
     {
+        const int maxDepth = scanDepthBelow();
         std::vector<std::pair<std::filesystem::path, int>> todo{ { rootPath, 0 } };
         while (!todo.empty()) {
             auto [dir, depth] = todo.back();
@@ -1479,7 +1487,7 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
                 if (dec) { dec.clear(); break; }
                 std::error_code fec;
                 if (dit->is_directory(fec)) {
-                    if (depth < 3) todo.push_back({ dit->path(), depth + 1 });
+                    if (depth < maxDepth) todo.push_back({ dit->path(), depth + 1 });
                 } else if (dit->is_regular_file(fec)) {
                     addFile(dit->path());
                 }

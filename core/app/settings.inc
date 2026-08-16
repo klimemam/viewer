@@ -415,7 +415,20 @@ enum SKey {
     SK_pythonExe, SK_searchPath, SK_editor,
     SK_defaultUnit,
     // 段2d/2e: the three prefs keys stage 1 could not read yet.
-    SK_memBudget, SK_watchFiles, SK_watchAuto
+    SK_memBudget, SK_watchFiles, SK_watchAuto,
+    // #204: how far "all stacks below" reaches. A key is appended HERE, at the
+    // end, which is why SK_Count exists - see it.
+    SK_scanDepth,
+    // The end marker, and it is not bookkeeping. The origin ledger and the
+    // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
+    // used to be SK_defaultUnit - the last id on the day they were written. Any
+    // key added after that line fell outside it and was silently dropped from
+    // both: measuring.memoryBudgetGB and the two watch keys have never carried
+    // a "settings.jsonc:12" badge and have never warned that a change to them
+    // springs back at the next start, which is #50's own symptom reappearing in
+    // the mechanism built to end it. Sized off the enum itself, that cannot
+    // happen to the next key - or to this one.
+    SK_Count
 };
 
 enum SStatus {
@@ -517,6 +530,16 @@ static const SKeyDef SETTING_KEYS[] = {
     // build LOADS rather than about how it looks.
     { SK_watchFiles,  "loading.watchFiles",       SS_Read, nullptr, "true" },
     { SK_watchAuto,   "loading.watchAutoReload",  SS_Read, nullptr, "false" },
+    // #204 (裁定 2026-08-17: "the depth is a setting, and its default is 6").
+    // Loading-class for the watch keys' own reason: how far under a folder
+    // "all stacks below" looks is a question about what this build LOADS, not
+    // about how it looks. The default is 6 because 6 is the number that has
+    // already SHIPPED - the peer has been asked for it since the feature
+    // existed - so nobody's reach narrows on upgrade; it was the local walk's 3
+    // that was the outlier, and it only ever applied to one of the two doors.
+    // The sample is deliberately NOT the default: 3 is the old local depth, so
+    // the schema walk feeds this row a number that has to actually land.
+    { SK_scanDepth,   "loading.folderScanDepth",  SS_Read, nullptr, "3" },
 };
 static const size_t SETTING_KEY_COUNT = sizeof SETTING_KEYS / sizeof SETTING_KEYS[0];
 
@@ -599,7 +622,7 @@ struct OriginEntry {
     int line = 0;                     // settings.jsonc line, File only
     const char* cliFlag = nullptr;    // "--frame", Cli only
 };
-static OriginEntry g_settingsOrigin[SK_defaultUnit + 1];
+static OriginEntry g_settingsOrigin[SK_Count];
 
 static void settingsOriginClear() {
     for (auto& e : g_settingsOrigin) e = OriginEntry{};
@@ -608,7 +631,7 @@ static void settingsOriginClear() {
 // and this build refuses (判断8) leaves no claim behind - a refused key did not
 // decide anything.
 static void settingsOriginFile(SKey id, int line) {
-    if (id > SK_None && id <= SK_defaultUnit) {
+    if (id > SK_None && id < SK_Count) {
         g_settingsOrigin[id].who = SetOrigin::File;
         g_settingsOrigin[id].line = line;
         g_settingsOrigin[id].cliFlag = nullptr;
@@ -617,7 +640,7 @@ static void settingsOriginFile(SKey id, int line) {
 // ...and a FLAG spoke, which beats the file (判断13: a temporary override is
 // what the command line is for, and there must not be two truths).
 static void settingsOriginCli(SKey id, const char* flag) {
-    if (id > SK_None && id <= SK_defaultUnit) {
+    if (id > SK_None && id < SK_Count) {
         g_settingsOrigin[id].who = SetOrigin::Cli;
         g_settingsOrigin[id].cliFlag = flag;
         g_settingsOrigin[id].line = 0;
@@ -625,7 +648,7 @@ static void settingsOriginCli(SKey id, const char* flag) {
 }
 static const OriginEntry& settingsOriginOf(SKey id) {
     static const OriginEntry NONE;
-    return (id > SK_None && id <= SK_defaultUnit) ? g_settingsOrigin[id] : NONE;
+    return (id > SK_None && id < SK_Count) ? g_settingsOrigin[id] : NONE;
 }
 
 // A GUI change to a key the FILE decides is temporary, and the operator has to
@@ -640,11 +663,11 @@ static const OriginEntry& settingsOriginOf(SKey id) {
 //
 // Once per key per run: the sentence is a fact about the file, and repeating it
 // on every toggle would train the operator to dismiss it.
-static bool g_stickySaid[SK_defaultUnit + 1];
+static bool g_stickySaid[SK_Count];
 static void settingsWarnIfSticky(SKey id, const char* path) {
     const OriginEntry& e = settingsOriginOf(id);
     if (e.who != SetOrigin::File) return;
-    if (id > SK_None && id <= SK_defaultUnit) {
+    if (id > SK_None && id < SK_Count) {
         if (g_stickySaid[id]) return;
         g_stickySaid[id] = true;
     }
@@ -1037,6 +1060,21 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             if (A.wantBool(v, path, b2)) A.setB(app.watchAutoReload, b2, path);
             break;
         }
+        case SK_scanDepth: {
+            double n = 0;
+            if (!A.wantNum(v, path, n)) break;
+            // REFUSED outside the window, not clamped - the same answer accent
+            // and displayGamma give (判断8). The window itself is
+            // scanDepthBelow()'s, in core/app/state.h, where the one reader
+            // enforces it for values that did not come through this file.
+            if (n != floor(n) || n < 1 || n > 16) {
+                A.rangeErr(v, path, "a whole number from 1 to 16 (levels under "
+                                    "the folder that is opened)");
+                break;
+            }
+            A.setI(app.folderScanDepth, (int)n, path);
+            break;
+        }
         case SK_defaultUnit: {
             std::string s;
             if (!A.wantStr(v, path, s)) break;
@@ -1051,7 +1089,10 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             A.rep->applied++;
             break;
         }
-        case SK_None: break;   // SS_Later / SS_NotHere never reach here
+        // SS_Later / SS_NotHere never reach here, and SK_Count is the enum's
+        // end marker rather than a key - both are listed so that the compiler,
+        // not a reader, is what notices the next key added above.
+        case SK_None: case SK_Count: break;
     }
 }
 
@@ -1354,7 +1395,7 @@ static SWidget settingsWidgetFor(SKey id) {
         case SK_naturalSort: case SK_lowBandwidth:
         case SK_watchFiles: case SK_watchAuto:
             return SW_Bool;
-        case SK_accent: case SK_memBudget:
+        case SK_accent: case SK_memBudget: case SK_scanDepth:
             return SW_Int;
         // series.defaultUnit is a free string, not an enumeration: the
         // applier accepts any name that fits (a lab measures in whatever it
@@ -1406,7 +1447,15 @@ static bool* prefBoolField(SKey id) {
     }
 }
 static int* prefIntField(SKey id) {
-    return id == SK_accent ? &app.themeAccent : nullptr;
+    switch (id) {
+        case SK_accent:    return &app.themeAccent;
+        // The PREFERENCE, not scanDepthBelow()'s answer: the panel edits what
+        // was written and the reader is what keeps it in range (state.h). The
+        // clamp still happens on the way out of the control - prefAfterChange
+        // below - so the row cannot sit there showing 40 while walks use 16.
+        case SK_scanDepth: return &app.folderScanDepth;
+        default:           return nullptr;
+    }
 }
 static std::string* prefTextField(SKey id) {
     switch (id) {
@@ -1477,6 +1526,13 @@ static void prefAfterChange(SKey id) {
             ui_theme::apply(app.themeVariant, app.themeAccent, app.uiScale, app.compactUi);
             break;
         case SK_gamma: markAllTexDirty(); break;
+        // The same shape as the accent above: an InputInt has no bounds, so the
+        // control's own answer is put back inside the window the reader
+        // enforces - a row that kept showing 40 while every walk used 16 would
+        // be the "I set it and nothing happened" this panel exists to end.
+        case SK_scanDepth:
+            app.folderScanDepth = std::clamp(app.folderScanDepth, 1, 16);
+            break;
         case SK_titleBar:
             window_frame::setMode(app.frameMode == 1 ? window_frame::Integrated
                                                      : window_frame::System);
@@ -1575,6 +1631,10 @@ static std::string settingsCurrentValue(SKey id) {
             return app.memBudgetGB == 0 ? "" : fmtExact(app.memBudgetGB);
         case SK_watchFiles: return app.watchEnabled ? "" : "false";
         case SK_watchAuto:  return app.watchAutoReload ? "true" : "";
+        // 6 is the built-in default (#204), so 6 writes nothing: 判断9 keeps
+        // "chose 6" and "never chose" apart for the day the default moves.
+        case SK_scanDepth:
+            return app.folderScanDepth == 6 ? "" : std::to_string(app.folderScanDepth);
         case SK_stackPrompt:
             return app.seqLoadMode == 0 ? "" :
                    (app.seqLoadMode == 1 ? "\"always\"" : "\"never\"");
@@ -1607,7 +1667,7 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_editor: return g_settingsEditorCmd.empty() ? "" : sjQuote(g_settingsEditorCmd);
         case SK_defaultUnit:
             return strcmp(app.lin.unit, "lx") == 0 ? "" : sjQuote(app.lin.unit);
-        case SK_None: return "";
+        case SK_None: case SK_Count: return "";   // not keys; see the enum
     }
     return "";
 }
