@@ -163,6 +163,15 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
         if (!d->src->member.empty()) f << "member " << d->src->member << "\n";
+        // #179 ruling C: a session NAMES the reader that produced these pixels
+        // and never runs one. Written only when this machine still remembers
+        // (the memo is the bounded LRU below) - the hint exists so that a
+        // restore WITHOUT the memo can say "reader X" instead of "some reader,
+        // no record". ADDITIVE like npyread: an older viewer skips the key.
+        if (d->src->member.rfind("__pixels_", 0) == 0) {
+            const std::string rh = readerFor(d->src->path);
+            if (!rh.empty()) f << "readerhint " << rh << "\n";
+        }
         // §3.3: the reading is the user's declaration and it sticks across
         // sessions. ADDITIVE, and written only when there IS a declaration - an
         // older viewer skips the unknown key and reloads natively, which is
@@ -2106,6 +2115,7 @@ static std::string loadSession(const std::string& path) {
     float zoom = 0; ImVec2 center(0, 0); int current = 0;
     int pendingLut = -1;
     std::string pendingMember;         // .npz array name for the next image line
+    std::string pendingReaderHint;     // #179 C: names a reader, NEVER runs one
     int pendingRead = NR_NATIVE;       // §3.3 reading for the next image line
     bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
@@ -2275,6 +2285,7 @@ static std::string loadSession(const std::string& path) {
         }
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
+        else if (key == "readerhint") pendingReaderHint = restOfLine(ls);
         else if (key == "npyread") {              // §3.3, applies to the next image line
             int r = NR_NATIVE;
             ls >> r;
@@ -2746,7 +2757,21 @@ static std::string loadSession(const std::string& path) {
                                 pendingMember.rfind("__pixels_", 0) == 0;
                             err = "member " + pendingMember + " is not in what " +
                                   p + " rebuilt";
-                            if (fromReader)
+                            if (fromReader && !pendingReaderHint.empty())
+                                // #179 ruling C: the session NAMES its reader,
+                                // and the viewer never runs one on a document's
+                                // say-so - the memo (the user's own recorded
+                                // choice, on this machine) is the only thing
+                                // that runs a reader unprompted. The name goes
+                                // in the report, where it turns "some reader"
+                                // into an instruction that can be followed.
+                                err += " - it was read by an input adapter; this "
+                                       "session records it as " + pendingReaderHint +
+                                       ". A session names a reader but never runs "
+                                       "one: open the file with that reader again "
+                                       "if you trust it, and this session will "
+                                       "find it";
+                            else if (fromReader)
                                 err += " - it was read by an input adapter, and this "
                                        "build has no record of which one (that record "
                                        "is per-machine and bounded). Open it with the "
@@ -2783,6 +2808,7 @@ static std::string loadSession(const std::string& path) {
                 err = loadNpy(p);
             }
             pendingMember.clear();
+            pendingReaderHint.clear();    // same rule: one image line, one hint
             pendingRead = NR_NATIVE;      // must not leak onto the next image
             if (!err.empty()) {
                 failures.push_back(err);
