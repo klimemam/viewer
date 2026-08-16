@@ -2710,6 +2710,74 @@
                 std::filesystem::remove(pathFromUtf8(ms), mec);
                 std::filesystem::remove(pathFromUtf8(mp), mec);
             }
+
+            // ---- V25p2: the session NAMES the reader - and never runs it -----
+            // Issue #179, ruling C (2026-08-14). V25p established what is lost
+            // when the memo is gone: the restore knows a reader was involved
+            // and cannot say which. The session now carries the name -
+            // "readerhint", written beside "member" when the machine still
+            // knows it - and the ruling draws the line exactly here: a session
+            // may NAME a reader, it may never RUN one. The memo (this user's
+            // own recorded choice, on this machine) is the only thing that
+            // runs a reader unprompted; the hint's whole job is to make the
+            // failure say "reader X" instead of "some reader, no record".
+            {
+                closeAll();
+                std::error_code mec;
+                std::vector<uint16_t> px(64);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(i * 3);
+                const std::string mp = (adir / "named_reader.npy").u8string();
+                npyWriteFile(mp, "<u2", { 8, 8 }, px.data(), px.size() * 2);
+
+                // WRITER half: on the machine that still remembers, the saved
+                // session carries the name. The doc is staged by hand (native
+                // open, then given a reader's member) for V25p's reason: no
+                // Python, the subject is the session file.
+                const std::string spec = (adir / "my_reader.py").u8string() + ":load";
+                std::string serr = loadNpy(mp);
+                check(serr.empty(), "V25p2 (setup) the fixture opens");
+                cur()->src->member = "__pixels_1";
+                rememberReader(mp, spec);
+                const std::string ms = (adir / "named_reader.vsession").u8string();
+                saveSession(ms, true);
+                std::string written;
+                {
+                    std::ifstream sf(pathFromUtf8(ms), std::ios::binary);
+                    std::string line;
+                    while (std::getline(sf, line))
+                        if (line.rfind("readerhint ", 0) == 0) written = line.substr(11);
+                }
+                fprintf(stderr, "verifyselftest: V25p2 saved hint=\"%s\"\n",
+                        written.c_str());
+                check(written == spec,
+                      "V25p2 the session records WHICH reader, beside the member");
+                closeAll();
+
+                // READER half: on the machine that does not remember, the
+                // failure names it - and nothing is executed. The spec points
+                // at a Python file that does not even exist, which is the
+                // point: naming must be safe for a name that cannot run.
+                forgetReader(mp);
+                const int runsBefore = g_adapterRuns;
+                const size_t logBefore = app.msgLog.size();
+                loadSession(ms);
+                bool named = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].err &&
+                        app.msgLog[i].text.find("my_reader.py") != std::string::npos)
+                        named = true;
+                fprintf(stderr, "verifyselftest: V25p2 restore without memo: named=%d "
+                                "adapter runs %d -> %d\n",
+                        (int)named, runsBefore, g_adapterRuns);
+                check(named, "V25p2 without the memo, the failure names the reader "
+                             "the session was saved with");
+                check(g_adapterRuns == runsBefore,
+                      "V25p2 ...and NAMING is all that happened - the session "
+                      "never runs a reader");
+                closeAll();
+                std::filesystem::remove(pathFromUtf8(ms), mec);
+                std::filesystem::remove(pathFromUtf8(mp), mec);
+            }
             // ---- V25o: the search path itself (§4.13.2, issue #51) -----------
             // Everything here is filesystem and string work, so it runs on every
             // machine whether or not V25h found a Python. Four questions, and
