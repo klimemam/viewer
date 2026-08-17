@@ -1822,7 +1822,6 @@ struct HistHlRange {
 static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
                                   float origin, float w) {
     HistHlRange r;
-    return r;   // NOT IMPLEMENTED YET - the tests above it are the specification
     if (!pr.ok || !(w > 0) || !std::isfinite(w) || !std::isfinite(origin)) return r;
     if (fabsf(a.x - b.x) < 4.0f) return r;
     float xa = pr.unmap(a).x, xb = pr.unmap(b).x;

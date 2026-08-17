@@ -813,7 +813,6 @@ static void histHlProbeSet(const char* key, const std::string& said) {
 // an RGB frame does - but RGB with "all" selected does not, because "in range"
 // would have to mean one of three things and v1 declines to guess.
 static std::string histHlRefusalFor(const ImageDoc* im, int plane) {
-    return {};   // NOT IMPLEMENTED YET
     if (!im) return "no image";
     const bool cfa = im->ch == 1 && im->cfa != 0;
     if (plane < 0 && !cfa && im->ch > 1)
@@ -873,7 +872,6 @@ static int histHlPlanesOf(const ImageDoc& im, const char* (&names)[4]) {
 // the plane) in the same walk so the share cannot be a ratio of two different
 // passes.
 static void histHlPaint(ImageDoc& im, std::vector<uint8_t>& rgba) {
-    return;   // NOT IMPLEMENTED YET
     const App::HistHighlight& H = app.highlight;
     if (!H.on) return;
     const char* names[4] = {};
@@ -920,7 +918,6 @@ static void histHlPaint(ImageDoc& im, std::vector<uint8_t>& rgba) {
 // and the export note, on abHistXLabel's rule: three surfaces must not be able
 // to say three different things about one selection.
 static std::string histHlRangeSaid(const std::string& dtype) {
-    return {};   // NOT IMPLEMENTED YET
     const App::HistHighlight& H = app.highlight;
     if (!H.on) return {};
     const std::string u = abValueUnit(dtype);
@@ -975,7 +972,6 @@ static std::string histHlCountPhrase(const App::HlCount& C, const char* region) 
 // What ONE document answered, with its letter in front. Read from the paint,
 // never re-derived: a second count wearing the same face is the trap.
 static std::string histHlSideSaid(const ImageDoc* d, const std::string& letter) {
-    return {};   // NOT IMPLEMENTED YET
     if (!d || !app.highlight.on) return {};
     auto it = app.hlCount.find(d->uid);
     if (it == app.hlCount.end()) return {};
@@ -988,7 +984,6 @@ static std::string histHlSideSaid(const ImageDoc* d, const std::string& letter) 
 // the selection can be CLOSED while the paint is still on the pixels, and a
 // lens that paints in silence is the one failure this feature must not ship.
 static std::string histHlBadgeSaid() {
-    return {};   // NOT IMPLEMENTED YET
     if (!app.highlight.on) return {};
     // The difference view is built from DIFFERENCES, not values, on a separate
     // path that never reaches renderDocRGBA - so it is not painted, and that
