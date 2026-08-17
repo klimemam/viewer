@@ -553,7 +553,20 @@ static void drawPanelHistogram() {
                       : ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
                                             ImGui::GetContentRegionAvail().x).y +
                         ImGui::GetStyle().ItemSpacing.y;
-        float footerH = ImGui::GetTextLineHeightWithSpacing() * (float)nSides
+        // ...and the value highlight's own lines, one per side that answers,
+        // COUNTED HERE with the rest rather than discovered when they are
+        // drawn: everything below this point is sized against footerH, and a
+        // line that appears after the layout pushes the whole footer out of the
+        // bottom of the panel - which is exactly the state where the highlight
+        // must not be the thing that scrolls away.
+        int hlLines = 0;
+        if (app.highlight.on) {
+            for (const HistSide& sd : sides)
+                if (sd.H->img && app.hlCount.count(sd.H->img->uid)) hlLines++;
+            if (!hlLines) hlLines = 1;              // the "(not painted yet)" line
+        }
+        float footerH = ImGui::GetTextLineHeightWithSpacing() *
+                            (float)(nSides + hlLines)
                       + (tooNarrow ? abNarrowNoteH() : 0.0f) + offMsgH;
         // the legend row lives under the overlaid plot, and its height comes off
         // the plot BEFORE the plot is laid out
