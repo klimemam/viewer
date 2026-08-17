@@ -3165,11 +3165,34 @@ static void handleReaderRun(Buf& in) {
     // §5.3's key. The peer's OWN stat of the origin, because a client's stat of
     // a NAS mounted twice makes identity a lie; the reader's whole text, so
     // "the same reader" means the same bytes and not the same name; the
-    // function; and the version the key RULE was fixed at, so a peer that
-    // changes what a key covers cannot hand back a hit computed under the old
-    // one. That number stays 12: protocol 13 added a second family of keys
-    // (§10.6) and changed nothing about what a reader key means, and bumping it
-    // would invalidate every cache on every peer to say so.
+    // function; the ENVIRONMENT that produced the pixels; and the version the
+    // key RULE was fixed at, so a peer that changes what a key covers cannot
+    // hand back a hit computed under the old one.
+    //
+    // That number is 13 (#218 review). It was 12 through protocol 13, which
+    // added a second family of keys (§10.6) and changed nothing about what a
+    // reader key MEANS. This does change it, so it moves: every cache entry
+    // written under the old rule is one whose environment nobody recorded, and
+    // there is no way to tell a good one from a stale one after the fact.
+    //
+    // WHY THE ENVIRONMENT IS IN IT. The key covered the origin and the reader's
+    // text and stopped there, so the answer to "which python ran this" was not
+    // part of what made a hit a hit - while `prov` was reported beside the
+    // pixels on every reply, cached or not. Point VIEWER_SERVE_PYTHON at a
+    // different interpreter, or upgrade numpy under the one it names, and the
+    // peer handed back the OLD environment's pixels with the NEW environment's
+    // provenance printed next to them. That is not a stale cache; it is a
+    // provenance line that says something untrue about the numbers it labels,
+    // which is the one failure this project spends its refusals on.
+    //
+    // Both halves are here on purpose. `py` is the interpreter this peer was
+    // told to use - two paths are two environments even when they report the
+    // same versions. `prov` is what that interpreter SAYS it is (§4.3.1's
+    // sentence: "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4"), which is
+    // what moves when numpy is upgraded in place and the path does not. It is
+    // asked once per interpreter per PROCESS, so an upgrade is noticed by the
+    // next peer process - which is exactly the case the persistent cache makes
+    // dangerous, since that is the cache that outlives the upgrade.
     std::error_code ec;
     const std::filesystem::path origin = std::filesystem::u8path(peerPath);
     uint64_t oMtime = 0, oSize = 0;
@@ -3181,11 +3204,13 @@ static void handleReaderRun(Buf& in) {
             if (!ec) oSize = (uint64_t)s;
         }
     }
-    uint64_t h = readerHash("viewer-serve reader 12");
+    uint64_t h = readerHash("viewer-serve reader 13");
     h = readerHash(peerPath, h);
     h = readerHash(std::to_string(oMtime) + "|" + std::to_string(oSize), h);
     for (int i = 0; i < 3; i++) h = readerHash(body[i], h);
     h = readerHash(func, h);
+    h = readerHash(py, h);
+    h = readerHash(prov, h);
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
     const std::string key = hex;

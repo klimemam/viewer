@@ -624,6 +624,205 @@
             forgetReader(url);
         }
 
+        {   // ---- R15: the key covers the PYTHON that produced the pixels ------
+            //
+            // #218 review: the key covered the origin, the reader's three texts
+            // and the function, and stopped. `prov` - "Python 3.11.4 (...),
+            // numpy 1.26.4" - was reported beside every reply, hit or run, but
+            // was not part of what made a hit a hit. So pointing the peer at a
+            // different interpreter, or upgrading numpy under the one it names,
+            // handed back the OLD environment's pixels under the NEW
+            // environment's provenance line. Not a stale cache: a label that is
+            // untrue about the numbers it labels.
+            //
+            // Two environments, for real, and the reader can TELL THEM APART:
+            //   A  whatever adapter::findPython settles on;
+            //   B  a venv over the same base (--system-site-packages, so numpy
+            //      is the same numpy) carrying a module A does not have.
+            // The reader adds that module's TAG to every sample, so "which
+            // environment produced these pixels" is a number and not a story.
+            //
+            // Everything here goes through raw remote::Session, never
+            // app.uiSession: the peer reads VIEWER_SERVE_PYTHON out of its
+            // environment at START, so "a different environment" means a
+            // different peer process, and app.uiSession's is already up.
+            closeAll();
+            const int EF = 2, EH = 4, EW = 6;
+            const uint16_t EBASE = 7;
+            const std::string envOrigin = root + "/envsrc.npy";
+            {
+                std::vector<uint16_t> px((size_t)EF * EH * EW);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(EBASE + i);
+                std::vector<uint8_t> b = selftestNpyBytes("<u2", { EF, EH, EW },
+                                                          px.data(), px.size() * 2);
+                std::ofstream f(pathFromUtf8(envOrigin), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            }
+            const std::string rdEnv = root + "/envtag.py";
+            writeText(rdEnv,
+                      "import numpy as np\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    try:\n"
+                      "        import viewer_env_tag as T\n"
+                      "        tag = int(T.TAG)\n"
+                      "    except Exception:\n"
+                      "        tag = 0\n"
+                      "    a = np.load(path).astype(np.uint16) + tag\n"
+                      "    return Stack(np.ascontiguousarray(a), name='envtag')\n");
+            std::string envFiles[3] = { std::string(), files[1], files[2] };
+            const bool haveEnvText = slurp(rdEnv, envFiles[0]);
+            check(haveEnvText, "R15a (setup) the environment-tagging reader is readable");
+
+            // The first sample of node 0, fetched THROUGH the key the RUN
+            // issued - the same road a document takes, so "B's pixels" is the
+            // peer's own answer and not this side's reconstruction.
+            auto keyedFirst = [&](remote::Session& s, const std::string& k, double& out) {
+                remote::KeyedRef ref{ k, 0, remote::KeyedRef::FromReader };
+                remote::Meta m;
+                std::string e;
+                const std::string eu = "local://" + envOrigin;
+                if (!s.meta(eu, m, e, 0, nullptr, &ref)) return false;
+                std::vector<uint8_t> raw;
+                int tw = 0, th = 0, tch = 0;
+                uint32_t dt = 0;
+                if (!s.tileBytes(eu, 0, 0, 0, m.w, m.h, 1, raw, tw, th, tch, dt, e,
+                                 0, nullptr, &ref))
+                    return false;
+                if (raw.size() < 2) return false;
+                uint16_t v = 0;
+                memcpy(&v, raw.data(), 2);
+                out = (double)v;
+                return true;
+            };
+            auto runOn = [&](const std::string& pyEnv, std::string& keyOut,
+                             std::string& provOut, double& pxOut, bool& cachedOut) {
+                setEnv("VIEWER_SERVE_PYTHON", pyEnv);
+                remote::Session s;
+                if (!openSession(s, true)) return false;
+                remote::ReaderRun r;
+                std::string e;
+                const bool sent = s.readerRun(envOrigin, "load", envFiles, r, e);
+                bool got = sent && r.outcome == rp::RO_OK;
+                if (got) {
+                    keyOut = r.key;
+                    provOut = r.provenance;
+                    cachedOut = has(r.stderrText, "read from cache");
+                    got = keyedFirst(s, r.key, pxOut);
+                }
+                s.stop();
+                return got;
+            };
+
+            std::string kA, pA;
+            double pxA = 0;
+            bool cachedA = false;
+            const bool okA = haveEnvText && runOn("", kA, pA, pxA, cachedA);
+            check(okA && pxA == (double)EBASE,
+                  "R15b environment A runs the reader and its pixels carry no tag");
+
+            // ---- environment B: a venv over the same base, plus one module ----
+            // --system-site-packages so numpy is the SAME numpy (the difference
+            // under test is the interpreter, not whether one exists);
+            // --without-pip because this has to be cheap enough to run every
+            // time. If the machine cannot build one, the environment half is
+            // SKIPPED BY NAME rather than passed vacuously.
+            // ABSOLUTE, and in the platform's own spelling: this path becomes
+            // argv[0] of a process, and CreateProcess does not resolve a
+            // relative path written with forward slashes (windows error 2).
+            std::filesystem::path envBp =
+                std::filesystem::absolute(pathFromUtf8(root + "/envB"), ec).lexically_normal();
+            envBp.make_preferred();
+            const std::string envB = envBp.u8string();
+            std::string pyB;
+            {
+                std::string why;
+                const std::string base = adapter::findPython("", why);
+                if (!base.empty()) {
+                    adapter::Run mk = adapter::run({ base, "-m", "venv",
+                                                     "--system-site-packages",
+                                                     "--without-pip", envB }, 120000);
+                    for (const char* sub : { "Scripts/python.exe", "bin/python3",
+                                             "bin/python" }) {
+                        std::filesystem::path c = envBp / std::filesystem::u8path(sub);
+                        c.make_preferred();
+                        if (std::filesystem::exists(c, ec)) { pyB = c.u8string(); break; }
+                    }
+                    if (!pyB.empty()) {
+                        adapter::Run probe = adapter::run({ pyB, "-c", "import numpy" }, 60000);
+                        if (!probe.started || probe.exit != 0) pyB.clear();
+                    }
+                    if (pyB.empty())
+                        fprintf(stderr, "rreaderselftest:   R15 venv unavailable "
+                                        "(base=%s exit=%d fail=\"%s\"): SKIPPING R15c-R15j\n",
+                                base.c_str(), mk.exit, mk.fail.c_str());
+                }
+            }
+            if (!pyB.empty()) {
+                // The module only environment B has. A venv's own site-packages
+                // precedes the base's, so this is B's and B's alone.
+                std::string sp;
+                for (auto& d : std::filesystem::recursive_directory_iterator(
+                         pathFromUtf8(envB), ec))
+                    if (d.is_directory(ec) &&
+                        d.path().filename().u8string() == "site-packages") {
+                        sp = d.path().u8string();
+                        break;
+                    }
+                check(!sp.empty(), "R15c (setup) environment B has a site-packages of its own");
+                writeText(sp + "/viewer_env_tag.py", "TAG = 1000\n");
+
+                std::string kB, pB;
+                double pxB = 0;
+                bool cachedB = false;
+                const bool okB = runOn(pyB, kB, pB, pxB, cachedB);
+                fprintf(stderr, "rreaderselftest:   R15 A key=%s prov=\"%s\" px=%g\n",
+                        kA.c_str(), pA.c_str(), pxA);
+                fprintf(stderr, "rreaderselftest:   R15 B key=%s prov=\"%s\" px=%g\n",
+                        kB.c_str(), pB.c_str(), pxB);
+                check(okB && kB != kA,
+                      "R15d the same origin/reader/function under B is a DIFFERENT key");
+                check(okB && !cachedB,
+                      "R15e ...so B is a miss and the reader is re-run there");
+                check(okB && pxB == (double)(EBASE + 1000),
+                      "R15f ...and the pixels that come back are B's, not A's");
+                check(okB && pB != pA && has(pB, "envB"),
+                      "R15g ...beside a provenance line that names B's interpreter");
+
+                // B -> B: the same environment IS a hit. A key that changed for
+                // any reason other than the environment would show up here.
+                std::string kB2, pB2;
+                double pxB2 = 0;
+                bool cachedB2 = false;
+                const bool okB2 = runOn(pyB, kB2, pB2, pxB2, cachedB2);
+                check(okB2 && kB2 == kB && cachedB2 && pxB2 == pxB,
+                      "R15h B twice is one key and one run: the cache answers the second");
+
+                // The upgrade case, which is the one the persistent cache makes
+                // dangerous: the SAME interpreter path reporting a different
+                // numpy. sitecustomize is imported at startup, so this is what
+                // `python -c "import numpy; print(numpy.__version__)"` - the
+                // provenance probe itself - sees, exactly as a real upgrade
+                // would be seen by the next peer process.
+                writeText(sp + "/sitecustomize.py",
+                          "import numpy\n"
+                          "numpy.__version__ = '99.9.9'\n");
+                std::string kB3, pB3;
+                double pxB3 = 0;
+                bool cachedB3 = false;
+                const bool okB3 = runOn(pyB, kB3, pB3, pxB3, cachedB3);
+                fprintf(stderr, "rreaderselftest:   R15 B' key=%s prov=\"%s\"\n",
+                        kB3.c_str(), pB3.c_str());
+                check(okB3 && has(pB3, "99.9.9"),
+                      "R15i (setup) the same interpreter path now reports another numpy");
+                check(okB3 && kB3 != kB && !cachedB3,
+                      "R15j an upgrade under one interpreter path is a miss, not a hit");
+            }
+            setEnv("VIEWER_SERVE_PYTHON", "");
+            closeAll();
+        }
+
         // ---- stage 4: the memo crosses the link, the hint never runs ----------
         // The V25p pair of core/selftest/verify.inc, over a peer. It lives HERE
         // rather than there for this file's own reason: half of what is asserted
