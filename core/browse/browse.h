@@ -203,3 +203,22 @@ extern ImVec2 g_injMouse;   // --browse-keys-selftest's injected cursor (<0: off
 extern int    g_injMouseBtn;
 extern int    g_rbKeysTarget;        // instance NUM the keys selftest drives
 App::BrowseInstance& rbKeysT();
+
+// ---- the row context menu, as text and as pixels ------------------------------
+// What a right-click on a listing row actually OFFERS. ImGui keeps no record of
+// what a popup contained, so the items are written down on their way in
+// (rbCtxItem) - the labels in the order they were submitted, and where each one
+// landed, so an injected click can pick one BY NAME. Without this the only
+// assertion a selftest could make about a menu was "a popup is open", which is
+// true of a menu that has lost half its verbs.
+//
+// `frame` is the ImGui frame the recording was taken on. A right-click that
+// opens nothing leaves the PREVIOUS menu standing here, and a check that read
+// it would be judging one row's menu on another row's contents - so the driver
+// requires the recording to be from the frame just gone.
+struct RbCtxProbe {
+    std::string items;                 // ";"-terminated labels, in order
+    std::vector<ImVec2> centre;        // one per item, for an injected click
+    int frame = -1;
+};
+extern RbCtxProbe g_rbCtx;

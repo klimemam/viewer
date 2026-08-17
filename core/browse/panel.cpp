@@ -126,6 +126,30 @@ std::string rbRowWhyNot(const std::string& host, const std::string& name) {
     return host.empty() ? viewerRefusalFor(name) : peerRefusalFor(name);
 }
 
+// §4.13's door from a listing row into the Reader panel. ONE function, because
+// TWO gestures open it and they must land in the same place: a double-click on
+// a row this side cannot read (§4.13.0's first entrance), and the row menu's
+// "Open with reader..." - which is the same door opened deliberately, on a row
+// that may well open natively.
+//
+// The path is the row's URL on a peer's listing and its bare path on this
+// disk's, which is the split startReader already makes (§4.13.1): a reader runs
+// where the file is, and handing it a peer's path as if it were local names a
+// file that does not exist on this machine. The panel is where the peer's
+// consent is then met or refused (--serve-readers, RO_GATE_CLOSED) - the door
+// does not pre-judge it, or the refusal would be said twice in two wordings.
+//
+// The `why` is the row's own reason for being dim, the same sentence its
+// tooltip says and the same one openPath puts on the panel. An openable row has
+// none, so choosing a reader for a .npy opens the panel with nothing to
+// apologise for - which is the point of that half of the door.
+static void rbReaderDoor(const App::RemoteBrowse& B, const RbRow& r) {
+    const std::string full = r.full();
+    g_browseHost.openReaderPicker(B.host.empty() ? full
+                                                 : makeRemoteUrl(B.host, full, B.port),
+                                  rbRowWhyNot(B.host, r.name()));
+}
+
 static void rbAddRows(const App::BrowseInstance& I,
                       const std::string* dir, const std::vector<remote::Entry>& ents,
                       bool flat, bool tree, int depth, std::vector<RbRow>& out);
@@ -623,6 +647,23 @@ int g_rbKeysTarget = 1;      // instance NUM the keys selftest drives
 App::BrowseInstance& rbKeysT() {
     if (App::BrowseInstance* p = rbFindNum(g_rbKeysTarget)) return *p;
     return rbMain();
+}
+
+// The row menu, written down as it is built (browse.h RbCtxProbe). Every item of
+// the listing's context popup goes through here instead of ImGui::MenuItem, so
+// the labels a right-click offers are readable as text and each one's rectangle
+// is known - which is what lets a selftest click "Open with reader..." rather
+// than call the function behind it.
+RbCtxProbe g_rbCtx;
+static RbCtxProbe g_rbCtxLive;          // the menu being built THIS frame
+static bool rbCtxItem(const char* label, bool enabled = true) {
+    const bool hit = ImGui::MenuItem(label, nullptr, false, enabled);
+    g_rbCtxLive.items += label;
+    g_rbCtxLive.items += ';';
+    g_rbCtxLive.centre.push_back(
+        ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f,
+               (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f));
+    return hit;
 }
 
 // The "+" affordance: one more Browse, as a TAB beside this one. It used to
@@ -2126,22 +2167,13 @@ void drawPanelRemote(App::BrowseInstance& I) {
             // simply inert. A dimmed row that does nothing when you double-click
             // it is the tool saying "no" with no way forward, which is the exact
             // dead end §3.2 set out to remove.
-            // Local only: running the adapter on the peer is §4.13.1, and
-            // pretending a remote path is a local one would hand the reader a
-            // path that does not exist on this machine.
             if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
                 ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                if (B.host.empty())
-                    g_browseHost.openReaderPicker(r.full(),
-                        "the viewer has no native reading for this file");
-                else
-                    g_browseHost.toast("readers run on this machine only for now - "
-                                       "copy the file over, or open it from a local folder",
-                                       true);
-            }
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                rbReaderDoor(B, r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
+                g_rbCtxLive = RbCtxProbe{};       // this row's menu, from scratch
                 std::string full = r.full();
                 // Right-clicking a row that is PART of a multi-row selection acts
                 // on the whole selection, the way every file manager does. This
@@ -2154,7 +2186,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     char lb[96];   // the average item names its stack count too
                     snprintf(lb, sizeof lb, "Open %d selected as stack", rbNSel);
                     if (!rbSelStackWhyNot.empty()) ImGui::BeginDisabled();
-                    if (ImGui::MenuItem(lb)) {
+                    if (rbCtxItem(lb)) {
                         std::vector<std::string> files = rbSelFiles();
                         sortFramesNumerically(files);
                         std::vector<std::string> bases;
@@ -2196,7 +2228,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     else
                         snprintf(lb, sizeof lb, "Open %d selected as frame average", rbNSel);
                     if (!rbSelAvgWhyNot.empty()) ImGui::BeginDisabled();
-                    if (ImGui::MenuItem(lb)) {
+                    if (rbCtxItem(lb)) {
                         for (const auto& s : avgStacks)
                             g_browseHost.openStackForAverage(B.host, s.files, s.name, B.port);
                         // Said again AFTER the fact, because the opens are
@@ -2241,7 +2273,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // very menu, which is why the removal is not a dead end -
                     // and on the Temporal panel of an opened stack.)
                     snprintf(lb, sizeof lb, "Copy %d path(s)", rbNSel);
-                    if (ImGui::MenuItem(lb)) {
+                    if (rbCtxItem(lb)) {
                         std::vector<std::string> files = rbSelFiles();
                         std::string all;
                         for (const auto& f : files) { all += f; all += "\n"; }
@@ -2251,17 +2283,17 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("one absolute path per line; a numbered group\n"
                                           "expands to the frames it stands for");
-                    if (ImGui::MenuItem("Clear selection")) rbSel.assign(view.size(), 0);
+                    if (rbCtxItem("Clear selection")) rbSel.assign(view.size(), 0);
                     ImGui::Separator();
                 }
                 if (r.isDir()) {
-                    if (ImGui::MenuItem("Open folder (all stacks below)"))
+                    if (rbCtxItem("Open folder (all stacks below)"))
                         remoteScanFolder(I, full);
-                    if (ImGui::MenuItem("Search under here")) {
+                    if (rbCtxItem("Search under here")) {
                         rbSearchRoot = full;   // the chip beside the box shows and clears it
                         I.searchOpen = true;   // ...and the caret goes in the box
                     }
-                    if (ImGui::MenuItem("Bookmark")) {
+                    if (rbCtxItem("Bookmark")) {
                         std::string u = placeUrl(B.host, B.port, full);
                         if (std::find(app.rbBookmarks.begin(), app.rbBookmarks.end(), u) ==
                             app.rbBookmarks.end()) {
@@ -2273,7 +2305,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     }
                     ImGui::Separator();
                 } else if (r.isGroup()) {
-                    if (ImGui::MenuItem("Open as stack")) {
+                    if (rbCtxItem("Open as stack")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         g_browseHost.openRemoteStack(B.host, files,
@@ -2283,7 +2315,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // across the frame axis. Beside "Open as stack" because it
                     // is the same subject and the same click, answering the
                     // other question you open a dark or flat set to ask.
-                    if (ImGui::MenuItem("Open as frame average")) {
+                    if (rbCtxItem("Open as frame average")) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         g_browseHost.openStackForAverage(B.host, files,
@@ -2308,7 +2340,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     char tl[160];
                     snprintf(tl, sizeof tl, "Temporal stats (server) for stack \"%s\"",
                              e.name.c_str());
-                    if (ImGui::MenuItem(tl)) {
+                    if (rbCtxItem(tl)) {
                         std::vector<std::string> files;
                         for (const auto& m : e.members) files.push_back(r.join(m));
                         std::string leaf = B.dir;
@@ -2340,7 +2372,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                                           "time, or open one and use the Temporal panel.");
                     ImGui::Separator();
                 } else if (rbRowOpenable(B.host, rname)) {
-                    if (ImGui::MenuItem("Open"))
+                    if (rbCtxItem("Open"))
                         g_browseHost.openRemote(makeRemoteUrl(B.host, full, B.port),
                                                 false, 0, 0);
                     // The stack verbs below are the PEER's, on a local listing
@@ -2351,10 +2383,10 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // once picked.
                     if (peerServesName(rname)) {
                         // one file as a stack: a frame-axis file becomes its frames
-                        if (ImGui::MenuItem("Open as stack"))
+                        if (rbCtxItem("Open as stack"))
                             g_browseHost.openRemoteStack(B.host, { full },
                                                          stackNameFor(*r.dir, rname), B.port, 0);
-                        if (ImGui::MenuItem("Open as frame average"))
+                        if (rbCtxItem("Open as frame average"))
                             g_browseHost.openStackForAverage(B.host, { full },
                                                              stackNameFor(*r.dir, rname), B.port);
                         if (ImGui::IsItemHovered())
@@ -2363,7 +2395,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                         if (r.member >= 0) {
                             char sl[64];
                             snprintf(sl, sizeof sl, "Open the whole stack (%u frames)", e.frames);
-                            if (ImGui::MenuItem(sl)) {
+                            if (rbCtxItem(sl)) {
                                 std::vector<std::string> files;
                                 for (const auto& m : e.members) files.push_back(r.join(m));
                                 g_browseHost.openRemoteStack(B.host, files,
@@ -2371,7 +2403,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                             }
                             snprintf(sl, sizeof sl, "Open the whole stack as frame average (%u)",
                                      e.frames);
-                            if (ImGui::MenuItem(sl)) {
+                            if (rbCtxItem(sl)) {
                                 std::vector<std::string> files;
                                 for (const auto& m : e.members) files.push_back(r.join(m));
                                 g_browseHost.openStackForAverage(B.host, files,
@@ -2388,16 +2420,48 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // one place a user right-clicks to ask "what can I do with
                     // this?". Dropping the item entirely would answer with a
                     // menu that looks like it forgot.
-                    ImGui::MenuItem("Open", nullptr, false, false);
+                    rbCtxItem("Open", false);
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                         ImGui::SetTooltip("%s", rbRowWhyNot(B.host, rname).c_str());
                     ImGui::Separator();
                 }
-                if (ImGui::MenuItem("Copy path")) {
+                // §4.13's fourth entrance, and the first one that does not
+                // require the viewer to have already failed. The other three
+                // (the File menu, the Inspector's reader field, the dim row's
+                // double-click) between them left two doors missing: a file
+                // ALREADY bound to a reader had no way back to the panel to
+                // pick a different one - the memo runs the old one from then on
+                // (§4.12) - and a file the viewer reads natively could not be
+                // handed to a reader at all, because the only row-level way in
+                // was a row that could not be opened.
+                //
+                // ONE file, so not on a folder and not on a group row: a reader
+                // is handed a path and returns one thing (§4.1). The group's
+                // members each have their own row in flat view, and that is
+                // where their door is.
+                //
+                // Not gated on WHOSE disk either. Since #180 stages 1-2 a reader
+                // runs on the peer, so the same item on a remote row is a true
+                // offer; whether that peer will run it is the peer's own answer
+                // (--serve-readers), said by the Reader panel when Load is
+                // pressed, in the words §2 of docs/remote-reader-design.md
+                // already chose. Refusing here as well would be a second, worse
+                // spelling of a sentence that exists.
+                if (!r.isDir() && !r.isGroup()) {
+                    if (rbCtxItem("Open with reader...")) rbReaderDoor(B, r);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Open the Reader panel on this file: pick a\n"
+                                          "Python function to read it with, whether or not\n"
+                                          "this viewer reads the format itself. The choice\n"
+                                          "is remembered for this path, and choosing again\n"
+                                          "replaces it.");
+                    ImGui::Separator();
+                }
+                if (rbCtxItem("Copy path")) {
                     ImGui::SetClipboardText(full.c_str());
                     g_browseHost.toast("copied " + full, false);
                 }
-                if (!r.isDir() && ImGui::MenuItem("Properties...")) {
+                if (!r.isDir() && rbCtxItem("Properties...")) {
                     rbPropsEntry = e;
                     if (r.member >= 0) {          // an expanded frame: the group's
                         rbPropsEntry.name = rname;   // meta, but none of its totals
@@ -2409,6 +2473,8 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     rbPropsPath = full;
                     rbPropsOpen = true;
                 }
+                g_rbCtxLive.frame = ImGui::GetFrameCount();
+                g_rbCtx = g_rbCtxLive;            // whole, and only when drawn
                 ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
