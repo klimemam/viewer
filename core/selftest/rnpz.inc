@@ -380,6 +380,122 @@
                   "R17f a member inflated after the file moved is refused BY NAME");
         }
 
+        // ---- R18: a zip64 record that does not hold together -------------------
+        //
+        // #221 review r3794616476. The central directory says 0xffffffff for a
+        // size, which means "the real number is in the zip64 extra field", and
+        // the walk then read three 64-bit values out of that field having
+        // checked only that its four-byte HEADER fitted. An extra field with id
+        // 1 and a declared size of 0 - a truncated file, or a writer with a bug
+        // - therefore read up to 24 bytes past the end of the buffer. On the
+        // PEER that is a crash, caused by a file a client did no more than
+        // name; and a peer that dies takes the session with it.
+        //
+        // The fixtures are the three truncations in turn, because "which of the
+        // three values was missing" is what the sentence has to be able to say.
+        {
+            // A zip written the way a zip64 writer writes one: the 32-bit
+            // fields in the central directory are 0xffffffff and the real
+            // numbers live in the extra field. `z64n` is how many of the three
+            // u64s that field actually carries - 3 is well-formed.
+            auto writeZip64 = [&](const std::string& path, const std::string& member,
+                                  const std::vector<uint8_t>& body, int z64n) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff));
+                    z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                auto p64 = [&](uint64_t x) {
+                    for (int i = 0; i < 8; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                const std::string nm = member + ".npy";
+                const uint32_t crc =
+                    (uint32_t)mz_crc32(MZ_CRC32_INIT, body.data(), body.size());
+                const uint32_t lo = (uint32_t)z.size();
+                // The LOCAL header carries the real 32-bit sizes: the fixture is
+                // small, and what is under test is the CENTRAL directory's
+                // zip64 record, so nothing else is made strange.
+                p32(0x04034b50); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc); p32((uint32_t)body.size()); p32((uint32_t)body.size());
+                p16((uint32_t)nm.size()); p16(0);
+                z.insert(z.end(), nm.begin(), nm.end());
+                z.insert(z.end(), body.begin(), body.end());
+                const uint32_t cdOff = (uint32_t)z.size();
+                const uint32_t elen = (uint32_t)(4 + 8 * z64n);
+                p32(0x02014b50); p16(45); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc);
+                p32(0xffffffffu); p32(0xffffffffu);           // csize, usize: "see the extra"
+                p16((uint32_t)nm.size()); p16(elen); p16(0); p16(0); p16(0); p32(0);
+                p32(0xffffffffu);                             // localOff: the same
+                z.insert(z.end(), nm.begin(), nm.end());
+                p16(1); p16((uint32_t)(8 * z64n));            // the zip64 extra field
+                const uint64_t vals[3] = { (uint64_t)body.size(), (uint64_t)body.size(),
+                                           (uint64_t)lo };
+                for (int i = 0; i < z64n; i++) p64(vals[i]);
+                const uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                p32(0x06054b50); p16(0); p16(0); p16(1); p16(1);
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            const std::vector<uint8_t> imgNpy =
+                selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2);
+
+            if (!connect()) return 1;
+            // (a) the WELL-FORMED one still opens. A bounds check that refused
+            //     real zip64 files would be the same outage wearing a message.
+            const std::string z64ok = root + "/z64ok.npz";
+            writeZip64(z64ok, "img", imgNpy, 3);
+            {
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool got = readFileBytes(z64ok, zip) && npzList(zip, ents, zerr);
+                check(got && ents.size() == 1 && ents[0].usize == imgNpy.size() &&
+                          ents[0].csize == imgNpy.size(),
+                      "R18a a real zip64 record still reads: the sizes come out of the extra");
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(z64ok, sc, err);
+                check(sent && sc.members.size() == 1,
+                      "R18b ...and the peer lists it over the link");
+            }
+            // (b) the three truncations, each named.
+            const char* who[3] = { "uncompressed size", "compressed size",
+                                   "local header offset" };
+            const char* tag[3] = { "R18c a zip64 field with no room for the USIZE is refused BY NAME",
+                                   "R18d ...and one with no room for the CSIZE",
+                                   "R18e ...and one with no room for the LOCAL OFFSET" };
+            for (int n = 0; n < 3; n++) {
+                const std::string p = root + "/z64cut" + std::to_string(n) + ".npz";
+                writeZip64(p, "img", imgNpy, n);
+                // The LOCAL walk first - it is the same parser, and a peer that
+                // refused what this door accepted would be two answers again.
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool listed = readFileBytes(p, zip) && npzList(zip, ents, zerr);
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(p, sc, err);
+                fprintf(stderr, "rnpzselftest:   R18 cut%d local=\"%s\" peer=\"%s\"\n",
+                        n, zerr.c_str(), err.c_str());
+                check(!listed && !sent && has(err, "img.npy") && has(err, who[n]) &&
+                          err == zerr,
+                      tag[n]);
+            }
+            // (c) THE PEER IS STILL THERE. That is the whole point: an out-of-
+            //     bounds read ends the process, and a refusal does not.
+            remote::NpzScan sc;
+            std::string err;
+            const bool alive = app.uiSession.npzScan(many, sc, err);
+            check(alive && sc.members.size() == 5,
+                  "R18f the same session lists a good container afterwards: the peer lived");
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

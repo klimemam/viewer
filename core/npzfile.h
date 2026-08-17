@@ -138,6 +138,16 @@ inline bool peekHeader(const std::vector<uint8_t>& buf, Head& H, std::string& er
     return true;
 }
 
+// A zip64 record that does not hold together, said with the MEMBER in it
+// (#221 review). The peer runs this walk on a file the client named, so the
+// refusal it sends is the only thing the person ever sees: "corrupt zip" with
+// no name is a sentence about a container of forty arrays that says nothing
+// about which one, and a peer that instead read past the buffer would not be
+// sending a sentence at all.
+inline std::string zip64Bad(const std::string& member, const std::string& why) {
+    return "corrupt zip64 record for member \"" + member + "\": " + why;
+}
+
 // Minimal zip reader for npz: central-directory walk, stored (0) and deflate
 // (8), with zip64 sizes. Inflate comes from miniz.
 inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::string& err) {
@@ -183,17 +193,66 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
         // then subscripts one past the end.
         e.name.assign((const char*)buf.data() + p + 46, nlen);
         if (e.csize == 0xffffffffu || e.usize == 0xffffffffu || e.localOff == 0xffffffffu) {
-            size_t ep = p + 46 + nlen, eend = ep + elen;      // zip64 extra field
-            while (ep + 4 <= eend && ep + 4 <= buf.size()) {
-                uint16_t id = rd16(ep), sz = rd16(ep + 2);
-                if (id == 1) {
-                    size_t q = ep + 4;
-                    if (e.usize == 0xffffffffu) { e.usize = rd64(q); q += 8; }
-                    if (e.csize == 0xffffffffu) { e.csize = rd64(q); q += 8; }
-                    if (e.localOff == 0xffffffffu) { e.localOff = rd64(q); }
-                    break;
+            // ---- the zip64 extra field (APPNOTE 4.5.3) ----------------------
+            //
+            // #221 review. Every value below is EIGHT BYTES read at a length
+            // the file itself declared, and the old code checked only that the
+            // four-byte extra-field HEADER fit: an extra field with id 1 and a
+            // size of 0 then had rd64() read up to 24 bytes past the end of
+            // `buf`. On the peer that is a crash instead of an answer, from a
+            // file a client merely named.
+            //
+            // So each read is checked against BOTH ends, immediately before it
+            // happens: the declared end of the extra block (`fend`, which the
+            // record promises) and the end of the buffer actually held
+            // (`buf.size()`, which is the truth). They are different questions
+            // - a record can promise more than the file contains - and the
+            // arithmetic is done by SUBTRACTION so that no sum can wrap.
+            const size_t ep0 = p + 46 + nlen;                 // <= buf.size(), above
+            if ((size_t)elen > buf.size() - ep0) {
+                err = zip64Bad(e.name, "its extra field runs past the end of the file");
+                return false;
+            }
+            const size_t eend = ep0 + elen;
+            size_t ep = ep0;
+            bool got = false;
+            while (ep + 4 <= eend) {
+                const uint16_t id = rd16(ep), sz = rd16(ep + 2);
+                const size_t body = ep + 4;                   // <= eend <= buf.size()
+                if ((size_t)sz > eend - body) {
+                    err = zip64Bad(e.name,
+                                   "an extra field claims more bytes than the record holds");
+                    return false;
                 }
-                ep += 4 + sz;
+                const size_t fend = body + sz;
+                if (id != 1) { ep = fend; continue; }
+                size_t q = body;
+                // WHICH value was missing, by name. "usize / csize / localOff"
+                // are three different truncations of the same field and a
+                // person looking at the message is trying to find out which
+                // writer produced the file.
+                bool bad = false;
+                auto take = [&](uint64_t& dst, const char* what) {
+                    if (fend - q < 8 || buf.size() - q < 8) {
+                        err = zip64Bad(e.name, std::string("its zip64 extra field stops "
+                                                           "before the ") + what);
+                        bad = true;
+                        return;
+                    }
+                    dst = rd64(q);
+                    q += 8;
+                };
+                if (e.usize == 0xffffffffu)    take(e.usize, "uncompressed size");
+                if (!bad && e.csize == 0xffffffffu)    take(e.csize, "compressed size");
+                if (!bad && e.localOff == 0xffffffffu) take(e.localOff, "local header offset");
+                if (bad) return false;
+                got = true;
+                break;
+            }
+            if (!got) {
+                err = zip64Bad(e.name, "it declares zip64 sizes and carries no zip64 "
+                                       "extra field");
+                return false;
             }
         }
         out.push_back(std::move(e));
