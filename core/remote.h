@@ -62,6 +62,28 @@ struct Meta {
     bool readFellBack = false;
 };
 
+// Which ARRAY INSIDE A MATERIALISATION a request is about (protocol 12 for a
+// reader's output, 13 for a member of a .npz, 14 for a MEASURE of either -
+// docs/remote-reader-design.md §10.5). The key is the peer's own opaque token:
+// it is issued there, quoted back here and never recomputed, because two
+// implementations of a cache key is two answers to "is this the same thing"
+// (#71). It names an entry in the peer's cache directory and carries no path,
+// so it is not a second way for a client to ask the peer to open something.
+//
+// `kind` is NOT on the wire and never will be. The peer resolves which family a
+// key belongs to from its own cache, which is the point of an opaque token; the
+// field exists because the CLIENT has one question the peer cannot answer for
+// it - which protocol number to refuse an old peer from, before it sends
+// anything (readerTooOldText is 12's sentence and npzTooOldText is 13's, and
+// they name different fixes). MEASURE asks the same question and gets ONE
+// answer for both families, because 14 is one build and one fix.
+struct KeyedRef {
+    enum Kind { FromReader, FromNpz };
+    std::string key;
+    int node = 0;              // the peer's own address for one array in it
+    int kind = FromReader;
+};
+
 // MEASURE: what came back is exactly what the analyzer emitted, so the caller
 // renders it through the same grid/plot code as a local run.
 struct MeasureItem {
@@ -129,27 +151,15 @@ struct MeasureReq {
     // form is refused by the peer, exactly as an undeclared plugin version is.
     std::string foldForm;
     int join = 0;                     // rp::SetJoin
-};
-
-// Which ARRAY INSIDE A MATERIALISATION a META or TILE is about (protocol 12 for
-// a reader's output, 13 for a member of a .npz - docs/remote-reader-design.md
-// §10.5). The key is the peer's own opaque token: it is issued there, quoted
-// back here and never recomputed, because two implementations of a cache key is
-// two answers to "is this the same thing" (#71). It names an entry in the
-// peer's cache directory and carries no path, so it is not a second way for a
-// client to ask the peer to open something.
-//
-// `kind` is NOT on the wire and never will be. The peer resolves which family a
-// key belongs to from its own cache, which is the point of an opaque token; the
-// field exists because the CLIENT has one question the peer cannot answer for
-// it - which protocol number to refuse an old peer from, before it sends
-// anything (readerTooOldText is 12's sentence and npzTooOldText is 13's, and
-// they name different fixes).
-struct KeyedRef {
-    enum Kind { FromReader, FromNpz };
-    std::string key;
-    int node = 0;              // the peer's own address for one array in it
-    int kind = FromReader;
+    // The subject is ONE ARRAY INSIDE A MATERIALISATION and not a file at all
+    // (protocol 14): a node of what a reader produced on the peer, or a member
+    // of a .npz it listed. `paths` is then EMPTY and stays empty - the request
+    // carries no origin path, for the reason meta() sends none, and a peer that
+    // predates 14 therefore refuses the head instead of measuring the container
+    // whole. Refused before it is sent by measure() when the peer is too old
+    // (rp::measureKeyedTooOldText).
+    bool hasKeyed = false;
+    KeyedRef keyed;
 };
 
 // What MSG_READER_RUN answered. Every field is a FACT the peer observed; the
@@ -286,7 +296,11 @@ public:
     // HELLO: a v12 peer answers this verb with "unknown request", which is what
     // it also says for a typo.
     bool npzScan(const std::string& path, NpzScan& out, std::string& err);
-    // run analysis where the data is; only the emitted results travel
+    // run analysis where the data is; only the emitted results travel.
+    // `q.hasKeyed` makes the subject one array inside a materialisation instead
+    // of a path (protocol 14) - which is the whole of "where the data is" for a
+    // document that came from a reader's output or a container's member, since
+    // for those there IS no file on the peer holding just those pixels.
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
     // Start the peer with --serve-readers (the default). Turned OFF only by the
     // test that has to observe a CLOSED gate: the flag is written by the side

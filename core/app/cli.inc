@@ -74,6 +74,9 @@ static std::string g_rreaderSelftest;   // --rreader-selftest <dir>: a reader RU
                                         // the document it opens over the link (#180), exit
 static std::string g_rnpzSelftest;      // --rnpz-selftest <dir>: a .npz LISTED and materialised by
                                         // the peer, member by member (#217), exit
+static std::string g_rmeasureSelftest;  // --rmeasure-selftest <dir>: the stack aggregate computed
+                                        // on the peer for a document that is NOT a file - a
+                                        // reader's node and a container's member (#180 stage 5), exit
 static std::string g_mediaSelftest;     // --media-selftest <dir>: PNG/JPEG/TIFF through the seam, exit
 static std::string g_fmtRegSelftest;    // --fmtreg-selftest <dir>: every format's place in the
                                         // source registry and the reload walk (§6.2 / §3.2), exit
@@ -865,6 +868,8 @@ static void parseCli(int argc, char** argv) {
             g_rreaderSelftest = next();            // handled in main()
         } else if (a == "--rnpz-selftest") {
             g_rnpzSelftest = next();               // handled in main()
+        } else if (a == "--rmeasure-selftest") {
+            g_rmeasureSelftest = next();           // handled in main()
         } else if (a == "--media-selftest") {
             g_mediaSelftest = next();              // handled in main()
         } else if (a == "--fmtreg-selftest") {

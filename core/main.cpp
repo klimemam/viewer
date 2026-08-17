@@ -1081,6 +1081,11 @@ int main(int argc, char** argv) {
     #include "selftest/rreader.inc"
     #include "selftest/rnpz.inc"
 
+    // ...and the aggregate computed WHERE those pixels are (stage 5). Same
+    // reason for the standalone peer, one level up: "the peer measured it"
+    // cannot be told from "this process did" without a peer.
+    #include "selftest/rmeasure.inc"
+
     #include "selftest/media.inc"
 
     // settings.jsonc: the dialect, the load order and the two refusals.

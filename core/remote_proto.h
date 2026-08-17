@@ -422,13 +422,24 @@ enum MeasureTarget : uint32_t {
 // rois must be empty. A set analyzer reads the frame (core/app/setanalysis.inc:
 // "EVERY pixel, no decimation"), so a request carrying one is refused rather
 // than quietly measuring a different population than the local path would.
+//
+// MRF_KEYED (protocol 14) appends, right behind the recipe and in bit order:
+//   [str key][u32 node]   ONE ARRAY INSIDE SOMETHING THE PEER MATERIALISED -
+//                         the same pair, with the same meaning, that META and
+//                         TILE carry (rp::RQ_KEYED, §10.5). The subject of the
+//                         measurement is that array, and `nPaths` is then 0:
+//                         the request names NO path, for the reason the trailer
+//                         on META does. A key resolves inside the peer's own
+//                         cache and is never a second way to name a file on its
+//                         disk, and a measurement that carried an origin path
+//                         beside a key would be a request with two subjects.
 struct MeasureReqHead {
     uint32_t op;                 // MeasureOp
     uint32_t frame0, frameCount; // range in a frame-axis file; frameCount 0 = all
     uint32_t cfaType, cfaPattern;// psCfaType / psCfaPattern values
     float    black, white;       // display-range hint handed to the analyzer
-    uint32_t nPaths, nRois;
-    uint32_t flags;              // MRF_RAW_RECIPE: a RawWire follows the rois
+    uint32_t nPaths, nRois;      // nPaths 0 only with MRF_KEYED
+    uint32_t flags;              // MRF_RAW_RECIPE / MRF_KEYED: what follows the rois
 };
 
 // Reply (MSG_OK): a serialization of exactly what the plugin sink emitted, so
@@ -557,6 +568,20 @@ static const uint32_t RAW_MAX_DIM = 32768;
 // head is the cheapest thing for the parsers that already exist. The field was
 // declared "reserved, 0", so a v10 or older client writes 0 there.
 static const uint32_t MRF_RAW_RECIPE = 1u;
+// ...and bit1 (protocol 14): [str key][u32 node] follows, and the subject of
+// the measurement is that ONE ARRAY INSIDE A MATERIALISATION rather than any
+// file - so nPaths is 0. Same value, same position discipline, same reason as
+// bit0: the blocks behind the rois are read in bit order and each one's
+// presence is declared in the head, never inferred from bytes remaining.
+//
+// The spelling is KEYED and not READER. docs/remote-reader-design.md §4.2
+// called it MRF_READER when a reader's output was the only thing a key could
+// name; §10.5 fixed the meaning of the pair to "the peer materialised
+// something, and this is one array in it", and a native .npz stack measured
+// here has no reader anywhere near it. The VALUE the design assigned is kept -
+// no build ever wrote the other name - and RQ_KEYED on META / TILE was renamed
+// for this reason first (protocol 13).
+static const uint32_t MRF_KEYED = 2u;
 
 // TILE reply header; the pixel blob follows, possibly deflate-compressed.
 struct TileRep {
@@ -958,6 +983,39 @@ inline std::string npzTooOldText(int peerVersion, const std::string& name) {
            "speaks protocol " + std::to_string(peerVersion) + ", and a .npz needs "
            "13 (update viewer-serve). Nothing was opened: this file IS readable "
            "here, so browsing it locally or copying it here both work today.";
+}
+
+// The peer predates MEASURE reaching one array inside a materialisation (issue
+// #180 stage 5). The sixth sentence of this family, and the one whose unrefused
+// send would be worst of all: a v13 peer reads the head it knows, never reads
+// the key behind the rois, and - if the request carried an origin path - would
+// answer with a real statistic over the WHOLE .npz or over the file a reader
+// was pointed at. A number under the right label, computed from bytes nobody
+// opened. So the client sends no path with a key at all (an older peer then
+// refuses the head instead of measuring the wrong thing), and refuses HERE
+// first, from the number the peer announced in HELLO.
+//
+// One sentence for both families of key, unlike the two META / TILE gates,
+// because here there is only one fix: the reader's 12 and the container's 13
+// send a person to different places, and "your peer cannot measure inside a
+// materialisation" sends them to the same place whichever issued the key.
+//
+// The way out is the one that is true: the pixels are already reachable - this
+// document opens and draws - so the measurement can be made HERE once the
+// frames are local, which is exactly what the panel falls back to.
+//
+// The only sentence of the six that names NOTHING. The other five are about a
+// file and print its name; the subject here is one array inside a
+// materialisation, whose only wire name is a hex token issued by the peer -
+// and a person reads this under the heading of the stack it is about, which
+// already says which one it is. A key in a sentence would be noise wearing the
+// shape of an identifier.
+inline std::string measureKeyedTooOldText(int peerVersion) {
+    return "the remote peer cannot measure one array inside what it materialised"
+           " - it speaks protocol " + std::to_string(peerVersion) + ", and a keyed "
+           "measurement needs 14 (update viewer-serve). Nothing was measured on the "
+           "peer: the frames arrive here in the background, and the panel computes "
+           "the same quantity locally once they have.";
 }
 
 // The gate the peer's own launcher opened, or did not (§2.1). A DIFFERENT

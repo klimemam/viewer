@@ -1387,6 +1387,20 @@ viewer_selftest(rreader NOGL --rreader-selftest tools/testdata
 viewer_selftest(rnpz NOGL --rnpz-selftest tools/testdata
                      --remote-exe $<TARGET_FILE:viewer-serve>)
 
+# ...and the NUMBER, computed where those pixels are (#180 stage 5, protocol
+# 14). A document that came from a reader's node or a container's member is not
+# a file on the peer, and until now MEASURE could only name files - so the one
+# thing the link exists for was the one thing such a stack could not do. The
+# assertions are all comparisons of a measurement: the peer's sigma_t against an
+# independent f64 reference, against what this viewer computes over the same
+# stack opened locally (bit for bit), and the two issuers of a key against each
+# other. Plus the two negatives - a v13 peer refused before anything is sent,
+# and a shut --serve-readers gate leaving the container's measurement untouched.
+#
+# --remote-exe is the test again, for rreader's reason one level up.
+viewer_selftest(rmeasure NOGL --rmeasure-selftest tools/testdata
+                         --remote-exe $<TARGET_FILE:viewer-serve>)
+
 # ...and WHICH formats that walk, and the registry it keys off, actually reach:
 # one row per backend of core/imagefile.h plus the members of a viewer
 # container - registers / reload reaches / a second open shares. It writes the
