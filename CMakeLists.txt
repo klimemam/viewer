@@ -983,24 +983,15 @@ function(viewer_selftest name)
   # both are needed: TMP separates the FIXTURES a test writes, this separates
   # what the APP writes about itself.
   #
-  # ONE NAMED EXCEPTION, because the alternative is a silent one. selftest.
-  # browse-dbl aims a scripted double-click at a pixel one row below the cursor,
-  # and on a config dir with no layout.ini that click lands and does nothing -
-  # reproduced here, virgin dir: cursor row [23,371]-[393,400], click (208,414),
-  # and the cursor never moves. With a layout.ini present the identical point
-  # works. So the test passes today only because an EARLIER test left a layout
-  # in the folder they all shared. core/main.cpp:920-935 already says this in
-  # so many words and declines to fix it there; issue #206 carries it.
-  #
-  # Giving it a private dir would turn a real defect into a red test with no
-  # fix attached, so it stays paired with the test whose leftovers it has been
-  # living on - deterministically, since ctest here is serial and browse-keys
-  # runs first, where today it depends on whoever happened to run before.
-  set(_homename ${name})
-  if(name STREQUAL "browse-dbl")
-    set(_homename browse-keys)
-  endif()
-  set(_home ${CMAKE_CURRENT_BINARY_DIR}/selftest-home/${_homename})
+  # selftest.browse-dbl used to be a named exception here, pinned to browse-keys'
+  # directory: its scripted double-click only landed on a config dir where an
+  # EARLIER test had left a layout.ini. Measured cause (#206): with no layout.ini
+  # the Browse panel starts docked, and undocking it for the test's "w400" does
+  # not lift it above the floating ROIs/Analysis panels that then own the pixel.
+  # The run that pins the panel's width now pins its display order too, so the
+  # exception is gone and every test gets its own directory. A selftest no
+  # longer reads or writes layout.ini at all (core/main.cpp, scriptedRun).
+  set(_home ${CMAKE_CURRENT_BINARY_DIR}/selftest-home/${name})
   file(MAKE_DIRECTORY ${_home})
   set(_env "APPDATA=${_home};HOME=${_home};TMP=${_tmp};TEMP=${_tmp};TMPDIR=${_tmp}")
   foreach(kv IN LISTS extra_env)

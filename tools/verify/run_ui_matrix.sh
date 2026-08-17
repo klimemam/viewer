@@ -5,13 +5,12 @@
 #   bash tools/verify/run_ui_matrix.sh [<checkout-dir>]
 #
 # WHY THE APPDATA DANCE (do not remove it):
-# the viewer points io.IniFilename straight at %APPDATA%/viewer/layout.ini
-# (core/main.cpp:20910) with no selftest guard, and the periodic autosave in
-# the frame loop (core/main.cpp:28609) is guarded only by !benchFrames. A
-# --browse-keys-selftest run therefore WRITES the user's real layout.ini and
-# a real autosave.vsession - see docs/verify-ui.md defect D-1. Every run below
-# is pointed at a throwaway config dir so the suite can never touch the
-# operator's own panel layout or session.
+# the periodic autosave in the frame loop (core/main.cpp, guarded only by
+# !benchFrames) means a --browse-keys-selftest run WRITES a real
+# autosave.vsession - see docs/verify-ui.md defect D-1. The layout.ini half of
+# that defect is closed (#206): io.IniFilename is now nullptr for any scripted
+# run. The session half is not, so every run below is still pointed at a
+# throwaway config dir and the suite can never touch the operator's own state.
 set -u
 cd "${1:-.}" || exit 1
 V=./build-mingw/viewer.exe
