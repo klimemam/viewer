@@ -3,6 +3,24 @@
 Opus(Claude)が Codex に **調査・修正・検証** を依頼するときの置き場。
 Codex はこのフォルダをポーリングする。
 
+## 作業場所の取り決め(2026-08-17 合意)
+
+1. **主 checkout(このフォルダ直下)は main のまま触らない** —— ブランチを切らない・
+   ステージを残さない。Opus が board/docs を main に直接コミットする場所で、ここの
+   HEAD/index が動くと「別ブランチに他人のコミットが積まれ、ステージ残りが他人の
+   メッセージでコミットされる」事故が起きる(2026-08-17 に実際に起きた)
+2. **作業は worktree で**: 名前は `viewer_work/codex-<内容>`、基点は **`origin/main`
+   を明示**(ローカル main は遅れていることがある)
+   ```
+   git fetch origin && git worktree add viewer_work/codex-<slug> -b <branch> origin/main
+   ```
+3. **ビルドは worktree 内に自前の build-mingw**。deps は
+   `-DFETCHCONTENT_SOURCE_DIR_*` で主 checkout の `build-mingw/_deps` を指してよい。
+   selftest は per-test TMP/config-dir 化済みなので並行実行して安全
+4. **着手前に名乗る**: このフォルダの依頼なら該当ファイルを `status: taken` に。
+   自発タスクなら盤(docs/tasks.csv)の行番号を issue で名乗る。Opus 側のエージェントと
+   同じ領域を同時に触らないための唯一の仕組みなので省略しない
+
 ## 契約
 
 - **1依頼 = 1ファイル**。名前は `YYYYMMDD-NN-slug.md`(NN はその日の連番)
