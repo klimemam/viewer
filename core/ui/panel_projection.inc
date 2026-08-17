@@ -1,12 +1,25 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // What the Projection panel SAID about the slots on the last frame it drew -
 // the same grammar as g_histSideProbe ("rowX;" per table side, "curves=",
-// "said-no-curve="), because it guards the same equation:
+// "said-no-curve=", "emph=", "plane="), because it guards the same equation:
 // rows ⊆ curves ∪ said-no-curve. The projection was the panel issue #60 caught
 // giving slots table rows while the plots drew A and B and said NOTHING about
 // the letters they left off - the exact silence the histogram had already been
 // cured of, unguarded here because no probe existed to assert it.
 static std::string g_projSideProbe;
+
+// One side of the Projection panel: A, B, or a lettered slot. Built ONCE, above
+// everything, and the plots, the legend, the mismatch notices and the statistics
+// table all walk this one list - so the table can never give a letter numbers
+// that the plots have no opinion about. This is the histogram's HistSide, and
+// it is the same list for the same reason.
+struct ProjSide {
+    const App::ProjState* S;
+    std::string name;                 // "A", "B", "C", ... - the POSITION
+    std::string label;                // the stack this side is looking at
+    bool stale = false;
+    ImU32 ink = 0;
+};
 
 static void drawPanelProjection() {
     g_projSideProbe.clear();
@@ -44,10 +57,37 @@ static void drawPanelProjection() {
     const App::ProjState& PB = app.proj[1];
     const bool bStale = Bim && (PB.uid != Bim->uid || g_abFollowDiverged);
     const std::string bLabel = Bim ? abDocLabel(Bim) : std::string();
+    // ---- the sides, once. Order is slot order (A, B, C...) and nothing below
+    // re-sorts it: arming a letter must not move the panes already on screen.
+    // A lagging side may lag as long as it is VISIBLY not current (ruling A4),
+    // so `stale` is the whole of that - the follow diverged, the cache is a
+    // different document, or the step throttle is holding the recompute back -
+    // and it drives the band, the legend and the table's dimming alike.
+    std::vector<ProjSide> sides;
+    sides.push_back({ &P, "A", abDocLabel(im), false, slotInk(0) });
+    if (Bim) sides.push_back({ &PB, "B", bLabel,
+                               bStale || (abStepBusy() && app.proj[1].uid != 0),
+                               slotInk(1) });
+    for (const ResolvedSlot& rs : xslots)
+        if (rs.idx < app.projExtra.size())
+            sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx), abDocLabel(rs.doc),
+                              slotFollowDiverged(rs.idx) || abStepBusy(),
+                              slotInk(rs.idx + 2) });
+    const size_t nSides = sides.size();
     ImGui::SameLine();
-    if (Bim) ImGui::TextDisabled("A %dx%d  B %dx%d  (%s)", P.rw, P.rh, PB.rw, PB.rh,
-                                 P.roiUsed ? "ROI" : "whole image");
-    else     ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image", P.rw, P.rh);
+    {   // the sampled region of EVERY side, not of A and B: "A 512x512 B 512x512"
+        // was the two-image spelling, and a third slot of another size was the
+        // one thing this line existed to make visible.
+        std::string dims;
+        for (const ProjSide& sd : sides) {
+            if (!dims.empty()) dims += "  ";
+            dims += sd.name + " " + std::to_string(sd.S->rw) + "x" + std::to_string(sd.S->rh);
+        }
+        if (nSides > 1) ImGui::TextDisabled("%s  (%s)", dims.c_str(),
+                                            P.roiUsed ? "ROI" : "whole image");
+        else            ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image",
+                                            P.rw, P.rh);
+    }
 
     // value axis: a rescaling y axis makes profiles impossible to compare
     const char* ymodes[3] = { "auto", "display range", "fixed" };
@@ -71,12 +111,14 @@ static void drawPanelProjection() {
     float yLo, yHi;
     if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
     else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
-    else {                                   // shared across H, V - and A and B
-        yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax);
-        if (Bim) {
-            yLo = std::min(yLo, std::min(PB.hMin, PB.vMin));
-            yHi = std::max(yHi, std::max(PB.hMax, PB.vMax));
+    else {                       // shared across H, V - and across EVERY side,
+                                 // so no pane and no curve is rescaled to fit
+        yLo = FLT_MAX; yHi = -FLT_MAX;
+        for (const ProjSide& sd : sides) {
+            yLo = std::min(yLo, std::min(sd.S->hMin, sd.S->vMin));
+            yHi = std::max(yHi, std::max(sd.S->hMax, sd.S->vMax));
         }
+        if (!(yLo < yHi)) { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }
     }
     if (app.projYMode == 2) {
         ImGui::SameLine();
@@ -102,18 +144,106 @@ static void drawPanelProjection() {
     int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
     if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
 
-    // Overlay is only honest when the two profiles are the SAME axis: same
-    // length and same origin. Different lengths cannot be aligned without
-    // knowing the physical mapping between the two captures, and stretching one
-    // to fit the other would invent a correspondence that does not exist. So:
-    // fall back to side by side and say why.
-    const bool canOverlay = !Bim || abProjOverlayable(P, PB);
+    // ---- plane selector, and it is the HISTOGRAM'S (ruling 2 on #60,
+    // 2026-08-14: 「ヒストグラムと共有」). Narrowing to one plane is a statement
+    // about what is being compared, not about which panel is being read - two
+    // panels quietly holding two different planes would put one comparison on
+    // screen twice with two different subjects. It is also what unblocked the
+    // N overlay below: four planes times five slots times two axes is forty
+    // curves, so slots share an axis only when ONE plane is on it, and until
+    // this panel had a way to say which plane, there was no way to get there.
+    // Like the histogram's, it filters only what is DRAWN: every plane is
+    // computed either way and the table below keeps all of them.
+    app.histPlane = std::clamp(app.histPlane, -1, std::max(P.nSeries - 1, -1));
+    if (P.nSeries > 1) {
+        ImGui::SameLine();
+        const char* selName = app.histPlane < 0 ? "all" : P.seriesNames[app.histPlane];
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
+        if (ImGui::BeginCombo("plane##proj", selName)) {
+            if (ImGui::Selectable("all", app.histPlane < 0)) app.histPlane = -1;
+            for (int s = 0; s < P.nSeries; s++)
+                if (ImGui::Selectable(P.seriesNames[s], app.histPlane == s)) app.histPlane = s;
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Which plane the curves show - the SAME choice as the\n"
+                              "Statistics panel's, because it is one comparison.\n"
+                              "The profiles are computed for every plane either way;\n"
+                              "this chooses what is drawn, and one plane on the axis\n"
+                              "is what lets slots past B share it.");
+    }
+    auto drawn = [&](int s) { return app.histPlane < 0 || app.histPlane == s; };
+    int nDrawn = 0;
+    for (int s = 0; s < P.nSeries; s++) if (drawn(s)) nDrawn++;
+
+    // Overlay is only honest when the profiles are the SAME axis: same length
+    // and same origin. Different lengths cannot be aligned without knowing the
+    // physical mapping between the captures, and stretching one to fit another
+    // would invent a correspondence that does not exist. So: fall back to side
+    // by side and say why - which now holds every side, not two, so no side
+    // loses its curve to a mismatch the way it would if the odd one were simply
+    // dropped. Asked of A against EVERY side, because any one of them can be
+    // the odd size.
+    std::string mismatch;                 // the letters whose axis is not A's
+    for (size_t i = 1; i < nSides; i++)
+        if (!abProjOverlayable(P, *sides[i].S)) {
+            if (!mismatch.empty()) mismatch += ", ";
+            mismatch += sides[i].name;
+        }
+    const bool canOverlay = mismatch.empty();
     const float minSide = AB_MIN_SIDE * app.uiScale;
-    bool side = Bim && (abSideBySide() || !canOverlay);
-    // the narrow-panel fallback yields to correctness: mismatched profiles are
-    // never overlaid, however little room there is
-    bool tooNarrow = side && canOverlay && ImGui::GetContentRegionAvail().x < minSide;
+    bool side = nSides > 1 && (abSideBySide() || !canOverlay);
+    // Side by side holds ONE PANE PER SIDE at any N (ruling 1: 「splitの場合は
+    // 横並び(A, B, Cなら3つならぶ)」), equal widths, slot order. At large N the
+    // panes shrink (ruling 3) and below the minimum the panel says so and
+    // retreats to the overlay - except that the narrow fallback yields to
+    // correctness: mismatched profiles are never overlaid, however little room
+    // there is.
+    const float paneW = (ImGui::GetContentRegionAvail().x -
+                         ImGui::GetStyle().ItemSpacing.x * (float)(nSides - 1))
+                      / (float)std::max<size_t>(nSides, 1);
+    bool tooNarrow = side && canOverlay && paneW < minSide;
     if (tooNarrow) side = false;
+
+    // ---- how many sides the SHARED axis can take, by exactly the histogram's
+    // two spoken limits: one plane on the axis, and one ink per letter. Neither
+    // applies side by side, where a pane holds one side under its own name band
+    // and the plane hues mean planes again.
+    size_t nPlot;
+    const char* offWhy = nullptr;
+    if (side) {
+        nPlot = nSides;                    // one pane each: nothing is left off
+    } else if (nSides > 2 && nDrawn > 1) {
+        nPlot = Bim ? 2 : 1;               // the A|B pair the two-image modes mean
+        offWhy = "pick ONE plane above and every slot overlays on it";
+    } else if (nSides > slotInkCount()) {
+        nPlot = slotInkCount();
+        offWhy = "the palette runs out - these would repeat a colour already on "
+                 "the plot, and two slots in one ink is not a comparison";
+    } else {
+        nPlot = nSides;
+    }
+    std::string offPlot, offMsg;           // the letters that get no curve
+    for (size_t i = nPlot; i < nSides; i++) {
+        if (!offPlot.empty()) offPlot += ", ";
+        offPlot += sides[i].name;
+    }
+    if (!offPlot.empty())
+        offMsg = "slot " + offPlot + ": no curve - " + offWhy +
+                 ". Their numbers are in the table below.";
+    // Which side the image is showing this instant, drawn HEAVY so the overlay
+    // says it too (ruling 1: 「表示中のスロットが分かる状態にする(太線等)」).
+    // Only on a shared axis: a pane already wears its letter in a band.
+    // ...and only while the list really is A, B, ...: blinkSideIndex() counts
+    // in the canvas's seats, so with no measurable B its "1" would name C.
+    const int emphIdx = side || !Bim ? -1 : abEmphSide();
+    const bool emphOn = emphIdx >= 0 && (size_t)emphIdx < nPlot && nSides > 1;
+    // Once SLOTS share one axis the colour has to say which SLOT, and it says
+    // it with slotInk - the same ink the letter wears on the tiles, in the
+    // statistics rows and on the Temporal chart. A and B alone keep exactly the
+    // colours they had: A's planes in the plane hues, B lifted from the same
+    // hue so R stays R.
+    const bool bySlotInk = !side && nPlot > 2;
 
     // reserve the statistics table first: the plots must not push it off-panel
     int extraSeries = 0;
@@ -136,42 +266,65 @@ static void drawPanelProjection() {
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
                  + lineH;                                  // footnote
-    if (Bim && !canOverlay) statsH += lineH;               // the mismatch notice
+    if (!canOverlay) statsH += lineH;                      // the mismatch notice
     if (tooNarrow) statsH += abNarrowNoteH();
-    // one legend row under each overlaid plot, reserved before they are sized
+    if (!offMsg.empty())
+        statsH += ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
+                                      ImGui::GetContentRegionAvail().x).y +
+                  ImGui::GetStyle().ItemSpacing.y;
+    // One legend row under each overlaid plot, reserved before they are sized.
+    // Two sides keep the fixed A/B row; three or more fly the wrapping N-slot
+    // legend, because C/D/E push a single row off the panel - the histogram's
+    // rule, so the two panels' legends are the same object at the same N.
     const std::string aLabel = abDocLabel(im);
-    float legendH = Bim && !side ? abLegendH(aLabel, bLabel, bStale) : 0.0f;
+    std::vector<SlotLegendEntry> leg;
+    if (bySlotInk)
+        for (size_t i = 0; i < nPlot; i++)
+            leg.push_back({ abLegendText(sides[i].name.c_str(), sides[i].label) +
+                            (sides[i].stale ? std::string("  ") + AB_STALE_TOKEN
+                                            : std::string()),
+                            sides[i].ink });
+    float legendH = !leg.empty() ? slotLegendRow(leg, false)
+                  : (Bim && !side ? abLegendH(aLabel, bLabel, bStale) : 0.0f);
     float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
-    // x range: the UNION of A's and B's sample ranges, so both plots (side by
-    // side or overlaid) carry the same axis and neither is rescaled to fit.
+    // x range: the UNION of every side's sample range, so every plot (side by
+    // side or overlaid) carries the same axis and none is rescaled to fit.
     auto xRange = [&](bool horizontal, float& x0, float& x1) {
-        int o = horizontal ? P.rx : P.ry, n = horizontal ? P.rw : P.rh;
-        x0 = (float)o; x1 = (float)(o + std::max(n - 1, 1));
-        if (Bim) {
-            int ob = horizontal ? PB.rx : PB.ry, nb = horizontal ? PB.rw : PB.rh;
-            x0 = std::min(x0, (float)ob);
-            x1 = std::max(x1, (float)(ob + std::max(nb - 1, 1)));
+        x0 = FLT_MAX; x1 = -FLT_MAX;
+        for (const ProjSide& sd : sides) {
+            int o = horizontal ? sd.S->rx : sd.S->ry, n = horizontal ? sd.S->rw : sd.S->rh;
+            x0 = std::min(x0, (float)o);
+            x1 = std::max(x1, (float)(o + std::max(n - 1, 1)));
         }
     };
-    // Stroke one side's profiles. isB = this is the compare slot. tint = the
-    // two are sharing ONE plot, so B needs its own ink; drawn side by side
-    // there is nothing to tell apart within a plot, and B is stroked exactly
-    // like A so the two panels can be read against each other. bars = the
-    // min-max range of a decimated bucket - suppressed only when overlaid,
-    // where two sets of range bars on one plot is noise.
-    auto stroke = [&](const PlotRect& pr, const App::ProjState& S, bool horizontal,
-                      bool isB, bool tint, bool bars) {
+    // Stroke ONE side's profiles, named by its index in `sides` so that the
+    // colour rule, the plane filter and the emphasis all read the same list the
+    // table does. tint = A and B are sharing one plot, so B needs to separate
+    // from A; drawn in its own pane there is nothing to tell apart inside the
+    // plot and every side is stroked exactly like A, so the panes can be read
+    // against each other. bars = the min-max range of a decimated bucket -
+    // suppressed only when overlaid, where N sets of range bars is noise.
+    auto stroke = [&](const PlotRect& pr, size_t si, bool horizontal,
+                      bool tint, bool bars) {
+        const App::ProjState& S = *sides[si].S;
+        const bool isB = si > 0;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const std::vector<float>* series = horizontal ? S.h : S.v;
         int origin = horizontal ? S.rx : S.ry;
+        // the emphasised side is drawn HEAVY; everything else keeps the 1.2 px
+        // the profiles have always been stroked at
+        const float w = abCurveW(1.2f, emphOn && (int)si == emphIdx);
         for (int s = 0; s < S.nSeries; s++) {
             // colour follows A's series OF THE SAME NAME (R is always R); a
             // series only one side has gets a neutral stroke, never a plane hue
             int a = isB ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            // the plane selector filters by A's plane index, so a series only
+            // this side has is drawn only when every plane is on the axis
+            if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
             const bool mono = !cfa && P.nSeries == 1;
             ImU32 col = a < 0 ? ODD_COL
                       : (cfa ? CFA_COLS[a]
@@ -182,6 +335,11 @@ static void drawPanelProjection() {
             // the curve simply looked broken. The mono case has no hue to keep
             // (A is already near-white), so B takes the blue the legend flies.
             if (tint && a >= 0) col = mono ? AB_B_INK : abLiftInk(col, 0.45f);
+            // ...and past two sides the hue belongs to the LETTER: with one
+            // plane on the axis the plane is fixed and named on it, so nothing
+            // is lost, and the letter gains the colour it already wears
+            // everywhere else in the application.
+            if (bySlotInk) col = sides[si].ink;
             const std::vector<float>& d = series[s];
             // decimate to the plot's pixel width: 4000 samples into 400 px was
             // 4000 line segments per series per frame
@@ -190,7 +348,7 @@ static void drawPanelProjection() {
             std::vector<ImVec2> run;
             auto flush = [&]() {
                 if (run.size() >= 2)
-                    dl->AddPolyline(run.data(), (int)run.size(), col, 0, 1.2f);
+                    dl->AddPolyline(run.data(), (int)run.size(), col, 0, w);
                 run.clear();
             };
             for (int i = 0; i < (int)d.size(); i += stride) {
@@ -200,7 +358,7 @@ static void drawPanelProjection() {
                 if (lo > hi) { flush(); continue; }
                 if (bars && stride > 1) {
                     ImVec2 a2 = pr.at((float)(origin + i), lo), b2 = pr.at((float)(origin + i), hi);
-                    if (b2.y != a2.y) dl->AddLine(a2, b2, col, 1.2f);   // min-max bar
+                    if (b2.y != a2.y) dl->AddLine(a2, b2, col, w);   // min-max bar
                 }
                 run.push_back(pr.at((float)(origin + i), (lo + hi) * 0.5f));
             }
@@ -210,7 +368,8 @@ static void drawPanelProjection() {
     // "There is a spike - WHICH column is it?" The readout answers with the
     // exact index and the values under the cursor, without decimation: the
     // marker snaps to the true sample, not to the plotted min-max bucket.
-    auto hoverReadout = [&](const PlotRect& pr, bool horizontal, bool wantA, bool wantB) {
+    auto hoverReadout = [&](const PlotRect& pr, bool horizontal,
+                            const std::vector<size_t>& which) {
         if (!ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float mx = ImGui::GetMousePos().x;
@@ -218,26 +377,35 @@ static void drawPanelProjection() {
         int at = (int)(pr.xmin + t * (pr.xmax - pr.xmin) + 0.5f);
         dl->AddLine(pr.at((float)at, pr.ymin), pr.at((float)at, pr.ymax),
                     IM_COL32(230, 200, 90, 140), 1.0f);
-        char tip[512];
+        char tip[768];
         int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y", at);
-        auto one = [&](const App::ProjState& S, const char* side2, const std::string& dt) {
+        // ...for every side ON THIS PLOT, and only the plane(s) drawn: a
+        // readout that quotes a curve the plot does not carry is a value with
+        // no line to point at.
+        for (size_t si : which) {
+            const App::ProjState& S = *sides[si].S;
+            const std::string dt = abValueUnit(S.img ? S.img->dtype : im->dtype);
+            const std::string pre = nSides > 1 ? sides[si].name + " " : std::string();
             const std::vector<float>* series = horizontal ? S.h : S.v;
             int origin = horizontal ? S.rx : S.ry;
             int i = at - origin;
             for (int s2 = 0; s2 < S.nSeries; s2++) {
+                int a = si == 0 ? s2 : abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s2]);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
                 if (i < 0 || i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
                 const char* nm = S.nSeries == 1 ? "" : S.seriesNames[s2];
                 off += snprintf(tip + off, sizeof tip - off, "\n%s%s%s%.6g %s",
-                                side2, nm, *nm ? ": " : "", series[s2][i], dt.c_str());
+                                pre.c_str(), nm, *nm ? ": " : "", series[s2][i], dt.c_str());
                 dl->AddCircleFilled(pr.at((float)at, series[s2][i]), 3.0f,
                                     IM_COL32(230, 200, 90, 230));
             }
-        };
-        if (wantA) one(P, Bim ? "A " : "", abValueUnit(im->dtype));
-        if (wantB && Bim) one(PB, "B ", abValueUnit(Bim->dtype));
+        }
         ImGui::SetTooltip("%s", tip);
     };
-    auto onePlot = [&](bool horizontal, bool wantA, bool wantB) {
+    // One plot, carrying the sides in `which` - one of them in a pane, all of
+    // them on the shared axis. There is no wantA/wantB any more: two booleans
+    // were the shape that could not say "C".
+    auto onePlot = [&](bool horizontal, const std::vector<size_t>& which) {
         float x0, x1;
         xRange(horizontal, x0, x1);
         char yl[176];
@@ -258,20 +426,23 @@ static void drawPanelProjection() {
         if (!pr.ok) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->PushClipRect(pr.p0, pr.p1, true);
-        // overlaid = both on this plot: B gets its own ink and gives up the
-        // range bars. Alone in its own panel, B is stroked exactly like A.
-        const bool overlaid = wantA && wantB && Bim;
-        if (wantA) stroke(pr, P, horizontal, false, false, true);
-        if (wantB && Bim) stroke(pr, PB, horizontal, true, overlaid, !overlaid);
+        // overlaid = more than one side on this plot: they separate by ink and
+        // give up the range bars, which N times over is noise. Alone in its own
+        // pane a side is stroked exactly like A, bars and all.
+        const bool overlaid = which.size() > 1;
+        for (size_t si : which)
+            stroke(pr, si, horizontal, overlaid && si > 0 && !bySlotInk, !overlaid);
         dl->PopClipRect();
-        hoverReadout(pr, horizontal, wantA, wantB);
+        hoverReadout(pr, horizontal, which);
         // How flat is what I am looking at? Per SERIES, because the canon
         // forbids mixing CFA planes inside one statistic - four planes of a
         // mosaic have four answers and one pooled number would be the
         // inter-plane level difference wearing the profile's name. Over the
         // VISIBLE x range, and it says so: the number moves when the window
-        // does, so the window is part of the statement.
-        if (wantA) {
+        // does, so the window is part of the statement. A's, because the spread
+        // lines have no room for a letter - the table below is where every
+        // side's numbers are.
+        if (!which.empty() && which[0] == 0) {
             const std::vector<float>* srcs = horizontal ? P.h : P.v;
             const int nS = P.nSeries + (P.allRow ? 1 : 0);
             for (int k = 0; k < nS && k < 5; k++) {
@@ -281,61 +452,77 @@ static void drawPanelProjection() {
                 plotSpreadLine(sp, nm);
             }
         }
-        if (wantA && wantB && Bim) drawABLegendRow(abDocLabel(im), bLabel, bStale);
+        if (overlaid) {
+            // ...and the fixed A/B row only when B is really the second side:
+            // drawABLegendRow spells "B" into its own text, so with no
+            // measurable B it would label a slot's curve with B's name. The
+            // histogram guards the same call the same way.
+            if (!leg.empty()) slotLegendRow(leg, true);
+            else if (Bim)     drawABLegendRow(abDocLabel(im), bLabel, bStale);
+        }
     };
 
     if (!side) {
-        if (app.showProjH) onePlot(true, true, true);
-        if (app.showProjV) onePlot(false, true, true);
+        std::vector<size_t> which;
+        for (size_t i = 0; i < nPlot; i++) which.push_back(i);
+        if (app.showProjH) onePlot(true, which);
+        if (app.showProjV) onePlot(false, which);
     } else {
-        // always 50/50 and always A on the left (docs/ab-stats-plan.md 3)
-        const ImGuiStyle& st = ImGui::GetStyle();
-        float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+        // equal widths, slot order, A first (docs/ab-stats-plan.md 3 at N):
+        // arming a letter appends a pane and moves nobody
         float childH = ImGui::GetTextLineHeight() + 8 * app.uiScale
                      + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
-        ImGui::BeginChild("##projA", ImVec2(half, childH), false,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("A", abDocLabel(im));
-        if (app.showProjH) onePlot(true, true, false);
-        if (app.showProjV) onePlot(false, true, false);
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("##projB", ImVec2(half, childH), false,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        drawABBand("B", bLabel, bStale);
-        if (app.showProjH) onePlot(true, false, true);
-        if (app.showProjV) onePlot(false, false, true);
-        ImGui::EndChild();
+        for (size_t i = 0; i < nSides; i++) {
+            if (i) ImGui::SameLine();
+            ImGui::BeginChild(("##projSide" + sides[i].name).c_str(),
+                              ImVec2(paneW, childH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawABBand(sides[i].name.c_str(), sides[i].label, sides[i].stale);
+            if (app.showProjH) onePlot(true, { i });
+            if (app.showProjV) onePlot(false, { i });
+            ImGui::EndChild();
+        }
     }
-    if (Bim && !canOverlay)
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "profiles do not share an axis (A x %d..%d, y %d..%d px; "
-                           "B x %d..%d, y %d..%d px): shown side by side, never stretched",
-                           P.rx, P.rx + P.rw - 1, P.ry, P.ry + P.rh - 1,
-                           PB.rx, PB.rx + PB.rw - 1, PB.ry, PB.ry + PB.rh - 1);
+    if (!canOverlay) {
+        // WHICH letters diverge and by how much, so the reader can see whether
+        // it is the ROI clamping against a smaller frame or two unrelated
+        // captures. Every side is still drawn - in its own pane, on its own
+        // axis - because the alternative is dropping a curve for a reason the
+        // reader cannot act on.
+        std::string dims;
+        for (const ProjSide& sd : sides) {
+            if (!dims.empty()) dims += "; ";
+            dims += sd.name + " x " + std::to_string(sd.S->rx) + ".." +
+                    std::to_string(sd.S->rx + sd.S->rw - 1) + ", y " +
+                    std::to_string(sd.S->ry) + ".." +
+                    std::to_string(sd.S->ry + sd.S->rh - 1) + " px";
+        }
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(AB_AMBER,
+                           "%s: no shared axis with A (%s): shown side by side, "
+                           "never stretched", mismatch.c_str(), dims.c_str());
+        ImGui::PopTextWrapPos();
+    }
     if (tooNarrow) abNarrowNote();
-    {   // What the plots took and what they left, as the panel says it. The
-        // profile plots still draw only A and B: the lettered slots are fed
-        // (projExtra recomputes above) and the table below gives them rows,
-        // and until the N overlay lands (docs/compare-n.md §12) the plots
-        // cannot take them - which must be SAID, right here under the plots,
-        // or a slot's absence reads as the slot having been lost. Same rule,
-        // same wording shape and same amber as the histogram's off-plot note.
-        g_projSideProbe += std::string("curves=A") + (Bim ? "B" : "") + ";";
-        if (!xslots.empty()) {
-            std::string off;
-            for (const ResolvedSlot& rs : xslots) {
-                if (!off.empty()) off += ", ";
-                off += slotName(rs.idx);
-            }
-            std::string offLetters;
-            for (const ResolvedSlot& rs : xslots) offLetters += slotName(rs.idx);
-            g_projSideProbe += "said-no-curve=" + offLetters + ";";
+    {   // What the plots took and what they left, as the panel says it - the
+        // silence issue #60 caught here was slots getting table rows while the
+        // plots drew A and B and said NOTHING about the letters they left off.
+        // The plots now take every side the shared axis can carry (the N
+        // overlay, docs/compare-n-design.md D5); what a spoken limit keeps off
+        // is named right here, under the plot that does not have it, in the
+        // same wording shape and the same amber as the histogram's.
+        std::string got, off;
+        for (size_t i = 0; i < nSides; i++)
+            (i < nPlot ? got : off) += sides[i].name;
+        g_projSideProbe += "curves=" + got + ";";
+        if (!off.empty()) g_projSideProbe += "said-no-curve=" + off + ";";
+        if (emphOn) g_projSideProbe += "emph=" + sides[emphIdx].name + ";";
+        g_projSideProbe += std::string("plane=") +
+                           (app.histPlane < 0 ? "all" : P.seriesNames[app.histPlane]) + ";";
+        g_projSideProbe += std::string("layout=") + (side ? "side" : "overlay") + ";";
+        if (!offMsg.empty()) {
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                               "slot %s: no curve here yet - the profile plots draw "
-                               "only A and B. The table below has every slot's numbers.",
-                               off.c_str());
+            ImGui::TextColored(AB_AMBER, "%s", offMsg.c_str());
             ImGui::PopTextWrapPos();
         }
     }
@@ -344,32 +531,26 @@ static void drawPanelProjection() {
     ImGui::SeparatorText("profile statistics");
     // "side" exists as a column the moment there is more than one side, which
     // is B or any extra slot
-    const bool anySide = Bim || !xslots.empty();
-    // Every row of both tables comes from here, so the two layouts can never
-    // disagree about which rows exist or what order they are in. Side major
-    // keeps one capture's planes together; channel major puts R:A directly
-    // above R:B, which is what comparing ONE plane across sides wants. The
-    // pooled "all" row is always last of its group - it is not a plane, and
-    // sorting it among them would invite reading it as one.
+    const bool anySide = nSides > 1;
+    // Every row of both tables comes from the ONE side list built at the top of
+    // the panel - the same list the plots, the legend and the mismatch notice
+    // walk - so the two layouts can never disagree about which rows exist or
+    // what order they are in, and the table can never name a side the plots
+    // have no opinion about. Side major keeps one capture's planes together;
+    // channel major puts R:A directly above R:B, which is what comparing ONE
+    // plane across sides wants. The pooled "all" row is always last of its
+    // group - it is not a plane, and sorting it among them would invite
+    // reading it as one.
     // CFA interpretation is a property of an IMAGE, not of the sensor: A can be
     // set to Bayer in the Inspector while B, loaded another way, is still plain
     // 1-channel. Then A gets four rows and B gets one, and nothing on screen
     // says why - the reader concludes B has no planes rather than that B was
     // never told it is a mosaic. Say it.
-    struct SideRef { const App::ProjState* S; std::string name; bool stale; };
-    std::vector<SideRef> sides;
-    sides.push_back({ &P, "A", false });
-    // B is stale while the step throttle holds its recompute back, or when
-    // follow-frame found no partner; a slot is stale when ITS follow diverged.
-    // The user's ruling (A4): a lagging number may lag if it is VISIBLY not
-    // current - so the stale side's cells draw dimmed, not in the same ink as
-    // fresh ones.
-    if (Bim) sides.push_back({ &PB, "B",
-                               bStale || (abStepBusy() && app.proj[1].uid != 0) });
-    for (const ResolvedSlot& rs : xslots)
-        if (rs.idx < app.projExtra.size())
-            sides.push_back({ &app.projExtra[rs.idx], slotName(rs.idx),
-                              slotFollowDiverged(rs.idx) || abStepBusy() });
+    //
+    // The table takes EVERY side and every plane, whatever the plane selector
+    // is showing and whatever the plot could carry: a chart has readability
+    // limits and a column of numbers does not.
+    using SideRef = ProjSide;
     // every side the table is about to give numbers to, for the equation
     for (const SideRef& sr : sides) g_projSideProbe += "row" + sr.name + ";";
     {   // a diverged slot's rows are the last frame its stack had - say so with

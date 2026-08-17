@@ -95,12 +95,13 @@ C は frame 200 を持ち D は 150 で終わる、が普通に起きる (再撮
 
 ## 4. 数値側 — 残っている N 化
 
-~~Projection は済~~ → **表のみ済・チャートは A/B のまま** (行 = スロット、wide 表は
-行軸をスロットに空けてある)。この行の「済」が #60 の実機報告「projection が
-3個以上にならん」の正体だった — projExtra への供給と表の行は N だが、
-プロファイル曲線を描く側はスロットを一度も撫でていない (2026-08-06 棚卸し)。
-今は画面がそう**言う**ようになった (「slot C, D: no curve here yet …」、
-`g_projSideProbe` + selftest N6 が固定)。重ねる本体は §12 の I7。
+~~Projection は済~~ → ~~**表のみ済・チャートは A/B のまま**~~ →
+**表もチャートも済 (2026-08-17, I7)**。この行の最初の「済」が #60 の実機報告
+「projection が3個以上にならん」の正体だった — projExtra への供給と表の行は N
+だが、プロファイル曲線を描く側はスロットを一度も撫でていなかった (2026-08-06
+棚卸し)。まず画面がそう**言う**ようになり (`g_projSideProbe` + selftest N6)、
+2026-08-14 の裁定 (面セレクタ共有) で障害が外れて**重ねる本体が入った** —
+1面が軸に乗っていれば全席が `slotInk` で1軸に並ぶ (§11、I7)。
 Temporal はチャート済・表は A|B|Δ のまま。残り:
 
 - **キャッシュの N 化が先決。** ~~`hist[2]` / `temporal[2]`~~ → **`hist[2]` のみ**。
@@ -335,9 +336,32 @@ issue #60 の続きとして、**画像側の見せ方**が決まった。原文
 - **`compareBUid` + `cmpExtra` → `slots[0..]` の一本化** (§8-1)。
   約50箇所。挙動不変の機械的作業だが、このブランチには入っていない。
 - **グリッド / side-by-side のモード化** (§10 → 仕様は §12 I6)。
-- **Projection の N 重ね** (§12 I7)。
 - N-blink (§8-4 → 仕様は §12)、`SLOT_LETTERS` の 14 → 6 (§8-3)、
   Release all slots、`Run on slot` (§4, §5)。
+
+**済 (2026-08-17, branch `auto-follows-the-image` — #60 裁定1・2 + I7)**:
+
+2026-08-14 の裁定が I7 の着手障害を外した。仕様は
+[compare-n-design.md](compare-n-design.md) §7.1 / §7.2 / D5 にあり、ここには
+**着地の事実**だけを置く:
+
+- **Auto が N でも画像の並びに従う。** `abSideBySide()` の答えは元から
+  「split なら並べる」だった — 2で止まっていたのは Histogram / Projection の
+  side-by-side に「半分が2つ」が打ち込まれていたから。**1側1ペイン**になり、
+  Temporal が既に持っていた「ペイン幅が `AB_MIN_SIDE` を割ったら言って退く」
+  規則を両パネルが共有する。
+- **collapsed の overlay で、画像が今映している側を太線で描く**
+  (`abEmphSide()` + `abCurveW()`)。blink だけ — wipe / diff は両側が同時に
+  画面にあるので主役が存在しない。表の blink 追従 (#76) のチャート側対応物。
+- **Projection の面セレクタは `histPlane` 共有**、そして **N 重ね (I7)**:
+  1面のとき全席が `slotInk` で1軸に乗り、凡例は `slotLegendRow`、上限
+  `slotInkCount()`、はみ出しは名指し。軸不一致は panel 全体が side-by-side に
+  退く (N ペインになったので、席が曲線を失わない — I7 の「描かず」の精緻化)。
+- **selftest**: N3 が side-by-side で `curves == "ABCD"` を、N3b が狭い panel で
+  overlay への退避を、N6 が投影の `curves == "ABCDE"` を、N7 が blink の
+  `emph=` の移動を、N8 が面セレクタ共有を張る。probe に `emph=` / `plane=` /
+  `layout=` が増えた (どれも**画面が言ったこと**の記録で、px 値ではない)。
+  変更前は 14 assert が赤。
 
 **済 (2026-08-09, branch `rois-compare` — #76 の裁定)**:
 
@@ -445,9 +469,21 @@ side-by-side (`abStatsLayout`) は**別物** — 画像レイアウトの話を�
 - 着地の定義: `g_projSideProbe` の `curves=` に letter が入り、selftest N6 の
   `curves == "AB"` の固定が `"ABCDE"` に**動く** (N6 のコメントに明記済み)。
 
+**着地 (2026-08-17)**: 上のとおり入った。**1点だけ精緻化**した — 軸不一致は
+「スロットを落とす」ではなく **panel 全体が side-by-side に退く**。裁定1で
+side-by-side が N ペインになったので、退いた先で**どの席も曲線を失わない**
+(この項が「スロットは落とさない」と書いたときは side-by-side が A|B の2枚
+しか持てず、退避先が無かった)。詳細は compare-n-design.md §7.1 / D5。
+
 ### 開いている判断 — ユーザーの裁定待ち
 
-1. **統計パネルの Auto (`abStatsLayout = AbAuto`) は N で何に解決するか。**
+1. **裁定済み (2026-08-14, #60) — 実装済み (2026-08-17)。**
+   答えは「**画像の並びに従う**を N でも貫く」で、提案 (armed なら overlay)
+   とも、チャートと表で分けるとも違った: split は**並べる** (1側1ペイン)、
+   collapsed は**重ねる + 表示中の側を太線**。表と分ける必要が消えたのは、
+   split で表も N 列のままだから。仕様は compare-n-design.md §7.1。以下は
+   裁定前の記録として残す。
+   **統計パネルの Auto (`abStatsLayout = AbAuto`) は N で何に解決するか。**
    今は「画像が split なら plot も side-by-side」— つまり **2枚の答え**で、
    タイルが5枚出ている画面の隣で plot は A|B の2枚に割れる (N3 が固定して
    いる現状)。#60 の「histogram が3個以上にならん」の半分はこれ (もう半分は
@@ -458,7 +494,12 @@ side-by-side (`abStatsLayout`) は**別物** — 画像レイアウトの話を�
    「armed なら overlay」を採ると、タイルが5枚出ている画面の隣で ROI 表は
    1スロットに畳まれる — チャートには情報が増える提案が、表には減る提案になる。
    裁定するなら**チャートと表で解決先を分ける**必要があるかもしれない。
-2. **Projection の plane セレクタ**をヒストグラムの `histPlane` と**共有**
+2. **裁定済み (2026-08-14, #60) — 実装済み (2026-08-17)。共有。**
+   `histPlane` 1つを両パネルが読み、片方で変えると両方変わる (selftest N8)。
+   セッションキーが `abstats` 行に居たままである点も、この裁定のとおり据え置き
+   — 改名は terminology.md の管轄。仕様は compare-n-design.md §7.2。
+   以下は裁定前の記録として残す。
+   **Projection の plane セレクタ**をヒストグラムの `histPlane` と**共有**
    するか、パネル独立にするか。**提案**: 共有 (「1面に絞る」は比較の状態で
    あってパネルの状態ではない — 絞った面をパネルごとに変えて見るのは
    比較ではなく探索)。ただし histPlane は今セッションの `abstats` 行に

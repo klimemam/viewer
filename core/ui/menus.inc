@@ -399,22 +399,25 @@ static void drawMenuBar(GLFWwindow* win) {
                                 app.abStatsLayout == App::AbAuto))
                 app.abStatsLayout = App::AbAuto;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Side by side images (split) -> side by side plots.\n"
-                                  "Wipe / blink / difference have one image area,\n"
-                                  "so their plots overlay.");
+                ImGui::SetTooltip("The plots are arranged the way the IMAGES are, at any\n"
+                                  "number of slots. Split tiles A, B and every slot, so\n"
+                                  "there is one plot per tile. Wipe / blink / difference\n"
+                                  "have one image area, so every side goes on one plot -\n"
+                                  "and under blink the side on screen is drawn heavy.");
             // "(A solid, B dashed)" described a stroke style that no longer
             // exists - every side past A draws SOLID in its own ink, and at N
             // the parenthetical also implied a pair. Say what the mode does.
             if (ImGui::MenuItem("  Overlay (every side on one plot)", nullptr,
                                 app.abStatsLayout == App::AbOverlay))
                 app.abStatsLayout = App::AbOverlay;
-            if (ImGui::MenuItem("  Side by side (A on the left)", nullptr,
+            if (ImGui::MenuItem("  Side by side (one plot per slot, A first)", nullptr,
                                 app.abStatsLayout == App::AbSide))
                 app.abStatsLayout = App::AbSide;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Always 50/50 and always A on the left: two shapes\n"
-                                  "can only be compared on plots of equal width.\n"
-                                  "Narrow panels fall back to the overlay.");
+                ImGui::SetTooltip("One plot per side, all of equal width and always in\n"
+                                  "slot order: shapes can only be compared on plots of\n"
+                                  "equal width. More slots make each plot narrower;\n"
+                                  "below 320 px they fall back to the overlay and say so.");
             ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a
