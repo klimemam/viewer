@@ -91,6 +91,17 @@ Temporal パネルには既に**フレームごとの X 軸**がある (貼り�
 ただし**リモートでは peer に zip の中身一覧を返す動詞が要る** — プロトコル追加。
 ローカル先行、リモートは後続で良い。
 
+> **後続が来た (2026-08-17, issue #217)。** その動詞は `MSG_NPZ_SCAN` (protocol 13)
+> で、返すのは**事実だけ** — member 名・shape・descr・宣言サイズ・展開可否と、
+> 小さい member の値。分類 (`npzScan` の RImage/RAxis/RMeta/RAmbig/RBad) と
+> picker は client の 1 箇所のままで、行の文言がどちらの端から来ても変わらない
+> ことが構造で保証される。member の画素は `[key][node]` トレーラで 1 本ずつ
+> 遅延 materialise される。設計は `docs/remote-reader-design.md §10`。
+>
+> **行の展開そのもの (Browse の tree にメンバを出す) はまだ**。今日の道は
+> 「行をダブルクリック → SCAN → 同じ picker」で、1クリックのプレビューは
+> 付かない (コンテナに 1 つの幾何は無い)。
+
 ## 2.5 人が手で書ける形 — adapter 無しでどこまで言えるか
 
 viewer の容器 (`__layer_0` / `__parent_0`) は**機械のための形**で、往復が保証される

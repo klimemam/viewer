@@ -121,7 +121,7 @@ doc には**構造上あり得ない**。したがって操作の表は 2枚に�
 | | D1 CLI | D2 D&D file | D3 D&D folder | D4 Open | D5 Open Folder | D6 Browse local | D7 Browse peer | D8 session | D9 reader |
 |---|---|---|---|---|---|---|---|---|---|
 | **F1 .npy** | ○ `[T:remote]` | ○ `[C:main.cpp:359]` | ○ `[C:2339]` | ○ `[C:2369]` | ○ `[T:scan]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[T:verify V15]` | ○ `[T:verify V25m]` |
-| **F2 .npz** | ○ `[C:2311]` | ○ `[C:2311]` | **×落 G3** | ○ `[C:2369]` | **×落 G3** `[C:seq:1454]` | ○ `[C:1734]` | ×決 `[P]` `[D:npz-design:91]` | ○ `[T:verify V21]` | ○ `[C:sess:2591]` |
+| **F2 .npz** | ○ `[C:2311]` | ○ `[C:2311]` | **×落 G3** | ○ `[C:2369]` | **×落 G3** `[C:seq:1454]` | ○ `[C:1734]` | ○ SCAN → picker `[T:rnpz R14/R15]` | ○ `[T:verify V21]` | ○ `[C:sess:2591]` |
 | **F3 PNG** | ○ `[T:media]` | ○ | ○ `[T:scan S3]` | ○ `[P]` | ○ `[T:scan S3]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2/P7]` | ○ `[T:media M9]` | ○ |
 | **F4 JPEG** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[C:sess:2604]` | ○ |
 | **F5 TIFF** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[T:media M12]` | ○ |
@@ -132,7 +132,7 @@ doc には**構造上あり得ない**。したがって操作の表は 2枚に�
 | **F10 `.rggb`** | ○ `[C:cli:836]` | ○ | ○ | **×落 G8** `[C:2369]` | ○ `[C:seq:1380]` | **×落 G2** `[P]` | **×落 G1** `[P]` | ○ `[C:sess:2537]` 無試験 | ○ |
 | **F11 動画** | ×決 `[T:fmtgate F2]` | ×決 | — 束ねない `[C:seq:1383]` | ×決 `[C:2341]` | — 同上 | ×決 `[T:fmtgate F3 local]` | **×落 G7** `[P]` | — | ○ `[C:2353]` |
 | **F12 `.vsession`** | ○ `[C:2317]` | ○ `[C:2317]` | — 画像ではない | ○ `[C:2372]` | — `SEQ_EXTS` に無い | **×落 G2** `[P]` | — peer にセッションは無い | — | ○ `[C:2289]` |
-| **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ | **×落 G3** (`.npz` として) | ○ `[C:2369]` | **×落 G3** | ○ `[C:menus:669]` | ×決 `[C:imagefile:422]` | **×落 G6** `[C:sess:2591]` | ○ `[T:verify V25m]` |
+| **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ | **×落 G3** (`.npz` として) | ○ `[C:2369]` | **×落 G3** | ○ `[C:menus:669]` | ○ SCAN → `vnzBuild` `[T:rnpz R16]` | **×落 G6** `[C:sess:2591]` | ○ `[T:verify V25m]` |
 
 **D9 はこのマシンのパスにしか効かない。** `readerFor` が引かれるのは `openPath` の
 先頭 (`core/app/open_dispatch.inc:2289`) だけで、`openRemote` は
@@ -192,7 +192,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
 |---|---|---|---|---|---|---|---|
 | **F1 .npy** | ○ `[T:fmtgate P1/P2]` | ○ `[T:scan]` `[T:browse]` | ○ 常駐分のみ `[C:pt:429]` | ○ `[T:rtemporal]` | ○ `[T:rwatch]` | ○ `[T:rwatch R]` `[C:od:616]` | ○ / **×落 G4** preview |
-| **F2 .npz** | ○ ローカルの戸へ再ルート `[C:od:1734]` \| ×決 `[P]` | — 再ルート後は表B \| — | — \| — | — \| — | — \| — | — \| — | — \| — |
+| **F2 .npz** | ○ ローカルの戸へ再ルート `[C:od:1734]` \| ○ SCAN の道 `[T:rnpz]` | — 再ルート後は表B \| メンバごとに表B | — \| — | — \| — | — \| — | — \| — | — \| **×決** preview 無し `[T:fmtgate F4g]` |
 | **F3 PNG** | ○ `[T:fmtgate P1/P2]` | ○ `[T:fmtgate P7]` | ○ | ○ `[T:rtemporal-png]` | ○ `[T:rwatch R12]` | ○ `[T:rwatch]` | ○ / **×落 G4** |
 | **F4 JPEG** | ○ `[T:fmtgate P1/P2]` | ○ `[C:serve:1129]` | ○ | ○ `[C:serve:558]` 無試験 | ○ `[C:watch:51]` | ○ | ○ / **×落 G4** |
 | **F5 TIFF** | ○ `[T:fmtgate P1/P2]` | ○ 複数ページ `[T:fmtgate P2]` | ○ | ○ `[C:serve:558]` 無試験 | ○ | ○ | ○ / **×落 G4** |
@@ -676,10 +676,21 @@ META・TILE の末尾 `[u32 flags][str key][u32 node]` で materialisation の�
 試験は `--rreader-selftest` (`core/selftest/rreader.inc`, R0-R11、`--remote-exe` で
 本物の `viewer-serve` を立てる)。
 
-**残り。** stage 3 (木: series / batch)、stage 4 (memo / session 復元)、
-stage 5 (MEASURE) は未着手で、#180 は開いたままである。zoom による精細化
-(`pumpRemoteFetch`) も繋いでいない——理由は
-`docs/remote-reader-design.md` stage 2 の注記。
+**stage 3 済 (2026-08-17)。** 木がリンクを渡る。`[u32 node]` は series の
+stack を個別に指し、conditions・名前・単位がローカル実行と同値で立つ
+(`--rreader-selftest` R12)。範囲外のノードは名指しで断る (R13)。zoom による精細化
+も**この回で繋いだ**——`FrameSource::remoteKey/remoteNode` を `RFetchJob` まで
+通し、木が着地したあと `remoteTreeRefine` が node ごとに `requestFullRemote` を
+呼ぶ。
+
+**同じ回に issue #217 (remote `.npz`) が乗った。** protocol **13** /
+`MSG_NPZ_SCAN` / peer は列挙と member 単位の遅延 materialise だけ / 分類・picker・
+木は client の既存 1 経路。`.npz` は `peerServesDeclared` に入り (行が生きる)、
+`peerServes` には入らない (1クリックプレビューの門は据え置き)。試験は
+`--rnpz-selftest` (R14〜R17) と `fmtgate` **F4g** (R18)。
+
+**残り。** stage 4 (memo / session 復元)、stage 5 (MEASURE) は未着手で、#180 は
+開いたままである。
 
 ---
 
@@ -691,7 +702,7 @@ stage 5 (MEASURE) は未着手で、#180 は開いたままである。zoom に�
 | 拒否 | 記録場所 |
 |---|---|
 | ベンダ RAW は peer に渡らない | `Backend::overLink=0` + `core/imagefile.h:126-145` + `docs/input-adapters.md §3.6.4b` + issue #148 判断B。試験: `fmtgate` F3/P6 |
-| `.npz` は peer に渡らない | `core/imagefile.cpp:422` の拒否文 + `docs/npz-design.md:91,187` (「リモートでは peer に zip の中身一覧を返す動詞が要る。ローカル先行」) |
+| ~~`.npz` は peer に渡らない~~ **渡る (#217, protocol 13)** | `MSG_NPZ_SCAN` + `docs/remote-reader-design.md §10`。`docs/npz-design.md:91` が名指しした「zip の中身一覧を返す動詞」がこれ。残る拒否は「`.npz` 丸ごとを 1 配列として指した要求」だけで、文面は `core/imagefile.cpp` の `isNpz` 分岐。試験: `fmtgate` F4g / `--rnpz-selftest` |
 | 動画コンテナは読まない | `imagefile::videoRefusal` + `docs/video-support.md §1` (実測: σ_t 40 DN16 → 0.00) + issue #54 |
 | CFA TIFF は当てずに断る | `core/tiffread.cpp` + `core/imagefile.h:41-47` (規則3) + `docs/manual.md:270` |
 | container / reader メンバは per-member reload しない | `reloadUnavailable` `core/app/open_dispatch.inc:505` + `reloadSource:610`。試験: `fmtreg` F6/F8 |

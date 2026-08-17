@@ -11,90 +11,27 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
                                                  std::string& errOut, int frameIdx,
                                                  int& framesOut, int64_t& frameStrideOut,
                                                  int npyRead = 0 /*NR_NATIVE*/);
-struct NpzEntry { std::string name; size_t localOff, csize, usize; uint16_t method; };
-
-// ---- the .npy header, parsed ONCE -------------------------------------------
-// shape is the shape AS WRITTEN: a scalar is 0-D and stays 0-D here, because
-// "() versus (1,) versus (1,1)" is the whole question the .npz classifier asks.
-// esize 0 = a dtype this viewer cannot read as pixels (strings, object arrays);
-// that is a fact about the member, not an error, so the peek still succeeds and
-// the caller decides. The decoder and the classifier share this function so
-// what the picker promises and what actually opens cannot drift apart.
-struct NpyHead {
-    std::vector<int64_t> shape;
-    std::string descr;                // raw, e.g. "<u2" / "<U8" / "|O"
-    std::string code;                 // descr without the byte-order character
-    std::string dtypeName;            // "u16" ... empty when esize == 0
-    int esize = 0;
-    bool fortran = false, be = false;
-    size_t dataOff = 0;
-};
+// The zip listing and the .npy header peek live in core/npzfile.h since issue
+// #217: the PEER walks the same directory and peeks the same headers when it
+// lists a container over the link (MSG_NPZ_SCAN), and two implementations of
+// "what is in this file" is two answers to it (#71). What stays HERE is what
+// those facts MEAN - the classification below, and the documents it opens.
+using NpzEntry = nz::Entry;
+using NpyHead  = nz::Head;
 static bool npyPeekHeader(const std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
-    auto fail = [&](const char* m) { err = m; return false; };
-    if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
-        return fail("not a .npy file (bad magic)");
-    int major = buf[6];
-    size_t hlen, hoff;
-    if (major >= 2) {
-        if (buf.size() < 12) return fail("corrupt npy header");
-        uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
-    } else {
-        uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
-    }
-    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
-    // data() + hoff, never &buf[hoff]: a 10-byte v1 file declaring hlen 0 passes
-    // the check above with hoff == buf.size(), and the subscript is then one
-    // past the end - undefined, and an abort under -D_GLIBCXX_ASSERTIONS. Same
-    // defect as decodeNpyBuffer's payload pointer, one call earlier in the same
-    // path; the empty header is refused by "cannot parse descr" either way.
-    std::string hdr((const char*)buf.data() + hoff, hlen);
-    auto findQuoted = [&](const char* key) -> std::string {
-        size_t k = hdr.find(key);
-        if (k == std::string::npos) return {};
-        size_t q1 = hdr.find('\'', hdr.find(':', k));
-        if (q1 == std::string::npos) return {};
-        size_t q2 = hdr.find('\'', q1 + 1);
-        return hdr.substr(q1 + 1, q2 - q1 - 1);
-    };
-    H.descr = findQuoted("'descr'");
-    if (H.descr.empty()) return fail("cannot parse descr");
-    H.fortran = hdr.find("'fortran_order': True") != std::string::npos;
-    size_t sp = hdr.find("'shape'");
-    size_t p1 = hdr.find('(', sp), p2 = hdr.find(')', sp);
-    if (p1 == std::string::npos || p2 == std::string::npos) return fail("cannot parse shape");
-    H.shape.clear();
-    {
-        std::string s = hdr.substr(p1 + 1, p2 - p1 - 1);
-        size_t pos = 0;
-        while (pos < s.size()) {
-            size_t c = s.find(',', pos);
-            std::string tok = s.substr(pos, c == std::string::npos ? std::string::npos : c - pos);
-            if (tok.find_first_of("0123456789") != std::string::npos)
-                H.shape.push_back(std::stoll(tok));
-            if (c == std::string::npos) break;
-            pos = c + 1;
-        }
-    }
-    char bo = '<';
-    H.code = H.descr;
-    if (!H.code.empty() && (H.code[0] == '<' || H.code[0] == '>' ||
-                            H.code[0] == '|' || H.code[0] == '=')) {
-        bo = H.code[0]; H.code = H.code.substr(1);
-    }
-    H.be = (bo == '>');
-    H.esize = 0;
-    H.dtypeName.clear();
-    if      (H.code == "u1") { H.esize = 1; H.dtypeName = "u8"; }
-    else if (H.code == "i1") { H.esize = 1; H.dtypeName = "i8"; }
-    else if (H.code == "b1") { H.esize = 1; H.dtypeName = "bool"; }
-    else if (H.code == "u2") { H.esize = 2; H.dtypeName = "u16"; }
-    else if (H.code == "i2") { H.esize = 2; H.dtypeName = "i16"; }
-    else if (H.code == "u4") { H.esize = 4; H.dtypeName = "u32"; }
-    else if (H.code == "i4") { H.esize = 4; H.dtypeName = "i32"; }
-    else if (H.code == "f4") { H.esize = 4; H.dtypeName = "f32"; }
-    else if (H.code == "f8") { H.esize = 8; H.dtypeName = "f64"; }
-    H.dataOff = hoff + hlen;
-    return true;
+    return nz::peekHeader(buf, H, err);
+}
+static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out,
+                    std::string& err) {
+    return nz::list(buf, out, err);
+}
+static bool npzExtract(const std::vector<uint8_t>& zip, const NpzEntry& e,
+                       std::vector<uint8_t>& out, std::string& err) {
+    return nz::extract(zip, e, out, err);
+}
+static bool npzExtractPrefix(const std::vector<uint8_t>& zip, const NpzEntry& e,
+                             size_t want, std::vector<uint8_t>& out, std::string& err) {
+    return nz::extractPrefix(zip, e, want, out, err);
 }
 
 // "(24, 480, 640)" / "scalar" - the shape a human recognises from the script
@@ -353,127 +290,6 @@ static std::vector<int> npyReadOptions(const std::vector<int64_t>& shape) {
     return out;
 }
 
-static bool npzList(const std::vector<uint8_t>& buf, std::vector<NpzEntry>& out, std::string& err) {
-    auto rd16 = [&](size_t o) { return (uint16_t)(buf[o] | buf[o + 1] << 8); };
-    auto rd32 = [&](size_t o) {
-        return (uint32_t)buf[o] | (uint32_t)buf[o + 1] << 8 |
-               (uint32_t)buf[o + 2] << 16 | (uint32_t)buf[o + 3] << 24;
-    };
-    auto rd64 = [&](size_t o) {
-        uint64_t v = 0;
-        for (int i = 0; i < 8; i++) v |= (uint64_t)buf[o + i] << (8 * i);
-        return v;
-    };
-    if (buf.size() < 22) { err = "not a zip file"; return false; }
-    size_t eocd = SIZE_MAX;
-    size_t start = buf.size() > 65557 ? buf.size() - 65557 : 0;
-    for (size_t i = buf.size() - 22 + 1; i-- > start;)
-        if (rd32(i) == 0x06054b50) { eocd = i; break; }
-    if (eocd == SIZE_MAX) { err = "not a zip file (no end record)"; return false; }
-    uint64_t count = rd16(eocd + 10);
-    uint64_t cdOff = rd32(eocd + 16);
-    if (cdOff == 0xffffffffu || count == 0xffffu) {          // zip64
-        if (eocd >= 20 && rd32(eocd - 20) == 0x07064b50) {
-            uint64_t z64 = rd64(eocd - 20 + 8);
-            if (z64 + 56 <= buf.size() && rd32((size_t)z64) == 0x06064b50) {
-                count = rd64((size_t)z64 + 32);
-                cdOff = rd64((size_t)z64 + 48);
-            }
-        }
-    }
-    size_t p = (size_t)cdOff;
-    for (uint64_t i = 0; i < count && p + 46 <= buf.size(); i++) {
-        if (rd32(p) != 0x02014b50) break;
-        NpzEntry e{};
-        e.method = rd16(p + 10);
-        e.csize = rd32(p + 20);
-        e.usize = rd32(p + 24);
-        uint16_t nlen = rd16(p + 28), elen = rd16(p + 30), clen = rd16(p + 32);
-        e.localOff = rd32(p + 42);
-        if (p + 46 + nlen > buf.size()) break;
-        // data() + off again: a central-directory header that ends exactly at
-        // the last byte with a zero-length name satisfies both bounds above and
-        // then subscripts one past the end. Same defect as decodeNpyBuffer's.
-        e.name.assign((const char*)buf.data() + p + 46, nlen);
-        if (e.csize == 0xffffffffu || e.usize == 0xffffffffu || e.localOff == 0xffffffffu) {
-            size_t ep = p + 46 + nlen, eend = ep + elen;      // zip64 extra field
-            while (ep + 4 <= eend && ep + 4 <= buf.size()) {
-                uint16_t id = rd16(ep), sz = rd16(ep + 2);
-                if (id == 1) {
-                    size_t q = ep + 4;
-                    if (e.usize == 0xffffffffu) { e.usize = (size_t)rd64(q); q += 8; }
-                    if (e.csize == 0xffffffffu) { e.csize = (size_t)rd64(q); q += 8; }
-                    if (e.localOff == 0xffffffffu) { e.localOff = (size_t)rd64(q); }
-                    break;
-                }
-                ep += 4 + sz;
-            }
-        }
-        out.push_back(std::move(e));
-        p += 46 + nlen + elen + clen;
-    }
-    if (out.empty()) { err = "zip contains no entries"; return false; }
-    return true;
-}
-
-static bool npzExtract(const std::vector<uint8_t>& zip, const NpzEntry& e,
-                       std::vector<uint8_t>& out, std::string& err) {
-    if (e.localOff + 30 > zip.size()) { err = "corrupt local header"; return false; }
-    auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
-    size_t nlen = rd16(e.localOff + 26), elen = rd16(e.localOff + 28);
-    size_t data = e.localOff + 30 + nlen + elen;
-    if (data + e.csize > zip.size()) { err = "truncated zip member"; return false; }
-    if (e.method == 0) {                                     // stored
-        out.assign(zip.begin() + data, zip.begin() + data + e.csize);
-        return true;
-    }
-    if (e.method != 8) { err = "unsupported zip compression method"; return false; }
-    // zip members are RAW deflate (no zlib header), and the uncompressed size is
-    // known from the directory, so decompress straight into the output buffer
-    out.resize(e.usize);
-    size_t got = tinfl_decompress_mem_to_mem(out.data(), out.size(),
-                                             zip.data() + data, e.csize, 0);
-    if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) { err = "inflate failed"; return false; }
-    out.resize(got);
-    return true;
-}
-
-// Just enough bytes to read a .npy HEADER out of a member. The classifier looks
-// at ~128 bytes of each member, and inflating every member in FULL to see them
-// meant opening a multi-GB .npz decompressed the whole file on the UI thread
-// before the dialog appeared - and a session restore paid it again, per member.
-// Deflate is streamed into a fixed buffer and stopped when that buffer is full:
-// HAS_MORE_OUTPUT is the expected outcome here, not a failure.
-static bool npzExtractPrefix(const std::vector<uint8_t>& zip, const NpzEntry& e,
-                             size_t want, std::vector<uint8_t>& out, std::string& err) {
-    if (e.localOff + 30 > zip.size()) { err = "corrupt local header"; return false; }
-    auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
-    size_t nlen = rd16(e.localOff + 26), elen = rd16(e.localOff + 28);
-    size_t data = e.localOff + 30 + nlen + elen;
-    if (data + e.csize > zip.size()) { err = "truncated zip member"; return false; }
-    size_t cap = std::min(want, e.usize);
-    if (e.method == 0) {                                     // stored
-        size_t nCopy = std::min(cap, e.csize);
-        out.assign(zip.begin() + data, zip.begin() + data + nCopy);
-        return true;
-    }
-    if (e.method != 8) { err = "unsupported zip compression method"; return false; }
-    out.assign(cap, 0);
-    if (cap == 0) return true;
-    auto inf = std::make_unique<tinfl_decompressor>();   // ~11 KB: not a stack object
-    tinfl_init(inf.get());
-    size_t inBytes = e.csize, outBytes = cap;
-    tinfl_status st = tinfl_decompress(inf.get(), zip.data() + data, &inBytes,
-                                       out.data(), out.data(), &outBytes,
-                                       TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
-    if (st != TINFL_STATUS_DONE && st != TINFL_STATUS_HAS_MORE_OUTPUT) {
-        err = "inflate failed";
-        return false;
-    }
-    out.resize(outBytes);
-    return true;
-}
-
 // Load a .npy; an array with a frame axis becomes one stack (塊), which is what
 // the temporal analysis operates on.
 static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::string& errOut,
@@ -614,28 +430,25 @@ static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& 
 // whole fix: the decision "is this pixels?" is made from the header, once, and
 // a member that is not pixels can no longer become pixels by falling through
 // into the image path.
-static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
-                                      const std::vector<NpzEntry>& entries) {
+//
+// It takes FACTS (nz::Fact) rather than a zip, and that split is issue #217's
+// (docs/remote-reader-design.md §10.2). The facts can come from a file on this
+// disk or from a MSG_NPZ_SCAN reply, and the vocabulary below - RImage / RAxis
+// / RMeta / RAmbig / RBad, and every word a picker row shows - is computed from
+// them HERE, once. So a member listed by a peer and the same member listed off
+// this disk get the same role and the same sentence by construction: there is
+// no second classifier to drift (#71 / #148).
+static std::vector<NpzMember> npzClassify(const std::vector<nz::Fact>& facts) {
     std::vector<NpzMember> out;
-    for (size_t i = 0; i < entries.size(); i++) {
-        const NpzEntry& e = entries[i];
-        if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
+    for (const nz::Fact& f : facts) {
         NpzMember m;
-        m.entry = i;
-        m.name = e.name.substr(0, e.name.size() - 4);
+        m.entry = f.entry;
+        m.name = f.name;
         m.shapeText = "?";
         m.dtype = "?";
-        // Header only: an image member is never inflated here, however big it is.
-        // 64 KiB covers every .npy header (v1 caps the length at 65535 and the
-        // dict is padded to a 64-byte multiple); a v2 header longer than that
-        // falls back to a full read rather than being called corrupt.
-        std::vector<uint8_t> buf;
-        std::string err;
         NpyHead H;
-        bool got = npzExtractPrefix(zip, e, 64 * 1024, buf, err) &&
-                   npyPeekHeader(buf, H, err);
-        if (!got && buf.size() < e.usize)
-            got = npzExtract(zip, e, buf, err) && npyPeekHeader(buf, H, err);
+        std::string err = f.err;
+        const bool got = err.empty() && npyPeekHeader(f.bytes, H, err);
         if (!got) {
             m.role = NpzMember::RBad;
             m.becomes = "not opened";
@@ -649,40 +462,39 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
         // (2305843009213693952,) wraps a size_t product to 0, which then passed
         // the "fits in the buffer" guard and reached reserve() as an uncaught
         // length_error. Every dim is checked, the product is checked, and the
-        // result is checked against the bytes the ZIP DIRECTORY says are there -
-        // so a truncated member is refused in the scan and never promised.
-        size_t n = 1;
+        // result is checked against the bytes the LISTING says are there - so a
+        // truncated member is refused in the scan and never promised.
+        uint64_t n = 1;
         bool sane = true;
         for (int64_t d : H.shape) {
             if (d < 0) { sane = false; break; }
-            if (d != 0 && n > (size_t)-1 / (size_t)d) { sane = false; break; }
-            n *= (size_t)d;
+            if (d != 0 && n > UINT64_MAX / (uint64_t)d) { sane = false; break; }
+            n *= (uint64_t)d;
         }
-        size_t payload = 0;
+        uint64_t payload = 0;
         if (sane && H.esize > 0) {
-            if (n > ((size_t)-1 - H.dataOff) / (size_t)H.esize) sane = false;
-            else payload = n * (size_t)H.esize;
+            if (n > (UINT64_MAX - H.dataOff) / (uint64_t)H.esize) sane = false;
+            else payload = n * (uint64_t)H.esize;
         }
-        if (!sane || H.dataOff + payload > e.usize) {
+        if (!sane || H.dataOff + payload > f.usize) {
             m.role = NpzMember::RBad;
             m.becomes = "not an image: truncated or impossible";
             m.why = "shape " + m.shapeText + " needs more bytes than the member holds";
             out.push_back(std::move(m));
             continue;
         }
-        // values live at the far end of the member, so anything that needs them
-        // (metadata and axis candidates only - never an image) reads it in full
-        auto fullBuf = [&]() -> bool {
-            if (buf.size() >= H.dataOff + payload) return true;
-            std::string e2;
-            return npzExtract(zip, e, buf, e2);
-        };
+        // The values live at the far end of the member, and only two roles ever
+        // need them (metadata and axis candidates - never an image). Whoever
+        // produced these facts already decided that, by the ONE rule in
+        // nz::wantsValues, so this reads what is here and never reaches for
+        // more: over a link there is nothing more to reach for.
+        const bool haveVals = f.whole && f.bytes.size() >= H.dataOff + payload;
         if (H.esize == 0) {                       // strings, object arrays, ...
             m.role = NpzMember::RMeta;
             m.becomes = "metadata";
             m.why = "dtype " + H.descr + " is not pixels";
-            if (fullBuf()) {
-                m.text = npzTextValue(buf, H);
+            if (f.whole) {
+                m.text = npzTextValue(f.bytes, H);
                 // an ARRAY of strings is not its first element: say which one
                 // this is rather than passing element 0 off as the whole thing
                 if (!m.text.empty() && n > 1)
@@ -697,8 +509,7 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
             m.role = NpzMember::RMeta;
             m.becomes = "metadata";
             m.why = "a scalar is not pixels";
-            if (fullBuf() && H.dataOff + (size_t)H.esize <= buf.size())
-                m.text = fmtExact(npyElem(buf, H, 0));
+            if (haveVals) m.text = fmtExact(npyElem(f.bytes, H, 0));
             out.push_back(std::move(m));
             continue;
         }
@@ -706,14 +517,21 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
             m.role = NpzMember::RAxis;
             m.becomes = "metadata";               // upgraded to "x axis" when a
             m.why = "a 1-D array is not pixels";  // stack of the same length opens
-            // an axis has one value per frame; something with millions of them
-            // is not one, and is not worth inflating to find out
-            if (n > (1u << 24)) {
+            // An axis has one value per frame, and a served stack tops out at
+            // 2^20 frames - so a longer 1-D member cannot be one whatever else
+            // is true of it, and is not worth carrying or inflating to find
+            // out. The ceiling used to be 2^24 here and nz::INLINE_MAX_ELEMS is
+            // 2^20; docs/remote-reader-design.md §10.2 tightened it deliberately
+            // when the rule was shared, and what changes on screen is the
+            // wording of members that were called axis candidates and could
+            // never have been promoted.
+            if (n > nz::INLINE_MAX_ELEMS) {
                 m.role = NpzMember::RMeta;
                 m.why = "a 1-D array of " + std::to_string(n) + " values is not a frame axis";
-            } else if (fullBuf() && H.dataOff + payload <= buf.size()) {
-                m.vals.reserve(n);
-                for (size_t k = 0; k < n; k++) m.vals.push_back(npyElem(buf, H, k));
+            } else if (haveVals) {
+                m.vals.reserve((size_t)n);
+                for (uint64_t k = 0; k < n; k++)
+                    m.vals.push_back(npyElem(f.bytes, H, (size_t)k));
             }
             out.push_back(std::move(m));
             continue;
@@ -746,6 +564,12 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
         out.push_back(std::move(m));
     }
     return out;
+}
+
+// The local carrier: the facts come out of the zip in front of us.
+static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
+                                      const std::vector<NpzEntry>& entries) {
+    return npzClassify(nz::readFacts(zip, entries));
 }
 
 // Open ONE image-shaped member: the stack (or the frame) it makes, tagged with
@@ -884,42 +708,51 @@ struct VnzNode {
     int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
 };
 
+// How one RESERVED member's bytes are got. Two carriers since issue #217: the
+// zip in this process, and the MSG_NPZ_SCAN reply in which a peer sent every
+// reserved member verbatim (they are words, numbers and short vectors - the
+// declaration, never the pixels). The reader of the declaration is ONE, so a
+// container opened over a link and the same file opened off this disk cannot
+// build two different trees (docs/remote-reader-design.md §10.2).
+using VnzMemberFetch = std::function<bool(const std::string& name,
+                                          std::vector<uint8_t>& out, std::string& err)>;
+
 // One reserved member, by name. Everything the container says about itself is
 // small (a word, a number, a vector) except the pixels, which are handed to the
 // same decoder a plain member uses rather than being re-implemented here.
-static bool vnzRead(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+static bool vnzRead(const VnzMemberFetch& mem,
                     const std::map<std::string, size_t>& byName, const std::string& name,
                     std::vector<uint8_t>& buf, NpyHead& H, std::string& err) {
     auto it = byName.find(name);
     if (it == byName.end()) { err = "missing member " + name; return false; }
-    if (!npzExtract(zip, entries[it->second], buf, err)) return false;
+    if (!mem(name, buf, err)) return false;
     if (!npyPeekHeader(buf, H, err)) { err = name + ": " + err; return false; }
     return true;
 }
 
-static std::string vnzStr(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+static std::string vnzStr(const VnzMemberFetch& mem,
                           const std::map<std::string, size_t>& byName, const std::string& name,
                           bool full = false) {
     std::vector<uint8_t> buf; NpyHead H; std::string e;
-    if (!vnzRead(zip, entries, byName, name, buf, H, e)) return {};
+    if (!vnzRead(mem, byName, name, buf, H, e)) return {};
     return npzTextValue(buf, H, full ? 0 : 120);
 }
 
-static bool vnzNum(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+static bool vnzNum(const VnzMemberFetch& mem,
                    const std::map<std::string, size_t>& byName, const std::string& name,
                    double& out, std::string& err) {
     std::vector<uint8_t> buf; NpyHead H;
-    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (!vnzRead(mem, byName, name, buf, H, err)) return false;
     if (H.esize == 0) { err = name + " is not a number"; return false; }
     out = npyElem(buf, H, 0);
     return true;
 }
 
-static bool vnzVec(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+static bool vnzVec(const VnzMemberFetch& mem,
                    const std::map<std::string, size_t>& byName, const std::string& name,
                    std::vector<double>& out, std::vector<int64_t>& shape, std::string& err) {
     std::vector<uint8_t> buf; NpyHead H;
-    if (!vnzRead(zip, entries, byName, name, buf, H, err)) return false;
+    if (!vnzRead(mem, byName, name, buf, H, err)) return false;
     if (H.esize == 0) { err = name + " is not numeric"; return false; }
     size_t n = 1;
     for (int64_t d : H.shape) {
@@ -1207,7 +1040,7 @@ using VnzFetch = std::function<bool(int i, const VnzNode& v,
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn,
-                            const FrameSource& originStat);
+                            const FrameSource& originStat, bool peerPixels = false);
 
 // ---- the framed stream ------------------------------------------------------
 // What the harness writes with --stream: a line-based header, then the pixel
@@ -1428,10 +1261,28 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
                     meta, originStat);
 }
 
-static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
-                                 const std::vector<NpzEntry>& entries, int version,
+// A viewer container, whatever is carrying it (docs/input-adapters.md §4.11).
+//
+// `byName` says which reserved members EXIST and, for `__pixels_<i>`, gives the
+// carrier its own address for them; `mem` hands over the bytes of one; `pixels`
+// hands over one node's array as a .npy buffer. Everything else - the layer
+// vocabulary, the parent rules, the series/condition arithmetic, the set check,
+// every refusal sentence - is below, once, for both carriers. Issue #217 split
+// it this way rather than writing a remote container reader: two readers of one
+// declaration is two trees for one file (#71).
+// `nodesOut` / `nOut`, when given, hand the built tree back to the caller -
+// which the REMOTE carrier needs and the local one does not: vnzBuild records
+// docFirst / docCount per node, and that is how the full-resolution swap finds
+// which documents belong to which node (open_dispatch.inc remoteTreeRefine).
+// `peerPixels` says the same thing one level down: these pixels arrived
+// decimated over a link, so they are not the file's bytes and must not enter
+// the source registry under the file's identity tuple.
+static std::string loadViewerNpz(const VnzMemberFetch& mem,
+                                 const std::map<std::string, size_t>& byName, int version,
                                  const std::string& readerSpec, const std::string& origin,
-                                 const FrameSource& originStat) {
+                                 const FrameSource& originStat, const VnzFetch& pixels,
+                                 std::vector<VnzNode>* nodesOut = nullptr,
+                                 int* nOut = nullptr) {
     if (version > VIEWER_NPZ_VERSION) {
         char b[192];
         snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
@@ -1439,34 +1290,31 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
                  version, VIEWER_NPZ_VERSION);
         return b;
     }
-    std::map<std::string, size_t> byName;
-    for (size_t i = 0; i < entries.size(); i++) {
-        const std::string& n = entries[i].name;
-        if (n.size() > 4 && n.compare(n.size() - 4, 4, ".npy") == 0)
-            byName[n.substr(0, n.size() - 4)] = i;
-    }
     std::string err;
     double nd = 0;
-    if (!vnzNum(zip, entries, byName, "__n", nd, err))
+    if (!vnzNum(mem, byName, "__n", nd, err))
         return "not a usable container: " + err + " (a container declares __n, the node count)";
     int n = (int)nd;
     if (n <= 0 || n > 100000) return "__n is " + std::to_string(n) + ": not a node count";
 
-    std::vector<VnzNode> nodes((size_t)n);
+    std::vector<VnzNode> ownNodes;
+    std::vector<VnzNode>& nodes = nodesOut ? *nodesOut : ownNodes;
+    nodes.assign((size_t)n, VnzNode{});
+    if (nOut) *nOut = n;
     for (int i = 0; i < n; i++) {
         VnzNode& nd2 = nodes[(size_t)i];
         std::string si = std::to_string(i);
         if (byName.find("__layer_" + si) == byName.end())
             return "__layer_" + si + " is missing: every node declares its layer "
                    "(frame / stack / series / batch / analysisset)";
-        nd2.layer = vnzStr(zip, entries, byName, "__layer_" + si);
+        nd2.layer = vnzStr(mem, byName, "__layer_" + si);
         if (nd2.layer != "frame" && nd2.layer != "stack" && nd2.layer != "series" &&
             nd2.layer != "batch" && nd2.layer != "analysisset")
             return "__layer_" + si + " is \"" + nd2.layer + "\": not a layer "
                    "(frame / stack / series / batch / analysisset)";
         double pv = -1;
         if (byName.count("__parent_" + si)) {
-            if (!vnzNum(zip, entries, byName, "__parent_" + si, pv, err)) return err;
+            if (!vnzNum(mem, byName, "__parent_" + si, pv, err)) return err;
         } else if (i != 0) {
             return "__parent_" + si + " is missing: a node that is not the root names its parent";
         }
@@ -1476,35 +1324,33 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         if (i != 0 && (nd2.parent < 0 || nd2.parent >= i))
             return "__parent_" + si + " is " + std::to_string(nd2.parent) +
                    ": a parent must be an earlier node (depth first, root 0)";
-        nd2.name = vnzStr(zip, entries, byName, "__name_" + si);
-        nd2.note = vnzStr(zip, entries, byName, "__note_" + si);
-        nd2.cfa  = vnzStr(zip, entries, byName, "__cfa_" + si);
+        nd2.name = vnzStr(mem, byName, "__name_" + si);
+        nd2.note = vnzStr(mem, byName, "__note_" + si);
+        nd2.cfa  = vnzStr(mem, byName, "__cfa_" + si);
         // the set members (ras §4). refs come back WHOLE (full=true): the JSON
         // is machine-read and a display cap would truncate a path mid-escape.
         if (byName.count("__role_" + si))
-            nd2.role = vnzStr(zip, entries, byName, "__role_" + si);
+            nd2.role = vnzStr(mem, byName, "__role_" + si);
         if (byName.count("__refs_" + si))
-            nd2.refsJson = vnzStr(zip, entries, byName, "__refs_" + si, true);
+            nd2.refsJson = vnzStr(mem, byName, "__refs_" + si, true);
         auto px = byName.find("__pixels_" + si);
         if (px != byName.end()) { nd2.hasPixels = true; nd2.pixelEntry = px->second; }
         if ((nd2.layer == "frame" || nd2.layer == "stack") && !nd2.hasPixels)
             return "__pixels_" + si + " is missing: a " + nd2.layer + " is pixels";
         if (byName.count("__range_" + si) &&
-            !vnzVec(zip, entries, byName, "__range_" + si, nd2.range, nd2.rangeShape, err))
+            !vnzVec(mem, byName, "__range_" + si, nd2.range, nd2.rangeShape, err))
             return err;
         for (int f = 0; f < 2; f++) {
             const char* field = f == 0 ? "timestamps" : "conditions";
             std::string base = std::string("__") + field + "_values_" + si;
             if (!byName.count(base)) continue;
             std::vector<double> vals; std::vector<int64_t> shp;
-            if (!vnzVec(zip, entries, byName, base, vals, shp, err)) return err;
+            if (!vnzVec(mem, byName, base, vals, shp, err)) return err;
             if (shp.size() != 1)
                 return base + " is not a 1-D vector: one value per " +
                        (f == 0 ? "frame" : "stack");
-            std::string nm = vnzStr(zip, entries, byName,
-                                    std::string("__") + field + "_name_" + si);
-            std::string un = vnzStr(zip, entries, byName,
-                                    std::string("__") + field + "_unit_" + si);
+            std::string nm = vnzStr(mem, byName, std::string("__") + field + "_name_" + si);
+            std::string un = vnzStr(mem, byName, std::string("__") + field + "_unit_" + si);
             if (f == 0) { nd2.tsVals = std::move(vals); nd2.tsName = nm; nd2.tsUnit = un; nd2.hasTs = true; }
             else        { nd2.condVals = std::move(vals); nd2.condName = nm; nd2.condUnit = un; nd2.hasCond = true; }
         }
@@ -1548,18 +1394,17 @@ static std::string loadViewerNpz(const std::vector<uint8_t>& zip,
         if (!serr.empty()) return serr;
     }
 
-    // __meta_* lives in the zip, so it is read here where the zip is.
+    // __meta_* is a reserved member like any other, so it comes through the
+    // same carrier rather than out of a zip this function can no longer see.
     std::vector<std::pair<std::string, std::string>> meta;
     for (const auto& kv : byName) {
         if (kv.first.compare(0, 7, "__meta_") != 0) continue;
         std::vector<uint8_t> b; NpyHead H; std::string e;
-        if (!vnzRead(zip, entries, byName, kv.first, b, H, e)) continue;
+        if (!vnzRead(mem, byName, kv.first, b, H, e)) continue;
         meta.emplace_back(kv.first.substr(7), npzTextValue(b, H));
     }
-    return vnzBuild(nodes, n, origin, readerSpec,
-                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
-                        std::string& e) { return npzExtract(zip, entries[v.pixelEntry], out, e); },
-                    meta, originStat);
+    return vnzBuild(nodes, n, origin, readerSpec, pixels, meta, originStat,
+                    nodesOut != nullptr);
 }
 
 // ---- Ref resolution (docs/reader-analysisset.md §2.2) ------------------------
@@ -1909,7 +1754,7 @@ static std::string vnzBuildSets(std::vector<VnzNode>& nodes, int n, int batchId,
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn,
-                            const FrameSource& originStat) {
+                            const FrameSource& originStat, bool peerPixels) {
     int prevBatch = app.loadBatchId;
     std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
                                 ? nodes[0].name : baseName(origin);
@@ -2008,7 +1853,16 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
             // key; until a reader's spec is too, its output stays out. Being
             // out costs a re-decode on the second open; being in would cost the
             // wrong numbers, silently.
-            if (readerSpec.empty()) shareOrRegisterSource(*d);
+            //
+            // ...and NEITHER does a container whose pixels came over a LINK
+            // (issue #217). The reason is the tuple again and it is the same
+            // one: what arrived is a DECIMATED view chosen for this screen, and
+            // the tuple has no field for the step - so a second open at another
+            // zoom would adopt the first one's coarser samples and show them as
+            // the file's. The full-resolution swap replaces these pixels in
+            // place (remoteTreeRefine -> requestFullRemote), which is a
+            // mutation a registered source must never take.
+            if (readerSpec.empty() && !peerPixels) shareOrRegisterSource(*d);
         }
         // range: (2,) for the whole node, (F,2) one per frame (§4.3.3)
         if (v.rangeShape.size() == 1 && v.range.size() == 2) {
@@ -2160,7 +2014,23 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
                     d->src->member.compare(0, 9, "__pixels_") == 0)
                     return {};
         }
-        return loadViewerNpz(zip, entries, vver, readerSpec, src, zipStat);
+        std::map<std::string, size_t> byName;
+        for (size_t i = 0; i < entries.size(); i++) {
+            const std::string& nm = entries[i].name;
+            if (nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".npy") == 0)
+                byName[nm.substr(0, nm.size() - 4)] = i;
+        }
+        auto mem = [&](const std::string& nm, std::vector<uint8_t>& out,
+                       std::string& e) -> bool {
+            auto it = byName.find(nm);
+            if (it == byName.end()) { e = "missing member " + nm; return false; }
+            return npzExtract(zip, entries[it->second], out, e);
+        };
+        auto pixels = [&](int, const VnzNode& v, std::vector<uint8_t>& out,
+                          std::string& e) {
+            return npzExtract(zip, entries[v.pixelEntry], out, e);
+        };
+        return loadViewerNpz(mem, byName, vver, readerSpec, src, zipStat, pixels);
     }
     std::vector<NpzMember> mem = npzScan(zip, entries);
     if (mem.empty()) return "no arrays in npz";

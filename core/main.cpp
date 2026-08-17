@@ -1079,6 +1079,7 @@ int main(int argc, char** argv) {
     // because "the reader ran in the PEER's python" cannot be told from "it ran
     // in mine" by a client talking to itself - and that IS the claim.
     #include "selftest/rreader.inc"
+    #include "selftest/rnpz.inc"
 
     #include "selftest/media.inc"
 

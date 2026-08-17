@@ -147,6 +147,17 @@ struct FrameSource {
     // session was later pointed at a different host. Below rp::VERSION it is
     // what the "read as" line says INSTEAD of a menu (issue #124).
     int remoteProto = 0;
+    // ONE ARRAY INSIDE SOMETHING THE PEER MATERIALISED (protocol 12/13,
+    // remote::KeyedRef). Empty key = the url names a file on the peer's disk,
+    // which is every remote document that came before issue #180. When it is
+    // set, META and TILE address the key and the node instead of the path - so
+    // the full-resolution swap and the sibling frames of a stack have to carry
+    // it too, exactly as they carry the §3.3 reading, or the refinement of a
+    // .npz member would silently fetch the whole container as one array.
+    std::string remoteKey;
+    int remoteNode = 0;
+    int remoteKeyKind = 0;            // remote::KeyedRef::Kind - which protocol
+                                      // number an old peer is refused from
     std::string remoteErr;            // background fetch failed; preview is all we have
     // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
     int rawDtype = -1, rawInterp = 0, rawOffset = 0;
@@ -1758,6 +1769,14 @@ struct App {
         int npyRead = 0;              // rp::NpyRead
         int remoteProto = 0;
         std::vector<int64_t> npyShape;
+        // ...and WHICH ARRAY, when the url does not name one on its own: a
+        // member of a container the peer listed, or a node of what a reader
+        // produced there (FrameSource::remoteKey). A job that dropped these
+        // would fetch the whole .npz as one array and get a refusal, or - for a
+        // reader - the origin's own pixels under the reader's label, which is
+        // the failure protocol 12's version gate exists to prevent.
+        std::string key, member;
+        int node = 0, keyKind = 0;
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -1775,6 +1794,8 @@ struct App {
         int npyRead = 0;              // the reading it was fetched under, back
         int remoteProto = 0;          // from the job: a minted sibling records
         std::vector<int64_t> npyShape;// the same three facts its head does
+        std::string key, member;      // ...and which array of a materialisation
+        int node = 0, keyKind = 0;    // it is, for the same reason (see RFetchJob)
         // ...and what float32 cost THESE samples, measured on the worker where
         // the peer's exact bytes still existed. It cannot be recomputed on the
         // UI thread - by then the only copy is the float one.

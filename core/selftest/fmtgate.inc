@@ -468,6 +468,45 @@
             check(!generic, "F4d ...instead of the generic list it used to fall to");
         }
 
+        // ---- F4g: a CONTAINER on a peer (issue #217, R18) --------------------
+        // The user's report was ".npz is still greyed out on a peer", and the
+        // sentence behind the grey said the peer serves "one array per file,
+        // not a container". That was true, and it stopped being true the day
+        // MSG_NPZ_SCAN shipped - a refusal that denies a door which exists is
+        // verify-matrix G11 all over again, which is why the wording is
+        // asserted here rather than left to whoever reads it next.
+        //
+        // The two halves go together exactly as F4d's do, and for the same
+        // reason: the ROW is openable (peerServesDeclared) and the ONE-CLICK
+        // PREVIEW is not (peerServes). A preview is a decimated tile of one
+        // geometry; a container has members instead of a geometry, so widening
+        // the preview gate would make a row promise a picture that cannot be
+        // made. Neither half can be changed without the other failing.
+        {
+            const std::string nm = "capture.npz";
+            const bool rowLive = rbRowOpenable("trc2", nm);
+            const bool previewGate = peerServesName(nm);      // must stay false
+            const bool declared = imagefile::peerServesDeclared(nm);
+            const std::string why = peerRefusalFor(nm);
+            const bool saysMembers = has(why, "member list") && has(why, "container");
+            const bool saysOld = has(why, "one array per file");
+            const bool localIntact = has(viewerRefusalFor(nm), "reader") ||
+                                     viewerReadsName(nm);
+            fprintf(stderr, "fmtgateselftest:   F4g .npz on a peer: row=%d preview=%d "
+                            "declared=%d\n"
+                            "fmtgateselftest:   F4g reason: \"%s\"\n",
+                    rowLive ? 1 : 0, previewGate ? 1 : 0, declared ? 1 : 0, why.c_str());
+            check(rowLive && declared,
+                  "F4g a .npz row is OPENABLE on a peer (protocol 13)");
+            check(!previewGate,
+                  "F4g ...and the one-click preview gate was not widened with it");
+            check(saysMembers,
+                  "F4g the refusal names the member list, which is the door that exists");
+            check(!saysOld,
+                  "F4g ...and no longer claims the peer serves one array per file");
+            check(localIntact, "F4g the LOCAL door for a .npz is untouched");
+        }
+
         // ---- F4d2: the fall-through says what was DECIDED about readers ------
         // verify-matrix G11 / issue #180 ruling B, stage 0 of
         // docs/remote-reader-design.md. F4d moved headerless files OFF the

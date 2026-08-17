@@ -91,6 +91,22 @@
                   "def load(path):\n"
                   "    a = np.load(path).reshape(2, 4, 3, 6)\n"
                   "    return Stack(np.ascontiguousarray(a))\n");
+        // A SERIES: two stacks under one varied condition, with a unit. Stage 3
+        // is about the TREE crossing the link, and a series is the smallest
+        // thing that has one - a batch, a series node carrying the conditions,
+        // and two stacks under it, each addressed by its own node number.
+        const std::string rdSeries = root + "/sweep.py";
+        writeText(rdSeries,
+                  "import numpy as np\n"
+                  "from viewer_import import Series, Stack, Values\n"
+                  "VERSION = 1\n"
+                  "def load(path):\n"
+                  "    a = np.load(path).reshape(3, 8, 6)\n"
+                  "    s0 = Stack(np.ascontiguousarray(a[:2]), name='e2')\n"
+                  "    s1 = Stack(np.ascontiguousarray(a[1:]), name='e8')\n"
+                  "    return Series([s0, s1],\n"
+                  "                  conditions=Values([2.0, 8.0], name='exposure',\n"
+                  "                                    unit='ms'))\n");
         const std::string rdSet = root + "/withset.py";
         writeText(rdSet,
                   "import numpy as np\n"
@@ -243,7 +259,7 @@
             check(!sent && err == rp::readerTooOldText(11, origin),
                   "R3b a reader on a v11 peer is refused by the CLIENT, from the number");
             // ...and the trailer never goes either, for the sharper reason.
-            remote::ReaderRef ref{ "0123456789abcdef", 0 };
+            remote::KeyedRef ref{ "0123456789abcdef", 0 };
             remote::Meta m;
             std::string merr;
             check(!old.meta(origin, m, merr, 0, nullptr, &ref) &&
@@ -316,7 +332,7 @@
             }
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
-            remote::ReaderRef ref{ key, 0 };
+            remote::KeyedRef ref{ key, 0 };
             remote::Meta m;
             std::string perr;
             const bool got = ses.meta(url, m, perr, 0, nullptr, &ref);
@@ -328,7 +344,7 @@
             check(!lerr.empty() && has(lerr, rp::npyNotNativeText({ 2, 2, 3, 4, 5 })),
                   "R7f ...and the local door refuses the same bytes with the same sentence");
             // A key that names nothing is a refusal too, and not a crash.
-            remote::ReaderRef gone{ "0000000000000000", 0 };
+            remote::KeyedRef gone{ "0000000000000000", 0 };
             std::string gerr;
             check(!ses.meta(url, m, gerr, 0, nullptr, &gone) && has(gerr, "reader key"),
                   "R7g a key the peer has never issued is refused by name");
@@ -381,6 +397,82 @@
             check(sameDtype && !app.images.empty() &&
                       app.images[remoteFirst]->src->dtype == "u16",
                   "R9 ...and the dtype reads the same on both sides (u16, from a numpy u2)");
+        }
+
+        {   // ---- stage 3: the TREE crosses the link ---------------------------
+            //
+            // Stage 2 opened a single-rooted stack, and the node number in the
+            // trailer was always 0 by construction. A series has four nodes and
+            // two of them carry pixels, so this is the first time [key][node]
+            // addresses anything: node 2 and node 3 are DIFFERENT arrays inside
+            // one materialisation, and the peer has to answer for each.
+            //
+            // What is asserted is the same thing R16 asserts for a native .npz
+            // container, and that is the point of asserting it twice: the
+            // declaration travels verbatim and ONE builder on this side turns
+            // it into documents, so a reader's tree and a container's tree
+            // cannot come out differently.
+            const std::string spec = rdSeries + ":load";
+            closeAll();
+            const size_t rFirst = app.images.size();
+            const std::string rerr = openRemoteWithReader(url, spec);
+            const size_t rDocs = app.images.size() - rFirst;
+            std::vector<double> rVals;
+            std::string rUnit, rParam;
+            if (!app.series.empty()) {
+                for (const auto& mm : app.series.back().members) rVals.push_back(mm.value);
+                rUnit = app.series.back().unit;
+                rParam = app.series.back().paramName;
+            }
+            check(rerr.empty() && rDocs == 4,
+                  "R12a a series reader opens over the link, both stacks of it");
+            closeAll();
+            const size_t lFirst = app.images.size();
+            const std::string lerr = openWithReader(origin, spec, false);
+            const size_t lDocs = app.images.size() - lFirst;
+            std::vector<double> lVals;
+            std::string lUnit, lParam;
+            if (!app.series.empty()) {
+                for (const auto& mm : app.series.back().members) lVals.push_back(mm.value);
+                lUnit = app.series.back().unit;
+                lParam = app.series.back().paramName;
+            }
+            fprintf(stderr, "rreaderselftest:   R12 remote %zu doc(s) unit=\"%s\"; "
+                            "local %zu doc(s) unit=\"%s\"\n",
+                    rDocs, rUnit.c_str(), lDocs, lUnit.c_str());
+            check(lerr.empty() && lDocs == rDocs,
+                  "R12b ...into the same number of documents the local run makes");
+            check(rVals == lVals && rVals.size() == 2,
+                  "R12c the series conditions are the same values on both sides");
+            check(rUnit == lUnit && rUnit == "ms" && rParam == lParam && rParam == "exposure",
+                  "R12d ...and so are the condition's name and unit");
+            closeAll();
+
+            // ---- R13: a node number that names nothing ----------------------
+            // The address space is the peer's and it says so by name rather
+            // than clamping onto some other node's pixels - which is the same
+            // call peerStackGet makes for a frame past the end (§5.1: NULL is
+            // the one honest failure, and a clamp answers a question about
+            // frame 9 with frame 2).
+            remote::Session ses;
+            if (!openSession(ses, true)) return 1;
+            remote::ReaderRun run;
+            std::string err;
+            std::string sf[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdSeries, sf[0]), "R13a (setup) the series reader is readable");
+            const bool sent = ses.readerRun(origin, "load", sf, run, err);
+            check(sent && run.outcome == rp::RO_OK, "R13b (setup) it ran on the peer");
+            remote::Meta m;
+            std::string good, bad;
+            remote::KeyedRef okRef{ run.key, 2, remote::KeyedRef::FromReader };
+            remote::KeyedRef offRef{ run.key, 99, remote::KeyedRef::FromReader };
+            const bool okGot = ses.meta(url, m, good, 0, nullptr, &okRef);
+            const bool offGot = ses.meta(url, m, bad, 0, nullptr, &offRef);
+            fprintf(stderr, "rreaderselftest:   R13 node 99: \"%s\"\n", bad.c_str());
+            check(okGot, "R13c node 2 of the tree is a real array");
+            check(!offGot && has(bad, "node 99") && has(bad, "no pixels"),
+                  "R13d ...and node 99 is refused BY NUMBER, never clamped onto one");
+            ses.stop();
         }
 
         {   // ---- R11: a set does not cross the link in v1 (§7) ----------------

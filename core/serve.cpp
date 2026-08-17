@@ -11,6 +11,7 @@
 #include "version.h"                 // the commit this peer was built from (provenance)
 #include "adapter.h"                 // running the reader harness here (issue #180)
 #include "vstream.h"                 // what it writes, and the tree check both ends use
+#include "npzfile.h"                 // the zip walk and the header peek both ends use
 
 #include <algorithm>
 #include <chrono>
@@ -680,14 +681,17 @@ static std::string readerCacheDir() {
 // because it is issued here and quoted back by the client (§4.2): a key that
 // could carry a path would be a second way for a client to name a file on this
 // disk, and there is no reason to build one.
-static bool readerCachePath(const std::string& key, std::string& out) {
+static bool cacheFileFor(const std::string& key, const std::string& leaf, std::string& out) {
     if (key.empty() || key.size() > 64) return false;
     for (char c : key)
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     const std::string dir = readerCacheDir();
     if (dir.empty()) return false;
-    out = (std::filesystem::u8path(dir) / (key + ".vstream")).u8string();
+    out = (std::filesystem::u8path(dir) / (key + leaf)).u8string();
     return true;
+}
+static bool readerCachePath(const std::string& key, std::string& out) {
+    return cacheFileFor(key, ".vstream", out);
 }
 
 // One node of a reader's output, laid out for readNpyRegion.
@@ -741,6 +745,163 @@ static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node
     n.ndim = 0;
     n.ok = true;
     return true;
+}
+
+// ---------------------------------------------------------------- containers
+//
+// issue #217, docs/remote-reader-design.md §10. A .npz is a zip of .npy
+// members, so the peer's job is exactly two things it can do and the client
+// cannot: LIST what is in the file, and turn ONE named member into bytes that
+// readNpyRegion can decimate. Everything else - which member is pixels, which
+// is an axis, what a picker row says, what tree a viewer container declares -
+// stays on the client, where the one implementation of it already lives.
+//
+// The materialisation is a real .npy FILE in the same cache the reader uses,
+// because that is what makes the pixel path free: a member written out is a
+// .npy, and openNpy already reads a .npy with the right strides, the right
+// fortran handling and the right byte order.
+
+// What a key was issued FOR, written beside the members it names. A key is
+// opaque and carries no path (§4.2), so the peer needs its own note of which
+// file it listed - and it has to be on DISK rather than in this process,
+// because the client fetches through more than one session: the UI thread's
+// peer answers the open and the prefetch worker's peer, a different process
+// entirely, answers the full-resolution swap. A key that only one of them could
+// resolve would make refinement fail on exactly the frames it exists for.
+struct NpzSrc {
+    std::string path;
+    uint64_t mtime = 0, fsize = 0;
+};
+static bool npzSrcWrite(const std::string& key, const NpzSrc& s) {
+    std::string p;
+    if (!cacheFileFor(key, ".npzsrc", p)) return false;
+    std::ofstream f(std::filesystem::u8path(p), std::ios::binary);
+    if (!f) return false;
+    f << s.mtime << "\n" << s.fsize << "\n" << s.path << "\n";
+    return (bool)f;
+}
+static bool npzSrcRead(const std::string& key, NpzSrc& s) {
+    std::string p;
+    if (!cacheFileFor(key, ".npzsrc", p)) return false;
+    std::ifstream f(std::filesystem::u8path(p), std::ios::binary);
+    if (!f) return false;
+    std::string a, b;
+    if (!std::getline(f, a) || !std::getline(f, b) || !std::getline(f, s.path)) return false;
+    s.mtime = strtoull(a.c_str(), nullptr, 10);
+    s.fsize = strtoull(b.c_str(), nullptr, 10);
+    return !s.path.empty();
+}
+
+// The peer's own stat, which is the only one that means anything: a client's
+// stat of a NAS mounted twice makes identity a lie (§5.3, and §10.6 keeps it).
+static void statPeerFile(const std::string& path, uint64_t& mtime, uint64_t& fsize) {
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::u8path(path);
+    auto t = std::filesystem::last_write_time(p, ec);
+    mtime = ec ? 0 : (uint64_t)t.time_since_epoch().count();
+    ec.clear();
+    auto s = std::filesystem::file_size(p, ec);
+    fsize = ec ? 0 : (uint64_t)s;
+}
+
+// Whole-file read, with the ceiling openPicture already applies for the reason
+// it applies it: a peer that OOMs takes the session down for everyone using it.
+// A .npz is read whole here exactly as the local door reads it whole - the zip
+// directory is at the END, so there is no streaming form of this - and the cost
+// is paid ONCE per member because the member is then a cache file.
+static bool readWholeInto(const std::string& path, std::vector<uint8_t>& out, std::string& err) {
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    if (!in) { err = "cannot open " + path; return false; }
+    in.seekg(0, std::ios::end);
+    const std::streamoff sz = in.tellg();
+    if (sz < 0) { err = "cannot read " + path; return false; }
+    if ((uint64_t)sz > (2ull << 30)) { err = "file is too large to open (> 2 GiB)"; return false; }
+    out.resize((size_t)sz);
+    in.seekg(0);
+    in.read((char*)out.data(), sz);
+    if (in.gcount() != sz) { err = "short read on " + path; return false; }
+    return true;
+}
+
+// ONE member of a listed .npz, as a ServedFile. Lazy and per member (§10.6):
+// the first request for (key, node) inflates that one array and nothing else,
+// so opening one member of a forty-member file costs one inflate.
+static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
+                          std::string& err) {
+    NpzSrc src;
+    if (!npzSrcRead(key, src)) {
+        err = "this peer has not listed a container under that key - reopen the "
+              "file to rescan it";
+        return false;
+    }
+    std::string memberPath;
+    if (!cacheFileFor(key, "-" + std::to_string(node) + ".npy", memberPath)) {
+        err = "that is not a container key";
+        return false;
+    }
+    std::error_code ec;
+    // Already materialised: those bytes ARE the ones the key was issued for, so
+    // they are served without touching the container again. Identity is bound
+    // at materialisation, which is the local door's rule (a .npz is read whole
+    // and the members opened from that copy) reached one member at a time.
+    if (!std::filesystem::exists(std::filesystem::u8path(memberPath), ec))
+    {
+        // identity BEFORE the bytes, over a link (§10.6). Locally the whole zip
+        // is in hand before a member is decoded, so an overwrite cannot land
+        // between the two; here the read happens later than the listing did, so
+        // the tuple is checked again and a change is REFUSED rather than
+        // silently re-bound to whatever is on the disk now.
+        uint64_t mtime = 0, fsize = 0;
+        statPeerFile(src.path, mtime, fsize);
+        if (mtime != src.mtime || fsize != src.fsize) {
+            err = "the file changed on the peer since its members were listed - "
+                  "reopen to rescan";
+            return false;
+        }
+        std::vector<uint8_t> zip;
+        if (!readWholeInto(src.path, zip, err)) return false;
+        std::vector<nz::Entry> entries;
+        if (!nz::list(zip, entries, err)) return false;
+        if (node >= entries.size()) {
+            err = "member " + std::to_string(node) + " is past the end of this "
+                  "container (" + std::to_string(entries.size()) + " member(s))";
+            return false;
+        }
+        std::vector<uint8_t> member;
+        if (!nz::extract(zip, entries[node], member, err)) return false;
+        // Written through a temporary and renamed: two sessions may materialise
+        // the same member at the same moment, and a reader that met a half
+        // written file would refuse a member that is perfectly good. The bytes
+        // are identical either way - the key covers the path and the stat - so
+        // the loser of the race simply overwrites with the same content.
+        const std::string tmp = memberPath + ".part" +
+                                std::to_string((unsigned long long)(uintptr_t)&n);
+        {
+            std::ofstream f(std::filesystem::u8path(tmp), std::ios::binary);
+            if (!f) { err = "cannot write into this peer's cache"; return false; }
+            f.write((const char*)member.data(), (std::streamsize)member.size());
+            if (!f) { err = "cannot write into this peer's cache"; return false; }
+        }
+        std::filesystem::rename(std::filesystem::u8path(tmp),
+                                std::filesystem::u8path(memberPath), ec);
+        if (ec) {
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            err = "cannot place the member in this peer's cache";
+            return false;
+        }
+    }
+    // From here it is an ordinary .npy, which is the point of materialising:
+    // the axis rule, the ceiling, both refusal sentences, the fortran strides
+    // and the endian normalisation are the ones every other .npy gets.
+    return openNpy(n, memberPath, err, NR_NATIVE);
+}
+
+// Which family a key belongs to. The wire does not say (§10.5: a key names a
+// materialisation and the trailer does not care what produced it), so the peer
+// resolves it from its own cache - the note it wrote when it issued the key.
+static bool keyIsNpz(const std::string& key) {
+    NpzSrc s;
+    return npzSrcRead(key, s);
 }
 
 static bool openServed(ServedFile& n, const std::string& path, std::string& err,
@@ -1421,9 +1582,9 @@ static bool getRead(Buf& in, int& read, std::string& err) {
 struct ReqTrailers {
     bool haveRw = false;
     RawWire rw{};
-    bool haveReader = false;
-    std::string key;
-    uint32_t node = 0;
+    bool haveKey = false;             // [str key][u32 node]: one array inside
+    std::string key;                  // something this peer materialised - a
+    uint32_t node = 0;                // reader's output, or a listed .npz
 };
 static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
     t = ReqTrailers{};
@@ -1437,7 +1598,7 @@ static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
     }
     uint32_t flags = 0;
     if (!in.getU32(flags)) return true;                    // nothing at all
-    if (flags & ~(uint32_t)(RQ_RAW_RECIPE | RQ_READER)) {
+    if (flags & ~(uint32_t)(RQ_RAW_RECIPE | RQ_KEYED)) {
         err = "unknown request trailer " + std::to_string(flags);
         return false;
     }
@@ -1447,30 +1608,38 @@ static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
         in.rd += sizeof t.rw;
         t.haveRw = true;
     }
-    if (flags & RQ_READER) {
+    if (flags & RQ_KEYED) {
         if (!in.getStr(t.key) || !in.getU32(t.node)) {
-            err = "truncated reader trailer";
+            err = "truncated keyed trailer";
             return false;
         }
-        t.haveReader = true;
+        t.haveKey = true;
     }
     return true;
 }
 
-// One request's subject: a path on this disk, or a node of what a reader
-// returned here. Both end as a ServedFile, which is why META and TILE below
-// each grew one line and nothing else.
+// One request's subject: a path on this disk, or one array inside something
+// this peer materialised. Both end as a ServedFile, which is why META and TILE
+// below each grew one line and nothing else.
+//
+// WHICH materialisation is asked of the cache, not of the wire (§10.5). A
+// reader's output and a listed .npz are addressed identically on purpose - the
+// trailer says "key, node" and means it - so this is the one place that has to
+// know there are two kinds, and it learns it from the note the peer wrote when
+// it issued the key.
 static bool openRequested(ServedFile& n, const std::string& path, const ReqTrailers& t,
                           int read, std::string& err) {
-    if (!t.haveReader) return openServed(n, path, err, read, t.haveRw ? &t.rw : nullptr);
+    if (!t.haveKey) return openServed(n, path, err, read, t.haveRw ? &t.rw : nullptr);
     if (t.haveRw) {
-        err = "a raw recipe does not apply to what a reader returned";
+        err = "a raw recipe does not apply to an array inside a materialisation";
         return false;
     }
     if (read != NR_NATIVE) {
-        err = "a declared .npy reading does not apply to what a reader returned";
+        err = "a declared .npy reading does not apply to an array inside a "
+              "materialisation";
         return false;
     }
+    if (keyIsNpz(t.key)) return openNpzMember(n, t.key, t.node, err);
     return openReaderCache(n, t.key, t.node, err);
 }
 
@@ -2919,8 +3088,11 @@ static void handleReaderRun(Buf& in) {
     // §5.3's key. The peer's OWN stat of the origin, because a client's stat of
     // a NAS mounted twice makes identity a lie; the reader's whole text, so
     // "the same reader" means the same bytes and not the same name; the
-    // function; and this protocol number, so a peer that changes what a key
-    // covers cannot hand back a hit computed under the old rule.
+    // function; and the version the key RULE was fixed at, so a peer that
+    // changes what a key covers cannot hand back a hit computed under the old
+    // one. That number stays 12: protocol 13 added a second family of keys
+    // (§10.6) and changed nothing about what a reader key means, and bumping it
+    // would invalidate every cache on every peer to say so.
     std::error_code ec;
     const std::filesystem::path origin = std::filesystem::u8path(peerPath);
     uint64_t oMtime = 0, oSize = 0;
@@ -3034,6 +3206,98 @@ static void handleReaderRun(Buf& in) {
     reply(RO_OK, "", r.err, prov, key, header);
 }
 
+// ---------------------------------------------------------------- npz scan
+//
+// issue #217, docs/remote-reader-design.md §10.2. What is in this container -
+// facts only. The peer classifies nothing, builds no tree and inflates no
+// pixels: it walks the zip directory, peeks each member's .npy header, and
+// carries the VALUES of the small members (a scalar, a string, a short 1-D
+// vector, and a viewer container's reserved members) because those are what a
+// picker row and a declared tree are made of and they are kilobytes.
+//
+// --serve-readers has nothing to do with this. The gate (§2) is about OTHER
+// PEOPLE'S CODE running here; what runs for a .npz is this binary, on a format
+// it already reads. A peer with the flag closed answers SCAN.
+static void handleNpzScan(Buf& in) {
+    std::string path;
+    if (!in.getStr(path)) { sendErr("bad NPZ_SCAN"); return; }
+    if (!imagefile::isNpz(path)) {
+        sendErr("this is not a .npz: " + path);
+        return;
+    }
+    uint64_t mtime = 0, fsize = 0;
+    statPeerFile(path, mtime, fsize);
+    std::vector<uint8_t> zip;
+    std::string err;
+    if (!readWholeInto(path, zip, err)) { sendErr(err); return; }
+    std::vector<nz::Entry> entries;
+    if (!nz::list(zip, entries, err)) { sendErr(err); return; }
+    const std::vector<nz::Fact> facts = nz::readFacts(zip, entries);
+    if (facts.empty()) { sendErr("no arrays in npz"); return; }
+
+    // §10.6's key. The kind word is what keeps the two families apart in one
+    // cache root: a reader key and a container key over the same origin must
+    // not collide, and they cannot, because "npz" is inside the hash.
+    uint64_t h = readerHash("viewer-serve npz 13");
+    h = readerHash(path, h);
+    h = readerHash(std::to_string(mtime) + "|" + std::to_string(fsize), h);
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    const std::string key = hex;
+    NpzSrc src;
+    src.path = path;
+    src.mtime = mtime;
+    src.fsize = fsize;
+    if (!npzSrcWrite(key, src)) {
+        sendErr("this peer has nowhere to keep what it lists (set VIEWER_SERVE_CACHE)");
+        return;
+    }
+
+    uint32_t cver = 0;
+    const bool container = nz::hasContainerMark(entries);
+    if (container) {
+        // The version the file declares, read where the bytes are. The client
+        // refuses a version it does not know with its own sentence - the check
+        // stays at ONE gate (§5.2) - so this is carried, never judged here.
+        for (const nz::Fact& f : facts) {
+            if (f.name != "__viewer" || !f.whole) continue;
+            nz::Head H;
+            std::string e2;
+            if (!nz::peekHeader(f.bytes, H, e2) || H.esize <= 0) break;
+            if (H.dataOff + (size_t)H.esize > f.bytes.size()) break;
+            double v = 0;
+            const uint8_t* p = f.bytes.data() + H.dataOff;
+            switch (H.esize) {
+                case 1: v = (double)*p; break;
+                case 2: { uint16_t u; memcpy(&u, p, 2); v = (double)u; break; }
+                case 4: { if (H.code == "f4") { float g; memcpy(&g, p, 4); v = (double)g; }
+                          else { uint32_t u; memcpy(&u, p, 4); v = (double)u; } break; }
+                case 8: { if (H.code == "f8") { double g; memcpy(&g, p, 8); v = g; }
+                          else { uint64_t u; memcpy(&u, p, 8); v = (double)u; } break; }
+            }
+            if (v > 0 && v < 1e9) cver = (uint32_t)v;
+            break;
+        }
+    }
+
+    Buf out;
+    out.putStr(key);
+    out.putU32(container ? (uint32_t)NK_CONTAINER : (uint32_t)NK_ORDINARY);
+    out.putU32(cver);
+    out.putU32((uint32_t)facts.size());
+    for (const nz::Fact& f : facts) {
+        out.putStr(f.name);
+        out.putU32((uint32_t)(f.usize & 0xffffffffu));
+        out.putU32((uint32_t)(f.usize >> 32));
+        out.putU32((uint32_t)f.entry);
+        out.putStr(f.err);
+        out.putU32(f.whole ? 1u : 0u);
+        out.putU32((uint32_t)f.bytes.size());
+        out.putBlob(f.bytes.data(), f.bytes.size());
+    }
+    sendMsg(MSG_OK, out);
+}
+
 // VIEWER_SERVE_LAG_MS: hold a META or TILE answer back by that many
 // milliseconds. A real link's latency, on demand - the peer the selftests run
 // against is a pipe on the same disk, and "the UI thread blocks while a file
@@ -3075,6 +3339,10 @@ void handleRequest(uint32_t type, Buf& in) {
         case MSG_READER_RUN:
             if (servedVersion() < 12) sendErr("unknown request");
             else                      handleReaderRun(in);
+            break;
+        case MSG_NPZ_SCAN:
+            if (servedVersion() < 13) sendErr("unknown request");
+            else                      handleNpzScan(in);
             break;
         default: sendErr("unknown request"); break;
     }

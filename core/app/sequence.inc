@@ -2059,6 +2059,10 @@ static void npzPickNext() {
     if (app.npzPickOpen || app.npzPickQueue.empty()) return;
     std::string next = app.npzPickQueue.front();
     app.npzPickQueue.erase(app.npzPickQueue.begin());
+    // ...whichever door it came in through: the queue holds urls too since
+    // issue #217, and "waiting its turn" has to end at the same door that put
+    // it there.
+    if (isRemoteUrl(next)) { openRemoteNpz(next, std::string()); return; }
     std::string err = loadNpz(next);
     if (!err.empty()) toast(baseName(next) + ": " + err, true);
 }
@@ -2072,14 +2076,34 @@ static void npzPickAccept() {
     app.npzPickPath.clear();
     if (path.empty() || mem.empty()) return;
     // identity BEFORE the bytes (§6.2), same as loadNpz: the dialog may have
-    // stood open across an overwrite, and the members below bind to THIS stat
+    // stood open across an overwrite, and the members below bind to THIS stat.
+    //
+    // TWO CARRIERS since issue #217, and the difference is four lines: a file
+    // on this disk is re-read and re-listed, a file on a peer is re-SCANNED.
+    // Both do it for the same reason and it is the one the loop below names -
+    // the picker stood open for as long as a person took, and what is opened
+    // must be what is in the file NOW, found by name. Re-scanning also re-issues
+    // the peer's key, so a container that changed under the dialog produces a
+    // different materialisation rather than a stale one.
+    const bool remote = isRemoteUrl(path);
     FrameSource zipStat;
     zipStat.path = path;
-    statSourceFile(zipStat);
+    if (!remote) statSourceFile(zipStat);
     std::vector<uint8_t> zip;
     std::vector<NpzEntry> entries;
+    remote::NpzScan sc;
     std::string err;
-    if (!readFileBytes(path, zip) || !npzList(zip, entries, err)) {
+    if (remote) {
+        std::string host, rpath;
+        int port = 0;
+        if (!remote::parseUrl(path, host, rpath, &port) ||
+            !ensureUiSession(host, err, port) ||
+            !app.uiSession.npzScan(rpath, sc, err)) {
+            toast(baseName(path) + ": " + (err.empty() ? std::string("cannot list it") : err),
+                  true);
+            return;
+        }
+    } else if (!readFileBytes(path, zip) || !npzList(zip, entries, err)) {
         toast(baseName(path) + ": " + (err.empty() ? std::string("cannot read file") : err), true);
         return;
     }
@@ -2094,17 +2118,37 @@ static void npzPickAccept() {
         // by NAME, not by the index the scan recorded: the file could have been
         // rewritten while the dialog stood open, and opening whatever now sits
         // at that index under the old member's name is the quiet lie again
-        size_t at = entries.size();
-        for (size_t k = 0; k < entries.size(); k++)
-            if (entries[k].name == m.name + ".npy") { at = k; break; }
-        if (at == entries.size()) {
-            toast(baseName(path) + ": " + m.name + " is no longer in this file", true);
-            continue;
-        }
         size_t before = app.images.size();
-        std::string oErr = npzOpenMember(path, zip, entries[at], m.name,
-                                         0 /*NR_NATIVE*/, zipStat);
-        if (!oErr.empty()) { toast(baseName(path) + ":" + m.name + ": " + oErr, true); continue; }
+        if (remote) {
+            NpzMember now;
+            bool found = false;
+            for (const nz::Fact& f : sc.members)
+                if (f.name == m.name) {
+                    now = m;
+                    now.entry = f.entry;      // the peer's own address, re-issued
+                    found = true;
+                    break;
+                }
+            if (!found) {
+                toast(baseName(path) + ": " + m.name + " is no longer in this file", true);
+                continue;
+            }
+            if (!openRemoteNpzMember(path, sc.key, now, false)) continue;
+        } else {
+            size_t at = entries.size();
+            for (size_t k = 0; k < entries.size(); k++)
+                if (entries[k].name == m.name + ".npy") { at = k; break; }
+            if (at == entries.size()) {
+                toast(baseName(path) + ": " + m.name + " is no longer in this file", true);
+                continue;
+            }
+            std::string oErr = npzOpenMember(path, zip, entries[at], m.name,
+                                             0 /*NR_NATIVE*/, zipStat);
+            if (!oErr.empty()) {
+                toast(baseName(path) + ":" + m.name + ": " + oErr, true);
+                continue;
+            }
+        }
         openedNames.push_back(m.name);
         int sid = 0;
         for (size_t k = before; k < app.images.size(); k++)

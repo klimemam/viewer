@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "remote_proto.h"            // rp::F32Loss - tile()'s narrowing census
+#include "npzfile.h"                 // nz::Fact - what a MSG_NPZ_SCAN reply IS
 
 namespace remote {
 
@@ -130,15 +131,25 @@ struct MeasureReq {
     int join = 0;                     // rp::SetJoin
 };
 
-// Which node of WHAT A READER RETURNED a META or TILE is about (protocol 12,
-// issue #180). The key is the peer's own opaque token - it is issued there,
-// quoted back here and never recomputed, because two implementations of a cache
-// key is two answers to "is this the same thing" (#71). It names a file inside
-// the peer's cache directory and carries no path, so it is not a second way for
-// a client to ask the peer to open something.
-struct ReaderRef {
+// Which ARRAY INSIDE A MATERIALISATION a META or TILE is about (protocol 12 for
+// a reader's output, 13 for a member of a .npz - docs/remote-reader-design.md
+// §10.5). The key is the peer's own opaque token: it is issued there, quoted
+// back here and never recomputed, because two implementations of a cache key is
+// two answers to "is this the same thing" (#71). It names an entry in the
+// peer's cache directory and carries no path, so it is not a second way for a
+// client to ask the peer to open something.
+//
+// `kind` is NOT on the wire and never will be. The peer resolves which family a
+// key belongs to from its own cache, which is the point of an opaque token; the
+// field exists because the CLIENT has one question the peer cannot answer for
+// it - which protocol number to refuse an old peer from, before it sends
+// anything (readerTooOldText is 12's sentence and npzTooOldText is 13's, and
+// they name different fixes).
+struct KeyedRef {
+    enum Kind { FromReader, FromNpz };
     std::string key;
-    int node = 0;              // index into the tree the reader declared
+    int node = 0;              // the peer's own address for one array in it
+    int kind = FromReader;
 };
 
 // What MSG_READER_RUN answered. Every field is a FACT the peer observed; the
@@ -150,8 +161,20 @@ struct ReaderRun {
     std::string err;              // the peer's one line for outcome != 0
     std::string stderrText;       // the harness's stderr, WHOLE, success or not
     std::string provenance;       // "Python 3.11.4 (...), numpy 1.26.4"
-    std::string key;              // outcome 0 only: what to put in a ReaderRef
+    std::string key;              // outcome 0 only: what to put in a KeyedRef
     std::string header;           // outcome 0 only: the .vstream header verbatim
+};
+
+// What MSG_NPZ_SCAN answered: the key this listing was issued under, which of
+// the two readings the file gets, and one fact per member. `members` is
+// nz::Fact - the SAME struct the local door fills from a zip in this process -
+// so the classifier downstream cannot tell the two carriers apart, which is
+// what makes a picker row read the same either way (§10.2).
+struct NpzScan {
+    std::string key;
+    int kind = 0;                  // rp::NpzKind
+    int containerVersion = 0;      // kind 1 only: what `__viewer` declares
+    std::vector<nz::Fact> members;
 };
 
 // One connection to one machine. Not thread-safe: requests are serialised by the
@@ -214,7 +237,7 @@ public:
     // fail to read the trailer, it never looks at it, opens the origin path
     // natively and answers with pixels that are not the reader's.
     bool meta(const std::string& path, Meta& out, std::string& err, int read = 0,
-              const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
+              const rp::RawWire* rw = nullptr, const KeyedRef* rd = nullptr);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
     // (converted from the source dtype) plus the decimated dimensions. The rect
     // and the frame index are coordinates INSIDE `read`, so it must be the same
@@ -227,7 +250,7 @@ public:
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
               std::string& err, int read = 0, rp::F32Loss* loss = nullptr,
-              const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
+              const rp::RawWire* rw = nullptr, const KeyedRef* rd = nullptr);
     // The SAME request, stopping one step earlier: the samples exactly as the
     // peer sent them, in the source dtype, with no narrowing to float32.
     //
@@ -241,7 +264,7 @@ public:
     bool tileBytes(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<uint8_t>& raw, int& outW, int& outH, int& outCh,
                    uint32_t& dtype, std::string& err, int read = 0,
-                   const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
+                   const rp::RawWire* rw = nullptr, const KeyedRef* rd = nullptr);
     // Run a reader ON THE PEER, over `peerPath`, and get back the four facts
     // adapter::Run separates plus the key and the header (protocol 12).
     // `files` are the three texts rp::READER_RUN_FILES names, in that order:
@@ -253,6 +276,16 @@ public:
     // true return with an outcome that says so.
     bool readerRun(const std::string& peerPath, const std::string& func,
                    const std::string files[3], ReaderRun& out, std::string& err);
+    // What is inside a .npz on the peer (protocol 13, issue #217). FACTS only -
+    // the member names, what the directory says they hold, their .npy headers
+    // and the values of the small ones - because the vocabulary that turns
+    // those into picker rows lives in ONE place on this side (core/app/
+    // loader_npz.inc) and a second copy over there is the drift #71 is about.
+    //
+    // Refused before it is sent when the peer predates 13, from the number in
+    // HELLO: a v12 peer answers this verb with "unknown request", which is what
+    // it also says for a typo.
+    bool npzScan(const std::string& path, NpzScan& out, std::string& err);
     // run analysis where the data is; only the emitted results travel
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
     // Start the peer with --serve-readers (the default). Turned OFF only by the
@@ -283,11 +316,16 @@ private:
     // it through to come back as "not a .npy file".
     bool recipeServable(const std::string& path, const rp::RawWire* rw,
                         std::string& err) const;
-    // "can this peer be asked about a reader's output at all" - the protocol-12
-    // gate, in one place for the reason the three above are, and refused here
-    // rather than at the peer because an older peer answers the request it
+    // "can this peer be asked about one array inside a materialisation" - the
+    // protocol-12 gate for a reader's output and the protocol-13 one for a
+    // .npz member, in one place for the reason the three above are, and refused
+    // here rather than at the peer because an older peer answers the request it
     // thinks it was sent instead of refusing the one it was.
-    bool readerServable(const std::string& name, std::string& err) const;
+    bool keyedServable(const KeyedRef& rd, const std::string& name,
+                       std::string& err) const;
+    // ...and "can this peer list a container at all" - the same gate asked of
+    // the SCAN itself, before a byte of it is written.
+    bool npzServable(const std::string& path, std::string& err) const;
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
     bool recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& err);
 
