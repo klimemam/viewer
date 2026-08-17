@@ -65,6 +65,7 @@
 #include <condition_variable>
 #include <limits>
 #include <iomanip>
+#include <array>
 #include <sstream>
 #include <string>
 #include <chrono>

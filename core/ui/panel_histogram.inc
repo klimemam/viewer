@@ -158,6 +158,13 @@ static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState
     if (!pr.ok || !im) return;
     static ImVec2 dragA;
     static bool dragging = false;
+    // WHICH plot the drag began on. Side by side calls this twice per frame
+    // with two different rectangles, and a gesture is one gesture: without
+    // this, a drag started in the B half was completed by the A half's call
+    // (A is drawn first), which unmapped B's screen x through A's rectangle
+    // and armed an interval nobody drew - pinned to bin 255, because every
+    // point of the right-hand plot is past the left-hand plot's xmax.
+    static float dragOn = 0;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const bool hov = ImGui::IsMouseHoveringRect(pr.p0, pr.p1) &&
                      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
@@ -168,8 +175,10 @@ static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState
     }
     if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         dragA = ImGui::GetMousePos();
+        dragOn = pr.p0.x;
         dragging = true;
     }
+    if (dragging && dragOn != pr.p0.x) return;      // the other half's plot
     if (dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const ImVec2 m = ImGui::GetMousePos();
         float x0 = std::clamp(std::min(dragA.x, m.x), pr.p0.x, pr.p1.x);
