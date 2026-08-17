@@ -3469,22 +3469,20 @@ static void handleNpzScan(Buf& in) {
         // The version the file declares, read where the bytes are. The client
         // refuses a version it does not know with its own sentence - the check
         // stays at ONE gate (§5.2) - so this is carried, never judged here.
+        //
+        // Read with nz::elem, which is what the local loader reads its own
+        // members with. This used to be a switch of host-order memcpys written
+        // out here, and it ignored the byte order the descr states: `>i4`
+        // version 1 arrived as 16777216, the client refused a "version it does
+        // not know", and the same file opened locally was fine. Carrying a
+        // number is only harmless if it is the number the file says (#221
+        // review); bounds and byte order both belong to the decoder.
         for (const nz::Fact& f : facts) {
             if (f.name != "__viewer" || !f.whole) continue;
             nz::Head H;
             std::string e2;
             if (!nz::peekHeader(f.bytes, H, e2) || H.esize <= 0) break;
-            if (H.dataOff + (size_t)H.esize > f.bytes.size()) break;
-            double v = 0;
-            const uint8_t* p = f.bytes.data() + H.dataOff;
-            switch (H.esize) {
-                case 1: v = (double)*p; break;
-                case 2: { uint16_t u; memcpy(&u, p, 2); v = (double)u; break; }
-                case 4: { if (H.code == "f4") { float g; memcpy(&g, p, 4); v = (double)g; }
-                          else { uint32_t u; memcpy(&u, p, 4); v = (double)u; } break; }
-                case 8: { if (H.code == "f8") { double g; memcpy(&g, p, 8); v = g; }
-                          else { uint64_t u; memcpy(&u, p, 8); v = (double)u; } break; }
-            }
+            const double v = nz::elem(f.bytes, H, 0);
             if (v > 0 && v < 1e9) cver = (uint32_t)v;
             break;
         }

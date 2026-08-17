@@ -138,6 +138,51 @@ inline bool peekHeader(const std::vector<uint8_t>& buf, Head& H, std::string& er
     return true;
 }
 
+// One element of a numeric member as a DOUBLE, byte order INCLUDED.
+//
+// A double and not a float because an axis is the quantity data is plotted
+// against, so it must not pass through float on the way in: the pixel path's
+// getVal returns float and that is right for pixels, but not for
+// 12345.678901234567.
+//
+// It lives HERE, beside peekHeader, because both machines decode the same
+// bytes and there may only be one answer (#221 review). The peer read
+// `__viewer`'s version with a host-order memcpy of its own, so a container
+// written big-endian - `>i4`, which numpy writes the moment its author says so
+// - was version 1 to this side and version 16777216 to the peer. The peer then
+// carried that number to the client as the file's declared version and the
+// client refused a file it opens perfectly well when the same bytes are local.
+// A header field whose meaning depends on which machine looked is not a
+// format; the descr already says which order the bytes are in, and now the
+// only decoder that exists reads it.
+inline double elem(const std::vector<uint8_t>& buf, const Head& H, size_t i) {
+    if (H.esize <= 0) return 0;
+    // Bounds are the DECODER's business, not each caller's: a member whose
+    // header promises more than the file holds is a fact about the file, and
+    // the peer meets those on input it did not write.
+    const size_t es = (size_t)H.esize;
+    if (i > (size_t)-1 / es) return 0;
+    const size_t off = H.dataOff + i * es;
+    if (off < H.dataOff || off > buf.size() || es > buf.size() - off) return 0;
+    const uint8_t* p = buf.data() + off;
+    auto bswap = [](uint64_t v, int n) {
+        uint64_t r = 0;
+        for (int k = 0; k < n; k++) r = (r << 8) | ((v >> (8 * k)) & 0xff);
+        return r;
+    };
+    switch (H.esize) {
+    case 1: return H.code == "i1" ? (double)*(const int8_t*)p : (double)*p;
+    case 2: { uint16_t u; memcpy(&u, p, 2); if (H.be) u = (uint16_t)bswap(u, 2);
+              return H.code == "i2" ? (double)(int16_t)u : (double)u; }
+    case 4: { uint32_t u; memcpy(&u, p, 4); if (H.be) u = (uint32_t)bswap(u, 4);
+              if (H.code == "f4") { float f; memcpy(&f, &u, 4); return (double)f; }
+              return H.code == "i4" ? (double)(int32_t)u : (double)u; }
+    case 8: { uint64_t u; memcpy(&u, p, 8); if (H.be) u = bswap(u, 8);
+              double d; memcpy(&d, &u, 8); return d; }
+    }
+    return 0;
+}
+
 // A zip64 record that does not hold together, said with the MEMBER in it
 // (#221 review). The peer runs this walk on a file the client named, so the
 // refusal it sends is the only thing the person ever sees: "corrupt zip" with

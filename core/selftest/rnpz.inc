@@ -496,6 +496,128 @@
                   "R18f the same session lists a good container afterwards: the peer lived");
         }
 
+        // ---- R19: the container's version, in the byte order the file states ---
+        //
+        // #221 review r3794616468. The peer read `__viewer`'s value with a
+        // host-order memcpy written out at the call site, so a container whose
+        // version member is a valid big-endian dtype - `>i4`, which numpy
+        // writes the moment its author asks for it - arrived as 16777216 where
+        // the file says 1. The client carries that number straight into
+        // loadViewerNpz's ONE version gate (§5.2), which refused it as "written
+        // by a newer viewer": a file that opens perfectly well off this disk was
+        // unopenable over a link. Two machines, two readings of four bytes.
+        //
+        // The fix is not a second byte-order switch on the peer. There is ONE
+        // decoder now - nz::elem, beside the peekHeader that says which order
+        // the bytes are in - and both doors call it. R19a/b assert that decoder
+        // directly against the raw bytes, because that is the statement the fix
+        // makes; R19c carries it to the wire and R19d/e to the screen.
+        {
+            if (!connect()) return 1;
+            // `>i4` holding 1. The payload is 00 00 00 01, which is 16777216 to
+            // anything that reads it in this host's order.
+            auto i32be = [](int32_t v) {
+                const uint8_t b[4] = { (uint8_t)((v >> 24) & 0xff),
+                                       (uint8_t)((v >> 16) & 0xff),
+                                       (uint8_t)((v >> 8) & 0xff),
+                                       (uint8_t)(v & 0xff) };
+                return selftestNpyBytes(">i4", {}, b, 4);
+            };
+            const std::vector<uint8_t> vb = i32be(1);
+
+            // ---- R19a/b: the decoder, on the bytes, with no link in sight ----
+            nz::Head VH;
+            std::string vherr;
+            const bool peeked = nz::peekHeader(vb, VH, vherr);
+            uint32_t raw = 0;                       // what a host-order read says
+            if (peeked && VH.dataOff + 4 <= vb.size()) memcpy(&raw, vb.data() + VH.dataOff, 4);
+            const double dec = peeked ? nz::elem(vb, VH, 0) : -1.0;
+            fprintf(stderr, "rnpzselftest:   R19 __viewer as '>i4' 1: be=%d code=%s "
+                            "host-order=%u  nz::elem=%.0f\n",
+                    peeked && VH.be ? 1 : 0, peeked ? VH.code.c_str() : "?",
+                    (unsigned)raw, dec);
+            check(peeked && VH.be && VH.code == "i4" && VH.esize == 4,
+                  "R19a (setup) the fixture's __viewer really IS a big-endian i4");
+            check(raw == 16777216u,
+                  "R19a ...and a host-order read of those four bytes really says 16777216");
+            check(dec == 1.0,
+                  "R19b nz::elem - the one decoder both doors call - reads the 1 the file says");
+
+            // ---- the fixture: R16's container with that version member -------
+            // Everything else is byte-for-byte what tree.npz holds, so the only
+            // thing that can differ below is the version.
+            const std::string contBE = root + "/tree_be.npz";
+            selftestWriteNpz(contBE, {
+                { "__viewer",   vb },
+                { "__n",        i32(4) },
+                { "__layer_0",  str1("batch") },
+                { "__parent_0", i32(-1) },
+                { "__name_0",   str1("sweep") },
+                { "__layer_1",  str1("series") },
+                { "__parent_1", i32(0) },
+                { "__name_1",   str1("exposure sweep") },
+                { "__conditions_values_1", f64v({ 2.0, 8.0 }) },
+                { "__conditions_name_1",   str1("exposure") },
+                { "__conditions_unit_1",   str1("ms") },
+                { "__layer_2",  str1("stack") },
+                { "__parent_2", i32(1) },
+                { "__name_2",   str1("e2") },
+                { "__pixels_2", selftestNpyBytes("<u2", { 2, HH, WW }, sa.data(), sa.size() * 2) },
+                { "__layer_3",  str1("stack") },
+                { "__parent_3", i32(1) },
+                { "__name_3",   str1("e8") },
+                { "__pixels_3", selftestNpyBytes("<u2", { 2, HH, WW }, sb.data(), sb.size() * 2) },
+            });
+
+            // ---- R19c: what the PEER says the file declares -------------------
+            remote::NpzScan sc;
+            std::string err;
+            const bool got = app.uiSession.npzScan(contBE, sc, err);
+            fprintf(stderr, "rnpzselftest:   R19 peer: got=%d kind=%d version=%d \"%s\"\n",
+                    got ? 1 : 0, got ? sc.kind : -1, got ? sc.containerVersion : -1,
+                    err.c_str());
+            check(got && sc.kind == rp::NK_CONTAINER,
+                  "R19c the peer knows it is a viewer container");
+            check(got && sc.containerVersion == 1,
+                  "R19c ...and carries the version the FILE declares, not the host's reading");
+
+            // ---- R19d/e: and therefore it opens, both ways ---------------------
+            closeAll();
+            const size_t rFirst = app.images.size();
+            const bool ropen = openRemoteNpz(urlOf(contBE), std::string());
+            const size_t rDocs = app.images.size() - rFirst;
+            fprintf(stderr, "rnpzselftest:   R19 remote open=%d docs=%zu toast=\"%s\"\n",
+                    ropen ? 1 : 0, rDocs, app.toast.c_str());
+            check(ropen && rDocs == 4,
+                  "R19d a big-endian container opens over the LINK, every frame of it");
+            closeAll();
+            const std::string lerr = loadNpz(contBE);
+            fprintf(stderr, "rnpzselftest:   R19 local open docs=%zu \"%s\"\n",
+                    app.images.size(), lerr.c_str());
+            check(lerr.empty() && app.images.size() == 4,
+                  "R19e ...and the local door opens the same file the same way");
+            closeAll();
+
+            // ---- R19f: ANTI-VACUITY - the gate R19c feeds is a real gate ------
+            // A container that really does declare 16777216 is still refused. So
+            // R19d/e are not "the version check is gone"; they are "the number
+            // that reached the check was the file's".
+            const std::string contFuture = root + "/tree_future.npz";
+            selftestWriteNpz(contFuture, {
+                { "__viewer",   i32(16777216) },
+                { "__n",        i32(1) },
+                { "__layer_0",  str1("stack") },
+                { "__parent_0", i32(-1) },
+                { "__name_0",   str1("e2") },
+                { "__pixels_0", selftestNpyBytes("<u2", { 2, HH, WW }, sa.data(), sa.size() * 2) },
+            });
+            const std::string ferr = loadNpz(contFuture);
+            fprintf(stderr, "rnpzselftest:   R19 declared-16777216: \"%s\"\n", ferr.c_str());
+            check(has(ferr, "16777216") && has(ferr, "newer viewer"),
+                  "R19f a container that really declares 16777216 is still refused BY NUMBER");
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

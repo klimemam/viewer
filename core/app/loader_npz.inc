@@ -359,27 +359,12 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
 }
 
 // ---- classifying an .npz's members (docs/npz-design.md §2.1) ----------------
-// One element as a DOUBLE. An axis is the quantity data is plotted against, so
-// it never passes through float on the way in: the pixel path's getVal returns
-// float and that is right for pixels, but it is not right for 12345.678901234567.
+// One element as a DOUBLE, byte order included - nz::elem, which core/serve.cpp
+// reads the same bytes with. The name stays because the call sites are about
+// .npy members; the decoding lives beside the header parse that says which
+// order the bytes are in (#221 review).
 static double npyElem(const std::vector<uint8_t>& buf, const NpyHead& H, size_t i) {
-    const uint8_t* p = buf.data() + H.dataOff + i * (size_t)H.esize;
-    auto bswap = [](uint64_t v, int n) {
-        uint64_t r = 0;
-        for (int k = 0; k < n; k++) r = (r << 8) | ((v >> (8 * k)) & 0xff);
-        return r;
-    };
-    switch (H.esize) {
-    case 1: return H.code == "i1" ? (double)*(const int8_t*)p : (double)*p;
-    case 2: { uint16_t u; memcpy(&u, p, 2); if (H.be) u = (uint16_t)bswap(u, 2);
-              return H.code == "i2" ? (double)(int16_t)u : (double)u; }
-    case 4: { uint32_t u; memcpy(&u, p, 4); if (H.be) u = (uint32_t)bswap(u, 4);
-              if (H.code == "f4") { float f; memcpy(&f, &u, 4); return (double)f; }
-              return H.code == "i4" ? (double)(int32_t)u : (double)u; }
-    case 8: { uint64_t u; memcpy(&u, p, 8); if (H.be) u = bswap(u, 8);
-              double d; memcpy(&d, &u, 8); return d; }
-    }
-    return 0;
+    return nz::elem(buf, H, i);
 }
 
 // A string member's value, so a "note" key can be SHOWN and not merely counted.
