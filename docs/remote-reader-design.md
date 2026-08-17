@@ -442,3 +442,226 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 | キャッシュ鍵の stat は peer、鍵は peer 発行の不透明トークン | キャッシュ肥大の実地報告 → 両側同方針の掃除 |
 | set は断る、ssh の「手元で走らす」は文で逃がす、進捗 tail は無し | それぞれ §7 / §6 に個別に記載 |
 | stage 0 は独立に先行 (拒否文の 1 文 + fmtgate assert) | stage 2 で文を差し替え |
+
+---
+
+## 10. 追記 (2026-08-17, Fable) — remote .npz は stage 3 に乗る (issue #217)
+
+**乗る、と判断する。** ただし #217 の言い方に一点訂正がある (§10.1): ordinary npz
+に「木」は無い。乗るのは木のコードではなく、**ワイヤの継ぎ目**である。
+
+状況: ユーザー報告「.npz がいまだに remote だと gray out」(#217)。拒否は判断済み
+(`core/imagefile.cpp:438`「the peer serves one array per file, not a container」)
+で、**reader とは無関係** — .npz は native 形式であり、欠けているのは「コンテナ
+(複数配列) がリンクを渡る」機構だけ。`docs/npz-design.md` §2.4 (:91) は既にその
+動詞を名指ししている:「リモートでは peer に zip の中身一覧を返す動詞が要る —
+プロトコル追加。ローカル先行、リモートは後続で良い」。後続の番が来た、というのが
+本追記である。
+
+### 10.0 決定 5 件を先に
+
+| # | 問い | 決定 |
+|---|---|---|
+| a | peer 側で npz の木を作るのは誰か | **誰も作らない。** peer は列挙と materialise だけ。木・分類・picker は client の既存 1 経路 (§10.2) |
+| b | member 選択 UI | **同じ picker、同じ入口** — drawNpzPickModal と loadNpz の規則すべてを共有 (§10.3) |
+| c | :438 の拒否文 | .npz は **peerServesDeclared に入り、peerServes には入らない** (protocol 11 が headerless で割った線)。:438 の文は「member 一覧から開く」事実に書き換わり、旧 peer には presend の `npzTooOldText` (定型 5 本目) が断る (§10.4) |
+| d | MRF_READER トレーラとの区別 | **しない。** [str key][u32 node] の意味を「peer 上の materialisation の中の 1 配列」に固定する。reader は key の出自の一つに過ぎない (§10.5) |
+| e | キャッシュ鍵 | `H("npz", peerPath, peer の stat)` — **SCAN 時に peer が発行**、member は node で選ぶ。reader 鍵とは kind 語で族が分かれる (§10.6) |
+
+`--serve-readers` は **npz に関与しない**: §2 の門が守るのは「他人のコードがこの
+機械で走る」ことで、npz で peer に走るのは viewer 自身のコードだけである。旗の
+閉じた v12 peer でも SCAN は答える。
+
+### 10.1 #217 の言い方への訂正 — 「木」は半分だけ正しい
+
+#217 は「remote .npz は peer が native に開いた npz の木」と言うが、ローカルの
+ordinary npz に木は無い: `npzScan` (loader_npz.inc :617) が member を**フラットに**
+分類し、picker (:2213-2224) が選ばせ、`npzOpenMember` (:758) が 1 member ずつ
+開く。`vnzBuild` を通るのは `__viewer` 判別子を持つ viewer container だけ
+(:2136-2150)。したがって「stage 3 に乗る」の正確な中身は:
+
+- **両方の顔が共有する**のはワイヤの継ぎ目 — SCAN 動詞 + [key][node] トレーラ +
+  peer 側 materialisation キャッシュ + openRaw 形の TILE (§5.2 の 3 と同じ道)。
+- **vnzBuild に触るのは container の顔だけ**で、その形は stage 3 の reader 木と
+  同一 (「宣言は逐語で渡り、木のビルダは client の 1 つ」§5.2 の 2)。
+- ordinary npz の顔が共有するのは npzScan → picker → 1 member 開き、という
+  **client の既存 1 経路**。これも「コードは 1 つ」だが、木のコードではなく
+  分類と picker のコードである。
+
+### 10.2 (a) peer は木を作らない — 列挙と materialise だけ
+
+**コンパイル単位の現実** (確かめた): viewer-serve は serve_main.cpp + serve.cpp +
+imagefile.cpp + 各画像 reader + miniz (CMakeLists.txt :613-618)。loader_npz.inc は
+「core/main.cpp から #include される断片」(loader_npz.inc :1) で、**peer には
+居ない**。そして vnzBuild は app.images と seq/series の登記を直接触る — App の
+無い peer が呼べる関数ではない。「peer が loader_npz の vnzBuild を呼ぶ」形は
+最初から成立しない。
+
+peer に足すのは **`MSG_NPZ_SCAN = 9`** (版の置き場は §10.7):
+
+```
+MSG_NPZ_SCAN
+  -> [str peerPath]
+  <- MSG_OK:
+     [str key]        materialisation 鍵 (§10.6)。peer 発行・不透明
+     [u32 kind]       0 ordinary / 1 viewer container (+ __viewer の版)
+     [u32 nMembers]   per member: [str name][u32 ndim][i64 dims...]
+                      [str descr][u64 usize][str err]
+                      [u32 nInline][bytes]     小さい値 (scalar / 文字列 /
+                                               短い 1-D) は npy バッファ逐語
+     kind 1 のとき: 予約 member (__pixels_ 系以外) の npy バッファ逐語
+```
+
+- zip の central-directory 歩き (`npzList`) と npy ヘッダ覗き (`npyPeekHeader`)
+  は**共有 TU に括って両バイナリで compile** — §5.2 の 1 が vnzCheckTree に既に
+  決めた扱いそのもの。miniz は serve に**既にリンク済み** (serve.cpp :28、今日は
+  タイル圧縮 :1346 に使っている) なので、新しい依存は増えない。
+- **分類 (RImage/RAxis/RMeta/RBad の語彙) は client の npzScan 1 箇所のまま**:
+  SCAN が返すのは事実 (name・shape・descr・usize・展開可否・小さい値) で、役割は
+  その事実から client が判定する。picker の行の文言が local と peer で一字も
+  違えない (#71/#148) ことの構造保証である。peer が担うのは bytes を持つ側にしか
+  できないことだけ — 展開できるかの検査 (「truncated zip member」:425/:453 の文
+  ごと共有 TU へ) と、値の同梱。
+- 同梱する 1-D 値の上限は **frame 天井 1<<20** (serveLayout :204-208 の既存天井)。
+  ローカル npzScan の cap は 1<<24 (:711) だが、2^20 を超える 1-D はどの stack の
+  軸にも成れない (frames ≤ 2^20) ので、**共有化の際にローカル側も 1<<20 に締める**。
+  観測可能な差は「軸候補と呼ばれるが決して昇格しない member」の分類文言だけ。
+  矛盾の名指し: これは既存コード (:711) の cap 変更であり、本追記が決める。
+- container の予約 member は「小さい」(word・数値・ベクトル — loader_npz.inc
+  :887-888) ので逐語で乗る。条件 2^20 × f8 = 8 MB が最悪で 64 MB 枠 (serve.cpp
+  :2623) に収まる。`__pixels_<i>` は乗らない — それが渡らないための本設計である。
+  版の拒否 (`VIEWER_NPZ_VERSION` :851、3 は名指しで断る) は client の既存文のまま
+  — 検査の門は 1 つ、が §5.2 の規律。
+
+### 10.3 (b) member picker — 同じ画面、同じ入口
+
+- **同じ modal**: `drawNpzPickModal` (sequence.inc :2851) は app.npzPick の行を
+  描くだけで、行が zip バイトから来たか SCAN 応答から来たかを知らない。npzScan を
+  「zip から事実を得る」層と「事実から行を作る」層に割り、後者を両経路が共有する。
+  パス表示 (:2864 dispPath) は url をそのまま出す。
+- **loadNpz の規則が全部ついて来る**: 画像 member 1 つなら dialog 無し (:2190)、
+  dialog は 1 度に 1 枚で残りは queue (:2213)、軸候補は「長さ == frames」の同じ
+  判定、軸の名前と単位はユーザー確定。remote 用の第 2 の規則集は作らない。
+- **入口**: openRemote (open_dispatch.inc :1847) の門が .npz を SCAN の道へ回す —
+  META より前 (コンテナに 1 つの geometry は無いので、META では答えられない)。
+  local:// は今日と同じく :1848 が openPath へ回す (§7 の記録どおり、ローカルの
+  picker がそのまま出る) — この道は ssh:// の道である。
+- **開く**: 選ばれた member ごとに stage 2 の着地 (間引きの最初の 1 枚 :1902 の
+  step 計算、stack は n / N、zoom/pan で精細化)。TILE は [key][member index] で引く。
+- **復元**: src->path = url、src->member = 配列名 (npzOpenMember :769 と同じ器が
+  remote doc にもある)。session 復元は onlyMember の規則 (:2115-2117) ごと共有 —
+  SCAN して名指しの member だけを picker 無しで開く。memo / readerhint は無関係
+  (native であり、走るものが無い)。
+
+### 10.4 (c) 拒否文と灰色の解け方
+
+- .npz は **peerServesDeclared (imagefile.cpp :414) に入る**: Browse の行
+  (browse/panel.cpp :123) が点き、double-click が SCAN 経由で開く。**peerServes
+  (:379) には入れない**: one-click preview は「1 つの geometry を持つファイル」の
+  約束で、コンテナはそれを持たない。protocol 11 が headerless で割った線 (行は
+  生きる / preview の門は広げない、fmtgate F4d が**対で** assert する形) をそのまま
+  踏む。
+- **imagefile.cpp :438 の文は stage 3 で書き換わる**。「the peer serves one array
+  per file, not a container」は door が開いた日に**偽になる文**なので残せない —
+  存在する door を否定する拒否は G11 の再演である。残る真実で言い換える:
+  `".npz is a container and opens from its member list - this request addressed
+  the whole file as one array\n  open it from Browse (the peer lists the
+  members), or copy it here"` (最終文言は実装時、R18 が事実を assert する)。
+  このブランチに残る客は、丸ごとの .npz を 1 枚として指した要求への peer 側の
+  断り (serve.cpp :459 経由) だけになる。
+- **旧 peer は client が送る前に数字で断る**: `formatServable` (remote.cpp
+  :583-596) が pictureTooOldText でやっている形の 5 本目、`npzTooOldText`。
+  remote_proto.h の定型 (:736/:750/:767 + §4.1 の readerTooOldText) に並ぶ。
+- 名指しする隣人 (本追記の範囲外): serve.cpp :488 の .exr named-parts 拒否
+  「the link addresses a file, not a part of one」— [key][node] はまさに
+  『part of one』を言うワイヤの語彙なので、この拒否は stage 3 の日に再訪**可能**に
+  なる。ここでは開けない (.exr の named part は SCAN の形も picker も別物)。
+  再訪条件: remote .npz が通った後、.exr の layer を link 越しに開きたい実報告。
+
+### 10.5 (d) reader トレーラとの区別 — しない
+
+§4.2 のトレーラ [str key][u32 node] の意味を 1 つに固定する: **key は peer 上の
+materialisation を、node はその中の 1 配列を指す**。reader RUN も npz SCAN も
+key の**発行者**であり、ワイヤはどちらが発行したかを知らない。native npz が
+reader 鍵を持たないことは問題にならない — 鍵は reader の鍵ではなく
+materialisation の鍵だからである。reader である事実は provenance (Inspector の
+reader 行、stage 2) に居り、番地付けには居ない。
+
+矛盾の名指し 2 件 (どちらも未実装の本文なので、実装はこの追記の読みで行う):
+
+- §4.2 の注「key 空 = reader 無し」は狭い。正しくは「**key 空 = path そのものが
+  origin**」— reader 無しでも npz の TILE は key を持つ。
+- **`MRF_READER` という綴りは stage 5 で嘘になる** (native npz の stack を測る
+  MEASURE に reader はどこにも居ない)。値 2 は §4.2 のまま、綴りは実装時に
+  **`MRF_KEYED`** とする。まだ 1 バイトも出荷されていないから、この改名は無料。
+
+node の意味は**コンテナ自身の番地**: .vstream = 木の pixel ノード番号 (§4.2 の
+まま)、npz = SCAN 応答の member index。member **名**は META/TILE に乗らない —
+名→番地の束縛は SCAN の応答で 1 回だけ起き、client が peer の任意 path の任意
+member を SCAN 無しで指す第 2 の経路を作らない (§4.2 の鍵の論法と同じ)。
+
+### 10.6 (e) キャッシュ鍵と identity
+
+```
+key = H( "npz",                        ← kind 語。reader 鍵 (§5.3) と族が分かれ、
+         peerPath,                        同じキャッシュ根に同居して衝突しない
+         peer の stat (mtime, fsize) )  ← stat は peer が取る (§5.3 の NAS 論拠のまま)
+```
+
+- 発行は SCAN 時に 1 つ、member の選別は node。reader 鍵に居た reader ハッシュ・
+  func・module VERSION は**入らない** — 走る Python が無いから。キャッシュ根は
+  1 つ (§5.3 の置き場に同居する。根が 2 つ = 掃除方針が 2 つ)。
+- **materialise は遅延で、member 単位**: (key, node) の最初の TILE がその member
+  を 1 本だけ inflate してキャッシュに置く。40 member の npz で 1 member 開くため
+  に 40 本 inflate しない。以後の TILE / MEASURE は openRaw (serve.cpp :568) と
+  同じ「offset + stride の ServedFile」で readNpyRegion :301 が無改造で読む —
+  §5.2 の 3 と同じ理由で、npz 専用の画素ループは 1 本も書かない。
+- **identity BEFORE the bytes はリンク越しでこう守る**: inflate の直前に peer が
+  再 stat し、SCAN 時の tuple と違えば**名指しで断る** (`"the file changed on the
+  peer since its members were listed - reopen to rescan"`)。ローカルは zip 丸読み
+  が束縛する (loadNpz :2121-2126) が、remote は読む瞬間が開いた瞬間より遅い —
+  黙って新バイトへ再束縛するより、断って再 SCAN させる方が強い。
+- **stored member を zip offset から直に serve する形は退けた**: 展開コストは
+  ゼロだが、zip の in-place 上書きが「開いている doc の画素」を identity の下で
+  差し替える — :2121 が名指しするまさにその窓である。stored も copy して鍵付き
+  ファイルにする (1 回の read+write、ローカルの zip 丸読みと同じコスト級)。
+  再訪条件: 実運用の multi-GB stored member で copy が痛んだ実報告 — その時は
+  fd 保持か読み口検証の別設計を、identity を割らずに立てる。
+
+### 10.7 版とワイヤの置き場 — §7 の「同じ回」束は解く
+
+`MSG_NPZ_SCAN = 9` は **VERSION 12 の定義に同居**する — v12 は未出荷なので番号は
+無料である。規律の名指し: stage 1 が npz より先に main へ入って**出荷された後**に
+この動詞を足すなら、それは 13 である (「送る前に数字で断る」を成立させる数が
+それだから)。
+
+矛盾の名指し: §7 の表 1 行目は「.npz over link の zip の中身一覧を返す動詞」を
+set (VIEWERSTREAM 2) の設計と**同じ回**に束ねた。その束は解く — 動詞の設計は
+#217 (ユーザー報告 = 再訪条件の到来) で今ここに来た。束ねた根拠「同じ『ファイル
+の中の部分を指す』問い」は [key][node] という**答えの共有**として残る。**set の
+側は §7 のまま据え置き** — set の Ref が peer の path を指し役割の解決が client
+の登記と絡む問題は、この追記の何にも答えられていない。
+
+### 10.8 stage 3 の受け入れ条件と赤→緑 (追加分)
+
+stage 3 の完了条件に足す: **remote .npz が member 込みで開く — reader 不要の
+native コンテナとして、SCAN + [key][node] で**。
+
+| # | 赤→緑 |
+|---|---|
+| R14 | fmtgate の bothWays の型 (standalone peer への session 直叩き、fmtgate.inc :690〜) で multi-member .npz: SCAN の行がローカル npzScan と**同じ role・同じ文言**を出し、選んだ member の TILE 全画素がローカル open と**ビット一致** (同一機なので張れる assert — R8 と同じ線) |
+| R15 | 画像 member 1 つの npz → dialog 無しで開く (:2190 の規則が remote でも同文で成立) |
+| R16 | `__viewer` container を peer 越しに開き、ローカル open と doc 数・conditions 値・単位が一致 (R12 の npz 版 — R12 は reader 産、R16 は npz 産、**通る木のコードが同じ 1 つ**であることの証明) |
+| R17 | `VIEWER_SERVE_PROTOCOL=11` → client が**送信前に** npzTooOldText / SCAN 後に peer 側で zip を上書き → 次の inflate が再 stat で名指し拒否 (§10.6 の文) |
+| R18 | fmtgate: .npz の行が peer で生きる + preview の門は広がらない (F4d の対 assert の npz 版) + :438 の新文が「member 一覧」を言い、旧文「one array per file」を言わない |
+
+### 10.9 台帳 (追加分)
+
+| 決定 | 再訪条件 |
+|---|---|
+| npz は stage 3 の継ぎ目に乗る: peer は列挙と materialise、木・分類・picker は client の 1 経路 | — |
+| トレーラは 1 本 (綴りは MRF_KEYED に直す)、key = materialisation、reader は出自の 1 つ | — |
+| .npz は peerServesDeclared に入り peerServes に入らない (preview 無し) | 単一 image member npz の preview 実需要 |
+| stored member も copy して materialise (zip offset 直 serve は identity で退けた) | multi-GB stored member で copy が痛んだ実報告 |
+| §7 の「同じ回」束は解く: npz 動詞は今 (#217)、set は据え置き | set は §7 の再訪条件のまま |
+| .exr named parts (serve.cpp :488) は同じ語彙で再訪可能になるが、ここでは開けない | remote .npz 通過後、.exr layer の実報告 |
