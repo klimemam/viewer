@@ -1747,6 +1747,20 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (tooNarrow) abNarrowNote();
 }
 
+// The A side of Compare asks for itself, for the same reason and in the same
+// place as the lone-stack path below: DRAWING IS THE GATE. abTemporalOf takes
+// the server's numbers only when the one slot is holding that side's stack
+// (S.seqId == d->seqId), so an A that is not in the slot silently shows the
+// local numbers over the frames that happen to be RESIDENT - a different
+// quantity, printed in the same table as B's, with nothing saying so.
+//
+// B is not asked for. There is one slot and it cannot hold both sides at once;
+// that is an existing constraint of the A slot, and widening it is a design
+// question rather than a thing to settle inside a fix for this one.
+static void ensureAbServerTemporal(const ImageDoc* im) {
+    if (im && im->seqId != 0) ensureServerTemporalFor(im->seqId);
+}
+
 static void drawPanelTemporal() {
     // a browser-fired aggregate (files nobody opened) owns the panel until
     // dismissed - it is the freshest thing the user asked for and has no
@@ -1761,6 +1775,7 @@ static void drawPanelTemporal() {
     // lone-frame A used to leave the whole panel blank while B, a full stack
     // with a perfectly good time axis, went unplotted.
     if (ImageDoc* Bim = abStatsB()) {
+        ensureAbServerTemporal(im);   // ...this branch returns before the ask below
         drawTemporalAB(im, Bim);
         return;
     }

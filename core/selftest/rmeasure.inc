@@ -506,6 +506,40 @@
                       S2.token == tAfterRe,
                   "M6i ...and re-measuring the stack the slot holds keeps it there: a "
                   "new number for the same stack, and no second ask behind it");
+
+            // ...and the same gate on the COMPARE path, which returns from
+            // drawPanelTemporal before the lone-stack branch that asks. Y is in
+            // the slot; compare goes on; A becomes X. abTemporalOf takes the
+            // server's numbers only for the side the slot is holding, so
+            // without an ask here X's column would quietly be a LOCAL
+            // computation over the frames that happen to be resident - printed
+            // beside B's in the same table, with nothing saying they are
+            // different quantities.
+            ImageDoc* bDoc = nullptr;
+            for (const auto& d : app.images)
+                if (d->seqId == seqOther) { bDoc = d.get(); break; }
+            if (bDoc) setCompareB(bDoc);
+            app.compareMode = App::CmpSplit;
+            selectStack(seqCur);                       // A <- X, the slot still Y's
+            const uint64_t tAb = S2.token;
+            const bool armed = abStatsB() != nullptr && S2.seqId == seqOther;
+            ensureAbServerTemporal(cur());             // what the compare branch calls
+            settle(120.0);
+            const App::TemporalState& T4 = localTemporal();
+            const AbTemporal A4 = abTemporalOf(cur(), T4, app.srvTemporal);
+            fprintf(stderr, "rmeasureselftest:   M6 compare: armed=%d slot %d valid=%d "
+                            "token %llu->%llu, A fromServer=%d sigma_t %.12g "
+                            "(X server %.12g, X local %.12g)\n",
+                    armed ? 1 : 0, S2.seqId, S2.valid ? 1 : 0, (unsigned long long)tAb,
+                    (unsigned long long)S2.token, A4.fromServer ? 1 : 0, A4.sigT[0],
+                    sigCur, T4.tempNoise[0]);
+            check(armed && S2.token != tAb && S2.seqId == seqCur && S2.valid &&
+                      A4.valid && A4.fromServer && A4.sigT[0] == sigCur,
+                  "M6j the A side of Compare asks for itself too - changing A while "
+                  "compare is on moves the slot to it, so its column is the server's "
+                  "numbers and not a fallback over the resident frames");
+            app.compareMode = App::CmpOff;
+            app.compareBUid = 0;
             closeAll();
         }
 
