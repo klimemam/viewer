@@ -2484,6 +2484,29 @@ static bool g_watchSuppressed = false;
                     else if (keyPhase == 5 && (op == "dbl" || op == "dbloff")) g_injMouseBtn = -1;
                     else if (keyPhase == 5 && op == "ctrlclick")
                         rio.AddKeyEvent(ImGuiMod_Ctrl, false);
+                } else if (op == "ctxclick") {
+                    // A real click on ONE ITEM of the row menu that is standing,
+                    // picked BY LABEL. rbCtxItem wrote down where each item
+                    // landed while the menu was being built, so this aims at the
+                    // pixels the user would aim at - the item, not the function
+                    // behind it. ("svtemp" fires a menu action directly and says
+                    // so; it does that because until this probe existed there
+                    // was no way to reach an item, and the ones it stands for
+                    // are not what is being asserted here.)
+                    if (keyPhase == 0) {
+                        int hitIdx = -1, k4 = 0;
+                        for (size_t x = 0, y; x < g_rbCtx.items.size(); x = y + 1, k4++) {
+                            y = g_rbCtx.items.find(';', x);
+                            if (y == std::string::npos) break;
+                            if (g_rbCtx.items.compare(x, y - x, sarg) == 0) hitIdx = k4;
+                        }
+                        if (hitIdx < 0 || hitIdx >= (int)g_rbCtx.centre.size())
+                            chk(false, "no such item: [" + g_rbCtx.items + "]");
+                        else
+                            g_injMouse = g_rbCtx.centre[hitIdx];
+                    }
+                    else if (keyPhase == 2) g_injMouseBtn = 0;
+                    else if (keyPhase == 3) g_injMouseBtn = -1;
                 } else if (op == "altleft" || op == "altright") {
                     // the keyboard mirror of mouse back/forward
                     ImGuiKey k2 = op == "altleft" ? ImGuiKey_LeftArrow : ImGuiKey_RightArrow;
@@ -2629,6 +2652,25 @@ static bool g_watchSuppressed = false;
                         // ...and the other half of the defect: a right-click
                         // context popup on a listing row.
                         g_injMouse = ImVec2(rbKeysT().toolbar.rowX, rbKeysT().toolbar.rowY);
+                    }
+                    else if (a == "rctxcur" && rbKeysT().cursorRect[1].y > 0) {
+                        // The same gesture aimed at the CURSOR's row instead of
+                        // the first one. "rctx" asks whether a popup opens at
+                        // all, which one fixed row answers; asking what a menu
+                        // CONTAINS needs to reach a folder row, a group row and
+                        // a file row, and the keyboard is what walks between
+                        // them.
+                        g_injMouse = ImVec2((rbKeysT().cursorRect[0].x +
+                                             rbKeysT().cursorRect[1].x) * 0.5f,
+                                            (rbKeysT().cursorRect[0].y +
+                                             rbKeysT().cursorRect[1].y) * 0.5f);
+                    }
+                    else if (a == "rdrshut") {
+                        // the Reader panel, put back to "never opened" - so the
+                        // check after a menu click is about THAT click and not
+                        // about a panel some earlier action left standing
+                        app.readerPanelOpen = false;
+                        app.readerPickPath.clear();
                     }
                     else if (a == "blur")  { g_browseKeysBlur = true;
                                              g_navKeyAtBlur = g_navKeyGlobal;
@@ -2950,6 +2992,47 @@ static bool g_watchSuppressed = false;
                             " list top " + std::to_string((int)g.listTopY) +
                             "  line=\"" + g.statusFull + "\"");
                     }
+                    else if (op == "chkctx") {
+                        // What the row menu that is up OFFERS, read back as the
+                        // text a human reads off it. Three spellings, because
+                        // three different things go wrong: "N" is the count (an
+                        // item that quietly disappeared when a new one was added
+                        // is the regression nobody notices), "+label" that a verb
+                        // is on this row, "-label" that it is NOT - a folder has
+                        // no business offering a one-file door.
+                        //
+                        // Judged only when the recording is from the frame just
+                        // drawn. A right-click that opened nothing leaves the
+                        // PREVIOUS row's menu standing in the probe, and every
+                        // "-label" would then pass by reading a menu that was
+                        // never on screen.
+                        const bool fresh = g_rbCtx.frame >= ImGui::GetFrameCount() - 2;
+                        int nit = 0;
+                        for (char c : g_rbCtx.items) if (c == ';') nit++;
+                        const bool byName = !sarg.empty() &&
+                                            (sarg[0] == '+' || sarg[0] == '-');
+                        const std::string want = byName ? sarg.substr(1) : std::string();
+                        bool has = false;
+                        for (size_t x = 0, y; x < g_rbCtx.items.size(); x = y + 1) {
+                            y = g_rbCtx.items.find(';', x);
+                            if (y == std::string::npos) break;
+                            if (g_rbCtx.items.compare(x, y - x, want) == 0) has = true;
+                        }
+                        chk(fresh && (!byName ? nit == arg
+                                              : sarg[0] == '+' ? has : !has),
+                            (fresh ? "" : "STALE ") + std::to_string(nit) +
+                            " item(s): [" + g_rbCtx.items + "]");
+                    }
+                    else if (op == "chkrdr") {
+                        // ...and where the door LED. §4.13.0's panel, standing
+                        // on the path that was right-clicked - the whole claim
+                        // the menu item makes.
+                        chk(app.readerPanelOpen &&
+                            app.readerPickPath.find(sarg) != std::string::npos,
+                            std::string(app.readerPanelOpen ? "reader panel open on \""
+                                                            : "reader panel CLOSED, path \"") +
+                            app.readerPickPath + "\"");
+                    }
                     else if (a[0] == 'w')  g_rbForceW = (float)atof(a.c_str() + 1);
                     // "h<px>" - a digit is required, or "home" and "hidep" would
                     // both be read as a height. It only bites while w<px> is on,
@@ -2961,10 +3044,11 @@ static bool g_watchSuppressed = false;
                     if (reproKey(a) != ImGuiKey_None) rio.AddKeyEvent(reproKey(a), false);
                 } else if (keyPhase == 2) {
                     if (a == "fmenu") g_injMouseBtn = 0;
-                    if (a == "rctx")  g_injMouseBtn = 1;
+                    if (a == "rctx" || a == "rctxcur") g_injMouseBtn = 1;
                 } else if (keyPhase == 4) {
                     g_injMouseBtn = -1;
-                } else if (keyPhase == 7 && (a == "fmenu" || a == "rctx" || a == "esc")) {
+                } else if (keyPhase == 7 && (a == "fmenu" || a == "rctx" ||
+                                             a == "rctxcur" || a == "esc")) {
                     // Escape must close a menu. ImGui only does that with
                     // keyboard nav on, which this app cannot have, so the File
                     // menu stayed up - and an open menu owns the keyboard, which

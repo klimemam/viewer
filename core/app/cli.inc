@@ -186,6 +186,13 @@ static bool g_bundledSelftest = false;
 // marklist / starmark / seterr / clrerr (baselines and a fake failure for the
 // drawer-removal checks below); mback / mfwd
 // (mouse buttons 4 / 5); svtemp (the group row's server-temporal request);
+// rctxcur (the right-click of "rctx", aimed at the CURSOR's row instead of the
+// first one, so a folder / group / file row can each be asked what its menu
+// holds); ctxclick:LABEL (a real click on the item of that menu whose label is
+// LABEL); chkctx:N | chkctx:+LABEL | chkctx:-LABEL (the menu that is up, read
+// back as text: how many items, and whether one is there or absent);
+// rdrshut (shut the Reader panel and forget its path) with chkrdr:NAME (it is
+// open on a path containing NAME);
 // viewreset (absolute grouped+list+folded+natural-name state - the toggles are
 // relative);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
@@ -460,6 +467,39 @@ static std::string g_browseKeysActs =
     "end,chkpin:a;b;c;,"
     "imgmark,pinclick,chkimgmark,chkpin:-,"
     "h0,w0,viewreset,back,waitdir:expset,back,waitdir:rb,"
+    // ---- "Open with reader..." on a row (docs/input-adapters.md §4.13) -----
+    // The reader had ONE way in from this panel: double-click something the
+    // viewer cannot read. That serves the file nobody can open and nobody
+    // else - there was no way to re-bind a file already bound to a reader,
+    // and no way at all to put a reader on a .npy, which opens natively and
+    // was therefore unreachable. The menu item is that door, and these lines
+    // are what "a door" means here: it is ON a file row, it is NOT on a
+    // folder or a group (a reader takes one file - §4.1), the verbs already
+    // on each row are all still there (the counts), and CLICKING it lands on
+    // the Reader panel standing on that path.
+    //
+    // The click is a real click at the item's own rectangle, not a call to
+    // the function behind it: "the menu offers it" and "the menu item works"
+    // are two claims, and a test that fires the action directly makes only
+    // the second one.
+    //
+    // rb/ in the default view: 0 "..", 1-6 the folders, 7 dark.npy,
+    // 8 flat.npy, 9 the frame_000..023 group, 10 notes.txt.
+    "home,down,down,down,down,down,down,down,chkatrow:dark.npy,"
+    // a file this viewer reads natively - the case that had NO entrance
+    "rctxcur,chkctx:6,chkctx:+Open with reader...,esc,"
+    // ...a GROUP row: a reader is handed one path, so this is not its row
+    "down,down,chkatrow:frame_000\xE2\x80\xA5" "023.npy,"
+    "rctxcur,chkctx:5,chkctx:-Open with reader...,esc,"
+    // ...and a FOLDER, same reason
+    "home,down,chkatrow:digitset,rctxcur,chkctx:4,chkctx:-Open with reader...,esc,"
+    // ...and the row that had the double-click entrance keeps it AND gains
+    // the explicit one, beside the disabled "Open" that says why
+    "end,chkatrow:notes.txt,rctxcur,chkctx:4,chkctx:+Open with reader...,esc,"
+    // the door itself: shut the panel, click the item, and it is open on the
+    // path that was right-clicked
+    "home,down,down,down,down,down,down,down,chkatrow:dark.npy,"
+    "rdrshut,rctxcur,ctxclick:Open with reader...,chkrdr:dark.npy,"
     // ...and LAST the root-level popup collision: open the RAW dialog for a
     // QUEUE, then ask for the sequence prompt, which is the other root-level
     // modal. The RAW dialog must survive - which is why this runs last: it
