@@ -1210,6 +1210,102 @@
             forgetReader(url);            // the memo is shared prefs; leave none
         }
 
+        {   // ---- R18: the same file Loaded TWICE comes back twice -------------
+            //
+            // #219 review r3794522023. The Reader panel's Load is repeatable, so
+            // a session can hold the same path - or the same url - twice, as two
+            // independent groups with their own ranges. The restore asked "is
+            // any open image's path this one", which every line of the SECOND
+            // group answered yes to: it skipped its run, resolved onto the first
+            // group's documents, and wrote its saved range over theirs. Half the
+            // session simply did not come back.
+            //
+            // The witnesses are the RANGE and the LUT, because per-group display
+            // state is what the review says is overwritten: group 1 is left at
+            // 10/100 lut 3 and group 2 at 20/200 lut 5, and a restore that lost
+            // the grouping cannot produce both.
+            //
+            // What this reader produces matters, and is why the first fix did
+            // not work: perm.py:load returns a 3-frame STACK, and a stack is one
+            // session LINE (isSavedLine) over three documents whose (path,
+            // member) are identical. So "has this run an unclaimed DOCUMENT for
+            // my member" still answered yes to the second group - it found the
+            // first group's frames 1 and 2. The claim has to be per line, which
+            // means per stack. A reader whose output were three loose documents
+            // would never have shown it.
+            //
+            // Both restores go through the reader CACHE (the setup's own two
+            // Loads filled it), which is the review's "cache経由でも後続group
+            // を失わない": a cache hit must not be a reason to fold the groups.
+            const std::string spec = rdPerm + ":load";
+            auto twoGroups = [&](const std::string& what, bool remote, const char* tag0,
+                                 const char* tag1, const char* tag2, const char* tag3) {
+                closeAll();
+                const std::string e1 = remote ? openRemoteWithReader(what, spec)
+                                              : openWithReader(what, spec);
+                const std::string e2 = remote ? openRemoteWithReader(what, spec)
+                                              : openWithReader(what, spec);
+                check(e1.empty() && e2.empty() && app.images.size() == (size_t)(2 * S), tag0);
+                if (app.images.size() != (size_t)(2 * S)) return;
+                auto wantBlack = [&](int i) { return i < S ? 10.0f : 20.0f; };
+                auto wantWhite = [&](int i) { return i < S ? 100.0f : 200.0f; };
+                auto wantLut   = [&](int i) { return i < S ? 3 : 5; };
+                for (int i = 0; i < 2 * S; i++) {
+                    app.images[i]->black = wantBlack(i);
+                    app.images[i]->white = wantWhite(i);
+                    app.images[i]->displayLut = wantLut(i);
+                }
+                const std::string sess = root + (remote ? "/twice-r.vsession"
+                                                        : "/twice-l.vsession");
+                saveSession(sess, true);
+                closeAll();
+                const int runsBefore = g_adapterRuns;
+                const std::string re = loadSession(sess);
+                fprintf(stderr, "rreaderselftest:   R18 %s: err=\"%s\" %zu doc(s) "
+                                "runs %d -> %d |",
+                        remote ? "peer" : "local", re.c_str(), app.images.size(),
+                        runsBefore, g_adapterRuns);
+                for (const auto& d : app.images)
+                    fprintf(stderr, " %g/%g lut%d", (double)d->black, (double)d->white,
+                            d->displayLut);
+                fprintf(stderr, "\n");
+                check(re.empty() && app.images.size() == (size_t)(2 * S), tag1);
+                bool split = app.images.size() == (size_t)(2 * S);
+                for (int i = 0; i < 2 * S && split; i++)
+                    if (app.images[i]->black != wantBlack(i) ||
+                        app.images[i]->white != wantWhite(i) ||
+                        app.images[i]->displayLut != wantLut(i)) split = false;
+                check(split, tag2);
+                // Two groups, and two SEQUENCES: the second Load is a group of
+                // its own, not extra frames appended to the first one's stack.
+                std::vector<int> seqs;
+                for (const auto& d : app.images)
+                    if (d->seqId != 0 &&
+                        std::find(seqs.begin(), seqs.end(), d->seqId) == seqs.end())
+                        seqs.push_back(d->seqId);
+                check(seqs.size() == 2, tag3);
+                check(g_adapterRuns == runsBefore,
+                      remote ? "R18h ...and no adapter ran HERE either way"
+                             : "R18d ...both groups came back through the reader CACHE");
+                closeAll();
+            };
+            forgetReader(origin);
+            twoGroups(origin, false,
+                      "R18a (setup) the local door Loads one file twice: two groups",
+                      "R18b ...and a restore brings BOTH groups back",
+                      "R18c ...each with its own range and LUT, not the first group's twice",
+                      "R18e ...as two stacks, not one stack of six frames");
+            forgetReader(origin);
+            forgetReader(url);
+            twoGroups(url, true,
+                      "R18f (setup) the peer's door does the same over the link",
+                      "R18g ...and that restore brings both groups back too",
+                      "R18i ...with the range and LUT still one set per group",
+                      "R18j ...and two stacks over the link as well");
+            forgetReader(url);
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

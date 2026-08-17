@@ -2281,6 +2281,77 @@ static std::string loadSession(const std::string& path) {
         while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) p.pop_back();
         return p;
     };
+    // ---- WHICH RUN of a reader a line belongs to (#219 review) --------------
+    //
+    // One reader run rebuilds every document that file produced and the session
+    // carries one line per document, so a line whose doc is already here must
+    // not run the reader a second time. That question used to be asked as "is
+    // any open image's path this one", which is right for ONE group and wrong
+    // for two: the Reader panel's Load is repeatable, so a session can hold the
+    // same path (or the same url) twice, as two independent groups with their
+    // own ranges, LUTs and crops. Every line of the second group then found the
+    // FIRST group's documents, skipped its run, and resolved onto them - the
+    // second set of documents never came back, and its saved state overwrote
+    // the first set's.
+    //
+    // So it is asked per GROUP and per OCCURRENCE instead: a line belongs to the
+    // newest run of its path that still has an UNCLAIMED LINE for the member it
+    // names. When there is none - because the previous group's documents are all
+    // spoken for - the reader runs again, and that second run is what makes the
+    // second Load come back as a second group.
+    //
+    // "Unclaimed LINE", not "unclaimed document", and that distinction is the
+    // whole of it: a stack contributes exactly ONE line to the file (isSavedLine
+    // - the frame it was left on) while contributing N documents to app.images,
+    // and its frames share both halves of (path, member). Counting documents
+    // therefore lets a three-frame group answer three lines, so the second Load
+    // of a stack-producing reader still found room in the first group and never
+    // ran. A line claims the whole stack it lands on; the run is used up when
+    // every stack and every lone document in it is spoken for.
+    //
+    // Both doors, deliberately: codex's補足2 - the local branch had the same
+    // path-only test as the remote one, so the two would have disagreed about
+    // what a repeated Load restores to.
+    struct ReaderRestoreRun {
+        std::string path;
+        size_t from = 0;             // where in app.images this run's documents start
+        std::vector<int> takenSeq;   // ...which of its STACKS a line already holds
+        std::vector<int> takenDoc;   // ...and which of its lone docs, by index
+    };
+    std::vector<ReaderRestoreRun> readerRuns;
+    // The first document of the unclaimed line for (path, member) in the NEWEST
+    // run of that path, or -1 when that run is used up (which is what "a new
+    // group starts here" looks like from a line). The FIRST, because that is
+    // where a line's display state goes and loadSession spreads it over the
+    // stack from there - the same rule sessionDocAt states for the plain case.
+    auto readerSlot = [&](const std::string& path, const std::string& member,
+                          ReaderRestoreRun** runOut) -> int {
+        for (size_t i = readerRuns.size(); i-- > 0;) {
+            ReaderRestoreRun& r = readerRuns[i];
+            if (r.path != path) continue;
+            for (int k = (int)r.from; k < (int)app.images.size(); k++) {
+                const ImageDoc* d = app.images[k].get();
+                if (d->preview || d->src->path != path || d->src->member != member) continue;
+                const std::vector<int>& t = d->seqId != 0 ? r.takenSeq : r.takenDoc;
+                const int id = d->seqId != 0 ? d->seqId : k;
+                if (std::find(t.begin(), t.end(), id) != t.end()) continue;
+                if (runOut) *runOut = &r;
+                return k;
+            }
+            return -1;               // the newest run has no room: a NEW group
+        }
+        return -1;
+    };
+    auto readerSlotTake = [&](const std::string& path, const std::string& member) {
+        ReaderRestoreRun* run = nullptr;
+        const int at = readerSlot(path, member, &run);
+        if (at >= 0 && run) {
+            const ImageDoc* d = app.images[at].get();
+            if (d->seqId != 0) run->takenSeq.push_back(d->seqId);
+            else               run->takenDoc.push_back(at);
+        }
+        return at;
+    };
     while (std::getline(ss, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
@@ -2767,6 +2838,7 @@ static std::string loadSession(const std::string& path) {
             ls >> bk >> wt >> kind;
             std::string err;
             const size_t docsBefore = app.images.size();   // "did this line open anything"
+            bool readerLine = false;      // ...and is it a line a READER rebuilds (#219)
             if (kind == "raw3" || kind == "raw2" || kind == "raw") {
                 RawDialog d;
                 int le = 1, col = 0;
@@ -2831,14 +2903,17 @@ static std::string loadSession(const std::string& path) {
                 if (remoteReaderDoc && !remoteMemo.empty()) {
                     // ONE run rebuilds every doc that reader produced, and the
                     // session carries one line per doc - the local door's
-                    // reasoning, and its dedupe, unchanged (a six-frame series
-                    // would otherwise come back six times over). The RUN itself
-                    // is the one stage 1 built: the peer answers a repeat out of
-                    // its cache, so a restore does not re-execute Python either.
-                    bool already = false;
-                    for (const auto& d : app.images)
-                        if (d->src->path == p) { already = true; break; }
+                    // reasoning (a six-frame series would otherwise come back
+                    // six times over). Asked of THIS line's group, not of every
+                    // image sharing the url: see readerSlot (#219 review). The
+                    // RUN itself is the one stage 1 built: the peer answers a
+                    // repeat out of its cache, so a restore does not re-execute
+                    // Python either.
+                    readerLine = true;
+                    const bool already = readerSlot(p, pendingMember, nullptr) >= 0;
                     err = already ? std::string() : openRemoteWithReader(p, remoteMemo);
+                    if (!already && err.empty())
+                        readerRuns.push_back(ReaderRestoreRun{ p, docsBefore, {} });
                 } else if (remoteReaderDoc) {
                     // No memo: NAME it and stop. Not a picker, not a request -
                     // the peer is not even asked, because "may this reader run"
@@ -2883,13 +2958,16 @@ static std::string loadSession(const std::string& path) {
                     if (!rspec.empty()) {
                         // ONE reader run rebuilds every doc that file produced,
                         // but the session carries one line per doc. Run it for
-                        // the first line and let the rest recognise their own
-                        // pixels as already present - otherwise a six-frame
-                        // series comes back six times over.
-                        bool already = false;
-                        for (const auto& d : app.images)
-                            if (d->src->path == p) { already = true; break; }
+                        // the first line of a GROUP and let the rest recognise
+                        // their own pixels as already present - otherwise a
+                        // six-frame series comes back six times over. Per group,
+                        // not per path: the same file opened twice in one
+                        // session is two groups (#219 review, codex 補足2).
+                        readerLine = true;
+                        const bool already = readerSlot(p, pendingMember, nullptr) >= 0;
                         err = already ? std::string() : openWithReader(p, rspec);
+                        if (!already && err.empty())
+                            readerRuns.push_back(ReaderRestoreRun{ p, docsBefore, {} });
                     } else if (isNpz)
                         err = loadNpz(p, pendingMember, pendingRead);
                     else if (imagefile::forPath(p))
@@ -2919,8 +2997,11 @@ static std::string loadSession(const std::string& path) {
                     if (app.images.size() > docsBefore) {
                         // it opened something: the line's doc is among what IT
                         // added, never among the docs already here (a file may
-                        // legitimately be opened twice in one session).
-                        int at = sessionDocAt(p, pendingMember, docsBefore);
+                        // legitimately be opened twice in one session). For a
+                        // reader line the same sentence is said by the RUN:
+                        // its slot, claimed so no later line can take it twice.
+                        int at = readerLine ? readerSlotTake(p, pendingMember)
+                                            : sessionDocAt(p, pendingMember, docsBefore);
                         if (at >= 0) selectImage(at);
                         else if (!pendingMember.empty()) {
                             // The line NAMED a member and that member is not
@@ -2970,8 +3051,12 @@ static std::string loadSession(const std::string& path) {
                         }
                     } else {
                         // it opened NOTHING and did not fail: the already-here
-                        // dedupe. Only a doc that is already open can be meant.
-                        int at = sessionDocAt(p, pendingMember, 0);
+                        // dedupe. Only a doc that is already open can be meant -
+                        // and for a reader line, only one in ITS OWN run, which
+                        // is the whole of #219's fix: searching from 0 sent the
+                        // second group's lines onto the first group's documents.
+                        int at = readerLine ? readerSlotTake(p, pendingMember)
+                                            : sessionDocAt(p, pendingMember, 0);
                         if (at >= 0) selectImage(at);
                         else err = (pendingMember.empty() ? std::string("the pixels")
                                                           : "member " + pendingMember) +
