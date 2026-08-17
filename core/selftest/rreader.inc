@@ -161,7 +161,7 @@
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "R1a the peer speaks the protocol this build does (12)");
+                  "R1a the peer speaks the protocol this build does (14)");
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);

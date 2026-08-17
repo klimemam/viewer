@@ -144,7 +144,7 @@
         app.remoteExe = exe;
         if (!connect()) return 1;
         check(app.uiSession.peerVersion() == (int)rp::VERSION,
-              "R14a the peer speaks the protocol this build does (13)");
+              "R14a the peer speaks the protocol this build does (14)");
 
         // ---- R14: the same file, both doors -----------------------------------
         {

@@ -210,7 +210,40 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // that moment a peer announcing 12 is a peer that has no MSG_NPZ_SCAN. Sharing
 // the number would make "refuse before you send" unwritable, which is the one
 // discipline this header does not bend.
-static const uint32_t VERSION = 13;
+//
+// 14: MEASURE REACHES ONE ARRAY INSIDE A MATERIALISATION (issue #180 stage 5,
+// docs/remote-reader-design.md §8). Twelve and 13 taught META and TILE to
+// address a reader's node and a .npz member; MEASURE could still only name
+// FILES, so the one thing a document opened that way could not do was the thing
+// the link exists for - have its statistics computed where its pixels are. The
+// aggregate ops take the same [str key][u32 node] the other two do, declared by
+// MeasureReqHead::flags bit1 (MRF_KEYED) and written after the rois.
+//
+// FRAMING, like 7, 8, 12 and 13: no answer a v13 peer already gives changes
+// meaning, and every request an older client sends is byte for byte what it was
+// (`flags` bit1 was reserved-0, and the block only exists when the bit is set).
+//
+// It has to be a number, and here BOTH failure modes this header collects are
+// in play at once. A v13 peer does not refuse the keyed block - it never reads
+// it - and what it does with the rest of the request depends on what the
+// request says the subject is:
+//   nPaths 0  it answers "bad MEASURE header", a sentence about a malformed
+//             request for a limit that belongs to its build (#148's shape);
+//   nPaths 1  it would measure THE ORIGIN PATH - the .npz whole, or the file a
+//             reader was pointed at - and answer with a sigma_t computed over
+//             bytes the user never opened, under the label of the document they
+//             are looking at. That is #124 exactly, and it is why the client
+//             sends no path at all for a keyed measurement and refuses before
+//             it sends (rp::measureKeyedTooOldText).
+//
+// Why not "inside 13": §10.7's rule again, and it decides this the same way it
+// decided the line above. Thirteen shipped (#217 / #180 stage 3, PR #221)
+// before this was built, so a peer announcing 13 is a peer whose MEASURE knows
+// nothing of a key - and sharing its number would make the refusal above
+// unwritable. The design assigned this bit the value 2 when it expected to
+// arrive inside 12 (§4.2's MRF_READER); the VALUE is kept, because no byte of
+// it has ever been on a wire, and only the number that gates it moves.
+static const uint32_t VERSION = 14;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)

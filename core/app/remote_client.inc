@@ -486,8 +486,21 @@ static void mWorker() {
                 q.op = job.op;
                 q.cfaType = job.cfaType; q.cfaPattern = job.cfaPattern;
                 q.black = job.black; q.white = job.white;
-                if (job.files.empty()) q.paths = { rpath };
-                else                   q.paths = job.files;   // one file per frame
+                // The subject: one array inside a materialisation, or files.
+                // Never both - a keyed request carries no path at all, which is
+                // what keeps a peer that predates 14 from measuring the origin
+                // (the whole .npz, or the file a reader was pointed at) and
+                // answering under this document's name.
+                if (!job.key.empty()) {
+                    q.hasKeyed = true;
+                    q.keyed.key = job.key;
+                    q.keyed.node = job.node;
+                    q.keyed.kind = job.keyKind;
+                } else if (job.files.empty()) {
+                    q.paths = { rpath };
+                } else {
+                    q.paths = job.files;                      // one file per frame
+                }
                 if (job.rw > 0 && job.rh > 0)
                     q.rois.push_back({ job.rx, job.ry, job.rw, job.rh });
                 q.hasRecipe = job.hasRecipe;

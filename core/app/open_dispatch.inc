@@ -448,11 +448,34 @@ std::string makeRemoteUrl(const std::string& host, const std::string& path, int 
     return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
 }
 
+// This stack's subject when it is ONE ARRAY INSIDE A MATERIALISATION - a node
+// of what a reader produced on the peer, or a member of a container it listed
+// (protocol 12/13, measured since 14). It is read off the DOCUMENTS rather than
+// off SeqInfo because that is where the four fields live and are kept in step
+// (remoteTreeRefine writes them, rfInheritRead carries them to every sibling
+// frame): a stack whose head says "key k, node n" IS that array, and a second
+// copy of the answer on the stack row is a second thing to keep true.
+//
+// It is also what makes a reader's stack answerable at all. The documents a
+// tree lands as are built by vnzBuild, so their SeqInfo carries no remoteUrl -
+// nothing about the stack row says "these pixels are over there" - and without
+// this the one thing the link exists for would be the one thing that stack
+// could not do.
+static const FrameSource* stackKeyedSubject(int seqId) {
+    if (seqId == 0) return nullptr;
+    for (const auto& d : app.images)
+        if (d->seqId == seqId && d->src && !d->src->remoteKey.empty() &&
+            !d->src->remoteUrl.empty())
+            return d->src.get();
+    return nullptr;
+}
+
 // Does analysis of this stack run on the server? Yes for remote data unless the
 // user chose local-fetch. (Single-frame policy nuance lives in the Analysis
 // panel; this is the stack-aggregate decision.)
 static bool serverComputes(const App::SeqInfo& si) {
-    if (si.remoteUrl.empty() && si.remoteFiles.empty()) return false;   // local data
+    if (si.remoteUrl.empty() && si.remoteFiles.empty() && !stackKeyedSubject(si.id))
+        return false;                                                   // local data
     return app.procPolicy != App::PolLocalFetch;
 }
 
@@ -480,7 +503,18 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
     j.cfaType = si->cfaType; j.cfaPattern = si->cfaPattern;
-    if (!si->remoteFiles.empty()) {
+    // The subject, in the order that decides it. A KEY wins over both path
+    // forms and is not merely added to them: for a .npz member the url names
+    // the CONTAINER, so a request that also carried the path would have the
+    // peer measure the whole file - which is what it did before protocol 14,
+    // and it came back as "not a .npy file" rather than as a wrong number only
+    // because a container happens not to open as one array.
+    if (const FrameSource* kd = stackKeyedSubject(seqId)) {
+        j.url = kd->remoteUrl;        // the HOST to ask; no path goes on the wire
+        j.key = kd->remoteKey;
+        j.node = kd->remoteNode;
+        j.keyKind = kd->remoteKeyKind;
+    } else if (!si->remoteFiles.empty()) {
         j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0], si->remotePort);
         for (const auto& f : si->remoteFiles) j.files.push_back(f);
     } else {
@@ -2496,6 +2530,7 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
 static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
                              int n, const std::string& key, int kind,
                              const std::map<int, int>& stepOf) {
+    int firstStack = 0;
     for (int i = 0; i < n; i++) {
         const VnzNode& v = nodes[(size_t)i];
         if (v.docFirst < 0 || v.docCount <= 0) continue;
@@ -2513,8 +2548,16 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
             S.remoteKeyKind = kind;
             S.remoteProto = app.uiSession.peerVersion();
             if (step > 1) requestFullRemote(d);
+            if (!firstStack && d->seqId) firstStack = d->seqId;
         }
     }
+    // ...and now that the documents say where their pixels live, ask the peer
+    // for the stack aggregate - the same call openRemote makes the moment IT
+    // mints a remote stack (#180 stage 5). ONE stack, because app.srvTemporal
+    // is one slot: a series would otherwise fire N measurements of which N-1
+    // are overwritten before anyone reads them, and the one that survives would
+    // be the last node rather than the one on screen.
+    if (firstStack) maybeRequestServerTemporal(firstStack);
 }
 
 // The whole round trip, synchronously. The door the selftests and a session

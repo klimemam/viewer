@@ -1618,15 +1618,27 @@ static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
     return true;
 }
 
-// One request's subject: a path on this disk, or one array inside something
-// this peer materialised. Both end as a ServedFile, which is why META and TILE
-// below each grew one line and nothing else.
+// ONE ARRAY INSIDE SOMETHING THIS PEER MATERIALISED, whatever asked for it.
 //
 // WHICH materialisation is asked of the cache, not of the wire (§10.5). A
 // reader's output and a listed .npz are addressed identically on purpose - the
 // trailer says "key, node" and means it - so this is the one place that has to
 // know there are two kinds, and it learns it from the note the peer wrote when
 // it issued the key.
+//
+// A function rather than three lines inside openRequested, because MEASURE
+// reaches it too since protocol 14: the subject of a keyed measurement is
+// resolved by exactly this, so a statistic and a tile of the same [key][node]
+// cannot come from two different arrays.
+static bool openKeyed(ServedFile& n, const std::string& key, uint32_t node,
+                      std::string& err) {
+    if (keyIsNpz(key)) return openNpzMember(n, key, node, err);
+    return openReaderCache(n, key, node, err);
+}
+
+// One request's subject: a path on this disk, or one array inside something
+// this peer materialised. Both end as a ServedFile, which is why META and TILE
+// below each grew one line and nothing else.
 static bool openRequested(ServedFile& n, const std::string& path, const ReqTrailers& t,
                           int read, std::string& err) {
     if (!t.haveKey) return openServed(n, path, err, read, t.haveRw ? &t.rw : nullptr);
@@ -1639,8 +1651,7 @@ static bool openRequested(ServedFile& n, const std::string& path, const ReqTrail
               "materialisation";
         return false;
     }
-    if (keyIsNpz(t.key)) return openNpzMember(n, t.key, t.node, err);
-    return openReaderCache(n, t.key, t.node, err);
+    return openKeyed(n, t.key, t.node, err);
 }
 
 static void handleMeta(Buf& in) {
@@ -1844,6 +1855,16 @@ std::string planeKey(const char* base, uint32_t cfaType, int plane) {
     return cfaType ? std::string(base) + " " + PLANE_NAMES[plane] : std::string(base);
 }
 
+// The subject of a MEASURE when it is not a file (protocol 14, MRF_KEYED): one
+// array inside something this peer materialised. The pair travels with the
+// SAME meaning it has on META and TILE, and it is resolved by the same function
+// (openKeyed), so a stack's sigma_t and its pixels cannot come from two
+// different arrays.
+struct MeasureKey {
+    std::string key;
+    uint32_t node = 0;
+};
+
 // Frames from one frame-axis file, or one file per frame; ROI rows only, so the
 // disk pays for the region, not the file.
 struct FrameSource {
@@ -1860,13 +1881,23 @@ struct FrameSource {
     // that reason, on the client, before it is sent.
     const RawWire* recipe = nullptr;
 
+    // `kd` (optional) makes the subject one array inside a materialisation
+    // instead of `p` - which is then EMPTY, because a keyed request carries no
+    // path at all. The frame axis, the range check and read() below are
+    // untouched by which of the two opened the ServedFile: that is the point of
+    // the shape, and it is why MOP_TEMPORAL_STATS and MOP_FRAME_ROI_STATS
+    // needed no arithmetic of their own for stage 5.
     bool init(const MeasureReqHead& h, const std::vector<std::string>& p,
-              const RawWire* rec) {
+              const RawWire* rec, const MeasureKey* kd = nullptr) {
         head = &h;
         paths = &p;
         recipe = rec;
-        perFile = p.size() > 1;
-        if (!openServed(n, p[0], err, NR_NATIVE, recipe)) return false;
+        perFile = !kd && p.size() > 1;
+        if (kd) {
+            if (!openKeyed(n, kd->key, kd->node, err)) return false;
+        } else if (!openServed(n, p[0], err, NR_NATIVE, recipe)) {
+            return false;
+        }
         if (perFile) {
             count = (uint32_t)p.size();
         } else {
@@ -1978,9 +2009,10 @@ static void sendMeasureReply(uint32_t framesUsed,
 // the two on the same stack rather than trusting that they look alike.
 static void runTemporalStats(const MeasureReqHead& head,
                              const std::vector<std::string>& paths,
-                             const std::vector<RoiRect>& rois, const RawWire* rec) {
+                             const std::vector<RoiRect>& rois, const RawWire* rec,
+                             const MeasureKey* kd) {
     FrameSource src;
-    if (!src.init(head, paths, rec)) { sendErr(src.err); return; }
+    if (!src.init(head, paths, rec, kd)) { sendErr(src.err); return; }
     if (src.count < 2) { sendErr("temporal stats needs at least 2 frames"); return; }
     if (head.cfaType && src.n.ch != 1) {
         sendErr("CFA planes need a 1-channel frame");   // planes over RGB = nonsense
@@ -2109,9 +2141,10 @@ static void runTemporalStats(const MeasureReqHead& head,
 // linearity curves, ~50 KB for 300 frames x 5 ROIs instead of gigabytes.
 static void runFrameRoiStats(const MeasureReqHead& head,
                              const std::vector<std::string>& paths,
-                             const std::vector<RoiRect>& rois, const RawWire* rec) {
+                             const std::vector<RoiRect>& rois, const RawWire* rec,
+                             const MeasureKey* kd) {
     FrameSource src;
-    if (!src.init(head, paths, rec)) { sendErr(src.err); return; }
+    if (!src.init(head, paths, rec, kd)) { sendErr(src.err); return; }
     if (head.cfaType && src.n.ch != 1) {
         sendErr("CFA planes need a 1-channel frame");
         return;
@@ -2815,9 +2848,22 @@ static void handleMeasure(Buf& in) {
     if (in.rd + sizeof head > in.b.size()) { sendErr("bad MEASURE"); return; }
     memcpy(&head, in.b.data() + in.rd, sizeof head);
     in.rd += sizeof head;
-    if (head.nPaths == 0 || head.nPaths > 100000 || head.nRois > 4096 ||
+    // The subject is ONE ARRAY INSIDE A MATERIALISATION and there is no path in
+    // this request (protocol 14). Gated on the SERVED version, so the
+    // VIEWER_SERVE_PROTOCOL seam keeps testing a peer that could exist: told to
+    // be a 13, this answers "bad MEASURE header" below - which is exactly what
+    // a real v13 answers a request with no paths in it, and exactly why the
+    // client refuses from the number instead of sending and reading that back.
+    const bool keyed = (head.flags & MRF_KEYED) && servedVersion() >= 14;
+    if ((head.nPaths == 0 && !keyed) || head.nPaths > 100000 || head.nRois > 4096 ||
         head.cfaType > 2 || head.cfaPattern > 3) {
         sendErr("bad MEASURE header");
+        return;
+    }
+    // ...and a key WITH paths is two subjects. Refused rather than resolved by
+    // precedence: whichever this peer picked, the other end meant the other one.
+    if (keyed && head.nPaths != 0) {
+        sendErr("a keyed measurement addresses one array, not a list of files");
         return;
     }
     std::vector<std::string> paths(head.nPaths);
@@ -2844,8 +2890,34 @@ static void handleMeasure(Buf& in) {
         haveMrw = true;
     }
     const RawWire* mrwp = haveMrw ? &mrw : nullptr;
-    if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois, mrwp); return; }
-    if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois, mrwp); return; }
+    // ...and the key behind the recipe, in BIT ORDER - the same rule the META /
+    // TILE trailer keeps, for the same reason: two optional blocks cannot share
+    // one "if bytes remain".
+    MeasureKey mkey;
+    if (keyed) {
+        if (!in.getStr(mkey.key) || !in.getU32(mkey.node)) {
+            sendErr("truncated keyed trailer");
+            return;
+        }
+        // Two declarations of what the pixels ARE. The words are META's, so a
+        // person meets one sentence for one mistake wherever they meet it.
+        if (haveMrw) {
+            sendErr("a raw recipe does not apply to an array inside a materialisation");
+            return;
+        }
+        // The ops whose own blocks name FILES. The client refuses these before
+        // sending; this end refuses them too, because a peer that measured the
+        // wrong bytes on a request it half-understood is the failure the whole
+        // trailer discipline exists to prevent.
+        if (head.op != MOP_TEMPORAL_STATS && head.op != MOP_FRAME_ROI_STATS) {
+            sendErr("this measure op addresses files, and this request addresses one "
+                    "array inside something this peer materialised");
+            return;
+        }
+    }
+    const MeasureKey* mkp = keyed ? &mkey : nullptr;
+    if (head.op == MOP_TEMPORAL_STATS)  { runTemporalStats(head, paths, rois, mrwp, mkp); return; }
+    if (head.op == MOP_FRAME_ROI_STATS) { runFrameRoiStats(head, paths, rois, mrwp, mkp); return; }
     if (head.op == MOP_PLUGIN_ANALYZE) {
         // The parity block, read AFTER the rois so that nothing an older op
         // parses moved. A truncated one is a bad request, not a parity failure:
