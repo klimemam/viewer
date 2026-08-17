@@ -1129,23 +1129,18 @@ static bool vnzParseRefs(const std::string& js, std::vector<VnzRef>& out,
 // things it might. Two carriers of one format that check different amounts is
 // the defect #71 named ("a second copy is a copy that drifts") wearing a
 // validator's clothes.
+// The sentences moved to core/vstream.h when the PEER gained a reason to say
+// them (issue #180): a reader now runs on the far end and what it wrote is
+// checked there, before a key for it is ever handed back. This projection is
+// what keeps that one implementation - a tree is a layer and a parent, and
+// everything else a VnzNode carries is about what the node HOLDS.
 static std::string vnzCheckTree(const std::vector<VnzNode>& nodes, int n) {
-    if (n < 0 || (size_t)n > nodes.size()) return "the node count does not match the nodes";
-    for (int i = 0; i < n; i++) {
-        const VnzNode& v = nodes[(size_t)i];
-        const std::string si = std::to_string(i);
-        if (v.layer != "frame" && v.layer != "stack" && v.layer != "series" &&
-            v.layer != "batch" && v.layer != "analysisset")
-            return "node " + si + " is a \"" + v.layer + "\": not a layer "
-                   "(frame / stack / series / batch / analysisset)";
-        if (i == 0 && v.parent != -1)
-            return "node 0's parent is " + std::to_string(v.parent) +
-                   ": node 0 is the root (-1)";
-        if (i != 0 && (v.parent < 0 || v.parent >= i))
-            return "node " + si + "'s parent is " + std::to_string(v.parent) +
-                   ": a parent must be an earlier node (depth first, root 0)";
+    std::vector<vns::TreeNode> t(nodes.size());
+    for (size_t i = 0; i < nodes.size(); i++) {
+        t[i].layer = nodes[i].layer;
+        t[i].parent = nodes[i].parent;
     }
-    return {};
+    return vns::checkTree(t, n);
 }
 
 static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int version) {
@@ -1286,25 +1281,29 @@ static std::string vnsUnescape(const std::string& s) {
     return o;
 }
 
-static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
-                                    const std::string& origin,
-                                    const FrameSource& originStat) {
-    std::ifstream f(pathFromUtf8(path), std::ios::binary);
-    if (!f) return "cannot open what the reader wrote: " + path;
+// The header of a framed stream, whatever is carrying it. TWO carriers now:
+// the cache file this process wrote (loadViewerStream, below) and the header
+// text a PEER returned verbatim when it ran the reader on its own machine
+// (issue #180 - the bytes stay there, the header travels). One parser, because
+// the fields it reads are what a DOCUMENT is made of - the layer, the axes, the
+// unit, the note, the cfa, the range - and a reader that produced one document
+// must not produce two different ones depending on which end ran it.
+static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode>& nodes,
+                                  int& n, std::vector<VnzBlob>& blobs,
+                                  std::vector<std::pair<std::string, std::string>>& meta) {
     std::string line;
+    ver = 0;
+    n = -1;
+    nodes.clear();
+    blobs.clear();
+    meta.clear();
     if (!std::getline(f, line)) return "the reader produced nothing";
     if (!line.empty() && line.back() == '\r') line.pop_back();
-    int ver = 0;
     if (sscanf(line.c_str(), "VIEWERSTREAM %d", &ver) != 1)
         return "not a viewer stream: first line is \"" + line.substr(0, 60) + "\"";
     if (ver > VIEWER_STREAM_VERSION)
         return "this stream is version " + std::to_string(ver) + " and this viewer reads " +
                std::to_string(VIEWER_STREAM_VERSION);
-
-    std::vector<VnzNode> nodes;
-    std::vector<VnzBlob> blobs;
-    std::vector<std::pair<std::string, std::string>> meta;
-    int n = -1;
     auto need = [&](int i) -> VnzNode* {
         if (i < 0 || i >= n) return nullptr;
         return &nodes[(size_t)i];
@@ -1388,6 +1387,20 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
         std::string serr = vnzCheckSets(nodes, n, ver);
         if (!serr.empty()) return serr;
     }
+    return {};
+}
+
+static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
+                                    const std::string& origin,
+                                    const FrameSource& originStat) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote: " + path;
+    int ver = 0, n = -1;
+    std::vector<VnzNode> nodes;
+    std::vector<VnzBlob> blobs;
+    std::vector<std::pair<std::string, std::string>> meta;
+    std::string herr = vnsParseHeader(f, ver, nodes, n, blobs, meta);
+    if (!herr.empty()) return herr;
 
     // The blobs follow, in order. Read one, hand it to the same decoder a loose
     // .npy goes through, move on: only one blob is in memory at a time.

@@ -10,6 +10,13 @@
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
+        // docs/remote-reader-design.md §2. The consent for "code sent from a
+        // client may run on this machine" belongs to whoever STARTED this
+        // process, and the only thing that carries their decision this far is
+        // the argv they wrote. Default closed: on the day a transport arrives
+        // whose far end is not already a shell (the WebSocket front core/
+        // serve.cpp's handler note is written for), doing nothing must be safe.
+        if (!strcmp(argv[i], "--serve-readers")) rp::setServeReaders(true);
         // The client compares this against its own protocol version to decide
         // whether the installed peer is current; "--help works" is not enough,
         // since an outdated peer answers --help perfectly well.
@@ -21,7 +28,10 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "viewer-serve: answer image requests on stdin/stdout.\n"
                     "Started for you by the viewer over ssh:\n"
-                    "  viewer ssh://user@host/path.npy --remote-exe /path/to/viewer-serve\n");
+                    "  viewer ssh://user@host/path.npy --remote-exe /path/to/viewer-serve\n"
+                    "\n"
+                    "  --serve-readers   let a client send a reader (Python) to be RUN\n"
+                    "                    here, on this machine's data. Off unless said.\n");
             return 0;
         }
     }

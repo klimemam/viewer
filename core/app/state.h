@@ -2109,6 +2109,19 @@ struct App {
         size_t shown = 0;                  // how much of the live output is on screen
         int64_t srcMtime = 0;              // the origin's stat, taken BEFORE the
         uint64_t srcFsize = 0;             // reader ran (identity before bytes)
+        // ---- the reader ran on a PEER (issue #180) --------------------------
+        // The same job, with the process on the other machine. The thread owns
+        // a SESSION OF ITS OWN rather than borrowing app.uiSession, for that
+        // session's two documented reasons: a 300 s round trip must not hold
+        // the UI's frame, and two threads framing requests into one ssh stdin
+        // desynchronise the stream permanently.
+        bool remote = false;
+        std::string url, host;             // what was opened, and where it ran
+        int port = 0;
+        std::string files[3];              // the texts the RUN carries
+        remote::ReaderRun rrun;            // what came back
+        bool rok = false;                  // ...or the link failed, and why
+        std::string rerr;
     };
     std::unique_ptr<ReaderJob> rdJob;
     bool anyFileDialog() const {      // see the note on csvDlg

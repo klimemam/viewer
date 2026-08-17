@@ -1859,8 +1859,16 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         // round trip, with the reason and the way out. The peer's own answer to
         // this file is "not a .npy file", which blames the file for a limit
         // that belongs to the link.
-        toast(baseName(rpath) + ": " +
-              (host.empty() ? viewerRefusalFor(rpath) : peerRefusalFor(rpath)), true);
+        const std::string why = host.empty() ? viewerRefusalFor(rpath) : peerRefusalFor(rpath);
+        toast(baseName(rpath) + ": " + why, true);
+        // ...and the door the refusal now NAMES (issue #180 stage 2). Since a
+        // reader runs on the peer, "choose a reader" is a true offer for a
+        // remote row too, so the dim row leads to the same panel a local
+        // unreadable file leads to - openPath's own openReaderPicker call, one
+        // layer out. A refusal that names a mechanism and does not open it is
+        // the half-feature this whole file refuses to ship; before stage 2
+        // there was no mechanism to name, which is why the sentence said so.
+        if (!asPreview) openReaderPicker(url, why);
         return false;
     }
     if (asPreview) dropPreview();          // ONE slot: the next look replaces it
@@ -2126,6 +2134,303 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         toast(host.empty() ? "opened " + baseName(rpath)
                            : "opened " + baseName(rpath) + " from " + host);
     return true;
+}
+
+// ---- a reader that runs on the PEER (issue #180, docs/remote-reader-design.md)
+//
+// The local door is openWithReader (core/app/session.inc): find the reader,
+// start Python here, read the .vstream it writes. This is the same door with
+// the middle step on the other machine - and NOTHING ELSE moves, which is the
+// point of the shape rather than a happy accident:
+//
+//   the CHOICE stays here. Only a picker or the memo names a reader (§4.13),
+//   and the peer reads neither. What can make code run over there is one
+//   product: an explicit RUN this client sent, times a flag the peer's own
+//   launcher set.
+//   the READER travels. Three texts, carried, never resolved by name on the
+//   far side - so the bytes that ran are the bytes the memo names (§3.2).
+//   the PIXELS do not. The materialisation stays in the peer's cache and
+//   reaches this process through META and TILE, decimated to the screen, in
+//   the source dtype. §4.13.1's "the converted result does not cross the
+//   wire", implemented.
+//   the DOCUMENT is built by the ONE tree builder. vnzBuild with a different
+//   fetch (§5.2): the layer, the axes, the unit, the note, the cfa and the
+//   range all go through the code a local reader open goes through, so there
+//   is no room for one reader to make two different documents.
+
+// " on <host>", or " on the local peer" - the machine a sentence is about.
+// local:// is a real peer (its own process, its own python) and saying so is
+// more honest than an empty phrase that reads like this machine.
+static std::string readerHostWhere(const std::string& host) {
+    return host.empty() ? std::string(" on the local peer") : " on " + host;
+}
+
+// The whole text of a file, or "" - the reader and the two harness files, as
+// they will be written on the peer. Read as BYTES: a reader may be in any
+// encoding Python accepts and re-encoding it here would change the file that
+// runs from the file the author edits.
+static bool readWholeTextFile(const std::string& path, std::string& out) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return false;
+    out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// A url this door owns. Narrow on purpose: makeRemoteUrl writes exactly these
+// two schemes, and remote::parseUrl also accepts the bare `host:path` scp form,
+// which a Windows path is one colon away from being mistaken for.
+static bool isRemoteUrl(const std::string& s) {
+    return s.compare(0, 8, "local://") == 0 || s.compare(0, 6, "ssh://") == 0;
+}
+
+// Everything BEFORE the far side is asked anything: which reader, and the three
+// texts as bytes. Split out because the RUN itself belongs on a worker thread
+// (§5: 300 s must not hold the UI's frame) while this half needs the reader
+// search path and the settings, which live on the UI thread.
+static std::string remoteReaderPrepare(const std::string& url, const std::string& specIn,
+                                       std::string& spec, std::string& host,
+                                       std::string& rpath, int& port,
+                                       std::string files[3]) {
+    port = 0;
+    if (!remote::parseUrl(url, host, rpath, &port))
+        return "expected ssh://user@host/path or local://path";
+    // §4.13.2, unchanged over the link: the reader is located BEFORE anything
+    // is started, so "there is no such reader" is a sentence naming every place
+    // we looked instead of a traceback from a machine the user cannot see.
+    ReaderLookup look = resolveReaderFile(specIn);
+    if (look.file.empty()) return look.why;
+    spec = look.file + ":" + readerFuncOf(specIn);
+    if (!readWholeTextFile(look.file, files[0]))
+        return "cannot read the reader: " + dispPath(look.file);
+    const std::string script = runAdapterScript();
+    if (script.empty())
+        return "cannot find tools/import/run_adapter.py - the adapter harness ships "
+               "with the viewer and this build cannot see it";
+    const std::string vimport =
+        (pathFromUtf8(script).parent_path() / "viewer_import.py").u8string();
+    if (!readWholeTextFile(vimport, files[1]))
+        return "cannot read " + dispPath(vimport) + " - it ships beside run_adapter.py";
+    if (!readWholeTextFile(script, files[2]))
+        return "cannot read " + dispPath(script);
+    // §6's promise, kept on this side too: the command as it will be built over
+    // there, before it is asked for. Same shape as the local door's
+    // "reader: ..." line, so "what did it actually start?" is answerable after
+    // the fact on either machine.
+    logMsg("reader (" + (host.empty() ? std::string("local peer") : host) + "): python -u " +
+           std::string(rp::READER_RUN_FILES[2]) + " " + std::string(rp::READER_RUN_FILES[0]) +
+           ":" + readerFuncOf(spec) + " " + rpath + " --stream");
+    return {};
+}
+
+// Everything AFTER it: the outcome as a sentence, or the documents. On the UI
+// thread, because it touches app.images and app.uiSession.
+static std::string remoteReaderLand(const std::string& url, const std::string& spec,
+                                    const std::string& host,
+                                    const remote::ReaderRun& run) {
+    const std::string where = readerHostWhere(host);
+    app.readerLastSpec = spec;
+    // §6's table, in order. Each outcome is a DIFFERENT sentence because each
+    // has a different fix, and two of the fixes are on the other machine.
+    if (run.outcome != rp::RO_OK) {
+        std::string msg;
+        switch (run.outcome) {
+            case rp::RO_GATE_CLOSED: msg = run.err; break;   // the peer's own words
+            case rp::RO_NO_PYTHON:
+                msg = readerNoPythonText(where, run.err,
+                          "install numpy for it, or set VIEWER_SERVE_PYTHON where "
+                          "viewer-serve runs");
+                break;
+            case rp::RO_NOT_STARTED: msg = readerNotStartedText(where, run.err); break;
+            case rp::RO_TIMED_OUT:   msg = readerTimedOutText(where); break;
+            case rp::RO_EXITED:
+                // VERBATIM (§4.9 / §4.13.0). The traceback's line numbers are
+                // this machine's file's, because that file is what ran.
+                msg = run.stderrText.empty() ? run.err : run.stderrText;
+                while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+                break;
+            case rp::RO_UNREADABLE:  msg = readerUnreadableText(where, run.err); break;
+            default:                 msg = run.err.empty() ? "the reader did not run" : run.err;
+        }
+        app.readerLastOut = msg;
+        if (!run.stderrText.empty() && run.outcome != rp::RO_EXITED)
+            app.readerLastOut += "\n\n" + run.stderrText;
+        return msg;
+    }
+
+    // The header, parsed by the parser the cache file goes through. ONE reading
+    // of what a reader declared, whichever machine wrote it.
+    int ver = 0, n = -1;
+    std::vector<VnzNode> nodes;
+    std::vector<VnzBlob> blobs;
+    std::vector<std::pair<std::string, std::string>> meta;
+    std::istringstream hs(run.header);
+    std::string herr = vnsParseHeader(hs, ver, nodes, n, blobs, meta);
+    if (!herr.empty()) {
+        app.readerLastOut = readerUnreadableText(where, herr);
+        return herr;
+    }
+    // §7: a set does not cross the link in v1. Its Refs name paths on the PEER
+    // and the roles are resolved against this machine's registry, which is a
+    // design question ("what does a Ref mean across a link") and not a missing
+    // field. Refused by name rather than half-built.
+    for (int i = 0; i < n; i++)
+        if (nodes[(size_t)i].layer == "analysisset") {
+            const std::string m =
+                "the reader returned an analysis set, and a set does not cross the "
+                "link yet: its Refs name files" + where + " and the roles are bound "
+                "here. Copy the data to this machine and run the reader locally, "
+                "which does build the set.";
+            app.readerLastOut = m;
+            return m;
+        }
+    if (blobs.empty()) {
+        const std::string m = readerUnreadableText(where, "the container declares no pixels");
+        app.readerLastOut = m;
+        return m;
+    }
+
+    // The tiles come through the UI thread's session, not the job thread's -
+    // that one has already been closed, and the pixels a document goes on
+    // needing belong to the session every other document fetches through.
+    {
+        std::string h2, p2;
+        int port2 = 0;
+        remote::parseUrl(url, h2, p2, &port2);
+        std::string serr;
+        if (!ensureUiSession(h2, serr, port2)) {
+            app.readerLastOut = "remote: " + serr;
+            return "remote: " + serr;
+        }
+    }
+    // identity BEFORE the bytes (§6.2). For a local:// url the peer reads this
+    // disk, so the tuple is real; ssh:// stays 0/0, exactly as openRemote
+    // records it, because a peer's disk cannot be statted from here.
+    FrameSource originStat;
+    originStat.remoteUrl = url;
+    statLocalUrl(originStat);
+    originStat.path = url;
+
+    // The fetch, and it is the ONLY thing that differs from a local reader
+    // open. Locally this reads the blob out of the cache file; here it asks the
+    // peer for the same node, decimated to what a screen can show, and rebuilds
+    // a .npy around the samples IN THE SOURCE DTYPE so the very same decoder
+    // sees the very same bytes (which is what makes stage 2's bit-identity
+    // assertion something the code guarantees rather than something it hopes).
+    auto fetch = [&](int i, const VnzNode& v, std::vector<uint8_t>& out,
+                     std::string& e) -> bool {
+        if (v.pixelEntry >= blobs.size()) { e = "that node declared no pixels"; return false; }
+        const VnzBlob& b = blobs[v.pixelEntry];
+        remote::ReaderRef ref{ run.key, i };
+        remote::Meta m;
+        if (!app.uiSession.meta(url, m, e, 0, nullptr, &ref)) return false;
+        const size_t rank = b.shape.size();
+        int iF = -1, iH = -1, iW = -1, iC = -1;
+        if (rank == 2) { iH = 0; iW = 1; }
+        else if (!rp::npyReadAxes(rank, rp::npyNativeRead(b.shape), iF, iH, iW, iC)) {
+            e = rp::npyNotNativeText(b.shape);
+            return false;
+        }
+        // The two ends agreeing about one array, checked rather than assumed:
+        // the peer computed w/h/ch/frames from this same shape through
+        // serveLayout, so a disagreement means the doors have drifted and the
+        // one thing that must not follow is pixels under a label.
+        const int64_t wantF = iF >= 0 ? b.shape[iF] : 1;
+        const int64_t wantC = iC >= 0 ? b.shape[iC] : 1;
+        if (m.w != (int)b.shape[iW] || m.h != (int)b.shape[iH] ||
+            m.frames != (int)wantF || m.ch != (int)wantC) {
+            e = "the peer reads " + rp::npyShapeText(b.shape) + " as " +
+                std::to_string(m.frames) + "x" + std::to_string(m.h) + "x" +
+                std::to_string(m.w) + "x" + std::to_string(m.ch) + " and this viewer "
+                "does not";
+            return false;
+        }
+        // openRemote's first view, to the pixel: about one sample per screen
+        // pixel, and the full resolution only when something asks for it.
+        int step = std::max(1, (int)ceilf((float)std::max(m.w, m.h) / 1600.0f));
+        std::vector<int64_t> dec = b.shape;
+        for (int pass = 0; pass < 2; pass++) {
+            dec = b.shape;
+            dec[(size_t)iH] = (m.h + step - 1) / step;
+            dec[(size_t)iW] = (m.w + step - 1) / step;
+            // A decimated array must still READ the way the full one does. A
+            // (F,H,W) whose W decimates to 4 or fewer would come back out of
+            // the shape rule as (H,W,C) - the same samples under a different
+            // meaning, which is the one thing decimation may never cost. So
+            // that case is fetched whole instead.
+            if (rank < 3 || rp::npyNativeRead(dec) == rp::npyNativeRead(b.shape)) break;
+            step = 1;
+        }
+        const uint32_t dt = rp::dtypeFromName(m.dtype.c_str());
+        const char* npyDt = rp::dtypeNpy(dt);
+        if (!*npyDt) { e = "the peer returned dtype " + m.dtype; return false; }
+        const size_t esz = rp::dtypeSize(dt);
+        const size_t per = (size_t)dec[(size_t)iH] * (size_t)dec[(size_t)iW] *
+                           (size_t)(iC >= 0 ? dec[(size_t)iC] : 1) * esz;
+        const size_t pre = writeNpyHeaderFor(out, npyDt, dec);
+        out.resize(pre + per * (size_t)wantF);
+        for (int64_t f = 0; f < wantF; f++) {
+            std::vector<uint8_t> raw;
+            int tw = 0, th = 0, tch = 0;
+            uint32_t rdt = 0;
+            if (!app.uiSession.tileBytes(url, (int)f, 0, 0, m.w, m.h, step, raw,
+                                         tw, th, tch, rdt, e, 0, nullptr, &ref))
+                return false;
+            if (rdt != dt || raw.size() != per) {
+                e = "the peer returned " + std::to_string(raw.size()) +
+                    " bytes for frame " + std::to_string(f) + " and this viewer sized " +
+                    std::to_string(per);
+                return false;
+            }
+            memcpy(out.data() + pre + per * (size_t)f, raw.data(), per);
+        }
+        return true;
+    };
+
+    // Provenance, as metadata beside the frames: §4.3.1's rule is that the
+    // viewer CARRIES what it is told and never rewrites it, and "which python,
+    // on which machine" is exactly the kind of thing a number gets quoted
+    // without later. vnzBuild adds the reader spec itself.
+    meta.emplace_back("reader ran on", host.empty() ? std::string("local peer") : host);
+    if (!run.provenance.empty()) meta.emplace_back("reader python", run.provenance);
+    const std::string berr = vnzBuild(nodes, n, url, spec, fetch, meta, originStat);
+    if (!berr.empty()) {
+        app.readerLastOut = readerUnreadableText(where, berr);
+        return berr;
+    }
+    // The memo is keyed on the WHOLE url (§4.12 over a link): readerFor is
+    // asked with FrameSource::path, and a remote document's path IS its url, so
+    // the Inspector's reader row and a later restore both find this without a
+    // second lookup rule.
+    rememberReader(url, spec);
+    app.readerLastOk = true;
+    std::string sum = run.stderrText;
+    while (!sum.empty() && (sum.back() == '\n' || sum.back() == '\r')) sum.pop_back();
+    app.readerLastOut = sum.empty() ? std::string("the reader wrote no summary") : sum;
+    app.readerLastOut += "\n\nran" + where;
+    if (!run.provenance.empty()) app.readerLastOut += " with " + run.provenance;
+    return {};
+}
+
+// The whole round trip, synchronously. The door the selftests and a session
+// restore use; the PANEL uses the two halves above with the RUN on a thread of
+// its own, because 300 s on the UI thread is the exact freeze §5 refuses.
+static std::string openRemoteWithReader(const std::string& url, const std::string& specIn) {
+    app.readerRan = true;
+    app.readerLastOk = false;
+    app.readerLastSpec = specIn;
+    app.readerLastOut.clear();
+    std::string spec, host, rpath, files[3];
+    int port = 0;
+    std::string perr = remoteReaderPrepare(url, specIn, spec, host, rpath, port, files);
+    if (!perr.empty()) { app.readerLastOut = perr; return perr; }
+    std::string err;
+    if (!ensureUiSession(host, err, port)) return "remote: " + err;
+    remote::ReaderRun run;
+    if (!app.uiSession.readerRun(rpath, readerFuncOf(spec), files, run, err)) {
+        app.readerLastOut = err;
+        return err;
+    }
+    return remoteReaderLand(url, spec, host, run);
 }
 
 // The stack AROUND a remote frame that is already open: the SeqInfo, the

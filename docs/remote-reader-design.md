@@ -373,7 +373,22 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   (現行文には無いので赤) → 文を足して緑。
 - verify-matrix G11 の行を「stage 0 済 (拒否が判断を言う)、実装は本設計」に更新。
 
-### stage 1 — protocol 12: RUN が peer で走る (doc はまだ開かない)
+### stage 1 — protocol 12: RUN が peer で走る (doc はまだ開かない) — **済**
+
+> 実装 2026-08-17 (issue #180 stage 1-2)。試験は `--rreader-selftest`
+> (`core/selftest/rreader.inc`)。設計との差分 3 点:
+> ① 鍵の中身はハッシュ関数が sha256 でなく `adapterHash` と同じ 64-bit FNV
+>    (ローカルのキャッシュ鍵と 1 つの関数に揃えた)。入力は設計より強く、
+>    reader の**本文そのもの**を混ぜているので `moduleVersion` は不要。
+> ② `VIEWER_SERVE_PYTHON` は peer では**厳格**(指定が失敗したら PATH に
+>    落ちない)。peer 側には設定窓が無く、黙って別の python で走った結果は
+>    再現できないため。
+> ③ 木の検査を共有 TU に括る件は `core/vstream.h` の `vns::checkTree` +
+>    `vns::scanHeader`。ヘッダの**残り**(note/cfa/range/…) は client だけが
+>    使うので共有していない —— 代わりに client の 2 経路 (キャッシュファイル /
+>    peer が返したヘッダ本文) が `vnsParseHeader` 1 本を通る。
+
+
 
 - VERSION 12・`MSG_READER_RUN`・`--serve-readers`・`readerTooOldText`・
   `VIEWER_SERVE_PYTHON`・キャッシュ・§6 の outcome 全種。client 側は remote::Session
@@ -390,7 +405,29 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   R7 (S,H,W) を Stack と名乗る reader → 両門同文 (ローカル `loadViewerStream` の
   文と strcmp 一致)。
 
-### stage 2 — 開く: 単根の frame / stack が link 越しに doc になる
+### stage 2 — 開く: 単根の frame / stack が link 越しに doc になる — **済**
+
+> 実装 2026-08-17 (同 PR)。META/TILE の末尾は設計の `[str key][u32 node]` に
+> **フラグ語 1 つを前置**した (`rp::ReqTrailer`): v11 の「残りバイトがあれば
+> recipe」規則は任意ブロックが 2 つになると成立せず、鍵が geometry として
+> 読まれる事故が起きうる。v12↔v12 のときだけ書き、両端とも
+> `servedVersion()` で門を張るので `VIEWER_SERVE_PROTOCOL` の継ぎ目は生きている。
+>
+> 設計との差分 2 点:
+> ① doc は `vnzBuild` が作る**ローカル doc** (間引き済み画素を保持) であり、
+>    `openRemote` が作る remote doc ではない。よって zoom での精細化
+>    (`pumpRemoteFetch`) は**繋いでいない** —— 着地は §5.2.4 どおり間引き
+>    (`step = ceil(max(w,h)/1600)`) で、そこから先の要求は出ない。
+>    木ビルダを 1 本に保つ (§5.2.2) 方を採った結果で、精細化を足すなら
+>    stage 3 の木配線と同じ回に `S.remoteUrl` を立てるのが素直。
+> ② R10 (1600px 超) は書いていない。間引きの経路は R8 と同じ 1 本で、
+>    step の計算だけが違う。
+>
+> 併せて stage 0 の拒否文を `choose a reader` に差し替え (`core/imagefile.cpp`)、
+> fmtgate F4d2 をその裏返しに更新、Browse の淡色行 →
+> `openReaderPicker(url, …)` → Reader パネルの Load → **自前 session を持つ
+> スレッドで RUN** (§5 の「UI の枠を止めない」) を繋いだ。
+
 
 - META/TILE トレーラ・`openReaderCache` (openRaw 形)・RUN 応答ヘッダ →
   `vnzBuild`(VnzFetch = remote tile)・間引き着地・Inspector の

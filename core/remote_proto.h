@@ -158,7 +158,36 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 //
 // The trailer is APPENDED, so a v10 peer's parse of a v10 request does not move
 // by one byte - the discipline every append in this header has kept.
-static const uint32_t VERSION = 11;
+//
+// 12: READERS RUN ON THE PEER (issue #180 judgment B, docs/
+// remote-reader-design.md). docs/input-adapters.md §4.13.1 settled on
+// 2026-08-03 that "an adapter runs where the file lives"; until now there was
+// no door for it. MSG_READER_RUN carries the reader's THREE TEXTS to the peer,
+// the peer runs the harness there under a gate its own launcher opened
+// (--serve-readers, closed by default), and META / TILE reach what it produced
+// through a trailer naming the peer-issued cache key and the tree node.
+//
+// FRAMING, like 7 (MOP_PLUGIN_ANALYZE) and 8 (MOP_SET_FOLD): no answer a v11
+// peer already gives changes meaning, and the new op is one a v11 peer refuses
+// on the op number before it reads a byte of the payload.
+//
+// It has to be a number for this header's usual reason and for a sharper one
+// that is #124's exactly. The reader trailer on META / TILE is APPENDED, and an
+// older peer does not refuse a trailer - it never reads it. So a v11 peer
+// handed "META, key <k>, node 0" reads the path, finds a real .npy sitting
+// there (the origin the reader was pointed at IS often a file the peer serves),
+// and answers SUCCESSFULLY with the native reading of it. The client would then
+// label those pixels with the reader's name. A silent wrong answer wearing the
+// right label is worse than a blank, which is the whole of protocol 9's
+// conclusion - so the client refuses BEFORE it sends, from this number
+// (rp::readerTooOldText), and never learns it by asking.
+//
+// The three states a user can be in are three different sentences, and none of
+// them is guessed from an error string: "your peer is too old" is written here
+// from the number, "this peer was started without --serve-readers" is written
+// by the peer that has the flag and not the consent, and a v11 peer's "unknown
+// request" is neither of those and says so.
+static const uint32_t VERSION = 12;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -168,8 +197,54 @@ enum MsgType : uint32_t {
     MSG_MEASURE    = 5,   // -> (op, frames, rois, name)   <- emitted results only
     MSG_GLOB       = 6,   // -> (root, pattern, depth, cap) <- matching rel paths
     MSG_SCAN       = 7,   // -> (root, depth, cap)         <- stack groups per subdir
+    // -> (origin path, func, 3 named texts)  <- (outcome, err, stderr,
+    //                                            python provenance, key, header)
+    // The reader itself crosses the link; the pixels it makes do not. See
+    // docs/remote-reader-design.md §3 for why the file is CARRIED rather than
+    // resolved by name on the peer, and §4.2 for the field-by-field wire.
+    MSG_READER_RUN = 8,
     MSG_OK         = 128,
     MSG_ERR        = 129,
+};
+
+// What a MSG_READER_RUN reply says happened, and it is `adapter::Run`'s own
+// four facts plus the two the caller cannot see from here. Split rather than
+// folded into one string because the client writes a DIFFERENT sentence for
+// each and one of them (2) names a fix that is on the other machine
+// (docs/remote-reader-design.md §6).
+enum ReaderOutcome : uint32_t {
+    RO_OK            = 0,   // it ran, and `key` names what it produced
+    RO_GATE_CLOSED   = 1,   // this peer was started without --serve-readers
+    RO_NO_PYTHON     = 2,   // adapter::findPython found none WITH numpy
+    RO_NOT_STARTED   = 3,   // the interpreter did not start at all
+    RO_TIMED_OUT     = 4,   // 300 s, the same limit the local run has
+    RO_EXITED        = 5,   // it ran and raised: stderr is the traceback, whole
+    RO_UNREADABLE    = 6,   // it returned something this viewer cannot read
+};
+
+// The three names MSG_READER_RUN will carry, and no others. A client that could
+// name the file it writes on the peer would be a client that can write anywhere
+// on the peer's disk; the set is closed here so that path never exists.
+static const char* const READER_RUN_FILES[3] = {
+    "reader.py", "viewer_import.py", "run_adapter.py"
+};
+// Three texts. A reader is text (§3.3); 4 MB is far above any of them and far
+// below the 64 MB one message may be.
+static const uint32_t READER_RUN_MAX_BYTES = 4u << 20;
+
+// META / TILE, protocol 12: which optional blocks follow the reading.
+//
+// Before 12 the recipe was read by "if bytes remain, they were meant"
+// (getRecipe). A SECOND optional trailer cannot be read that way - two blocks
+// and one absence rule is how a key gets parsed as a geometry - so a v12 client
+// talking to a v12 peer writes this word ALWAYS, even when it is 0, and the
+// blocks follow it in bit order. Both sides gate on the SERVED version
+// (rp::VERSION at the client is what the peer announced in HELLO), so the seam
+// VIEWER_SERVE_PROTOCOL opens keeps working: a peer pretending to be 11 is sent
+// exactly the v11 bytes.
+enum ReqTrailer : uint32_t {
+    RQ_RAW_RECIPE = 1,   // a RawWire follows
+    RQ_READER     = 2,   // [str key][u32 node] follows: a reader's output
 };
 
 // LIST reply, v3. v2 was: [u32 n] then per entry [str name][u32 dir][u32 szLo]
@@ -772,8 +847,67 @@ inline std::string rawTooOldText(int peerVersion, const std::string& name) {
            "here and open it with File > Open, which does carry the recipe.";
 }
 
+// The peer predates readers running on it (issue #180, docs/
+// remote-reader-design.md §4.1). Written BEFORE anything is sent, from the
+// number the peer announced in HELLO, and for the reason the three sentences
+// above are - but here the failure an unrefused send produces is the WORST of
+// the four. A v11 peer does not refuse MSG_READER_RUN usefully ("unknown
+// request", indistinguishable from a typo), and worse, it does not refuse the
+// META / TILE trailer at all: it never reads it, opens the origin natively, and
+// answers with real pixels that are not the reader's. #124's "a silent wrong
+// answer wearing the right label" is what this sentence exists to prevent.
+//
+// The way out is named and it is the one that works today: local:// already
+// falls through to the local door (openRemote), so what is actually lost is
+// ssh - and for ssh the honest answer is to bring the file here, because there
+// is no send-a-file op in either direction and inventing one is a change of
+// principle rather than a feature (§7).
+inline std::string readerTooOldText(int peerVersion, const std::string& name) {
+    return name + ": a reader cannot run on this peer - it speaks protocol " +
+           std::to_string(peerVersion) + ", and readers over the link need 12 "
+           "(update viewer-serve). Nothing ran: the file stays where it is; "
+           "copy it here to use a reader today.";
+}
+
+// The gate the peer's own launcher opened, or did not (§2.1). A DIFFERENT
+// sentence from the one above, because the two are fixed in different places by
+// different people: the version is fixed by updating the peer, and this one by
+// whoever starts viewer-serve deciding that code sent from a client may run on
+// their machine. Three states - too old / closed / open - and each reads as
+// itself.
+inline std::string readerGateClosedText() {
+    return "this peer was started without --serve-readers: whoever starts "
+           "viewer-serve decides whether readers sent by a client may run here";
+}
+
+// rp::DType -> the numpy descr letter pair, which is what a .npy header says
+// and therefore what the client writes when it rebuilds one around samples that
+// arrived through TILE. dtypeName() spells the same types for a PERSON ("u16"),
+// and the two must not be confused: one is a label, this is a format.
+inline const char* dtypeNpy(uint32_t t) {
+    switch (t) {
+        case DT_U8:  return "u1";
+        case DT_I8:  return "i1";
+        case DT_U16: return "u2";
+        case DT_I16: return "i2";
+        case DT_U32: return "u4";
+        case DT_I32: return "i4";
+        case DT_F32: return "f4";
+        case DT_F64: return "f8";
+        case DT_F16: return "f2";
+        default:     return "";
+    }
+}
+
 // `viewer --serve`: answer requests on stdin/stdout until the peer closes.
 int runServeMode();
+
+// --serve-readers, off unless the launcher said so (§2.1). Set from the argv of
+// whichever binary is being the peer (core/serve_main.cpp, core/main.cpp), so
+// the consent belongs to the process that was started and not to a file, an
+// environment variable or a client's request.
+void setServeReaders(bool on);
+bool serveReadersOpen();
 
 // Natural order over the WHOLE name: every digit run compares as a number
 // ("img2_gain10" < "img10_gain2"), case-insensitive elsewhere. Lives here

@@ -9,6 +9,8 @@
 #include "plugin_host.h"
 #include "setfold.h"                 // the fold half of a set analysis, shared with the viewer
 #include "version.h"                 // the commit this peer was built from (provenance)
+#include "adapter.h"                 // running the reader harness here (issue #180)
+#include "vstream.h"                 // what it writes, and the tree check both ends use
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -30,6 +33,9 @@
 #if defined(_WIN32)
 #include <io.h>
 #include <fcntl.h>
+#include <process.h>                 // _getpid: the scratch directory a run owns
+#else
+#include <unistd.h>                  // getpid, same
 #endif
 
 namespace rp {
@@ -225,6 +231,24 @@ static bool serveLayout(ServedFile& n, const std::vector<int64_t>& dims, int rea
     return true;
 }
 
+// A numpy descr code, byte order already stripped, as an rp::DType. DT_COUNT =
+// this peer does not serve that type.
+//
+// Its own function since issue #180: a reader's framed stream declares its
+// blobs with the SAME two-letter codes a .npy header uses, and the peer now
+// reads both. `b1 -> DT_U8` is kept exactly where it was rather than being
+// widened into a wire type of its own - one bool per byte IS a u8 on the wire,
+// and the client's own decoder makes the same call.
+static uint32_t npyTypeCode(const std::string& t) {
+    static const struct { const char* np; uint32_t dt; } MAP[] = {
+        { "u1", DT_U8 }, { "i1", DT_I8 }, { "u2", DT_U16 }, { "i2", DT_I16 },
+        { "u4", DT_U32 }, { "i4", DT_I32 }, { "f4", DT_F32 }, { "f8", DT_F64 },
+        { "b1", DT_U8 },
+    };
+    for (const auto& m : MAP) if (t == m.np) return m.dt;
+    return DT_COUNT;
+}
+
 static bool openNpy(ServedFile& n, const std::string& path, std::string& err, int read) {
     n.f.open(std::filesystem::u8path(path), std::ios::binary);
     if (!n.f) { err = "cannot open " + path; return false; }
@@ -261,12 +285,7 @@ static bool openNpy(ServedFile& n, const std::string& path, std::string& err, in
                 hdr.find("True", fp) < hdr.find(',', fp);
     n.bigEndian = !descr.empty() && descr[0] == '>';
     std::string t = descr.substr(descr.find_first_of("<>|=") == std::string::npos ? 0 : 1);
-    static const struct { const char* np; uint32_t dt; } MAP[] = {
-        { "u1", DT_U8 }, { "i1", DT_I8 }, { "u2", DT_U16 }, { "i2", DT_I16 },
-        { "u4", DT_U32 }, { "i4", DT_I32 }, { "f4", DT_F32 }, { "f8", DT_F64 },
-        { "b1", DT_U8 },
-    };
-    for (const auto& m : MAP) if (t == m.np) { n.dtype = m.dt; break; }
+    n.dtype = npyTypeCode(t);
     if (n.dtype == DT_COUNT) { err = "unsupported dtype " + descr; return false; }
     n.elemSize = dtypeSize(n.dtype);
 
@@ -605,6 +624,120 @@ static bool openRaw(ServedFile& n, const std::string& path, std::string& err,
     // MR_SHAPE and the Inspector offers no "read as" menu - the same reason a
     // picture keeps ndim 0. Restating a recipe is the recipe panel's job (#166),
     // not the .npy reading menu's.
+    n.ndim = 0;
+    n.ok = true;
+    return true;
+}
+
+// ---------------------------------------------------------------- readers here
+//
+// docs/remote-reader-design.md, issue #180 judgment B. An adapter runs where
+// the file lives; what it produced stays here as a cache file, and the client
+// reaches its pixels through the SAME two requests every other file uses.
+//
+// §2: the consent belongs to whoever started this process. Not an environment
+// variable (ssh carries none), not a directory of blessed files (there is no
+// file to bless - the reader is carried), and closed unless said.
+static bool g_serveReaders = false;
+void setServeReaders(bool on) { g_serveReaders = on; }
+bool serveReadersOpen() { return g_serveReaders; }
+
+// The same 64-bit FNV the local adapter cache keys with (core/app/session.inc
+// adapterHash). The design named sha256; this is the weaker hash and it is the
+// one the other half of this feature already uses, so the two caches are keyed
+// by one function rather than by two that must be argued about separately. The
+// inputs are what matters and they are stronger than the local key's: the
+// reader's whole TEXT is hashed, not its mtime, so "the same bytes" is what the
+// key means and a module VERSION line is inside the thing being hashed.
+static uint64_t readerHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// ~/.viewer-serve/reader-cache, or VIEWER_SERVE_CACHE. The peer has no settings
+// window, so its SETTINGS are environment variables - the same call
+// VIEWER_SERVE_PLUGINS made. Consent is the flag; this is not consent.
+static std::string readerCacheDir() {
+    std::error_code ec;
+    std::filesystem::path d;
+    if (const char* e = getenv("VIEWER_SERVE_CACHE")) {
+        if (*e) d = std::filesystem::u8path(e);
+    }
+    if (d.empty()) {
+        const char* home = getenv("HOME");
+#if defined(_WIN32)
+        if (!home || !*home) home = getenv("USERPROFILE");
+#endif
+        if (!home || !*home) d = std::filesystem::temp_directory_path(ec) / "viewer-serve";
+        else                 d = std::filesystem::u8path(home) / ".viewer-serve";
+        d /= "reader-cache";
+    }
+    std::filesystem::create_directories(d, ec);
+    return d.u8string();
+}
+
+// A key names ONE file inside the cache directory and nothing else. It is hex
+// because it is issued here and quoted back by the client (§4.2): a key that
+// could carry a path would be a second way for a client to name a file on this
+// disk, and there is no reason to build one.
+static bool readerCachePath(const std::string& key, std::string& out) {
+    if (key.empty() || key.size() > 64) return false;
+    for (char c : key)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    const std::string dir = readerCacheDir();
+    if (dir.empty()) return false;
+    out = (std::filesystem::u8path(dir) / (key + ".vstream")).u8string();
+    return true;
+}
+
+// One node of a reader's output, laid out for readNpyRegion.
+//
+// This is openRaw's shape exactly and for openRaw's reason: the blob is C-order
+// contiguous, so an offset and four strides are the whole of it and the
+// decimating reader that already exists reads it with no reader-specific pixel
+// loop anywhere. The GEOMETRY comes out of serveLayout - the same function, the
+// same axis rule and the same two refusal sentences a loose .npy gets - so a
+// reader's (F,H,W) is read here the way the client's own decoder reads it.
+static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node,
+                            std::string& err) {
+    std::string path;
+    if (!readerCachePath(key, path)) { err = "that is not a reader key"; return false; }
+    n.f.open(std::filesystem::u8path(path), std::ios::binary);
+    if (!n.f) {
+        err = "this peer has nothing under that reader key any more - run the "
+              "reader again";
+        return false;
+    }
+    vns::Scan sc;
+    const std::string serr = vns::scanHeader(n.f, sc);
+    if (!serr.empty()) { err = serr; return false; }
+    const vns::Blob* b = nullptr;
+    for (const vns::Blob& q : sc.blobs) if ((uint32_t)q.node == node) { b = &q; break; }
+    if (!b) {
+        err = "node " + std::to_string(node) + " of what the reader returned has no "
+              "pixels (" + std::to_string(sc.blobs.size()) + " node(s) do)";
+        return false;
+    }
+    n.dtype = npyTypeCode(b->dtype);
+    if (n.dtype == DT_COUNT) { err = "unsupported dtype " + b->dtype; return false; }
+    n.elemSize = dtypeSize(n.dtype);
+    n.fortran = false;                 // the harness writes C order, LE, always
+    n.bigEndian = false;               // (adapter-transport-review A2/A4)
+    bool fellBack = false;
+    if (!serveLayout(n, b->shape, NR_NATIVE, fellBack, err)) return false;
+    uint64_t want = n.elemSize;
+    for (int64_t d : b->shape) want *= (uint64_t)(d > 0 ? d : 0);
+    if (want != b->nbytes) {
+        err = "node " + std::to_string(node) + " declares " + std::to_string(b->nbytes) +
+              " bytes and its shape needs " + std::to_string(want);
+        return false;
+    }
+    n.f.clear();                       // scanHeader may have stopped at a limit
+    n.dataOffset = b->at;
+    // ndim stays 0 for openRaw's reason: what the reader RETURNED is not a file
+    // that declares a shape a user may re-read another way. The §3.3 menu
+    // belongs to the origin, and offering one over a materialisation would let
+    // a person re-cut an array the reader already decided the meaning of.
     n.ndim = 0;
     n.ok = true;
     return true;
@@ -1272,17 +1405,73 @@ static bool getRead(Buf& in, int& read, std::string& err) {
     return true;
 }
 
-// The RawWire trailing a META or TILE request (protocol 11). Absent = no
-// recipe, which is what every v10 and older client sends. Read the same way
-// getRead reads its reading: if the bytes are there, they were meant.
-static bool getRecipe(Buf& in, RawWire& rw, bool& have, std::string& err) {
-    have = false;
-    if (in.rd >= in.b.size()) return true;                 // an older client
-    if (in.rd + sizeof rw > in.b.size()) { err = "truncated raw recipe"; return false; }
-    memcpy(&rw, in.b.data() + in.rd, sizeof rw);
-    in.rd += sizeof rw;
-    have = true;
+// What may follow the reading on a META or TILE request.
+//
+// Protocol 11 had ONE optional block and read it by "if bytes remain, they were
+// meant". Twelve has two, and that rule cannot carry two: a reader key parsed
+// as a geometry is a picture returned for a request nobody made. So a v12
+// client writes a FLAGS WORD always - 0 when it has nothing to add - and the
+// blocks follow it in bit order.
+//
+// Gated on the SERVED version and the client's own, both. servedVersion() is
+// the number this peer announced in HELLO, which is exactly what the client
+// gated on when it decided whether to write the word - so the
+// VIEWER_SERVE_PROTOCOL seam keeps testing a peer that could exist: pretend to
+// be 11 and the v11 bytes are what arrive.
+struct ReqTrailers {
+    bool haveRw = false;
+    RawWire rw{};
+    bool haveReader = false;
+    std::string key;
+    uint32_t node = 0;
+};
+static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
+    t = ReqTrailers{};
+    if (!(servedVersion() >= 12 && g_clientVersion >= 12)) {
+        if (in.rd >= in.b.size()) return true;             // an older client
+        if (in.rd + sizeof t.rw > in.b.size()) { err = "truncated raw recipe"; return false; }
+        memcpy(&t.rw, in.b.data() + in.rd, sizeof t.rw);
+        in.rd += sizeof t.rw;
+        t.haveRw = true;
+        return true;
+    }
+    uint32_t flags = 0;
+    if (!in.getU32(flags)) return true;                    // nothing at all
+    if (flags & ~(uint32_t)(RQ_RAW_RECIPE | RQ_READER)) {
+        err = "unknown request trailer " + std::to_string(flags);
+        return false;
+    }
+    if (flags & RQ_RAW_RECIPE) {
+        if (in.rd + sizeof t.rw > in.b.size()) { err = "truncated raw recipe"; return false; }
+        memcpy(&t.rw, in.b.data() + in.rd, sizeof t.rw);
+        in.rd += sizeof t.rw;
+        t.haveRw = true;
+    }
+    if (flags & RQ_READER) {
+        if (!in.getStr(t.key) || !in.getU32(t.node)) {
+            err = "truncated reader trailer";
+            return false;
+        }
+        t.haveReader = true;
+    }
     return true;
+}
+
+// One request's subject: a path on this disk, or a node of what a reader
+// returned here. Both end as a ServedFile, which is why META and TILE below
+// each grew one line and nothing else.
+static bool openRequested(ServedFile& n, const std::string& path, const ReqTrailers& t,
+                          int read, std::string& err) {
+    if (!t.haveReader) return openServed(n, path, err, read, t.haveRw ? &t.rw : nullptr);
+    if (t.haveRw) {
+        err = "a raw recipe does not apply to what a reader returned";
+        return false;
+    }
+    if (read != NR_NATIVE) {
+        err = "a declared .npy reading does not apply to what a reader returned";
+        return false;
+    }
+    return openReaderCache(n, t.key, t.node, err);
 }
 
 static void handleMeta(Buf& in) {
@@ -1291,10 +1480,10 @@ static void handleMeta(Buf& in) {
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
-    RawWire rw{}; bool haveRw = false;
-    if (!getRecipe(in, rw, haveRw, err)) { sendErr(err); return; }
+    ReqTrailers tr;
+    if (!getTrailers(in, tr, err)) { sendErr(err); return; }
     ServedFile n;
-    if (!openServed(n, path, err, read, haveRw ? &rw : nullptr)) { sendErr(err); return; }
+    if (!openRequested(n, path, tr, read, err)) { sendErr(err); return; }
     MetaRep m{};
     m.w = (uint32_t)n.w; m.h = (uint32_t)n.h; m.ch = (uint32_t)n.ch;
     m.dtype = n.dtype; m.frames = (uint32_t)n.frames; m.flags = 0;
@@ -1325,10 +1514,10 @@ static void handleTile(Buf& in) {
     int read = NR_NATIVE;
     std::string err;
     if (!getRead(in, read, err)) { sendErr(err); return; }
-    RawWire rw{}; bool haveRw = false;
-    if (!getRecipe(in, rw, haveRw, err)) { sendErr(err); return; }
+    ReqTrailers tr;
+    if (!getTrailers(in, tr, err)) { sendErr(err); return; }
     ServedFile n;
-    if (!openServed(n, path, err, read, haveRw ? &rw : nullptr)) { sendErr(err); return; }
+    if (!openRequested(n, path, tr, read, err)) { sendErr(err); return; }
     std::vector<uint8_t> pix;
     uint32_t ow = 0, oh = 0;
     if (!readRegion(n, r, pix, ow, oh, err)) { sendErr(err); return; }
@@ -2564,6 +2753,287 @@ static void handleMeasure(Buf& in) {
     sendMeasureReply(1, cols, series);
 }
 
+// ---------------------------------------------------------------- reader run
+//
+// The whole of MSG_READER_RUN. It answers with MSG_OK for every outcome
+// including the failures, because the four facts adapter::Run separates
+// (started / timedOut / exit / stderr) are FACTS about a run that happened on
+// this machine, and an MSG_ERR string would fold them back into one sentence
+// the client would have to parse. docs/remote-reader-design.md §6 maps each
+// outcome to the words a person reads; this end supplies the facts and never
+// the words - except where the words are settled HERE, which is the gate (§2.1)
+// and the check of what the reader returned (§5.2, shared with the local door).
+
+// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". Asked once and kept: it is
+// a property of the interpreter, and a cache hit deserves the same line as a
+// run because the client prints it either way.
+static std::string pythonProvenance(const std::string& py) {
+    static std::string cached;
+    static std::string cachedFor;
+    if (!cached.empty() && cachedFor == py) return cached;
+    adapter::Run r = adapter::run({ py, "-c",
+        "import sys,numpy;print('Python %d.%d.%d (%s), numpy %s' % "
+        "(sys.version_info[0],sys.version_info[1],sys.version_info[2],"
+        "sys.executable,numpy.__version__))" }, 30000);
+    std::string s = r.out;
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    if (s.empty()) s = py;               // it answered nothing: name what we ran
+    cached = s;
+    cachedFor = py;
+    return s;
+}
+
+static bool writeWholeFile(const std::filesystem::path& p, const std::string& body) {
+    std::ofstream f(p, std::ios::binary);
+    if (!f) return false;
+    f.write(body.data(), (std::streamsize)body.size());
+    return (bool)f;
+}
+
+// The first `n` bytes of a file, verbatim. The client is handed the header text
+// EXACTLY as the harness wrote it (§5.2): it parses that text with the same
+// parser it uses on a cache file of its own, so the layer, the axes, the unit,
+// the note and the cfa cannot come out differently depending on which machine
+// the reader ran on.
+static std::string headOfFile(const std::string& path, uint64_t n) {
+    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
+    if (!f) return {};
+    std::string s((size_t)n, '\0');
+    f.read(&s[0], (std::streamsize)n);
+    s.resize((size_t)f.gcount());
+    return s;
+}
+
+// Everything the peer can say about what a reader left behind, before it hands
+// out a key for it. The tree check is vns::checkTree (inside scanHeader) and
+// the geometry check is serveLayout - BOTH shared with the client's own door,
+// so a refusal reads the same wherever the reader ran. That sharing is the
+// whole reason those two moved: #71's rule, applied to a new pair of doors.
+static std::string checkReaderOutput(const std::string& cachePath, std::string& headerText) {
+    std::ifstream f(std::filesystem::u8path(cachePath), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote";
+    vns::Scan sc;
+    const std::string serr = vns::scanHeader(f, sc);
+    if (!serr.empty()) return serr;
+    if (sc.blobs.empty()) return "the container declares no pixels";
+    std::error_code ec;
+    const uint64_t fsize = (uint64_t)std::filesystem::file_size(
+                               std::filesystem::u8path(cachePath), ec);
+    for (const vns::Blob& b : sc.blobs) {
+        ServedFile probe;
+        probe.dtype = npyTypeCode(b.dtype);
+        if (probe.dtype == DT_COUNT) return "unsupported dtype " + b.dtype;
+        probe.elemSize = dtypeSize(probe.dtype);
+        probe.fortran = false;
+        bool fellBack = false;
+        std::string err;
+        if (!serveLayout(probe, b.shape, NR_NATIVE, fellBack, err)) return err;
+        if (!ec && b.at + b.nbytes > fsize)
+            return "the stream ended " + std::to_string(b.at + b.nbytes - fsize) +
+                   " byte(s) short of what it declared";
+    }
+    headerText = headOfFile(cachePath, sc.headerEnd);
+    return {};
+}
+
+static void handleReaderRun(Buf& in) {
+    auto reply = [](uint32_t outcome, const std::string& err, const std::string& errText,
+                    const std::string& prov, const std::string& key,
+                    const std::string& header) {
+        Buf out;
+        out.putU32(outcome);
+        out.putStr(err);
+        out.putStr(errText);
+        out.putStr(prov);
+        out.putStr(key);
+        out.putStr(header);
+        sendMsg(MSG_OK, out);
+    };
+    // FIRST, before the request is even read out: the gate is about this
+    // MACHINE, not about this request, so a closed one must not be reportable
+    // as "your third file was named wrong". Three states, three sentences
+    // (§4.1) - and this is the one the peer owns.
+    if (!serveReadersOpen()) {
+        reply(RO_GATE_CLOSED, readerGateClosedText(), "", "", "", "");
+        return;
+    }
+    std::string peerPath, func;
+    uint32_t nFiles = 0;
+    if (!in.getStr(peerPath) || !in.getStr(func) || !in.getU32(nFiles)) {
+        sendErr("bad READER_RUN");
+        return;
+    }
+    if (nFiles != 3) { sendErr("READER_RUN carries three files"); return; }
+    std::string body[3];
+    for (uint32_t i = 0; i < 3; i++) {
+        std::string name, text;
+        if (!in.getStr(name) || !in.getStr(text)) { sendErr("bad READER_RUN"); return; }
+        // The name is checked against a CLOSED SET rather than sanitised. A
+        // client that can name the file it writes here is a client that can
+        // write anywhere on this disk, and the cheapest way not to have that
+        // path is not to build it (§4.2).
+        if (name != READER_RUN_FILES[i]) {
+            sendErr("READER_RUN file " + std::to_string(i) + " is \"" + name +
+                    "\": this op carries " + READER_RUN_FILES[0] + ", " +
+                    READER_RUN_FILES[1] + " and " + READER_RUN_FILES[2] + ", in that order");
+            return;
+        }
+        if (text.size() > READER_RUN_MAX_BYTES) {
+            sendErr(name + " is " + std::to_string(text.size()) +
+                    " bytes: a reader is text, and this op carries up to " +
+                    std::to_string(READER_RUN_MAX_BYTES));
+            return;
+        }
+        body[i] = std::move(text);
+    }
+    if (func.empty() || func.size() > 128) { sendErr("READER_RUN needs a function name"); return; }
+
+    // VIEWER_SERVE_PYTHON is STRICT here, and that is a deliberate difference
+    // from the local door. The viewer falls back to PATH when a configured
+    // interpreter fails, because the person who configured it is sitting in
+    // front of a Settings window that shows what happened. On a peer nobody is
+    // looking: a run under an interpreter the operator did not choose is a
+    // result nobody can reproduce, and "it worked, with the wrong numpy" is
+    // exactly the silence this project spends its refusals on.
+    std::string why, py;
+    const char* cfgPy = getenv("VIEWER_SERVE_PYTHON");
+    if (cfgPy && *cfgPy) {
+        adapter::Run probe = adapter::run({ cfgPy, "-c", "import numpy" }, 30000);
+        if (probe.started && probe.exit == 0) {
+            py = cfgPy;
+        } else {
+            why = std::string("VIEWER_SERVE_PYTHON is ") + cfgPy +
+                  (!probe.started ? " (not found)"
+                   : probe.err.find("numpy") != std::string::npos
+                       ? " (no numpy)"
+                       : " (exit " + std::to_string(probe.exit) + ")");
+            reply(RO_NO_PYTHON, why, probe.err, "", "", "");
+            return;
+        }
+    } else {
+        py = adapter::findPython("", why);
+        if (py.empty()) { reply(RO_NO_PYTHON, why, "", "", "", ""); return; }
+    }
+    const std::string prov = pythonProvenance(py);
+
+    // §5.3's key. The peer's OWN stat of the origin, because a client's stat of
+    // a NAS mounted twice makes identity a lie; the reader's whole text, so
+    // "the same reader" means the same bytes and not the same name; the
+    // function; and this protocol number, so a peer that changes what a key
+    // covers cannot hand back a hit computed under the old rule.
+    std::error_code ec;
+    const std::filesystem::path origin = std::filesystem::u8path(peerPath);
+    uint64_t oMtime = 0, oSize = 0;
+    {
+        auto t = std::filesystem::last_write_time(origin, ec);
+        if (!ec) oMtime = (uint64_t)t.time_since_epoch().count();
+        if (!std::filesystem::is_directory(origin, ec)) {
+            auto s = std::filesystem::file_size(origin, ec);
+            if (!ec) oSize = (uint64_t)s;
+        }
+    }
+    uint64_t h = readerHash("viewer-serve reader 12");
+    h = readerHash(peerPath, h);
+    h = readerHash(std::to_string(oMtime) + "|" + std::to_string(oSize), h);
+    for (int i = 0; i < 3; i++) h = readerHash(body[i], h);
+    h = readerHash(func, h);
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    const std::string key = hex;
+    std::string cachePath;
+    if (!readerCachePath(key, cachePath)) {
+        sendErr("this peer has nowhere to keep what a reader produces "
+                "(set VIEWER_SERVE_CACHE)");
+        return;
+    }
+
+    if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
+        std::string header;
+        const std::string cerr = checkReaderOutput(cachePath, header);
+        if (cerr.empty()) {
+            // §5.3: the second run does not start Python. The key covers the
+            // reader's whole text and the origin's stat, so "cached" cannot
+            // mean "stale" - and the sentence is the local one, because it is
+            // the same promise being kept.
+            reply(RO_OK, "",
+                  "read from cache - the reader was not re-run.\n"
+                  "Edit the reader and press Load again to re-run it.",
+                  prov, key, header);
+            return;
+        }
+        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);  // earn it again
+    }
+
+    // The three texts land in a directory of their own and leave with it. What
+    // stays on this disk is the .vstream and nothing else: §3's form is only
+    // honest if the peer does not accumulate other people's code.
+    std::filesystem::path td = std::filesystem::temp_directory_path(ec);
+    char nm[64];
+    const unsigned long pid = (unsigned long)
+#if defined(_WIN32)
+        _getpid();
+#else
+        getpid();
+#endif
+    snprintf(nm, sizeof nm, "viewer_serve_reader_%lu_%s", pid, key.c_str());
+    td /= nm;
+    std::filesystem::remove_all(td, ec);
+    std::filesystem::create_directories(td, ec);
+    struct Sweep {
+        std::filesystem::path d;
+        ~Sweep() { std::error_code e; std::filesystem::remove_all(d, e); }
+    } sweep{ td };
+    bool wrote = true;
+    for (int i = 0; i < 3; i++) wrote &= writeWholeFile(td / READER_RUN_FILES[i], body[i]);
+    if (!wrote) {
+        reply(RO_NOT_STARTED, "cannot write the reader into " + td.u8string(), "", prov, "", "");
+        return;
+    }
+    const std::string spec = (td / READER_RUN_FILES[0]).u8string() + ":" + func;
+    const std::vector<std::string> argv = {
+        py, "-u", (td / READER_RUN_FILES[2]).u8string(), spec, peerPath, "--stream"
+    };
+    const std::string errFile = (td / "reader.err").u8string();
+    // 300 s, the local limit (core/app/session.inc). The policy lives with the
+    // code that runs the process and never on the wire: one side deciding how
+    // long the other side's patience is would be a setting with two owners.
+    adapter::Run r = adapter::run(argv, 300000, nullptr, cachePath, errFile, false);
+    // BEFORE the reply, not on the way out of this function. The client is
+    // entitled to treat the answer as proof that the code it sent is no longer
+    // on this disk, and a destructor that runs after the bytes are on the wire
+    // makes that a race it can lose. Nothing below needs the directory: what
+    // the reader printed is already in `r`.
+    std::filesystem::remove_all(td, ec);
+    if (!r.started) {
+        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
+        reply(RO_NOT_STARTED, r.fail, r.err, prov, "", "");
+        return;
+    }
+    if (r.timedOut) {
+        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
+        reply(RO_TIMED_OUT, adapter::showCommand(argv), r.err, prov, "", "");
+        return;
+    }
+    if (r.exit != 0) {
+        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
+        // The traceback travels WHOLE (§6). The line numbers in it are the
+        // client's own file's, because the file is the one the client sent -
+        // which is what carrying the reader buys that a peer-side copy could
+        // never promise.
+        reply(RO_EXITED, "the reader exited with status " + std::to_string(r.exit),
+              r.err, prov, "", "");
+        return;
+    }
+    std::string header;
+    const std::string cerr = checkReaderOutput(cachePath, header);
+    if (!cerr.empty()) {
+        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
+        reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
+        return;
+    }
+    reply(RO_OK, "", r.err, prov, key, header);
+}
+
 // VIEWER_SERVE_LAG_MS: hold a META or TILE answer back by that many
 // milliseconds. A real link's latency, on demand - the peer the selftests run
 // against is a pipe on the same disk, and "the UI thread blocks while a file
@@ -2598,6 +3068,14 @@ void handleRequest(uint32_t type, Buf& in) {
         case MSG_META: handleMeta(in); break;
         case MSG_TILE: handleTile(in); break;
         case MSG_MEASURE: handleMeasure(in); break;
+        // Refused by NUMBER when this peer is pretending to be older, and with
+        // the sentence a build that predates the op would give: the seam has to
+        // produce the refusal it exists to test, not a newer one wearing an old
+        // number (VIEWER_SERVE_PROTOCOL, above).
+        case MSG_READER_RUN:
+            if (servedVersion() < 12) sendErr("unknown request");
+            else                      handleReaderRun(in);
+            break;
         default: sendErr("unknown request"); break;
     }
 }

@@ -593,7 +593,19 @@ static void drawInspector() {
         // guessing whether the question even applies to the others.
         if (!im->src->path.empty() && im->src->remoteUrl.empty()) {
             std::string spec = readerFor(im->src->path);
-            ImGui::TextDisabled("reader    %s", spec.empty() ? "native" : spec.c_str());
+            // ...and WHERE it ran (issue #180). A reader that ran on the peer
+            // reads exactly like one that ran here unless the row says so, and
+            // "which machine" is half of what makes a number reproducible - the
+            // other half (which python) is beside the frames as metadata.
+            std::string ranOn;
+            if (!spec.empty() && isRemoteUrl(im->src->path)) {
+                std::string rh, rpp;
+                int rpt = 0;
+                remote::parseUrl(im->src->path, rh, rpp, &rpt);
+                ranOn = "  (ran on " + (rh.empty() ? std::string("the local peer") : rh) + ")";
+            }
+            ImGui::TextDisabled("reader    %s%s", spec.empty() ? "native" : spec.c_str(),
+                                ranOn.c_str());
             ImGui::SameLine();
             if (ImGui::SmallButton("change...")) openReaderPicker(im->src->path, "");
             if (!spec.empty()) {

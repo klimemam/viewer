@@ -637,7 +637,7 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 
 ---
 
-### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **stage 0 済 (拒否が判断を言う)**
+### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **stage 0-2 済 (戸が開いた)**
 
 **どこ。** `docs/input-adapters.md §4.13.1` は明確に決めている——
 「データが向こうにあるのに adapter を手元で走らせると生ファイルを転送してから
@@ -666,8 +666,20 @@ protocol 12・`MSG_READER_RUN`・起動引数 `--serve-readers`・reader は cli
 **この文は stage 2 で `choose a reader` に差し替わる**(戸が開いた日にこの検査が
 落ちるように書いてある)。
 
-**残り。** 前の半分「実装が無い」はそのまま。stage 1 (RUN が peer で走る)
-以降は未着手で、#180 は開いたままである。
+**stage 1-2 済 (2026-08-17)。** 前の半分「実装が無い」も消えた。protocol 12 /
+`MSG_READER_RUN` / 起動引数 `--serve-readers` (既定 閉) / reader は 3 テキストを
+client から運ぶ / peer 一時 dir で実行し実行後に削除 / 鍵は peer 発行の 16 進 /
+META・TILE の末尾 `[u32 flags][str key][u32 node]` で materialisation の画素だけが
+戻る。単根の frame / stack がリンク越しに doc になり、**同じ reader を手元で
+走らせた doc と画素ビット一致**する。F4d2 は予告どおり裏返した——拒否文は
+`choose a reader` と `--serve-readers` を言い、「not built yet」を言わない。
+試験は `--rreader-selftest` (`core/selftest/rreader.inc`, R0-R11、`--remote-exe` で
+本物の `viewer-serve` を立てる)。
+
+**残り。** stage 3 (木: series / batch)、stage 4 (memo / session 復元)、
+stage 5 (MEASURE) は未着手で、#180 は開いたままである。zoom による精細化
+(`pumpRemoteFetch`) も繋いでいない——理由は
+`docs/remote-reader-design.md` stage 2 の注記。
 
 ---
 
