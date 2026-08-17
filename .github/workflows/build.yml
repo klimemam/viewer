@@ -10,11 +10,33 @@ on:
   # conflicts cannot stop, so a branch always has a verdict of its own.
   push:
     branches: ['**']
+    # Documentation does not compile. A board commit, a design doc or a
+    # handoff file used to cost three OS builds x two runs, and the wait was
+    # long enough to change how often anyone dared to commit docs (measured:
+    # ~20 min per push, 2026-08-17). What CANNOT go in this list: .github
+    # (the workflow must test its own changes), tools/ and media/ (tests read
+    # them), and any path a selftest walks.
+    paths-ignore:
+      - 'docs/**'
+      - 'handoff/**'
+      - '*.md'
   # ...and the merge result stays gated separately: a branch that is green on
   # its own can still break main, which is the thing this was always for.
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'handoff/**'
+      - '*.md'
   workflow_dispatch:
+
+# A superseded run answers a question nobody is asking anymore: on branches,
+# a new push cancels the run for the old tip. main keeps every run - its
+# history is the record "this exact commit was green", and a cancelled run
+# there would leave a merge with no verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:
