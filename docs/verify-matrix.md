@@ -283,7 +283,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
 | G10 | 間引かれた doc の crop が復元で黙って落ちる | **済** PR #177 — 試験 browse restore-wait |
-| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **裁定待ち #180** |
+| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **stage 0 済** PR #211 — 拒否が判断を言う。試験 F4d2。実装 (stage 1〜5) は `docs/remote-reader-design.md`、#180 は開いたまま |
 
 ---
 
@@ -637,7 +637,7 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 
 ---
 
-### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない
+### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **stage 0 済 (拒否が判断を言う)**
 
 **どこ。** `docs/input-adapters.md §4.13.1` は明確に決めている——
 「データが向こうにあるのに adapter を手元で走らせると生ファイルを転送してから
@@ -653,6 +653,21 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 決め直して記録する——§4.13.1 自身がその逃げ道を「明示的に選ばせる」と書いている
 ので、**その半分だけ先に実装する**のが一番安い。
 (b) §4.13.1 のとおり protocol に adapter の口を足す。
+
+**裁定 (#180) は B。** 設計は `docs/remote-reader-design.md` (2026-08-17, Fable)——
+protocol 12・`MSG_READER_RUN`・起動引数 `--serve-readers`・reader は client から
+運ぶ、を stage 0〜5 に分けた。
+
+**stage 0 済 (PR #211)。** 二文のうち後ろの半分——「拒否文もそれを言わない」——だけ
+先に消した。`imagefile::peerRefusal` の fall-through が、決定 (§4.13.1) を名指しし、
+**戸が未完成である**と言い、今日効く道 (手元に copy して reader) を出す。
+無い機構は仄めかさない (同設計 §7: peer 上に reader を名前で探す道は無い)。
+試験は `fmtgate` **F4d2**——ヘッダレス拒否文を歩く F4d の隣。
+**この文は stage 2 で `choose a reader` に差し替わる**(戸が開いた日にこの検査が
+落ちるように書いてある)。
+
+**残り。** 前の半分「実装が無い」はそのまま。stage 1 (RUN が peer で走る)
+以降は未着手で、#180 は開いたままである。
 
 ---
 
