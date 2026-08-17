@@ -453,8 +453,12 @@ static void drawPanelProjection() {
             }
         }
         if (overlaid) {
+            // ...and the fixed A/B row only when B is really the second side:
+            // drawABLegendRow spells "B" into its own text, so with no
+            // measurable B it would label a slot's curve with B's name. The
+            // histogram guards the same call the same way.
             if (!leg.empty()) slotLegendRow(leg, true);
-            else              drawABLegendRow(abDocLabel(im), bLabel, bStale);
+            else if (Bim)     drawABLegendRow(abDocLabel(im), bLabel, bStale);
         }
     };
 
