@@ -823,6 +823,161 @@
             closeAll();
         }
 
+        {   // ---- R16: a folder's identity is its CHILDREN, both ends ----------
+            //
+            // #218 review, and codex's note that the same hole was in the LOCAL
+            // key: both recorded the directory's OWN mtime and left the size at
+            // zero. That mtime moves when a child is added or removed and NOT
+            // when an existing child is rewritten - which is what happens to a
+            // capture directory between two acquisitions. So a re-run over a
+            // folder whose every frame had been replaced returned the previous
+            // pixels, on this disk and on the peer's.
+            //
+            // The fixture reproduces that exactly: the child is overwritten with
+            // a file OF THE SAME NAME AND THE SAME SIZE, and the parent
+            // directory's mtime is then put back to what it was. Nothing about
+            // the directory itself has changed; everything inside it has.
+            closeAll();
+            const std::string capt = root + "/capture";
+            const std::string captSub = capt + "/sub";
+            std::filesystem::create_directories(pathFromUtf8(captSub), ec);
+            const int FH = 4, FW = 6;
+            auto writeFrame = [&](const std::string& p, uint16_t v) {
+                std::vector<uint16_t> px((size_t)FH * FW, v);
+                std::vector<uint8_t> b = selftestNpyBytes("<u2", { FH, FW },
+                                                          px.data(), px.size() * 2);
+                std::ofstream f(pathFromUtf8(p), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            };
+            const std::string childA = capt + "/a.npy";
+            const std::string childB = captSub + "/b.npy";
+            // A rewritten child gets a LATER mtime, set rather than waited for:
+            // this host's last_write_time has one-second granularity, and a
+            // test that slept for it would be paying a second per acquisition
+            // to observe something every real acquisition has anyway.
+            auto reframe = [&](const std::string& p, uint16_t v) {
+                const auto was = std::filesystem::last_write_time(pathFromUtf8(p), ec);
+                writeFrame(p, v);
+                std::filesystem::last_write_time(pathFromUtf8(p),
+                                                 was + std::chrono::seconds(10), ec);
+            };
+            writeFrame(childA, 11);
+            writeFrame(childB, 22);
+            const std::string rdFolder = root + "/folder.py";
+            writeText(rdFolder,
+                      "import numpy as np, os\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    fs = []\n"
+                      "    for r, d, f in os.walk(path):\n"
+                      "        for n in f:\n"
+                      "            if n.endswith('.npy'):\n"
+                      "                fs.append(os.path.join(r, n))\n"
+                      "    a = np.stack([np.load(p) for p in sorted(fs)])\n"
+                      "    return Stack(np.ascontiguousarray(a.astype(np.uint16)),\n"
+                      "                 name='capture')\n");
+            const std::string folderSpec = rdFolder + ":load";
+            std::string folderText[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdFolder, folderText[0]),
+                  "R16a (setup) the folder reader is readable");
+
+            // A directory's mtime, taken and PUT BACK. This is the whole
+            // premise: on every filesystem this build runs on, rewriting a
+            // child does not have to move it, and here it provably does not.
+            auto dirTime = [&](const std::string& d) {
+                return std::filesystem::last_write_time(pathFromUtf8(d), ec);
+            };
+            auto setDirTime = [&](const std::string& d,
+                                  std::filesystem::file_time_type t) {
+                std::filesystem::last_write_time(pathFromUtf8(d), t, ec);
+            };
+
+            // ---- the LOCAL door -----------------------------------------------
+            auto localFirstPx = [&]() -> float {
+                return cur() && !cur()->src->data.empty() ? cur()->src->data[0] : -1.0f;
+            };
+            const auto captAt0 = dirTime(capt);
+            const auto subAt0 = dirTime(captSub);
+            const std::string l1 = openWithReader(capt, folderSpec);
+            check(l1.empty() && localFirstPx() == 11.0f,
+                  "R16b the local door reads the folder: first child is 11");
+            closeAll();
+            // Same name, same size, new content - and the parent put back.
+            reframe(childA, 33);
+            setDirTime(capt, captAt0);
+            const int lruns = g_adapterRuns;
+            const std::string l2 = openWithReader(capt, folderSpec);
+            fprintf(stderr, "rreaderselftest:   R16 local re-run: err=\"%s\" runs %d -> %d "
+                            "px0=%g\n",
+                    l2.c_str(), lruns, g_adapterRuns, (double)localFirstPx());
+            check(l2.empty() && g_adapterRuns > lruns,
+                  "R16c a rewritten child is a MISS on this disk, and the reader re-runs");
+            check(localFirstPx() == 33.0f,
+                  "R16d ...and what comes back is the new child, not the cached one");
+            closeAll();
+            // ...and a NESTED child, with both directories put back.
+            const auto captAt1 = dirTime(capt);
+            reframe(childB, 44);
+            setDirTime(captSub, subAt0);
+            setDirTime(capt, captAt1);
+            const int lruns2 = g_adapterRuns;
+            const std::string l3 = openWithReader(capt, folderSpec);
+            bool sawNested = false;
+            for (const auto& d : app.images)
+                if (!d->src->data.empty() && d->src->data[0] == 44.0f) sawNested = true;
+            check(l3.empty() && g_adapterRuns > lruns2 && sawNested,
+                  "R16e a nested child counts too: miss, re-run, the new pixels");
+            closeAll();
+            forgetReader(capt);
+
+            // ---- the PEER's key -----------------------------------------------
+            // Same three states, asked of a real viewer-serve. The witness is
+            // the key it issues plus whether its own reply says it read from
+            // cache: a key that did not move IS the defect.
+            auto folderRun = [&](std::string& keyOut, bool& cachedOut) {
+                remote::Session s;
+                if (!openSession(s, true)) return false;
+                remote::ReaderRun r;
+                std::string e;
+                const bool sent = s.readerRun(capt, "load", folderText, r, e);
+                const bool got = sent && r.outcome == rp::RO_OK;
+                if (got) { keyOut = r.key; cachedOut = has(r.stderrText, "read from cache"); }
+                s.stop();
+                return got;
+            };
+            std::string fk1, fk2, fk3;
+            bool fc1 = false, fc2 = false, fc3 = false;
+            const auto captAt2 = dirTime(capt);
+            const bool f1 = folderRun(fk1, fc1);
+            check(f1, "R16f the peer runs a reader over a folder");
+            reframe(childA, 55);
+            setDirTime(capt, captAt2);
+            const bool f2 = folderRun(fk2, fc2);
+            fprintf(stderr, "rreaderselftest:   R16 peer keys %s / %s / ", fk1.c_str(),
+                    fk2.c_str());
+            check(f2 && fk2 != fk1 && !fc2,
+                  "R16g a rewritten child is a different key over there too, and a miss");
+            const auto captAt3 = dirTime(capt);
+            const auto subAt3 = dirTime(captSub);
+            reframe(childB, 66);
+            setDirTime(captSub, subAt3);
+            setDirTime(capt, captAt3);
+            const bool f3 = folderRun(fk3, fc3);
+            fprintf(stderr, "%s\n", fk3.c_str());
+            check(f3 && fk3 != fk2 && !fc3,
+                  "R16h ...and so is a nested one");
+            // ...and NOTHING changing is still a hit: an identity that moved on
+            // its own would make every folder read uncacheable, which is the
+            // opposite mistake and just as wrong.
+            std::string fk4;
+            bool fc4 = false;
+            const bool f4 = folderRun(fk4, fc4);
+            check(f4 && fk4 == fk3 && fc4,
+                  "R16i an unchanged folder is one key and one run: the cache answers");
+            closeAll();
+        }
+
         // ---- stage 4: the memo crosses the link, the hint never runs ----------
         // The V25p pair of core/selftest/verify.inc, over a peer. It lives HERE
         // rather than there for this file's own reason: half of what is asserted

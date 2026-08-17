@@ -1489,10 +1489,23 @@ static std::string adapterCacheKey(const std::string& src, const std::string& sp
     uint64_t srcMtime = 0, srcSize = 0;
     auto t = std::filesystem::last_write_time(sp, ec);
     if (!ec) srcMtime = (uint64_t)t.time_since_epoch().count();
-    // A folder is a legal source (§4.1). Its size is meaningless, but adding or
-    // removing a file inside it moves the directory's own mtime, which is the
-    // signal that matters here.
-    if (!std::filesystem::is_directory(sp, ec)) {
+    // A folder is a legal source (§4.1), and its identity comes from its
+    // CHILDREN (#218 review). The directory's own mtime was the whole of it
+    // here, and it moves when a child is added or removed and not when one is
+    // rewritten - so re-running a reader over a capture directory whose files
+    // had all been replaced returned the previous pixels out of this cache.
+    //
+    // adapter::folderIdentity is the same helper the peer's key uses, which is
+    // the point: two ends that disagreed about whether a directory had changed
+    // would be a bug that only appeared over a link. No identity, no cache -
+    // an empty key, which openWithReader reads as "write it to a temp and read
+    // it back", so the reader still runs and nothing stale can be found.
+    std::string folderId;
+    const bool folder = std::filesystem::is_directory(sp, ec) && !ec;
+    if (folder) {
+        srcMtime = 0;                    // the very number that was the defect
+        if (!adapter::folderIdentity(src, folderId)) return {};
+    } else {
         auto s = std::filesystem::file_size(sp, ec);
         if (!ec) srcSize = (uint64_t)s;
     }
@@ -1501,6 +1514,7 @@ static std::string adapterCacheKey(const std::string& src, const std::string& sp
     auto at = std::filesystem::last_write_time(pathFromUtf8(af), ec);
     if (!ec) adMtime = (uint64_t)at.time_since_epoch().count();
     std::string key = src + "|" + std::to_string(srcMtime) + "|" + std::to_string(srcSize) +
+                      "|" + (folder ? "dir:" + folderId : std::string("file")) +
                       "|" + af + "|" + std::to_string(adMtime) + "|" + readerFuncOf(spec) +
                       "|" + adapter::moduleVersion(af);
     char hex[24];
@@ -1593,11 +1607,16 @@ static std::string openWithReader(const std::string& src, const std::string& spe
 
     std::string cacheDir = adapterCacheDir();
     std::string cached;
-    if (!cacheDir.empty())
+    // An EMPTY key is adapterCacheKey saying this input has no identity it can
+    // establish - a folder it could not walk (#218 review). There is then no
+    // cache file to look for and none to write: `cached` stays empty and the
+    // run below goes to a temp, which is exactly the uncached path.
+    const std::string ckey = adapterCacheKey(src, spec);
+    if (!cacheDir.empty() && !ckey.empty())
         // .vstream, not .npz: the cache now holds the framed stream, and an npz
         // left by an older build must not be handed to the stream reader. A
         // stale one is simply not found, so the reader runs again.
-        cached = (pathFromUtf8(cacheDir) / (adapterCacheKey(src, spec) + ".vstream")).u8string();
+        cached = (pathFromUtf8(cacheDir) / (ckey + ".vstream")).u8string();
     std::error_code ec;
     if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
         // §7 stage 5: the second open does not start Python. The key already

@@ -3,6 +3,7 @@
 // started (docs/input-adapters.md §4.13 - "if Python is missing, say so").
 #include "adapter.h"
 
+#include <algorithm>                 // sort: a folder identity may not depend on walk order
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -416,6 +417,68 @@ std::vector<std::string> moduleFunctions(const std::string& pyFile) {
         if (ident) out.push_back(name);
     }
     return out;
+}
+
+bool folderIdentity(const std::string& dir, std::string& out) {
+    out.clear();
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path root = u8p(dir);
+    if (!fs::is_directory(root, ec) || ec) return false;
+
+    // A ceiling, because this runs before Python does and a person who points a
+    // reader at their home directory deserves a refusal rather than a walk of
+    // it. Crossing it is "no identity", which disables the cache - the reader
+    // still runs, every time, which is the honest cost of an input nobody can
+    // summarise cheaply.
+    static const size_t MAX_ROWS = 200000;
+    std::vector<std::string> rows;
+    fs::recursive_directory_iterator it(
+        root, fs::directory_options::skip_permission_denied, ec);
+    if (ec) return false;
+    const fs::recursive_directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return false;
+        if (rows.size() >= MAX_ROWS) return false;
+        const fs::path& p = it->path();
+        const std::string rel = p.lexically_relative(root).generic_u8string();
+        if (rel.empty() || rel == ".") return false;      // a walk that lost its way
+        // symlink_status, not status: a link is summarised as ITSELF (its
+        // target as written), because following it would make a loop an
+        // identity and a network mount a stat storm.
+        const fs::file_status st = fs::symlink_status(p, ec);
+        if (ec) return false;
+        if (fs::is_symlink(st)) {
+            const fs::path tgt = fs::read_symlink(p, ec);
+            if (ec) return false;
+            rows.push_back(rel + "|l|" + tgt.generic_u8string());
+            continue;
+        }
+        if (fs::is_directory(st)) { rows.push_back(rel + "|d"); continue; }
+        if (!fs::is_regular_file(st)) return false;       // fifo, socket, device
+        const uintmax_t sz = fs::file_size(p, ec);
+        if (ec) return false;
+        const fs::file_time_type mt = fs::last_write_time(p, ec);
+        if (ec) return false;
+        rows.push_back(rel + "|f|" + std::to_string((unsigned long long)sz) + "|" +
+                       std::to_string((long long)mt.time_since_epoch().count()));
+    }
+    // SORTED: no filesystem promises an iteration order, and an identity that
+    // depended on one would differ between two machines looking at the same
+    // directory - which is the exact failure this key exists to prevent.
+    std::sort(rows.begin(), rows.end());
+    uint64_t h = 1469598103934665603ull;
+    h ^= (uint64_t)rows.size();
+    h *= 1099511628211ull;
+    for (const std::string& r : rows) {
+        for (unsigned char c : r) { h ^= c; h *= 1099511628211ull; }
+        h ^= (uint64_t)'\n';
+        h *= 1099511628211ull;
+    }
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    out = hex;
+    return true;
 }
 
 }  // namespace adapter

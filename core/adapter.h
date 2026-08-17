@@ -85,4 +85,29 @@ std::string moduleVersion(const std::string& pyFile);
 // when a reader is chosen. Text again, for the same reason.
 std::vector<std::string> moduleFunctions(const std::string& pyFile);
 
+// The identity of a FOLDER used as a reader's input (docs/input-adapters.md
+// §4.1), for the cache keys on BOTH sides of the link (#218 review).
+//
+// A directory's own mtime moves when a child is added or removed and NOT when
+// an existing child is rewritten - which is precisely what happens to a capture
+// directory between two acquisitions. So both cache keys, which recorded that
+// mtime and left the size at zero, called a folder whose contents had entirely
+// changed "the same input" and handed back the previous pixels. The identity
+// has to come from the children, so here it does.
+//
+// DETERMINISTIC: every entry below `dir` contributes its path relative to it,
+// its kind, and - for a regular file - its size and mtime; the rows are sorted
+// before they are hashed, because no directory iteration order is promised.
+// Directory symlinks are not followed (that is the iterator's default and it is
+// what keeps a loop from being an identity); a symlink itself contributes its
+// target as written.
+//
+// FALSE means NO IDENTITY COULD BE ESTABLISHED - the path is not a directory,
+// the walk hit an error, an entry's stat failed, an entry is of a kind this
+// cannot summarise, or the tree is larger than it will walk. A caller that gets
+// false must treat the input as UNCACHEABLE. It must not fall back to the
+// directory's own mtime: that is the defect, and a quiet fallback to it would
+// be the same wrong answer arrived at more slowly.
+bool folderIdentity(const std::string& dir, std::string& out);
+
 }  // namespace adapter

@@ -14,6 +14,7 @@
 #include "npzfile.h"                 // the zip walk and the header peek both ends use
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -650,6 +651,16 @@ bool serveReadersOpen() { return g_serveReaders; }
 // inputs are what matters and they are stronger than the local key's: the
 // reader's whole TEXT is hashed, not its mtime, so "the same bytes" is what the
 // key means and a module VERSION line is inside the thing being hashed.
+// This process's id, which several places below need in a file name so that
+// two peers on one disk cannot write into one another's scratch.
+static unsigned long servePid() {
+#if defined(_WIN32)
+    return (unsigned long)_getpid();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
 static uint64_t readerHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
@@ -3193,24 +3204,55 @@ static void handleReaderRun(Buf& in) {
     // asked once per interpreter per PROCESS, so an upgrade is noticed by the
     // next peer process - which is exactly the case the persistent cache makes
     // dangerous, since that is the cache that outlives the upgrade.
+    //
+    // A FOLDER ORIGIN is the third thing in it (#218 review). Its own mtime
+    // moves when a child is added or removed and not when one is REWRITTEN,
+    // which is the ordinary way a capture directory changes - so this key,
+    // which recorded that mtime and left oSize at 0, called a folder whose
+    // every frame had been replaced "the same input". adapter::folderIdentity
+    // is the answer, and it is the LOCAL door's answer too: adapterCacheKey
+    // had the identical hole, and one helper is what keeps the two ends from
+    // disagreeing about whether a directory changed.
+    //
+    // No identity, no cache. The reply still has to carry a KEY - that is how
+    // the client addresses the materialisation it is about to read - so the key
+    // is made UNIQUE to this run instead of being made up out of the directory
+    // mtime. It is written, it is addressable, and no later run can ever hit
+    // it, which is what "caching must be disabled" means for a peer that
+    // answers by key.
     std::error_code ec;
     const std::filesystem::path origin = std::filesystem::u8path(peerPath);
     uint64_t oMtime = 0, oSize = 0;
+    std::string folderId;
+    bool folder = false, uncacheable = false;
     {
         auto t = std::filesystem::last_write_time(origin, ec);
         if (!ec) oMtime = (uint64_t)t.time_since_epoch().count();
-        if (!std::filesystem::is_directory(origin, ec)) {
+        std::error_code de;
+        folder = std::filesystem::is_directory(origin, de) && !de;
+        if (!folder) {
             auto s = std::filesystem::file_size(origin, ec);
             if (!ec) oSize = (uint64_t)s;
+        } else {
+            oMtime = 0;                  // the very number that was the defect
+            uncacheable = !adapter::folderIdentity(peerPath, folderId);
         }
     }
-    uint64_t h = readerHash("viewer-serve reader 13");
+    uint64_t h = readerHash("viewer-serve reader 14");
     h = readerHash(peerPath, h);
     h = readerHash(std::to_string(oMtime) + "|" + std::to_string(oSize), h);
+    if (folder) h = readerHash("dir|" + folderId, h);
     for (int i = 0; i < 3; i++) h = readerHash(body[i], h);
     h = readerHash(func, h);
     h = readerHash(py, h);
     h = readerHash(prov, h);
+    if (uncacheable) {
+        static std::atomic<uint64_t> nonce{ 0 };
+        const uint64_t n = nonce.fetch_add(1) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        h = readerHash("uncacheable|" + std::to_string((unsigned long long)servePid()) +
+                       "|" + std::to_string(n) + "|" + std::to_string((long long)now), h);
+    }
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
     const std::string key = hex;
