@@ -392,6 +392,111 @@
             check(app.images.size() == before, "R11b ...and nothing landed");
         }
 
+        // ---- stage 4: the memo crosses the link, the hint never runs ----------
+        // The V25p pair of core/selftest/verify.inc, over a peer. It lives HERE
+        // rather than there for this file's own reason: half of what is asserted
+        // is that NOTHING was asked of the far side, and a claim about the wire
+        // needs a real process on the other end of it.
+        //
+        // #179 ruling C, unchanged by the link (design §2.2): which reader is
+        // the CLIENT's question - the memo is this user's recorded choice on
+        // this machine - and a session may NAME a reader and may never run one.
+        // So the memo re-runs it (on the peer, where the file lives); the hint
+        // alone does not even ask.
+        {
+            closeAll();
+            const std::string spec = rdPerm + ":load";
+            const std::string sess = root + "/reader.vsession";
+            const std::string open1 = openRemoteWithReader(url, spec);
+            check(open1.empty() && app.images.size() == (size_t)S,
+                  "V25p-r0 (setup) the peer's reader output is open, frame for frame");
+
+            // ---- the WRITER half: what a session says about a remote reader --
+            saveSession(sess, true);
+            std::string hint, member, imageLine;
+            {
+                std::ifstream sf(pathFromUtf8(sess), std::ios::binary);
+                std::string line;
+                while (std::getline(sf, line)) {
+                    if (line.rfind("readerhint ", 0) == 0) hint = line.substr(11);
+                    else if (line.rfind("member ", 0) == 0) member = line.substr(7);
+                    else if (line.rfind("image ", 0) == 0) imageLine = line;
+                }
+            }
+            fprintf(stderr, "rreaderselftest: V25p-r1 saved hint=\"%s\" member=\"%s\"\n",
+                    hint.c_str(), member.c_str());
+            check(hint == spec,
+                  "V25p-r1a the session names the reader that ran on the peer");
+            check(member.rfind("__pixels_", 0) == 0 && has(imageLine, url),
+                  "V25p-r1b ...beside the member, on a line whose file is the URL");
+
+            // ---- WITH the memo: it comes back, and no Python starts anywhere --
+            // The RUN is sent again and the peer answers out of its cache (R2's
+            // observation, one layer up): the materialisation's mtime is the
+            // witness that the reader was not re-executed over there, and
+            // g_adapterRuns is the witness that it was not executed here.
+            closeAll();
+            // THIS reader's materialisation, by the key R1 saw the peer issue -
+            // the cache holds one per reader that has run, so a count alone
+            // would be answering about withset.py's as much as about this one.
+            const std::string permCache = cacheDir + "/" + keyPerm + ".vstream";
+            const size_t cacheCount = cacheFiles().size();
+            check(std::filesystem::exists(pathFromUtf8(permCache), ec),
+                  "V25p-r1c (setup) this reader's materialisation sits on the peer");
+            const auto cacheAt = std::filesystem::last_write_time(pathFromUtf8(permCache), ec);
+            const int runsBefore = g_adapterRuns;
+            const std::string s1 = loadSession(sess);
+            fprintf(stderr, "rreaderselftest: V25p-r1 restore: err=\"%s\" %zu doc(s) "
+                            "runs %d -> %d\n",
+                    s1.c_str(), app.images.size(), runsBefore, g_adapterRuns);
+            check(s1.empty() && app.images.size() == (size_t)S,
+                  "V25p-r1 with the memo, the restore reopens it through the peer's reader");
+            check(readerFor(url) == spec && cur() &&
+                      cur()->src->member.rfind("__pixels_", 0) == 0,
+                  "V25p-r1d ...as the reader's own document, not the origin file");
+            check(g_adapterRuns == runsBefore,
+                  "V25p-r1e ...and no adapter ran HERE (the reader runs where the file is)");
+            check(cacheFiles().size() == cacheCount &&
+                      std::filesystem::last_write_time(pathFromUtf8(permCache), ec) == cacheAt,
+                  "V25p-r1f ...nor THERE: the peer's RUN cache answered and did not move");
+
+            // ---- WITHOUT it: named, and that is all that happens --------------
+            // The reader file still exists and the peer is still up and still
+            // consenting, so every ingredient of a run is present. What is
+            // missing is the one thing that may start one: the user's own
+            // record. Nothing may go out on the wire - not even the request.
+            closeAll();
+            forgetReader(url);
+            const int runsBefore2 = g_adapterRuns;
+            const uint64_t rxBefore = app.uiSession.bytesReceived();
+            const size_t logBefore = app.msgLog.size();
+            const std::string s2 = loadSession(sess);
+            bool named = false, saidRun = false;
+            for (size_t i = logBefore; i < app.msgLog.size(); i++) {
+                if (!app.msgLog[i].err) continue;
+                if (has(app.msgLog[i].text, "perm.py")) named = true;
+                if (has(app.msgLog[i].text, "never runs one")) saidRun = true;
+            }
+            fprintf(stderr, "rreaderselftest: V25p-r2 restore without memo: named=%d "
+                            "%zu doc(s) runs %d -> %d rx %llu -> %llu cache %zu\n",
+                    (int)named, app.images.size(), runsBefore2, g_adapterRuns,
+                    (unsigned long long)rxBefore,
+                    (unsigned long long)app.uiSession.bytesReceived(), cacheFiles().size());
+            check(named && saidRun,
+                  "V25p-r2 without the memo the failure NAMES the reader, and says "
+                  "a session never runs one");
+            check(s2.empty() && app.images.empty(),
+                  "V25p-r2b ...and nothing came back under some other reading");
+            check(g_adapterRuns == runsBefore2,
+                  "V25p-r2c ...no reader was started here");
+            check(app.uiSession.bytesReceived() == rxBefore &&
+                      cacheFiles().size() == cacheCount &&
+                      std::filesystem::last_write_time(pathFromUtf8(permCache), ec) == cacheAt,
+                  "V25p-r2d ...and no RUN went out on the wire: the peer was never asked");
+            closeAll();
+            forgetReader(url);            // the memo is shared prefs; leave none
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

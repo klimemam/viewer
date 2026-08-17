@@ -3,6 +3,10 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
                        const rp::RawWire* rw);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
+// Run a reader ON THE PEER and open what it made (#180 stage 2). Declared here
+// because a session restore is one of its two callers - the memo, and only the
+// memo, reopens a remote reader's document (stage 4, and #179 ruling C).
+static std::string openRemoteWithReader(const std::string& url, const std::string& specIn);
 // the two halves of restoring a REMOTE folder stack: ask the peer which files
 // are its siblings, then build the stack around the frame that is already open
 static bool remoteSequenceSiblings(const std::string& url,
@@ -2780,7 +2784,60 @@ static std::string loadSession(const std::string& path) {
                                [](unsigned char c) { return (char)std::tolower(c); });
                 bool isNpz = lowp.size() > 4 && lowp.compare(lowp.size() - 4, 4, ".npz") == 0;
                 bool isRemote = hasUrlScheme(p);
-                if (isRemote) {
+                // A document a READER produced on the peer (#180 stage 4). Its
+                // pixels are not in the file the line names - they are what a
+                // reader made out of that file, over there - so the native
+                // reconnect below would hand back the origin's own array under
+                // this line's settings, or nothing at all when (as is usual for
+                // a file worth a reader) the peer cannot read it either.
+                //
+                // The rule is #179 ruling C, which the link does not move
+                // (design §2.2): the MEMO runs a reader, a session never does.
+                // The memo is this machine's record of a choice this user made,
+                // and it is keyed on the whole url - so it answers "which
+                // reader" here exactly as it does for a local file. The hint on
+                // the line answers nothing; it only lets the failure say a name.
+                //
+                // The MEMBER decides that this is such a document, not the memo
+                // alone: over a link the ordinary case is a url opened natively
+                // (a Browse double-click), and the same url may sit in the memo
+                // from some other day. Only the line knows which of the two it
+                // was written about. (The local door keys on the memo alone,
+                // where a reader's member is the only way that path opens.)
+                const bool remoteReaderDoc =
+                    isRemote && pendingMember.rfind("__pixels_", 0) == 0;
+                const std::string remoteMemo = remoteReaderDoc ? readerFor(p)
+                                                               : std::string();
+                if (remoteReaderDoc && !remoteMemo.empty()) {
+                    // ONE run rebuilds every doc that reader produced, and the
+                    // session carries one line per doc - the local door's
+                    // reasoning, and its dedupe, unchanged (a six-frame series
+                    // would otherwise come back six times over). The RUN itself
+                    // is the one stage 1 built: the peer answers a repeat out of
+                    // its cache, so a restore does not re-execute Python either.
+                    bool already = false;
+                    for (const auto& d : app.images)
+                        if (d->src->path == p) { already = true; break; }
+                    err = already ? std::string() : openRemoteWithReader(p, remoteMemo);
+                } else if (remoteReaderDoc) {
+                    // No memo: NAME it and stop. Not a picker, not a request -
+                    // the peer is not even asked, because "may this reader run"
+                    // is decided here (the memo) before "may readers run there"
+                    // (the peer's --serve-readers) is ever put to it. The two
+                    // sentences are the local pair one layer out; they differ
+                    // only in saying where the reader would have had to run.
+                    err = "this document was made by an input adapter running on "
+                          "the peer, and " + p + " cannot be reopened without it";
+                    if (!pendingReaderHint.empty())
+                        err += " - this session records it as " + pendingReaderHint +
+                               ". A session names a reader but never runs one, here "
+                               "or on the peer: open it with that reader again if "
+                               "you trust it, and this session will find it";
+                    else
+                        err += " - and this machine has no record of which one (that "
+                               "record is per-machine and bounded). Open it with the "
+                               "reader again, and this session will find it";
+                } else if (isRemote) {
                     // a remote image has no local file to decode: reconnect
                     // instead - carrying the §3.3 reading the line recorded,
                     // which since #124 is a thing a remote document can have.

@@ -449,7 +449,26 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 - **赤→緑**: R12 露光 8 × 16 枚の Series reader を peer 越しに開き、ローカルと
   doc 数・conditions 値・単位が一致。R13 ノード番号の範囲外 → 名指し拒否。
 
-### stage 4 — memo / session: V25p の remote 版
+### stage 4 — memo / session: V25p の remote 版 — **済**
+
+> 実装 2026-08-17 (issue #180 stage 4)。試験は `--rreader-selftest`
+> (`core/selftest/rreader.inc` の V25p-r0〜r2)。**ワイヤは 1 バイトも動かして
+> いない** —— 復元は stage 1〜2 の RUN 経路をそのまま呼ぶだけで、変更は
+> `core/app/session.inc` の復元分岐 1 箇所に閉じた。
+>
+> 設計との差分 3 点:
+> ① **保存側は無改造で既に正しかった**: memo の鍵が url 全体 (stage 2) なので
+>    `readerhint` の既存条件 (`member` が `__pixels_` で始まる → `readerFor(path)`)
+>    が remote doc にもそのまま当たる。V25p-r1a/r1b はその assert。
+> ② memo 枝は memo **だけ**でなく行の `member` (`__pixels_`) も見る。ローカル
+>    の門は memo 単独で判断するが、link の向こうでは同じ url を native で開く方
+>    (Browse) が常態で、「その doc が reader 産か」を知っているのは行の方だから。
+> ③ V25p-r1 の「実行回数が増えない」は client 側 `g_adapterRuns` では自明に 0
+>    (client は Python を起動しない)。実質の観測は **peer の materialisation の
+>    mtime が動かない** (stage 1 R2 の観測の一段上) で、両方を張っている。
+>    V25p-r2 の「hint は依頼もしない」は `bytesReceived()` が 1 バイトも動かない
+>    こと + peer のキャッシュ不変 —— 拒否は `ensureUiSession` より手前なので、
+>    接続すら起きない。
 
 - 復元: memo (url 鍵) が引ければ RUN → 開き直し (ローカル復元 :2691-2701 と同じ
   「memo が走らせる」)。引けなければ readerhint を**名指しだけ**して失敗報告
