@@ -121,8 +121,14 @@ static ImageDoc* abStatsB() {
 }
 
 // Side by side, or overlaid? One answer for every panel (App::abStatsLayout).
-// Auto mirrors the IMAGE: CmpSplit puts A and B left/right, so the plots go
-// left/right too; wipe / blink / difference have one image area, so they overlay.
+//
+// Auto mirrors the IMAGE, and the ruling on #60 (2026-08-14) is that it keeps
+// doing so at any N rather than splitting by panel kind: CmpSplit TILES A, B
+// and every armed slot, so the plots tile the same way and there are as many
+// panes as there are tiles; wipe / blink / difference collapse to ONE image
+// area, so the plots overlay onto one axis. What made the histogram stop at
+// two was never this function - it was the panels' side-by-side path having
+// exactly two halves nailed into it.
 static bool abSideBySide() {
     if (app.abStatsLayout == App::AbOverlay) return false;
     if (app.abStatsLayout == App::AbSide) return true;
@@ -147,6 +153,28 @@ static int blinkSideIndex() {
     if (app.compareMode != App::CmpFlip) return -1;
     return app.flipShowB ? 1 : 0;
 }
+
+// ...and which side an OVERLAID plot has to make stand out, as the same side
+// index. The other half of the 2026-08-14 ruling on #60: collapsed modes put
+// every curve on one axis, and "whatever the image is showing right now must
+// be the lead on the numeric side too" is then not said by the layout - it has
+// to be said by the drawing. Weight says it (a heavier stroke), because hue is
+// already spent naming the letter and cannot be borrowed.
+//
+// This is the chart-side twin of the ROI table following the blink (#76): the
+// table shows ONE side because rows cannot be superimposed, the chart shows
+// ALL of them because curves can - and both point at the same letter.
+//
+// -1 = nothing to emphasise, and wipe and difference are that case on purpose:
+// they put both sides on screen at the same instant, so no side is "the one
+// you are looking at" and inventing a lead there would be a claim the image
+// does not make.
+static int abEmphSide() { return blinkSideIndex(); }
+
+// The stroke a curve takes on a SHARED axis, and the one the emphasised side
+// takes. Twice over is the smallest ratio that survives a dense histogram and
+// the profile decimation: at 1.4 vs 1.8 px the difference reads as antialiasing.
+static float abCurveW(float base, bool emph) { return emph ? base * 2.2f : base; }
 
 // Can A's and B's profiles be drawn on ONE axis? Only when both sampled the
 // same range - same origin and same length. Anything else would have to be

@@ -1415,22 +1415,32 @@
             check(cmpB() != nullptr && app.cmpExtra.size() == 2,
                   "N fixture: B plus slots C and D are armed");
 
-            auto histFrame = [&]() {
+            // The panel width is an INPUT, not a constant: side by side keeps
+            // one pane per side and retreats to the overlay when a pane would
+            // fall under AB_MIN_SIDE, so "how many panes did it draw" and "did
+            // it retreat" are two different fixtures and differ only in width.
+            // 560 is what every test here used before N-wide panes existed and
+            // is now the narrow one; the wide one has to hold nSides * 320.
+            auto panelFrame = [&](void (*draw)(), const char* name, float w) {
                 for (int pass = 0; pass < 2; pass++) {
                     ImGui_ImplOpenGL3_NewFrame();
                     ImGui_ImplGlfw_NewFrame();
                     ImGui::NewFrame();
                     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-                    ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
-                    ImGui::Begin("HistProbe", nullptr,
+                    ImGui::SetNextWindowSize(ImVec2(w, 720.0f), ImGuiCond_Always);
+                    ImGui::Begin(name, nullptr,
                                  ImGuiWindowFlags_NoSavedSettings |
                                  ImGuiWindowFlags_NoTitleBar |
                                  ImGuiWindowFlags_NoDocking);
-                    drawPanelHistogram();
+                    draw();
                     ImGui::End();
                     ImGui::EndFrame();
                 }
             };
+            auto histFrameW = [&](float w) { panelFrame(drawPanelHistogram, "HistProbe", w); };
+            auto projFrameW = [&](float w) { panelFrame(drawPanelProjection, "ProjProbe", w); };
+            auto histFrame = [&]() { histFrameW(560.0f); };
+            auto projFrame = [&]() { projFrameW(560.0f); };
             // "rows=", "curves=" and "said-no-curve=" as letter sets, read back
             // out of the probe the panel wrote
             auto field = [](const std::string& probe, const char* key) {
@@ -1495,19 +1505,58 @@
                                 "plane limit is not reachable here, invariant only\n");
             app.histPlane = 0;
 
-            // N3: side by side has two halves, so it holds two sides. The other
-            // two are not on any plot and the panel has to say so.
+            // N3: side by side holds ONE PANE PER SIDE, at any N. The ruling on
+            // #60 (2026-08-14): 「splitの場合は横並び(A, B, Cなら3つならぶ)」 -
+            // the plots are arranged the way the images are, and split tiles
+            // every armed slot. Two halves were the two-image spelling of that,
+            // and while they were nailed in this assert read curves=AB with C
+            // and D named off the plot - which is half of the reported
+            // "histogram とか projection が3個以上にならん".
+            //
+            // Width is part of the fixture: four panes need 4 * AB_MIN_SIDE.
             app.abStatsLayout = App::AbSide;
-            histFrame();
+            // AB_MIN_SIDE is LOGICAL px and the floor is compared against the
+            // DPI-scaled one, so the fixture has to scale too - on a 150%
+            // display four 320 px panes need 1920, not 1280.
+            const float wide4 = (AB_MIN_SIDE * 4 + 140.0f) * app.uiScale;
+            histFrameW(wide4);
             std::string pSide = g_histSideProbe;
-            fprintf(stderr, "abstatsselftest: N3 side-by-side probe '%s'\n", pSide.c_str());
+            fprintf(stderr, "abstatsselftest: N3 side-by-side probe '%s' "
+                            "(width %.0f, uiScale %.2f)\n",
+                    pSide.c_str(), wide4, app.uiScale);
             check(rowsOf(pSide) == "ABCD",
                   "N3 side by side keeps every slot in the table");
-            check(field(pSide, "curves=") == "AB" &&
-                  field(pSide, "said-no-curve=") == "CD",
-                  "N3 ...and names the two it has no half for");
+            check(field(pSide, "layout=") == "side",
+                  "N3 ...and a panel this wide really is laid out, not fallen back");
+            check(field(pSide, "curves=") == "ABCD" &&
+                  field(pSide, "said-no-curve=").empty(),
+                  "N3 four sides get four panes - nothing is left off");
             check(accountedFor(pSide, unsaid),
                   "N3 every slot with numbers is drawn or named");
+            // ...and the Projection panel answers the same question the same
+            // way, off the same abSideBySide(): one setting, every panel, so a
+            // comparison laid out on the image is laid out in both of them.
+            projFrameW(wide4);
+            std::string pSideP = g_projSideProbe;
+            fprintf(stderr, "abstatsselftest: N3 projection side-by-side probe '%s'\n",
+                    pSideP.c_str());
+            check(field(pSideP, "layout=") == "side" &&
+                  field(pSideP, "curves=") == "ABCD",
+                  "N3 the projection lays out the same four sides in four panes");
+            check(accountedFor(pSideP, unsaid),
+                  "N3 ...and accounts for every one of them");
+
+            // N3b: ...and the same four sides in a 560 px panel. A pane would be
+            // 140 px, under the 320 px floor, so the panel SHRINKS to the point
+            // it cannot and then says so and retreats to the overlay (ruling 3:
+            // 「狭くなる,縮むでよい」 + the standing rule that a limit is spoken).
+            histFrameW(560.0f);
+            std::string pNarrow = g_histSideProbe;
+            fprintf(stderr, "abstatsselftest: N3b narrow probe '%s'\n", pNarrow.c_str());
+            check(field(pNarrow, "layout=") == "overlay",
+                  "N3b four panes do not fit in 560 px: it falls back to the overlay");
+            check(rowsOf(pNarrow) == "ABCD" && accountedFor(pNarrow, unsaid),
+                  "N3b ...and loses nobody on the way");
             app.abStatsLayout = App::AbOverlay;
 
             // N4: past the palette. slotInk tells slotInkCount() slots apart
@@ -1596,42 +1645,158 @@
 
             // N6: the same equation over the PROJECTION panel, which had no
             // probe at all - the panel issue #60 actually caught. Its table
-            // went N wide (75e5369) while its plots still draw only A and B,
-            // and nothing on screen said so: rows had letters that were in
-            // neither curves nor any sentence. The plots keeping to A|B is the
-            // pinned CURRENT limit, spoken on screen since this change; when
-            // the N overlay lands (compare-n.md §12) the curves assert below
-            // moves to ABCDE and said-no-curve empties.
+            // went N wide (75e5369) while its plots drew only A and B, and
+            // nothing on screen said so: rows had letters that were in neither
+            // curves nor any sentence. The first fix was to make it SAY so, and
+            // this assert pinned "AB" as the spoken limit of the day.
+            //
+            // The limit is now gone (docs/compare-n-design.md D5, unblocked by
+            // ruling 2 of 2026-08-14): with one plane on the axis - which the
+            // shared plane selector is what makes reachable - every side takes
+            // the shared axis in its own slot ink. Derivation of the expected
+            // value: A, B and the three slots N5 armed = 5 sides, histPlane is
+            // 0 so one plane is drawn, 5 <= slotInkCount() = 7, so five curves
+            // and nothing named off.
             {
-                auto projFrame = [&]() {
-                    for (int pass = 0; pass < 2; pass++) {
-                        ImGui_ImplOpenGL3_NewFrame();
-                        ImGui_ImplGlfw_NewFrame();
-                        ImGui::NewFrame();
-                        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-                        ImGui::SetNextWindowSize(ImVec2(560.0f, 720.0f), ImGuiCond_Always);
-                        ImGui::Begin("ProjProbe", nullptr,
-                                     ImGuiWindowFlags_NoSavedSettings |
-                                     ImGuiWindowFlags_NoTitleBar |
-                                     ImGuiWindowFlags_NoDocking);
-                        drawPanelProjection();
-                        ImGui::End();
-                        ImGui::EndFrame();
-                    }
-                };
                 check(app.cmpExtra.size() == 3, "N6 fixture: N5 left C, D, E armed");
+                check(app.histPlane == 0, "N6 fixture: one plane on the axis");
                 projFrame();
                 std::string pProj = g_projSideProbe;
                 fprintf(stderr, "abstatsselftest: N6 projection probe '%s'\n",
                         pProj.c_str());
                 check(rowsOf(pProj) == "ABCDE",
                       "N6 the projection table gives every armed side a row");
-                check(field(pProj, "curves=") == "AB",
-                      "N6 the profile plots hold A and B - today's limit, pinned");
-                check(field(pProj, "said-no-curve=") == "CDE",
-                      "N6 ...and the letters off the plots are named on screen");
+                check(field(pProj, "curves=") == "ABCDE",
+                      "N6 ...and one plane on the axis puts all five on the profile plots");
+                check(field(pProj, "said-no-curve=").empty(),
+                      "N6 ...with no letter left off to name");
                 check(accountedFor(pProj, unsaid),
                       "N6 no slot has numbers and no word about it");
+                // ...and every plane on the axis is still the spoken limit:
+                // four planes times five slots times two axes is forty curves.
+                if (app.proj[0].nSeries > 1) {
+                    const int keepPlane = app.histPlane;
+                    app.histPlane = -1;
+                    projFrame();
+                    std::string pAllP = g_projSideProbe;
+                    fprintf(stderr, "abstatsselftest: N6 all-planes probe '%s'\n",
+                            pAllP.c_str());
+                    check(field(pAllP, "curves=") == "AB" &&
+                          field(pAllP, "said-no-curve=") == "CDE",
+                          "N6 every plane on the axis: the slots come off BY NAME");
+                    check(accountedFor(pAllP, unsaid),
+                          "N6 ...and nothing is dropped in silence");
+                    app.histPlane = keepPlane;
+                } else {
+                    fprintf(stderr, "abstatsselftest: N6 single-plane fixture - the "
+                                    "plane limit is not reachable here\n");
+                }
+            }
+
+            // N7: the OTHER half of ruling 1 - 「重なって表示される場合(wipe/
+            // blink/diff)は重ねる。ただし表示中のスロットが分かる状態にする
+            // (太線等)」. Overlaid, every side is on the axis at once, so the
+            // layout cannot say which one the image is showing; the drawing
+            // has to. This is the chart-side twin of the ROI table following
+            // the blink (#76), so it is asserted the same way: as a LETTER the
+            // panel wrote down, never as a stroke width in pixels.
+            //
+            // Before this change there was no `emph` field at all, so every
+            // check below failed on an empty string.
+            {
+                const int keepMode = app.compareMode;
+                const bool keepFlip = app.flipShowB;
+                app.abStatsLayout = App::AbAuto;   // let the IMAGE decide, as shipped
+                app.compareMode = App::CmpFlip;    // one image area, showing one side
+
+                app.flipShowB = false;             // ...and the side it shows is A
+                histFrame();  std::string pFlipA = g_histSideProbe;
+                projFrame();  std::string qFlipA = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N7 blink=A hist '%s' proj '%s'\n",
+                        pFlipA.c_str(), qFlipA.c_str());
+                check(field(pFlipA, "layout=") == "overlay",
+                      "N7 blink is one image area, so Auto overlays the plots");
+                check(field(pFlipA, "emph=") == "A",
+                      "N7 the histogram draws the side the image is showing heavy");
+                check(field(qFlipA, "emph=") == "A",
+                      "N7 ...and so does the projection, off the same answer");
+
+                app.flipShowB = true;              // the blink turns over
+                histFrame();  std::string pFlipB = g_histSideProbe;
+                projFrame();  std::string qFlipB = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N7 blink=B hist '%s' proj '%s'\n",
+                        pFlipB.c_str(), qFlipB.c_str());
+                check(field(pFlipB, "emph=") == "B",
+                      "N7 ...and the weight moves with it, to B");
+                check(field(qFlipB, "emph=") == "B",
+                      "N7 ...on both panels");
+                // the emphasis is the ONLY thing that moved: every side still
+                // has its row and its curve, which is what "overlay" means
+                check(rowsOf(pFlipB) == rowsOf(pFlipA) &&
+                      field(pFlipB, "curves=") == field(pFlipA, "curves="),
+                      "N7 nobody enters or leaves the plot when the blink turns over");
+
+                // Wipe and difference put BOTH sides on screen in the same
+                // instant, so no side is "the one you are looking at" and
+                // inventing a lead would be a claim the image does not make.
+                app.compareMode = App::CmpWipe;
+                histFrame();  std::string pWipe = g_histSideProbe;
+                projFrame();  std::string qWipe = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N7 wipe hist '%s'\n", pWipe.c_str());
+                check(field(pWipe, "emph=").empty() && field(qWipe, "emph=").empty(),
+                      "N7 wipe shows both at once: no side is emphasised");
+                check(field(pWipe, "curves=") == field(pFlipB, "curves="),
+                      "N7 ...and the curves are the same ones either way");
+
+                app.compareMode = keepMode;
+                app.flipShowB = keepFlip;
+                app.abStatsLayout = App::AbOverlay;
+            }
+
+            // N8: ruling 2 - the Projection panel's plane selector IS the
+            // histogram's (`app.histPlane`), one setting read by both. Narrowing
+            // to one plane is a statement about what is being compared, not
+            // about which panel is being read.
+            //
+            // A menu combo cannot be scripted (the browse-keys precedent), so
+            // the sharing is asserted through the ONE thing a shared variable
+            // does that two variables cannot: each panel clamps it, and the
+            // other panel then reports what its neighbour wrote. That is the
+            // "both directions" check - projection -> histogram and back - and
+            // it fails against any build where the projection has a plane of
+            // its own or no plane at all.
+            {
+                const int keepPlane = app.histPlane;
+
+                app.histPlane = 99;             // out of range for either panel
+                projFrame();                    // the PROJECTION clamps it...
+                const int afterProj = app.histPlane;
+                histFrame();                    // ...and the histogram reads that
+                std::string pH = g_histSideProbe, pP = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N8 after proj clamp histPlane=%d "
+                                "hist '%s' proj '%s'\n", afterProj, pH.c_str(), pP.c_str());
+                check(afterProj >= -1 && afterProj < std::max(app.proj[0].nSeries, 1),
+                      "N8 the projection panel clamps the shared plane");
+                check(!field(pP, "plane=").empty() &&
+                      field(pH, "plane=") == field(pP, "plane="),
+                      "N8 ...and the histogram is showing the plane the projection wrote");
+
+                app.histPlane = -1;             // "all", set from outside both
+                histFrame();  pH = g_histSideProbe;
+                projFrame();  pP = g_projSideProbe;
+                check(field(pH, "plane=") == "all" && field(pP, "plane=") == "all",
+                      "N8 both panels follow the shared plane to 'all'");
+
+                app.histPlane = 0;              // ...and back to one plane
+                histFrame();  pH = g_histSideProbe;
+                projFrame();  pP = g_projSideProbe;
+                fprintf(stderr, "abstatsselftest: N8 plane=0 hist '%s' proj '%s'\n",
+                        pH.c_str(), pP.c_str());
+                check(!field(pH, "plane=").empty() && field(pH, "plane=") != "all" &&
+                      field(pH, "plane=") == field(pP, "plane="),
+                      "N8 ...and to the same single plane, named the same way");
+
+                app.histPlane = keepPlane;
             }
 
             app.cmpExtra.clear();

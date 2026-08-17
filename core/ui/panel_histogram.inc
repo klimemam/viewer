@@ -112,8 +112,15 @@ struct HistSide {
 //   "rows=ABCD;"        the sides the statistics table gave rows to
 //   "curves=ABC;"       the sides that got a curve on the plot
 //   "said-no-curve=D;"  the sides left OFF the plot AND named on screen for it
+//   "emph=B;"           the side drawn heavy because the IMAGE is showing it
+//   "plane=R;"          which plane the curves are of ("all" = every one)
+//   "layout=side;"      one pane per side, or "overlay" - one shared axis
 // A letter in `rows` but in neither of the other two would be the old defect
 // back again, which is what the N group of --abstats-selftest asserts.
+// `emph` and `plane` are the 2026-08-14 ruling on #60 made checkable: the
+// first is a STRUCTURAL record of the blink emphasis (which letter got the
+// weight, never how many pixels wide it was), the second is how a test sees
+// that the projection's plane selector and this one are one setting.
 static std::string g_histSideProbe;
 
 // ---- value highlight, the plot side (#68, docs/histogram-select-design.md) --
@@ -336,8 +343,15 @@ static void drawPanelHistogram() {
         bool cfaHist = im->ch == 1 && im->cfa != 0;
 
         // ---- plane selector: four CFA planes times two sides is eight curves
-        // on one axis. Same control as the ROI table's, and it filters BOTH
-        // sides, so a comparison is always plane against the same plane.
+        // on one axis. Same control as the ROI table's, and it filters EVERY
+        // side, so a comparison is always plane against the same plane.
+        //
+        // `app.histPlane` is SHARED with the Projection panel (ruling 2 on #60,
+        // 2026-08-14): narrowing to one plane is a statement about what is
+        // being compared, not about which panel you happen to be reading, and
+        // two panels quietly holding two different planes puts one comparison
+        // on screen twice with two different subjects. Changing it here moves
+        // the profiles too, and the profile panel's own combo moves this one.
         app.histPlane = std::clamp(app.histPlane, -1, std::max(H.nSeries - 1, -1));
         if (H.nSeries > 1) {
             const char* selName = app.histPlane < 0 ? "all" : H.seriesNames[app.histPlane];
@@ -358,18 +372,34 @@ static void drawPanelHistogram() {
 
         // ---- the layout question, asked BEFORE anything is sized, because the
         // answer decides how many footer lines and how tall a legend the plot
-        // has to leave room for. Side by side stays strictly the A|B pair: two
-        // halves hold two sides, and a grid that holds N is the image-side
-        // layout job (docs/compare-n.md 10 「表示レイアウト」), not something
-        // to fake here.
+        // has to leave room for.
+        //
+        // Side by side holds ONE PANE PER SIDE, at any N (ruling 1 on #60,
+        // 2026-08-14: 「splitの場合は横並び(A, B, Cなら3つならぶ)」). Two
+        // halves were the two-image spelling of the same thing, and while they
+        // were nailed in, split - the layout that tiles every armed slot on the
+        // image - was answering with a plot of A and B and a sentence about the
+        // rest. That is half of "histogram が3個以上にならん".
+        //
+        // At large N the panes SHRINK rather than scroll (ruling 3), and when a
+        // pane would fall under the minimum the panel says so and retreats to
+        // the overlay - the threshold is per PANE, exactly as the Temporal
+        // chart already measures it.
+        const size_t nSides = sides.size();
         const float minSide = AB_MIN_SIDE * app.uiScale;
-        bool side = Bim && abSideBySide();
-        bool tooNarrow = side && ImGui::GetContentRegionAvail().x < minSide;
+        // nSides, not Bim: a B with no pixels to measure (a remote preview
+        // placeholder) is not a side, but the letters behind it still are, and
+        // the image tiles them.
+        bool side = nSides > 1 && abSideBySide();
+        const float paneW = (ImGui::GetContentRegionAvail().x -
+                             ImGui::GetStyle().ItemSpacing.x * (float)(nSides - 1))
+                          / (float)std::max<size_t>(nSides, 1);
+        bool tooNarrow = side && paneW < minSide;
         if (tooNarrow) side = false;
 
         // ---- how many sides the PLOT can take. The table above always takes
-        // all of them; a chart has two hard limits and both of them have to be
-        // SPOKEN, never applied in silence:
+        // all of them; a SHARED axis has two hard limits and both of them have
+        // to be SPOKEN, never applied in silence:
         //   - PLANES. Four CFA planes times five slots is twenty curves, which
         //     is not a comparison, it is a texture. So slots overlay when ONE
         //     plane is on the axis (docs/compare-n.md 4 - the general form of
@@ -378,16 +408,18 @@ static void drawPanelHistogram() {
         //   - INK. slotInk can tell slotInkCount() slots apart and then wraps;
         //     drawing past that would put two slots in one colour, which is
         //     this panel omitting a slot again with a different mechanism.
+        // Both are properties of sharing one axis, so NEITHER applies side by
+        // side: a pane holds one side, wears its letter in a band, and colours
+        // by plane the way a single-image histogram always has.
         // Whatever is left off is named on screen, right under the plot.
-        const size_t nSides = sides.size();
         const bool onePlane = nDrawn <= 1;
         size_t nPlot;
         const char* offWhy = nullptr;
-        if (side || (!xslots.empty() && !onePlane)) {
+        if (side) {
+            nPlot = nSides;                // one pane each: nothing is left off
+        } else if (!xslots.empty() && !onePlane) {
             nPlot = Bim ? 2 : 1;           // the A|B pair the two-image modes mean
-            offWhy = side ? "side by side has two halves - set the A/B layout to "
-                            "overlay and every slot goes on one plot"
-                          : "pick ONE plane above and every slot overlays on it";
+            offWhy = "pick ONE plane above and every slot overlays on it";
         } else if (nSides > slotInkCount()) {
             nPlot = slotInkCount();
             offWhy = "the palette runs out - these would repeat a colour already "
@@ -448,7 +480,8 @@ static void drawPanelHistogram() {
         // one curve, one way to draw it: filled bars, solid outline, dashed
         // outline. The staircase is built once and reused by all three.
         auto plotSeries = [&](const PlotRect& pr, const uint32_t bins[256], double sc,
-                              ImU32 col, int style) {          // 0 fill, 1 solid, 2 dashed
+                              ImU32 col, int style,            // 0 fill, 1 solid, 2 dashed
+                              float w = 1.4f) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             float pw = pr.p1.x - pr.p0.x, ph = pr.p1.y - pr.p0.y;
             auto yOf = [&](uint32_t v) {
@@ -474,8 +507,8 @@ static void drawPanelHistogram() {
                 pts.push_back(ImVec2(bx0, y));
                 pts.push_back(ImVec2(bx1, y));
             }
-            if (style == 1) dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, 1.4f);
-            else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, 1.4f,
+            if (style == 1) dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, w);
+            else addDashedPolyline(dl, pts.data(), (int)pts.size(), col, w,
                                    5 * app.uiScale, 4 * app.uiScale);
         };
         // Once SLOTS share the plot, the colour has to say which SLOT. With one
@@ -488,14 +521,29 @@ static void drawPanelHistogram() {
         //
         // A and B alone keep exactly the colours they had: A's planes in the
         // plane colours, B lifted from the same hue so R stays R.
-        const bool bySlotInk = nPlot > 2;
+        // ...and side by side does NOT use it: a pane holds one side, its band
+        // says which, and the plane colours are then free to mean planes again.
+        const bool bySlotInk = !side && nPlot > 2;
+        // Which side the image is showing this instant, drawn HEAVY so that the
+        // overlay says it too (ruling 1 on #60: 「重なって表示される場合は
+        // 重ねる - ただし表示中のスロットが分かる状態にする(太線等)」).
+        // Only on a shared axis: side by side already gives every side its own
+        // pane and its own name band, so weight there would repeat the band.
+        // ...and only while the list really is A, B, ...: blinkSideIndex()
+        // counts in the canvas's seats, so with no measurable B its "1" would
+        // put the weight on C.
+        const int emphIdx = side || !Bim ? -1 : abEmphSide();
+        const bool emphOn = emphIdx >= 0 && (size_t)emphIdx < nPlot && nSides > 1;
         // Four CFA planes (or three RGB ones) as eight filled areas is
         // unreadable, so at three drawn curves or more BOTH sides become
         // outlines. Below that A keeps its fill and only B is an outline.
         // Slot ink means outlines throughout: N filled areas hide each other,
         // and the fill was only ever how "this one is A" got said when there
         // were two. With a legend and one hue per letter, the hue says it.
-        const bool outlineA = (nSides > 1 && nDrawn >= 3) || bySlotInk;
+        // Emphasis means outlines throughout for a different reason: weight is
+        // the message, and weight cannot be compared between a filled area and
+        // a line - a filled A would read as the lead whether or not it is.
+        const bool outlineA = (nSides > 1 && nDrawn >= 3) || bySlotInk || emphOn;
         auto drawSide = [&](const PlotRect& pr, size_t i) {
             const HistSide& sd = sides[i];
             for (int s = 0; s < sd.H->nSeries; s++) {
@@ -522,17 +570,24 @@ static void drawPanelHistogram() {
                 else                     col = i == 0 ? RGB_COLS[a]
                                                       : abLiftInk(RGB_COLS[a], 0.45f);
                 plotSeries(pr, sd.H->bins[s], norm ? sd.sc : 1.0, col,
-                           i == 0 && !outlineA ? 0 : 1);
+                           i == 0 && !outlineA ? 0 : 1,
+                           abCurveW(1.4f, emphOn && (int)i == emphIdx));
             }
         };
-        auto drawAll = [&](const PlotRect& pr, bool wantA, bool wantRest) {
+        // Every side the shared axis took, in one clip rect.
+        auto drawAll = [&](const PlotRect& pr) {
             if (!pr.ok) return;
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->PushClipRect(pr.p0, pr.p1, true);
-            for (size_t i = 0; i < nPlot; i++) {
-                if (i == 0 ? !wantA : !wantRest) continue;
-                drawSide(pr, i);
-            }
+            for (size_t i = 0; i < nPlot; i++) drawSide(pr, i);
+            dl->PopClipRect();
+        };
+        // ...and ONE side, in its own pane.
+        auto drawPane = [&](const PlotRect& pr, size_t i) {
+            if (!pr.ok) return;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(pr.p0, pr.p1, true);
+            drawSide(pr, i);
             dl->PopClipRect();
         };
 
@@ -585,48 +640,54 @@ static void drawPanelHistogram() {
                 (i < nPlot ? got : off) += sides[i].letter;
             g_histSideProbe += "curves=" + got + ";";
             if (!off.empty()) g_histSideProbe += "said-no-curve=" + off + ";";
+            if (emphOn) g_histSideProbe += "emph=" + sides[emphIdx].letter + ";";
+            g_histSideProbe += std::string("plane=") +
+                               (app.histPlane < 0 ? "all" : H.seriesNames[app.histPlane]) + ";";
+            // ...and WHICH arrangement drew them, because "every side got a
+            // curve" is true of one pane each and of one shared axis, and the
+            // ruling is about which of the two the image asked for.
+            g_histSideProbe += std::string("layout=") + (side ? "side" : "overlay") + ";";
         }
 
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                     false, false, plotH);
             histHlBand(hp);                 // under the curves
-            drawAll(hp, true, true);
+            drawAll(hp);
             histHlGesture(hp, im, H);
             if (!leg.empty())  slotLegendRow(leg, true);
             else if (Bim)      drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
-            // Always 50/50, never splitFrac: comparing two shapes needs two
-            // plots of the SAME width. What the layout copies from the image is
-            // the ORDER (A on the left), not the divider position.
-            const ImGuiStyle& st = ImGui::GetStyle();
-            float half = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+            // Equal widths, never splitFrac: comparing shapes needs plots of the
+            // SAME width, whether there are two of them or five. What the layout
+            // copies from the image is the ORDER (A first), not the divider
+            // position - which is also why the panes stay in slot order as
+            // letters are armed and released.
             float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
                          + ImGui::GetTextLineHeight() + 8 * app.uiScale;
-            ImGui::BeginChild("##histA", ImVec2(half, childH), false,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand("A", abDocLabel(im));
-            {   // the band and the gesture live on BOTH halves: one axis, one
-                // interval, and each half answers with its own pixels
-                PlotRect hpA = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
-                                         false, false, plotH);
-                histHlBand(hpA);
-                drawAll(hpA, true, false);
-                histHlGesture(hpA, im, H);
+            for (size_t i = 0; i < nSides; i++) {
+                if (i) ImGui::SameLine();
+                ImGui::BeginChild(("##histSide" + sides[i].letter).c_str(),
+                                  ImVec2(paneW, childH), false,
+                                  ImGuiWindowFlags_NoScrollbar |
+                                  ImGuiWindowFlags_NoScrollWithMouse);
+                drawABBand(sides[i].letter.c_str(), sides[i].label, sides[i].stale);
+                {   // The band and the gesture live on EVERY pane (#68), not on
+                    // two halves: one axis, one interval, and each pane answers
+                    // with its own pixels. Both are asked against A's bin grid
+                    // (im, H) whichever pane they are drawn in - every side is
+                    // binned on it, which is what makes the panes comparable at
+                    // all, and a per-pane grid would make the same drag select
+                    // a different range in each one.
+                    // identical axis ranges by construction: same xl/yl, same limits
+                    PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
+                                            false, false, plotH);
+                    histHlBand(hp);
+                    drawPane(hp, i);
+                    histHlGesture(hp, im, H);
+                }
+                ImGui::EndChild();
             }
-            ImGui::EndChild();
-            ImGui::SameLine();
-            ImGui::BeginChild("##histB", ImVec2(half, childH), false,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand("B", bLabel, bStale);
-            {   // identical axis ranges by construction: same xl/yl, same limits
-                PlotRect hpB = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
-                                         false, false, plotH);
-                histHlBand(hpB);
-                drawAll(hpB, false, true);
-                histHlGesture(hpB, im, H);
-            }
-            ImGui::EndChild();
         }
         if (tooNarrow) abNarrowNote();
         // A slot the plot could not take is named HERE, in the panel, next to
