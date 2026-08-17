@@ -708,8 +708,8 @@ int main(int argc, char** argv) {
     // answer: a suite whose window is whatever the developer last dragged is a
     // suite that measures the developer. Read once, here, from argv, because
     // that is the only thing that exists this early - the layout.ini guard
-    // below asks parseCli's g_browseKeys instead and is dead for it, which is a
-    // mistake this must not copy.
+    // below reads the same flag, having spent a while asking parseCli's
+    // g_browseKeys, which is set hundreds of lines later and was dead for it.
     //
     // --window-offset and g_rbForceW stay exactly as they are: those are
     // overrides a run asked for BY NAME, which is the opposite of inheriting one.
@@ -922,24 +922,24 @@ int main(int argc, char** argv) {
 #else
         if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
 #endif
-        // scripted runs (bench, browse-keys, --no-window) must neither read nor
+        // scripted runs (selftest, bench, --no-window) must neither read nor
         // write the user's layout - same rule the exit path applies to
-        // autosave/prefs. A run with no window has no layout to remember either.
+        // autosave/prefs, and the same rule the window geometry above applies.
+        // A run with no window has no layout to remember either.
         //
-        // NOT switched to scriptedRun, though the window geometry above is, and
-        // it is worth writing down why rather than leaving it to look like an
-        // oversight. `!g_browseKeys.empty()` is set by parseCli - several
-        // hundred lines BELOW this point - so for the keys selftests it is
-        // always false here, and only the APPDATA that CMakeLists.txt pins
-        // keeps ctest off the developer's real layout.ini (docs/verify-ui.md
-        // measured the md5 changing on a run by hand). Closing that hole makes
-        // selftest.browse-dbl fail every time: its scripted double-click is
-        // aimed at a panel whose place currently comes from the layout.ini an
-        // EARLIER test in the same pinned home left behind. That is a real
-        // defect and it is not this change's - a test that only lands its
-        // clicks because of another test's leftovers needs its own geometry
-        // pinned first, the way g_rbForceW already pins the width.
-        if (benchFrames || !g_browseKeys.empty() || noWindow) cfg.clear();
+        // scriptedRun, read from argv a few hundred lines up, because that is
+        // the only thing that exists this early. This used to ask parseCli's
+        // `!g_browseKeys.empty()` instead, which is set BELOW this point and so
+        // was always false here: every GUI selftest read and wrote a layout.ini,
+        // and only the APPDATA that CMakeLists.txt pins kept ctest off the
+        // developer's own (docs/verify-ui.md measured the md5 changing on a run
+        // by hand). Closing that hole used to make selftest.browse-dbl fail
+        // every time, because its scripted double-click was aimed at a panel
+        // whose place came from the layout.ini an EARLIER test in the shared
+        // home left behind. That defect is fixed where it belonged - the run
+        // that pins the panel's width now pins its display order too, see
+        // g_rbForceW below - so the hole closes here with nothing propping it.
+        if (scriptedRun) cfg.clear();   // covers --no-window and --bench* too
         if (!cfg.empty()) {
             cfg /= "viewer";
             std::filesystem::create_directories(cfg, ec);
@@ -1522,7 +1522,25 @@ static bool g_watchSuppressed = false;
                     ImGui::SetNextWindowDockID((ImGuiID)I.dockInto, ImGuiCond_Always);
                     I.dockInto = 0;
                 }
-                if (ImGui::Begin(I.wtitle.c_str(), &show)) drawPanelRemote(I);
+                bool vis = ImGui::Begin(I.wtitle.c_str(), &show);
+                // ...and the third coordinate. A rectangle is not where a click
+                // lands: what lands is whatever is DRAWN there. The panel this
+                // test floats starts DOCKED (a virgin config has no layout.ini,
+                // so the DockBuilder above puts Browse in the left node), and a
+                // docked window lives inside ##root, which carries
+                // NoBringToFrontOnFocus and therefore sits behind every
+                // floating window - including ROIs and Analysis, which are
+                // shown by default and open at ImGui's default 60,60. Undocking
+                // it here does not reorder it, so the scripted double-click at
+                // (208,414) was measured landing on Analysis
+                // (HoveredWindow=Analysis) and the cursor never moved. With a
+                // layout.ini the panel is floating from frame one, gets focused,
+                // and comes forward - which is the whole of why selftest.
+                // browse-dbl used to need another test's leftovers (#206).
+                // So the run that pins the width pins the display order too.
+                if (g_rbForceW > 0 && primordial)
+                    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+                if (vis) drawPanelRemote(I);
                 ImGui::End();
                 if (!show && !primordial) destroyNum = I.num;
             }

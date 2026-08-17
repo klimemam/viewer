@@ -56,7 +56,10 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 - **PROLOG が要る理由**: selftest は **利用者の生の状態を継承する**。起動時に
   flat/tree/advanced は落とされる (main.cpp:27750) が、`viewreset` は列の途中で
   効かせられる唯一の絶対ピン。`w400` はパネルを固定幅で float させ、注入クリックが
-  利用者の保存レイアウト次第の座標に落ちるのを防ぐ。
+  利用者の保存レイアウト次第の座標に落ちるのを防ぐ。**重なり順も `w400` が固定する**
+  (#206): 矩形を決めても、そこに描かれているのが別の窓なら注入クリックはそちらに
+  落ちる —— layout.ini の無い config では Browse は docked で始まり、`w400` の
+  undock だけでは既定で開いている ROIs / Analysis の下のままだった。
 - **EPILOG が要る理由**: 終了コードは
   `keysOk = routeOk && popOk && keysCheckBad == 0` (main.cpp:29132)。
   `routeOk` / `popOk` は `blur` と `popupcheck` だけが立てるカウンタを読む。
@@ -64,7 +67,9 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
   (`FAILED (the action list did not finish)`) になる。実測済み。
 
 > **警告 (defect D-1 参照)**: `--browse-keys-selftest` は利用者の実
-> `%APPDATA%/viewer/layout.ini` と `autosave.vsession` を **書き換える**。
+> `%APPDATA%/viewer/autosave.vsession` を **書き換える**。
+> (`layout.ini` の方は #206 で塞いだ —— `scriptedRun` の run は
+> `io.IniFilename` を持たない。`autosave.vsession` の穴は残っている。)
 > 検証は必ず `APPDATA` を捨てディレクトリに向けて回すこと。
 > `tools/verify/*.sh` はそうしてある。
 
@@ -246,11 +251,14 @@ main.cpp:29169-29176 は終了時に、はっきりこう書いて `autosaveSess
 
 > a selftest must not leave its scripted clicks in the user's session or their preferences
 
-ところが実際には **2 つ穴がある**:
+ところが実際には **2 つ穴があった**。1 は #206 で塞ぎ、2 は残っている:
 
-1. **`layout.ini`**: `io.IniFilename` は main.cpp:20910-20911 で利用者の実
-   `%APPDATA%/viewer/layout.ini` に **無条件で** 向けられ、`g_browseKeys` のガードが無い。
-   ImGui が終了時に自動保存するため、スクリプトが作ったパネル幾何がそのまま残る。
+1. ~~**`layout.ini`**~~ **塞いだ (#206)**: `io.IniFilename` は利用者の実
+   `%APPDATA%/viewer/layout.ini` に **無条件で** 向けられ、`g_browseKeys` のガードが
+   無かった (それは parseCli が数百行下で立てるので、ここでは常に false)。
+   ImGui が終了時に自動保存するため、スクリプトが作ったパネル幾何がそのまま残った。
+   現在は argv から読む `scriptedRun` で判定し、selftest / bench / `--no-window` は
+   `io.IniFilename = nullptr` で走る —— 読みも書きもしない。
 2. **`autosave.vsession`**: フレームループ内の周期オートセーブ (main.cpp:28609) は
    `!benchFrames` としか見ておらず `g_browseKeys` を見ていない。
    `--browse-keys-selftest` は約 2000 フレーム走り 45 枚開くので、これが発火する。
