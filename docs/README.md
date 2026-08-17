@@ -100,9 +100,10 @@
 |---|---|
 | [remote.md](remote.md) | `ssh://` でリモートのデータを手元から見る |
 | [remote-headerless-design.md](remote-headerless-design.md) | ヘッダ無し RAW のレシピがリンクを渡る設計 (G1) |
+| [remote-reader-design.md](remote-reader-design.md) | reader が peer 側で走る設計 (#180 裁定 B、板 240)。stage 0 済、1〜5 未 |
 
-`remote-reader-design.md` (#180 裁定 B、板 240) は**未着地**。生まれるときは
-`features/remote/` に直接生む — それが remote 波の引き金になる (§10)。
+(remote-reader-design.md は 2026-08-17 に着地した。remote 波では
+`features/remote/` へ — §10 の予約はそのまま生きている。)
 
 ### export / watch / settings / media / theme
 
@@ -176,6 +177,7 @@
 | [todo-open.md](todo-open.md) | 2026-07-30 時点の未着手一覧。**板に無い項目の統合監査が先** (板 参照) | `background/project/` (凍結 → 監査 → 移送) |
 | [docs-split-review.md](docs-split-review.md) | 旧分割案の全件レビュー | `background/documentation/` |
 | [docs-restructure-handoff.md](docs-restructure-handoff.md) | codex の構造案 | `background/documentation/` |
+| [docs-restructure-review.md](docs-restructure-review.md) | 構造案への Fable の6判断 + 移行マッピング | `background/documentation/` |
 
 ## 7. 素材と生成物 (据え置き)
 
@@ -233,7 +235,7 @@ issue 本文・git 履歴は旧パスで引き続けるので、1 ホップで�
 |---|---|---|
 | media-formats.md | branch 上 (未マージ)。C++ 3 箇所 (`core/rawread.h` ほか) + 板の参照列 3 | 上陸は現行パスで受け、media 波で `features/media/` へ |
 | python-plugins.md | branch `plugin-python-study` (未マージ)。板の参照列 2 | 上陸後 `features/plugins/` (このとき features/plugins を新設) |
-| remote-reader-design.md | **未着地の成果物** (板 240、#180 裁定 B) | `features/remote/` に直接生む |
+| remote-reader-design.md | 着地済 (2026-08-17)。§3 の remote 節に現行として掲載 | remote 波で `features/remote/` へ |
 
 `docs-split-review.md` のコードフェンス内にある `docs/x.md` と
 `.background/import-adapters.md` は**引用例文**であって参照ではない。
