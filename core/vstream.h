@@ -27,6 +27,12 @@
 //               half's "one definition" lives.
 #pragma once
 #include <stdint.h>
+#include <stdio.h>                   // sscanf, for the `pixels` line
+#include <stdlib.h>                  // atoi, for the numbers on the others
+                                     // (spelled out for remote_proto.h's reason:
+                                     //  MSVC and libc++ pull these in through
+                                     //  <string>, libstdc++ does not, and the
+                                     //  build that finds out is the Linux one)
 #include <istream>
 #include <string>
 #include <vector>
