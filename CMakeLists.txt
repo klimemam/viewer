@@ -1194,6 +1194,14 @@ viewer_selftest(roi-export  NOGL --roi-export-selftest)
 # roistats - it asserts what the panel prints, not where it landed - and the
 # same analytic in-memory fixtures, so it needs no fixture directory either.
 viewer_selftest(abeq        NOGL --abeq-selftest)
+# The value highlight (#68, docs/histogram-select-design.md): a value interval
+# dragged on the histogram's x axis, and the pixels in it painted on the image.
+# NOGL and fixture-free for abeq's reasons - the documents are analytic and
+# built in memory, and every assertion is a byte of RGBA, a count derived by
+# hand, or a string the panel printed. The two equations it turns on (painted
+# count == sum of the selected bins, inside the grid and at the folded end bin)
+# are the reason it is a test at all rather than a demo.
+viewer_selftest(histhl      NOGL --histhl-selftest)
 # settings.jsonc (issue #50 stage 1, docs/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
 # (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of

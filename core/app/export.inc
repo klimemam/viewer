@@ -98,6 +98,20 @@ static std::string exportRefusalFor(const ImageDoc* im) {
     return {};
 }
 
+// An export made while the value highlight is armed carries the magenta - it
+// has to, because renderDocRGBA is the one mapping and the whole point of
+// putting the highlight there is that the file and the screen agree. What the
+// file does NOT carry is the badge that explains it: the badge is ImGui chrome
+// over the canvas, not pixels. That is the same acceptance the display range,
+// the gamma and a display LUT already have (all baked in, none explained by the
+// image), so the sentence goes where the export is ANNOUNCED - the toast, the
+// Messages log it lands in, and stderr. "" when nothing is armed.
+static std::string exportHighlightNote(const ImageDoc* im) {
+    if (!app.highlight.on) return {};
+    return "exported with value " +
+           histHlRangeSaid(im ? im->dtype : std::string());
+}
+
 // The ONE place an export is produced, so the file and the clipboard can never
 // disagree about what the picture is.
 static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int& h) {
@@ -112,10 +126,13 @@ static void copyViewDotByDot() {
     std::vector<uint8_t> rgba; int w = 0, h = 0;
     if (!exportDocRGBA(im, rgba, w, h)) { toast(exportRefusalFor(im), true); return; }
     std::vector<uint8_t> png = encodePng(rgba, w, h);
+    const std::string hlNote = exportHighlightNote(im);
+    if (!hlNote.empty()) fprintf(stderr, "export: %s\n", hlNote.c_str());
 #ifdef _WIN32
     std::string err;
     if (clipboardPutImage(rgba, w, h, png, err))
-        toast("copied " + std::to_string(w) + "x" + std::to_string(h) + " (dot by dot)");
+        toast("copied " + std::to_string(w) + "x" + std::to_string(h) + " (dot by dot)" +
+              (hlNote.empty() ? "" : "  -  " + hlNote));
     else
         toast("copy failed: " + err, true);
 #else
@@ -127,7 +144,8 @@ static void copyViewDotByDot() {
     f.write((const char*)png.data(), (std::streamsize)png.size());
     f.close();
     ImGui::SetClipboardText(path.c_str());
-    toast("wrote " + path + " (path on the clipboard)");
+    toast("wrote " + path + " (path on the clipboard)" +
+          (hlNote.empty() ? "" : "  -  " + hlNote));
 #endif
 }
 
@@ -150,7 +168,10 @@ static void saveViewPng(const std::string& path, uint64_t uid = 0) {
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
     if (!f) { toast("cannot write " + path, true); return; }
     f.write((const char*)png.data(), (std::streamsize)png.size());
-    toast("saved " + baseName(path) + "  " + std::to_string(w) + "x" + std::to_string(h));
+    const std::string hlNote = exportHighlightNote(im);
+    if (!hlNote.empty()) fprintf(stderr, "export: %s\n", hlNote.c_str());
+    toast("saved " + baseName(path) + "  " + std::to_string(w) + "x" + std::to_string(h) +
+          (hlNote.empty() ? "" : "  -  " + hlNote));
 }
 
 // ここから forgetImage までは表示レンジ/テクスチャ/キャッシュ掃除の補助で export ではない(§2 の ~240 はこの並び込みの勘定)。住所のまま移動(§1) → P 段階で分けるなら compare 側へ

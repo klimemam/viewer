@@ -65,6 +65,7 @@
 #include <condition_variable>
 #include <limits>
 #include <iomanip>
+#include <array>
 #include <sstream>
 #include <string>
 #include <chrono>
@@ -636,6 +637,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 #include "selftest/rset.inc"
 
+// The value highlight (#68). Here rather than in the block inside main() for
+// abEqSelftest's reason: it is a function, and it drives the real Statistics
+// panel through real frames.
+#include "selftest/histhl.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -1088,6 +1094,12 @@ int main(int argc, char** argv) {
     // is what the Statistics panel PRINTS, and that is CPU on both sides of the
     // window branch.
     if (g_abEqSelftest) return abEqSelftest();
+
+    // The value highlight (#68): the drag -> interval mapping, the paint inside
+    // renderDocRGBA, the count the painting loop makes, and what the panel and
+    // the badge SAY. Windowless for the abeq reasons - fixtures in memory, and
+    // every assertion is a byte, a count or a string.
+    if (g_histHlSelftest) return histHlSelftest();
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
     // through the real panel. Windowless because every assertion is a string.

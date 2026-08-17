@@ -116,6 +116,95 @@ struct HistSide {
 // back again, which is what the N group of --abstats-selftest asserts.
 static std::string g_histSideProbe;
 
+// ---- value highlight, the plot side (#68, docs/histogram-select-design.md) --
+// The band and the gesture. Both derive their colour from HL_INK rather than
+// spelling magenta again, so §11's "one constant" really is one constant.
+static ImU32 histHlBandInk(int alpha) {
+    return (HL_INK & ~IM_COL32_A_MASK) | ((ImU32)alpha << IM_COL32_A_SHIFT);
+}
+
+// The selected interval, drawn where it was MADE: same hue as the paint on the
+// pixels, low alpha, UNDER the curves (it is the ground the distribution
+// stands on, not a mark over it). Drawn on every half of a side-by-side,
+// because there is one axis and the interval belongs to the axis - asking
+// "is this A's selection or B's" is a question the design deletes rather than
+// answers.
+static void histHlBand(const PlotRect& pr) {
+    if (!pr.ok || !app.highlight.on) return;
+    const App::HistHighlight& H = app.highlight;
+    // An OPEN side runs to the edge of the plot, because that is exactly what
+    // the end bar it touched means; a closed one lands on its own value.
+    float x0 = H.loOpen ? pr.p0.x : pr.at(H.lo, pr.ymin).x;
+    float x1 = H.hiOpen ? pr.p1.x : pr.at(H.hi, pr.ymin).x;
+    x0 = std::clamp(x0, pr.p0.x, pr.p1.x);
+    x1 = std::clamp(x1, pr.p0.x, pr.p1.x);
+    if (x1 < x0) std::swap(x0, x1);
+    // A band narrower than a pixel would leave the plot blank while the image
+    // is painted magenta. Armed is never invisible.
+    if (x1 - x0 < 1.0f) x1 = x0 + 1.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(40));
+    dl->AddRect(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(150));
+}
+
+// Left-drag across the plot arms on RELEASE; double-click clears. Nothing is
+// repainted while the mouse is down - the band follows live and the PAINT
+// happens once, on release, which is the Temporal box-zoom's gesture economy
+// and the reason a 12 Mpx frame is not re-rendered per mouse-move. The vertical
+// extent carries no meaning (y is frequency), so the band is always full
+// height. The histogram has no drag gesture of its own and no zoom, so there is
+// nothing here to collide with.
+static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState& H) {
+    if (!pr.ok || !im) return;
+    static ImVec2 dragA;
+    static bool dragging = false;
+    // WHICH plot the drag began on. Side by side calls this twice per frame
+    // with two different rectangles, and a gesture is one gesture: without
+    // this, a drag started in the B half was completed by the A half's call
+    // (A is drawn first), which unmapped B's screen x through A's rectangle
+    // and armed an interval nobody drew - pinned to bin 255, because every
+    // point of the right-hand plot is past the left-hand plot's xmax.
+    static float dragOn = 0;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const bool hov = ImGui::IsMouseHoveringRect(pr.p0, pr.p1) &&
+                     ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        histHlClear();
+        dragging = false;
+        return;
+    }
+    if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        dragA = ImGui::GetMousePos();
+        dragOn = pr.p0.x;
+        dragging = true;
+    }
+    if (dragging && dragOn != pr.p0.x) return;      // the other half's plot
+    if (dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const ImVec2 m = ImGui::GetMousePos();
+        float x0 = std::clamp(std::min(dragA.x, m.x), pr.p0.x, pr.p1.x);
+        float x1 = std::clamp(std::max(dragA.x, m.x), pr.p0.x, pr.p1.x);
+        dl->AddRectFilled(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(40));
+        dl->AddRect(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(150));
+    }
+    if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        dragging = false;
+        const HistHlRange r = histHlFromDrag(pr, dragA, ImGui::GetMousePos(),
+                                             H.binOrigin, H.binW);
+        if (!r.ok) return;                    // a click with jitter is not a drag
+        // The binding is decided HERE, once, at the moment of the drag - and a
+        // document on which "in range" would be ambiguous is declined out loud
+        // rather than painted on a guess.
+        const std::string no = histHlRefusalFor(im, app.histPlane);
+        if (!no.empty()) {
+            toast(no, true);
+            histHlProbeSet("refused", no);
+            return;
+        }
+        histHlArm(r.lo, r.hi, r.loOpen, r.hiOpen, app.histPlane,
+                  app.histPlane >= 0 ? H.seriesNames[app.histPlane] : nullptr);
+    }
+}
+
 static void drawPanelHistogram() {
     g_histSideProbe.clear();
     ImageDoc* im = cur();
@@ -464,7 +553,20 @@ static void drawPanelHistogram() {
                       : ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
                                             ImGui::GetContentRegionAvail().x).y +
                         ImGui::GetStyle().ItemSpacing.y;
-        float footerH = ImGui::GetTextLineHeightWithSpacing() * (float)nSides
+        // ...and the value highlight's own lines, one per side that answers,
+        // COUNTED HERE with the rest rather than discovered when they are
+        // drawn: everything below this point is sized against footerH, and a
+        // line that appears after the layout pushes the whole footer out of the
+        // bottom of the panel - which is exactly the state where the highlight
+        // must not be the thing that scrolls away.
+        int hlLines = 0;
+        if (app.highlight.on) {
+            for (const HistSide& sd : sides)
+                if (sd.H->img && app.hlCount.count(sd.H->img->uid)) hlLines++;
+            if (!hlLines) hlLines = 1;              // the "(not painted yet)" line
+        }
+        float footerH = ImGui::GetTextLineHeightWithSpacing() *
+                            (float)(nSides + hlLines)
                       + (tooNarrow ? abNarrowNoteH() : 0.0f) + offMsgH;
         // the legend row lives under the overlaid plot, and its height comes off
         // the plot BEFORE the plot is laid out
@@ -488,7 +590,9 @@ static void drawPanelHistogram() {
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                     false, false, plotH);
+            histHlBand(hp);                 // under the curves
             drawAll(hp, true, true);
+            histHlGesture(hp, im, H);
             if (!leg.empty())  slotLegendRow(leg, true);
             else if (Bim)      drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
@@ -502,16 +606,26 @@ static void drawPanelHistogram() {
             ImGui::BeginChild("##histA", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             drawABBand("A", abDocLabel(im));
-            drawAll(beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
-                              false, false, plotH), true, false);
+            {   // the band and the gesture live on BOTH halves: one axis, one
+                // interval, and each half answers with its own pixels
+                PlotRect hpA = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
+                                         false, false, plotH);
+                histHlBand(hpA);
+                drawAll(hpA, true, false);
+                histHlGesture(hpA, im, H);
+            }
             ImGui::EndChild();
             ImGui::SameLine();
             ImGui::BeginChild("##histB", ImVec2(half, childH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             drawABBand("B", bLabel, bStale);
-            // identical axis ranges by construction: same xl/yl, same limits
-            drawAll(beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
-                              false, false, plotH), false, true);
+            {   // identical axis ranges by construction: same xl/yl, same limits
+                PlotRect hpB = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
+                                         false, false, plotH);
+                histHlBand(hpB);
+                drawAll(hpB, false, true);
+                histHlGesture(hpB, im, H);
+            }
             ImGui::EndChild();
         }
         if (tooNarrow) abNarrowNote();
@@ -546,6 +660,46 @@ static void drawPanelHistogram() {
                 ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
                 ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
             }
+        }
+        // ---- the value highlight: what is armed, and what it found ----------
+        // Printed on EVERY frame it is armed. This sentence is the whole reason
+        // "the highlight is not saved in the session" is a safe decision (#68
+        // §1): a lens left on cannot become an invisible state, because the
+        // screen showing the paint always carries the line explaining it. It is
+        // also where the measurement earns the right to be quoted - the count,
+        // its denominator and the REGION it was taken over, every time, because
+        // the header above may be saying "(selected ROI)" about the curves
+        // while this is always the whole frame.
+        if (app.highlight.on) {
+            std::string joined;
+            const std::string head = histHlRangeSaid(im->dtype);
+            bool first = true;
+            auto emit = [&](const std::string& line) {
+                ImGui::TextUnformatted(line.c_str());
+                if (first) {          // one clear button, on the first line
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("clear##hl")) histHlClear();
+                    first = false;
+                }
+                joined += (joined.empty() ? "" : "|") + line;
+            };
+            // A line for every side whose pixels were actually PAINTED - and
+            // only those. A slot that is not drawn is not painted and makes no
+            // claim: the only way to give it a number would be to derive one
+            // from the bins, which is the sampled, possibly ROI-limited
+            // population that must never wear the same face as this count.
+            for (const HistSide& sd : sides) {
+                const ImageDoc* d = sd.H->img;
+                if (!d || !app.hlCount.count(d->uid)) continue;
+                emit(head + "  -  " + histHlSideSaid(d, sd.letter));
+            }
+            // Armed, but nothing has been through renderDocRGBA yet (the
+            // texture rebuild is lazy). Say the interval anyway: silence here
+            // would be the one state this feature is not allowed to have.
+            if (first) emit(head + "  -  (not painted yet)");
+            histHlProbeSet("panel", joined);
+        } else {
+            histHlProbeSet("panel", "");
         }
     }
 

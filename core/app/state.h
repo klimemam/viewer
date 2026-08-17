@@ -902,6 +902,60 @@ struct App {
     // are computed for every plane either way.
     int histPlane = -1;
 
+    // ---- value highlight (#68, docs/histogram-select-design.md) -------------
+    // Drag a value interval on the histogram's x axis and the pixels that fall
+    // in it are painted on the image, in one colour, with the count declared.
+    //
+    // AXIS state - not the document's, not an annotation's. The flagship use is
+    // "select the tail, then step frames and watch which pixels enter and leave
+    // it", and every step changes the uid: held on the document the selection
+    // would either vanish on the step or have to be copied across hundreds of
+    // frames. What was chosen is a VALUE, and the same value asks the same
+    // question of every frame. Nor is it an annotation: an annotation declares
+    // a PLACE, is saved in the session and has a name and a list; this is a
+    // question about VALUES with no identity of its own. It is not written to
+    // the session either (v1) - a lens you pick up, not a declaration. The
+    // guard against a forgotten lens is that it is ALWAYS declared on screen
+    // (the panel footer and the canvas badge), never that it is short-lived.
+    struct HistHighlight {
+        bool on = false;
+        // Raw DN, half-open [lo, hi), snapped OUTWARD onto the bin grid that
+        // was on the axis when the drag happened. RAW, so moving the display
+        // range or the gamma does not move it: what was chosen is "pixels of
+        // this value", never "pixels that look this bright".
+        float lo = 0, hi = 0;
+        // An END bin was touched, so that side is open. The bins fold
+        // everything outside the grid into bin 0 / bin 255
+        // (recomputeHistogramIfNeeded), which makes those bars mean "and
+        // everything beyond" - and a selection means what the bar means, or a
+        // user who dragged over the saturation tail is handed a count smaller
+        // than the bar they aimed at, missing exactly the pixels they came for.
+        bool loOpen = false, hiOpen = false;
+        // The plane selector BOUND at drag time (-1 = "all"), and its NAME.
+        // Bound, because the highlight is defined only where a pixel has
+        // exactly ONE value under the plane filter; moving the selector
+        // afterwards does not re-aim an existing selection. The name is what
+        // other documents are matched on - abSeriesMatch's standing rule, "B's
+        // plane is matched to A's by name; ch0 is not R".
+        int plane = -1;
+        char planeName[8] = "";
+    } highlight;
+    // What the PAINTING loop counted, per document uid. renderDocRGBA is the
+    // ONLY writer: the histogram bins are a different POPULATION (sampled to
+    // ~1M px, and limited to the ROI when a ROI drives the panel) while the
+    // paint sees every pixel of the frame, so deriving the count from the bins
+    // would put two numbers with different denominators behind one sentence.
+    // The panel and the canvas badge only READ this.
+    struct HlCount {
+        bool painted = false;         // this document could answer at all
+        std::string why;              // ...and when it could not, why, in words
+        int plane = -1;               // the binding RESOLVED in this document
+        int nSeries = 0;
+        const char* names[4] = {};
+        size_t hit[4] = {}, fin[4] = {};   // matched / finite, per plane
+    };
+    std::map<uint64_t, HlCount> hlCount;
+
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
     struct SeqInfo {
         int id = 0;

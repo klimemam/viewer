@@ -1223,6 +1223,32 @@ static void drawCanvas(ImVec2 avail) {
                               ImVec2(bx + ts.x + 8 * s, by + ts.y + 4 * s), bg, 4.0f * s);
             dl->AddText(ImVec2(bx, by), IM_COL32(255, 215, 140, 255), msg);
         }
+        // The value highlight declares itself ON the canvas for as long as it
+        // is armed (#68 §5). The Statistics panel that made the selection can
+        // be closed, docked away or scrolled off while the paint is still on
+        // the pixels, and magenta with nothing on screen to explain it is the
+        // one failure this feature must not ship. Top RIGHT: the slot badges
+        // own the top left, the preview notice the top centre, and the
+        // difference colour bar the bottom left.
+        {
+            const std::string hb = histHlBadgeSaid();
+            histHlProbeSet("badge", hb);
+            if (!hb.empty()) {
+                ImVec2 ts = ImGui::CalcTextSize(hb.c_str());
+                float bx = std::max(canvasP0.x + 6 * s, canvasP1.x - ts.x - 18 * s);
+                float by = canvasP0.y + 6 * s;
+                dl->AddRectFilled(ImVec2(bx - 6 * s, by - 3 * s),
+                                  ImVec2(bx + ts.x + 6 * s, by + ts.y + 3 * s),
+                                  IM_COL32(0, 0, 0, 190), 3.0f * s);
+                // The WORDS are neutral; the swatch is what ties the sentence
+                // to the colour on the pixels. Never the other way round - the
+                // colour is not the signal (a user LUT could hold magenta, and
+                // this machine can read neither a screenshot nor a hue).
+                dl->AddRectFilled(ImVec2(bx - 3 * s, by + ts.y * 0.25f),
+                                  ImVec2(bx, by + ts.y * 0.75f), HL_INK);
+                dl->AddText(ImVec2(bx, by), IM_COL32(230, 234, 240, 240), hb.c_str());
+            }
+        }
     } else {
         const char* msg = "Drop .npy / .bin / .raw files here   (O: open file)";
         ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -1763,6 +1789,58 @@ static bool zoomRangeFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
     x0 = std::min(da.x, db.x); x1 = std::max(da.x, db.x);
     y0 = std::min(da.y, db.y); y1 = std::max(da.y, db.y);
     return x1 > x0 && y1 > y0;
+}
+
+// A drag on the histogram's x axis -> the value interval it selects (#68,
+// docs/histogram-select-design.md §2). Pure, and here beside zoomRangeFromDrag
+// for its reason: a selftest can then pin the whole mapping with no mouse.
+//
+// Three rules, and each earns its place:
+//   * the ends SNAP OUTWARD onto the BIN grid. A plot cannot show a distinction
+//     finer than a bin, so an endpoint of 103.7 would name a precision the
+//     picture never offered; the bin the cursor touched is taken whole, in the
+//     same direction histBinGrid itself widens.
+//   * the interval is HALF-OPEN [lo, hi) - the same edge convention a bin has
+//     (state.h: bin b spans [origin + b*w, origin + (b+1)*w)), so a selection
+//     and the bars under it agree about which side an edge belongs to.
+//   * touching an END bin OPENS that side. recomputeHistogramIfNeeded folds
+//     everything below the grid into bin 0 and everything above it into bin
+//     255, so those two bars mean "and everything beyond". Read literally
+//     instead, a drag over the saturation tail would return a count far below
+//     the bar it covered, dropping exactly the pixels the user was hunting.
+//     A selection means what the bar means - and the dividend is that "painted
+//     count == sum of the selected bins" then holds at the edges too.
+// Only the HORIZONTAL extent is an intention: y is frequency, and the band is
+// always full height. The 4 px threshold is zoomRangeFromDrag's, for the same
+// reason - a click with jitter in it is not a drag.
+struct HistHlRange {
+    bool ok = false;
+    int b0 = 0, b1 = 0;                    // the bins touched, inclusive
+    float lo = 0, hi = 0;
+    bool loOpen = false, hiOpen = false;
+};
+static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
+                                  float origin, float w) {
+    HistHlRange r;
+    if (!pr.ok || !(w > 0) || !std::isfinite(w) || !std::isfinite(origin)) return r;
+    if (fabsf(a.x - b.x) < 4.0f) return r;
+    float xa = pr.unmap(a).x, xb = pr.unmap(b).x;
+    if (!std::isfinite(xa) || !std::isfinite(xb)) return r;
+    if (xb < xa) std::swap(xa, xb);
+    // DIVIDE in double, the same discipline the binning keeps: a reciprocal is
+    // inexact for every integer width that is not a power of two, and the
+    // floor would then land one bin low at exactly the edges the snapping
+    // exists to make exact.
+    const double t0 = std::floor(((double)xa - (double)origin) / (double)w);
+    const double t1 = std::floor(((double)xb - (double)origin) / (double)w);
+    r.b0 = (int)std::clamp(t0, 0.0, 255.0);
+    r.b1 = (int)std::clamp(t1, 0.0, 255.0);
+    r.lo = (float)((double)origin + (double)r.b0 * (double)w);
+    r.hi = (float)((double)origin + (double)(r.b1 + 1) * (double)w);
+    r.loOpen = r.b0 == 0;
+    r.hiOpen = r.b1 == 255;
+    r.ok = true;
+    return r;
 }
 
 // ImDrawList has no dashed line, and the A/B panels need one: hue is already
