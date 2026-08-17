@@ -618,6 +618,105 @@
             closeAll();
         }
 
+        // ---- R20: the SUM of the values, not just each one ---------------------
+        //
+        // #221 review r3794616480. Every member of an .npz can pass the
+        // per-member inline rule and the file still be unlistable:
+        // nz::INLINE_MAX_BYTES lets an 8 MiB axis through, a valid container may
+        // hold hundreds, and 65 one-million-element f8 axes are 520 MiB of reply
+        // for a file nothing is wrong with. core/remote.cpp refuses anything over
+        // 512 MiB as "oversized reply from the peer" - a sentence about the
+        // transport, said about a file, that nobody can act on. So the total has
+        // an owner now, and it is the side that fills the message.
+        //
+        // THE FIXTURE IS SCALED, NOT SHAPED DIFFERENTLY. Writing the 256 MiB that
+        // trips the real ceiling to prove an arithmetic comparison is a test
+        // nobody would run, so the peer's ceiling is injected small
+        // (VIEWER_SERVE_NPZ_SCAN_MAX) and the members are kilobytes. What is
+        // being asserted is exactly the reported shape: every member is far under
+        // the per-member rule (R20a), and the file is still refused (R20b).
+        {
+            const std::vector<double> ax(200, 1.5);
+            const uint64_t one = (uint64_t)f64v(ax).size();   // header + payload
+            const std::string heavy = root + "/heavy.npz";
+            selftestWriteNpz(heavy, {
+                { "a", f64v(ax) }, { "b", f64v(ax) }, { "c", f64v(ax) },
+            });
+            // Two of the three fit and the third does not - so the refusal is
+            // provably about the SUM: it arrives with two members already
+            // counted, not on the first thing it looked at.
+            const uint64_t ceiling = one * 2 + 1;
+            fprintf(stderr, "rnpzselftest:   R20 each member %llu B, per-member rule "
+                            "%llu B, injected ceiling %llu B\n",
+                    (unsigned long long)one, (unsigned long long)nz::INLINE_MAX_BYTES,
+                    (unsigned long long)ceiling);
+            check(one * 3 > ceiling && one < nz::INLINE_MAX_BYTES / 16,
+                  "R20a every member passes the PER-MEMBER rule with room to spare");
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(ceiling));
+            if (!connect()) return 1;
+
+            auto notes = [&] {
+                int n = 0;
+                std::error_code lec;
+                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), lec)) {
+                    const std::string nm = d.path().filename().u8string();
+                    if (nm.size() > 7 && nm.compare(nm.size() - 7, 7, ".npzsrc") == 0) n++;
+                }
+                return n;
+            };
+            const int notesBefore = notes();
+            remote::NpzScan sc;
+            std::string err;
+            const bool got = app.uiSession.npzScan(heavy, sc, err);
+            const int notesAfter = notes();
+            fprintf(stderr, "rnpzselftest:   R20 heavy.npz: got=%d members=%zu key=\"%s\" "
+                            "notes %d->%d  \"%s\"\n",
+                    got ? 1 : 0, sc.members.size(), sc.key.c_str(), notesBefore,
+                    notesAfter, err.c_str());
+            check(!got && sc.members.empty() && sc.key.empty(),
+                  "R20b the whole scan is refused: no key, no rows, nothing trimmed to fit");
+            check(has(err, "\"c\"") && has(err, std::to_string(one * 2)) &&
+                      has(err, std::to_string(ceiling)) && has(err, "heavy.npz"),
+                  "R20b ...naming the member that crossed it, the sum so far and the file");
+            // The budget is spent BEFORE the key is published, so a refused file
+            // leaves nothing behind for a client to quote back at this peer.
+            check(notesAfter == notesBefore,
+                  "R20c ...before anything was materialised: the peer published no key");
+
+            // ANTI-VACUITY, both directions. Under the SAME tiny ceiling a file
+            // that fits still lists - the peer did not simply stop answering...
+            {
+                remote::NpzScan s2;
+                std::string e2;
+                const bool ok2 = app.uiSession.npzScan(lone, s2, e2);
+                fprintf(stderr, "rnpzselftest:   R20 lone.npz under the same ceiling: "
+                                "got=%d members=%zu \"%s\"\n",
+                        ok2 ? 1 : 0, s2.members.size(), e2.c_str());
+                check(ok2 && s2.members.size() == 1,
+                      "R20d ...and the peer lives: a file that FITS still lists under it");
+            }
+            // ...and the very same heavy.npz lists in full once the ceiling is
+            // the real one, so R20b was about the sum and not about the file.
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "");
+            if (!connect()) return 1;
+            {
+                remote::NpzScan s3;
+                std::string e3;
+                const bool ok3 = app.uiSession.npzScan(heavy, s3, e3);
+                bool whole = ok3 && s3.members.size() == 3;
+                for (const auto& m : s3.members) if (!m.whole) whole = false;
+                fprintf(stderr, "rnpzselftest:   R20 heavy.npz at the real ceiling: "
+                                "got=%d members=%zu \"%s\"\n",
+                        ok3 ? 1 : 0, s3.members.size(), e3.c_str());
+                check(whole,
+                      "R20e ...and the same file lists all three, values and all, at 256 MiB");
+            }
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

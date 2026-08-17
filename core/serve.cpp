@@ -3428,6 +3428,36 @@ static void handleReaderRun(Buf& in) {
 // --serve-readers has nothing to do with this. The gate (§2) is about OTHER
 // PEOPLE'S CODE running here; what runs for a .npz is this binary, on a format
 // it already reads. A peer with the flag closed answers SCAN.
+// The ceiling on the VALUES one NPZ_SCAN reply carries, all members together
+// (#221 review). The per-member rule cannot bound a reply: nz::INLINE_MAX_BYTES
+// lets each member through at 8 MiB and a perfectly valid container may hold
+// hundreds of them, so 65 one-million-element f8 axes are 520 MiB of a file
+// nothing is wrong with - past the 512 MiB core/remote.cpp will accept, which
+// arrives as "oversized reply from the peer": a sentence about the transport,
+// for a file, that the person cannot act on.
+//
+// 256 MiB, which is half of that limit and leaves the names, the errors and the
+// framing all the room they could want. A file above it is refused WHOLE and by
+// name - never trimmed to fit, because a picker missing rows is a listing that
+// lied.
+//
+// VIEWER_SERVE_NPZ_SCAN_MAX overrides it, in bytes. That exists so the rule can
+// be TESTED: the fixture that trips 256 MiB is 256 MiB, and a selftest that
+// writes a quarter of a gigabyte to prove an arithmetic comparison is a selftest
+// nobody runs. Read once, at the first scan, so the peer answers one number for
+// its whole life.
+static uint64_t npzScanInlineMax() {
+    static const uint64_t n = [] {
+        const char* e = getenv("VIEWER_SERVE_NPZ_SCAN_MAX");
+        if (e && *e) {
+            const unsigned long long v = strtoull(e, nullptr, 10);
+            if (v) return (uint64_t)v;
+        }
+        return (uint64_t)(256ull << 20);
+    }();
+    return n;
+}
+
 static void handleNpzScan(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad NPZ_SCAN"); return; }
@@ -3442,7 +3472,22 @@ static void handleNpzScan(Buf& in) {
     if (!readWholeInto(path, zip, err)) { sendErr(err); return; }
     std::vector<nz::Entry> entries;
     if (!nz::list(zip, entries, err)) { sendErr(err); return; }
-    const std::vector<nz::Fact> facts = nz::readFacts(zip, entries);
+    // The budget is spent HERE - before a member is inflated, before the key is
+    // published and before one byte is copied into a reply. The order is the
+    // point: an aggregate ceiling enforced while filling the message would have
+    // already paid for everything it then refuses.
+    nz::InlineBudget budget;
+    budget.max = npzScanInlineMax();
+    const std::vector<nz::Fact> facts = nz::readFacts(zip, entries, &budget);
+    if (!budget.over.empty()) {
+        sendErr("this .npz carries more member values than one reply can hold: \"" +
+                budget.over + "\" needs " + std::to_string(budget.need) +
+                " bytes on top of " + std::to_string(budget.used) +
+                " already listed, over this peer's ceiling of " +
+                std::to_string(budget.max) + " bytes for one scan. Open " + path +
+                " on the machine it lives on.");
+        return;
+    }
     if (facts.empty()) { sendErr("no arrays in npz"); return; }
 
     // §10.6's key. The kind word is what keeps the two families apart in one

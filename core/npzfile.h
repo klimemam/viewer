@@ -408,6 +408,27 @@ static const uint64_t INLINE_MAX_ELEMS = 1ull << 20;
 // reason to know about.
 static const uint64_t INLINE_MAX_BYTES = 8ull << 20;
 
+// ...and the TOTAL, which is a different question and the one a wire has to ask
+// (#221 review). Every member of a valid container can pass the per-member rule
+// above and the file still be unlistable: 65 one-million-element f8 axes are 65
+// members of 8 MiB each - each of them legal, each of them wanted - and 520 MiB
+// of reply, which core/remote.cpp refuses at 512 MiB as "oversized reply from
+// the peer". So the sum has an owner too, and it is the side that fills the
+// message.
+//
+// `max` 0 means NO aggregate ceiling: that is the local door, which already
+// holds the whole zip and is not copying anything onto a wire. A caller that
+// sets one must refuse the WHOLE answer when `over` comes back non-empty - a
+// scan that returned the members it managed to fit would be a listing that
+// silently lost rows, and a picker missing a row is worse than a refusal that
+// names the file.
+struct InlineBudget {
+    uint64_t max = 0;      // the ceiling, in bytes of member payload; 0 = none
+    uint64_t used = 0;     // what the members already listed add up to
+    std::string over;      // the member that crossed it; "" = it was not crossed
+    uint64_t need = 0;     // ...and what THAT member wanted on top of `used`
+};
+
 // `__viewer` and nothing else decides which of the two readings an .npz gets
 // (docs/input-adapters.md §4.11.1). Asked from the NAMES alone, so the peer can
 // answer it before it inflates anything.
@@ -438,7 +459,8 @@ inline bool wantsValues(const std::string& name, const Head& H, bool container) 
 // Every .npy member of a zip, as facts. ONE implementation, run by the local
 // door on the file in front of it and by the peer on the file the link named.
 inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
-                                   const std::vector<Entry>& entries) {
+                                   const std::vector<Entry>& entries,
+                                   InlineBudget* budget = nullptr) {
     const bool container = hasContainerMark(entries);
     std::vector<Fact> out;
     for (size_t i = 0; i < entries.size(); i++) {
@@ -486,6 +508,25 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
         const uint64_t need = H.esize > 0 ? H.dataOff + payload : e.usize;
         const bool want = sane && wantsValues(f.name, H, container) &&
                           need <= INLINE_MAX_BYTES && need <= e.usize;
+        // WHAT THIS MEMBER WILL COST, decided from the header and the zip
+        // directory - so it is known BEFORE the member is inflated and long
+        // before anything is copied into a reply. A member that does not fit
+        // is never decompressed: refusing after paying for the decompression
+        // would be the outage the ceiling exists to prevent, wearing a message.
+        if (budget && budget->max) {
+            const uint64_t take = want ? need
+                                       : (buf.size() < H.dataOff ? (uint64_t)buf.size()
+                                                                 : H.dataOff);
+            // Subtraction and not addition: `used` never exceeds `max` (this is
+            // the only place it grows, and it grows only when it fit), so
+            // `max - used` cannot wrap and `used + take` can never be formed.
+            if (take > budget->max - budget->used) {
+                budget->over = f.name;
+                budget->need = take;
+                return {};
+            }
+            budget->used += take;
+        }
         if (want) {
             if (buf.size() < need && !extract(zip, e, buf, err)) {
                 f.err = err;
@@ -493,6 +534,14 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
                 continue;
             }
             f.whole = buf.size() >= need;
+            // ...and NO FURTHER. A member is its header and its array; bytes
+            // past the array are not its value, and `need` is the figure the
+            // budget above was told this member would cost. Without this a
+            // member whose directory entry declares far more than its shape
+            // does - the file says 1 GB, the header says 12 floats - would put
+            // that gigabyte on the wire under a ceiling that had been shown a
+            // much smaller number.
+            if (f.whole && buf.size() > need) buf.resize((size_t)need);
         }
         // Trim to the header when the values are not wanted: what crosses the
         // link for a 4 GB image member is a few hundred bytes.
