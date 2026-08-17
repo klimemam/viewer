@@ -705,6 +705,28 @@ static bool readerCachePath(const std::string& key, std::string& out) {
     return cacheFileFor(key, ".vstream", out);
 }
 
+// ...and where a run WRITES before it is anything (#218 review r3794154621).
+//
+// Two viewer sessions asking the same uncached key at the same time are two
+// viewer-serve processes, and both used to point their harness straight at the
+// cache file. One would then validate, delete or overwrite what the other was
+// still writing; when the two outputs happened to have compatible lengths the
+// mixture even passed the structural check, and a peer answered with pixels
+// that were half of one run and half of another.
+//
+// The leaf is UNIQUE to this process and this run and sits in the cache
+// DIRECTORY, which is the point: a rename within one filesystem is atomic, so
+// what appears under the key is a file that was already complete and already
+// checked. Nothing is ever published half-written, and no contender can touch
+// anything but its own temp.
+static bool readerTempPath(const std::string& key, std::string& out) {
+    static std::atomic<uint64_t> seq{ 0 };
+    char leaf[64];
+    snprintf(leaf, sizeof leaf, ".%lu.%llu.part", servePid(),
+             (unsigned long long)(seq.fetch_add(1) + 1));
+    return cacheFileFor(key, leaf, out);
+}
+
 // One node of a reader's output, laid out for readNpyRegion.
 //
 // This is openRaw's shape exactly and for openRaw's reason: the blob is C-order
@@ -3256,12 +3278,26 @@ static void handleReaderRun(Buf& in) {
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
     const std::string key = hex;
-    std::string cachePath;
-    if (!readerCachePath(key, cachePath)) {
+    std::string cachePath, tmpPath;
+    if (!readerCachePath(key, cachePath) || !readerTempPath(key, tmpPath)) {
         sendErr("this peer has nowhere to keep what a reader produces "
                 "(set VIEWER_SERVE_CACHE)");
         return;
     }
+    // Whatever happens below, THIS process's temp goes away and nothing else
+    // does. Every failure path used to delete `cachePath` - which is to say,
+    // a contender that timed out or whose Python raised deleted the file a
+    // DIFFERENT session had just published, and that session's next open then
+    // re-ran a reader that had already succeeded.
+    struct TempFile {
+        std::string p;
+        bool keep = false;
+        ~TempFile() {
+            if (keep || p.empty()) return;
+            std::error_code e;
+            std::filesystem::remove(std::filesystem::u8path(p), e);
+        }
+    } temp{ tmpPath };
 
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string header;
@@ -3313,25 +3349,25 @@ static void handleReaderRun(Buf& in) {
     // 300 s, the local limit (core/app/session.inc). The policy lives with the
     // code that runs the process and never on the wire: one side deciding how
     // long the other side's patience is would be a setting with two owners.
-    adapter::Run r = adapter::run(argv, 300000, nullptr, cachePath, errFile, false);
+    adapter::Run r = adapter::run(argv, 300000, nullptr, tmpPath, errFile, false);
     // BEFORE the reply, not on the way out of this function. The client is
     // entitled to treat the answer as proof that the code it sent is no longer
     // on this disk, and a destructor that runs after the bytes are on the wire
     // makes that a race it can lose. Nothing below needs the directory: what
     // the reader printed is already in `r`.
     std::filesystem::remove_all(td, ec);
+    // Each of the three failures below leaves ONLY its own temp behind, which
+    // `temp` then removes. None of them touches `cachePath`: this run never
+    // published anything, so there is nothing of its own there to withdraw.
     if (!r.started) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_NOT_STARTED, r.fail, r.err, prov, "", "");
         return;
     }
     if (r.timedOut) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_TIMED_OUT, adapter::showCommand(argv), r.err, prov, "", "");
         return;
     }
     if (r.exit != 0) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         // The traceback travels WHOLE (§6). The line numbers in it are the
         // client's own file's, because the file is the one the client sent -
         // which is what carrying the reader buys that a peer-side copy could
@@ -3340,14 +3376,44 @@ static void handleReaderRun(Buf& in) {
               r.err, prov, "", "");
         return;
     }
+    // VALIDATED FIRST, then published. The order is the promise: a file that
+    // appears under the key has already been read end to end by the process
+    // that wrote it, so a reader on the other side of a rename never has to
+    // wonder whether it is looking at half of something.
     std::string header;
-    const std::string cerr = checkReaderOutput(cachePath, header);
+    const std::string cerr = checkReaderOutput(tmpPath, header);
     if (!cerr.empty()) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
         return;
     }
-    reply(RO_OK, "", r.err, prov, key, header);
+    std::error_code re;
+    std::filesystem::rename(std::filesystem::u8path(tmpPath),
+                            std::filesystem::u8path(cachePath), re);
+    if (!re) {
+        temp.keep = true;                // it is the cache file now, not a temp
+        reply(RO_OK, "", r.err, prov, key, header);
+        return;
+    }
+    // A LOSER. Windows refuses a rename onto a file another process holds
+    // open, which is exactly what a concurrent winner's client is doing to it.
+    // The winner's file is complete by construction (it was validated before
+    // it was published), and it answers the same key - so the loser VERIFIES
+    // it and reports success on it, rather than deleting the good answer or
+    // handing back a failure the user cannot act on. Its own temp goes with
+    // `temp`; the winner's file is never touched either way.
+    std::string wheader;
+    const std::string werr = checkReaderOutput(cachePath, wheader);
+    if (werr.empty()) {
+        reply(RO_OK, "",
+              r.err.empty() ? std::string("another session published the same result first.")
+                            : r.err,
+              prov, key, wheader);
+        return;
+    }
+    reply(RO_UNREADABLE,
+          "the reader ran, but its result could not be put where this peer keeps them: " +
+              re.message(),
+          r.err, prov, "", "");
 }
 
 // ---------------------------------------------------------------- npz scan

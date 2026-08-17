@@ -978,6 +978,133 @@
             closeAll();
         }
 
+        {   // ---- R17: two peers, one key, and nothing half-written -----------
+            //
+            // #218 review r3794154621. Two viewer sessions asking the same
+            // uncached key at the same time are two viewer-serve PROCESSES, and
+            // both used to point their harness straight at the cache file. One
+            // then validated, deleted or overwrote what the other was still
+            // writing; when the two runs' outputs had compatible lengths the
+            // mixture even passed the structural check.
+            //
+            // The two contenders here carry the SAME reader text, so they
+            // contend for the same key - and the reader itself decides which of
+            // them is which, atomically, with an O_EXCL lock file. That makes
+            // the roles deterministic without making the timing so: whoever
+            // gets there first sleeps for three seconds and succeeds, the other
+            // one raises at once. Which is the shape the review describes -
+            // a failing contender running while a winner is mid-write.
+            closeAll();
+            const std::string rdRace = root + "/race.py";
+            writeText(rdRace,
+                      "import numpy as np, os, time\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    lock = path + '.first'\n"
+                      "    try:\n"
+                      "        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))\n"
+                      "    except FileExistsError:\n"
+                      "        raise ValueError('race-2: this contender was second')\n"
+                      "    time.sleep(3.0)\n"
+                      "    a = np.load(path)\n"
+                      "    return Stack(np.ascontiguousarray(\n"
+                      "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='race')\n");
+            std::string raceText[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdRace, raceText[0]), "R17a (setup) the racing reader is readable");
+            auto countSuffix = [&](const char* suf) {
+                int n = 0;
+                std::error_code e;
+                const std::string s = suf;
+                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                    const std::string nm = d.path().filename().u8string();
+                    if (nm.size() > s.size() &&
+                        nm.compare(nm.size() - s.size(), s.size(), s) == 0) n++;
+                }
+                return n;
+            };
+            const int vstream0 = countSuffix(".vstream");
+
+            struct Contender { bool sent = false; int outcome = -1; std::string key, err; };
+            Contender c[2];
+            std::atomic<int> ready{ 0 }, done{ 0 };
+            std::atomic<bool> go{ false };
+            auto contend = [&](int i) {
+                remote::Session s;
+                if (!openSession(s, true)) { done.fetch_add(1); return; }
+                ready.fetch_add(1);
+                while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                remote::ReaderRun r;
+                std::string e;
+                c[i].sent = s.readerRun(origin, "load", raceText, r, e);
+                if (c[i].sent) { c[i].outcome = (int)r.outcome; c[i].key = r.key; }
+                c[i].err = e;
+                s.stop();
+                done.fetch_add(1);
+            };
+            std::thread t0(contend, 0), t1(contend, 1);
+            // The barrier: both peers are up before either is asked, so the two
+            // requests really do overlap rather than merely being adjacent.
+            for (int k = 0; k < 2000 && ready.load() < 2; k++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            go.store(true);
+            // ...and what the cache directory looks like WHILE they run. This is
+            // the assertion the fix is: a run in progress is a `.part` of its
+            // own, and the file the key names does not appear until it is
+            // whole. Sampled inside the winner's three-second sleep.
+            bool sawPart = false;
+            int maxDuring = vstream0;
+            const auto t0c = std::chrono::steady_clock::now();
+            for (;;) {
+                const double el = std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - t0c).count();
+                if (el > 2.5 || done.load() >= 2) break;
+                if (el > 0.3) {
+                    if (countSuffix(".part") > 0) sawPart = true;
+                    maxDuring = std::max(maxDuring, countSuffix(".vstream"));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            t0.join();
+            t1.join();
+            const int oks = (c[0].outcome == (int)rp::RO_OK) + (c[1].outcome == (int)rp::RO_OK);
+            const int bad = (c[0].outcome == (int)rp::RO_EXITED) +
+                            (c[1].outcome == (int)rp::RO_EXITED);
+            fprintf(stderr, "rreaderselftest:   R17 outcomes %d/%d keys \"%s\"/\"%s\"; "
+                            ".vstream %d -> %d (max %d while running), part seen=%d\n",
+                    c[0].outcome, c[1].outcome, c[0].key.c_str(), c[1].key.c_str(),
+                    vstream0, countSuffix(".vstream"), maxDuring, sawPart ? 1 : 0);
+            check(c[0].sent && c[1].sent && oks == 1 && bad == 1,
+                  "R17b both contenders are answered: one ran, one refused");
+            check(sawPart,
+                  "R17c a run in progress is a temp of its own, not the cache file");
+            check(maxDuring == vstream0,
+                  "R17d ...so nothing appears under the key until it is WHOLE");
+            check(countSuffix(".vstream") == vstream0 + 1,
+                  "R17e exactly one result was published");
+            check(countSuffix(".part") == 0,
+                  "R17f and no temp is left behind by either of them");
+            // The loser must not have taken the winner's file with it: the
+            // third ask is a HIT, which is only possible if what was published
+            // is still there and still validates.
+            {
+                remote::Session s;
+                if (!openSession(s, true)) return 1;
+                remote::ReaderRun r;
+                std::string e;
+                const bool sent = s.readerRun(origin, "load", raceText, r, e);
+                const std::string winner = c[0].outcome == (int)rp::RO_OK ? c[0].key : c[1].key;
+                fprintf(stderr, "rreaderselftest:   R17 third ask: outcome=%d key=\"%s\" \"%s\"\n",
+                        sent ? (int)r.outcome : -1, sent ? r.key.c_str() : "",
+                        sent ? r.stderrText.c_str() : e.c_str());
+                check(sent && r.outcome == rp::RO_OK && r.key == winner &&
+                          has(r.stderrText, "read from cache"),
+                      "R17g the failing contender did not delete the winner: the cache answers");
+                s.stop();
+            }
+            closeAll();
+        }
+
         // ---- stage 4: the memo crosses the link, the hint never runs ----------
         // The V25p pair of core/selftest/verify.inc, over a peer. It lives HERE
         // rather than there for this file's own reason: half of what is asserted
