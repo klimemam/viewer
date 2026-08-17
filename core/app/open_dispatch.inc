@@ -1872,7 +1872,60 @@ static void openRemoteRawRow(const std::string& url, uint64_t sizeBytes) {
 // The 4-argument shape core/browse/host.h binds. See the note at that binding.
 static bool openRemoteNpz(const std::string& url, const std::string& onlyMember);  // fwd
 
+// §4.12 OVER A LINK, at the door rather than after it (#218 review).
+//
+// The memo is a RECORD OF A CHOICE - this user opened this url with this reader
+// once - and the whole point of remembering one is that the choice is applied
+// again BEFORE anything else is consulted. That is exactly what the two remote
+// doors did not do: openPath asked about the url SCHEME first and openRemote
+// asks the format table ("will the peer serve a file called this"), so a
+// remembered url the peer happens to read natively came back as the peer's own
+// array - the ORIGIN's pixels, under the reader's name - and one the peer does
+// not read came back as a refusal, with the saved __pixels_* member nowhere.
+// The local door has always asked the memo first (openPath's second block); this
+// is the same question, asked one layer out.
+//
+// WHICH DOORS ASK. The ones that mean "open this url, fresh, as itself": File >
+// Open, the command line, a drop, a desktop shortcut (openPath), and the Browse
+// panel's registered open. The ones that do NOT are the ones that already name
+// what they want, and each would be a different bug if it did:
+//
+//   a PREVIEW is a decimated tile of the peer's own array and one click may
+//   never start Python on another machine (§10.4);
+//   an explicit §3.3 READING is the user saying how to cut the peer's array,
+//   which is a statement about that array and not a request for another one;
+//   a headerless DECLARATION and a KEYED request are the same shape of thing -
+//   an address into bytes the peer already has;
+//   a SESSION line names a reader and never runs one (#179 ruling C). Its
+//   reader branch consults the memo itself, and only when the LINE says the
+//   pixels were a reader's (the __pixels_ member) - so a url saved as native
+//   reopens as native even while the same url sits in the memo from another
+//   day. That decision stays where the line is, and this door must not
+//   pre-empt it: session restore reaches openRemote directly.
+//
+// Returns whether the memo answered at all. `opened` is whether pixels landed -
+// a remembered reader that fails says so and the caller does NOT fall through
+// to the native path, because "the reader you chose could not run" is the
+// answer, and quietly handing back the origin's own array instead is the
+// silence this whole door exists to prevent.
+static bool openRemoteMemoFirst(const std::string& url, bool& opened) {
+    opened = false;
+    const std::string spec = readerFor(url);
+    if (spec.empty()) return false;              // no record: not this door's business
+    const size_t before = app.images.size();
+    const std::string err = openRemoteWithReader(url, spec);
+    if (err.empty()) opened = app.images.size() > before;
+    else toast(baseName(url) + " via " + spec + ": " + err, true);
+    return true;
+}
+
 static bool browseOpenRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
+    // The registered open, and only it: see openRemoteMemoFirst for why each of
+    // the three exclusions is one.
+    if (!asPreview && frame == 0 && npyRead == NR_NATIVE) {
+        bool opened = false;
+        if (openRemoteMemoFirst(url, opened)) return opened;
+    }
     return openRemote(url, asPreview, frame, npyRead, nullptr);
 }
 
@@ -3143,6 +3196,17 @@ static void openPath(const std::string& path) {
         // A local://.../shot.exr used to fall to the else and be BROWSED - the
         // listing of a file, which is empty - and openRemote now knows which
         // reader a url on this machine belongs to.
+        //
+        // ...but §4.12 comes FIRST, ahead of both answers this branch has
+        // (#218 review): a url the user chose a reader for reopens through
+        // that reader whether or not the format table would have called it
+        // readable. Asked here rather than in the block below, because the
+        // block below has already been passed by the time a url gets there.
+        // See openRemoteMemoFirst.
+        {
+            bool opened = false;
+            if (openRemoteMemoFirst(path, opened)) return;
+        }
         if (viewerReadsName(path)) {
             openRemote(path);
         } else {

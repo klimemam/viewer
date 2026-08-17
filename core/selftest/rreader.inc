@@ -487,6 +487,143 @@
             check(app.images.size() == before, "R11b ...and nothing landed");
         }
 
+        {   // ---- R14: the memo is asked BEFORE the url is (#218 review) -------
+            //
+            // The bug: openPath answered the url SCHEME first and openRemote
+            // answers the format table first, so a url this user had chosen a
+            // reader for reopened as the PEER's own array whenever the peer
+            // could read it natively - the origin's pixels, under the reader's
+            // name, with nothing said. The fixture is therefore a file the peer
+            // reads perfectly well: a plain (F,H,W) u2 that native META answers,
+            // and a reader whose output is the same shape with a constant added
+            // so that "whose pixels are these" is a number and not an inference.
+            //
+            // The exclusions are half the fix and get their own assertions: a
+            // preview, an explicit §3.3 reading and a session line that recorded
+            // NATIVE pixels must each come back native with the memo sitting
+            // right there.
+            closeAll();
+            const int NF = 3, NH = 5, NW = 6;   // W > 4: §3.1 reads this as (F,H,W)
+            const uint16_t BASE = 100, BUMP = 1000;
+            const std::string natOrigin = root + "/plain.npy";
+            {
+                std::vector<uint16_t> px((size_t)NF * NH * NW);
+                for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(BASE + i);
+                std::vector<uint8_t> b = selftestNpyBytes("<u2", { NF, NH, NW },
+                                                          px.data(), px.size() * 2);
+                std::ofstream f(pathFromUtf8(natOrigin), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            }
+            const std::string rdBump = root + "/bump.py";
+            writeText(rdBump,
+                      "import numpy as np\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    a = np.load(path).astype(np.uint16) + 1000\n"
+                      "    return Stack(np.ascontiguousarray(a), name='bumped')\n");
+            const std::string natUrl = "local://" + natOrigin;
+            const std::string natSpec = rdBump + ":load";
+            // The first sample of the document on screen, and whether the
+            // document is a reader's at all. A reader's member is __pixels_N
+            // (that is what a materialisation names its nodes); the peer's own
+            // array has no member.
+            auto firstPx = [&]() -> float {
+                return cur() && !cur()->src->data.empty() ? cur()->src->data[0] : -1.0f;
+            };
+            auto isReaderDoc = [&]() {
+                return cur() && cur()->src->member.rfind("__pixels_", 0) == 0;
+            };
+
+            // (a) the baseline: no memo yet, and the peer answers it natively.
+            forgetReader(natUrl);
+            const bool nat0 = browseOpenRemote(natUrl, false, 0, rp::NR_NATIVE);
+            check(nat0 && !isReaderDoc() && firstPx() == (float)BASE,
+                  "R14a (setup) the peer reads this file natively, memo or no memo");
+
+            // (b) the choice, made once. This is the only thing that may ever
+            // put an entry in the memo.
+            closeAll();
+            const std::string rerr = openRemoteWithReader(natUrl, natSpec);
+            check(rerr.empty() && isReaderDoc() && firstPx() == (float)(BASE + BUMP),
+                  "R14b the reader runs on the peer and its pixels are tellable apart");
+            check(readerFor(natUrl) == natSpec, "R14c ...and the choice is remembered");
+
+            // (c) FRESH OPEN of a natively-supported url: the memo wins.
+            closeAll();
+            openPath(natUrl);
+            check(isReaderDoc() && firstPx() == (float)(BASE + BUMP),
+                  "R14d a fresh open of a NATIVE-readable url returns the reader's pixels");
+            fprintf(stderr, "rreaderselftest:   R14 fresh open: %zu doc(s) member=\"%s\"\n",
+                    app.images.size(), cur() ? cur()->src->member.c_str() : "");
+            check(app.images.size() == (size_t)NF,
+                  "R14e ...as the stack the reader declared, not the peer's array");
+
+            // (d) ...and the Browse panel's registered open, the other door.
+            closeAll();
+            const bool bo = browseOpenRemote(natUrl, false, 0, rp::NR_NATIVE);
+            check(bo && isReaderDoc() && firstPx() == (float)(BASE + BUMP),
+                  "R14f Browse Open returns them too - one rule, both doors");
+
+            // (e) a PREVIEW may not start Python on another machine.
+            closeAll();
+            browseOpenRemote(natUrl, true, 0, rp::NR_NATIVE);
+            check(!app.images.empty() && !isReaderDoc(),
+                  "R14g a preview is the peer's own tile: the memo does not run");
+
+            // (f) an explicit §3.3 reading is a statement about the PEER's
+            // array, so it opens the peer's array.
+            closeAll();
+            // NR_CHW: (3,5,6) read as 3 planes of one frame. A reading the
+            // shape ADMITS and native would not have chosen, which is what
+            // makes it a statement rather than a synonym.
+            browseOpenRemote(natUrl, false, 0, rp::NR_CHW);
+            check(!app.images.empty() && !isReaderDoc(),
+                  "R14h an explicit reading opens the peer's array, not the reader's");
+
+            // (g) a session that saved NATIVE pixels restores native pixels,
+            // with the memo present the whole time (#179 ruling C: the LINE
+            // decides, and #219's restore must not start moving either).
+            closeAll();
+            const std::string natSess = root + "/native.vsession";
+            openRemote(natUrl, false, 0, rp::NR_NATIVE, nullptr, nullptr, std::string());
+            check(!app.images.empty() && !isReaderDoc(),
+                  "R14i (setup) a natively-opened remote document");
+            // writeSessionTo rather than saveSession: the same writer, without
+            // the atomic-rename plumbing around it. What this line is about is
+            // what the RESTORE does with a natively-saved line, and V25p below
+            // already exercises saveSession end to end on this same directory.
+            {
+                std::ofstream f(pathFromUtf8(natSess), std::ios::binary);
+                writeSessionTo(f);
+            }
+            closeAll();
+            const std::string sr = loadSession(natSess);
+            fprintf(stderr, "rreaderselftest:   R14j restore err=\"%s\" %zu doc(s) "
+                            "member=\"%s\" px0=%g\n",
+                    sr.c_str(), app.images.size(),
+                    cur() ? cur()->src->member.c_str() : "", (double)firstPx());
+            check(sr.empty() && !app.images.empty() && !isReaderDoc() &&
+                      firstPx() == (float)BASE,
+                  "R14j a session saved as NATIVE restores native, memo or no memo");
+
+            // (h) and the case the review names second: a url the peer CANNOT
+            // read. Before the fix this reached openRemote and was refused;
+            // now the memo answers it first, exactly as it does on this disk.
+            closeAll();
+            const std::string permSpec = rdPerm + ":load";
+            const std::string rerr2 = openRemoteWithReader(url, permSpec);
+            check(rerr2.empty(), "R14k (setup) the rank-5 origin opens through its reader");
+            closeAll();
+            openPath(url);
+            check(app.images.size() == (size_t)S && isReaderDoc(),
+                  "R14l a fresh open of an UNSUPPORTED url returns the reader's pixels too");
+
+            closeAll();
+            forgetReader(natUrl);          // the memo is shared prefs; leave none
+            forgetReader(url);
+        }
+
         // ---- stage 4: the memo crosses the link, the hint never runs ----------
         // The V25p pair of core/selftest/verify.inc, over a peer. It lives HERE
         // rather than there for this file's own reason: half of what is asserted
