@@ -247,6 +247,35 @@
             closeAll();
         }
 
+        // ---- R15b: the PICKER, end to end, over the link ----------------------
+        // The gesture a person actually makes: a container with a choice in it
+        // puts the same modal up, and saying yes opens what was ticked. What is
+        // asserted is that the SECOND half knows about a peer too - npzPickAccept
+        // re-lists before it opens anything, because the dialog stood open for
+        // as long as a person took, and over a link "re-list" is a re-SCAN.
+        {
+            closeAll();
+            app.npzPickOpen = false;
+            app.npzPick.clear();
+            app.npzPickQueue.clear();
+            const bool asked = openRemoteNpz(urlOf(many), std::string());
+            check(asked && app.npzPickOpen && app.npzPick.size() == 5,
+                  "R15b a container with a choice in it puts up the SAME picker");
+            check(app.npzPickPath == urlOf(many),
+                  "R15b ...against the url, which is what the modal shows");
+            for (auto& m : app.npzPick) m.selected = m.name == "dark";
+            const size_t before = app.images.size();
+            npzPickAccept();
+            drainRemote(120.0);
+            fprintf(stderr, "rnpzselftest:   R15b accepted: %zu doc(s), member=\"%s\"\n",
+                    app.images.size() - before,
+                    app.images.size() > before ? app.images[before]->src->member.c_str() : "");
+            check(app.images.size() == before + 1 && !app.npzPickOpen &&
+                      app.images[before]->src->member == "dark",
+                  "R15b ...and what was ticked opens, by name, through the peer");
+            closeAll();
+        }
+
         // ---- R16: the TREE, over the link -------------------------------------
         // The proof that the code a declaration travels through is ONE: R12
         // (rreader) does this with a reader's tree and this does it with an
