@@ -111,7 +111,6 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 | A23 | Browse インスタンス独立性 (item 17) | 既定列 `newpanel … target:N …` | 2枚目の Browse が別ディレクトリを同時に指し、filter/選択/履歴/focus が各々独立 | `chkpanels:2`、`chkfilt:-`、`chksel:0`、`chkback:0` すべて `ok` | PASS |
 | A24 | 新規ウィンドウの argv 形 (配置自体は D節) | `--newwin-selftest tools/testdata` N7 | stack は HEAD file + `--stack always`、CFA は pattern が先、remote は ssh url | `N7 stack argv: HEAD file + --stack always PASS` / `newwinselftest: ALL PASS` | PASS |
 | A25 | ルート popup 衝突: RAW ダイアログが競合モーダルで消えない | 既定列末尾 `rawopen,popupcheck,seqask,popupcheck` | 前後とも open=1、`forQueue` なら生存 | `root popup collision: RAW dialog open before the competing modal=1, after=1; forQueue implies a live dialog=1: ok` | PASS |
-
 | A26 | Browse 行の右クリックが**何を出すか** —— 「Open with reader...」の戸 (§4.13) | 既定列 `rctxcur,chkctx:N,chkctx:±LABEL,ctxclick:LABEL,chkrdr:NAME` | ファイル行に項目が出る (native で読める `.npy` にも、読めない `.txt` にも)。フォルダ行・グループ行には**出ない**。既存項目は1つも消えていない (件数)。**実際に押すと** Reader パネルがその path で開く | `chkctx:6 -> 6 item(s): [Open;Open as stack;Open as frame average;Open with reader...;Copy path;Properties...;]: ok` / `chkctx:4 -> 4 item(s): [Open folder (all stacks below);Search under here;Bookmark;Copy path;]: ok` / `chkrdr:dark.npy -> reader panel open on "tools/testdata/rb/dark.npy": ok` | PASS |
 
 **A節まとめ: 27項目 / 実行 27 / PASS 27 / FAIL 0。**

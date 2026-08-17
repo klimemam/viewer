@@ -2063,7 +2063,7 @@ struct App {
     struct ReaderMemo { std::string path, spec; };
     std::vector<ReaderMemo> readerMemo;     // most recent first; bounded, see §4.12
     std::vector<std::string> readerShown;   // specs whose command was shown once (§4.13)
-    // §4.13.0: ONE panel, three entrances, and it does not close. Writing an
+    // §4.13.0: ONE panel, four entrances, and it does not close. Writing an
     // adapter is write -> load -> read the failure -> fix -> load again, and a
     // modal cuts that loop every time the author leaves for their editor.
     std::string readerPickPath;             // the file or folder the panel is aimed at
