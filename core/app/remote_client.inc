@@ -32,8 +32,23 @@ std::string peerLabel(const std::string& host) {
 // every Browse open, the CLI and the session restore come through (see the
 // "#111: WHOSE READER" block), and a second door is a second place for the
 // rule to be different.
+// `kd` (optional) says the subject is not the file the url names but ONE ARRAY
+// INSIDE something the peer materialised - a member of a .npz it listed, or a
+// node of what a reader produced there (protocol 12/13). `member` is the name
+// that array goes into the identity tuple under, which is what keeps two
+// members of one container from sharing a source.
 static bool openRemote(const std::string& url, bool asPreview = false, int frame = 0,
-                       int npyRead = 0 /*rp::NR_NATIVE*/, const rp::RawWire* rw = nullptr);
+                       int npyRead = 0 /*rp::NR_NATIVE*/, const rp::RawWire* rw = nullptr,
+                       const remote::KeyedRef* kd = nullptr,
+                       const std::string& member = std::string());
+// The CONTAINER door (issue #217): what is inside a .npz on a peer, and one
+// member of it. Declared here because the picker (core/app/sequence.inc) is
+// compiled before the door itself and both halves of "choose arrays" - the one
+// that offers the rows and the one that opens what was ticked - have to reach
+// the same function whichever end listed the file.
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember);
+static bool openRemoteNpzMember(const std::string& url, const std::string& key,
+                                const NpzMember& m, bool asPreview);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
@@ -95,6 +110,8 @@ static void rfWorker() {
         d.mtime = job.mtime; d.fsize = job.fsize;
         d.npyRead = job.npyRead; d.remoteProto = job.remoteProto;
         d.npyShape = job.npyShape;
+        d.key = job.key; d.node = job.node; d.keyKind = job.keyKind;
+        d.member = job.member;
         std::string host, rpath, err;
         int port = 0;
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
@@ -107,8 +124,16 @@ static void rfWorker() {
                 // ...under the reading the OPEN was made with: a full-resolution
                 // swap that fetched the native reading of a document declared
                 // (F,H,W) would replace the preview with a different array.
+                // ...and WHICH array of it, when the url alone does not say.
+                // The worker's peer is a DIFFERENT PROCESS from the one the
+                // open went through, which is why the key has to be resolvable
+                // from the peer's own cache rather than from a session: see
+                // core/serve.cpp's .npzsrc note.
+                remote::KeyedRef kr;
+                kr.key = job.key; kr.node = job.node; kr.kind = job.keyKind;
                 if (!ses.tile(rpath, job.frame, 0, 0, 1 << 30, 1 << 30, 1,
-                              d.data, w, h, ch, d.dtype, err, job.npyRead, &d.f32loss)) {
+                              d.data, w, h, ch, d.dtype, err, job.npyRead, &d.f32loss,
+                              nullptr, job.key.empty() ? nullptr : &kr)) {
                     d.err = err;
                 } else {
                     d.w = w; d.h = h; d.ch = ch;
@@ -172,6 +197,13 @@ static void rfInheritRead(App::RFetchJob& j, const ImageDoc* head) {
     j.npyRead = head->src->npyRead;
     j.remoteProto = head->src->remoteProto;
     j.npyShape = head->src->npyShape;
+    // ...and which array of a materialisation this stack is, for the reason
+    // above one layer out: the frames of ONE .npz member are that member read
+    // N times, and a sibling that dropped the key would ask for the container.
+    j.key = head->src->remoteKey;
+    j.node = head->src->remoteNode;
+    j.keyKind = head->src->remoteKeyKind;
+    j.member = head->src->member;
 }
 
 static void requestFullRemote(const ImageDoc* d, bool low = false) {
@@ -202,6 +234,10 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     j.npyRead = d->src->npyRead;          // the declaration the preview was made
     j.remoteProto = d->src->remoteProto;  // under: the full frame is the SAME array
     j.npyShape = d->src->npyShape;
+    j.key = d->src->remoteKey;            // ...and the same array of the same
+    j.node = d->src->remoteNode;          // materialisation, which is what makes
+    j.keyKind = d->src->remoteKeyKind;    // a .npz member refine at all
+    j.member = d->src->member;
     // the full frame REPLACES the decimated one, so only the growth is new
     {
         size_t have = d->px().size() * sizeof(float);
@@ -301,6 +337,10 @@ static void pumpRemoteFetch() {
             S.npyShape = d.npyShape;
             S.npyRead = d.npyRead;
             S.remoteProto = d.remoteProto;
+            S.remoteKey = d.key;
+            S.remoteNode = d.node;
+            S.remoteKeyKind = d.keyKind;
+            S.member = d.member;      // identity: a member is part of the tuple
             S.dtype = d.dtype;
             S.w = d.w; S.h = d.h; S.ch = d.ch;
             S.data = std::move(d.data);

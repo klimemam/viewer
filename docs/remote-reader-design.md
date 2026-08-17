@@ -442,7 +442,29 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   R10 1600px 超の materialisation が step > 1 で着地し n / N が出る。
   R11 set 入り reader → §7 の一文。
 
-### stage 3 — 木: series / batch が通る
+### stage 3 — 木: series / batch が通る — **済**
+
+> 実装 2026-08-17。**protocol 13** (§10.7 の規律どおり: 12 は #218 で出荷済みなので
+> npz の動詞は 13 に乗った)。木そのものは stage 2 の継ぎ目がそのまま通した ——
+> `[u32 node]` は最初から木のノード番号で、peer 側 `openReaderCache` は blob を
+> node で引いている。stage 3 で足したのは **試験と、範囲外の拒否が名指しである
+> ことの確認** (R12/R13) と、下の精細化配線である。
+>
+> 設計との差分:
+> ① stage 2 の注記①(精細化未配線)を**この回で解消した**。`FrameSource` に
+>    `remoteKey` / `remoteNode` / `remoteKeyKind` を足し、`RFetchJob` /
+>    `RFetchDone` にも同じ 3 つを載せた上で、木が着地したあと
+>    `remoteTreeRefine` が node ごとに `S.remoteUrl` / `remoteFrame` /
+>    `remoteStep` を立てて `requestFullRemote` を呼ぶ。精細化の TILE は
+>    step 1 の同じ要求なので新しい経路は 1 本も無い。
+>    併せて `vnzBuild` に `peerPixels` を足した —— リンク越しに来た画素は
+>    **間引き済み**で、identity tuple に step の欄が無い以上ソース登記に
+>    入れてはならない (reader 出力を登記しない §6.2 の理由の一段下)。
+> ② `MRF_KEYED` への改名は**しなかった** —— `MRF_READER` は 1 度も書かれて
+>    いない (MEASURE のトレーラは stage 5)。代わりに **既に出荷済みの綴り**
+>    `rp::RQ_READER` → `rp::RQ_KEYED` と `remote::ReaderRef` → `KeyedRef` を
+>    直した。値 2 は不変なのでワイヤは 1 バイトも動かない。stage 5 が
+>    MEASURE のビットを足すときは最初から `MRF_KEYED` と綴る。
 
 - `[u32 node]` の実配線 (stage 2 では常に単根の pixel ノード)。series の
   conditions・単位・note がヘッダから両側同値で立つこと。
@@ -698,7 +720,32 @@ set (VIEWERSTREAM 2) の設計と**同じ回**に束ねた。その束は解く 
 側は §7 のまま据え置き** — set の Ref が peer の path を指し役割の解決が client
 の登記と絡む問題は、この追記の何にも答えられていない。
 
-### 10.8 stage 3 の受け入れ条件と赤→緑 (追加分)
+### 10.8 stage 3 の受け入れ条件と赤→緑 (追加分) — **済**
+
+> 実装 2026-08-17 (stage 3 と同じ PR)。`MSG_NPZ_SCAN = 9` / **VERSION 13** /
+> `npzTooOldText` / peer 側の遅延 materialise / `.npz` は
+> `peerServesDeclared` へ / `imagefile.cpp` の拒否文を書き換え。
+> 試験は `--rnpz-selftest` (`core/selftest/rnpz.inc`, R14〜R17) と
+> `fmtgate` **F4g** (R18)。
+>
+> 設計との差分 4 点:
+> ① **共有 TU は `core/npzfile.h`** (`nz::`)。zip 歩き・inflate・npy ヘッダ覗きに
+>    加えて **「member の事実」(`nz::Fact`) を作る規則そのもの**を共有した ——
+>    分類 (`npzClassify`) は client の 1 箇所のまま、という §10.2 の線は動かして
+>    いないが、「どの member の値を運ぶか」(`nz::wantsValues`) は両側が同じ 1 本
+>    でないと行の文言が割れるので、そこまでを共有側に置いた。
+> ② **member の事実は npy ヘッダ**を**逐語**で運ぶ (フィールド分解ではない)。
+>    §10.2 の素描 `[str descr][u32 ndim][i64 dims...]` には `fortran_order` が
+>    無く、それが落ちると fortran 順の member の role が両側で割れる。client は
+>    peer が覗いたのと同じバイトに `nz::peekHeader` を掛ける。
+> ③ **鍵 → origin の対応は peer のキャッシュに小さな控え (`<key>.npzsrc`)** を
+>    書く。プロセス内 map では足りない —— 精細化の TILE を投げるのは
+>    `rfWorker` の**別プロセスの peer** であり、SCAN を見ていない。
+> ④ **`local://` の .npz は今日どおりローカルの戸へ落ちる** (§10.3 の記録どおり)。
+>    SCAN の道は ssh:// の道で、試験は `openRemoteNpz` を直接叩いて両側を
+>    比較する (fmtgate bothWays と同じ型)。
+
+
 
 stage 3 の完了条件に足す: **remote .npz が member 込みで開く — reader 不要の
 native コンテナとして、SCAN + [key][node] で**。

@@ -235,15 +235,25 @@ std::string videoRefusal(const std::string& path);
 // sequence.inc. A list only the client can see is the defect #148 removed
 // ("one folder, two answers depending on the door") waiting to be re-made.
 //
-// `.npy` / `.npz` do NOT move with them: those are core/main.cpp's own doors,
-// the peer reads .npy inline and refuses .npz, and that split is unchanged.
+// `.npy` / `.npz` do NOT move with them: those are core/main.cpp's own doors
+// and the peer reads .npy inline, which is a different split from "the bytes
+// decide" and stays where it is.
 bool isHeaderless(const std::string& path);
-// "will the peer answer for this file IF the request declares its geometry"
-// (protocol 11). peerServes stays what it was - "answerable with nothing else
-// said" - because that is what a LISTING and a one-click preview ask: widening
-// it would make a .raw row claim a preview it cannot make (the geometry has to
-// come first, docs/remote-headerless-design.md §5.3). This is the second half,
-// asked where a door is about to be opened rather than where a row is drawn.
+// A CONTAINER: a zip of .npy arrays, so it has members rather than a geometry
+// (docs/npz-design.md §2). Named here for isHeaderless's reason - since
+// protocol 13 the peer lists one (MSG_NPZ_SCAN, issue #217) and it does not
+// compile the client's loader, so "what is a .npz" has to be one answer both
+// binaries read.
+bool isNpz(const std::string& path);
+// "will the peer answer for this file IF the request says which part of it"
+// (protocol 11 for a headerless geometry, 13 for a container's member).
+// peerServes stays what it was - "answerable with nothing else said" - because
+// that is what a LISTING and a one-click preview ask: widening it would make a
+// .raw row claim a preview it cannot make (the geometry has to come first,
+// docs/remote-headerless-design.md §5.3) and a .npz row claim one for a file
+// that has no single geometry to preview (docs/remote-reader-design.md §10.4).
+// This is the second half, asked where a door is about to be opened rather than
+// where a row is drawn.
 bool peerServesDeclared(const std::string& path);
 const std::vector<std::string>& headerlessExts();   // ".bin", ".raw", ...
 

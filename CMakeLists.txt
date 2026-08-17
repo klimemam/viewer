@@ -1377,6 +1377,16 @@ viewer_selftest(rwatch NOGL --rwatch-selftest tools/testdata
 viewer_selftest(rreader NOGL --rreader-selftest tools/testdata
                         --remote-exe $<TARGET_FILE:viewer-serve>)
 
+# ...and a CONTAINER over the same link (issue #217): the peer LISTS what is
+# inside a .npz and materialises one member at a time, while the classification,
+# the picker rows and the tree stay on this side. --remote-exe is the test again
+# for rreader's reason - a client talking to itself cannot show that the member
+# was inflated over there - and the assertions are comparisons: the same file
+# listed both ways must produce the same rows, and the same member opened both
+# ways must produce the same pixels, bit for bit.
+viewer_selftest(rnpz NOGL --rnpz-selftest tools/testdata
+                     --remote-exe $<TARGET_FILE:viewer-serve>)
+
 # ...and WHICH formats that walk, and the registry it keys off, actually reach:
 # one row per backend of core/imagefile.h plus the members of a viewer
 # container - registers / reload reaches / a second open shares. It writes the

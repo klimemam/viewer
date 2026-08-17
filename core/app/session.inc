@@ -1,6 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: session/prefs
 static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead,
-                       const rp::RawWire* rw);   // fwd (defaults: first decl)
+                       const rp::RawWire* rw, const remote::KeyedRef* kd,
+                       const std::string& member);   // fwd (defaults: first decl)
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
 // Run a reader ON THE PEER and open what it made (#180 stage 2). Declared here
@@ -2845,8 +2846,13 @@ static std::string loadSession(const std::string& path) {
                     // peer's own reading of an array the user had said was
                     // being read wrong, which is the one outcome §3.3 exists to
                     // prevent ("以後その doc はその読み方で扱われる").
+                    // ...and WHICH member, when the url names a container
+                    // (issue #217). openRemote routes a .npz to the SCAN door,
+                    // which takes the member name for the reason loadNpz does:
+                    // a session records one line per doc and must not reopen
+                    // the whole picker to restore one array.
                     size_t before = app.images.size();
-                    openRemote(p, false, 0, pendingRead);
+                    openRemote(p, false, 0, pendingRead, nullptr, nullptr, pendingMember);
                     err = app.images.size() > before ? "" : "cannot reopen " + p;
                 } else {
                     // §4.12: a file that was read by an adapter is read by that

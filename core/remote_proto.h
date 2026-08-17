@@ -187,7 +187,30 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // from the number, "this peer was started without --serve-readers" is written
 // by the peer that has the flag and not the consent, and a v11 peer's "unknown
 // request" is neither of those and says so.
-static const uint32_t VERSION = 12;
+//
+// 13: A CONTAINER CROSSES THE LINK (issue #217, docs/remote-reader-design.md
+// §10). An .npz is a zip of .npy arrays and the wire has only ever addressed
+// FILES, so a .npz row was refused with "the peer serves one array per file,
+// not a container" - a true sentence about a door nobody had built.
+// MSG_NPZ_SCAN lists the members, and the trailer protocol 12 introduced does
+// the rest: [str key][u32 node] already means "one array inside something the
+// peer materialised", and a reader's output was only the first thing that could
+// be (§10.5). No new addressing, no npz-specific pixel path - the member is
+// inflated once into the peer's cache and read by openNpy from there.
+//
+// It is FRAMING, like 7, 8 and 12: no answer a v12 peer gives changes meaning.
+// It is numbered for this header's usual two reasons and for the one that
+// applies to every gate here - a v12 peer answers MSG_NPZ_SCAN with "unknown
+// request", which is what it also says for a typo, so the client refuses BEFORE
+// it sends (rp::npzTooOldText) and names which mismatch it is.
+//
+// Why 13 and not "inside 12": §10.7 fixed the rule and the rule decided it.
+// Twelve had not shipped when §10 was written, so the verb could have been
+// free; it shipped (#180 stage 1-2, PR #218) before this was built, and from
+// that moment a peer announcing 12 is a peer that has no MSG_NPZ_SCAN. Sharing
+// the number would make "refuse before you send" unwritable, which is the one
+// discipline this header does not bend.
+static const uint32_t VERSION = 13;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -203,8 +226,49 @@ enum MsgType : uint32_t {
     // docs/remote-reader-design.md §3 for why the file is CARRIED rather than
     // resolved by name on the peer, and §4.2 for the field-by-field wire.
     MSG_READER_RUN = 8,
+    // -> (path)  <- (key, kind, one FACT per member of the .npz)
+    //
+    // What is in this container, and nothing about what it MEANS: a member's
+    // name, what its directory says it holds, the bytes of its .npy header,
+    // and - for the small ones - its values. The vocabulary that turns those
+    // into "stack of 24 frames" / "could be the x axis" / "metadata" stays in
+    // the client's one classifier, so a picker row cannot read differently
+    // depending on which end listed the file (§10.2).
+    //
+    // The peer builds no tree, opens no document and inflates no pixels here.
+    // The key it issues names the file it listed; a member is reached later by
+    // the ordinary [key][node] trailer on META / TILE, and inflated then.
+    //
+    //   -> [str peerPath]
+    //   <- [str key]                   opaque, hex, issued here (§10.6)
+    //      [u32 kind]                  NpzKind
+    //      [u32 containerVersion]      kind 1 only; 0 otherwise
+    //      [u32 nMembers] per member:
+    //          [str name]              the array name, without ".npy"
+    //          [u64 usize]             what the zip directory says it holds
+    //          [u32 node]              the address to quote back on META / TILE
+    //          [str err]               "" when the header was read
+    //          [u32 flags]             bit0: `bytes` is the WHOLE member
+    //          [u32 n][bytes]          the member's .npy HEADER, and its values
+    //                                  too when bit0 (nz::Fact)
+    //
+    // The header bytes travel rather than the fields parsed out of them, so
+    // that fortran order, byte order and item size cannot be dropped by a wire
+    // format that forgot one: the client runs nz::peekHeader on exactly the
+    // bytes the peer ran it on.
+    MSG_NPZ_SCAN   = 9,
     MSG_OK         = 128,
     MSG_ERR        = 129,
+};
+
+// MSG_NPZ_SCAN reply: which of the two readings docs/input-adapters.md §4.11.1
+// splits an .npz into. The peer decides it from the NAMES alone (`__viewer` is
+// present or it is not) - the same discriminator the local door uses, asked
+// before anything is inflated.
+enum NpzKind : uint32_t {
+    NK_ORDINARY  = 0,   // members classified by shape; the picker chooses
+    NK_CONTAINER = 1,   // a viewer container: it declares its own layers, and
+                        // the reply carries every reserved member verbatim
 };
 
 // What a MSG_READER_RUN reply says happened, and it is `adapter::Run`'s own
@@ -244,7 +308,15 @@ static const uint32_t READER_RUN_MAX_BYTES = 4u << 20;
 // exactly the v11 bytes.
 enum ReqTrailer : uint32_t {
     RQ_RAW_RECIPE = 1,   // a RawWire follows
-    RQ_READER     = 2,   // [str key][u32 node] follows: a reader's output
+    // [str key][u32 node] follows: ONE ARRAY INSIDE SOMETHING THE PEER
+    // MATERIALISED. The key names the materialisation, the node names the array
+    // in it - and the wire does not know, or need to know, what produced
+    // either. Protocol 12 issued keys from MSG_READER_RUN only, which is why
+    // this was spelled RQ_READER; 13 issues them from MSG_NPZ_SCAN too, and a
+    // native .npz has no reader anywhere near it (docs/remote-reader-design.md
+    // §10.5). THE VALUE IS UNCHANGED - a v12 peer and a v13 client mean the
+    // same 2 by it, and the rename costs no byte on any wire.
+    RQ_KEYED      = 2,
 };
 
 // LIST reply, v3. v2 was: [u32 n] then per entry [str name][u32 dir][u32 szLo]
@@ -867,6 +939,25 @@ inline std::string readerTooOldText(int peerVersion, const std::string& name) {
            std::to_string(peerVersion) + ", and readers over the link need 12 "
            "(update viewer-serve). Nothing ran: the file stays where it is; "
            "copy it here to use a reader today.";
+}
+
+// The peer predates a container crossing the link (issue #217, docs/
+// remote-reader-design.md §10.4). Same discipline as the four sentences above,
+// and the failure it prevents is the one MSG_NPZ_SCAN's own absence would
+// produce: a v12 peer answers the verb with "unknown request" - the sentence it
+// also gives for a typo - and answers a META that addresses the whole .npz as
+// one array with "not a .npy file", which blames the file for a limit that
+// belongs to the peer's build.
+//
+// The way out is named and it is the one that works today. The file IS readable
+// here, and for local:// the local door already opens it (openRemote falls
+// through), so what is actually lost is ssh - where the honest answer is to
+// bring the file over, because there is no send-a-file op in either direction.
+inline std::string npzTooOldText(int peerVersion, const std::string& name) {
+    return name + ": the remote peer cannot list what is inside a container - it "
+           "speaks protocol " + std::to_string(peerVersion) + ", and a .npz needs "
+           "13 (update viewer-serve). Nothing was opened: this file IS readable "
+           "here, so browsing it locally or copying it here both work today.";
 }
 
 // The gate the peer's own launcher opened, or did not (§2.1). A DIFFERENT

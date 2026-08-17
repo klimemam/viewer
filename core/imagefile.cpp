@@ -411,8 +411,10 @@ bool isHeaderless(const std::string& path) {
     return false;
 }
 
+bool isNpz(const std::string& path) { return lowerExt(path) == ".npz"; }
+
 bool peerServesDeclared(const std::string& path) {
-    return peerServes(path) || isHeaderless(path);
+    return peerServes(path) || isHeaderless(path) || isNpz(path);
 }
 
 std::string peerRefusal(const std::string& path) {
@@ -435,9 +437,24 @@ std::string peerRefusal(const std::string& path) {
                    "another machine over ssh";
         return why + WAY_OUT;
     }
-    if (lowerExt(path) == ".npz")
-        return ".npz is read on this machine, but the peer serves one array per "
-               "file, not a container" + std::string(WAY_OUT);
+    // A CONTAINER, and since protocol 13 the peer lists what is inside one
+    // (issue #217, docs/remote-reader-design.md §10.4). This sentence used to
+    // be "the peer serves one array per file, not a container" - true when
+    // nothing could address a member, and FALSE the day MSG_NPZ_SCAN shipped.
+    // A refusal that denies a door which exists is verify-matrix G11 all over
+    // again, so what is left is the part that is still true: this request named
+    // the whole file as if it were one array, and a container has no single
+    // geometry to answer with. The way out is the door that works, named.
+    //
+    // Reached by the ONE-CLICK PREVIEW and by anything else that addresses the
+    // file as an array - deliberately: peerServesDeclared lets the Browse row
+    // live and open, peerServes keeps the preview gate where it was, and this
+    // is the sentence in between (F4g asserts both halves together, the way
+    // F4d does for a headerless file).
+    if (isNpz(path))
+        return ".npz is a container and opens from its member list - this request "
+               "addressed the whole file as one array"
+               "\n  open it from Browse (the peer lists the members), or copy it here";
     // A headerless RAW. It reaches the fall-through below today and gets the
     // generic list, which is the defect verify-matrix G1 named: nobody DECIDED
     // that headerless files cannot cross the link, they fell off the end of a

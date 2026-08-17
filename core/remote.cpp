@@ -629,13 +629,33 @@ bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
     return true;
 }
 
-// A reader's output needs a peer that ran the reader. Refused HERE, from the
-// number, and for the reason at rp::readerTooOldText: an older peer does not
-// refuse the trailer - it never reads it, opens the path it was given and
-// answers with real pixels under the reader's name.
-bool Session::readerServable(const std::string& name, std::string& err) const {
-    if (peerVersion_ >= 12) return true;
-    err = rp::readerTooOldText(peerVersion_, name);
+// An array inside a materialisation needs a peer that made one. Refused HERE,
+// from the number, and for the reason at rp::readerTooOldText: an older peer
+// does not refuse the trailer - it never reads it, opens the path it was given
+// and answers with real pixels under the wrong name.
+//
+// WHICH number depends on what issued the key, and that is the whole of why
+// KeyedRef::kind exists. The two are different builds and different fixes: a
+// v12 peer runs readers and cannot list a container, so telling its user "a
+// reader cannot run on this peer" about a native .npz would send them to fix
+// something that is not broken.
+bool Session::keyedServable(const KeyedRef& rd, const std::string& name,
+                            std::string& err) const {
+    const int need = rd.kind == KeyedRef::FromNpz ? 13 : 12;
+    if (peerVersion_ >= need) return true;
+    err = rd.kind == KeyedRef::FromNpz ? rp::npzTooOldText(peerVersion_, name)
+                                       : rp::readerTooOldText(peerVersion_, name);
+    return false;
+}
+
+// ...and the same question asked of the file itself, before a SCAN is sent
+// (issue #217). A v12 peer answers MSG_NPZ_SCAN with "unknown request", the
+// same sentence a typo gets, so the client says which mismatch it is.
+bool Session::npzServable(const std::string& path, std::string& err) const {
+    if (peerVersion_ >= 13) return true;
+    const size_t slash = path.find_last_of("/\\");
+    err = rp::npzTooOldText(peerVersion_,
+                            slash == std::string::npos ? path : path.substr(slash + 1));
     return false;
 }
 
@@ -643,18 +663,18 @@ bool Session::readerServable(const std::string& name, std::string& err) const {
 // (rp::ReqTrailer). One place, because meta() and tile() have to agree byte for
 // byte about where a recipe stops and a key begins.
 static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
-                        const remote::ReaderRef* rd) {
+                        const remote::KeyedRef* rd) {
     if (peerVersion >= 12) {
         uint32_t f = 0;
         if (rw) f |= rp::RQ_RAW_RECIPE;
-        if (rd) f |= rp::RQ_READER;
+        if (rd) f |= rp::RQ_KEYED;
         w.u32(f);                          // ALWAYS, even 0: see rp::ReqTrailer
         if (rw) w.blob(rw, sizeof *rw);
         if (rd) { w.str(rd->key); w.u32((uint32_t)std::max(0, rd->node)); }
         return;
     }
     // Protocol 11 and below: one optional block, read by "if bytes remain".
-    // A ReaderRef never reaches here - readerServable refused first.
+    // A KeyedRef never reaches here - keyedServable refused first.
     if (rw && peerVersion >= 11) w.blob(rw, sizeof *rw);
 }
 
@@ -663,9 +683,9 @@ static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
 // names one entry in the peer's own cache and must not become a second way to
 // ask the peer to open a path.
 bool Session::meta(const std::string& path, Meta& out, std::string& err, int read,
-                   const rp::RawWire* rw, const ReaderRef* rd) {
+                   const rp::RawWire* rw, const KeyedRef* rd) {
     if (rd) {
-        if (!readerServable(path, err)) return false;
+        if (!keyedServable(*rd, path, err)) return false;
     } else if (!readServable(read, err) || !formatServable(path, err) ||
                !recipeServable(path, rw, err)) {
         return false;
@@ -766,9 +786,9 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w, int h,
                         int step, std::vector<uint8_t>& raw, int& outW, int& outH,
                         int& outCh, uint32_t& dtype, std::string& err, int read,
-                        const rp::RawWire* rw, const ReaderRef* rd) {
+                        const rp::RawWire* rw, const KeyedRef* rd) {
     if (rd) {
-        if (!readerServable(path, err)) return false;
+        if (!keyedServable(*rd, path, err)) return false;
     } else if (!readServable(read, err) || !formatServable(path, err) ||
                !recipeServable(path, rw, err)) {
         return false;
@@ -824,7 +844,7 @@ bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w,
 bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
                    std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
                    std::string& err, int read, rp::F32Loss* loss,
-                   const rp::RawWire* rw, const ReaderRef* rd) {
+                   const rp::RawWire* rw, const KeyedRef* rd) {
     std::vector<uint8_t> raw;
     uint32_t dt = 0;
     if (!tileBytes(path, frame, x, y, w, h, step, raw, outW, outH, outCh, dt, err,
@@ -838,7 +858,10 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
 bool Session::readerRun(const std::string& peerPath, const std::string& func,
                         const std::string files[3], ReaderRun& out, std::string& err) {
     out = ReaderRun{};
-    if (!readerServable(peerPath, err)) return false;
+    {
+        KeyedRef probe;                 // the reader family's number, asked once
+        if (!keyedServable(probe, peerPath, err)) return false;
+    }
     W w;
     w.str(serverPath(peerPath));
     w.str(func);
@@ -859,6 +882,48 @@ bool Session::readerRun(const std::string& peerPath, const std::string& func,
         return false;
     }
     out.outcome = (int)outcome;
+    return true;
+}
+
+bool Session::npzScan(const std::string& path, NpzScan& out, std::string& err) {
+    out = NpzScan{};
+    if (!npzServable(path, err)) return false;
+    W w;
+    w.str(serverPath(path));
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_NPZ_SCAN, w.b, err) || !recv(type, reply, err)) return false;
+    R r(reply);
+    if (type != rp::MSG_OK) { r.str(err); return false; }
+    uint32_t kind = 0, cver = 0, n = 0;
+    if (!r.str(out.key) || !r.u32(kind) || !r.u32(cver) || !r.u32(n)) {
+        err = "bad NPZ_SCAN reply";
+        return false;
+    }
+    out.kind = (int)kind;
+    out.containerVersion = (int)cver;
+    // A member costs at least a length word per field, so a count the payload
+    // cannot possibly hold is refused before it reserves anything - the same
+    // discipline tileReplySane keeps for a tile's dimensions.
+    if ((uint64_t)n * 16 > reply.size()) { err = "bad NPZ_SCAN reply"; return false; }
+    out.members.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        nz::Fact f;
+        uint32_t lo = 0, hi = 0, node = 0, flags = 0, nb = 0;
+        if (!r.str(f.name) || !r.u32(lo) || !r.u32(hi) || !r.u32(node) ||
+            !r.str(f.err) || !r.u32(flags) || !r.u32(nb)) {
+            err = "bad NPZ_SCAN reply";
+            return false;
+        }
+        if (nb > reply.size() - r.rd) { err = "bad NPZ_SCAN reply"; return false; }
+        f.usize = ((uint64_t)hi << 32) | lo;
+        f.entry = (size_t)node;
+        f.whole = (flags & 1) != 0;
+        f.bytes.assign(reply.begin() + (ptrdiff_t)r.rd,
+                       reply.begin() + (ptrdiff_t)(r.rd + nb));
+        r.rd += nb;
+        out.members.push_back(std::move(f));
+    }
     return true;
 }
 

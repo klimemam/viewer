@@ -1812,12 +1812,15 @@ static void openRemoteRawRow(const std::string& url, uint64_t sizeBytes) {
 }
 
 // The 4-argument shape core/browse/host.h binds. See the note at that binding.
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember);  // fwd
+
 static bool browseOpenRemote(const std::string& url, bool asPreview, int frame, int npyRead) {
     return openRemote(url, asPreview, frame, npyRead, nullptr);
 }
 
 static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead,
-                       const rp::RawWire* rw) {
+                       const rp::RawWire* rw, const remote::KeyedRef* kd,
+                       const std::string& member) {
     UiThreadStall stallCredit;      // see above: a blocked frame is not the user's
     std::string host, rpath;
     int port = 0;
@@ -1843,8 +1846,16 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // for "answerable with nothing else said" - it is what the listing and the
     // one-click preview ask - so the door adds the second half here rather than
     // widening that predicate underneath them.
+    // A KEYED request is not about a name on the peer's disk (protocol 12/13):
+    // it addresses one array inside something the peer already materialised, so
+    // the format gate below - which asks "will the peer serve a file called
+    // this" - has nothing to decide. It is skipped rather than widened: a .npz
+    // is deliberately NOT in peerServes (its Browse row lives through
+    // peerServesDeclared and its one-click preview stays off, §10.4), and
+    // widening the predicate to let a member through would take the preview
+    // with it.
     const bool headerlessOk = imagefile::isHeaderless(rpath) && rw != nullptr;
-    if (!headerlessOk && !peerServesName(rpath)) {
+    if (!kd && !headerlessOk && !peerServesName(rpath)) {
         if (host.empty() && viewerReadsName(rpath)) {
             // A PREVIEW is a decimated tile and only the peer path makes one.
             // The Browse click does not ask for one on these rows (see
@@ -1854,6 +1865,22 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
             const size_t before = app.images.size();
             openPath(rpath);              // the File > Open door, which SAYS what
             return app.images.size() > before;   // it did - including refusals
+        }
+        // A CONTAINER on the far side (issue #217). It comes after the local
+        // fall-through above on purpose: a local:// url names a file on THIS
+        // disk and the local door opens it with the picker, the metadata and
+        // the identity a member deserves, which is #111's rule and §10.3's
+        // record of it ("local:// は今日と同じく openPath へ回す"). What was
+        // missing was the ssh:// road, and this is it.
+        //
+        // A PREVIEW is refused rather than answered: one click makes a
+        // decimated tile of ONE geometry and a container has none (§10.4 -
+        // .npz is in peerServesDeclared, so the row lives and opens, and it is
+        // deliberately not in peerServes, so the preview gate stays where it
+        // is).
+        if (imagefile::isNpz(rpath)) {
+            if (asPreview) return false;
+            return openRemoteNpz(url, member);
         }
         // ssh://, or a name nothing here reads: refused BY NAME and before the
         // round trip, with the reason and the way out. The peer's own answer to
@@ -1891,7 +1918,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // with nothing checking they agree - which is what #71 cost a release.
     // Session::meta refuses a declaration a v8 peer cannot serve BEFORE sending.
     remote::Meta m;
-    if (!app.uiSession.meta(rpath, m, err, npyRead, rw)) { toast("remote: " + err, true); return false; }
+    if (!app.uiSession.meta(rpath, m, err, npyRead, rw, kd)) { toast("remote: " + err, true); return false; }
     // The peer fell back to native because the declaration does not fit this
     // shape - a session line against a file whose rank changed under it. The
     // local decoder's answer is a note and nothing else: the DECLARATION is
@@ -1913,7 +1940,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     std::string dt;
     rp::F32Loss tloss;                        // what float32 cost these pixels
     if (!app.uiSession.tile(rpath, frame, 0, 0, m.w, m.h, step, px, tw, th, tch, dt, err,
-                            npyRead, &tloss, rw)) {
+                            npyRead, &tloss, rw, kd)) {
         toast("remote: " + err, true);
         return false;
     }
@@ -1922,7 +1949,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         return false;
     }
     auto doc = std::make_unique<ImageDoc>();
-    doc->name = baseName(rpath) + (frame > 0 ? " #" + std::to_string(frame) : "") +
+    doc->name = baseName(rpath) + (member.empty() ? std::string() : ":" + member) +
+                (frame > 0 ? " #" + std::to_string(frame) : "") +
                 (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
     FrameSource& S = *doc->src;
     S.mtime = urlStat.mtime;                 // the PRE-read stat: 0/0 for ssh://,
@@ -1947,6 +1975,18 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     S.npyShape = m.shape;
     S.npyRead = npyRead;
     S.remoteProto = app.uiSession.peerVersion();
+    // WHICH array of a materialisation these pixels are (protocol 12/13). It
+    // rides on the source for the two reasons every other remote fact does: the
+    // full-resolution swap and the sibling frames re-ask the peer and must ask
+    // for the SAME array, and the identity tuple has to tell two members of one
+    // container apart - which `member` already did for a local .npz and now
+    // does for a remote one, through the very same field.
+    if (kd) {
+        S.remoteKey = kd->key;
+        S.remoteNode = kd->node;
+        S.remoteKeyKind = kd->kind;
+    }
+    S.member = member;
     // The recipe this open was made under, recorded on the SOURCE. Two reasons
     // and both are load-bearing:
     //
@@ -2084,7 +2124,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     if (m.frames > 1 && !asPreview) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
-        si.name = baseName(rpath) + " [remote]";
+        si.name = baseName(rpath) + (member.empty() ? std::string() : ":" + member) +
+                  " [remote]";
         si.remoteUrl = url;           // frame-axis: one file, N frames
         si.remoteHost = host;
         si.remotePort = port;
@@ -2116,6 +2157,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
             j.mtime = urlStat.mtime;  // the open's stat epoch rides to every frame
             j.fsize = urlStat.fsize;
             rfInheritRead(j, first);  // ...and so does the reading it is read under
+            if (!member.empty()) j.name = baseName(rpath) + ":" + member +
+                                          " #" + std::to_string(i);
             rfEnqueue(std::move(j));
         }
         if (fit < m.frames - 1) {
@@ -2130,9 +2173,11 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // g_quietLoad: a §3.3 re-read drives this open and says "read as ..." itself
     // when it finishes (pumpReRead), so an "opened X" beside it would be two
     // toasts for one gesture, the second one describing the wrong thing.
-    if (!g_quietLoad)
-        toast(host.empty() ? "opened " + baseName(rpath)
-                           : "opened " + baseName(rpath) + " from " + host);
+    if (!g_quietLoad) {
+        const std::string what = baseName(rpath) +
+                                 (member.empty() ? std::string() : ":" + member);
+        toast(host.empty() ? "opened " + what : "opened " + what + " from " + host);
+    }
     return true;
 }
 
@@ -2220,6 +2265,90 @@ static std::string remoteReaderPrepare(const std::string& url, const std::string
            std::string(rp::READER_RUN_FILES[2]) + " " + std::string(rp::READER_RUN_FILES[0]) +
            ":" + readerFuncOf(spec) + " " + rpath + " --stream");
     return {};
+}
+
+// ONE ARRAY of something the peer materialised, as a .npy buffer this process
+// can hand to the decoder every other array goes through.
+//
+// Shared by both things that produce a key (docs/remote-reader-design.md
+// §10.5): a reader's tree node and a .npz member. What it does is what stage 2
+// wrote for the reader and #217 needed unchanged - ask META what the peer makes
+// of this array, check that against the shape the DECLARATION says it has (a
+// disagreement means the two doors have drifted and the one thing that must not
+// follow is pixels under a label), and fetch it decimated to what a screen can
+// show, IN THE SOURCE DTYPE, so the very same decoder sees the very same bytes.
+// That last part is what makes the bit-identity assertions (R8, R14) something
+// the code guarantees rather than something it hopes.
+//
+// `stepOut` is the decimation it settled on, which the caller needs in order to
+// ask for the full resolution later.
+static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
+                             int n, const std::string& key, int kind,
+                             const std::map<int, int>& stepOf);   // fwd (below)
+
+static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref,
+                             const std::vector<int64_t>& shape,
+                             std::vector<uint8_t>& out, int& stepOut, std::string& e) {
+    remote::Meta m;
+    if (!app.uiSession.meta(url, m, e, 0, nullptr, &ref)) return false;
+    const size_t rank = shape.size();
+    int iF = -1, iH = -1, iW = -1, iC = -1;
+    if (rank == 2) { iH = 0; iW = 1; }
+    else if (!rp::npyReadAxes(rank, rp::npyNativeRead(shape), iF, iH, iW, iC)) {
+        e = rp::npyNotNativeText(shape);
+        return false;
+    }
+    const int64_t wantF = iF >= 0 ? shape[iF] : 1;
+    const int64_t wantC = iC >= 0 ? shape[iC] : 1;
+    if (m.w != (int)shape[iW] || m.h != (int)shape[iH] ||
+        m.frames != (int)wantF || m.ch != (int)wantC) {
+        e = "the peer reads " + rp::npyShapeText(shape) + " as " +
+            std::to_string(m.frames) + "x" + std::to_string(m.h) + "x" +
+            std::to_string(m.w) + "x" + std::to_string(m.ch) + " and this viewer "
+            "does not";
+        return false;
+    }
+    // openRemote's first view, to the pixel: about one sample per screen pixel,
+    // and the full resolution only when something asks for it.
+    int step = std::max(1, (int)ceilf((float)std::max(m.w, m.h) / 1600.0f));
+    std::vector<int64_t> dec = shape;
+    for (int pass = 0; pass < 2; pass++) {
+        dec = shape;
+        dec[(size_t)iH] = (m.h + step - 1) / step;
+        dec[(size_t)iW] = (m.w + step - 1) / step;
+        // A decimated array must still READ the way the full one does. A
+        // (F,H,W) whose W decimates to 4 or fewer would come back out of the
+        // shape rule as (H,W,C) - the same samples under a different meaning,
+        // which is the one thing decimation may never cost. So that case is
+        // fetched whole instead.
+        if (rank < 3 || rp::npyNativeRead(dec) == rp::npyNativeRead(shape)) break;
+        step = 1;
+    }
+    stepOut = step;
+    const uint32_t dt = rp::dtypeFromName(m.dtype.c_str());
+    const char* npyDt = rp::dtypeNpy(dt);
+    if (!*npyDt) { e = "the peer returned dtype " + m.dtype; return false; }
+    const size_t esz = rp::dtypeSize(dt);
+    const size_t per = (size_t)dec[(size_t)iH] * (size_t)dec[(size_t)iW] *
+                       (size_t)(iC >= 0 ? dec[(size_t)iC] : 1) * esz;
+    const size_t pre = writeNpyHeaderFor(out, npyDt, dec);
+    out.resize(pre + per * (size_t)wantF);
+    for (int64_t f = 0; f < wantF; f++) {
+        std::vector<uint8_t> raw;
+        int tw = 0, th = 0, tch = 0;
+        uint32_t rdt = 0;
+        if (!app.uiSession.tileBytes(url, (int)f, 0, 0, m.w, m.h, step, raw,
+                                     tw, th, tch, rdt, e, 0, nullptr, &ref))
+            return false;
+        if (rdt != dt || raw.size() != per) {
+            e = "the peer returned " + std::to_string(raw.size()) +
+                " bytes for frame " + std::to_string(f) + " and this viewer sized " +
+                std::to_string(per);
+            return false;
+        }
+        memcpy(out.data() + pre + per * (size_t)f, raw.data(), per);
+    }
+    return true;
 }
 
 // Everything AFTER it: the outcome as a sentence, or the documents. On the UI
@@ -2311,78 +2440,15 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
     originStat.path = url;
 
     // The fetch, and it is the ONLY thing that differs from a local reader
-    // open. Locally this reads the blob out of the cache file; here it asks the
-    // peer for the same node, decimated to what a screen can show, and rebuilds
-    // a .npy around the samples IN THE SOURCE DTYPE so the very same decoder
-    // sees the very same bytes (which is what makes stage 2's bit-identity
-    // assertion something the code guarantees rather than something it hopes).
+    // open (remoteKeyedArray, above).
+    std::map<int, int> stepOf;
     auto fetch = [&](int i, const VnzNode& v, std::vector<uint8_t>& out,
                      std::string& e) -> bool {
         if (v.pixelEntry >= blobs.size()) { e = "that node declared no pixels"; return false; }
-        const VnzBlob& b = blobs[v.pixelEntry];
-        remote::ReaderRef ref{ run.key, i };
-        remote::Meta m;
-        if (!app.uiSession.meta(url, m, e, 0, nullptr, &ref)) return false;
-        const size_t rank = b.shape.size();
-        int iF = -1, iH = -1, iW = -1, iC = -1;
-        if (rank == 2) { iH = 0; iW = 1; }
-        else if (!rp::npyReadAxes(rank, rp::npyNativeRead(b.shape), iF, iH, iW, iC)) {
-            e = rp::npyNotNativeText(b.shape);
-            return false;
-        }
-        // The two ends agreeing about one array, checked rather than assumed:
-        // the peer computed w/h/ch/frames from this same shape through
-        // serveLayout, so a disagreement means the doors have drifted and the
-        // one thing that must not follow is pixels under a label.
-        const int64_t wantF = iF >= 0 ? b.shape[iF] : 1;
-        const int64_t wantC = iC >= 0 ? b.shape[iC] : 1;
-        if (m.w != (int)b.shape[iW] || m.h != (int)b.shape[iH] ||
-            m.frames != (int)wantF || m.ch != (int)wantC) {
-            e = "the peer reads " + rp::npyShapeText(b.shape) + " as " +
-                std::to_string(m.frames) + "x" + std::to_string(m.h) + "x" +
-                std::to_string(m.w) + "x" + std::to_string(m.ch) + " and this viewer "
-                "does not";
-            return false;
-        }
-        // openRemote's first view, to the pixel: about one sample per screen
-        // pixel, and the full resolution only when something asks for it.
-        int step = std::max(1, (int)ceilf((float)std::max(m.w, m.h) / 1600.0f));
-        std::vector<int64_t> dec = b.shape;
-        for (int pass = 0; pass < 2; pass++) {
-            dec = b.shape;
-            dec[(size_t)iH] = (m.h + step - 1) / step;
-            dec[(size_t)iW] = (m.w + step - 1) / step;
-            // A decimated array must still READ the way the full one does. A
-            // (F,H,W) whose W decimates to 4 or fewer would come back out of
-            // the shape rule as (H,W,C) - the same samples under a different
-            // meaning, which is the one thing decimation may never cost. So
-            // that case is fetched whole instead.
-            if (rank < 3 || rp::npyNativeRead(dec) == rp::npyNativeRead(b.shape)) break;
-            step = 1;
-        }
-        const uint32_t dt = rp::dtypeFromName(m.dtype.c_str());
-        const char* npyDt = rp::dtypeNpy(dt);
-        if (!*npyDt) { e = "the peer returned dtype " + m.dtype; return false; }
-        const size_t esz = rp::dtypeSize(dt);
-        const size_t per = (size_t)dec[(size_t)iH] * (size_t)dec[(size_t)iW] *
-                           (size_t)(iC >= 0 ? dec[(size_t)iC] : 1) * esz;
-        const size_t pre = writeNpyHeaderFor(out, npyDt, dec);
-        out.resize(pre + per * (size_t)wantF);
-        for (int64_t f = 0; f < wantF; f++) {
-            std::vector<uint8_t> raw;
-            int tw = 0, th = 0, tch = 0;
-            uint32_t rdt = 0;
-            if (!app.uiSession.tileBytes(url, (int)f, 0, 0, m.w, m.h, step, raw,
-                                         tw, th, tch, rdt, e, 0, nullptr, &ref))
-                return false;
-            if (rdt != dt || raw.size() != per) {
-                e = "the peer returned " + std::to_string(raw.size()) +
-                    " bytes for frame " + std::to_string(f) + " and this viewer sized " +
-                    std::to_string(per);
-                return false;
-            }
-            memcpy(out.data() + pre + per * (size_t)f, raw.data(), per);
-        }
+        remote::KeyedRef ref{ run.key, i, remote::KeyedRef::FromReader };
+        int step = 1;
+        if (!remoteKeyedArray(url, ref, blobs[v.pixelEntry].shape, out, step, e)) return false;
+        stepOf[i] = step;               // what the full-resolution swap undoes
         return true;
     };
 
@@ -2392,11 +2458,12 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
     // without later. vnzBuild adds the reader spec itself.
     meta.emplace_back("reader ran on", host.empty() ? std::string("local peer") : host);
     if (!run.provenance.empty()) meta.emplace_back("reader python", run.provenance);
-    const std::string berr = vnzBuild(nodes, n, url, spec, fetch, meta, originStat);
+    const std::string berr = vnzBuild(nodes, n, url, spec, fetch, meta, originStat, true);
     if (!berr.empty()) {
         app.readerLastOut = readerUnreadableText(where, berr);
         return berr;
     }
+    remoteTreeRefine(url, nodes, n, run.key, remote::KeyedRef::FromReader, stepOf);
     // The memo is keyed on the WHOLE url (§4.12 over a link): readerFor is
     // asked with FrameSource::path, and a remote document's path IS its url, so
     // the Inspector's reader row and a later restore both find this without a
@@ -2409,6 +2476,45 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
     app.readerLastOut += "\n\nran" + where;
     if (!run.provenance.empty()) app.readerLastOut += " with " + run.provenance;
     return {};
+}
+
+// A tree the peer materialised lands as ORDINARY LOCAL DOCUMENTS: vnzBuild
+// decodes the .npy buffers this process fetched, exactly as it does for a
+// container on this disk, which is the whole point of there being one tree
+// builder. The cost of that shape is that nothing on the documents says where
+// the pixels came from - so the decimated first view (remoteKeyedArray picks
+// step = ceil(max(w,h)/1600), the same rule openRemote uses) would have stayed
+// decimated for the life of the session, with the Files row saying "1/2" and no
+// way to ask for the rest.
+//
+// This is the wiring that was missing after stage 2 and the natural place for
+// it is here, where the node numbers are: the fields openRemote fills on a
+// source of its own are filled on these, so requestFullRemote and
+// pumpRemoteFetch reach a reader's node and a .npz member through the code that
+// already refines every other remote document. Nothing about the fetch is
+// new - the full-resolution TILE is the same request with step 1.
+static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
+                             int n, const std::string& key, int kind,
+                             const std::map<int, int>& stepOf) {
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        if (v.docFirst < 0 || v.docCount <= 0) continue;
+        auto it = stepOf.find(i);
+        const int step = it == stepOf.end() ? 1 : it->second;
+        for (int k = 0; k < v.docCount; k++) {
+            if ((size_t)v.docFirst + (size_t)k >= app.images.size()) break;
+            ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
+            FrameSource& S = *d->src;
+            S.remoteUrl = url;
+            S.remoteFrame = k;
+            S.remoteStep = step;
+            S.remoteKey = key;
+            S.remoteNode = i;
+            S.remoteKeyKind = kind;
+            S.remoteProto = app.uiSession.peerVersion();
+            if (step > 1) requestFullRemote(d);
+        }
+    }
 }
 
 // The whole round trip, synchronously. The door the selftests and a session
@@ -2431,6 +2537,188 @@ static std::string openRemoteWithReader(const std::string& url, const std::strin
         return err;
     }
     return remoteReaderLand(url, spec, host, run);
+}
+
+// ---- a CONTAINER that lives on the peer (issue #217, §10) -------------------
+//
+// A .npz is a zip of .npy arrays: the file is a batch and each member is a
+// stack or a frame (docs/npz-design.md §2). Nothing about that is new here -
+// what was missing was a way to ASK a peer what is inside one, and a way to
+// address a member once it had. Both exist now and neither is npz-shaped: the
+// SCAN returns facts, and a member is reached by the same [key][node] trailer a
+// reader's node uses (§10.5).
+//
+// The three things that do NOT happen on the peer are the point of the shape:
+//   it builds no TREE - a viewer container's declaration comes back verbatim
+//   and this process's one tree builder reads it (§10.2);
+//   it classifies NOTHING - npzClassify turns the facts into picker rows here,
+//   so a row cannot read differently depending on which end listed the file;
+//   it inflates no PIXELS until one is asked for, and then exactly one.
+static bool openRemoteNpzMember(const std::string& url, const std::string& key,
+                                const NpzMember& m, bool asPreview) {
+    remote::KeyedRef ref{ key, (int)m.entry, remote::KeyedRef::FromNpz };
+    return openRemote(url, asPreview, 0, 0 /*NR_NATIVE*/, nullptr, &ref, m.name);
+}
+
+// The container half: the declaration comes back as reserved members and the
+// tree is built HERE, by the function a local .vnz goes through.
+static std::string openRemoteViewerNpz(const std::string& url, const remote::NpzScan& sc) {
+    std::map<std::string, size_t> byName;
+    for (size_t i = 0; i < sc.members.size(); i++) byName[sc.members[i].name] = i;
+    auto mem = [&](const std::string& name, std::vector<uint8_t>& out,
+                   std::string& e) -> bool {
+        auto it = byName.find(name);
+        if (it == byName.end()) { e = "missing member " + name; return false; }
+        const nz::Fact& f = sc.members[it->second];
+        if (!f.err.empty()) { e = f.err; return false; }
+        // A reserved member the peer did not carry. It says so rather than
+        // guessing: the peer's rule for what rides along is nz::wantsValues,
+        // and a container whose declaration does not fit that rule is a
+        // container this build cannot read - which is a sentence, not a shrug.
+        if (!f.whole) {
+            e = name + " is too large to carry across the link (a container's "
+                       "declaration is words and short vectors; its pixels are "
+                       "fetched a tile at a time)";
+            return false;
+        }
+        out = f.bytes;
+        return true;
+    };
+    std::map<int, int> stepOf;
+    auto pixels = [&](int i, const VnzNode& v, std::vector<uint8_t>& out,
+                      std::string& e) -> bool {
+        if (v.pixelEntry >= sc.members.size()) { e = "that node declared no pixels"; return false; }
+        const nz::Fact& f = sc.members[v.pixelEntry];
+        NpyHead H;
+        if (!npyPeekHeader(f.bytes, H, e)) { e = f.name + ": " + e; return false; }
+        // The NODE is the peer's own address for this member, issued with the
+        // key and quoted back - never a number computed here (§10.5).
+        remote::KeyedRef ref{ sc.key, (int)f.entry, remote::KeyedRef::FromNpz };
+        int step = 1;
+        if (!remoteKeyedArray(url, ref, H.shape, out, step, e)) return false;
+        stepOf[i] = step;
+        return true;
+    };
+    // identity BEFORE the bytes (§6.2). For a local:// url the peer reads this
+    // disk, so the tuple is real; ssh:// stays 0/0, exactly as openRemote
+    // records it, because a peer's disk cannot be statted from here.
+    FrameSource originStat;
+    originStat.remoteUrl = url;
+    statLocalUrl(originStat);
+    originStat.path = url;
+    std::vector<VnzNode> nodes;
+    int n = 0;
+    // vnzBuild fills docFirst/docCount on the nodes, which is what the refine
+    // pass below needs - so the vector has to outlive the call, and
+    // loadViewerNpz owns it. It is handed back through the two out-parameters
+    // rather than rebuilt here, for the reason everything else in this file is
+    // shared: a second reader of a declaration is a second tree.
+    const std::string err = loadViewerNpz(mem, byName, sc.containerVersion,
+                                          std::string(), url, originStat, pixels,
+                                          &nodes, &n);
+    if (!err.empty()) return err;
+    remoteTreeRefine(url, nodes, n, sc.key, remote::KeyedRef::FromNpz, stepOf);
+    return {};
+}
+
+// The door. `onlyMember` restores a single array (sessions record which one):
+// no picker and no batch of its own, because the session owns both - the same
+// rule loadNpz follows, shared rather than restated.
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember) {
+    std::string host, rpath;
+    int port = 0;
+    if (!remote::parseUrl(url, host, rpath, &port)) {
+        toast("expected ssh://user@host/path/to/file.npz", true);
+        return false;
+    }
+    std::string err;
+    if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return false; }
+    remote::NpzScan sc;
+    if (!app.uiSession.npzScan(rpath, sc, err)) { toast("remote: " + err, true); return false; }
+    if (sc.kind == rp::NK_CONTAINER) {
+        // A container is ONE unit and rebuilds every doc at once, so a session's
+        // second line for the same file adds nothing (loadNpz makes the same
+        // call, with the same reason).
+        if (!onlyMember.empty())
+            for (const auto& d : app.images)
+                if (d->src->path == url && d->src->member.compare(0, 9, "__pixels_") == 0)
+                    return true;
+        const size_t before = app.images.size();
+        const std::string cerr = openRemoteViewerNpz(url, sc);
+        if (!cerr.empty()) { toast(baseName(rpath) + ": " + cerr, true); return false; }
+        return app.images.size() > before;
+    }
+    std::vector<NpzMember> mem = npzClassify(sc.members);
+    if (mem.empty()) { toast(baseName(rpath) + ": no arrays in npz", true); return false; }
+    if (!onlyMember.empty()) {
+        for (const auto& m : mem) {
+            if (m.name != onlyMember) continue;
+            if (m.role != NpzMember::RImage) {
+                toast(baseName(rpath) + ": member " + onlyMember + " " + m.shapeText +
+                      " is not an image (" + m.why + ")", true);
+                return false;
+            }
+            npzRememberMeta(url, mem);
+            return openRemoteNpzMember(url, sc.key, m, false);
+        }
+        toast(baseName(rpath) + ": no member named " + onlyMember + " in this npz", true);
+        return false;
+    }
+    int images = 0, axes = 0;
+    for (const auto& m : mem) if (m.role == NpzMember::RImage) images++;
+    for (const auto& m : mem) {
+        if (m.role != NpzMember::RAxis || m.vals.empty()) continue;
+        for (const auto& im : mem)
+            if (im.role == NpzMember::RImage && im.frames > 1 &&
+                (size_t)im.frames == m.vals.size()) { axes++; break; }
+    }
+    if (images == 0) {
+        std::string what;
+        for (const auto& m : mem)
+            what += (what.empty() ? "" : ", ") + m.name + " " + m.shapeText + " " + m.dtype;
+        npzRememberMeta(url, mem);
+        toast(baseName(rpath) + ": no image-shaped arrays in this npz (" + what + ")", true);
+        return false;
+    }
+    // ONE image and nothing to decide: open it, no dialog. The rule is
+    // loadNpz's, word for word, because it is the same rule (§10.3) - a remote
+    // .npz that asked a question a local one does not would be the "two answers
+    // for one file" defect #148 removed, one container down.
+    if (images == 1 && axes == 0) {
+        npzRememberMeta(url, mem);
+        for (const auto& m : mem) {
+            if (m.role != NpzMember::RImage) continue;
+            int prevBatch = app.loadBatchId;
+            app.loadBatchId = newBatch(uniqueBatchName(baseName(rpath)));
+            const bool ok = openRemoteNpzMember(url, sc.key, m, false);
+            app.loadBatchId = prevBatch;
+            if (!ok) { pruneEmptyBatches(); return false; }
+            std::string say = npzSummary(url, mem, { m.name }, m.frames > 1 ? 1 : 0,
+                                         m.frames > 1 ? m.frames : 0, m.frames > 1 ? 0 : 1,
+                                         "");
+            fprintf(stderr, "npz: %s\n", say.c_str());
+            toast(say);
+            return true;
+        }
+    }
+    // More than one picture, or a 1-D key that could be this stack's axis: ask,
+    // in the SAME modal, from the SAME rows. drawNpzPickModal never learns that
+    // a listing can come from a peer - npzPickAccept re-scans by name when the
+    // user says yes, which is the remote half of "the file could have been
+    // rewritten while the dialog stood open".
+    if (app.npzPickOpen) {
+        app.npzPickQueue.push_back(url);
+        toast(baseName(rpath) + ": waiting its turn - choose arrays for " +
+              baseName(app.npzPickPath) + " first (" +
+              std::to_string(app.npzPickQueue.size()) + " file(s) waiting)");
+        return true;
+    }
+    app.npzPick = std::move(mem);
+    app.npzPickPath = url;
+    app.npzAxisName[0] = '\0';
+    app.npzAxisUnit[0] = '\0';
+    app.npzPickOpen = true;
+    return true;
 }
 
 // The stack AROUND a remote frame that is already open: the SeqInfo, the
@@ -2678,7 +2966,9 @@ static void promotePreview(ImageDoc* d) {
     if (d->remoteFrames > 1 && d->seqId == 0) {
         App::SeqInfo si;
         si.id = app.nextSeqId++;
-        si.name = baseName(rpath) + " [remote]";
+        si.name = baseName(rpath) +
+                  (d->src->member.empty() ? std::string() : ":" + d->src->member) +
+                  " [remote]";
         si.remoteUrl = d->src->remoteUrl;
         si.remoteHost = host;
         si.remotePort = port;
