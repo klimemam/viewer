@@ -1051,6 +1051,23 @@ inline std::string measureKeyedTooOldText(int peerVersion) {
            "the same quantity locally once they have.";
 }
 
+// A key that names nothing on the peer any more - or never did. ONE sentence,
+// and deliberately issuer-neutral: a key is opaque by construction (§4.2), so
+// when the cache holds nothing under it there is no way to know whether a
+// reader made it or a container listing did. The peer used to answer "run the
+// reader again", which is a correct instruction exactly half the time and sends
+// the other half to re-run something that was never involved.
+//
+// It names the two ways back because both are true of the thing that IS gone:
+// the materialisation. Which of them applies is knowable at the CLIENT (it is
+// looking at the document) and not here, so the sentence offers both rather
+// than guessing at one.
+inline std::string keyGoneText() {
+    return "this peer has nothing under that key any more: whatever it named has "
+           "left its cache. Open the file again - a container is listed again, a "
+           "reader is run again.";
+}
+
 // The gate the peer's own launcher opened, or did not (§2.1). A DIFFERENT
 // sentence from the one above, because the two are fixed in different places by
 // different people: the version is fixed by updating the peer, and this one by

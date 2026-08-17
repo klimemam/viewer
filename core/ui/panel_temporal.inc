@@ -100,7 +100,12 @@ static void temporalClampNote(int nPl, const bool* clamped) {
 // how many frames, always.
 static bool drawServerTemporal(const App::SeqInfo* si) {
     App::ServerTemporal& S = app.srvTemporal;
-    if (!si || !serverComputes(*si) || S.seqId != si->id) return false;
+    if (!si || !serverComputes(*si)) return false;
+    // A stack this slot has never held. One open can land several stacks (a
+    // series from a reader, a viewer container), and only one of them could be
+    // measured at landing - so the one being looked at asks for itself, once.
+    ensureServerTemporalFor(si->id);
+    if (S.seqId != si->id) return false;
     ImGui::Text("Temporal");
     ImGui::SameLine();
     if (S.pending) {

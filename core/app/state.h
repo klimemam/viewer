@@ -990,6 +990,13 @@ struct App {
         int refW = 0, refH = 0, refCh = 0;
         std::string refName;
         int cfaType = 0, cfaPattern = 0;
+        // Has the A slot ever been fired for this stack? A server aggregate is
+        // a real job on a real machine, so the panel may ask for a stack it has
+        // never asked about (a tree lands several and only one can be measured
+        // at landing - remoteTreeRefine) and may NOT re-ask every time the
+        // selection comes back to it. Recorded on the stack rather than kept as
+        // a set beside it, because it dies exactly when the stack does.
+        bool srvTemporalAsked = false;
         // Data revision of the stack AS A SET of pixels: the reload walk (§3.2)
         // bumps it whenever a member's source is swapped in place. Part of the
         // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a

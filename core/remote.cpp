@@ -944,6 +944,15 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
             err = "a raw recipe does not apply to an array inside a materialisation";
             return false;
         }
+        // ...and two subjects is not a request either. The wire cannot say it
+        // (nPaths goes to 0 below), so a caller that filled both would have had
+        // its file list SILENTLY DROPPED - which is the shape of bug that looks
+        // like a correct answer to a question nobody asked. The peer refuses
+        // this pair in these words; so does this end, before it is written.
+        if (!q.paths.empty() || !q.roles.empty()) {
+            err = "a keyed measurement addresses one array, not a list of files";
+            return false;
+        }
         // The ops whose grammar cannot say "this one array". A set names
         // several stacks and the plugin ops name a file in the sentences they
         // write about it; both are refused BY NAME rather than measured over

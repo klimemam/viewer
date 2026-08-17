@@ -705,11 +705,16 @@ static bool readerCachePath(const std::string& key, std::string& out) {
 static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node,
                             std::string& err) {
     std::string path;
-    if (!readerCachePath(key, path)) { err = "that is not a reader key"; return false; }
+    if (!readerCachePath(key, path)) {
+        err = "that is not a key this peer could have issued";
+        return false;
+    }
     n.f.open(std::filesystem::u8path(path), std::ios::binary);
     if (!n.f) {
-        err = "this peer has nothing under that reader key any more - run the "
-              "reader again";
+        // Not "run the reader again": a key that resolves to nothing is a key
+        // whose ISSUER is unknowable (rp::keyGoneText), and half of them came
+        // from a container listing.
+        err = rp::keyGoneText();
         return false;
     }
     vns::Scan sc;

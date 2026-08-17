@@ -21,7 +21,7 @@
 |---|---|---|
 | 1 | 許可の形 | **peer プロセスの起動引数 `--serve-readers`(既定 閉)**。環境変数でも同梱ディレクトリでもない。#179 裁定 C はリンクを越えても成立する: client 側は memo/picker だけが起動でき (変更なし)、peer 側の同意は「その旗を立ててプロセスを起動した者」に付く。ssh では起動者 = client のユーザー自身 = 既に shell 権限を持つ者なので、旗は ssh に対しては新権限を与えない。旗が守るのは **ssh でない起動者** (将来の WebSocket front、serve.cpp :641 の注釈が名指しする転送) である |
 | 2 | adapter ファイルの所在 | **クライアントから運ぶ** (reader 1 ファイル + `viewer_import.py` + `run_adapter.py` の 3 テキスト)。peer 側常設 (名前で解決) は採らない — §4.13.1 自身の文言・#148 の「同名別バイトの静かな分岐」・配備コスト・provenance の 4 点で負ける (§3) |
-| 3 | プロトコル | **VERSION 12、FRAMING の版上げ** (7/8/11 と同種)。新 op `MSG_READER_RUN = 8`。META/TILE/MEASURE は**末尾追記の reader トレーラ** (`[str key][u32 node]`、MEASURE は `MRF_READER` ビットで宣言)。client は **送る前に** HELLO の数で断る (`readerTooOldText`) — v11 peer はトレーラを黙って読まないので、#124 型の「正しいラベルの下の違う画素」が起きうるため (§4.2) |
+| 3 | プロトコル | **FRAMING の版上げ** (7/8/11 と同種)。新 op `MSG_READER_RUN = 8`。META/TILE/MEASURE は**末尾追記のトレーラ** (`[str key][u32 node]`)。client は **送る前に** HELLO の数で断る (`readerTooOldText` / `measureKeyedTooOldText`) — 古い peer はトレーラを黙って読まないので、#124 型の「正しいラベルの下の違う画素」が起きうるため (§4.2)。**出荷は 1 版ではなく 3 版**: 12 = RUN と META/TILE のトレーラ (PR #218)、13 = `MSG_NPZ_SCAN` (PR #221)、**14 = MEASURE の鍵トレーラ**。MEASURE のビットの綴りは **`MRF_KEYED`** (値 2) —— 鍵は materialisation を指し、reader はその出自の 1 つに過ぎない。以下 §4 が現在形で書く「VERSION 12 / `MRF_READER`」は**当初案の綴り**で、確定は §8 stage 3 注 ② と stage 5 注 ①、台帳は §9 |
 | 4 | MSG_TILE の原則 | **そのまま成り立つ**。reader が peer で materialise した画素の「source dtype」は **reader が宣言した dtype** (harness の 9 種、`b1` は serve.cpp :267 の既存表どおり `DT_U8`)。ファイルバイトも変換結果全体も回線を渡らない — 渡るのはヘッダ (テキスト) と間引きタイルと測定結果だけ (§4.3) |
 | 5 | #44 との接続 | peer 上で `run_adapter.py --stream → ファイル` (凍結済みの枠付き v1、0.268 s/151 MB)。**キャッシュファイルがそのまま配布面**: `.vstream` の blob は C-order 連続なので、`openRaw` (serve.cpp :568) と同じ「offset + stride の ServedFile」で `readNpyRegion` が無改造で読む。キャッシュ鍵の mtime/size は **peer の stat** (§5) |
 | 6 | 失敗の報告 | RUN 応答は `adapter::Run` が分けている 4 事実 (started / timedOut / exit / stderr) を**そのまま**運ぶ。文面は `readerFinish` (session.inc :1631) の文を関数に括って両経路で共有し、**機械名を足す** — 「どの python が無いのか」は machine を言わなければ直せない (§6) |
@@ -155,7 +155,7 @@ handler が意図的に転送非依存 (serve.cpp :641「same requests, same rep
 
 ---
 
-## 4. プロトコル — VERSION 12
+## 4. プロトコル — VERSION 12 (当初案の版番号。出荷は 12/13/14 — §0 の 3)
 
 ### 4.1 版の性格と両向きの拒否
 
@@ -218,6 +218,11 @@ MSG_META / MSG_TILE               既存の全フィールドの後ろに追記 
 
 MSG_MEASURE                       MeasureReqHead.flags に MRF_READER = 2。
   ... rois の後ろ (MRF_RAW_RECIPE :2482 と同じ位置規律) に [str key][u32 node]
+                                  (出荷時の綴りは MRF_KEYED、値 2 のまま。版は
+                                   14 —— stage 5 注 ①。node は「peer が発行した
+                                   その配列の番号」であって木の index ではない:
+                                   reader では両者が一致し、container では
+                                   SCAN が出した ZIP entry である — §10.5)
 ```
 
 鍵を **peer が発行し client は引用するだけ**にする理由: 鍵の再計算実装が 2 つ
