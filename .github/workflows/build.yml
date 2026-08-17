@@ -277,6 +277,12 @@ jobs:
           # the picture formats this viewer reads, so core/imagefile.h and the
           # readers behind it are part of what a peer IS now.
           #
+          # ...and core/adapter.cpp since issue #180: the peer RUNS the reader
+          # harness (MSG_READER_RUN), so starting a process and finding a python
+          # with numpy are things a peer does. That file was written free of the
+          # viewer's state precisely so both binaries could link it rather than
+          # keep two answers to "which interpreter".
+          #
           # VIEWER_NO_LIBRAW is the ONE reader still left out, and its reason is
           # a licence and not a build: LibRaw is CDDL-1.0 and this binary
           # installs itself onto someone else's machine. Refused by name on
@@ -295,6 +301,7 @@ jobs:
               -Ibuild/generated \
               -isystem /tmp/exr/include/OpenEXR -isystem /tmp/exr/include/Imath \
               core/serve_main.cpp core/serve.cpp core/plugin_host.cpp core/version.cpp \
+              core/adapter.cpp \
               core/imagefile.cpp core/tiffread.cpp core/y4mread.cpp core/rawread.cpp \
               core/exrread.cpp \
               /tmp/miniz.o /tmp/stb.o \

@@ -487,15 +487,26 @@
         // a reader for real ("choose a reader") and must not start saying a door
         // is missing - the missing door is the peer's.
         //
-        // The wording changes the day readers do run there (stage 2 of that
-        // design): it becomes `choose a reader`, the same way F4d's sentence is
-        // written to be replaced when the wire can carry a recipe. This check is
-        // where that replacement gets noticed.
+        // ...AND THE DAY CAME. Stage 1-2 of that design landed (protocol 12,
+        // MSG_READER_RUN, --serve-readers), so this check is now the other way
+        // round: the refusal must NOT say the door is missing, and it must make
+        // the local door's own offer - `choose a reader` - because a reader
+        // sent to the peer is a thing that happens now. The replacement is
+        // noticed here exactly as the note above promised it would be.
+        //
+        // What did NOT change is the pair of facts on either side of it: what
+        // the peer does serve is still named (an addition, never a swap), and
+        // the local refusal is still the local one.
         {
             const std::string why  = peerRefusalFor("capture.unknownfmt");
             const std::string here = viewerRefusalFor("capture.unknownfmt");
             const bool decided  = has(why, "reader") && has(why, "4.13.1");
-            const bool unbuilt  = has(why, "not built yet");
+            // The door is BUILT: the sentence offers it, names the flag whose
+            // absence is the one remaining refusal, and no longer says
+            // "not built yet" anywhere.
+            const bool built    = has(why, "choose a reader") &&
+                                  has(why, "--serve-readers") &&
+                                  !has(why, "not built yet");
             const bool wayOut   = has(why, "copy the file here");
             // ...and the Browse row is the surface an operator reads it on, so
             // it has to be the same sentence and not a second one (F3/F3b's
@@ -504,17 +515,17 @@
             const bool localIntact = has(here, "choose a reader") &&
                                      !has(here, "not built yet");
             fprintf(stderr, "fmtgateselftest:   reader ruling in the refusal: named=%d "
-                            "unbuilt=%d wayOut=%d panelSame=%d localIntact=%d\n"
+                            "built=%d wayOut=%d panelSame=%d localIntact=%d\n"
                             "fmtgateselftest:   fall-through reason: \"%s\"\n",
-                    decided ? 1 : 0, unbuilt ? 1 : 0, wayOut ? 1 : 0,
+                    decided ? 1 : 0, built ? 1 : 0, wayOut ? 1 : 0,
                     panelSame ? 1 : 0, localIntact ? 1 : 0, why.c_str());
             // anti-vacuity: the sentence is an ADDITION - what the peer does
             // serve is still named (F3b reads that half)
             check(!why.empty() && has(why, "the peer serves"),
                   "F4d2 the fall-through still names what the peer does serve");
             check(decided, "F4d2 ...and names the ruling that readers run on the peer");
-            check(unbuilt, "F4d2 ...and that the door is not built yet, not undecided");
-            check(wayOut,  "F4d2 ...with the way out that works today: copy it here");
+            check(built,   "F4d2 ...and OFFERS that door now that it is built (#180 stage 2)");
+            check(wayOut,  "F4d2 ...with the other way out kept: copy it here");
             check(panelSame, "F4d2 ...and the Browse row shows that same sentence");
             check(localIntact, "F4d2 the LOCAL refusal is untouched: it offers a reader");
         }

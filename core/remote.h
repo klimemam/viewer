@@ -130,6 +130,30 @@ struct MeasureReq {
     int join = 0;                     // rp::SetJoin
 };
 
+// Which node of WHAT A READER RETURNED a META or TILE is about (protocol 12,
+// issue #180). The key is the peer's own opaque token - it is issued there,
+// quoted back here and never recomputed, because two implementations of a cache
+// key is two answers to "is this the same thing" (#71). It names a file inside
+// the peer's cache directory and carries no path, so it is not a second way for
+// a client to ask the peer to open something.
+struct ReaderRef {
+    std::string key;
+    int node = 0;              // index into the tree the reader declared
+};
+
+// What MSG_READER_RUN answered. Every field is a FACT the peer observed; the
+// sentences a person reads are written by the client from these, because the
+// peer does not know whose machine it is being called from and half the fixes
+// are on the other end (docs/remote-reader-design.md §6).
+struct ReaderRun {
+    int outcome = 0;              // rp::ReaderOutcome
+    std::string err;              // the peer's one line for outcome != 0
+    std::string stderrText;       // the harness's stderr, WHOLE, success or not
+    std::string provenance;       // "Python 3.11.4 (...), numpy 1.26.4"
+    std::string key;              // outcome 0 only: what to put in a ReaderRef
+    std::string header;           // outcome 0 only: the .vstream header verbatim
+};
+
 // One connection to one machine. Not thread-safe: requests are serialised by the
 // caller (the UI thread today, a prefetch thread later).
 class Session {
@@ -183,8 +207,14 @@ public:
     // guessed at - by this client when the peer is too old (rp::rawTooOldText),
     // by the peer otherwise. Passing one for a file that states its own shape
     // is refused too, at the peer, for the reason a dropped trailer always is.
+    // `rd` (optional) says the subject is not a file on the peer's disk at all
+    // but a node of what a READER produced there (protocol 12). `path` is then
+    // ignored and sent empty. Refused before it is sent when the peer predates
+    // 12, and that refusal is the sharpest of the four: an older peer does not
+    // fail to read the trailer, it never looks at it, opens the origin path
+    // natively and answers with pixels that are not the reader's.
     bool meta(const std::string& path, Meta& out, std::string& err, int read = 0,
-              const rp::RawWire* rw = nullptr);
+              const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
     // Region [x,y,w,h] of `frame`, decimated by `step`. Returns float samples
     // (converted from the source dtype) plus the decimated dimensions. The rect
     // and the frame index are coordinates INSIDE `read`, so it must be the same
@@ -197,9 +227,41 @@ public:
     bool tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
               std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
               std::string& err, int read = 0, rp::F32Loss* loss = nullptr,
-              const rp::RawWire* rw = nullptr);
+              const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
+    // The SAME request, stopping one step earlier: the samples exactly as the
+    // peer sent them, in the source dtype, with no narrowing to float32.
+    //
+    // It exists for the reader path and for one assertion (docs/
+    // remote-reader-design.md stage 2 R8): a reader's output opened locally and
+    // through a peer must be BIT-IDENTICAL. The local door hands the .vstream
+    // blob to loadNpyBuffer; the remote door has to hand it the same bytes, and
+    // a round trip through float32 and back is exactly what would make a u4
+    // above 2^24 come out differently at the two ends. So the reader fetch
+    // rebuilds a .npy around THESE bytes and goes through the same decoder.
+    bool tileBytes(const std::string& path, int frame, int x, int y, int w, int h, int step,
+                   std::vector<uint8_t>& raw, int& outW, int& outH, int& outCh,
+                   uint32_t& dtype, std::string& err, int read = 0,
+                   const rp::RawWire* rw = nullptr, const ReaderRef* rd = nullptr);
+    // Run a reader ON THE PEER, over `peerPath`, and get back the four facts
+    // adapter::Run separates plus the key and the header (protocol 12).
+    // `files` are the three texts rp::READER_RUN_FILES names, in that order:
+    // the user's reader, viewer_import.py and run_adapter.py. They are CARRIED
+    // rather than resolved by name over there, so the bytes that ran are the
+    // bytes the memo names (docs/remote-reader-design.md §3).
+    //
+    // Returns false only when the LINK failed; a reader that could not run is a
+    // true return with an outcome that says so.
+    bool readerRun(const std::string& peerPath, const std::string& func,
+                   const std::string files[3], ReaderRun& out, std::string& err);
     // run analysis where the data is; only the emitted results travel
     bool measure(const MeasureReq& q, MeasureResult& out, std::string& err);
+    // Start the peer with --serve-readers (the default). Turned OFF only by the
+    // test that has to observe a CLOSED gate: the flag is written by the side
+    // that starts the process, so "a peer without it" is not something a client
+    // can reach any other way. docs/remote-reader-design.md §2.2 is why the
+    // client writing it is not a contradiction - over ssh it is the exercise of
+    // a permission the user already has.
+    void setServeReaders(bool on) { serveReaders_ = on; }
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }
@@ -221,6 +283,11 @@ private:
     // it through to come back as "not a .npy file".
     bool recipeServable(const std::string& path, const rp::RawWire* rw,
                         std::string& err) const;
+    // "can this peer be asked about a reader's output at all" - the protocol-12
+    // gate, in one place for the reason the three above are, and refused here
+    // rather than at the peer because an older peer answers the request it
+    // thinks it was sent instead of refusing the one it was.
+    bool readerServable(const std::string& name, std::string& err) const;
     bool send(uint32_t type, const std::vector<uint8_t>& payload, std::string& err);
     bool recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& err);
 
@@ -229,6 +296,7 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int port_ = 0;
+    bool serveReaders_ = true;
     const std::atomic<bool>* abort_ = nullptr;
     double idleTimeout_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles

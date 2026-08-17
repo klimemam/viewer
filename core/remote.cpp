@@ -338,8 +338,16 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     p->idleTimeout = idleTimeout_;    // ...and a bounded one for the UI thread's
     impl_ = p;
     std::vector<std::string> argv;
+    // --serve-readers: docs/remote-reader-design.md §2. The peer's consent is
+    // "whoever started this process said so", and over ssh the person who
+    // started it is this user - who already has a shell there and could start
+    // python by hand. So the client writes the flag: not a new permission, the
+    // exercise of one already held. What the flag guards is the transport that
+    // does NOT work that way (core/serve.cpp's handler note), where the argv
+    // belongs to an operator and doing nothing leaves the gate shut.
     if (host.empty()) {
         argv = { exe, "--serve" };
+        if (serveReaders_) argv.push_back("--serve-readers");
     } else {
         // BatchMode: fail fast instead of hanging on a password prompt with no
         // terminal. ConnectTimeout/ServerAlive: a black-holed route or a dead
@@ -350,6 +358,7 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         argv.push_back(host);
         argv.push_back(exe);
         argv.push_back("--serve");
+        if (serveReaders_) argv.push_back("--serve-readers");
     }
     if (!spawn(*p, argv, err)) { stop(); return false; }
     alive_ = true;
@@ -620,13 +629,50 @@ bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
     return true;
 }
 
+// A reader's output needs a peer that ran the reader. Refused HERE, from the
+// number, and for the reason at rp::readerTooOldText: an older peer does not
+// refuse the trailer - it never reads it, opens the path it was given and
+// answers with real pixels under the reader's name.
+bool Session::readerServable(const std::string& name, std::string& err) const {
+    if (peerVersion_ >= 12) return true;
+    err = rp::readerTooOldText(peerVersion_, name);
+    return false;
+}
+
+// The optional blocks behind the reading, written the way the peer reads them
+// (rp::ReqTrailer). One place, because meta() and tile() have to agree byte for
+// byte about where a recipe stops and a key begins.
+static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
+                        const remote::ReaderRef* rd) {
+    if (peerVersion >= 12) {
+        uint32_t f = 0;
+        if (rw) f |= rp::RQ_RAW_RECIPE;
+        if (rd) f |= rp::RQ_READER;
+        w.u32(f);                          // ALWAYS, even 0: see rp::ReqTrailer
+        if (rw) w.blob(rw, sizeof *rw);
+        if (rd) { w.str(rd->key); w.u32((uint32_t)std::max(0, rd->node)); }
+        return;
+    }
+    // Protocol 11 and below: one optional block, read by "if bytes remain".
+    // A ReaderRef never reaches here - readerServable refused first.
+    if (rw && peerVersion >= 11) w.blob(rw, sizeof *rw);
+}
+
+// What a request is ABOUT, at the door. A reader's node is not a file, so the
+// three file gates do not apply to it and the path is not sent at all: a key
+// names one entry in the peer's own cache and must not become a second way to
+// ask the peer to open a path.
 bool Session::meta(const std::string& path, Meta& out, std::string& err, int read,
-                   const rp::RawWire* rw) {
-    if (!readServable(read, err) || !formatServable(path, err) ||
-        !recipeServable(path, rw, err)) return false;
-    W w; w.str(serverPath(path));
+                   const rp::RawWire* rw, const ReaderRef* rd) {
+    if (rd) {
+        if (!readerServable(path, err)) return false;
+    } else if (!readServable(read, err) || !formatServable(path, err) ||
+               !recipeServable(path, rw, err)) {
+        return false;
+    }
+    W w; w.str(rd ? std::string() : serverPath(path));
     if (peerVersion_ >= 9) w.u32((uint32_t)read);
-    if (rw && peerVersion_ >= 11) w.blob(rw, sizeof *rw);
+    putTrailers(w, peerVersion_, rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -717,14 +763,18 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
     return (uint64_t)repW * repH * repCh * rp::dtypeSize(dtype) == (uint64_t)rawBytes;
 }
 
-bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
-                   std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
-                   std::string& err, int read, rp::F32Loss* loss,
-                   const rp::RawWire* rw) {
-    if (!readServable(read, err) || !formatServable(path, err) ||
-        !recipeServable(path, rw, err)) return false;
+bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w, int h,
+                        int step, std::vector<uint8_t>& raw, int& outW, int& outH,
+                        int& outCh, uint32_t& dtype, std::string& err, int read,
+                        const rp::RawWire* rw, const ReaderRef* rd) {
+    if (rd) {
+        if (!readerServable(path, err)) return false;
+    } else if (!readServable(read, err) || !formatServable(path, err) ||
+               !recipeServable(path, rw, err)) {
+        return false;
+    }
     W wr;
-    wr.str(serverPath(path));
+    wr.str(rd ? std::string() : serverPath(path));
     rp::TileReq q{};
     q.frame = (uint32_t)std::max(0, frame);
     q.x = (uint32_t)std::max(0, x); q.y = (uint32_t)std::max(0, y);
@@ -734,9 +784,9 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     wr.blob(&q, sizeof q);
     if (peerVersion_ >= 9) wr.u32((uint32_t)read);
     // Appended after the reading, in the order handleTile reads them. A peer
-    // below 11 never gets one - recipeServable refused above, so this is the
-    // v11 path only and the older wire does not move by a byte.
-    if (rw && peerVersion_ >= 11) wr.blob(rw, sizeof *rw);
+    // below 11 never gets a recipe and one below 12 never gets a reader key -
+    // the gates above refused first, so the older wire does not move by a byte.
+    putTrailers(wr, peerVersion_, rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_TILE, wr.b, err) || !recv(type, reply, err)) return false;
@@ -754,7 +804,6 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
     }
     const uint8_t* blob = reply.data() + r.rd;
     size_t blobBytes = reply.size() - r.rd;
-    std::vector<uint8_t> raw;
     if (rep.flags & 1) {
         raw.resize(rep.rawBytes);
         mz_ulong got = rep.rawBytes;
@@ -768,8 +817,48 @@ bool Session::tile(const std::string& path, int frame, int x, int y, int w, int 
         raw.assign(blob, blob + rep.rawBytes);
     }
     outW = (int)rep.w; outH = (int)rep.h; outCh = (int)rep.ch;
-    dtype = rp::dtypeName(rep.dtype);
-    toFloat(raw.data(), rep.dtype, (size_t)rep.w * rep.h * rep.ch, out, loss);
+    dtype = rep.dtype;
+    return true;
+}
+
+bool Session::tile(const std::string& path, int frame, int x, int y, int w, int h, int step,
+                   std::vector<float>& out, int& outW, int& outH, int& outCh, std::string& dtype,
+                   std::string& err, int read, rp::F32Loss* loss,
+                   const rp::RawWire* rw, const ReaderRef* rd) {
+    std::vector<uint8_t> raw;
+    uint32_t dt = 0;
+    if (!tileBytes(path, frame, x, y, w, h, step, raw, outW, outH, outCh, dt, err,
+                   read, rw, rd))
+        return false;
+    dtype = rp::dtypeName(dt);
+    toFloat(raw.data(), dt, (size_t)outW * outH * outCh, out, loss);
+    return true;
+}
+
+bool Session::readerRun(const std::string& peerPath, const std::string& func,
+                        const std::string files[3], ReaderRun& out, std::string& err) {
+    out = ReaderRun{};
+    if (!readerServable(peerPath, err)) return false;
+    W w;
+    w.str(serverPath(peerPath));
+    w.str(func);
+    w.u32(3);
+    for (int i = 0; i < 3; i++) {
+        w.str(rp::READER_RUN_FILES[i]);
+        w.str(files[i]);
+    }
+    std::vector<uint8_t> reply;
+    uint32_t type = 0;
+    if (!send(rp::MSG_READER_RUN, w.b, err) || !recv(type, reply, err)) return false;
+    R r(reply);
+    if (type != rp::MSG_OK) { r.str(err); return false; }
+    uint32_t outcome = 0;
+    if (!r.u32(outcome) || !r.str(out.err) || !r.str(out.stderrText) ||
+        !r.str(out.provenance) || !r.str(out.key) || !r.str(out.header)) {
+        err = "bad READER_RUN reply";
+        return false;
+    }
+    out.outcome = (int)outcome;
     return true;
 }
 

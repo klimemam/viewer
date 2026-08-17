@@ -610,8 +610,13 @@ endif()
 #
 # core/rawread.cpp is here for its SNIFF and nothing else (VIEWER_NO_LIBRAW
 # below). Every other reader is here whole.
+# core/adapter.cpp is here since issue #180: the peer RUNS the reader harness
+# now, and that file was built for this - "everything here is free of the
+# viewer's state" (core/adapter.h) is what lets a headless binary link the same
+# process-starting, Python-probing code the GUI uses instead of a second copy
+# that would find a different interpreter.
 add_executable(viewer-serve core/serve_main.cpp core/serve.cpp core/plugin_host.cpp
-                            core/version.cpp
+                            core/version.cpp core/adapter.cpp
                             core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
                             core/y4mread.cpp core/rawread.cpp
                             ${miniz_SOURCE_DIR}/miniz.c)
@@ -1356,6 +1361,21 @@ viewer_selftest(watch NOGL --watch-selftest tools/testdata)
 # longer necessarily .npy and R12 is what holds that to account.
 viewer_selftest(rwatch NOGL --rwatch-selftest tools/testdata
                        --remote-exe $<TARGET_FILE:viewer-serve>)
+
+# A READER sent to the peer and run there (issue #180, docs/
+# remote-reader-design.md stages 1 and 2). The gate that is closed unless the
+# peer's own launcher opened it, the cache that makes a second run not start
+# Python, the four failures each as its own sentence, and - stage 2's
+# acceptance condition - a document opened over the link whose pixels are
+# BIT-IDENTICAL to the same reader run locally.
+#
+# --remote-exe is the whole test, not decoration: with a local:// peer that is
+# THIS binary, "the reader ran in the peer's python" is unfalsifiable. It writes
+# its own fixtures (a 5-D .npy nothing native reads, and four readers) under a
+# scratch subdirectory of the given dir, and points the peer's cache at another
+# one through VIEWER_SERVE_CACHE.
+viewer_selftest(rreader NOGL --rreader-selftest tools/testdata
+                        --remote-exe $<TARGET_FILE:viewer-serve>)
 
 # ...and WHICH formats that walk, and the registry it keys off, actually reach:
 # one row per backend of core/imagefile.h plus the members of a viewer

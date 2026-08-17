@@ -488,24 +488,33 @@ std::string peerRefusal(const std::string& path) {
     // machine, so the door is a reader (docs/input-adapters.md §4.13), and what
     // this refusal owes the operator is the state of that door. It was DECIDED
     // on 2026-08-03 (§4.13.1: "adapter は peer 側で走る" - the file is where the
-    // data is, and shipping raw bytes here to convert them defeats the tool)
-    // and it is not built. Saying nothing made "decided and unbuilt" read
-    // exactly like "never considered" - verify-matrix G11, issue #180 ruling B,
-    // whose stage 0 (docs/remote-reader-design.md §8) is this sentence.
+    // data is, and shipping raw bytes here to convert them defeats the tool),
+    // and until issue #180 stage 1-2 it was not built. Saying nothing made
+    // "decided and unbuilt" read exactly like "never considered" - which was
+    // verify-matrix G11, and what stage 0 fixed by naming the decision.
     //
-    // Same discipline as the headerless branch above: the wording changes the
-    // day the door opens (that design's stage 2), when it becomes the local
-    // door's own `choose a reader` - a refusal is allowed to describe a
-    // decision, but never to imply a mechanism that is not there (§7: the dim
-    // row must not hint at readers waiting on the peer - there are none, and
-    // none are looked for by name).
+    // STAGE 2 CHANGED THIS SENTENCE, exactly as stage 0 said it would. The door
+    // is open: MSG_READER_RUN carries the reader there, it runs in the peer's
+    // python, and META / TILE bring back the pixels a screen needs. So the line
+    // is now the local door's own offer - `choose a reader` - and the Browse
+    // row that shows it leads to the Reader panel (core/app/open_dispatch.inc
+    // openRemote), which is the difference between describing a mechanism and
+    // having one.
+    //
+    // The --serve-readers clause is not a hedge, it is the second half of the
+    // truth (docs/remote-reader-design.md §2): the peer's own launcher decides
+    // whether code sent from here may run there, and a person told to choose a
+    // reader without being told that would meet the gate's refusal with no idea
+    // what it was about. It NAMES the flag rather than promising an outcome -
+    // §7's rule that a dim row must not imply readers waiting on the peer still
+    // holds: none are looked for by name over there, and none ever will be.
     return "the peer serves " + servedList() +
            "\n  this link carries those formats only - copy the file to this "
            "machine to open it with everything else this viewer reads"
-           "\n  a reader could read it, but readers do not yet run on the peer - "
-           "the decision (docs/input-adapters.md §4.13.1) is that they run where "
-           "the file lives, and that door is not built yet"
-           "\n  copy the file here to use a reader today";
+           "\n  choose a reader: it is sent to the peer and runs where the file "
+           "lives (docs/input-adapters.md §4.13.1), and only the pixels a screen "
+           "needs come back - if that peer was started with --serve-readers"
+           "\n  copy the file here to use a reader on this machine instead";
 }
 
 bool decode(const std::string& path, const std::vector<uint8_t>& bytes,

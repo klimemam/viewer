@@ -28,6 +28,7 @@
 #include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
 #include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
+#include "vstream.h"                 // the reader stream's tree check, shared with the peer
 #include "setfold.h"                 // the fold half of a set analysis, shared with the peer
 #include "app_icon.h"
 #include "window_frame.h"
@@ -658,7 +659,15 @@ int main(int argc, char** argv) {
     // no GL, no socket - it answers pixel requests on stdin/stdout. It must be
     // handled before anything touches GLFW.
     for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--serve")) return rp::runServeMode();
+        if (!strcmp(argv[i], "--serve")) {
+            // ...and the gate the launcher opened, read out of the same argv
+            // (docs/remote-reader-design.md §2). Same flag, same default, same
+            // meaning as core/serve_main.cpp: which binary is being the peer is
+            // an installation detail and must not change what it consents to.
+            for (int k = 1; k < argc; k++)
+                if (!strcmp(argv[k], "--serve-readers")) rp::setServeReaders(true);
+            return rp::runServeMode();
+        }
     {   // --remote-exe must reach the selftest too, or "test the standalone peer"
         // silently tests this binary against itself
         const char* rexe = nullptr;
@@ -1064,6 +1073,12 @@ int main(int argc, char** argv) {
     // needs the standalone viewer-serve binary, or "the peer grouped that
     // folder" cannot be told from "I did".
     #include "selftest/rwatch.inc"
+
+    // ...and a READER on the other side of the link (issue #180). Its own file
+    // for rwatch's reason exactly: it needs the standalone viewer-serve binary,
+    // because "the reader ran in the PEER's python" cannot be told from "it ran
+    // in mine" by a client talking to itself - and that IS the claim.
+    #include "selftest/rreader.inc"
 
     #include "selftest/media.inc"
 

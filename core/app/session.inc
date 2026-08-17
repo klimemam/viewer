@@ -1512,6 +1512,34 @@ static std::string adapterCacheDir() {
     return d.u8string();
 }
 
+// ---- the four sentences a run that did not work produces -------------------
+//
+// Pulled out of readerFinish when the SAME four became reachable from a peer
+// (issue #180, docs/remote-reader-design.md §6). `where` is "" for this machine
+// and " on <host>" for a peer, and it is the only difference: the same failure
+// must not get two sentences depending on which end hit it, and naming the
+// machine is what makes the remote ones actionable at all - "which python is
+// missing" is unanswerable without it.
+//
+// The FIX differs and is passed in for that reason: locally it is this
+// program's Settings, on a peer it is VIEWER_SERVE_PYTHON where viewer-serve
+// runs. Sending someone to a settings window on the wrong machine is worse than
+// saying nothing.
+static std::string readerNoPythonText(const std::string& where, const std::string& why,
+                                      const std::string& fix) {
+    return "no Python to run the reader with" + where + ": " + why + " (" + fix + ")";
+}
+static std::string readerNotStartedText(const std::string& where, const std::string& fail) {
+    return "could not start the reader" + where + ": " + fail;
+}
+static std::string readerTimedOutText(const std::string& where) {
+    return "the reader did not finish" + where + " (stopped after 5 minutes)";
+}
+static std::string readerUnreadableText(const std::string& where, const std::string& detail) {
+    return "the reader ran" + where + " and returned, but the viewer could not read "
+           "what it produced:\n\n" + detail;
+}
+
 // Run `spec` over `src` and open what it wrote. Returns "" on success; on
 // failure the string is the adapter's OWN message wherever there is one (§4.9),
 // because a message we invent in its place is a message the author cannot fix.
@@ -1555,8 +1583,8 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     std::string why;
     std::string py = adapter::findPython(app.pythonExe, why);
     if (py.empty())
-        return "no Python to run the reader with: " + why +
-               " (set one in Settings, or install numpy for the one you have)";
+        return readerNoPythonText("", why,
+                                  "set one in Settings, or install numpy for the one you have");
 
     std::string cacheDir = adapterCacheDir();
     std::string cached;
@@ -1647,15 +1675,14 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
         return "the reader was stopped";
     }
     if (!r.started) {
-        app.readerLastOut = "could not start the reader: " + r.fail + "\n" +
-                            adapter::showCommand(argv);
-        return "could not start the reader: " + r.fail + "\n  " + adapter::showCommand(argv);
+        const std::string s = readerNotStartedText("", r.fail);
+        app.readerLastOut = s + "\n" + adapter::showCommand(argv);
+        return s + "\n  " + adapter::showCommand(argv);
     }
     if (r.timedOut) {
-        app.readerLastOut = "the reader did not finish (stopped after 5 minutes)\n" +
-                            adapter::showCommand(argv) + "\n" + r.err;
-        return "the reader did not finish (stopped after 5 minutes)\n  " +
-               adapter::showCommand(argv);
+        const std::string s = readerTimedOutText("");
+        app.readerLastOut = s + "\n" + adapter::showCommand(argv) + "\n" + r.err;
+        return s + "\n  " + adapter::showCommand(argv);
     }
     if (r.exit != 0) {
         // The adapter's exception message, unchanged. run_adapter.py has already
@@ -1680,8 +1707,7 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
         // above fills readerLastOut; this one returned without doing it, so the
         // panel said "refused it" over a blank box and Copy copied nothing.
         // That is also the path a first reader most often takes.
-        app.readerLastOut = "the reader ran and returned, but the viewer could not read "
-                            "what it produced:\n\n" + lerr +
+        app.readerLastOut = readerUnreadableText("", lerr) +
                             "\n\nthe reader itself did not fail - check what load() returns "
                             "(the layer type, the shape, the dtype).\n" +
                             adapter::showCommand(argv);
@@ -1721,10 +1747,65 @@ static std::string readerTail(const std::string& path) {
     return s;
 }
 
+// The peer half of the reader door, defined in open_dispatch.inc (it needs
+// ensureUiSession and the tree builder). Declared here because startReader and
+// pollReader are the two ends of ONE job and the panel must not learn which
+// machine a reader is running on - the difference is a branch, not a mode.
+static bool isRemoteUrl(const std::string& s);
+static std::string remoteReaderPrepare(const std::string& url, const std::string& specIn,
+                                       std::string& spec, std::string& host,
+                                       std::string& rpath, int& port, std::string files[3]);
+static std::string remoteReaderLand(const std::string& url, const std::string& spec,
+                                    const std::string& host, const remote::ReaderRun& run);
+
 // Start a reader without waiting for it. The panel shows how long it has been
 // running, what it has printed so far, and a Stop.
 static void startReader(const std::string& src, const std::string& spec) {
     if (app.rdJob) { toast("a reader is already running", true); return; }
+    if (isRemoteUrl(src)) {
+        // A REMOTE run, and the thread opens a session of its OWN. Not
+        // app.uiSession, for that session's two documented reasons: a 300 s
+        // round trip would hold the UI's frame, and two threads framing
+        // requests into one ssh stdin desynchronise the stream permanently.
+        app.readerRan = true;
+        app.readerLastOk = false;
+        app.readerLastSpec = spec;
+        app.readerLastOut.clear();
+        auto j = std::unique_ptr<App::ReaderJob>(new App::ReaderJob());
+        std::string rpath;
+        std::string e = remoteReaderPrepare(src, spec, j->spec, j->host, rpath, j->port,
+                                            j->files);
+        if (!e.empty()) { app.readerLastOut = e; toast(e, true); return; }
+        j->remote = true;
+        j->src = rpath;
+        j->url = src;
+        j->startedAt = nowSec();
+        app.readerLastOut = "running " + baseName(readerFileOf(j->spec)) + " on " +
+                            (j->host.empty() ? std::string("the local peer") : j->host) +
+                            " ...\n";
+        app.rdJob = std::move(j);
+        App::ReaderJob* p = app.rdJob.get();
+        const std::string exe = (p->host.empty() && app.remoteExe.empty())
+                                    ? app.exePath
+                                    : (app.remoteExe.empty()
+                                           ? std::string(REMOTE_HOME) + "/viewer-serve"
+                                           : app.remoteExe);
+        p->th = std::thread([p, exe]() {
+            remote::Session s;
+            s.setAbort(&p->cancel);
+            std::string serr;
+            if (!s.startOn(p->host, p->port, exe, serr)) {
+                p->rok = false;
+                p->rerr = "remote: " + serr;
+            } else {
+                p->rok = s.readerRun(p->src, readerFuncOf(p->spec), p->files, p->rrun,
+                                     p->rerr);
+            }
+            s.stop();
+            p->done.store(true);
+        });
+        return;
+    }
     app.rdJob.reset(new App::ReaderJob());
     std::string e = openWithReader(src, spec, true, app.rdJob.get());
     // A cache hit, or a failure before Python was reached, finishes with no
@@ -1740,6 +1821,25 @@ static void startReader(const std::string& src, const std::string& spec) {
 static void pollReader() {
     if (!app.rdJob) return;
     App::ReaderJob* j = app.rdJob.get();
+    if (j->remote) {
+        // No tail: a RUN is ONE round trip, so the harness's stderr arrives
+        // whole at the end (§6's named v1 limit). The panel says what machine
+        // it is waiting on, and the timer beside it is the progress.
+        if (!j->done.load()) return;
+        j->th.join();
+        const std::string url = j->url, spec = j->spec, host = j->host;
+        const bool rok = j->rok;
+        const std::string rerr = j->rerr;
+        const remote::ReaderRun run = j->rrun;
+        app.rdJob.reset();
+        // The landing is on THIS thread and through app.uiSession, because it
+        // builds documents and touches GL - the same split the local half has
+        // between its worker and readerFinish.
+        std::string e = rok ? remoteReaderLand(url, spec, host, run) : rerr;
+        if (!rok) app.readerLastOut = rerr;
+        if (!e.empty()) toast(e, true);
+        return;
+    }
     if (!j->done.load()) {
         // errFile only: outFile is the payload, and tailing binary into a
         // text panel would show the pixels as mojibake.
