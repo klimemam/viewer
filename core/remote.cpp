@@ -929,6 +929,43 @@ bool Session::npzScan(const std::string& path, NpzScan& out, std::string& err) {
 
 bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err) {
     if (peerVersion_ < 2) { err = "the remote peer is too old for MEASURE (update viewer-serve)"; return false; }
+    // A subject that is one array inside a materialisation (protocol 14). The
+    // gate is HERE and not at the peer for this header's sharpest reason: a v13
+    // peer never reads the key, and a request that also carried an origin path
+    // would come back as a real statistic over the whole container. So the
+    // client refuses from the number, and sends no path when it does send.
+    if (q.hasKeyed) {
+        if (peerVersion_ < 14) { err = rp::measureKeyedTooOldText(peerVersion_); return false; }
+        // Two subjects is not a request. A recipe declares the geometry of a
+        // FILE, and what a reader or a container materialised declares its own;
+        // the peer refuses the pair for META and TILE in the same words, and
+        // refusing it here as well keeps the client from ever writing it.
+        if (q.hasRecipe) {
+            err = "a raw recipe does not apply to an array inside a materialisation";
+            return false;
+        }
+        // ...and two subjects is not a request either. The wire cannot say it
+        // (nPaths goes to 0 below), so a caller that filled both would have had
+        // its file list SILENTLY DROPPED - which is the shape of bug that looks
+        // like a correct answer to a question nobody asked. The peer refuses
+        // this pair in these words; so does this end, before it is written.
+        if (!q.paths.empty() || !q.roles.empty()) {
+            err = "a keyed measurement addresses one array, not a list of files";
+            return false;
+        }
+        // The ops whose grammar cannot say "this one array". A set names
+        // several stacks and the plugin ops name a file in the sentences they
+        // write about it; both are refused BY NAME rather than measured over
+        // some other bytes. The measurement that IS carried is the stack
+        // aggregate, which is what a document from a peer is opened to get.
+        if (q.op != rp::MOP_TEMPORAL_STATS && q.op != rp::MOP_FRAME_ROI_STATS) {
+            err = "this measurement addresses files, and these pixels are one array "
+                  "inside something the peer materialised - so it cannot be run over "
+                  "there yet. The temporal and per-frame statistics can; anything "
+                  "else runs here, over the frames as they arrive.";
+            return false;
+        }
+    }
     // MEASURE is the half #148 B exists for ("measure where the data is"), so
     // it gets the format gate too - and it gets it on EVERY path, because one
     // path per stack is what a set fold sends. A peer that could show a TIFF
@@ -997,12 +1034,20 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
         head.nPaths = (uint32_t)total;
     }
     if (q.hasRecipe) head.flags |= rp::MRF_RAW_RECIPE;
+    // ...and the subject that is not a path. nPaths goes to 0 and NO string is
+    // written: the key names an entry in the peer's own cache, and a request
+    // that also named a file would be asking two questions at once (and would
+    // be answerable, wrongly, by a peer that reads only the first).
+    if (q.hasKeyed) { head.flags |= rp::MRF_KEYED; head.nPaths = 0; }
     w.blob(&head, sizeof head);
-    if (q.op == rp::MOP_SET_FOLD) {
-        for (const auto& r : q.roles)
-            for (const auto& p : r.paths) w.str(serverPath(p));
-    } else {
-        for (const auto& p : q.paths) w.str(serverPath(p));
+    // A keyed request writes no path at all - its subject is the trailer.
+    if (!q.hasKeyed) {
+        if (q.op == rp::MOP_SET_FOLD) {
+            for (const auto& r : q.roles)
+                for (const auto& p : r.paths) w.str(serverPath(p));
+        } else {
+            for (const auto& p : q.paths) w.str(serverPath(p));
+        }
     }
     w.str(q.analyzer);
     w.str(q.params);
@@ -1014,6 +1059,13 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     // from, and declared by the head's bit rather than by "bytes remain",
     // because two other blocks already live back here.
     if (q.hasRecipe) w.blob(&q.recipe, sizeof q.recipe);
+    // ...and the key behind it, in BIT ORDER, which is the same rule the META /
+    // TILE trailer keeps (rp::ReqTrailer). Two optional blocks and one "if
+    // bytes remain" is how a key gets read as a geometry.
+    if (q.hasKeyed) {
+        w.str(q.keyed.key);
+        w.u32((uint32_t)std::max(0, q.keyed.node));
+    }
     // the parity block, last, so that the three older ops send the same bytes
     // they always sent (remote_proto.h)
     if (q.op == rp::MOP_PLUGIN_ANALYZE) {

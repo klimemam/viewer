@@ -283,7 +283,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
 | G10 | 間引かれた doc の crop が復元で黙って落ちる | **済** PR #177 — 試験 browse restore-wait |
-| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **stage 0 済** PR #211 — 拒否が判断を言う。試験 F4d2。実装 (stage 1〜5) は `docs/remote-reader-design.md`、#180 は開いたまま |
+| G11 | §4.13.1「adapter は peer で走る」が未実装かつ未拒否 | **全段済** PR #211 / #218 / #219 / #221 / 本 PR — 拒否が判断を言い (F4d2)、reader が peer で走り (protocol 12)、木も渡り (13)、測定も向こうで走る (14)。試験 `--rreader-selftest` / `--rnpz-selftest` / `--rmeasure-selftest`。設計は `docs/remote-reader-design.md` |
 
 ---
 
@@ -647,7 +647,7 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 
 ---
 
-### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **stage 0-2 済 (戸が開いた)**
+### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **全段済 (戸が開き、測定も向こうで走る)**
 
 **どこ。** `docs/input-adapters.md §4.13.1` は明確に決めている——
 「データが向こうにあるのに adapter を手元で走らせると生ファイルを転送してから
@@ -699,8 +699,25 @@ stack を個別に指し、conditions・名前・単位がローカル実行と�
 `peerServes` には入らない (1クリックプレビューの門は据え置き)。試験は
 `--rnpz-selftest` (R14〜R17) と `fmtgate` **F4g** (R18)。
 
-**残り。** stage 4 (memo / session 復元)、stage 5 (MEASURE) は未着手で、#180 は
-開いたままである。
+**stage 4 済 (2026-08-17)。** memo / session 復元の remote 版。memo (url 鍵) が
+引ければ復元が peer 側で reader を走らせ直す——ただし RUN キャッシュが答えるので
+Python はどちらのマシンでも起動しない。memo が無ければ `readerhint` を**名指す
+だけ**で、要求すら線に出ない (#179 裁定 C はリンクを越えても同じ)。試験は
+`--rreader-selftest` V25p-r0〜r2d。
+
+**stage 5 済 (2026-08-17)。** protocol **14**。MEASURE がファイルしか名指せなかった
+最後の穴を塞ぐ——`MeasureReqHead::flags` の `MRF_KEYED` + rois の後ろの
+`[str key][u32 node]` で、**reader の node も .npz の member も**「データのある側」で
+集計される (`nPaths` は 0 = パスは一切送らない)。着地は
+`FrameSource::init` が `openKeyed` を通るだけで、σ_t/σ_fpn の算術は 1 文字も
+動いていない。σ_t は独立 f64 参照と一致し、同じ stack をローカルで開いて測った値と
+**ビット一致**する。v13 peer へは送信前に断る (`rp::measureKeyedTooOldText`)——
+v13 の実際の答えは "bad MEASURE header" で、それは請求が壊れているという文であって
+peer が古いという文ではない。試験は `--rmeasure-selftest`
+(`core/selftest/rmeasure.inc`, M1〜M5f、`--remote-exe` で本物の `viewer-serve`)。
+
+**これで G11 は閉じる**——決定 (§4.13.1) は実装され、拒否文はどれも今日の事実を
+言う。#180 のクローズ自体は親の判断。
 
 ---
 

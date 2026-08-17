@@ -161,7 +161,7 @@
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "R1a the peer speaks the protocol this build does (12)");
+                  "R1a the peer speaks the protocol this build does (14)");
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);
@@ -346,7 +346,10 @@
             // A key that names nothing is a refusal too, and not a crash.
             remote::KeyedRef gone{ "0000000000000000", 0 };
             std::string gerr;
-            check(!ses.meta(url, m, gerr, 0, nullptr, &gone) && has(gerr, "reader key"),
+            // ...and the sentence names the MATERIALISATION, not a reader: an
+            // unresolvable key has no knowable issuer (rp::keyGoneText), and
+            // "run the reader again" was correct for half of them.
+            check(!ses.meta(url, m, gerr, 0, nullptr, &gone) && gerr == rp::keyGoneText(),
                   "R7g a key the peer has never issued is refused by name");
             ses.stop();
             std::filesystem::remove(pathFromUtf8(path), ec);

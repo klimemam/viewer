@@ -448,11 +448,34 @@ std::string makeRemoteUrl(const std::string& host, const std::string& path, int 
     return "ssh://" + host + (port > 0 ? ":" + std::to_string(port) : "") + p;
 }
 
+// This stack's subject when it is ONE ARRAY INSIDE A MATERIALISATION - a node
+// of what a reader produced on the peer, or a member of a container it listed
+// (protocol 12/13, measured since 14). It is read off the DOCUMENTS rather than
+// off SeqInfo because that is where the four fields live and are kept in step
+// (remoteTreeRefine writes them, rfInheritRead carries them to every sibling
+// frame): a stack whose head says "key k, node n" IS that array, and a second
+// copy of the answer on the stack row is a second thing to keep true.
+//
+// It is also what makes a reader's stack answerable at all. The documents a
+// tree lands as are built by vnzBuild, so their SeqInfo carries no remoteUrl -
+// nothing about the stack row says "these pixels are over there" - and without
+// this the one thing the link exists for would be the one thing that stack
+// could not do.
+static const FrameSource* stackKeyedSubject(int seqId) {
+    if (seqId == 0) return nullptr;
+    for (const auto& d : app.images)
+        if (d->seqId == seqId && d->src && !d->src->remoteKey.empty() &&
+            !d->src->remoteUrl.empty())
+            return d->src.get();
+    return nullptr;
+}
+
 // Does analysis of this stack run on the server? Yes for remote data unless the
 // user chose local-fetch. (Single-frame policy nuance lives in the Analysis
 // panel; this is the stack-aggregate decision.)
 static bool serverComputes(const App::SeqInfo& si) {
-    if (si.remoteUrl.empty() && si.remoteFiles.empty()) return false;   // local data
+    if (si.remoteUrl.empty() && si.remoteFiles.empty() && !stackKeyedSubject(si.id))
+        return false;                                                   // local data
     return app.procPolicy != App::PolLocalFetch;
 }
 
@@ -480,7 +503,18 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
     j.cfaType = si->cfaType; j.cfaPattern = si->cfaPattern;
-    if (!si->remoteFiles.empty()) {
+    // The subject, in the order that decides it. A KEY wins over both path
+    // forms and is not merely added to them: for a .npz member the url names
+    // the CONTAINER, so a request that also carried the path would have the
+    // peer measure the whole file - which is what it did before protocol 14,
+    // and it came back as "not a .npy file" rather than as a wrong number only
+    // because a container happens not to open as one array.
+    if (const FrameSource* kd = stackKeyedSubject(seqId)) {
+        j.url = kd->remoteUrl;        // the HOST to ask; no path goes on the wire
+        j.key = kd->remoteKey;
+        j.node = kd->remoteNode;
+        j.keyKind = kd->remoteKeyKind;
+    } else if (!si->remoteFiles.empty()) {
         j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0], si->remotePort);
         for (const auto& f : si->remoteFiles) j.files.push_back(f);
     } else {
@@ -506,6 +540,30 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
 }
 static void maybeRequestServerTemporal(int seqId) {
     requestServerTemporal(seqId, app.srvTemporal);
+}
+
+// The A slot follows the SELECTION.
+//
+// Every door that mints a remote stack fires the aggregate for it at that
+// moment - which answers the whole question while a stack is a stack. A TREE is
+// not: one open lands several, and only one of them can hold the single A slot.
+// So the panel asks on behalf of the stack it is drawing.
+//
+// THE SLOT IS THE RECORD, and there is no second one kept on the stack. A
+// per-stack "has been asked" bit meant a stack asked once was never asked
+// again, so looking B -> A -> B left the slot holding A: the panel drops the
+// server row when it is not this stack's (S.seqId != si->id) and B fell back to
+// computing locally - "remote when it can be remote", inverted by looking away
+// and back. The slot answers the only question there is - is the number being
+// held this stack's? - and it is already what every other re-fire here keys off
+// (the mosaic change below, the reload walk, and the close that empties it).
+//
+// So a return trip costs one measurement, which is the price of the answer
+// reaching the screen at all. Nothing storms: the request sets the slot's seqId
+// synchronously, so the line above returns on every frame after this one.
+static void ensureServerTemporalFor(int seqId) {
+    if (app.srvTemporal.seqId == seqId) return;      // it is already this one's
+    requestServerTemporal(seqId, app.srvTemporal);   // ...and it refuses non-server stacks
 }
 
 // The Inspector changed a frame's mosaic. The stack it belongs to carries that
@@ -2282,9 +2340,27 @@ static std::string remoteReaderPrepare(const std::string& url, const std::string
 //
 // `stepOut` is the decimation it settled on, which the caller needs in order to
 // ask for the full resolution later.
+// What one node of a landed tree needs in order to be asked for AGAIN - the
+// full-resolution swap, a sibling frame, and (protocol 14) its statistics.
+//
+// TWO facts, in ONE record, written at the single place that knows both: the
+// fetch that made the node's first request. It used to be a map of decimation
+// steps beside an ASSUMPTION about the address - that the peer's number for a
+// node is the tree's own index - and the assumption is true of a reader (whose
+// .vstream node numbers ARE the tree's) and false of a container, whose address
+// is the ZIP entry the SCAN issued. In tools/testdata's two-stack container the
+// two are 2/3 and 14/18; where they happen to collide, a request would come
+// back not as a refusal but as another member's pixels under this stack's name.
+// §10.5's rule is that the node is "the peer's own address, quoted back - never
+// a number computed here", and this is what makes that structural.
+struct VnzWire {
+    int node = 0;                 // what the PEER called this node's array
+    int step = 1;                 // the decimation its first fetch settled on
+};
+
 static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
                              int n, const std::string& key, int kind,
-                             const std::map<int, int>& stepOf);   // fwd (below)
+                             const std::map<int, VnzWire>& wireOf);   // fwd (below)
 
 static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref,
                              const std::vector<int64_t>& shape,
@@ -2441,14 +2517,18 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
 
     // The fetch, and it is the ONLY thing that differs from a local reader
     // open (remoteKeyedArray, above).
-    std::map<int, int> stepOf;
+    std::map<int, VnzWire> wireOf;
     auto fetch = [&](int i, const VnzNode& v, std::vector<uint8_t>& out,
                      std::string& e) -> bool {
         if (v.pixelEntry >= blobs.size()) { e = "that node declared no pixels"; return false; }
         remote::KeyedRef ref{ run.key, i, remote::KeyedRef::FromReader };
         int step = 1;
         if (!remoteKeyedArray(url, ref, blobs[v.pixelEntry].shape, out, step, e)) return false;
-        stepOf[i] = step;               // what the full-resolution swap undoes
+        // A reader's address IS the tree index - the .vstream declares its
+        // nodes with these very numbers - so the two halves of VnzWire are
+        // equal here and differ for a container. Recorded either way, at the
+        // one place that made the request, rather than assumed later.
+        wireOf[i] = { i, step };
         return true;
     };
 
@@ -2463,7 +2543,7 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
         app.readerLastOut = readerUnreadableText(where, berr);
         return berr;
     }
-    remoteTreeRefine(url, nodes, n, run.key, remote::KeyedRef::FromReader, stepOf);
+    remoteTreeRefine(url, nodes, n, run.key, remote::KeyedRef::FromReader, wireOf);
     // The memo is keyed on the WHOLE url (§4.12 over a link): readerFor is
     // asked with FrameSource::path, and a remote document's path IS its url, so
     // the Inspector's reader row and a later restore both find this without a
@@ -2495,12 +2575,20 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
 // new - the full-resolution TILE is the same request with step 1.
 static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
                              int n, const std::string& key, int kind,
-                             const std::map<int, int>& stepOf) {
+                             const std::map<int, VnzWire>& wireOf) {
+    std::vector<int> stacks;                     // refined, in declaration order
     for (int i = 0; i < n; i++) {
         const VnzNode& v = nodes[(size_t)i];
         if (v.docFirst < 0 || v.docCount <= 0) continue;
-        auto it = stepOf.find(i);
-        const int step = it == stepOf.end() ? 1 : it->second;
+        // No recorded address means no request was ever made for this node's
+        // pixels, and there is no number to invent - `i` is the reader's answer
+        // and would be a DIFFERENT ARRAY for a container. Left un-refined: the
+        // documents keep the pixels they have, and nothing addresses what it
+        // cannot name.
+        auto it = wireOf.find(i);
+        if (it == wireOf.end()) continue;
+        const int node = it->second.node;
+        const int step = it->second.step;
         for (int k = 0; k < v.docCount; k++) {
             if ((size_t)v.docFirst + (size_t)k >= app.images.size()) break;
             ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
@@ -2509,12 +2597,45 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
             S.remoteFrame = k;
             S.remoteStep = step;
             S.remoteKey = key;
-            S.remoteNode = i;
+            S.remoteNode = node;
             S.remoteKeyKind = kind;
             S.remoteProto = app.uiSession.peerVersion();
             if (step > 1) requestFullRemote(d);
+            // The STACK's own facts, from the node that declared them. vnzBuild
+            // puts a container's `__cfa_i` on every ImageDoc and leaves SeqInfo
+            // at its defaults, which nothing local ever read - but the wire does
+            // (requestServerTemporal sends the STACK's mosaic), so a Bayer stack
+            // would have been folded into one plane over there while this side
+            // splits it into four. Two answers to one question, which is the
+            // one thing a peer may not produce. expectedFrames rides along: the
+            // panel prints it while a measurement is in flight.
+            if (k == 0 && d->seqId) {
+                for (auto& s : app.seqs)
+                    if (s.id == d->seqId) {
+                        s.cfaType = d->cfa;
+                        s.cfaPattern = d->cfaPattern;
+                        if (!s.expectedFrames) s.expectedFrames = v.docCount;
+                        break;
+                    }
+                stacks.push_back(d->seqId);
+            }
         }
     }
+    // ...and now that the documents say where their pixels live and the stacks
+    // say what they are, ask the peer for the aggregate - the same call
+    // openRemote makes the moment IT mints a remote stack (#180 stage 5).
+    //
+    // ONE stack, because app.srvTemporal is one slot, and THE ONE THAT IS ON
+    // SCREEN: a tree lands several, the last one added is normally the current
+    // document, and the panel shows a server row only for the stack it is
+    // looking at. Firing for the first node would leave the visible stack
+    // computing locally while a measurement of another one sat unread. The
+    // others ask for themselves when they are selected
+    // (ensureServerTemporalFor, called by the panel).
+    if (stacks.empty()) return;
+    int want = cur() ? cur()->seqId : 0;
+    if (std::find(stacks.begin(), stacks.end(), want) == stacks.end()) want = stacks.front();
+    maybeRequestServerTemporal(want);
 }
 
 // The whole round trip, synchronously. The door the selftests and a session
@@ -2584,7 +2705,7 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
         out = f.bytes;
         return true;
     };
-    std::map<int, int> stepOf;
+    std::map<int, VnzWire> wireOf;
     auto pixels = [&](int i, const VnzNode& v, std::vector<uint8_t>& out,
                       std::string& e) -> bool {
         if (v.pixelEntry >= sc.members.size()) { e = "that node declared no pixels"; return false; }
@@ -2592,11 +2713,16 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
         NpyHead H;
         if (!npyPeekHeader(f.bytes, H, e)) { e = f.name + ": " + e; return false; }
         // The NODE is the peer's own address for this member, issued with the
-        // key and quoted back - never a number computed here (§10.5).
+        // key and quoted back - never a number computed here (§10.5). It is NOT
+        // the tree index `i`: a container's stacks are nodes 2 and 3 of a
+        // declaration whose `__pixels_` members are ZIP entries 14 and 18, and
+        // every later request for this node - the full-resolution swap, a
+        // sibling frame, its statistics - has to quote the same number this one
+        // did or it addresses a different array.
         remote::KeyedRef ref{ sc.key, (int)f.entry, remote::KeyedRef::FromNpz };
         int step = 1;
         if (!remoteKeyedArray(url, ref, H.shape, out, step, e)) return false;
-        stepOf[i] = step;
+        wireOf[i] = { (int)f.entry, step };
         return true;
     };
     // identity BEFORE the bytes (§6.2). For a local:// url the peer reads this
@@ -2617,7 +2743,7 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
                                           std::string(), url, originStat, pixels,
                                           &nodes, &n);
     if (!err.empty()) return err;
-    remoteTreeRefine(url, nodes, n, sc.key, remote::KeyedRef::FromNpz, stepOf);
+    remoteTreeRefine(url, nodes, n, sc.key, remote::KeyedRef::FromNpz, wireOf);
     return {};
 }
 

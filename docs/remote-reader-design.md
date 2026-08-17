@@ -21,7 +21,7 @@
 |---|---|---|
 | 1 | 許可の形 | **peer プロセスの起動引数 `--serve-readers`(既定 閉)**。環境変数でも同梱ディレクトリでもない。#179 裁定 C はリンクを越えても成立する: client 側は memo/picker だけが起動でき (変更なし)、peer 側の同意は「その旗を立ててプロセスを起動した者」に付く。ssh では起動者 = client のユーザー自身 = 既に shell 権限を持つ者なので、旗は ssh に対しては新権限を与えない。旗が守るのは **ssh でない起動者** (将来の WebSocket front、serve.cpp :641 の注釈が名指しする転送) である |
 | 2 | adapter ファイルの所在 | **クライアントから運ぶ** (reader 1 ファイル + `viewer_import.py` + `run_adapter.py` の 3 テキスト)。peer 側常設 (名前で解決) は採らない — §4.13.1 自身の文言・#148 の「同名別バイトの静かな分岐」・配備コスト・provenance の 4 点で負ける (§3) |
-| 3 | プロトコル | **VERSION 12、FRAMING の版上げ** (7/8/11 と同種)。新 op `MSG_READER_RUN = 8`。META/TILE/MEASURE は**末尾追記の reader トレーラ** (`[str key][u32 node]`、MEASURE は `MRF_READER` ビットで宣言)。client は **送る前に** HELLO の数で断る (`readerTooOldText`) — v11 peer はトレーラを黙って読まないので、#124 型の「正しいラベルの下の違う画素」が起きうるため (§4.2) |
+| 3 | プロトコル | **FRAMING の版上げ** (7/8/11 と同種)。新 op `MSG_READER_RUN = 8`。META/TILE/MEASURE は**末尾追記のトレーラ** (`[str key][u32 node]`)。client は **送る前に** HELLO の数で断る (`readerTooOldText` / `measureKeyedTooOldText`) — 古い peer はトレーラを黙って読まないので、#124 型の「正しいラベルの下の違う画素」が起きうるため (§4.2)。**出荷は 1 版ではなく 3 版**: 12 = RUN と META/TILE のトレーラ (PR #218)、13 = `MSG_NPZ_SCAN` (PR #221)、**14 = MEASURE の鍵トレーラ**。MEASURE のビットの綴りは **`MRF_KEYED`** (値 2) —— 鍵は materialisation を指し、reader はその出自の 1 つに過ぎない。以下 §4 が現在形で書く「VERSION 12 / `MRF_READER`」は**当初案の綴り**で、確定は §8 stage 3 注 ② と stage 5 注 ①、台帳は §9 |
 | 4 | MSG_TILE の原則 | **そのまま成り立つ**。reader が peer で materialise した画素の「source dtype」は **reader が宣言した dtype** (harness の 9 種、`b1` は serve.cpp :267 の既存表どおり `DT_U8`)。ファイルバイトも変換結果全体も回線を渡らない — 渡るのはヘッダ (テキスト) と間引きタイルと測定結果だけ (§4.3) |
 | 5 | #44 との接続 | peer 上で `run_adapter.py --stream → ファイル` (凍結済みの枠付き v1、0.268 s/151 MB)。**キャッシュファイルがそのまま配布面**: `.vstream` の blob は C-order 連続なので、`openRaw` (serve.cpp :568) と同じ「offset + stride の ServedFile」で `readNpyRegion` が無改造で読む。キャッシュ鍵の mtime/size は **peer の stat** (§5) |
 | 6 | 失敗の報告 | RUN 応答は `adapter::Run` が分けている 4 事実 (started / timedOut / exit / stderr) を**そのまま**運ぶ。文面は `readerFinish` (session.inc :1631) の文を関数に括って両経路で共有し、**機械名を足す** — 「どの python が無いのか」は machine を言わなければ直せない (§6) |
@@ -155,7 +155,7 @@ handler が意図的に転送非依存 (serve.cpp :641「same requests, same rep
 
 ---
 
-## 4. プロトコル — VERSION 12
+## 4. プロトコル — VERSION 12 (当初案の版番号。出荷は 12/13/14 — §0 の 3)
 
 ### 4.1 版の性格と両向きの拒否
 
@@ -218,6 +218,11 @@ MSG_META / MSG_TILE               既存の全フィールドの後ろに追記 
 
 MSG_MEASURE                       MeasureReqHead.flags に MRF_READER = 2。
   ... rois の後ろ (MRF_RAW_RECIPE :2482 と同じ位置規律) に [str key][u32 node]
+                                  (出荷時の綴りは MRF_KEYED、値 2 のまま。版は
+                                   14 —— stage 5 注 ①。node は「peer が発行した
+                                   その配列の番号」であって木の index ではない:
+                                   reader では両者が一致し、container では
+                                   SCAN が出した ZIP entry である — §10.5)
 ```
 
 鍵を **peer が発行し client は引用するだけ**にする理由: 鍵の再計算実装が 2 つ
@@ -499,13 +504,49 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   キャッシュにより増えない**。V25p-r2 memo を消して復元 → hint 名入りの失敗行、
   実行回数 0。
 
-### stage 5 — MEASURE: reader 産 stack を peer で測る
+### stage 5 — MEASURE: reader 産 stack を peer で測る — **済**
 
-- `MRF_READER` + トレーラ。`FrameSource::init` (serve.cpp :1505) が
-  openReaderCache を通るだけで、MOP_TEMPORAL_STATS / MOP_FRAME_ROI_STATS /
-  plugin 系は無改造。
+> 実装 2026-08-17 (issue #180 stage 5)。試験は `--rmeasure-selftest`
+> (`core/selftest/rmeasure.inc`)。設計との差分 4 点:
+> ① **綴りは `MRF_KEYED`、値は 2**(§10.5 の指示どおり)。ただし**版は 14**であって
+>    12 ではない。§10.7 が固定した規則がそのまま決める —— 12 も 13 も**出荷済み**
+>    (PR #218 / #221) で、13 を名乗る peer は MEASURE に鍵を知らない peer である。
+>    番号を共有すると「送る前に数字で断る」が書けなくなる。定型は 6 本目の
+>    `rp::measureKeyedTooOldText`。
+> ② **鍵付き要求はパスを 1 本も送らない**(`nPaths = 0`)。§4.2 が META で決めた
+>    「path は送らない」をそのまま MEASURE に適用した結果で、これが版番号の
+>    実質でもある: パスを添えていたら v13 peer は**コンテナ丸ごとの σ_t** を
+>    正しい見出しの下に返していた (#124)。添えないので v13 は
+>    "bad MEASURE header" と答え、それは読めない文なので client が先に断る。
+> ③ **plugin 系は無改造ではなかった。** `runStackAnalyzerOn` / `runFrameAnalyzerOn`
+>    は `paths[0]` を**人間が読む名前**として使う (「… "cube.npy" has 2 of 6
+>    frames」)。鍵にはその名前が無く、16 進トークンを refusal に出すのは名前では
+>    ない。よって v1 で鍵を運ぶのは **MOP_TEMPORAL_STATS / MOP_FRAME_ROI_STATS の
+>    2 つ**で、MOP_ANALYZER / MOP_PLUGIN_ANALYZE / MOP_SET_FOLD は**名指しで断る**
+>    (hasRecipe が既に持っている拒否と同じ形・同じ位置)。**再訪条件**: peer が鍵に
+>    人間の読める名前を持てるようになった時 (reader 側の `.readersrc` 相当) に、
+>    plugin 系へ広げる。
+> ④ **client 側の配線が必要だった。** 設計は peer 側だけを書いていたが、reader 産
+>    stack は `vnzBuild` が作るローカル doc の集まりなので `SeqInfo::remoteUrl` が
+>    空で、`serverComputes` が false を返して**そもそも測定要求が出なかった**。
+>    subject は doc 側 (`FrameSource::remoteKey/remoteNode/remoteKeyKind`) にあり、
+>    `stackKeyedSubject` がそれを引く。`SeqInfo` に鍵を写さない理由は Watch:
+>    `si.remoteUrl` を立てると reader 産 stack が peer stack として watch 対象に
+>    入ってしまい、それは §7 が別件と記録した話だから。
+>    ついでに直った既存の欠陥: **.npz member の stack は今日も server temporal を
+>    投げていて、url = コンテナなので "not a .npy file" が返っていた**(赤の観測)。
+
+- `MRF_KEYED` + トレーラ。`FrameSource::init` (serve.cpp) が `openKeyed`
+  (= META/TILE と同じ 1 本) を通るだけで、MOP_TEMPORAL_STATS /
+  MOP_FRAME_ROI_STATS の算術は無改造。
 - **赤→緑**: rtemporal の型 — reader 産 stack の σ_t が独立 f64 参照と一致し、
-  同 stack をローカル reader 経由で開いて測った値と**ビット一致**。
+  同 stack をローカル reader 経由で開いて測った値と**ビット一致** (M1)。
+  npz member でも同じで、しかも**両者が互いにビット一致**する (M2 — 同じ画素を
+  2 つの鍵発行者から測っているので、ワイヤがどちらが発行したかを知らないことの
+  証明になる)。旗を閉じた peer では reader 産 doc が存在しないので測るものが無く、
+  member の測定だけが通る (M3 — 旗はコードを守る、データではない)。v13 peer は
+  送信前に断られる (M4)。文法の縁 — 第 2 の集計 op・set fold の拒否・recipe との
+  同居拒否・未発行の鍵 (M5)。
 
 ---
 
@@ -520,6 +561,8 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 | キャッシュ鍵の stat は peer、鍵は peer 発行の不透明トークン | キャッシュ肥大の実地報告 → 両側同方針の掃除 |
 | set は断る、ssh の「手元で走らす」は文で逃がす、進捗 tail は無し | それぞれ §7 / §6 に個別に記載 |
 | stage 0 は独立に先行 (拒否文の 1 文 + fmtgate assert) | stage 2 で文を差し替え |
+| MEASURE の鍵は **版 14**、鍵付き要求はパスを送らない (`nPaths = 0`) | — (§10.7 の規則の帰結。この header の恒常規律) |
+| 鍵を運ぶ MEASURE op は集計 2 つだけ、plugin/set は名指しで断る | peer が鍵に人間可読な名前を持てるようになったら plugin 系へ (stage 5 注 ③) |
 
 ---
 
