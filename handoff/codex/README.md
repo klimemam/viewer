@@ -1,52 +1,64 @@
 # handoff/codex — Opus → Codex の作業受け渡し
 
-Opus(Claude)が Codex に **調査・修正・検証** を依頼するときの置き場。
-Codex はこのフォルダをポーリングする。
+Opus（Claude）がCodexに**調査・修正・検証**を依頼するときの置き場。
 
-## 作業場所の取り決め(2026-08-17 合意)
+Codexはこのフォルダを自動監視しない。ユーザーまたはOpusが会話でhandoff IDか
+ファイルを指定したときに着手する。
 
-1. **主 checkout(このフォルダ直下)は main のまま触らない** —— ブランチを切らない・
-   ステージを残さない。Opus が board/docs を main に直接コミットする場所で、ここの
-   HEAD/index が動くと「別ブランチに他人のコミットが積まれ、ステージ残りが他人の
-   メッセージでコミットされる」事故が起きる(2026-08-17 に実際に起きた)
-2. **作業は worktree で**: 名前は `viewer_work/codex-<内容>`、基点は **`origin/main`
-   を明示**(ローカル main は遅れていることがある)
-   ```
-   git fetch origin && git worktree add viewer_work/codex-<slug> -b <branch> origin/main
-   ```
-3. **ビルドは worktree 内に自前の build-mingw**。deps は
-   `-DFETCHCONTENT_SOURCE_DIR_*` で主 checkout の `build-mingw/_deps` を指してよい。
-   selftest は per-test TMP/config-dir 化済みなので並行実行して安全
-4. **着手前に名乗る**: このフォルダの依頼なら該当ファイルを `status: taken` に。
-   自発タスクなら盤(docs/tasks.csv)の行番号を issue で名乗る。Opus 側のエージェントと
-   同じ領域を同時に触らないための唯一の仕組みなので省略しない
+## 正典
 
-## 契約
+- 判断と議論はGitHub Issue、課題状態は`docs/tasks.csv`を正典とする。
+- handoffファイルには依頼、参照先、完了条件、結果だけを書く。
+- 1依頼につき1ファイルとし、必ずIssue番号と判定可能な完了条件を書く。
+- ファイル名は`YYYYMMDD-NN-slug.md`とする。`NN`はその日の連番。
 
-- **1依頼 = 1ファイル**。名前は `YYYYMMDD-NN-slug.md`(NN はその日の連番)
-- 依頼の**判断**はここに書かない —— 判断は issue、正典は `docs/tasks.csv`。
-  ここにあるのは作業の受け渡しだけで、必ず issue 番号を参照する
-- このフォルダと自分の作業ブランチ以外を Codex は触らない
+## 共有checkoutを守る
 
-## ポーリング手順(Codex 側)
+主checkoutは、Opusの作業場所として`main`のまま残す。Codexは主checkoutの
+HEAD、index、作業ファイルを変更しない。作業には、更新した`origin/main`を基点とする
+専用worktreeを使う。
 
-1. `git pull`
-2. frontmatter が `status: open` のファイルを探す(`grep -l "status: open" handoff/codex/*.md`)
-3. 着手時: `status: taken` に書き換えて commit(名乗り。二重着手の防止)
-4. 完了時: **結果** 節に記入して `status: done` に書き換えて commit
+```text
+git fetch origin
+git worktree add viewer_work/codex-<slug> -b <branch> origin/main
+```
 
-## 種別ごとの届け方
+- ビルド出力はworktree内に置く。
+- 他のworktreeや他者の未コミット変更を操作しない。
 
-| kind | 成果物の置き場 |
-|---|---|
-| 調査 | このファイルの **結果** 節に追記して main へ commit |
-| 検証 | 同上(実行環境・手順・判定を書く。過去の実行結果は書き換えない) |
-| 修正 | ブランチ + PR(PR 本文の1行目に handoff id を書く)。結果節には PR 番号だけ |
+## 作業手順
+
+1. handoffファイル、Issue、参照文書を読む。
+2. Issueに同じ作業の着手宣言がないことを確認する。同時作業の可能性がある場合は、
+   Issueにhandoff IDとブランチ名を書いてから着手する。
+3. 専用worktreeで調査、修正、検証を行う。
+4. handoffファイルの**結果**節を記入し、`status: done`へ変更する。
+5. 成果物はPRで提出し、本文の冒頭にhandoff IDを書く。mainへ直接コミットしない。
 
 ## 状態
 
-`open`(未着手)→ `taken`(Codex 作業中)→ `done`(結果記入済)。
-done の回収(issue / 盤への反映)は Opus がやる。ファイルは履歴として残す。
+`open`（未着手）→ `done`（結果記入済み）。`status: done`への変更は成果物PRに
+同乗させる（mainへ直接コミットしない、の帰結）。
+
+作業の衝突防止にはIssueの着手宣言を使う。**双方の義務**: Codexは作業手順2のとおり、
+OpusもIssueに紐づく作業をエージェントに出すときは同じ着手宣言（ブランチ名つき）を
+Issueに書く。片側だけの排他は排他ではない。Issueや`docs/tasks.csv`への反映は、
+依頼に含まれる場合だけCodexが行い、それ以外はOpusが行う。
+
+## 署名
+
+このリポジトリは1つのGitHubアカウントを3者（ユーザー / Opus / Codex）で共有している。
+Issue・PRのコメントは**必ず1行目に署名**を置く: Opusは`🤖 **Opus**`、Codexは
+`🤖 **Codex**`。着手宣言も署名がなければ誰の宣言か分からない。
+
+## 会話の使い分け（2026-08-17 合意、PR #220）
+
+| 用途 | 場所 |
+|---|---|
+| 作業の受け渡し | このフォルダ（依頼・参照・完了条件・結果のみ） |
+| **作業中の質疑** | **参照Issueへの署名コメント**（Codexはフォルダを監視しないため、ファイルstatusではなくIssueが質疑の線。OpusはPRとIssueを監視している） |
+| 判断・裁定・レビュー | Issue / PRのコメント（署名つき。ユーザーも読む場所） |
+| 状態の正典 | `docs/tasks.csv`（会話をここに書かない） |
 
 **逆向き(Codex → Opus)**: 作業中に Opus の判断・情報が要るときは、同じファイルの
 **質問** 節に書いて `status: question` にして commit + push する。Opus はこのフォルダを
@@ -69,5 +81,4 @@ issue・PR のコメントは**必ず1行目に署名**を置く: Opus は `🤖
 
 ## 書式
 
-`TEMPLATE.md` をコピーして使う。**完了条件を必ず書く** —— 完了条件の無い依頼は
-受けられない(このリポジトリの流儀: 拒否も含め、判定できる形でしか仕事を出さない)。
+`TEMPLATE.md`をコピーして使う。完了条件のない依頼には着手しない。
