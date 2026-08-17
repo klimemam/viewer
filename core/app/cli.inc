@@ -123,6 +123,14 @@ static bool g_rawRecipeSelftest = false;
 // the same reason: see abEqSelftest().
 static bool g_abEqSelftest = false;
 
+// --histhl-selftest: the value highlight (#68) - the drag -> interval mapping,
+// the paint in renderDocRGBA, the count that comes out of the painting loop,
+// and the sentences the panel and the badge say about it. Takes no directory
+// and no window for the --abeq-selftest reasons: analytic fixtures built in
+// memory, and every assertion is a pixel value, a count or a string. See
+// histHlSelftest().
+static bool g_histHlSelftest = false;
+
 // --anaprov-selftest: analyzer results name the dll they came from (#46 stage
 // 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
 // directory and no window for the --roistats-selftest reasons: the fixture is
@@ -567,6 +575,8 @@ static void printUsage() {
         "                              the rectangle carried as x/y/w/h columns\n"
         "  --abeq-selftest             A and B on ONE document: both sides drawn,\n"
         "                              coinciding, through the real panel\n"
+        "  --histhl-selftest           the value highlight (#68): the drag -> interval\n"
+        "                              mapping, the paint, the count, the sentences\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
         "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
@@ -741,6 +751,8 @@ static void parseCli(int argc, char** argv) {
             g_roiExportSelftest = true;            // handled in main()
         } else if (a == "--abeq-selftest") {
             g_abEqSelftest = true;                 // handled in main()
+        } else if (a == "--histhl-selftest") {
+            g_histHlSelftest = true;               // handled in main()
         } else if (a == "--anaprov-selftest") {
             g_anaProvSelftest = true;              // handled in main()
         } else if (a == "--stackana-selftest") {

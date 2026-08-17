@@ -761,6 +761,251 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
             (nowSec() - t0) * 1000);
 }
 
+// ---- value highlight (#68, docs/histogram-select-design.md) ----------------
+// The ink, in ONE constant, because §11 left the colour as the single thing the
+// user might want to change after seeing it on a real image.
+//
+// Magenta, opaque replacement. Nothing the display pipe emits FOR A VALUE is
+// magenta - not greyscale, not the CFA tints (pure R/G/B), not the jet/turbo
+// falsecolor ramps, not the difference view's warm/cool/yellow - and no sensor
+// image carries magenta as a scene colour. The theme ACCENT was rejected on
+// purpose: it is one of five colours the user picks between, so Aurora Blue
+// would collide with the CFA B tint and Coral with the R tint, and a colour
+// over the pixels whose meaning depends on a preference is not a colour that
+// means anything. And the colour is never the SIGNAL - a user's own display LUT
+// could contain magenta, so the fact is carried by the sentences below and the
+// paint only points at where.
+static const ImU32 HL_INK = IM_COL32(255, 0, 255, 255);
+// ...unpacked once: the paint writes bytes, the plot band draws an ImU32, and
+// two spellings of one colour is how they come to disagree.
+static const uint8_t HL_RGBA[4] = {
+    (uint8_t)((HL_INK >> IM_COL32_R_SHIFT) & 0xFF),
+    (uint8_t)((HL_INK >> IM_COL32_G_SHIFT) & 0xFF),
+    (uint8_t)((HL_INK >> IM_COL32_B_SHIFT) & 0xFF),
+    (uint8_t)((HL_INK >> IM_COL32_A_SHIFT) & 0xFF),
+};
+
+static int abSeriesMatch(const char* const* names, int n, const char* want);  // fwd
+static std::string abValueUnit(const std::string& dtype);                     // fwd: "DN"
+
+// What the panel footer and the canvas badge ACTUALLY said about the highlight
+// on the last frame each of them drew - the g_histSideProbe reasoning exactly:
+// this machine cannot screenshot GL, and the defect a highlight can ship with
+// is SILENCE (paint on the pixels that nothing on screen explains). Keyed, so
+// each writer replaces its own entry whatever order the frame draws in, and an
+// empty string erases the key: off, the probe is empty.
+static std::string g_histHlProbe;
+static void histHlProbeSet(const char* key, const std::string& said) {
+    const std::string k = std::string(key) + "=";
+    size_t at = g_histHlProbe.find(k);
+    if (at != std::string::npos) {
+        size_t e = g_histHlProbe.find(';', at);
+        g_histHlProbe.erase(at, e == std::string::npos ? std::string::npos
+                                                       : e - at + 1);
+    }
+    if (!said.empty()) g_histHlProbe += k + said + ";";
+}
+
+// "" = a drag bound to `plane` may arm on this document; otherwise the sentence
+// saying why not. One rule: the highlight is DEFINED only where a pixel has
+// exactly one value under the plane filter. A mosaiced frame always does (one
+// photosite, one number), a single channel always does, and a chosen channel of
+// an RGB frame does - but RGB with "all" selected does not, because "in range"
+// would have to mean one of three things and v1 declines to guess.
+static std::string histHlRefusalFor(const ImageDoc* im, int plane) {
+    return {};   // NOT IMPLEMENTED YET
+    if (!im) return "no image";
+    const bool cfa = im->ch == 1 && im->cfa != 0;
+    if (plane < 0 && !cfa && im->ch > 1)
+        return "highlight needs ONE channel - pick it above";
+    return {};
+}
+
+// Arming, re-dragging and clearing all change what every open document's pixels
+// should look like, so every one is marked dirty; the rebuild itself is lazy
+// (it happens when a texture is next drawn), which is what makes marking cheap.
+// The counts go with it - they were measured for the PREVIOUS interval, and a
+// sentence reading them afterwards would answer a question nobody asked.
+static void histHlTouchAll() {
+    app.hlCount.clear();
+    for (auto& d : app.images) d->texDirty = true;
+}
+static void histHlClear() {
+    if (!app.highlight.on) return;
+    app.highlight = App::HistHighlight{};
+    histHlProbeSet("refused", "");
+    histHlTouchAll();
+}
+static void histHlArm(float lo, float hi, bool loOpen, bool hiOpen,
+                      int plane, const char* name) {
+    App::HistHighlight& H = app.highlight;
+    H.on = true;
+    H.lo = lo; H.hi = hi; H.loOpen = loOpen; H.hiOpen = hiOpen;
+    H.plane = plane;
+    snprintf(H.planeName, sizeof H.planeName, "%s",
+             plane >= 0 && name ? name : "");
+    histHlProbeSet("refused", "");
+    histHlTouchAll();
+}
+
+// The plane vocabulary of a document, by the SAME rule the bins use
+// (recomputeHistogramIfNeeded): a mosaiced 1ch image is four named planes,
+// anything else is its channels. One rule, or a name a highlight is bound to
+// would mean one thing in the panel and another on the pixels.
+static int histHlPlanesOf(const ImageDoc& im, const char* (&names)[4]) {
+    static const char* CFA_SERIES[4] = { "R", "Gr", "Gb", "B" };
+    static const char* CH_SERIES[4] = { "ch0", "ch1", "ch2", "ch3" };
+    const bool cfa = im.ch == 1 && im.cfa != 0;
+    for (int s = 0; s < 4; s++) names[s] = cfa ? CFA_SERIES[s] : CH_SERIES[s];
+    return cfa ? 4 : std::min(im.ch, 3);
+}
+
+// The paint, and the count that comes out of the same loop.
+//
+// A SECOND pass over the pixels rather than a branch inside renderDocRGBA's
+// hot loop: switched off the cost is one test OUTSIDE the loop and the bytes
+// above are the ones that were always produced, which makes "off is unchanged"
+// structural instead of a thing to keep re-checking. Switched on it is one read
+// of the value and one comparison per pixel.
+//
+// It counts what it PAINTS - never what the bins hold - because the two are
+// different populations (§5), and it counts the denominator (finite pixels of
+// the plane) in the same walk so the share cannot be a ratio of two different
+// passes.
+static void histHlPaint(ImageDoc& im, std::vector<uint8_t>& rgba) {
+    return;   // NOT IMPLEMENTED YET
+    const App::HistHighlight& H = app.highlight;
+    if (!H.on) return;
+    const char* names[4] = {};
+    App::HlCount C;
+    C.nSeries = histHlPlanesOf(im, names);
+    for (int s = 0; s < 4; s++) C.names[s] = names[s];
+    if (H.plane >= 0) {
+        // by NAME, never by channel number: the panel forbade that already, and
+        // a B matched positionally would paint Gr where the user asked for R
+        C.plane = abSeriesMatch(names, C.nSeries, H.planeName);
+        if (C.plane < 0) {
+            C.why = std::string("no ") + H.planeName + " plane";
+            app.hlCount[im.uid] = C;      // painting nothing, and SAYING so
+            return;
+        }
+    } else if (std::string no = histHlRefusalFor(&im, -1); !no.empty()) {
+        C.why = no;
+        app.hlCount[im.uid] = C;
+        return;
+    }
+    C.painted = true;
+    const bool cfa = im.ch == 1 && im.cfa != 0;
+    int px = 0, py = 0;
+    for (size_t p = 0; p < (size_t)im.w * im.h; p++, px++) {
+        if (px == im.w) { px = 0; py++; }
+        const float* src = &im.px()[p * im.ch];
+        int s;                       // the plane THIS pixel belongs to
+        float v;
+        if (cfa) { s = cfaChannelAt(im, px, py); v = src[0]; }
+        else     { s = C.plane < 0 ? 0 : C.plane; v = src[s]; }
+        if (s < 0 || s >= 4) continue;
+        if (C.plane >= 0 && s != C.plane) continue;      // outside the binding
+        if (!std::isfinite(v)) continue;                 // NaN is never in range
+        C.fin[s]++;
+        if (!H.loOpen && !(v >= H.lo)) continue;
+        if (!H.hiOpen && !(v < H.hi)) continue;          // half-open [lo, hi)
+        C.hit[s]++;
+        memcpy(&rgba[p * 4], HL_RGBA, 4);
+    }
+    app.hlCount[im.uid] = C;
+}
+
+// The interval, in words. ONE builder for the panel footer, the canvas badge
+// and the export note, on abHistXLabel's rule: three surfaces must not be able
+// to say three different things about one selection.
+static std::string histHlRangeSaid(const std::string& dtype) {
+    return {};   // NOT IMPLEMENTED YET
+    const App::HistHighlight& H = app.highlight;
+    if (!H.on) return {};
+    const std::string u = abValueUnit(dtype);
+    char b[128];
+    // The open cases are not decoration: they are what the END BARS mean, so
+    // the sentence has to read the way the bar does.
+    if (H.loOpen && H.hiOpen) snprintf(b, sizeof b, "all values");
+    else if (H.loOpen)        snprintf(b, sizeof b, "< %.6g %s", (double)H.hi, u.c_str());
+    else if (H.hiOpen)        snprintf(b, sizeof b, ">= %.6g %s", (double)H.lo, u.c_str());
+    else snprintf(b, sizeof b, "%.6g..%.6g %s", (double)H.lo, (double)H.hi, u.c_str());
+    std::string head = "highlight ";
+    if (H.plane >= 0 && H.planeName[0]) head += std::string(H.planeName) + " ";
+    return head + b;
+}
+
+// The COUNT half, built once and worn by both surfaces: the footer passes the
+// region it is always measured over ("whole frame" - it is named EVERY time,
+// because the panel header above may be saying "(selected ROI)" about the
+// curves), the badge passes nothing and gets the short form.
+static std::string histHlCountPhrase(const App::HlCount& C, const char* region) {
+    char b[352];
+    const std::string tail = region ? std::string(", ") + region : std::string();
+    if (C.plane >= 0) {
+        const double sh = C.fin[C.plane] ? 100.0 * (double)C.hit[C.plane] /
+                                           (double)C.fin[C.plane] : 0.0;
+        snprintf(b, sizeof b, "%zu px (%.2f%% of finite %s%s)",
+                 C.hit[C.plane], sh, C.names[C.plane], tail.c_str());
+        return b;
+    }
+    if (C.nSeries <= 1) {
+        const double sh = C.fin[0] ? 100.0 * (double)C.hit[0] / (double)C.fin[0] : 0.0;
+        snprintf(b, sizeof b, "%zu px (%.2f%% of finite pixels%s)",
+                 C.hit[0], sh, tail.c_str());
+        return b;
+    }
+    // A mosaiced frame under an "all" binding. The counts stay PER PLANE:
+    // statistics are never mixed across planes anywhere else in this tree, and
+    // one pooled percentage would be exactly that mixing.
+    std::string s;
+    for (int i = 0; i < C.nSeries; i++) {
+        const double sh = C.fin[i] ? 100.0 * (double)C.hit[i] / (double)C.fin[i] : 0.0;
+        char one[96];
+        if (region) snprintf(one, sizeof one, "%s%s %zu (%.2f%%)",
+                             i ? " | " : "", C.names[i], C.hit[i], sh);
+        else        snprintf(one, sizeof one, "%s%s %zu",
+                             i ? " | " : "", C.names[i], C.hit[i]);
+        s += one;
+    }
+    return s + " px" + (region ? std::string("  (") + region + ")" : std::string());
+}
+
+// What ONE document answered, with its letter in front. Read from the paint,
+// never re-derived: a second count wearing the same face is the trap.
+static std::string histHlSideSaid(const ImageDoc* d, const std::string& letter) {
+    return {};   // NOT IMPLEMENTED YET
+    if (!d || !app.highlight.on) return {};
+    auto it = app.hlCount.find(d->uid);
+    if (it == app.hlCount.end()) return {};
+    const App::HlCount& C = it->second;
+    if (!C.painted) return letter + ": " + C.why;
+    return letter + ": " + histHlCountPhrase(C, "whole frame");
+}
+
+// The canvas badge: A's summary, short. It exists because the panel that made
+// the selection can be CLOSED while the paint is still on the pixels, and a
+// lens that paints in silence is the one failure this feature must not ship.
+static std::string histHlBadgeSaid() {
+    return {};   // NOT IMPLEMENTED YET
+    if (!app.highlight.on) return {};
+    // The difference view is built from DIFFERENCES, not values, on a separate
+    // path that never reaches renderDocRGBA - so it is not painted, and that
+    // limit is spoken rather than left to be discovered. A stated limit is not
+    // a defect; an unstated one is.
+    if (app.compareMode == App::CmpDiff)
+        return "highlight armed - not shown in difference view";
+    ImageDoc* a = cur();
+    const std::string head = histHlRangeSaid(a ? a->dtype : std::string());
+    if (!a) return head;
+    auto it = app.hlCount.find(a->uid);
+    if (it == app.hlCount.end()) return head;
+    const App::HlCount& C = it->second;
+    if (!C.painted) return head + ": " + C.why;
+    return head + ": " + histHlCountPhrase(C, nullptr);
+}
+
 // upload/normalize into RGBA8 texture
 // float pixels -> display RGBA, exactly as the screen shows them (range, gamma,
 // colormap, CFA colorize). Split out of rebuildTexture so that EXPORTING a view
@@ -827,6 +1072,15 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
         }
         rgba[p * 4 + 3] = 255;
     }
+    // The value highlight goes HERE and nowhere else. This is the one place a
+    // pixel becomes RGBA, so the screen, the view export and every thumbnail
+    // agree by CONSTRUCTION rather than by three implementations happening to
+    // agree - which is the same contract the comment above this function
+    // states for the range, the gamma and the colormap. Note what follows from
+    // that: the interval is tested against the RAW value, so it does not follow
+    // the display range or the gamma. That is the intended behaviour, not an
+    // oversight - what was selected is a value, not a brightness.
+    histHlPaint(im, rgba);
 }
 
 static void rebuildTexture(ImageDoc& im) {
