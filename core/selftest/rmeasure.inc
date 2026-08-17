@@ -446,13 +446,66 @@
             // array measured twice.
             check(sigCur != sigOther,
                   "M6g (fixture) the two stacks are genuinely different arrays");
-            // ...and asking again for a stack already answered starts no second
-            // job: a server aggregate is a real job on a real machine.
-            const uint64_t t2 = app.srvTemporal.token;
-            ensureServerTemporalFor(seqOther);
+            // ...and the SLOT is the whole record of who has been asked. Asking
+            // again for the stack it is holding starts no second job - but a
+            // stack that LOST the slot has to be able to get it back: B -> A -> B
+            // leaves it holding A, and if B never asks again the panel drops the
+            // server row (S.seqId != B) and B computes locally with a peer
+            // standing ready, which is this stage's arbitration inverted by
+            // looking away and back.
+            const uint64_t tHeld = app.srvTemporal.token;
+            ensureServerTemporalFor(seqOther);            // the one it holds
+            const bool noSecondJob = app.srvTemporal.token == tHeld &&
+                                     !app.srvTemporal.pending;
+            selectStack(seqCur);                          // ...away
             ensureServerTemporalFor(seqCur);
-            check(app.srvTemporal.token == t2 && !app.srvTemporal.pending,
-                  "M6h ...and a stack that has been asked is never asked twice");
+            settle(120.0);
+            const bool wentAway = app.srvTemporal.seqId == seqCur;
+            selectStack(seqOther);                        // ...and back
+            ensureServerTemporalFor(seqOther);
+            settle(120.0);
+            const App::TemporalState& T3 = localTemporal();
+            fprintf(stderr, "rmeasureselftest:   M6 round trip: held token %llu, away on "
+                            "%d = %d, back on %d valid=%d token %llu sigma_t %.12g "
+                            "vs local %.12g\n",
+                    (unsigned long long)tHeld, seqCur, wentAway ? 1 : 0, S2.seqId,
+                    S2.valid ? 1 : 0, (unsigned long long)S2.token, S2.tempNoise[0],
+                    T3.tempNoise[0]);
+            // ...and having come back, it STAYS. The panel calls this every
+            // frame it draws, so a slot that holds the stack being looked at
+            // must answer "nothing to do" - otherwise the fix for the round
+            // trip is a measurement per frame, which is the same defect with
+            // the sign flipped.
+            const uint64_t tBack = S2.token;
+            ensureServerTemporalFor(seqOther);
+            ensureServerTemporalFor(seqOther);
+            const bool stays = S2.token == tBack && S2.seqId == seqOther && S2.valid;
+            check(noSecondJob && wentAway && S2.valid && S2.seqId == seqOther &&
+                      S2.token != tHeld && sameAsLocal(S2, T3) &&
+                      S2.tempNoise[0] == sigOther && stays,
+                  "M6h a stack the slot is holding is not asked twice - but one that "
+                  "lost it asks again, so a B->A->B round trip puts B's own server "
+                  "answer back where the panel will draw it, and leaves it there");
+
+            // The OTHER re-fire, which must not be confused with the one above:
+            // the same stack measured AGAIN because its own facts changed. The
+            // mosaic edit and the reload walk both call requestServerTemporal
+            // for the stack the slot is already holding, and that has to leave
+            // the slot on that stack - a stack does not lose its place by being
+            // re-measured, and must not start asking for itself again after.
+            const uint64_t tRe = S2.token;
+            requestServerTemporal(seqOther, app.srvTemporal);   // the CFA/reload door
+            settle(120.0);
+            const uint64_t tAfterRe = S2.token;
+            ensureServerTemporalFor(seqOther);
+            fprintf(stderr, "rmeasureselftest:   M6 re-measure same seq: token %llu -> %llu, "
+                            "seq %d valid=%d, ensure after = %llu\n",
+                    (unsigned long long)tRe, (unsigned long long)tAfterRe, S2.seqId,
+                    S2.valid ? 1 : 0, (unsigned long long)S2.token);
+            check(tAfterRe != tRe && S2.seqId == seqOther && S2.valid &&
+                      S2.token == tAfterRe,
+                  "M6i ...and re-measuring the stack the slot holds keeps it there: a "
+                  "new number for the same stack, and no second ask behind it");
             closeAll();
         }
 

@@ -490,10 +490,6 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     App::SeqInfo* si = nullptr;
     for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
     if (!si || !serverComputes(*si)) return;
-    // ...and it has now been asked, which is what stops the panel asking again
-    // every time the selection comes back. Only the A slot: B is a button a
-    // person pressed, and pressing it must not make A stop offering itself.
-    if (&S == &app.srvTemporal) si->srvTemporalAsked = true;
     S = App::ServerTemporal{};
     S.seqId = seqId;
     S.token = g_measureToken++;
@@ -546,25 +542,28 @@ static void maybeRequestServerTemporal(int seqId) {
     requestServerTemporal(seqId, app.srvTemporal);
 }
 
-// The A slot follows the SELECTION, once per stack.
+// The A slot follows the SELECTION.
 //
 // Every door that mints a remote stack fires the aggregate for it at that
 // moment - which answers the whole question while a stack is a stack. A TREE is
 // not: one open lands several, and only one of them can hold the single A slot.
-// So the panel asks on behalf of the stack it is drawing, and the record of
-// having asked lives on the stack (SeqInfo::srvTemporalAsked), because the
-// alternative - asking whenever the slot holds someone else - would run a real
-// job on a real machine every time a person looked back and forth between two
-// stacks of one series.
+// So the panel asks on behalf of the stack it is drawing.
 //
-// A stack that was asked and FAILED is not re-asked either: the failure is in
-// the slot with its sentence, and repeating it would only repeat the sentence.
+// THE SLOT IS THE RECORD, and there is no second one kept on the stack. A
+// per-stack "has been asked" bit meant a stack asked once was never asked
+// again, so looking B -> A -> B left the slot holding A: the panel drops the
+// server row when it is not this stack's (S.seqId != si->id) and B fell back to
+// computing locally - "remote when it can be remote", inverted by looking away
+// and back. The slot answers the only question there is - is the number being
+// held this stack's? - and it is already what every other re-fire here keys off
+// (the mosaic change below, the reload walk, and the close that empties it).
+//
+// So a return trip costs one measurement, which is the price of the answer
+// reaching the screen at all. Nothing storms: the request sets the slot's seqId
+// synchronously, so the line above returns on every frame after this one.
 static void ensureServerTemporalFor(int seqId) {
     if (app.srvTemporal.seqId == seqId) return;      // it is already this one's
-    App::SeqInfo* si = nullptr;
-    for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
-    if (!si || si->srvTemporalAsked) return;
-    requestServerTemporal(seqId, app.srvTemporal);
+    requestServerTemporal(seqId, app.srvTemporal);   // ...and it refuses non-server stacks
 }
 
 // The Inspector changed a frame's mosaic. The stack it belongs to carries that
