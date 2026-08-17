@@ -1283,6 +1283,11 @@ struct App {
     uint64_t nextUid = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
+    // "all stacks below": how many levels UNDER the opened folder the scan
+    // walks (issue #204, ruled 2026-08-17 - the depth is a setting, 6 by
+    // default). THE PREFERENCE AS WRITTEN; every walk asks scanDepthBelow()
+    // below, which is where the range is enforced and which is the only reader.
+    int folderScanDepth = 6;
     int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
     // remote viewing: one peer process per host, reached over ssh.
@@ -2200,3 +2205,26 @@ struct App {
 // THE app. Declared here so every TU that includes this header sees the same
 // object; DEFINED in core/main.cpp — §6 keeps the definition in the spine.
 extern App app;
+
+// ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
+// Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)
+// and its default is 6. Before that ruling the number was a literal at each
+// door - scanFolderGroups walked 3, the peer was asked for 6 - so the SAME
+// folder answered differently depending on which door opened it, and neither
+// literal knew the other existed. This is the one mouth both doors now put
+// their lips to (#71: "a second copy is a copy that drifts"), and it lives
+// beside the field rather than in either door's file so that neither door owns
+// it and a third door cannot be opened at some other depth by accident.
+//
+// THE CLAMP IS HERE because this is the one READER. settings.jsonc refuses a
+// value outside the window by name (判断8 - a file that asked for 40 meant
+// something, and quietly giving it 16 would answer a question it did not ask),
+// but prefs.txt is plain text a user can edit and the Preferences panel's
+// InputInt has no bounds of its own, so the number that reaches a directory
+// walk still has to be sane no matter who wrote it.
+//   1  - the shallowest walk that is still a walk: the opened folder plus one
+//        level under it. 0 would make "all stacks below" mean "nothing below".
+//   16 - far past any capture tree anyone has put in front of this program, and
+//        still finite. core/serve.cpp caps its own SCAN/GLOB walk at 32, so
+//        every depth this can ask for is one the peer will honour.
+inline int scanDepthBelow() { return std::clamp(app.folderScanDepth, 1, 16); }

@@ -64,7 +64,10 @@
 
 **v1 (段2b) 時点のパネルは 31 行** (23 編集可 + 6 まだ + 2 ここではない)、
 セクション見出し 9 + `panels` 節の注 1 行。**段2d/2e 完了後は 33 行**
-(26 編集可 + 5 まだ + 2 ここではない)。
+(26 編集可 + 5 まだ + 2 ここではない)。**#204 (2026-08-17 裁定) で
+`loading.folderScanDepth` が加わり 34 行 (27 編集可)** —— この 1 行だけは
+prefs.txt から昇格したのではなく、裁定が設定を作った側 (prefs キー
+`scandepth` は同時に生まれた)。
 
 ### 3.2 行の一覧
 
@@ -108,6 +111,7 @@ bool → チェックボックス、列挙 → コンボ、数値 → 入力、�
 | (panels 節) | 注1行:「layout.ini との決着待ち」 | — | — | — |
 | loading.watchFiles (段2e) | bool | true | watchfiles | plumbing |
 | loading.watchAutoReload (段2e) | bool | false | watchauto | plumbing (毎回1行名乗る — File メニューの約束のまま) |
+| loading.folderScanDepth (#204) | 数値 1..16 | **6** | scandepth | plumbing (「all stacks below」がローカル・peer とも読む唯一の深さ) |
 
 ### 3.3 43 個のパネル内トグルからの昇格は 0
 

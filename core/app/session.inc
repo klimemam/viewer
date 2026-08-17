@@ -962,6 +962,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "watchfiles " << (app.watchEnabled ? 1 : 0) << "\n";
     f << "watchauto " << (app.watchAutoReload ? 1 : 0) << "\n";
     f << "seqload " << app.seqLoadMode << "\n";
+    f << "scandepth " << app.folderScanDepth << "\n";
     f << "showfps " << (app.showFps ? 1 : 0) << "\n";
     f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
     f << "membudget " << app.memBudgetGB << "\n";
@@ -1068,6 +1069,14 @@ static void loadPrefs() {
         // only answer: nobody has opted in to anything by upgrading.
         else if (key == "watchauto")   { ls >> v; app.watchAutoReload = v != 0; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
+        // #204. Read RAW, and not clamped here on purpose: scanDepthBelow()
+        // (core/app/state.h) is the one reader and the one place the window is
+        // enforced, so a prefs.txt somebody hand-edited to 40 is kept as 40 in
+        // the panel's own row - where it can be seen and corrected - while
+        // every walk uses 16. A prefs.txt written before this key existed has
+        // no such line, so an upgrading user gets the in-class default of 6,
+        // which is the depth the peer door already had.
+        else if (key == "scandepth")   { ls >> app.folderScanDepth; }
         else if (key == "showfps")     { ls >> v; app.showFps = v != 0; }
         else if (key == "lowbandwidth"){ ls >> v; app.lowBandwidth = v != 0; }
         else if (key == "membudget")   { ls >> app.memBudgetGB;
