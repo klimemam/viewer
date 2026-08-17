@@ -126,6 +126,30 @@ std::string rbRowWhyNot(const std::string& host, const std::string& name) {
     return host.empty() ? viewerRefusalFor(name) : peerRefusalFor(name);
 }
 
+// §4.13's door from a listing row into the Reader panel. ONE function, because
+// TWO gestures open it and they must land in the same place: a double-click on
+// a row this side cannot read (§4.13.0's first entrance), and the row menu's
+// "Open with reader..." - which is the same door opened deliberately, on a row
+// that may well open natively.
+//
+// The path is the row's URL on a peer's listing and its bare path on this
+// disk's, which is the split startReader already makes (§4.13.1): a reader runs
+// where the file is, and handing it a peer's path as if it were local names a
+// file that does not exist on this machine. The panel is where the peer's
+// consent is then met or refused (--serve-readers, RO_GATE_CLOSED) - the door
+// does not pre-judge it, or the refusal would be said twice in two wordings.
+//
+// The `why` is the row's own reason for being dim, the same sentence its
+// tooltip says and the same one openPath puts on the panel. An openable row has
+// none, so choosing a reader for a .npy opens the panel with nothing to
+// apologise for - which is the point of that half of the door.
+static void rbReaderDoor(const App::RemoteBrowse& B, const RbRow& r) {
+    const std::string full = r.full();
+    g_browseHost.openReaderPicker(B.host.empty() ? full
+                                                 : makeRemoteUrl(B.host, full, B.port),
+                                  rbRowWhyNot(B.host, r.name()));
+}
+
 static void rbAddRows(const App::BrowseInstance& I,
                       const std::string* dir, const std::vector<remote::Entry>& ents,
                       bool flat, bool tree, int depth, std::vector<RbRow>& out);
@@ -2143,20 +2167,10 @@ void drawPanelRemote(App::BrowseInstance& I) {
             // simply inert. A dimmed row that does nothing when you double-click
             // it is the tool saying "no" with no way forward, which is the exact
             // dead end §3.2 set out to remove.
-            // Local only: running the adapter on the peer is §4.13.1, and
-            // pretending a remote path is a local one would hand the reader a
-            // path that does not exist on this machine.
             if (!servable && !r.ph && !r.up && !r.isDir() && !rbNavGesture &&
                 ImGui::IsItemHovered() &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                if (B.host.empty())
-                    g_browseHost.openReaderPicker(r.full(),
-                        "the viewer has no native reading for this file");
-                else
-                    g_browseHost.toast("readers run on this machine only for now - "
-                                       "copy the file over, or open it from a local folder",
-                                       true);
-            }
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                rbReaderDoor(B, r);
             if (!servable) ImGui::PopStyleColor();   // before the popup, or it tints the menu
             if (!r.ph && !r.up && ImGui::BeginPopupContextItem("ctx")) {
                 g_rbCtxLive = RbCtxProbe{};       // this row's menu, from scratch
@@ -2409,6 +2423,38 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     rbCtxItem("Open", false);
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                         ImGui::SetTooltip("%s", rbRowWhyNot(B.host, rname).c_str());
+                    ImGui::Separator();
+                }
+                // §4.13's fourth entrance, and the first one that does not
+                // require the viewer to have already failed. The other three
+                // (the File menu, the Inspector's reader field, the dim row's
+                // double-click) between them left two doors missing: a file
+                // ALREADY bound to a reader had no way back to the panel to
+                // pick a different one - the memo runs the old one from then on
+                // (§4.12) - and a file the viewer reads natively could not be
+                // handed to a reader at all, because the only row-level way in
+                // was a row that could not be opened.
+                //
+                // ONE file, so not on a folder and not on a group row: a reader
+                // is handed a path and returns one thing (§4.1). The group's
+                // members each have their own row in flat view, and that is
+                // where their door is.
+                //
+                // Not gated on WHOSE disk either. Since #180 stages 1-2 a reader
+                // runs on the peer, so the same item on a remote row is a true
+                // offer; whether that peer will run it is the peer's own answer
+                // (--serve-readers), said by the Reader panel when Load is
+                // pressed, in the words §2 of docs/remote-reader-design.md
+                // already chose. Refusing here as well would be a second, worse
+                // spelling of a sentence that exists.
+                if (!r.isDir() && !r.isGroup()) {
+                    if (rbCtxItem("Open with reader...")) rbReaderDoor(B, r);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Open the Reader panel on this file: pick a\n"
+                                          "Python function to read it with, whether or not\n"
+                                          "this viewer reads the format itself. The choice\n"
+                                          "is remembered for this path, and choosing again\n"
+                                          "replaces it.");
                     ImGui::Separator();
                 }
                 if (rbCtxItem("Copy path")) {

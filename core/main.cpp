@@ -3024,7 +3024,7 @@ static bool g_watchSuppressed = false;
                             " item(s): [" + g_rbCtx.items + "]");
                     }
                     else if (op == "chkrdr") {
-                        // ...and where the door LED. §4.13.0's panel, standing
+                        // ...and where the door led. §4.13.0's panel, standing
                         // on the path that was right-clicked - the whole claim
                         // the menu item makes.
                         chk(app.readerPanelOpen &&

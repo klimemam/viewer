@@ -37,7 +37,8 @@ UI を **実フレーム経由で** 駆動できるのは 1 本だけ:
 - キー: `down` `up` `left` `right` `enter` `home` `end` `back` `esc` `comma` `period`
 - マウス: `click` (カーソル行の中心 +40px)、`dbl` (本物のダブルクリック)、
   `ctrlclick`、`chevclick` (chevron 座標を直接叩く)、`mback`/`mfwd` (ボタン 3/4)、
-  `altleft`/`altright`、`fmenu`、`rctx`
+  `altleft`/`altright`、`fmenu`、`rctx`、`rctxcur` (`rctx` の**カーソル行**版)、
+  `ctxclick:LABEL` (開いている行メニューの、その名前の項目を本物のクリックで押す)
 - 状態ピン: `viewreset` (grouped+list+folded の**絶対**ピン)、`w<px>` (パネルを
   その幅で float)、`focus` / `blur`、`more` / `flat` / `tree`
 - インスタンス: `target:N` `newpanel` `reconnect` `closep` `hidep` `showp` `filt:S` `sessrt`
@@ -45,6 +46,8 @@ UI を **実フレーム経由で** 駆動できるのは 1 本だけ:
 - assert: `chkimg:N` `chkpv:N` `chkidx:K` `chkopen:S` `chkcurn:NAME` `chknames:SPEC`
   `chkdir:LEAF` `chkcursor:N` `chkatrow:NAME` `chkback:N` `chkfwd:N` `chkexp:N`
   `exparm`/`chkexpn:0` `chkfocus:0|1` `chkfilt:S` `chkpanels:N` `chkshown:N` `chksel:N`
+  `chkctx:N` / `chkctx:+LABEL` / `chkctx:-LABEL` (今出ている行メニューの件数・項目の
+  有無)、`rdrshut` と `chkrdr:NAME` (Reader パネルを閉じる / その path で開いている)
 
 ### 自作スクリプトの定型 (C節はこれを前提に書いてある)
 
@@ -109,7 +112,9 @@ EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask
 | A24 | 新規ウィンドウの argv 形 (配置自体は D節) | `--newwin-selftest tools/testdata` N7 | stack は HEAD file + `--stack always`、CFA は pattern が先、remote は ssh url | `N7 stack argv: HEAD file + --stack always PASS` / `newwinselftest: ALL PASS` | PASS |
 | A25 | ルート popup 衝突: RAW ダイアログが競合モーダルで消えない | 既定列末尾 `rawopen,popupcheck,seqask,popupcheck` | 前後とも open=1、`forQueue` なら生存 | `root popup collision: RAW dialog open before the competing modal=1, after=1; forQueue implies a live dialog=1: ok` | PASS |
 
-**A節まとめ: 26項目 / 実行 26 / PASS 26 / FAIL 0。**
+| A26 | Browse 行の右クリックが**何を出すか** —— 「Open with reader...」の戸 (§4.13) | 既定列 `rctxcur,chkctx:N,chkctx:±LABEL,ctxclick:LABEL,chkrdr:NAME` | ファイル行に項目が出る (native で読める `.npy` にも、読めない `.txt` にも)。フォルダ行・グループ行には**出ない**。既存項目は1つも消えていない (件数)。**実際に押すと** Reader パネルがその path で開く | `chkctx:6 -> 6 item(s): [Open;Open as stack;Open as frame average;Open with reader...;Copy path;Properties...;]: ok` / `chkctx:4 -> 4 item(s): [Open folder (all stacks below);Search under here;Bookmark;Copy path;]: ok` / `chkrdr:dark.npy -> reader panel open on "tools/testdata/rb/dark.npy": ok` | PASS |
+
+**A節まとめ: 27項目 / 実行 27 / PASS 27 / FAIL 0。**
 スイート全体 (21 test): `SUITE TOTAL /c/Users/hish/Desktop/viewer-wt-verifyui pass=21 fail=0`
 
 > **A節から外した項目 (追跡用)**

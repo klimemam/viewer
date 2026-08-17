@@ -2533,7 +2533,7 @@ static void drawFolderPickModal() {
 }
 
 // ---- the Reader panel (docs/input-adapters.md §4.13.0) -----------------------
-// Three entrances, one destination, and IT DOES NOT CLOSE. Writing an adapter is
+// Four entrances, one destination, and IT DOES NOT CLOSE. Writing an adapter is
 // a loop - write, load, read the failure, fix, load again - and the first design
 // here was a modal, which cut that loop every time the author went to their
 // editor. A panel that stays put lets the loop run: press Load, alt-tab, fix the
