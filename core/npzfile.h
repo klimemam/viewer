@@ -410,11 +410,27 @@ static const uint64_t INLINE_MAX_BYTES = 8ull << 20;
 
 // ...and the TOTAL, which is a different question and the one a wire has to ask
 // (#221 review). Every member of a valid container can pass the per-member rule
-// above and the file still be unlistable: 65 one-million-element f8 axes are 65
-// members of 8 MiB each - each of them legal, each of them wanted - and 520 MiB
+// above and the file still be unlistable: 68 one-million-element f8 axes are 68
+// members of 8 MiB each - each of them legal, each of them wanted - and 544 MiB
 // of reply, which core/remote.cpp refuses at 512 MiB as "oversized reply from
 // the peer". So the sum has an owner too, and it is the side that fills the
 // message.
+//
+// AND THE SUM IS THE WHOLE MESSAGE, not the values in it (#180 codex review).
+// The first version of this counted `bytes` and nothing else, so a reply's
+// NAMES were unbudgeted: a zip member name is a 16-bit length, 5,000 members of
+// 60,000 characters each carry 300 MB of name alone, and a file whose values
+// added up to 238 MiB - comfortably inside a 256 MiB ceiling - produced 524 MiB
+// on the wire and came back to the person as "oversized reply from the peer".
+// A ceiling that does not count everything the message carries is not a
+// ceiling; it is an estimate with a failure mode.
+//
+// So a caller states, once, what a member costs BESIDES its three
+// variable-length pieces (`perFact`) and pre-charges the message's own
+// top-level fields into `used`. The three variable pieces - name, err, bytes -
+// are counted here, where they are decided. This file still does not know the
+// wire format; it knows that a wire has fixed overheads and that only the side
+// filling the message can say what they are.
 //
 // `max` 0 means NO aggregate ceiling: that is the local door, which already
 // holds the whole zip and is not copying anything onto a wire. A caller that
@@ -423,8 +439,11 @@ static const uint64_t INLINE_MAX_BYTES = 8ull << 20;
 // silently lost rows, and a picker missing a row is worse than a refusal that
 // names the file.
 struct InlineBudget {
-    uint64_t max = 0;      // the ceiling, in bytes of member payload; 0 = none
-    uint64_t used = 0;     // what the members already listed add up to
+    uint64_t max = 0;      // the ceiling, in bytes of the whole reply; 0 = none
+    uint64_t used = 0;     // the reply so far, framing included. A caller sets
+                           // this to what the message costs before its first
+                           // member - the fields ahead of the member array.
+    uint64_t perFact = 0;  // what one member costs beyond name + err + bytes
     std::string over;      // the member that crossed it; "" = it was not crossed
     uint64_t need = 0;     // ...and what THAT member wanted on top of `used`
 };
@@ -463,6 +482,32 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
                                    InlineBudget* budget = nullptr) {
     const bool container = hasContainerMark(entries);
     std::vector<Fact> out;
+    // RESERVE asks; COMMIT spends. They are two operations because the guard has
+    // to happen before an inflate that may be refused (a ceiling that refuses
+    // after paying for the decompression is the outage it exists to prevent),
+    // while what is finally SPENT is the size of the buffer that actually ended
+    // up on the fact - which can only be smaller. Both are subtractions:
+    // `used` never exceeds `max` (that is the invariant reserve enforces and
+    // commit preserves), so `max - used` cannot wrap and `used + take` is never
+    // formed. `over` non-empty means the caller must refuse the whole answer.
+    auto reserve = [&](uint64_t take, const std::string& who) {
+        if (!budget || !budget->max) return true;
+        if (take > budget->max - budget->used) {
+            budget->over = who;
+            budget->need = take;
+            return false;
+        }
+        return true;
+    };
+    auto commit = [&](uint64_t take) { if (budget && budget->max) budget->used += take; };
+    // A caller may pre-charge the message's own top-level fields into `used`.
+    // If those alone do not fit there is nothing to list and saying so here
+    // keeps the one refusal path.
+    if (budget && budget->max && budget->used > budget->max) {
+        budget->over = "(the reply's own fields)";
+        budget->need = budget->used;
+        return {};
+    }
     for (size_t i = 0; i < entries.size(); i++) {
         const Entry& e = entries[i];
         if (e.name.size() < 4 || e.name.compare(e.name.size() - 4, 4, ".npy") != 0) continue;
@@ -470,6 +515,16 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
         f.entry = i;
         f.name = e.name.substr(0, e.name.size() - 4);
         f.usize = e.usize;
+        // THE NAME AND THE FRAMING FIRST, before this member is even looked at.
+        // They are known from the zip directory alone, they are on the wire
+        // whatever else this member turns out to be, and 5,000 long names were
+        // the reported way to pass a budget and blow the reply.
+        {
+            const uint64_t fixed =
+                (budget ? budget->perFact : 0) + (uint64_t)f.name.size();
+            if (!reserve(fixed, f.name)) return {};
+            commit(fixed);
+        }
         // Header only: an image member is never inflated here, however big it
         // is. 64 KiB covers every .npy header (v1 caps the length at 65535 and
         // the dict is padded to a 64-byte multiple); a v2 header longer than
@@ -482,6 +537,11 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
             got = extract(zip, e, buf, err) && peekHeader(buf, H, err);
         if (!got) {
             f.err = err;
+            // The error TRAVELS, so it is counted. It is one of this file's own
+            // sentences and it is short, but "short" is not a bound and the
+            // reply's size may not depend on a quantity nobody checked.
+            if (!reserve((uint64_t)f.err.size(), f.name)) return {};
+            commit((uint64_t)f.err.size());
             out.push_back(std::move(f));
             continue;
         }
@@ -508,28 +568,23 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
         const uint64_t need = H.esize > 0 ? H.dataOff + payload : e.usize;
         const bool want = sane && wantsValues(f.name, H, container) &&
                           need <= INLINE_MAX_BYTES && need <= e.usize;
-        // WHAT THIS MEMBER WILL COST, decided from the header and the zip
-        // directory - so it is known BEFORE the member is inflated and long
-        // before anything is copied into a reply. A member that does not fit
-        // is never decompressed: refusing after paying for the decompression
-        // would be the outage the ceiling exists to prevent, wearing a message.
-        if (budget && budget->max) {
-            const uint64_t take = want ? need
-                                       : (buf.size() < H.dataOff ? (uint64_t)buf.size()
-                                                                 : H.dataOff);
-            // Subtraction and not addition: `used` never exceeds `max` (this is
-            // the only place it grows, and it grows only when it fit), so
-            // `max - used` cannot wrap and `used + take` can never be formed.
-            if (take > budget->max - budget->used) {
-                budget->over = f.name;
-                budget->need = take;
-                return {};
-            }
-            budget->used += take;
-        }
+        // WHAT THIS MEMBER'S BYTES WILL COST AT MOST, decided from the header
+        // and the zip directory - so it is known BEFORE the member is inflated
+        // and long before anything is copied into a reply. A member that does
+        // not fit is never decompressed: refusing after paying for the
+        // decompression would be the outage the ceiling exists to prevent,
+        // wearing a message. RESERVED, not spent: what is spent is the buffer
+        // that actually ends up on the fact, a few lines down.
+        if (!reserve(want ? need
+                          : (buf.size() < H.dataOff ? (uint64_t)buf.size()
+                                                    : (uint64_t)H.dataOff),
+                     f.name))
+            return {};
         if (want) {
             if (buf.size() < need && !extract(zip, e, buf, err)) {
                 f.err = err;
+                if (!reserve((uint64_t)f.err.size(), f.name)) return {};
+                commit((uint64_t)f.err.size());
                 out.push_back(std::move(f));
                 continue;
             }
@@ -546,6 +601,9 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
         // Trim to the header when the values are not wanted: what crosses the
         // link for a 4 GB image member is a few hundred bytes.
         if (!f.whole && buf.size() > H.dataOff) buf.resize(H.dataOff);
+        // ...and THIS is the number that goes on the wire, so this is the one
+        // that is spent. It is never larger than what was reserved above.
+        commit((uint64_t)buf.size());
         f.bytes = std::move(buf);
         out.push_back(std::move(f));
     }

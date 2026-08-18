@@ -654,6 +654,49 @@ MSG_NPZ_SCAN
   版の拒否 (`VIEWER_NPZ_VERSION` :851、3 は名指しで断る) は client の既存文のまま
   — 検査の門は 1 つ、が §5.2 の規律。
 
+#### 10.2.1 一通の SCAN 応答の天井 — 出荷時の値 (#221 review、#180 codex review で訂正)
+
+**per-member の規則は応答を縛れない。** `nz::INLINE_MAX_BYTES` は 1 member を
+8 MiB まで通し、正当な container が member を何百個持つことはある — 2^20 要素の
+f8 軸 68 本は 8 MiB × 68 = **544 MiB**、どこも壊れていないファイルの応答である。
+client (core/remote.cpp :405) は 512 MiB を超える応答を `oversized reply from the
+peer` で断る。**転送についての文が、ファイルについて、人に届く** — その人に打つ手は
+無い。だから合計にも所有者が要る。持つのは**メッセージを詰める側**、すなわち peer。
+
+**天井は 256 MiB** (`rp::NPZ_SCAN_INLINE_MAX`)。client の上限のちょうど半分で、
+これに収まった応答が `oversized` になる経路は無い。`VIEWER_SERVE_NPZ_SCAN_MAX`
+(bytes) が上書きする — 256 MiB を踏む fixture は 256 MiB であり、算術の比較を
+証明するために 1/4 GB を書く selftest は誰も走らせない、という理由だけのために
+在る。最初の scan で 1 度読み、peer は生涯 1 つの数を答える。
+
+**天井が数えるのは応答の全体であって、値ではない (#180 codex review の訂正)。**
+最初の実装は `f.bytes` だけを数えたので、**name が予算の外**にあった。zip の
+member 名は 16-bit 長 — 60,000 文字 × 5,000 member は name だけで 300 MB になり、
+値の合計 238.4 MiB は 256 MiB を通り、ワイヤには 524.5 MiB が出て、人には
+`oversized reply from the peer` が返った。数え落としのある天井は天井ではない。
+
+数えるのは、**inflate と `Buf` 構築より前に**、overflow-safe (減算のみ) で:
+
+| 何 | bytes | 置き場 |
+|---|---|---|
+| `[str key][u32 kind][u32 version][u32 nMembers]` | `4 + 16 + 4 + 4 + 4` = **32** | `rp::NPZ_SCAN_REPLY_FIXED` |
+| member ごとの固定 field (`nameLen`/`usizeLo`/`usizeHi`/`entry`/`errLen`/`whole`/`nBytes`) | **28** | `rp::NPZ_SCAN_FACT_FIXED` |
+| member ごとの可変 — `name` + `err` + `bytes` | 実長 | `nz::readFacts` |
+
+合計は `rp::Header` の 12 byte を含まない (client が縛るのは u32 の payload 長)。
+`used` が `max` を超えないことは reserve が守る不変条件なので `max - used` は
+wrap せず、`used + take` は形にすらならない。予算は **inflate の前に** 引かれる
+— 断ってから解凍代を払うのは、天井が防ごうとしている障害そのものである。
+
+**超えたら、ファイルは丸ごと断る** (`MSG_ERR`)。行を間引いて収める道は無い:
+行の欠けた picker は嘘をつく listing である。文は member 名・そこまでの合計・
+天井・ファイル名を名指しし、`key` は**発行されない** (断ったファイルについて
+client が後から引ける材料化物を残さない)。応答を組み立てた後にも `Buf` の実寸と
+予算を突き合わせ、食い違えば送らずに断る — 到達しない検査だが、外れたときの
+代償が「断られたファイル」ではなく「終わった session」だからである。
+
+赤→緑: rnpz **R20**(値の合計)・**R21**(name を含む正確なワイヤ総量、実寸一致まで)。
+
 ### 10.3 (b) member picker — 同じ画面、同じ入口
 
 - **同じ modal**: `drawNpzPickModal` (sequence.inc :2851) は app.npzPick の行を

@@ -645,12 +645,22 @@
             // Two of the three fit and the third does not - so the refusal is
             // provably about the SUM: it arrives with two members already
             // counted, not on the first thing it looked at.
-            const uint64_t ceiling = one * 2 + 1;
-            fprintf(stderr, "rnpzselftest:   R20 each member %llu B, per-member rule "
-                            "%llu B, injected ceiling %llu B\n",
-                    (unsigned long long)one, (unsigned long long)nz::INLINE_MAX_BYTES,
+            //
+            // What a member COSTS is the whole of what it puts on the wire
+            // (#180 codex review): its values, its one-character name, and the
+            // fields that frame them. Computed from rp::'s own two numbers, so
+            // this test and the peer read one definition of what a reply is.
+            const uint64_t cost = rp::NPZ_SCAN_FACT_FIXED + 1 + one;   // name "a"/"b"/"c"
+            const uint64_t twoFit = rp::NPZ_SCAN_REPLY_FIXED + cost * 2;
+            const uint64_t ceiling = twoFit + 1;
+            fprintf(stderr, "rnpzselftest:   R20 each member %llu B of values, %llu B "
+                            "on the wire, per-member rule %llu B, injected ceiling "
+                            "%llu B\n",
+                    (unsigned long long)one, (unsigned long long)cost,
+                    (unsigned long long)nz::INLINE_MAX_BYTES,
                     (unsigned long long)ceiling);
-            check(one * 3 > ceiling && one < nz::INLINE_MAX_BYTES / 16,
+            check(cost * 3 + rp::NPZ_SCAN_REPLY_FIXED > ceiling &&
+                      one < nz::INLINE_MAX_BYTES / 16,
                   "R20a every member passes the PER-MEMBER rule with room to spare");
 
             app.uiSession.stop();
@@ -677,7 +687,7 @@
                     notesAfter, err.c_str());
             check(!got && sc.members.empty() && sc.key.empty(),
                   "R20b the whole scan is refused: no key, no rows, nothing trimmed to fit");
-            check(has(err, "\"c\"") && has(err, std::to_string(one * 2)) &&
+            check(has(err, "\"c\"") && has(err, std::to_string(twoFit)) &&
                       has(err, std::to_string(ceiling)) && has(err, "heavy.npz"),
                   "R20b ...naming the member that crossed it, the sum so far and the file");
             // The budget is spent BEFORE the key is published, so a refused file
@@ -714,6 +724,110 @@
                 check(whole,
                       "R20e ...and the same file lists all three, values and all, at 256 MiB");
             }
+            closeAll();
+        }
+
+        // ---- R21: the budget is the MESSAGE, not the values in it --------------
+        //
+        // #180 codex review of #224. R20 gave the reply a ceiling and then spent
+        // it on `f.bytes` alone - so everything else the message carries was
+        // unbudgeted, and a zip member name is a SIXTEEN-BIT length. 5,000
+        // members of 60,000 characters each are 300 MB of name; a file whose
+        // values summed to 238.4 MiB passed a 256 MiB ceiling and put 524.5 MiB
+        // on the wire, which came back to the person as "oversized reply from
+        // the peer" - a sentence about the transport, said about a file, that
+        // nobody can act on. R20's three members are named "a", "b" and "c", so
+        // it could not see it.
+        //
+        // The fixture is that shape at test scale: the VALUES are a few hundred
+        // bytes all together and the NAMES are the file. Same discipline as R20 -
+        // scale the ceiling, not the shape.
+        {
+            const size_t NLEN = 20000;
+            const std::string wa = "aaa_" + std::string(NLEN, 'a');
+            const std::string wb = "bbb_" + std::string(NLEN, 'b');
+            const std::string wc = "ccc_" + std::string(NLEN, 'c');
+            const std::vector<uint8_t> wval = f64v({ 1.5, 2.5 });
+            const std::string wide = root + "/wide.npz";
+            selftestWriteNpz(wide, { { wa, wval }, { wb, wval }, { wc, wval } });
+            // What each member COSTS on the wire, computed from the two numbers
+            // rp:: states beside the message it describes - so this test and the
+            // peer cannot disagree about what a reply is made of.
+            auto costOf = [&](const std::string& nm) {
+                return rp::NPZ_SCAN_FACT_FIXED + (uint64_t)nm.size() + (uint64_t)wval.size();
+            };
+            const uint64_t whole3 =
+                rp::NPZ_SCAN_REPLY_FIXED + costOf(wa) + costOf(wb) + costOf(wc);
+            // Two fit and the third does not, so the refusal is provably about
+            // the SUM and arrives with two members already counted.
+            const uint64_t ceiling =
+                rp::NPZ_SCAN_REPLY_FIXED + costOf(wa) + costOf(wb) + 1;
+            const uint64_t valuesOnly = 3 * (uint64_t)wval.size();
+            fprintf(stderr, "rnpzselftest:   R21 names %zu B each, values %llu B all "
+                            "together, ceiling %llu B, whole reply %llu B\n",
+                    wa.size(), (unsigned long long)valuesOnly,
+                    (unsigned long long)ceiling, (unsigned long long)whole3);
+            // THE REPORTED SHAPE, stated as an assertion: under this ceiling the
+            // old budget - which counted `f.bytes` and nothing else - had room
+            // for all three members many times over, and let the file through.
+            check(valuesOnly * 8 < ceiling && (uint64_t)wval.size() < nz::INLINE_MAX_BYTES,
+                  "R21a every member is far under the per-member rule, and their VALUES "
+                  "all together are far under the ceiling");
+            check(rp::NPZ_SCAN_INLINE_MAX < (512ull << 20),
+                  "R21b the peer's own ceiling is under what core/remote.cpp accepts, "
+                  "so a reply that fits it can never be \"oversized\"");
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(ceiling));
+            if (!connect()) return 1;
+            {
+                remote::NpzScan sc;
+                std::string err;
+                const bool got = app.uiSession.npzScan(wide, sc, err);
+                fprintf(stderr, "rnpzselftest:   R21 wide.npz: got=%d members=%zu "
+                                "key=\"%s\" err[0..120]=\"%s\"\n",
+                        got ? 1 : 0, sc.members.size(), sc.key.c_str(),
+                        err.substr(0, 120).c_str());
+                check(!got && sc.members.empty() && sc.key.empty(),
+                      "R21c the whole scan is refused: the NAMES are counted too");
+                check(has(err, "ccc_") &&
+                          has(err, std::to_string(rp::NPZ_SCAN_REPLY_FIXED +
+                                                  costOf(wa) + costOf(wb))) &&
+                          has(err, std::to_string(ceiling)) && has(err, "wide.npz"),
+                      "R21d ...naming the member that crossed it, the sum so far and the file");
+            }
+            // ...and at a ceiling one byte above the whole reply it lists, which
+            // is what makes R21c about the sum and not about the file. The
+            // WITNESS is the byte count: what came back over the link must be
+            // exactly what the budget said it would be, or the ceiling is an
+            // estimate again.
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(whole3));
+            if (!connect()) return 1;
+            {
+                const uint64_t rx0 = app.uiSession.bytesReceived();
+                remote::NpzScan sc;
+                std::string err;
+                const bool got = app.uiSession.npzScan(wide, sc, err);
+                const uint64_t rx = app.uiSession.bytesReceived() - rx0;
+                fprintf(stderr, "rnpzselftest:   R21 wide.npz at %llu B: got=%d "
+                                "members=%zu received %llu B (predicted %llu + %zu "
+                                "header)\n",
+                        (unsigned long long)whole3, got ? 1 : 0, sc.members.size(),
+                        (unsigned long long)rx, (unsigned long long)whole3,
+                        sizeof(rp::Header));
+                bool whole = got && sc.members.size() == 3;
+                for (const auto& m : sc.members) if (!m.whole) whole = false;
+                check(whole,
+                      "R21e ...and the same file lists all three, values and all, one "
+                      "byte above the reply it produces");
+                check(rx == whole3 + sizeof(rp::Header),
+                      "R21f ...and the reply that arrived is the size the budget "
+                      "predicted, to the byte");
+            }
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "");
+            if (!connect()) return 1;
             closeAll();
         }
 

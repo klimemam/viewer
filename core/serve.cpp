@@ -3549,18 +3549,27 @@ static void handleReaderRun(Buf& in) {
 // --serve-readers has nothing to do with this. The gate (§2) is about OTHER
 // PEOPLE'S CODE running here; what runs for a .npz is this binary, on a format
 // it already reads. A peer with the flag closed answers SCAN.
-// The ceiling on the VALUES one NPZ_SCAN reply carries, all members together
-// (#221 review). The per-member rule cannot bound a reply: nz::INLINE_MAX_BYTES
-// lets each member through at 8 MiB and a perfectly valid container may hold
-// hundreds of them, so 65 one-million-element f8 axes are 520 MiB of a file
-// nothing is wrong with - past the 512 MiB core/remote.cpp will accept, which
-// arrives as "oversized reply from the peer": a sentence about the transport,
-// for a file, that the person cannot act on.
+// The ceiling on ONE NPZ_SCAN REPLY - the whole of it, all members together
+// (#221 review, corrected by #180's). The per-member rule cannot bound a reply:
+// nz::INLINE_MAX_BYTES lets each member through at 8 MiB and a perfectly valid
+// container may hold hundreds of them, so 68 one-million-element f8 axes are
+// 544 MiB of a file nothing is wrong with - past the 512 MiB core/remote.cpp
+// will accept, which arrives as "oversized reply from the peer": a sentence
+// about the transport, for a file, that the person cannot act on.
 //
-// 256 MiB, which is half of that limit and leaves the names, the errors and the
-// framing all the room they could want. A file above it is refused WHOLE and by
-// name - never trimmed to fit, because a picker missing rows is a listing that
-// lied.
+// AND IT IS THE WHOLE REPLY, not the values in it. The first version of this
+// budgeted `f.bytes` alone, which left the NAMES unbudgeted - a zip member name
+// is a 16-bit length, so 5,000 members of 60,000 characters carry 300 MB of
+// name, and a file whose values summed to 238.4 MiB passed a 256 MiB ceiling
+// and put 524.5 MiB on the wire. So what is spent here is rp::
+// NPZ_SCAN_REPLY_FIXED plus, per member, rp::NPZ_SCAN_FACT_FIXED + name + err +
+// bytes: exactly the bytes handleNpzScan will append below, counted before one
+// of them is built.
+//
+// 256 MiB, which is half of the client's limit. A file above it is refused
+// WHOLE and by name - never trimmed to fit, because a picker missing rows is a
+// listing that lied - and the refusal is an MSG_ERR for the FILE, so the person
+// is told about the file rather than about the transport.
 //
 // VIEWER_SERVE_NPZ_SCAN_MAX overrides it, in bytes. That exists so the rule can
 // be TESTED: the fixture that trips 256 MiB is 256 MiB, and a selftest that
@@ -3574,7 +3583,7 @@ static uint64_t npzScanInlineMax() {
             const unsigned long long v = strtoull(e, nullptr, 10);
             if (v) return (uint64_t)v;
         }
-        return (uint64_t)(256ull << 20);
+        return NPZ_SCAN_INLINE_MAX;
     }();
     return n;
 }
@@ -3599,9 +3608,15 @@ static void handleNpzScan(Buf& in) {
     // already paid for everything it then refuses.
     nz::InlineBudget budget;
     budget.max = npzScanInlineMax();
+    // The message's own fields, charged before the first member is looked at,
+    // and what each member costs beyond its name, its error and its bytes. Both
+    // are rp::'s, next to the wire they describe, so this cannot drift from what
+    // the Buf below actually appends.
+    budget.used = NPZ_SCAN_REPLY_FIXED;
+    budget.perFact = NPZ_SCAN_FACT_FIXED;
     const std::vector<nz::Fact> facts = nz::readFacts(zip, entries, &budget);
     if (!budget.over.empty()) {
-        sendErr("this .npz carries more member values than one reply can hold: \"" +
+        sendErr("this .npz needs more than one reply can hold: \"" +
                 budget.over + "\" needs " + std::to_string(budget.need) +
                 " bytes on top of " + std::to_string(budget.used) +
                 " already listed, over this peer's ceiling of " +
@@ -3668,6 +3683,22 @@ static void handleNpzScan(Buf& in) {
         out.putU32(f.whole ? 1u : 0u);
         out.putU32((uint32_t)f.bytes.size());
         out.putBlob(f.bytes.data(), f.bytes.size());
+    }
+    // THE BUDGET WAS A PREDICTION; this is the message. They must be the same
+    // number, and if they are not then something appended a byte the ceiling
+    // never saw - so the reply is refused rather than sent, and the peer says
+    // which of the two it trusts. A reply's length is also a u32 on the wire
+    // (rp::Header), and 256 MiB is far under that, but the bound is stated
+    // rather than assumed because the consequence of it being wrong is a
+    // session that ends instead of a file that is refused.
+    if (out.b.size() != (size_t)budget.used || (uint64_t)out.b.size() > budget.max ||
+        out.b.size() > 0xffffffffull) {
+        sendErr("this peer built a reply of " + std::to_string(out.b.size()) +
+                " bytes for " + path + " after budgeting " +
+                std::to_string(budget.used) + " against a ceiling of " +
+                std::to_string(budget.max) + ". It will not send it. Open the file "
+                "on the machine it lives on.");
+        return;
     }
     sendMsg(MSG_OK, out);
 }
