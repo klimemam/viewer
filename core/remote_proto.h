@@ -326,11 +326,29 @@ static const uint64_t NPZ_SCAN_FACT_FIXED = 28;
 //               -> 4 + 16 + 4 + 4 + 4 = 32, the key being the 16 hex characters
 //                  readerHash is always formatted to
 static const uint64_t NPZ_SCAN_REPLY_FIXED = 32;
-// ...and the ceiling those two are spent against, unless VIEWER_SERVE_NPZ_SCAN_MAX
-// says otherwise. Half of the 512 MiB core/remote.cpp will accept, so a reply
-// that fits this cannot become "oversized reply from the peer" no matter how the
-// remaining halves of the message are divided between values, names and errors.
+// ...and the ceiling those two are spent against. VIEWER_SERVE_NPZ_SCAN_MAX may
+// lower it for tests, never raise it. Half of the 512 MiB core/remote.cpp will
+// accept, so a reply that fits this cannot become "oversized reply from the
+// peer" no matter how the remaining halves are divided between values, names
+// and errors.
 static const uint64_t NPZ_SCAN_INLINE_MAX = 256ull << 20;
+
+// Parse the test override strictly and clamp it in the only safe direction.
+// Accepting a prefix ("4096x"), a sign ("-1" becomes UINT64_MAX in strtoull),
+// or an overflowing digit string can silently raise the ceiling beyond the
+// transport limit this constant is meant to stay below.
+inline uint64_t npzScanCeilingFor(const char* env) {
+    if (!env || !*env) return NPZ_SCAN_INLINE_MAX;
+    uint64_t v = 0;
+    for (const char* p = env; *p; p++) {
+        if (*p < '0' || *p > '9') return NPZ_SCAN_INLINE_MAX;
+        const uint64_t d = (uint64_t)(*p - '0');
+        if (v > (UINT64_MAX - d) / 10) return NPZ_SCAN_INLINE_MAX;
+        v = v * 10 + d;
+    }
+    if (!v || v >= NPZ_SCAN_INLINE_MAX) return NPZ_SCAN_INLINE_MAX;
+    return v;
+}
 
 // What a MSG_READER_RUN reply says happened, and it is `adapter::Run`'s own
 // four facts plus the two the caller cannot see from here. Split rather than

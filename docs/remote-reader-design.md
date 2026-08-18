@@ -659,12 +659,12 @@ MSG_NPZ_SCAN
   -> [str peerPath]
   <- MSG_OK:
      [str key]        materialisation 鍵 (§10.6)。peer 発行・不透明
-     [u32 kind]       0 ordinary / 1 viewer container (+ __viewer の版)
-     [u32 nMembers]   per member: [str name][u32 ndim][i64 dims...]
-                      [str descr][u64 usize][str err]
-                      [u32 nInline][bytes]     小さい値 (scalar / 文字列 /
-                                               短い 1-D) は npy バッファ逐語
-     kind 1 のとき: 予約 member (__pixels_ 系以外) の npy バッファ逐語
+     [u32 kind]       0 ordinary / 1 viewer container
+     [u32 version]    kind 1 の __viewer 版。ordinary は 0
+     [u32 nMembers]   per member: [str name][u32 usizeLo][u32 usizeHi]
+                      [u32 entry][str err][u32 whole][u32 nBytes][bytes]
+                      成功時の bytes は npy header、whole=1 なら必要な値まで。
+                      err が非空なら bytes は空
 ```
 
 - zip の central-directory 歩き (`npzList`) と npy ヘッダ覗き (`npyPeekHeader`)
@@ -683,8 +683,9 @@ MSG_NPZ_SCAN
   観測可能な差は「軸候補と呼ばれるが決して昇格しない member」の分類文言だけ。
   矛盾の名指し: これは既存コード (:711) の cap 変更であり、本追記が決める。
 - container の予約 member は「小さい」(word・数値・ベクトル — loader_npz.inc
-  :887-888) ので逐語で乗る。条件 2^20 × f8 = 8 MB が最悪で 64 MB 枠 (serve.cpp
-  :2623) に収まる。`__pixels_<i>` は乗らない — それが渡らないための本設計である。
+  :887-888) ので逐語で乗る。member ごとの条件 2^20 × f8 = 8 MiB が上限で、
+  応答全体には下記の 256 MiB 枠を別に適用する。`__pixels_<i>` は乗らない —
+  それが渡らないための本設計である。
   版の拒否 (`VIEWER_NPZ_VERSION` :851、3 は名指しで断る) は client の既存文のまま
   — 検査の門は 1 つ、が §5.2 の規律。
 
@@ -699,7 +700,9 @@ peer` で断る。**転送についての文が、ファイルについて、人
 
 **天井は 256 MiB** (`rp::NPZ_SCAN_INLINE_MAX`)。client の上限のちょうど半分で、
 これに収まった応答が `oversized` になる経路は無い。`VIEWER_SERVE_NPZ_SCAN_MAX`
-(bytes) が上書きする — 256 MiB を踏む fixture は 256 MiB であり、算術の比較を
+(bytes) はこの値を**下げる場合だけ**有効で、符号・空白・末尾文字・桁あふれを
+含む値は無効、256 MiB 以上は 256 MiB に留める。256 MiB を踏む fixture は
+256 MiB であり、算術の比較を
 証明するために 1/4 GB を書く selftest は誰も走らせない、という理由だけのために
 在る。最初の scan で 1 度読み、peer は生涯 1 つの数を答える。
 
@@ -709,7 +712,7 @@ member 名は 16-bit 長 — 60,000 文字 × 5,000 member は name だけで 30
 値の合計 238.4 MiB は 256 MiB を通り、ワイヤには 524.5 MiB が出て、人には
 `oversized reply from the peer` が返った。数え落としのある天井は天井ではない。
 
-数えるのは、**inflate と `Buf` 構築より前に**、overflow-safe (減算のみ) で:
+数えるのは、**inflate と `Buf` 構築より前に**、overflow-safe に:
 
 | 何 | bytes | 置き場 |
 |---|---|---|
@@ -718,8 +721,9 @@ member 名は 16-bit 長 — 60,000 文字 × 5,000 member は name だけで 30
 | member ごとの可変 — `name` + `err` + `bytes` | 実長 | `nz::readFacts` |
 
 合計は `rp::Header` の 12 byte を含まない (client が縛るのは u32 の payload 長)。
-`used` が `max` を超えないことは reserve が守る不変条件なので `max - used` は
-wrap せず、`used + take` は形にすらならない。予算は **inflate の前に** 引かれる
+`used` が `max` を超えないことは reserve が守る不変条件なので、比較時の
+`max - used` は wrap しない。`used + take` は reserve が `take <= max - used` を
+証明した後だけ形成し、結果は必ず `max` 以下になる。予算は **inflate の前に** 引かれる
 — 断ってから解凍代を払うのは、天井が防ごうとしている障害そのものである。
 
 **超えたら、ファイルは丸ごと断る** (`MSG_ERR`)。行を間引いて収める道は無い:
@@ -729,7 +733,19 @@ client が後から引ける材料化物を残さない)。応答を組み立て
 予算を突き合わせ、食い違えば送らずに断る — 到達しない検査だが、外れたときの
 代償が「断られたファイル」ではなく「終わった session」だからである。
 
-赤→緑: rnpz **R20**(値の合計)・**R21**(name を含む正確なワイヤ総量、実寸一致まで)。
+header は最初の 12 byte から形式自身が宣言した末尾を 64-bit で求め、その長さを
+member の `usize`・allocation・応答残量に照合してから、宣言末尾までだけを展開する。
+値を同梱する場合も shape と dtype から求めた `need` までで止め、directory が後続の
+padding を含んでいても全 member を展開しない。
+
+zip の central directory は EOCD/Zip64 が宣言する `cdSize` と entry 数を最後まで
+満たす必要があり、途中まで読めた entry を部分的な listing として返さない。各 entry
+は local header の signature・member 名・圧縮 method と一致して初めて、その data
+span を読む。
+
+赤→緑: rnpz **R20**(値の合計)・**R21**(name/error を含む正確なワイヤ総量と実寸一致)・
+**R23**(12-byte probe、長い header、trailing bytes、ratio 境界)・**R24**(central
+directory 完走、local header 照合、長い error の実寸)・**R25**(lower-only override)。
 
 ### 10.3 (b) member picker — 同じ画面、同じ入口
 

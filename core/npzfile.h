@@ -68,24 +68,68 @@ struct Head {
     size_t dataOff = 0;
 };
 
+// Return the end of a .npy header from the format's fixed prefix.  Version 1
+// stores a u16 length at +8; later versions store a u32 length there.  Keeping
+// the result in uint64_t matters on 32-bit builds: 12 + UINT32_MAX cannot be
+// represented by size_t, and this value must be checked before it is cast for
+// an allocation.
+inline bool npyHeaderEnd(const std::vector<uint8_t>& pre, uint64_t& headerEnd,
+                         std::string& err) {
+    auto fail = [&](const char* m) { err = m; return false; };
+    if (pre.size() < 10 || pre[0] != 0x93 || memcmp(&pre[1], "NUMPY", 5) != 0)
+        return fail("not a .npy file (bad magic)");
+    if (pre[6] >= 2) {
+        if (pre.size() < 12) return fail("corrupt npy header");
+        uint32_t v;
+        memcpy(&v, &pre[8], 4);
+        headerEnd = 12ull + (uint64_t)v;
+    } else {
+        uint16_t v;
+        memcpy(&v, &pre[8], 2);
+        headerEnd = 10ull + (uint64_t)v;
+    }
+    return true;
+}
+
+// Check both limits that stand between a 64-bit length from a file and a
+// vector allocation on this build.  This is asked before resize/assign, never
+// after a narrowing cast.
+inline bool fitsAlloc(uint64_t n) {
+    const std::vector<uint8_t> probe;
+    const uint64_t cap = std::min<uint64_t>((uint64_t)probe.max_size(),
+                                            (uint64_t)(size_t)-1);
+    return n <= cap;
+}
+
+// miniz's deflate bound, expressed without the file-controlled multiply-add
+// `csize * 1032 + 1024`.  The ceil form is exactly equivalent at the boundary
+// and cannot overflow for any uint64_t input.
+inline bool deflateSizePlausible(uint64_t usize, uint64_t csize) {
+    const uint64_t excess = usize > 1024 ? usize - 1024 : 0;
+    const uint64_t minCompressed =
+        excess / 1032 + (excess % 1032 == 0 ? 0 : 1);
+    return csize >= minCompressed;
+}
+
 inline bool peekHeader(const std::vector<uint8_t>& buf, Head& H, std::string& err) {
     auto fail = [&](const char* m) { err = m; return false; };
     if (buf.size() < 10 || buf[0] != 0x93 || memcmp(&buf[1], "NUMPY", 5) != 0)
         return fail("not a .npy file (bad magic)");
     int major = buf[6];
-    size_t hlen, hoff;
+    uint64_t hlen = 0, hoff = 0;
     if (major >= 2) {
         if (buf.size() < 12) return fail("corrupt npy header");
         uint32_t v; memcpy(&v, &buf[8], 4); hlen = v; hoff = 12;
     } else {
         uint16_t v; memcpy(&v, &buf[8], 2); hlen = v; hoff = 10;
     }
-    if (hoff + hlen > buf.size()) return fail("corrupt npy header");
+    const uint64_t bsz = (uint64_t)buf.size();
+    if (hoff > bsz || hlen > bsz - hoff) return fail("corrupt npy header");
     // data() + hoff, never &buf[hoff]: a 10-byte v1 file declaring hlen 0 passes
     // the check above with hoff == buf.size(), and the subscript is then one
     // past the end - undefined, and an abort under -D_GLIBCXX_ASSERTIONS. The
     // empty header is refused by "cannot parse descr" either way.
-    std::string hdr((const char*)buf.data() + hoff, hlen);
+    std::string hdr((const char*)buf.data() + (size_t)hoff, (size_t)hlen);
     auto findQuoted = [&](const char* key) -> std::string {
         size_t k = hdr.find(key);
         if (k == std::string::npos) return {};
@@ -134,7 +178,7 @@ inline bool peekHeader(const std::vector<uint8_t>& buf, Head& H, std::string& er
     else if (H.code == "i4") { H.esize = 4; H.dtypeName = "i32"; }
     else if (H.code == "f4") { H.esize = 4; H.dtypeName = "f32"; }
     else if (H.code == "f8") { H.esize = 8; H.dtypeName = "f64"; }
-    H.dataOff = hoff + hlen;
+    H.dataOff = (size_t)(hoff + hlen);       // bounded by buf.size(), above
     return true;
 }
 
@@ -235,6 +279,7 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
         for (int i = 0; i < 8; i++) v |= (uint64_t)buf[o + i] << (8 * i);
         return v;
     };
+    out.clear();
     if (buf.size() < 22) { err = "not a zip file"; return false; }
     const uint64_t bsz = (uint64_t)buf.size();
     size_t eocd = SIZE_MAX;
@@ -243,7 +288,9 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
         if (rd32(i) == 0x06054b50) { eocd = i; break; }
     if (eocd == SIZE_MAX) { err = "not a zip file (no end record)"; return false; }
     uint64_t count = rd16(eocd + 10);
+    uint64_t cdSize = rd32(eocd + 12);
     uint64_t cdOff = rd32(eocd + 16);
+    const bool needZip64 = cdOff == 0xffffffffu || cdSize == 0xffffffffu;
     // 0xffffffff in the end record is not a number: it is the file SAYING "the
     // real one is in the zip64 record". So a file that says it and then does
     // not hold a zip64 record that fits is refused HERE, by that name - the old
@@ -252,22 +299,34 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
     //
     // A count of 0xffff alone is NOT that claim (a plain zip may legitimately
     // hold exactly 65535 members), so it still only opts into the lookup.
-    if (cdOff == 0xffffffffu || count == 0xffffu) {          // zip64
+    if (needZip64 || count == 0xffffu) {                    // zip64, when present
         bool got64 = false;
         if (eocd >= 20 && rd32(eocd - 20) == 0x07064b50) {
             const uint64_t z64 = rd64(eocd - 20 + 8);
-            // 56 = the fixed part of the zip64 end record, up to and including
-            // the central-directory offset at +48. SUBTRACTION: z64 is a number
-            // out of the file and `z64 + 56` wraps for anything near UINT64_MAX.
-            if (zipFits(z64, 56, bsz) && rd32((size_t)z64) == 0x06064b50) {
-                count = rd64((size_t)z64 + 32);
-                cdOff = rd64((size_t)z64 + 48);
-                got64 = true;
+            // A zip64 end record is [signature][u64 size][size bytes].  Merely
+            // checking the first fixed 56 bytes is insufficient: a record can
+            // claim a longer body that runs into its locator or past the file.
+            // Validate the declared span by subtraction before reading fields.
+            const uint64_t locator = (uint64_t)eocd - 20;
+            if (zipFits(z64, 12, bsz) && z64 <= locator &&
+                rd32((size_t)z64) == 0x06064b50) {
+                const uint64_t recordSize = rd64((size_t)z64 + 4);
+                const uint64_t room = locator - z64;
+                if (recordSize >= 44 && room >= 12 && recordSize <= room - 12) {
+                    count = rd64((size_t)z64 + 32);
+                    cdSize = rd64((size_t)z64 + 40);
+                    cdOff = rd64((size_t)z64 + 48);
+                    got64 = true;
+                }
             }
         }
-        if (!got64 && cdOff == 0xffffffffu) {
+        // A plain archive may really contain exactly 65535 entries, so the
+        // count sentinel alone only asks us to use zip64 if it is present.
+        // Offset and size sentinels, however, have no numeric meaning without
+        // that record and must never fall through as ordinary values.
+        if (!got64 && needZip64) {
             err = zipBad("its end record defers to a zip64 end record that is not "
-                         "there, or that starts past the end of the file");
+                         "there, is incomplete, or starts past the end of the file");
             return false;
         }
     }
@@ -278,21 +337,45 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
         err = zipBad("its central directory starts past the end of the file");
         return false;
     }
-    uint64_t p = cdOff;
-    for (uint64_t i = 0; i < count && zipFits(p, 46, bsz); i++) {
-        if (rd32((size_t)p) != 0x02014b50) break;
+    if (!zipFits(cdOff, cdSize, bsz)) {
+        err = zipBad("its central directory runs past the end of the file");
+        return false;
+    }
+
+    // Read exactly the count the end record declares.  A short or malformed
+    // later record invalidates the container as a whole; returning the prefix
+    // already walked would silently remove rows from the member picker.
+    std::vector<Entry> listed;
+    uint64_t p = cdOff, left = cdSize;
+    for (uint64_t i = 0; i < count; i++) {
+        auto shortDirectory = [&]() {
+            err = zipBad("its end record declares " + std::to_string(count) +
+                         " entries and its central directory holds " +
+                         std::to_string(i));
+            return false;
+        };
+        if (!zipFits(p, 46, bsz) || 46 > left) return shortDirectory();
+        if (rd32((size_t)p) != 0x02014b50) {
+            err = zipBad("entry " + std::to_string(i) + " of its central directory "
+                         "does not begin with a central-directory signature");
+            return false;
+        }
         Entry e{};
         e.method = rd16((size_t)p + 10);
         e.csize = rd32((size_t)p + 20);
         e.usize = rd32((size_t)p + 24);
-        uint16_t nlen = rd16((size_t)p + 28), elen = rd16((size_t)p + 30),
-                 clen = rd16((size_t)p + 32);
+        const uint64_t nlen = rd16((size_t)p + 28), elen = rd16((size_t)p + 30),
+                       clen = rd16((size_t)p + 32);
         e.localOff = rd32((size_t)p + 42);
-        if (!zipFits(p + 46, nlen, bsz)) break;   // p + 46 <= sz: the loop said so
+        // The fixed header and all three variable fields form one record.  Its
+        // entire span has to fit both the file and the declared directory size
+        // before a name or extra field is read.
+        const uint64_t span = 46 + nlen + elen + clen;
+        if (!zipFits(p, span, bsz) || span > left) return shortDirectory();
         // data() + off again: a central-directory header that ends exactly at
         // the last byte with a zero-length name satisfies both bounds above and
         // then subscripts one past the end.
-        e.name.assign((const char*)buf.data() + p + 46, nlen);
+        e.name.assign((const char*)buf.data() + (size_t)(p + 46), (size_t)nlen);
         if (e.csize == 0xffffffffu || e.usize == 0xffffffffu || e.localOff == 0xffffffffu) {
             // ---- the zip64 extra field (APPNOTE 4.5.3) ----------------------
             //
@@ -309,7 +392,7 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
             // (`buf.size()`, which is the truth). They are different questions
             // - a record can promise more than the file contains - and the
             // arithmetic is done by SUBTRACTION so that no sum can wrap.
-            const size_t ep0 = (size_t)(p + 46) + nlen;                 // <= buf.size(), above
+            const size_t ep0 = (size_t)(p + 46 + nlen);                // <= buf.size(), above
             if ((size_t)elen > buf.size() - ep0) {
                 err = zip64Bad(e.name, "its extra field runs past the end of the file");
                 return false;
@@ -317,7 +400,7 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
             const size_t eend = ep0 + elen;
             size_t ep = ep0;
             bool got = false;
-            while (ep + 4 <= eend) {
+            while (ep <= eend && eend - ep >= 4) {
                 const uint16_t id = rd16(ep), sz = rd16(ep + 2);
                 const size_t body = ep + 4;                   // <= eend <= buf.size()
                 if ((size_t)sz > eend - body) {
@@ -356,10 +439,29 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
                 return false;
             }
         }
-        out.push_back(std::move(e));
-        p += 46 + nlen + elen + clen;
+        listed.push_back(std::move(e));
+        p += span;                         // proved to fit, above
+        left -= span;
     }
-    if (out.empty()) { err = "zip contains no entries"; return false; }
+
+    // A central-directory digital signature is a legal record after the file
+    // headers and is included in cdSize.  Apart from that one defined trailer,
+    // the declared size must be consumed exactly by the declared records.
+    if (left) {
+        if (left >= 6 && rd32((size_t)p) == 0x05054b50) {
+            const uint64_t sigSpan = 6 + (uint64_t)rd16((size_t)p + 4);
+            if (sigSpan == left && zipFits(p, sigSpan, bsz)) {
+                p += sigSpan;
+                left = 0;
+            }
+        }
+        if (left) {
+            err = zipBad("its central-directory size does not match its complete records");
+            return false;
+        }
+    }
+    if (listed.empty()) { err = "zip contains no entries"; return false; }
+    out.swap(listed);
     return true;
 }
 
@@ -381,10 +483,39 @@ inline bool dataStart(const std::vector<uint8_t>& zip, const Entry& e, size_t& a
         return false;
     }
     auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
-    const uint64_t nlen = rd16((size_t)e.localOff + 26), elen = rd16((size_t)e.localOff + 28);
-    // 30 fits (above) and nlen/elen are 16-bit, so this sum is formed in 64 bits
-    // out of numbers that cannot carry it past UINT64_MAX.
-    const uint64_t start = e.localOff + 30 + nlen + elen;
+    auto rd32 = [&](size_t o) {
+        return (uint32_t)zip[o] | (uint32_t)zip[o + 1] << 8 |
+               (uint32_t)zip[o + 2] << 16 | (uint32_t)zip[o + 3] << 24;
+    };
+    if (rd32((size_t)e.localOff) != 0x04034b50) {
+        err = "corrupt local header for member \"" + e.name +
+              "\": there is no local header where the directory says there is one";
+        return false;
+    }
+    if (rd16((size_t)e.localOff + 8) != e.method) {
+        err = "corrupt local header for member \"" + e.name +
+              "\": it and the directory disagree about how the member is compressed";
+        return false;
+    }
+    const uint64_t nlen = rd16((size_t)e.localOff + 26);
+    const uint64_t elen = rd16((size_t)e.localOff + 28);
+    // Check the complete local-header span before forming its end or comparing
+    // the repeated member name.  nlen/elen are only 16-bit, but localOff is a
+    // file-controlled zip64 value.
+    const uint64_t span = 30 + nlen + elen;
+    if (!zipFits(e.localOff, span, zsz)) {
+        err = "corrupt local header for member \"" + e.name +
+              "\": it runs past the end of the file";
+        return false;
+    }
+    if (nlen != (uint64_t)e.name.size() ||
+        (nlen && memcmp(zip.data() + (size_t)e.localOff + 30, e.name.data(),
+                        (size_t)nlen) != 0)) {
+        err = "corrupt zip: the directory entry for member \"" + e.name +
+              "\" points at another member's bytes";
+        return false;
+    }
+    const uint64_t start = e.localOff + span;       // proved to fit, above
     if (!zipFits(start, e.csize, zsz)) {
         err = "truncated zip member \"" + e.name + "\"";
         return false;
@@ -407,11 +538,17 @@ inline bool extract(const std::vector<uint8_t>& zip, const Entry& e,
     // cannot expand by more than 1032:1, so anything above that is a claim the
     // compressed run could not possibly redeem - refused as a fact about the
     // member instead of thrown as a bad_alloc from the middle of a walk.
-    // (csize was bounded against the buffer by dataStart above, so the product
-    // below is formed out of a number smaller than the file and cannot wrap.)
-    if (e.usize > e.csize * 1032 + 1024) {
+    // Preserve the exact `usize > csize * 1032 + 1024` boundary without ever
+    // forming that multiply-add.  The comparison is equivalent to asking
+    // whether csize is smaller than ceil((usize - 1024) / 1032).
+    if (!deflateSizePlausible(e.usize, e.csize)) {
         err = "corrupt zip member \"" + e.name +
               "\": it declares more uncompressed bytes than its compressed run can hold";
+        return false;
+    }
+    if (!fitsAlloc(e.usize)) {
+        err = "corrupt zip member \"" + e.name +
+              "\": it declares more uncompressed bytes than this machine can hold";
         return false;
     }
     // zip members are RAW deflate (no zlib header), and the uncompressed size is
@@ -434,7 +571,13 @@ inline bool extractPrefix(const std::vector<uint8_t>& zip, const Entry& e,
                           size_t want, std::vector<uint8_t>& out, std::string& err) {
     size_t data = 0;
     if (!dataStart(zip, e, data, err)) return false;
-    size_t cap = std::min<uint64_t>(want, e.usize);
+    const uint64_t capWanted = std::min<uint64_t>((uint64_t)want, e.usize);
+    if (!fitsAlloc(capWanted)) {
+        err = "corrupt zip member \"" + e.name +
+              "\": it declares more uncompressed bytes than this machine can hold";
+        return false;
+    }
+    const size_t cap = (size_t)capWanted;
     if (e.method == 0) {                                     // stored
         size_t nCopy = (size_t)std::min<uint64_t>(cap, e.csize);
         out.assign(zip.begin() + (ptrdiff_t)data, zip.begin() + (ptrdiff_t)(data + nCopy));
@@ -495,7 +638,7 @@ static const uint64_t INLINE_MAX_BYTES = 8ull << 20;
 
 // ...and the TOTAL, which is a different question and the one a wire has to ask
 // (#221 review). Every member of a valid container can pass the per-member rule
-// above and the file still be unlistable: 68 one-million-element f8 axes are 68
+// above and the file still be unlistable: 68 axes of 2^20 f8 elements are 68
 // members of 8 MiB each - each of them legal, each of them wanted - and 544 MiB
 // of reply, which core/remote.cpp refuses at 512 MiB as "oversized reply from
 // the peer". So the sum has an owner too, and it is the side that fills the
@@ -571,10 +714,11 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
     // to happen before an inflate that may be refused (a ceiling that refuses
     // after paying for the decompression is the outage it exists to prevent),
     // while what is finally SPENT is the size of the buffer that actually ended
-    // up on the fact - which can only be smaller. Both are subtractions:
-    // `used` never exceeds `max` (that is the invariant reserve enforces and
-    // commit preserves), so `max - used` cannot wrap and `used + take` is never
-    // formed. `over` non-empty means the caller must refuse the whole answer.
+    // up on the fact - which can only be smaller. The comparison is a
+    // subtraction: `used` never exceeds `max`, so `max - used` cannot wrap.
+    // commit then forms `used + take` only after reserve proved that sum is at
+    // most `max`. `over` non-empty means the caller must refuse the whole
+    // answer.
     auto reserve = [&](uint64_t take, const std::string& who) {
         if (!budget || !budget->max) return true;
         if (take > budget->max - budget->used) {
@@ -610,16 +754,31 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
             if (!reserve(fixed, f.name)) return {};
             commit(fixed);
         }
-        // Header only: an image member is never inflated here, however big it
-        // is. 64 KiB covers every .npy header (v1 caps the length at 65535 and
-        // the dict is padded to a 64-byte multiple); a v2 header longer than
-        // that falls back to a full read rather than being called corrupt.
+        // Read the fixed prefix first, derive the header's declared end from
+        // it, validate that length, then read exactly that prefix.  There is no
+        // full extract in readFacts: a long or malformed v2 header must not
+        // turn a header peek into an allocation of the member's entire declared
+        // uncompressed size.
         std::vector<uint8_t> buf;
         std::string err;
         Head H;
-        bool got = extractPrefix(zip, e, 64 * 1024, buf, err) && peekHeader(buf, H, err);
-        if (!got && buf.size() < e.usize)
-            got = extract(zip, e, buf, err) && peekHeader(buf, H, err);
+        uint64_t headerEnd = 0;
+        bool got = extractPrefix(zip, e, 12, buf, err) &&
+                   npyHeaderEnd(buf, headerEnd, err);
+        if (got && headerEnd > e.usize) {
+            got = false;
+            err = "corrupt npy header";
+        }
+        if (got && !fitsAlloc(headerEnd)) {
+            got = false;
+            err = "corrupt npy header: it is longer than this machine can hold";
+        }
+        // A successful header is carried on the wire, so its exact declared
+        // size is also the allocation guard for the second prefix read.
+        if (got && !reserve(headerEnd, f.name)) return {};
+        if (got)
+            got = extractPrefix(zip, e, (size_t)headerEnd, buf, err) &&
+                  peekHeader(buf, H, err);
         if (!got) {
             f.err = err;
             // The error TRAVELS, so it is counted. It is one of this file's own
@@ -666,7 +825,10 @@ inline std::vector<Fact> readFacts(const std::vector<uint8_t>& zip,
                      f.name))
             return {};
         if (want) {
-            if (buf.size() < need && !extract(zip, e, buf, err)) {
+            // Read only the bytes the parsed array needs.  Directory padding
+            // after the value is neither sent nor allocated.
+            if (buf.size() < need &&
+                !extractPrefix(zip, e, (size_t)need, buf, err)) {
                 f.err = err;
                 if (!reserve((uint64_t)f.err.size(), f.name)) return {};
                 commit((uint64_t)f.err.size());

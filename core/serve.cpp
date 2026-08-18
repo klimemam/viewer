@@ -3654,7 +3654,7 @@ static void handleReaderRun(Buf& in) {
 // The ceiling on ONE NPZ_SCAN REPLY - the whole of it, all members together
 // (#221 review, corrected by #180's). The per-member rule cannot bound a reply:
 // nz::INLINE_MAX_BYTES lets each member through at 8 MiB and a perfectly valid
-// container may hold hundreds of them, so 68 one-million-element f8 axes are
+// container may hold hundreds of them, so 68 axes of 2^20 f8 elements are
 // 544 MiB of a file nothing is wrong with - past the 512 MiB core/remote.cpp
 // will accept, which arrives as "oversized reply from the peer": a sentence
 // about the transport, for a file, that the person cannot act on.
@@ -3673,20 +3673,14 @@ static void handleReaderRun(Buf& in) {
 // listing that lied - and the refusal is an MSG_ERR for the FILE, so the person
 // is told about the file rather than about the transport.
 //
-// VIEWER_SERVE_NPZ_SCAN_MAX overrides it, in bytes. That exists so the rule can
-// be TESTED: the fixture that trips 256 MiB is 256 MiB, and a selftest that
-// writes a quarter of a gigabyte to prove an arithmetic comparison is a selftest
-// nobody runs. Read once, at the first scan, so the peer answers one number for
-// its whole life.
+// VIEWER_SERVE_NPZ_SCAN_MAX may LOWER it, in bytes. That exists so the rule can
+// be tested without writing a quarter-gigabyte fixture; it must not raise the
+// ceiling past the transport bound the default was chosen to respect. The
+// strict parse and clamp live beside the protocol constant and are read once,
+// at the first scan, so the peer answers one number for its whole life.
 static uint64_t npzScanInlineMax() {
-    static const uint64_t n = [] {
-        const char* e = getenv("VIEWER_SERVE_NPZ_SCAN_MAX");
-        if (e && *e) {
-            const unsigned long long v = strtoull(e, nullptr, 10);
-            if (v) return (uint64_t)v;
-        }
-        return NPZ_SCAN_INLINE_MAX;
-    }();
+    static const uint64_t n =
+        rp::npzScanCeilingFor(getenv("VIEWER_SERVE_NPZ_SCAN_MAX"));
     return n;
 }
 
@@ -3714,8 +3708,8 @@ static void handleNpzScan(Buf& in) {
     // and what each member costs beyond its name, its error and its bytes. Both
     // are rp::'s, next to the wire they describe, so this cannot drift from what
     // the Buf below actually appends.
-    budget.used = NPZ_SCAN_REPLY_FIXED;
-    budget.perFact = NPZ_SCAN_FACT_FIXED;
+    budget.used = rp::NPZ_SCAN_REPLY_FIXED;
+    budget.perFact = rp::NPZ_SCAN_FACT_FIXED;
     const std::vector<nz::Fact> facts = nz::readFacts(zip, entries, &budget);
     if (!budget.over.empty()) {
         sendErr("this .npz needs more than one reply can hold: \"" +
