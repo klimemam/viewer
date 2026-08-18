@@ -867,8 +867,15 @@ static void drawInspector() {
 
         const int g = displayGammaPreset(app.dispGamma);
         ImGui::TextUnformatted("gamma"); ImGui::SameLine();
-        if (ImGui::RadioButton("1.0", g == 0) && g != 0) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
-        if (ImGui::RadioButton("2.2", g == 1) && g != 1) { app.dispGamma = 2.2f; markAllTexDirty(); }
+        if (ImGui::RadioButton("1.0", g == 0) && g != 0) {
+            app.dispGamma = 1.0f;
+            settingsDisplayGuiChanged(SK_gamma, "appearance.displayGamma");
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("2.2", g == 1) && g != 1) {
+            app.dispGamma = 2.2f;
+            settingsDisplayGuiChanged(SK_gamma, "appearance.displayGamma");
+        }
         if (g < 0) {
             ImGui::SameLine();
             ImGui::TextDisabled("custom %s", displayGammaText(app.dispGamma).c_str());
@@ -880,7 +887,8 @@ static void drawInspector() {
             float used = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x -
                          ImGui::GetCursorStartPos().x;
             if (ImGui::GetContentRegionAvail().x - used >= need) ImGui::SameLine();
-            ImGui::Checkbox("grid (G)", &app.showGrid);
+            if (ImGui::Checkbox("grid (G)", &app.showGrid))
+                settingsDisplayGuiChanged(SK_pixelGrid, "appearance.pixelGrid");
         }
     } else {
         ImGui::TextDisabled("no image");

@@ -179,7 +179,7 @@ RAW recipes パネルの「Copy as JSONC」(`rawRecipeJsonc`) と
 
 ## 5. 出所の申告 (問い3)
 
-### 5.1 4値のバッジ
+### 5.1 5値のバッジ
 
 各行が右端に1つ、**出所バッジ**を出す (新語はこれ1つ: 段1 の
 `SettingsReport` が file:line で名乗る「出所」の画面語。既存語「名指し」は
@@ -187,12 +187,42 @@ RAW recipes パネルの「Copy as JSONC」(`rawRecipeJsonc`) と
 
 | バッジ | 意味 | 根拠 |
 |---|---|---|
-| **既定のまま** | どの層も発言せず、値も組み込み既定と同じ | 判断9 の表示形 |
-| **このマシン** | prefs.txt / GUI 由来 (値が既定と違う) | — |
-| **settings.jsonc:NN** | ファイルが決めている。**粘る** | 段1 §10.2 の帰結 |
-| **コマンドライン (--flag)** | この起動だけ | 判断13 |
+| **`default`** | どの層も発言せず、値も組み込み既定と同じ | 判断9 の表示形 |
+| **`this machine`** | prefs.txt / GUI 由来 (値が既定と違う) | — |
+| **`settings.jsonc:NN`** | ファイルが決めている。**粘る** | 段1 §10.2 の帰結 |
+| **`command line (--flag)`** | この起動だけ | 判断13 |
+| **`session (.vsession)`** | 開いているセッションが gamma または grid を決めている | [Issue #225](https://github.com/klimemam/viewer/issues/225) |
 
-**File / Cli は発言ベース、Default / このマシン は値ベース (P4)。** 非対称
+`.vsession` から有効な `gamma` / `grid` 行を読んだ場合だけ、対応する行に
+`session (.vsession)` を表示する。session は起動時の4層より後に復元されるため、
+この2項目に限って最上位になる。ほかの Preferences 項目へ Session origin を
+広げない。
+
+```
+組み込みの既定 < prefs.txt < settings.jsonc < コマンドライン < session (.vsession)
+```
+
+最初に開いたセッションで行が欠けている、または値を解釈できない場合は、
+Session origin を新たに付けず、起動時の4層で決まった値と出所を維持する。
+同じプロセスで続けてセッションを開き、後のファイルに行がない場合は、従来の
+reader と同じく直前の実効値を変えない。直前が session 由来なら、その出所も
+維持する。値だけを維持してバッジを下位層へ戻すと、表示が事実と食い違うためである。
+
+session 読込後に Preferences、Inspector、メニュー、G キーで gamma/grid を
+変えても、出所は `session (.vsession)` のままとする。変更後の値は現在開いて
+いるセッションの表示状態であり、通常の保存と自動保存に入る。一方、GUI変更は
+prefs.txt の下位値も更新する。session を読んだだけでは下位値を上書きせず、
+実際に GUI で変更した項目だけを専用の下位スナップショットへ反映する。
+このスナップショットは最初の有効な session header を読む直前に、組み込み既定、
+prefs.txt、settings.jsonc、コマンドラインを解決した実効値から作る。session を
+一度も開かない起動では従来どおり App の実効値を prefs.txt に書くため、
+settings.jsonc やコマンドラインの保存挙動をこの2項目だけ変えることはない。
+
+`.vsession` の形式と版は変えない。従来からある `gamma` / `grid` 行をそのまま
+読み書きし、gamma は #228 の契約どおり float 変換後も0より大きい有限値だけを
+受理する。1.0 / 2.2 はプリセットであり、それ以外の有効値は Custom のまま復元する。
+
+**File / Cli / Session は発言ベース、Default / このマシン は値ベース (P4)。** 非対称
 なのは形式の事実による: settings.jsonc は「書いたキーだけが発言」(判断9) だが、
 prefs.txt は `writePrefsTo` が**毎回全キーを書く**ので、キーの存在から
 「利用者が選んだ」を読み取れない。だから prefs 層では値比較しか言えることが
@@ -211,14 +241,23 @@ state.json の段である。
 `SKey` ごとに1エントリの小さな台帳:
 
 ```
-enum class SetOrigin { None, File, Cli };        // 発言ベースの2層だけ持つ
-struct OriginEntry { SetOrigin who; int line; const char* cliFlag; std::string fileVal; };
+enum class SetOrigin { None, File, Cli, Session };
+struct OriginEntry { SetOrigin who; int line; const char* cliFlag; };
 ```
 
-- `loadSettings()` が適用したキーに `File` + 行番号 + 適用値を記す
+- `loadSettings()` が適用したキーに `File` + 行番号を記す。適用値は App の
+  実効フィールドが持ち、台帳には複製しない
   (`SjVal` が位置を運んでいるので追加費用はほぼ無い)。
 - `parseCli()` の既定を決める 20 フラグのうち表と 1:1 のもの (`--frame`
   `--stack` `--mem-budget` `--remote-exe` `--remote-policy`) が `Cli` を記す。
+- `.vsession` の有効な `gamma` / `grid` 行は、それぞれ `SK_gamma` /
+  `SK_pixelGrid` にだけ `Session` を記す。欠落・不正な行は記帳しない。
+- 最初の有効な session header の直前に、起動時4層を解決した gamma/grid を
+  `PrefsBase` に保存する。session を開かなければ prefs writer は従来どおり
+  App の実効値を書く。
+- GUI変更は `PrefsBase` の対応項目だけを更新し、Session origin は維持する。
+  session save / autosave は App の現値、session 後の prefs writer は
+  `PrefsBase` を書く。
 - Default / このマシン は台帳に**無い**: 描画時に
   `settingsCurrentValue(id).empty()` で判定する (§5.1)。
 
@@ -342,6 +381,8 @@ prefs.txt を書くテストが共有 home を汚してはならない。
   - titleBar → Cli (`--frame`)。導出: 判断13、右端が勝つ。
   - dragPans → 既定のまま。導出: どの層も発言せず
     `settingsCurrentValue` が空。
+  - O5 → gamma/grid の有効な session 行、初回 missing/invalid、File/CLI 超越、
+    連続 load、GUI後の Session origin と下位 prefs、session/prefs writer を確認する。
 - **単独の意味**: 粘るキーの警告が「次の起動後」から「変えた瞬間」に前倒しに
   なる。パネルが無くてもメニューで既に効く。
 
@@ -415,7 +456,7 @@ prefs.txt を書くテストが共有 home を汚してはならない。
    判断3 の継承 + GUI の書き先が2つあれば「自分の設定はどこ」が壊れる (§4)。
 3. **P3 — Copy as JSONC はクリップボードのみ。** `rawRecipeJsonc` と
    `--settings-template` の前例どおり、アプリは出すだけ、書くのは利用者。
-4. **P4 — 出所は4バッジ。File/Cli は発言ベース、Default/このマシン は
+4. **P4 — 出所は5バッジ。File/Cli/Session は発言ベース、Default/このマシン は
    値ベース。** prefs.txt が全キーを書く形式である以上、prefs 層に発言の
    概念が無い。既定判定は `settingsCurrentValue()` を再利用し、既定表を
    2つにしない。

@@ -112,6 +112,10 @@ App app;
 
 #include "app/loader_npy_raw.inc"
 
+// session.inc restores two settings before settings.inc defines the origin
+// ledger.  Resolve them by canonical path once that ledger is available.
+static void settingsOriginSessionPath(const char* path);
+
 #include "app/session.inc"
 
 // settings.jsonc (issue #50 stage 1, docs/settings-inventory.md). AFTER
@@ -1329,7 +1333,10 @@ static bool g_watchSuppressed = false;
             if (ImGui::IsKeyPressed(ImGuiKey_F, false)) app.fitRequested = true;
             if (ImGui::IsKeyPressed(ImGuiKey_1, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad1, false))
                 app.view.zoom = 1.0f;
-            if (ImGui::IsKeyPressed(ImGuiKey_G, false)) app.showGrid = !app.showGrid;
+            if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+                app.showGrid = !app.showGrid;
+                settingsDisplayGuiChanged(SK_pixelGrid, "appearance.pixelGrid");
+            }
             // C is an alias: ImGuiKey_Backslash follows the US scancode, which is
             // not where "\" sits on a JIS keyboard
             if (ImGui::IsKeyPressed(ImGuiKey_Backslash, false) ||

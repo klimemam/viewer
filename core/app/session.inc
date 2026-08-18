@@ -957,6 +957,28 @@ static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work) {
 // Split out of savePrefs for the same reason writeSessionTo is split out of
 // saveSession: the bytes are one thing and getting them onto the disk safely is
 // another, and only the second one has a failure worth talking about.
+//
+// gamma/grid are also session display state.  Their effective App fields can
+// therefore contain a value restored from .vsession, but that must not silently
+// become this machine's preference when an unrelated preference is saved.  Keep
+// the lower prefs.txt layer separately for just these two overlapping keys.
+struct PrefsBase {
+    float dispGamma = 1.0f;
+    bool showGrid = false;
+};
+static PrefsBase g_prefsBase;
+// Inactive until the first valid .vsession header. Before that point prefs.txt
+// keeps its historical behaviour and writes App's effective startup value,
+// including a settings.jsonc override. At the first session boundary we freeze
+// that exact lower value so only the later session value is excluded.
+static bool g_prefsBaseActive = false;
+
+static void capturePrefsBase() {
+    g_prefsBase.dispGamma = app.dispGamma;
+    g_prefsBase.showGrid = app.showGrid;
+    g_prefsBaseActive = true;
+}
+
 static void writePrefsTo(std::ostream& f) {
     f << "viewer-prefs 1\n";
     f << "theme " << app.themeVariant << " " << app.themeAccent << "\n";
@@ -973,8 +995,10 @@ static void writePrefsTo(std::ostream& f) {
     f << "membudget " << app.memBudgetGB << "\n";
     f << "procpolicy " << app.procPolicy << "\n";
     f << "linunit " << app.lin.unit << "\n";
-    f << "gamma " << displayGammaText(app.dispGamma) << "\n";
-    f << "grid " << (app.showGrid ? 1 : 0) << "\n";
+    f << "gamma " << displayGammaText(g_prefsBaseActive ? g_prefsBase.dispGamma
+                                                         : app.dispGamma) << "\n";
+    f << "grid " << ((g_prefsBaseActive ? g_prefsBase.showGrid : app.showGrid) ? 1 : 0)
+      << "\n";
     f << "frame " << app.frameMode << "\n";
     // The window: logical size, raw position, then the maximized flag (see
     // fitSavedWindow). Written only once a real window has reported a geometry,
@@ -2232,6 +2256,7 @@ static std::string loadSession(const std::string& path) {
     std::string line;
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
+    if (!g_prefsBaseActive) capturePrefsBase();
     closeAll();                    // stops the loader and empties every open
                                    // queue: orphan frames from a previous load
                                    // must not graft onto the restored list
@@ -2256,6 +2281,11 @@ static std::string loadSession(const std::string& path) {
     int pendingRead = NR_NATIVE;       // §3.3 reading for the next image line
     bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
+    // Old sessions may omit either display line. An absent or malformed line
+    // must not create a new Session claim. If the current value was already
+    // Session-owned, both value and claim remain: the reader has always left an
+    // omitted value intact, and changing only its badge would make it untrue.
+    bool gammaFromSession = false, gridFromSession = false;
     // "current" is an ordinal over saved image lines; a line can expand into a
     // whole stack, so resolve it to a real index once that line is fully applied
     // (seqframe, which picks the frame, comes after the image line).
@@ -2365,10 +2395,15 @@ static std::string loadSession(const std::string& path) {
         if      (key == "gamma") {
             double candidate = 0;
             float gamma = 0;
-            if ((ls >> candidate) && displayGammaValue(candidate, gamma))
+            if ((ls >> candidate) && displayGammaValue(candidate, gamma)) {
                 app.dispGamma = gamma;
+                gammaFromSession = true;
+            }
         }
-        else if (key == "grid")  { int g = 0; ls >> g; app.showGrid = g != 0; }
+        else if (key == "grid")  {
+            int g = app.showGrid ? 1 : 0;
+            if (ls >> g) { app.showGrid = g != 0; gridFromSession = true; }
+        }
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;
         else if (key == "current") ls >> wantCurrent;
@@ -3173,6 +3208,8 @@ static std::string loadSession(const std::string& path) {
                 stackFailures.size(), stackFailures.front().c_str());
     }
     g_sessionRestoring = false;        // deferred refs resolve at the drain gate
+    if (gammaFromSession) settingsOriginSessionPath("appearance.displayGamma");
+    if (gridFromSession)  settingsOriginSessionPath("appearance.pixelGrid");
     markAllTexDirty();                 // gamma may have changed
     return {};
 }

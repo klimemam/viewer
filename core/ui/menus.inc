@@ -459,7 +459,8 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::MenuItem("Zoom Out", "-", false, has))
             app.view.zoom = std::clamp(app.view.zoom * 0.5f, 1.0f / 512, 256.0f);
         ImGui::Separator();
-        ImGui::MenuItem("Pixel Grid", "G", &app.showGrid);
+        if (ImGui::MenuItem("Pixel Grid", "G", &app.showGrid))
+            settingsDisplayGuiChanged(SK_pixelGrid, "appearance.pixelGrid");
         ImGui::MenuItem("Wheel zooms without Ctrl", nullptr, &app.wheelZoomPlain);
         ImGui::MenuItem("Left drag pans (Shift = new ROI)", nullptr, &app.dragPans);
         if (ImGui::MenuItem("Compact UI (dense rows)", nullptr, &app.compactUi))
@@ -532,10 +533,14 @@ static void drawMenuBar(GLFWwindow* win) {
         }
         if (ImGui::BeginMenu("Display Gamma")) {
             const int preset = displayGammaPreset(app.dispGamma);
-            if (ImGui::MenuItem("1.0 (linear)", nullptr, preset == 0) && preset != 0)
-                { app.dispGamma = 1.0f; markAllTexDirty(); }
-            if (ImGui::MenuItem("2.2", nullptr, preset == 1) && preset != 1)
-                { app.dispGamma = 2.2f; markAllTexDirty(); }
+            if (ImGui::MenuItem("1.0 (linear)", nullptr, preset == 0) && preset != 0) {
+                app.dispGamma = 1.0f;
+                settingsDisplayGuiChanged(SK_gamma, "appearance.displayGamma");
+            }
+            if (ImGui::MenuItem("2.2", nullptr, preset == 1) && preset != 1) {
+                app.dispGamma = 2.2f;
+                settingsDisplayGuiChanged(SK_gamma, "appearance.displayGamma");
+            }
             if (preset < 0) {
                 ImGui::Separator();
                 ImGui::TextDisabled("Custom: %s", displayGammaText(app.dispGamma).c_str());
