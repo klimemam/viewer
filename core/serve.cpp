@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -33,10 +34,16 @@
 #include "miniz.h"
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <process.h>                 // _getpid: the scratch directory a run owns
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>                  // getpid, same
 #endif
 
@@ -644,13 +651,13 @@ static bool g_serveReaders = false;
 void setServeReaders(bool on) { g_serveReaders = on; }
 bool serveReadersOpen() { return g_serveReaders; }
 
-// The same 64-bit FNV the local adapter cache keys with (core/app/session.inc
-// adapterHash). The design named sha256; this is the weaker hash and it is the
-// one the other half of this feature already uses, so the two caches are keyed
-// by one function rather than by two that must be argued about separately. The
-// inputs are what matters and they are stronger than the local key's: the
-// reader's whole TEXT is hashed, not its mtime, so "the same bytes" is what the
-// key means and a module VERSION line is inside the thing being hashed.
+// The same 64-bit FNV-1a-style recurrence the local adapter cache uses in
+// core/app/session.inc (`adapterHash`). These are separate helpers because the
+// two caches have different owners and inputs; keeping the algorithm aligned
+// does not pretend their key formulas are interchangeable. The design named
+// sha256; the implementation hashes the reader's whole TEXT, not its mtime, so
+// "the same bytes" is what this key means and a module VERSION line is already
+// inside the thing being hashed.
 // This process's id, which several places below need in a file name so that
 // two peers on one disk cannot write into one another's scratch.
 static unsigned long servePid() {
@@ -705,6 +712,94 @@ static bool readerCachePath(const std::string& key, std::string& out) {
     return cacheFileFor(key, ".vstream", out);
 }
 
+// The persistent rendezvous file for every mutation of one canonical cache
+// entry. The file stays behind: unlinking a lock file after unlock creates two
+// different inodes when a waiter already has the old one open and a third
+// process opens the newly-created path. Keeping one inode per key is what makes
+// this a lock rather than a best-effort marker.
+static bool readerLockPath(const std::string& key, std::string& out) {
+    return cacheFileFor(key, ".lock", out);
+}
+
+// An OS-owned, interprocess lock. The kernel releases it if viewer-serve exits
+// or crashes, unlike an O_EXCL marker which can strand a key forever. It is
+// deliberately held only while the canonical name is inspected or changed;
+// Python writes to a per-run .part without it, so two expensive producers may
+// overlap and the first complete result still wins.
+class ReaderKeyLock {
+public:
+    ReaderKeyLock() = default;
+    ReaderKeyLock(const ReaderKeyLock&) = delete;
+    ReaderKeyLock& operator=(const ReaderKeyLock&) = delete;
+    ~ReaderKeyLock() { release(); }
+
+    bool acquire(const std::string& key, std::string& why) {
+        std::string path;
+        if (!readerLockPath(key, path)) {
+            why = "cannot form the per-key cache lock path";
+            return false;
+        }
+#if defined(_WIN32)
+        handle_ = CreateFileW(std::filesystem::u8path(path).wstring().c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            why = "cannot open the per-key cache lock (Windows error " +
+                  std::to_string((unsigned long)GetLastError()) + ")";
+            return false;
+        }
+        OVERLAPPED ov{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+            why = "cannot take the per-key cache lock (Windows error " +
+                  std::to_string((unsigned long)GetLastError()) + ")";
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            return false;
+        }
+#else
+        fd_ = open(std::filesystem::u8path(path).c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd_ < 0) {
+            why = "cannot open the per-key cache lock: " +
+                  std::string(std::strerror(errno));
+            return false;
+        }
+        int rc;
+        do { rc = flock(fd_, LOCK_EX); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) {
+            why = "cannot take the per-key cache lock: " +
+                  std::string(std::strerror(errno));
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+#endif
+        return true;
+    }
+
+private:
+    void release() {
+#if defined(_WIN32)
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        OVERLAPPED ov{};
+        UnlockFileEx(handle_, 0, 1, 0, &ov);
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+#else
+        if (fd_ < 0) return;
+        flock(fd_, LOCK_UN);
+        close(fd_);
+        fd_ = -1;
+#endif
+    }
+
+#if defined(_WIN32)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
 // ...and where a run WRITES before it is anything (#218 review r3794154621).
 //
 // Two viewer sessions asking the same uncached key at the same time are two
@@ -727,41 +822,17 @@ static bool readerTempPath(const std::string& key, std::string& out) {
     return cacheFileFor(key, leaf, out);
 }
 
-// ...and where an entry this process has decided is UNUSABLE goes while that
-// decision is acted on (#180 codex review).
-//
-// The publish path above made the winner safe; the REMOVAL path was still a
-// check-then-act. A process that read an existing cache entry, found it
-// unreadable, and then removed it, removed whatever was at that path AT THE
-// MOMENT OF THE REMOVE - which, in the window between the two, may be a
-// different file entirely: another process that made the same judgement, ran
-// the reader and published a perfectly good result. The good result vanished
-// and the session that had just been told "here is your key" found nothing
-// under it.
-//
-// A rename takes the file AWAY from the shared name in one step and gives it a
-// name only this process knows, so from then on the bytes are unambiguously
-// this process's to delete. It does not, on its own, prove they are the bytes
-// that were judged - so the judgement is made AGAIN on the quarantined file,
-// and an entry that turns out to be whole is put straight back. Ownership
-// first, verdict second: that ordering is the entire fix.
-static bool readerQuarantinePath(const std::string& key, std::string& out) {
-    static std::atomic<uint64_t> seq{ 0 };
-    char leaf[64];
-    snprintf(leaf, sizeof leaf, ".%lu.%llu.bad", servePid(),
-             (unsigned long long)(seq.fetch_add(1) + 1));
-    return cacheFileFor(key, leaf, out);
-}
-
 // VIEWER_SERVE_CACHE_JUDGE_HOLD: a seam that stops this process between judging
-// an existing cache entry unusable and acting on that judgement.
+// an existing cache entry unusable and taking the per-key lock that makes it
+// safe to act on that judgement.
 //
 // The race it exists to test is a window of a few microseconds between two
 // processes on one disk. A selftest that started two peers and hoped would be a
 // test that passes because the machine was busy, so this is a HANDSHAKE rather
 // than a sleep: the peer writes `<path>.at` to say it has judged and is
 // waiting, and waits for `<path>` to appear before it goes on. The test then
-// knows exactly when the window is open and closes it deliberately. A minute,
+// knows exactly when the stale observation exists and closes it deliberately.
+// The handler MUST recheck after acquiring the lock. A minute,
 // and then it proceeds anyway - a seam may not be a way to hang a peer.
 //
 // Absent everywhere else, read once, exactly as VIEWER_SERVE_LAG_MS and
@@ -3097,7 +3168,7 @@ static void handleMeasure(Buf& in) {
 // the words - except where the words are settled HERE, which is the gate (§2.1)
 // and the check of what the reader returned (§5.2, shared with the local door).
 
-// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". ASKED EVERY RUN.
+// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". ASKED ONCE PER RUN.
 //
 // It was asked once per interpreter per process and kept (#180 codex review),
 // which is a claim about a peer's lifetime that a peer does not get to make.
@@ -3110,21 +3181,48 @@ static void handleMeasure(Buf& in) {
 // published under the OLD environment's name. The second is the exact thing
 // putting `prov` in the key was for.
 //
-// The cost is one `python -c "import numpy"` per READER_RUN - a few hundred
-// milliseconds, once per Load, on the side that was about to run a reader
-// anyway. A cache hit pays it too, and that is the point: the hit is only a hit
-// if the environment is still the one the key was computed under, and there is
-// no cheaper honest way to find that out. "The second run does not start
-// Python" (§5.3) stays true of the READER, which is what it was ever about.
-static std::string pythonProvenance(const std::string& py) {
+// The cost is one authoritative `python -c` provenance probe per READER_RUN -
+// a few hundred milliseconds, once per Load. A cache hit pays it too, and that
+// is the point: the hit is only a hit if the environment is still the one the
+// key was computed under. The configured interpreter used to be started once
+// merely to import numpy and then a second time to ask this question. Besides
+// doing twice the work, that admitted two different answers across an upgrade;
+// this one command both proves numpy is importable and supplies the key fact.
+// Failure or silence is RO_NO_PYTHON, never a made-up provenance equal to `py`.
+static bool pythonProvenance(const std::string& py, std::string& provenance,
+                             std::string& why, std::string& detail) {
     adapter::Run r = adapter::run({ py, "-c",
         "import sys,numpy;print('Python %d.%d.%d (%s), numpy %s' % "
         "(sys.version_info[0],sys.version_info[1],sys.version_info[2],"
         "sys.executable,numpy.__version__))" }, 30000);
-    std::string s = r.out;
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    if (s.empty()) s = py;               // it answered nothing: name what we ran
-    return s;
+    detail = r.err;
+    if (!r.started) {
+        why = r.fail.empty() ? "the provenance probe could not start" : r.fail;
+        return false;
+    }
+    if (r.timedOut) {
+        why = "the provenance probe did not finish within 30 seconds";
+        return false;
+    }
+    if (r.exit != 0) {
+        why = r.err.find("numpy") != std::string::npos
+                ? "the provenance probe could not import or identify numpy"
+                : "the provenance probe exited with status " + std::to_string(r.exit);
+        return false;
+    }
+    provenance = r.out;
+    while (!provenance.empty() &&
+           (provenance.back() == '\n' || provenance.back() == '\r' ||
+            provenance.back() == ' ' || provenance.back() == '\t'))
+        provenance.pop_back();
+    const size_t first = provenance.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        provenance.clear();
+        why = "the provenance probe returned no Python/numpy identity";
+        return false;
+    }
+    if (first) provenance.erase(0, first);
+    return true;
 }
 
 static bool writeWholeFile(const std::filesystem::path& p, const std::string& body) {
@@ -3242,23 +3340,20 @@ static void handleReaderRun(Buf& in) {
     std::string why, py;
     const char* cfgPy = getenv("VIEWER_SERVE_PYTHON");
     if (cfgPy && *cfgPy) {
-        adapter::Run probe = adapter::run({ cfgPy, "-c", "import numpy" }, 30000);
-        if (probe.started && probe.exit == 0) {
-            py = cfgPy;
-        } else {
-            why = std::string("VIEWER_SERVE_PYTHON is ") + cfgPy +
-                  (!probe.started ? " (not found)"
-                   : probe.err.find("numpy") != std::string::npos
-                       ? " (no numpy)"
-                       : " (exit " + std::to_string(probe.exit) + ")");
-            reply(RO_NO_PYTHON, why, probe.err, "", "", "");
-            return;
-        }
+        // Do not run a preliminary `import numpy`: the provenance command below
+        // is the one authoritative observation for this RUN.
+        py = cfgPy;
     } else {
         py = adapter::findPython("", why);
         if (py.empty()) { reply(RO_NO_PYTHON, why, "", "", "", ""); return; }
     }
-    const std::string prov = pythonProvenance(py);
+    std::string prov, probeDetail;
+    if (!pythonProvenance(py, prov, why, probeDetail)) {
+        if (cfgPy && *cfgPy)
+            why = std::string("VIEWER_SERVE_PYTHON is ") + cfgPy + ": " + why;
+        reply(RO_NO_PYTHON, why, probeDetail, "", "", "");
+        return;
+    }
 
     // §5.3's key. The peer's OWN stat of the origin, because a client's stat of
     // a NAS mounted twice makes identity a lie; the reader's whole text, so
@@ -3267,11 +3362,11 @@ static void handleReaderRun(Buf& in) {
     // key RULE was fixed at, so a peer that changes what a key covers cannot
     // hand back a hit computed under the old one.
     //
-    // That number is 13 (#218 review). It was 12 through protocol 13, which
-    // added a second family of keys (§10.6) and changed nothing about what a
-    // reader key MEANS. This does change it, so it moves: every cache entry
-    // written under the old rule is one whose environment nobody recorded, and
-    // there is no way to tell a good one from a stale one after the fact.
+    // The current number is 14. Rule 13 first added `py` and `prov`; rule 14
+    // invalidates entries a long-lived peer could have issued from its former
+    // process-cached provenance. There is no fact in such an entry that can
+    // prove whether the environment was still the one printed beside it, so a
+    // current peer must never call it a hit.
     //
     // WHY THE ENVIRONMENT IS IN IT. The key covered the origin and the reader's
     // text and stopped there, so the answer to "which python ran this" was not
@@ -3366,17 +3461,18 @@ static void handleReaderRun(Buf& in) {
         }
     } temp{ tmpPath };
 
-    // The cache answer, and the ONE sentence that says it (§5.3: the second run
-    // does not start Python; the key covers the reader's whole text and the
-    // origin's stat, so "cached" cannot mean "stale"). Written once because
-    // both the plain hit and the recovered-from-quarantine hit are the same
-    // promise being kept and must not read differently.
+    // The cache answer, and the ONE sentence that says exactly what did and did
+    // not run. The reader and harness are skipped; the Python provenance probe
+    // above still runs, because its answer is part of this run's key.
     auto replyFromCache = [&](const std::string& header) {
         reply(RO_OK, "",
-              "read from cache - the reader was not re-run.\n"
+              "read from cache - the reader and harness were not re-run; Python "
+              "ran only the environment provenance probe.\n"
               "Edit the reader and press Load again to re-run it.",
               prov, key, header);
     };
+    bool observedInvalid = false;
+    ec.clear();
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string header;
         const std::string cerr = checkReaderOutput(cachePath, header);
@@ -3384,75 +3480,43 @@ static void handleReaderRun(Buf& in) {
             replyFromCache(header);
             return;
         }
-        // UNUSABLE - and now the interesting part (#180 codex review). The old
-        // code removed `cachePath` here, which is a check-then-act across two
-        // system calls: another process that judged the same rubbish, removed
-        // it, ran the reader and PUBLISHED had its result deleted by this one,
-        // and the session it had just answered found nothing under its key.
-        //
-        // So: take the file away first (a rename to a name only this process
-        // knows - one step, and afterwards the bytes are unambiguously ours),
-        // and only then decide what they are.
+        observedInvalid = true;
+    }
+    if (observedInvalid) {
         serveCacheJudgeHold();
-        std::string badPath;
-        std::error_code qe;
-        if (!readerQuarantinePath(key, badPath)) {
-            sendErr("this peer has nowhere to keep what a reader produces "
-                    "(set VIEWER_SERVE_CACHE)");
+
+        // Every change to `<key>.vstream` is made while this lock is held. Most
+        // importantly, an INVALID observation made before the lock is never
+        // acted on directly: recheck after acquisition. Another producer may
+        // have replaced the bad bytes and already issued this key while we
+        // waited. An absent key needs no mutation here; its producer takes this
+        // same lock at publish time.
+        ReaderKeyLock lock;
+        std::string lockWhy;
+        if (!lock.acquire(key, lockWhy)) {
+            sendErr(lockWhy);
             return;
         }
-        std::filesystem::rename(std::filesystem::u8path(cachePath),
-                                std::filesystem::u8path(badPath), qe);
-        if (qe) {
-            // Somebody else moved it while we were deciding, or this platform
-            // will not rename a file another process holds open. Either way
-            // this process never owned it and must not delete it. Ask the path
-            // again: whatever is there now is either a good answer (use it) or
-            // nothing (run).
-            std::string h2;
-            if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec) &&
-                checkReaderOutput(cachePath, h2).empty()) {
-                replyFromCache(h2);
+        ec.clear();
+        if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
+            std::string header;
+            if (checkReaderOutput(cachePath, header).empty()) {
+                replyFromCache(header);
                 return;
             }
-        } else {
-            // OURS. Judge it again, because a rename proves ownership and not
-            // identity: in the window above another process may have published
-            // a whole, valid result under this key, and that is the file we
-            // have just taken. Put it back rather than delete it - it answers
-            // the key, and it was never ours to withdraw.
-            std::string h3;
-            if (checkReaderOutput(badPath, h3).empty()) {
-                std::error_code be;
-                std::filesystem::rename(std::filesystem::u8path(badPath),
-                                        std::filesystem::u8path(cachePath), be);
-                if (!be) {
-                    replyFromCache(h3);
-                    return;
-                }
-                // It would not go back, which on Windows means something else
-                // is already published under the key. Check THAT, and if it is
-                // good, answer on it; our copy is redundant either way.
-                std::string h4;
-                const bool other =
-                    std::filesystem::exists(std::filesystem::u8path(cachePath), ec) &&
-                    checkReaderOutput(cachePath, h4).empty();
-                std::filesystem::remove(std::filesystem::u8path(badPath), be);
-                if (other) {
-                    replyFromCache(h4);
-                    return;
-                }
-            } else {
-                // It really was rubbish, and it really was ours: earn it again.
-                std::error_code be;
-                std::filesystem::remove(std::filesystem::u8path(badPath), be);
+            // Still invalid while exclusively owned. Removal is safe now: no
+            // conforming producer can publish between this verdict and act.
+            std::error_code de;
+            if (!std::filesystem::remove(std::filesystem::u8path(cachePath), de) || de) {
+                sendErr("cannot remove an unusable reader cache entry: " + de.message());
+                return;
             }
         }
     }
 
     // The three texts land in a directory of their own and leave with it. What
-    // stays on this disk is the .vstream and nothing else: §3's form is only
-    // honest if the peer does not accumulate other people's code.
+    // stays on this disk is the .vstream plus its empty lock rendezvous, never
+    // other people's code: that is the part §3's form requires.
     std::filesystem::path td = std::filesystem::temp_directory_path(ec);
     char nm[64];
     const unsigned long pid = (unsigned long)
@@ -3510,15 +3574,44 @@ static void handleReaderRun(Buf& in) {
               r.err, prov, "", "");
         return;
     }
-    // VALIDATED FIRST, then published. The order is the promise: a file that
-    // appears under the key has already been read end to end by the process
-    // that wrote it, so a reader on the other side of a rename never has to
-    // wonder whether it is looking at half of something.
+    // VALIDATED FIRST, then published under the SAME per-key exclusion used by
+    // invalid-entry removal. The shared lock is the promise: after any process
+    // has issued `key`, every later producer rechecks its valid canonical and
+    // leaves it in place. META/TILE can therefore use that key immediately,
+    // even while older producers are still finishing their own .part files.
     std::string header;
     const std::string cerr = checkReaderOutput(tmpPath, header);
     if (!cerr.empty()) {
         reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
         return;
+    }
+    ReaderKeyLock publishLock;
+    std::string lockWhy;
+    if (!publishLock.acquire(key, lockWhy)) {
+        sendErr(lockWhy);
+        return;
+    }
+    ec.clear();
+    if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
+        std::string winnerHeader;
+        if (checkReaderOutput(cachePath, winnerHeader).empty()) {
+            reply(RO_OK, "",
+                  r.err.empty() ? std::string("another session published this key first.")
+                                : r.err,
+                  prov, key, winnerHeader);
+            return;
+        }
+        // An external writer, an old peer, or a crash may have left rubbish
+        // while this producer ran. It is owned, rechecked and removed under the
+        // same exclusion as every current producer's publish.
+        std::error_code de;
+        if (!std::filesystem::remove(std::filesystem::u8path(cachePath), de) || de) {
+            reply(RO_UNREADABLE,
+                  "the reader ran, but an unusable cache entry could not be removed: " +
+                      de.message(),
+                  r.err, prov, "", "");
+            return;
+        }
     }
     std::error_code re;
     std::filesystem::rename(std::filesystem::u8path(tmpPath),
@@ -3528,18 +3621,14 @@ static void handleReaderRun(Buf& in) {
         reply(RO_OK, "", r.err, prov, key, header);
         return;
     }
-    // A LOSER. Windows refuses a rename onto a file another process holds
-    // open, which is exactly what a concurrent winner's client is doing to it.
-    // The winner's file is complete by construction (it was validated before
-    // it was published), and it answers the same key - so the loser VERIFIES
-    // it and reports success on it, rather than deleting the good answer or
-    // handing back a failure the user cannot act on. Its own temp goes with
-    // `temp`; the winner's file is never touched either way.
+    // This can now only be an I/O failure or a writer that ignores the lock.
+    // Recheck before reporting it: if a valid canonical nevertheless appeared,
+    // it answers this key and our own temp remains ours to remove.
     std::string wheader;
     const std::string werr = checkReaderOutput(cachePath, wheader);
     if (werr.empty()) {
         reply(RO_OK, "",
-              r.err.empty() ? std::string("another session published the same result first.")
+              r.err.empty() ? std::string("another session published this key first.")
                             : r.err,
               prov, key, wheader);
         return;

@@ -13,8 +13,9 @@
     // standalone viewer-serve binary, exactly as rwatch and rtemporal do it.
     //
     // NOTHING HERE IS TIMED. The peer's cache is observed by its FILE (does it
-    // exist, did its mtime move), which is what makes "the second run did not
-    // start Python" a measurement rather than a stopwatch.
+    // exist, did its mtime move), which proves that the reader/harness did not
+    // run again. The environment provenance probe deliberately still starts
+    // Python once for every RUN, including a cache hit.
     if (!g_rreaderSelftest.empty()) {
         bool ok = true;
         auto check = [&](bool cond, const char* what) {
@@ -151,8 +152,12 @@
         auto cacheFiles = [&]() {
             std::vector<std::filesystem::path> out;
             std::error_code e;
-            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e))
-                out.push_back(d.path());
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string name = d.path().filename().u8string();
+                if (name.size() >= 8 &&
+                    name.compare(name.size() - 8, 8, ".vstream") == 0)
+                    out.push_back(d.path());
+            }
             return out;
         };
 
@@ -165,6 +170,12 @@
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);
+            if (!sent || run.outcome != rp::RO_OK)
+                fprintf(stderr,
+                        "rreaderselftest:   R1 RUN diagnostic: sent=%d outcome=%d "
+                        "transport=\"%s\" err=\"%s\" stderr=\"%s\" provenance=\"%s\"\n",
+                        sent ? 1 : 0, sent ? (int)run.outcome : -1, err.c_str(),
+                        run.err.c_str(), run.stderrText.c_str(), run.provenance.c_str());
             check(sent, "R1b the RUN reached the peer");
             check(sent && run.outcome == rp::RO_OK, "R1c ...and the reader ran: outcome 0");
             check(sent && has(run.stderrText, "1 stack"),
@@ -175,9 +186,9 @@
                   "R1f a key and the .vstream header verbatim");
             check(sent && has(run.header, "VIEWERSTREAM ") && has(run.header, "layer 0 stack"),
                   "R1g the header is the harness's own text, not a re-rendering");
-            auto files1 = cacheFiles();
+            const auto files1 = cacheFiles();
             check(files1.size() == 1,
-                  "R1h the materialisation is a file on the PEER's disk, and one file");
+                  "R1h the materialisation is one .vstream on the PEER's disk");
             // ...and NOT here: the whole of §4.13.1's second line is that the
             // converted array does not cross the wire. What crossed so far is
             // a header of a few hundred bytes.
@@ -195,20 +206,32 @@
                     strays++;
             check(strays == 0, "R1j the carried reader is gone from the peer's temp dir");
 
-            {   // ---- R2: the second RUN does not start Python -----------------
-                const auto before = std::filesystem::last_write_time(files1[0], ec);
-                const uintmax_t beforeSize = std::filesystem::file_size(files1[0], ec);
+            {   // ---- R2: a hit skips the reader, not the provenance probe ------
+                // Guard the indexed diagnostic even after R1h has recorded a
+                // failure. A selftest should report the cause, not crash while
+                // trying to gather the next piece of evidence.
+                const bool haveCacheFile = files1.size() == 1;
+                const auto before = haveCacheFile
+                    ? std::filesystem::last_write_time(files1[0], ec)
+                    : std::filesystem::file_time_type{};
+                const uintmax_t beforeSize = haveCacheFile
+                    ? std::filesystem::file_size(files1[0], ec) : 0;
                 remote::ReaderRun again;
                 std::string e2;
                 const bool got = ses.readerRun(origin, "load", files, again, e2);
                 check(got && again.outcome == rp::RO_OK && again.key == keyPerm,
                       "R2a the same RUN answers with the same key");
-                check(got && has(again.stderrText, "read from cache - the reader was not re-run"),
-                      "R2b ...and says so in the local door's own words");
-                const auto after = std::filesystem::last_write_time(files1[0], ec);
-                check(before == after &&
-                          beforeSize == std::filesystem::file_size(files1[0], ec),
-                      "R2c the cache file did not move: Python was never started");
+                check(got && has(again.stderrText,
+                                 "reader and harness were not re-run; Python ran only the "
+                                 "environment provenance probe"),
+                      "R2b ...and distinguishes the skipped reader from the required probe");
+                const auto after = haveCacheFile
+                    ? std::filesystem::last_write_time(files1[0], ec)
+                    : std::filesystem::file_time_type{};
+                const uintmax_t afterSize = haveCacheFile
+                    ? std::filesystem::file_size(files1[0], ec) : 0;
+                check(haveCacheFile && before == after && beforeSize == afterSize,
+                      "R2c the cache file did not move: the reader/harness did not run");
                 check(cacheFiles().size() == 1, "R2d ...and no second copy was made");
             }
 
@@ -225,7 +248,7 @@
                       "R6c the traceback arrives verbatim, message and all");
                 check(got && bad.key.empty(), "R6d ...and no key: nothing was produced");
                 check(cacheFiles().size() == 1,
-                      "R6e a failed run leaves nothing behind in the cache");
+                      "R6e a failed run leaves no .vstream materialisation behind");
             }
 
             {   // ---- R7: what the reader returned is checked with the LOCAL
@@ -736,13 +759,14 @@
             envBp.make_preferred();
             const std::string envB = envBp.u8string();
             std::string pyB;
+            std::string baseWhy;
+            std::string base;
+            adapter::Run mk;
             {
-                std::string why;
-                const std::string base = adapter::findPython("", why);
+                base = adapter::findPython("", baseWhy);
                 if (!base.empty()) {
-                    adapter::Run mk = adapter::run({ base, "-m", "venv",
-                                                     "--system-site-packages",
-                                                     "--without-pip", envB }, 120000);
+                    mk = adapter::run({ base, "-m", "venv", "--system-site-packages",
+                                        "--without-pip", envB }, 120000);
                     for (const char* sub : { "Scripts/python.exe", "bin/python3",
                                              "bin/python" }) {
                         std::filesystem::path c = envBp / std::filesystem::u8path(sub);
@@ -753,12 +777,14 @@
                         adapter::Run probe = adapter::run({ pyB, "-c", "import numpy" }, 60000);
                         if (!probe.started || probe.exit != 0) pyB.clear();
                     }
-                    if (pyB.empty())
-                        fprintf(stderr, "rreaderselftest:   R15 venv unavailable "
-                                        "(base=%s exit=%d fail=\"%s\"): SKIPPING R15c-R15j\n",
-                                base.c_str(), mk.exit, mk.fail.c_str());
                 }
             }
+            if (pyB.empty())
+                fprintf(stderr, "rreaderselftest:   R15 venv unavailable "
+                                "(base=%s why=\"%s\" exit=%d fail=\"%s\"): "
+                                "SKIPPING R15c-R15s\n",
+                        base.empty() ? "<none>" : base.c_str(), baseWhy.c_str(), mk.exit,
+                        mk.fail.c_str());
             if (!pyB.empty()) {
                 // The module only environment B has. A venv's own site-packages
                 // precedes the base's, so this is B's and B's alone.
@@ -771,6 +797,11 @@
                         break;
                     }
                 check(!sp.empty(), "R15c (setup) environment B has a site-packages of its own");
+                if (sp.empty()) {
+                    fprintf(stderr,
+                            "rreaderselftest:   R15 venv has no site-packages: "
+                            "SKIPPING R15d-R15s\n");
+                } else {
                 writeText(sp + "/viewer_env_tag.py", "TAG = 1000\n");
 
                 std::string kB, pB;
@@ -819,7 +850,7 @@
                 check(okB3 && kB3 != kB && !cachedB3,
                       "R15j an upgrade under one interpreter path is a miss, not a hit");
 
-                // ---- R15k-n: the same PEER PROCESS, and numpy moves under it --
+                // ---- R15k-o: the same PEER PROCESS, and numpy moves under it --
                 //
                 // #180 codex review of #224. R15i/j start a new viewer-serve for
                 // each environment, so they can only ever show that the NEXT
@@ -911,6 +942,83 @@
                           "R15o ...and the pixels that come back were made by the numpy "
                           "the provenance line names");
                     one.stop();
+
+                    // One configured RUN has one authoritative provenance
+                    // probe. A miss starts Python once more for the harness; a
+                    // hit does not. sitecustomize counts interpreter starts,
+                    // making that contract observable without timing it.
+                    const std::string probeCount = root + "/provenance-starts.txt";
+                    std::filesystem::remove(pathFromUtf8(probeCount), ec);
+                    writeText(sp + "/sitecustomize.py",
+                              "import numpy, pathlib\n"
+                              "p = pathlib.Path(r'" + probeCount + "')\n"
+                              "try:\n"
+                              "    n = int(p.read_text())\n"
+                              "except Exception:\n"
+                              "    n = 0\n"
+                              "p.write_text(str(n + 1))\n"
+                              "numpy.__version__ = '53.0.0'\n");
+                    std::filesystem::remove_all(pathFromUtf8(sp + "/__pycache__"), ec);
+                    auto starts = [&]() {
+                        std::ifstream f(pathFromUtf8(probeCount), std::ios::binary);
+                        int n = -1;
+                        if (f) f >> n;
+                        return n;
+                    };
+                    setEnv("VIEWER_SERVE_PYTHON", pyB);
+                    remote::Session counted;
+                    if (!openSession(counted, true)) return 1;
+                    remote::ReaderRun cr1, cr2;
+                    std::string ce1, ce2;
+                    const bool cs1 = counted.readerRun(envOrigin, "load", npFiles, cr1, ce1);
+                    const int startsAfterMiss = starts();
+                    const bool cs2 = counted.readerRun(envOrigin, "load", npFiles, cr2, ce2);
+                    const int startsAfterHit = starts();
+                    check(cs1 && cr1.outcome == rp::RO_OK && startsAfterMiss == 2,
+                          "R15p configured miss starts one provenance probe and one harness");
+                    check(cs2 && cr2.outcome == rp::RO_OK && cr2.key == cr1.key &&
+                              has(cr2.stderrText, "read from cache") &&
+                              startsAfterHit == startsAfterMiss + 1,
+                          "R15q configured hit starts only its authoritative provenance probe");
+                    counted.stop();
+
+                    // A command that starts and imports numpy can still fail to
+                    // identify it. That is no provenance, hence no runnable
+                    // Python for this protocol outcome; the harness must not be
+                    // started under a made-up fallback label.
+                    writeText(sp + "/sitecustomize.py",
+                              "import numpy\n"
+                              "del numpy.__version__\n");
+                    std::filesystem::remove_all(pathFromUtf8(sp + "/__pycache__"), ec);
+                    remote::Session noProv;
+                    if (!openSession(noProv, true)) return 1;
+                    remote::ReaderRun nr;
+                    std::string ne;
+                    const bool ns = noProv.readerRun(envOrigin, "load", npFiles, nr, ne);
+                    check(ns && nr.outcome == rp::RO_NO_PYTHON && nr.provenance.empty() &&
+                              nr.key.empty(),
+                          "R15r failed provenance is RO_NO_PYTHON, not a path-shaped label");
+                    noProv.stop();
+
+                    // Exit 0 with no identity is no better: success is the
+                    // presence of the provenance fact, not merely a process
+                    // status. Suppress the probe's print at startup to make the
+                    // otherwise unusual empty-answer case deterministic.
+                    writeText(sp + "/sitecustomize.py",
+                              "import builtins, numpy\n"
+                              "builtins.print = lambda *args, **kwargs: None\n");
+                    std::filesystem::remove_all(pathFromUtf8(sp + "/__pycache__"), ec);
+                    remote::Session emptyProv;
+                    if (!openSession(emptyProv, true)) return 1;
+                    remote::ReaderRun er;
+                    std::string ee;
+                    const bool es = emptyProv.readerRun(envOrigin, "load", npFiles, er, ee);
+                    check(es && er.outcome == rp::RO_NO_PYTHON &&
+                              has(er.err, "returned no Python/numpy identity") &&
+                              er.provenance.empty() && er.key.empty(),
+                          "R15s empty provenance is RO_NO_PYTHON and names the missing fact");
+                    emptyProv.stop();
+                }
                 }
             }
             setEnv("VIEWER_SERVE_PYTHON", "");
@@ -1029,25 +1137,36 @@
             // Same three states, asked of a real viewer-serve. The witness is
             // the key it issues plus whether its own reply says it read from
             // cache: a key that did not move IS the defect.
-            auto folderRun = [&](std::string& keyOut, bool& cachedOut) {
+            auto folderRun = [&](const char* label, std::string& keyOut, bool& cachedOut) {
+                keyOut.clear();
+                cachedOut = false;
                 remote::Session s;
-                if (!openSession(s, true)) return false;
+                if (!openSession(s, true)) {
+                    fprintf(stderr, "rreaderselftest:   %s could not start peer\n", label);
+                    return false;
+                }
                 remote::ReaderRun r;
                 std::string e;
                 const bool sent = s.readerRun(capt, "load", folderText, r, e);
                 const bool got = sent && r.outcome == rp::RO_OK;
                 if (got) { keyOut = r.key; cachedOut = has(r.stderrText, "read from cache"); }
+                else
+                    fprintf(stderr,
+                            "rreaderselftest:   %s failed: sent=%d outcome=%d transport=\"%s\" "
+                            "err=\"%s\" stderr=\"%s\"\n",
+                            label, sent ? 1 : 0, sent ? (int)r.outcome : -1, e.c_str(),
+                            r.err.c_str(), r.stderrText.c_str());
                 s.stop();
                 return got;
             };
             std::string fk1, fk2, fk3;
             bool fc1 = false, fc2 = false, fc3 = false;
             const auto captAt2 = dirTime(capt);
-            const bool f1 = folderRun(fk1, fc1);
+            const bool f1 = folderRun("R16f", fk1, fc1);
             check(f1, "R16f the peer runs a reader over a folder");
             reframe(childA, 55);
             setDirTime(capt, captAt2);
-            const bool f2 = folderRun(fk2, fc2);
+            const bool f2 = folderRun("R16g", fk2, fc2);
             fprintf(stderr, "rreaderselftest:   R16 peer keys %s / %s / ", fk1.c_str(),
                     fk2.c_str());
             check(f2 && fk2 != fk1 && !fc2,
@@ -1057,7 +1176,7 @@
             reframe(childB, 66);
             setDirTime(captSub, subAt3);
             setDirTime(capt, captAt3);
-            const bool f3 = folderRun(fk3, fc3);
+            const bool f3 = folderRun("R16h", fk3, fc3);
             fprintf(stderr, "%s\n", fk3.c_str());
             check(f3 && fk3 != fk2 && !fc3,
                   "R16h ...and so is a nested one");
@@ -1066,7 +1185,7 @@
             // opposite mistake and just as wrong.
             std::string fk4;
             bool fc4 = false;
-            const bool f4 = folderRun(fk4, fc4);
+            const bool f4 = folderRun("R16i", fk4, fc4);
             check(f4 && fk4 == fk3 && fc4,
                   "R16i an unchanged folder is one key and one run: the cache answers");
             closeAll();
@@ -1400,7 +1519,7 @@
             closeAll();
         }
 
-        {   // ---- R19: a folder with a LINK in it has no identity --------------
+        {   // ---- R19: a folder symlink, or one below it, has no identity -------
             //
             // #180 codex review of #224. adapter::folderIdentity summarised a
             // symlink by its TARGET AS WRITTEN and returned success. That is a
@@ -1431,10 +1550,11 @@
             };
             const std::string target = outside + "/target.npy";
             const std::string link = linked + "/aaa_link.npy";   // sorts first
+            const std::string rootLink = root + "/linked-root";
             const std::string plain = linked + "/zzz_plain.npy";
             writeLFrame(target, 77);
             writeLFrame(plain, 5);
-            std::error_code se;
+            std::error_code se, rse;
             // ABSOLUTE. A symlink's target is resolved relative to the LINK's
             // own directory, not to this process's working directory, and every
             // path in this test is relative to the latter (tools/testdata/...) -
@@ -1442,24 +1562,54 @@
             // reader met FileNotFoundError instead of the target's pixels.
             const std::filesystem::path targetAbs =
                 std::filesystem::absolute(pathFromUtf8(target), ec).lexically_normal();
+            const std::filesystem::path outsideAbs =
+                std::filesystem::absolute(pathFromUtf8(outside), ec).lexically_normal();
             std::filesystem::create_symlink(targetAbs, pathFromUtf8(link), se);
-            bool haveLink = !se;
-            if (haveLink) {
+            std::filesystem::create_directory_symlink(outsideAbs, pathFromUtf8(rootLink), rse);
+            bool haveLinks = !se && !rse;
+            if (haveLinks) {
                 std::error_code le;
-                haveLink = std::filesystem::is_symlink(pathFromUtf8(link), le) && !le;
+                haveLinks = std::filesystem::is_symlink(pathFromUtf8(link), le) && !le;
                 // ...and it has to RESOLVE, or this test would assert that a
                 // reader cannot read a broken link, which is not the question.
-                if (haveLink && !std::filesystem::exists(pathFromUtf8(link), le))
-                    haveLink = false;
+                if (haveLinks && !std::filesystem::exists(pathFromUtf8(link), le))
+                    haveLinks = false;
+                if (haveLinks)
+                    haveLinks = std::filesystem::is_symlink(pathFromUtf8(rootLink), le) &&
+                                !le && std::filesystem::is_directory(pathFromUtf8(rootLink), le) &&
+                                !le;
             }
-            if (!haveLink) {
-                // NAMED, never silent: on Windows a symlink needs Developer Mode
-                // or an elevated process, and a machine that has neither cannot
-                // run this. It runs on the Linux and macOS jobs.
-                fprintf(stderr, "rreaderselftest:   R19 cannot create a symlink here "
-                                "(%s): SKIPPING R19a-R19h\n",
-                        se ? se.message().c_str() : "not a link once created");
+            auto knownWindowsSymlinkLimit = [](const std::error_code& e) {
+#if defined(_WIN32)
+                return e.value() == ERROR_PRIVILEGE_NOT_HELD ||
+                       e.value() == ERROR_ACCESS_DENIED ||
+                       e.value() == ERROR_NOT_SUPPORTED ||
+                       e.value() == ERROR_INVALID_FUNCTION ||
+                       e == std::errc::operation_not_permitted ||
+                       e == std::errc::permission_denied ||
+                       e == std::errc::function_not_supported;
+#else
+                (void)e;
+                return false;
+#endif
+            };
+            if (!haveLinks) {
+                // Only the known Windows privilege/capability limitation is a
+                // skip. A typo, dangling fixture or unexpected filesystem error
+                // is a failed test on every platform, not a green blind spot.
+                const bool maySkip = (se || rse) &&
+                                     (!se || knownWindowsSymlinkLimit(se)) &&
+                                     (!rse || knownWindowsSymlinkLimit(rse));
+                if (maySkip)
+                    fprintf(stderr, "rreaderselftest:   R19 symlinks unavailable on this "
+                                    "Windows host (file=\"%s\" root=\"%s\"): "
+                                    "SKIPPING R19a-R19o\n",
+                            se.message().c_str(), rse.message().c_str());
+                else
+                    check(false,
+                          "R19a (setup) file and root-directory symlinks resolve correctly");
             } else {
+                check(true, "R19a (setup) file and root-directory symlinks resolve correctly");
                 const std::string rdLink = root + "/linkfolder.py";
                 writeText(rdLink,
                           "import numpy as np, os\n"
@@ -1477,16 +1627,18 @@
                 const std::string linkSpec = rdLink + ":load";
                 std::string linkText[3] = { std::string(), files[1], files[2] };
                 check(slurp(rdLink, linkText[0]),
-                      "R19a (setup) the link-walking reader is readable");
+                      "R19b (setup) the link-walking reader is readable");
 
                 std::string fid;
                 check(!adapter::folderIdentity(linked, fid),
-                      "R19b a folder with a link below it has NO identity, so nothing "
+                      "R19c a folder with a link below it has NO identity, so nothing "
                       "may cache it");
+                std::string rid;
+                check(!adapter::folderIdentity(rootLink, rid),
+                      "R19d a root directory symlink has NO identity either");
                 std::string pid;
                 check(adapter::folderIdentity(outside, pid) && !pid.empty(),
-                      "R19c ...while the folder without one still has, so R19b is about "
-                      "the link and not about walking");
+                      "R19e ...while its real target has one: the refusal is the link");
 
                 // ---- the LOCAL door ---------------------------------------------
                 auto firstPx = [&]() -> float {
@@ -1494,7 +1646,7 @@
                 };
                 const std::string o1 = openWithReader(linked, linkSpec);
                 check(o1.empty() && firstPx() == 77.0f,
-                      "R19d the local door reads it: the link's TARGET is the first frame");
+                      "R19f the local door reads it: the child link's target is first");
                 closeAll();
                 // ONLY the target's bytes change. The link still says the same
                 // thing, the folder still holds the same two names, and every
@@ -1511,9 +1663,9 @@
                                 "px0=%g\n",
                         o2.c_str(), lruns, g_adapterRuns, (double)firstPx());
                 check(o2.empty() && g_adapterRuns > lruns,
-                      "R19e a target rewritten behind the link re-runs the reader here");
+                      "R19g a target rewritten behind the child link re-runs locally");
                 check(firstPx() == 88.0f,
-                      "R19f ...and what comes back is the new target, not the cached one");
+                      "R19h ...and returns the new target, not a cached one");
                 closeAll();
                 forgetReader(linked);
 
@@ -1523,124 +1675,168 @@
                 // means the key is unique to the RUN: two asks with nothing
                 // changed are two keys and two runs, and a rewritten target can
                 // never be answered out of the cache.
-                auto linkRun = [&](std::string& keyOut, bool& cachedOut) {
+                auto linkRun = [&](const std::string& source, std::string& keyOut,
+                                   bool& cachedOut) {
                     remote::Session s;
                     if (!openSession(s, true)) return false;
                     remote::ReaderRun r;
                     std::string e;
-                    const bool sent = s.readerRun(linked, "load", linkText, r, e);
+                    const bool sent = s.readerRun(source, "load", linkText, r, e);
                     const bool got = sent && r.outcome == rp::RO_OK;
                     if (got) { keyOut = r.key; cachedOut = has(r.stderrText, "read from cache"); }
+                    else
+                        fprintf(stderr,
+                                "rreaderselftest:   R19 peer run failed: source=\"%s\" "
+                                "sent=%d outcome=%d transport=\"%s\" err=\"%s\" stderr=\"%s\"\n",
+                                source.c_str(), sent ? 1 : 0,
+                                sent ? (int)r.outcome : -1, e.c_str(), r.err.c_str(),
+                                r.stderrText.c_str());
                     s.stop();
                     return got;
                 };
                 std::string pk1, pk2, pk3;
                 bool pc1 = false, pc2 = false, pc3 = false;
-                const bool p1 = linkRun(pk1, pc1);
+                const bool p1 = linkRun(linked, pk1, pc1);
                 {
                     const auto was = std::filesystem::last_write_time(pathFromUtf8(target), ec);
                     writeLFrame(target, 99);
                     std::filesystem::last_write_time(pathFromUtf8(target),
                                                      was + std::chrono::seconds(10), ec);
                 }
-                const bool p2 = linkRun(pk2, pc2);
-                const bool p3 = linkRun(pk3, pc3);
+                const bool p2 = linkRun(linked, pk2, pc2);
+                const bool p3 = linkRun(linked, pk3, pc3);
                 fprintf(stderr, "rreaderselftest:   R19 peer keys %s / %s / %s "
                                 "cached %d/%d/%d\n",
                         pk1.c_str(), pk2.c_str(), pk3.c_str(), pc1 ? 1 : 0, pc2 ? 1 : 0,
                         pc3 ? 1 : 0);
                 check(p1 && p2 && pk2 != pk1 && !pc2,
-                      "R19g a target rewritten behind the link is a different key over "
-                      "there too, and a miss");
+                      "R19i the rewritten child-link target is a new peer key and miss");
                 check(p3 && pk3 != pk2 && !pc3,
-                      "R19h ...and the peer never caches such a folder at all: even "
-                      "unchanged, it runs");
+                      "R19j the peer never caches a folder containing a child link");
+
+                // The root link is a different hole: recursive iteration never
+                // yields the entry it started from. Exercise both doors, not
+                // merely folderIdentity, so a caller cannot accidentally follow
+                // it before consulting the shared helper.
+                closeAll();
+                const std::string ro1 = openWithReader(rootLink, linkSpec);
+                const int rootRuns = g_adapterRuns;
+                closeAll();
+                const std::string ro2 = openWithReader(rootLink, linkSpec);
+                check(ro1.empty() && ro2.empty() && g_adapterRuns > rootRuns,
+                      "R19k the local door re-runs an unchanged root directory symlink");
+                check(firstPx() == 99.0f,
+                      "R19l ...and reads the current target rather than a materialisation");
+                closeAll();
+                forgetReader(rootLink);
+
+                std::string rk1, rk2;
+                bool rc1 = false, rc2 = false;
+                const bool rp1 = linkRun(rootLink, rk1, rc1);
+                const bool rp2 = linkRun(rootLink, rk2, rc2);
+                check(rp1 && rp2 && !rk1.empty() && rk2 != rk1,
+                      "R19m the peer gives each root-directory-symlink run a new key");
+                check(rp1 && rp2 && !rc1 && !rc2,
+                      "R19n ...and neither unchanged ask is reported as a cache hit");
+                std::string rootId;
+                check(!adapter::folderIdentity(rootLink, rootId) && rootId.empty(),
+                      "R19o the shared identity helper remains an explicit refusal");
             }
             closeAll();
         }
 
-        {   // ---- R20: an unusable entry is TAKEN first, then judged -----------
+        {   // ---- R20: one key, one exclusion for removal AND every publish ----
             //
-            // #180 codex review of #224. #218's fix made publishing atomic, but
-            // the removal of an entry judged unusable was still a check-then-act
-            // across two system calls. Process A reads the entry, finds it
-            // rubbish, and stalls; process B makes the same judgement, removes
-            // it, runs the reader and PUBLISHES; A then removes what is at that
-            // path - which is now B's whole, valid result. B's session had
-            // already been handed that key. R17 starts from an EMPTY cache and
-            // cannot see this: there is no invalid entry for anyone to judge.
+            // A stale invalid verdict and a producer publish must use the same
+            // per-key exclusion. A stops after observing rubbish. C removes it
+            // and begins producing, but waits inside the reader. B then produces
+            // and publishes first. Before A or C is released, B's issued key is
+            // used for real META and TILE requests. Finally A (old verdict) and C
+            // (old producer) resume together. Both must recheck under the lock,
+            // accept B's valid canonical and leave the exact file in place.
+            // C adds 1000 to its pixels, deliberately, so a forbidden late
+            // replacement is visible even on a filesystem whose mtime cannot
+            // distinguish the two publishes.
             //
-            // Both contenders are real viewer-serve processes, started from an
-            // INVALID existing entry, and the ordering is a handshake rather
-            // than a hope: VIEWER_SERVE_CACHE_JUDGE_HOLD stops A exactly in the
-            // window and this test closes it deliberately, so the race is
-            // reproduced every run on every machine rather than when the
-            // scheduler happens to cooperate.
-            //
-            // The reader takes an O_EXCL lock and the SECOND caller raises. That
-            // is what makes the assertion sharp: if A deletes B's result it
-            // cannot replace it, so the cache ends up EMPTY and the key B
-            // answered with names nothing.
+            // Every ordering is a file handshake. No scheduler luck or timeout
+            // is used to decide which participant has reached which state.
             closeAll();
-            const std::string rdOnce = root + "/once.py";
-            writeText(rdOnce,
-                      "import numpy as np, os\n"
+            const std::string rdRace3 = root + "/race3.py";
+            writeText(rdRace3,
+                      "import numpy as np, os, time\n"
                       "from viewer_import import Stack\n"
                       "VERSION = 1\n"
                       "def load(path):\n"
-                      "    lock = path + '.once'\n"
-                      "    try:\n"
-                      "        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))\n"
-                      "    except FileExistsError:\n"
-                      "        raise ValueError('once-2: this reader had already run')\n"
+                      "    slow = False\n"
+                      "    if os.path.exists(path + '.producer-arm'):\n"
+                      "        try:\n"
+                      "            os.close(os.open(path + '.producer-started',\n"
+                      "                             os.O_CREAT | os.O_EXCL | os.O_WRONLY))\n"
+                      "            slow = True\n"
+                      "            while not os.path.exists(path + '.producer-release'):\n"
+                      "                time.sleep(0.01)\n"
+                      "        except FileExistsError:\n"
+                      "            pass\n"
                       "    a = np.load(path)\n"
+                      "    if slow:\n"
+                      "        a = a + 1000\n"
                       "    return Stack(np.ascontiguousarray(\n"
-                      "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='once')\n");
-            std::string onceText[3] = { std::string(), files[1], files[2] };
-            check(slurp(rdOnce, onceText[0]), "R20a (setup) the run-once reader is readable");
-            const std::string lock = origin + ".once";
+                      "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='race3')\n");
+            std::string race3Text[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdRace3, race3Text[0]),
+                  "R20a (setup) the three-party reader is readable");
             const std::string hold = root + "/judge.hold";
+            const std::string producerArm = origin + ".producer-arm";
+            const std::string producerStarted = origin + ".producer-started";
+            const std::string producerRelease = origin + ".producer-release";
             std::filesystem::remove(pathFromUtf8(hold), ec);
             std::filesystem::remove(pathFromUtf8(hold + ".at"), ec);
+            std::filesystem::remove(pathFromUtf8(producerArm), ec);
+            std::filesystem::remove(pathFromUtf8(producerStarted), ec);
+            std::filesystem::remove(pathFromUtf8(producerRelease), ec);
 
             // ---- the setup: learn the key, then put rubbish under it ----------
-            std::string onceKey;
+            std::string raceKey;
             {
-                std::filesystem::remove(pathFromUtf8(lock), ec);
                 setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
                 remote::Session s;
                 if (!openSession(s, true)) return 1;
                 remote::ReaderRun r;
                 std::string e;
-                const bool sent = s.readerRun(origin, "load", onceText, r, e);
-                if (sent && r.outcome == rp::RO_OK) onceKey = r.key;
+                const bool sent = s.readerRun(origin, "load", race3Text, r, e);
+                if (sent && r.outcome == rp::RO_OK) raceKey = r.key;
                 s.stop();
             }
-            const std::string oncePath = cacheDir + "/" + onceKey + ".vstream";
-            check(!onceKey.empty() &&
-                      std::filesystem::exists(pathFromUtf8(oncePath), ec),
+            const std::string racePath = cacheDir + "/" + raceKey + ".vstream";
+            check(!raceKey.empty() &&
+                      std::filesystem::exists(pathFromUtf8(racePath), ec),
                   "R20b (setup) one run publishes under a key this test can now name");
-            // ...rubbish, and the lock released so that exactly ONE more run can
-            // succeed. Whoever gets it is the winner; the other must not be able
-            // to replace what the winner published.
-            writeText(oncePath, "this is not a viewer stream at all");
-            std::filesystem::remove(pathFromUtf8(lock), ec);
+            writeText(racePath, "this is not a viewer stream at all");
 
-            struct Side { bool sent = false; int outcome = -1; std::string key, text; };
-            Side A, B;
-            // A is held IN the window; B is not.
+            struct Side {
+                bool sent = false;
+                int outcome = -1;
+                std::string key, text, transport, err;
+            };
+            Side A, B, C;
+            // A is held after the invalid observation; B and C are ordinary.
             setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", hold);
             remote::Session sa;
             if (!openSession(sa, true)) return 1;
             setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
-            remote::Session sb;
+            remote::Session sb, sc;
             if (!openSession(sb, true)) return 1;
+            if (!openSession(sc, true)) return 1;
 
             std::thread ta([&] {
                 remote::ReaderRun r;
                 std::string e;
-                A.sent = sa.readerRun(origin, "load", onceText, r, e);
-                if (A.sent) { A.outcome = (int)r.outcome; A.key = r.key; A.text = r.stderrText; }
+                A.sent = sa.readerRun(origin, "load", race3Text, r, e);
+                A.transport = e;
+                if (A.sent) {
+                    A.outcome = (int)r.outcome; A.key = r.key;
+                    A.text = r.stderrText; A.err = r.err;
+                }
             });
             // A has read the entry, called it rubbish, and is now standing in
             // the window. That is not a guess: the peer says so by writing this
@@ -1652,18 +1848,73 @@
                 if (!held) std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
             check(held, "R20c the first peer judged the entry unusable and is in the window");
+
+            // C owns the slow-producer handshake. It removes the rubbish under
+            // the key lock, releases that lock, and writes only to its .part.
+            writeText(producerArm, "armed\n");
+            std::thread tc([&] {
+                remote::ReaderRun r;
+                std::string e;
+                C.sent = sc.readerRun(origin, "load", race3Text, r, e);
+                C.transport = e;
+                if (C.sent) {
+                    C.outcome = (int)r.outcome; C.key = r.key;
+                    C.text = r.stderrText; C.err = r.err;
+                }
+            });
+            bool producing = false;
+            for (int i = 0; i < 1500 && !producing; i++) {
+                producing = std::filesystem::exists(pathFromUtf8(producerStarted), ec);
+                if (!producing) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            check(producing, "R20d a third peer is producing the same key into its own temp");
+            if (!producing)
+                // Keep the failure diagnostic finite: if C never reached the
+                // handshake, a later participant must not become the waiter.
+                writeText(producerRelease, "abort\n");
+
+            // B is the fast producer and publishes while both other peers wait.
             {
                 remote::ReaderRun r;
                 std::string e;
-                B.sent = sb.readerRun(origin, "load", onceText, r, e);
-                if (B.sent) { B.outcome = (int)r.outcome; B.key = r.key; B.text = r.stderrText; }
+                B.sent = sb.readerRun(origin, "load", race3Text, r, e);
+                B.transport = e;
+                if (B.sent) {
+                    B.outcome = (int)r.outcome; B.key = r.key;
+                    B.text = r.stderrText; B.err = r.err;
+                }
             }
-            check(B.sent && B.outcome == (int)rp::RO_OK && B.key == onceKey &&
+            check(B.sent && B.outcome == (int)rp::RO_OK && B.key == raceKey &&
                       !has(B.text, "read from cache"),
-                  "R20d the other peer removes the rubbish, runs the reader and PUBLISHES");
-            // ...and now A acts on a judgement that is no longer true.
+                  "R20e B publishes while stale A and producer C are unfinished");
+
+            // The key is a capability, not a promise that becomes true when the
+            // other requests finish. Consume it now, before either is released.
+            bool bMeta = false, bTile = false;
+            uint16_t bFirst = 0;
+            if (B.sent && B.outcome == (int)rp::RO_OK) {
+                remote::KeyedRef bref{ B.key, 0, remote::KeyedRef::FromReader };
+                remote::Meta bm;
+                std::string be;
+                bMeta = sb.meta(url, bm, be, 0, nullptr, &bref);
+                std::vector<uint8_t> raw;
+                int tw = 0, th = 0, tch = 0;
+                uint32_t dt = 0;
+                bTile = bMeta && sb.tileBytes(url, 0, 0, 0, bm.w, bm.h, 1, raw,
+                                              tw, th, tch, dt, be, 0, nullptr, &bref);
+                if (bTile && raw.size() >= sizeof bFirst)
+                    memcpy(&bFirst, raw.data(), sizeof bFirst);
+            }
+            check(bMeta && bTile && bFirst == 11,
+                  "R20f B's issued key serves META and TILE before A or C finishes");
+            const auto publishedAt = std::filesystem::last_write_time(pathFromUtf8(racePath), ec);
+
+            // A's old verdict and C's old producer now compete for the same lock.
+            // Neither may move or replace the valid canonical they find there.
             writeText(hold, "go\n");
+            writeText(producerRelease, "go\n");
             ta.join();
+            tc.join();
             int vstreams = 0, parts = 0, bads = 0;
             {
                 std::error_code de;
@@ -1678,36 +1929,57 @@
                     else if (ends(".bad")) bads++;
                 }
             }
-            fprintf(stderr, "rreaderselftest:   R20 A outcome=%d key=\"%s\" \"%s\" | "
-                            "B outcome=%d | cache %d vstream / %d part / %d bad\n",
-                    A.outcome, A.key.c_str(), A.text.c_str(), B.outcome, vstreams,
-                    parts, bads);
-            check(A.sent && A.outcome == (int)rp::RO_OK && A.key == onceKey,
-                  "R20e the held peer is answered on the same key, not with a failure");
-            check(A.sent && has(A.text, "read from cache"),
-                  "R20f ...out of what the other one published: it recovered rather "
-                  "than re-ran");
-            check(std::filesystem::exists(pathFromUtf8(oncePath), ec),
-                  "R20g and the published result is STILL THERE - the stale judgement "
-                  "did not remove another process's winner");
-            check(bads == 0 && parts == 0,
-                  "R20h nothing quarantined and nothing half-written is left behind");
-            {   // ...and it still answers, which is the whole point of R20g.
+            fprintf(stderr, "rreaderselftest:   R20 A=%d/%s \"%s\" B=%d/%s "
+                            "C=%d/%s \"%s\" | cache %d vstream / %d part / %d bad\n",
+                    A.outcome, A.key.c_str(), A.text.c_str(), B.outcome, B.key.c_str(),
+                    C.outcome, C.key.c_str(), C.text.c_str(), vstreams, parts, bads);
+            check(A.sent && A.outcome == (int)rp::RO_OK && A.key == raceKey &&
+                      has(A.text, "read from cache"),
+                  "R20g stale A rechecks under the lock and accepts B's canonical");
+            check(C.sent && C.outcome == (int)rp::RO_OK && C.key == raceKey &&
+                      !has(C.text, "read from cache"),
+                  "R20h producer C loses publication without replacing B's result");
+            const auto afterInterleave =
+                std::filesystem::last_write_time(pathFromUtf8(racePath), ec);
+            bool afterMeta = false, afterTile = false;
+            uint16_t afterFirst = 0;
+            if (B.sent && B.outcome == (int)rp::RO_OK) {
+                remote::KeyedRef bref{ B.key, 0, remote::KeyedRef::FromReader };
+                remote::Meta bm;
+                std::string be;
+                afterMeta = sb.meta(url, bm, be, 0, nullptr, &bref);
+                std::vector<uint8_t> raw;
+                int tw = 0, th = 0, tch = 0;
+                uint32_t dt = 0;
+                afterTile = afterMeta &&
+                    sb.tileBytes(url, 0, 0, 0, bm.w, bm.h, 1, raw, tw, th, tch, dt,
+                                 be, 0, nullptr, &bref);
+                if (afterTile && raw.size() >= sizeof afterFirst)
+                    memcpy(&afterFirst, raw.data(), sizeof afterFirst);
+            }
+            check(std::filesystem::exists(pathFromUtf8(racePath), ec) &&
+                      publishedAt == afterInterleave && afterMeta && afterTile &&
+                      afterFirst == bFirst && afterFirst == 11 &&
+                      bads == 0 && parts == 0,
+                  "R20i B's canonical is unchanged and no private temp is left behind");
+            {   // ...and it still answers, after every stale participant finished.
                 remote::Session s;
                 if (!openSession(s, true)) return 1;
                 remote::ReaderRun r;
                 std::string e;
-                const bool sent = s.readerRun(origin, "load", onceText, r, e);
-                check(sent && r.outcome == rp::RO_OK && r.key == onceKey &&
+                const bool sent = s.readerRun(origin, "load", race3Text, r, e);
+                check(sent && r.outcome == rp::RO_OK && r.key == raceKey &&
                           has(r.stderrText, "read from cache"),
-                      "R20i a later ask is a HIT on it: the key the winner issued still "
-                      "names a whole result");
+                      "R20j a later RUN is a hit on the same whole result");
                 s.stop();
             }
             sa.stop();
             sb.stop();
+            sc.stop();
             setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
-            std::filesystem::remove(pathFromUtf8(lock), ec);
+            std::filesystem::remove(pathFromUtf8(producerArm), ec);
+            std::filesystem::remove(pathFromUtf8(producerStarted), ec);
+            std::filesystem::remove(pathFromUtf8(producerRelease), ec);
             closeAll();
         }
 

@@ -1364,16 +1364,20 @@ viewer_selftest(rwatch NOGL --rwatch-selftest tools/testdata
 
 # A READER sent to the peer and run there (issue #180, docs/
 # remote-reader-design.md stages 1 and 2). The gate that is closed unless the
-# peer's own launcher opened it, the cache that makes a second run not start
-# Python, the four failures each as its own sentence, and - stage 2's
+# peer's own launcher opened it, the cache that skips the reader/harness while
+# still probing Python provenance once per RUN, the per-key interprocess lock
+# shared by invalid-entry removal and every publish, the four failures each as
+# its own sentence, and - stage 2's
 # acceptance condition - a document opened over the link whose pixels are
 # BIT-IDENTICAL to the same reader run locally.
 #
 # --remote-exe is the whole test, not decoration: with a local:// peer that is
 # THIS binary, "the reader ran in the peer's python" is unfalsifiable. It writes
-# its own fixtures (a 5-D .npy nothing native reads, and four readers) under a
-# scratch subdirectory of the given dir, and points the peer's cache at another
-# one through VIEWER_SERVE_CACHE.
+# its own fixtures under a scratch subdirectory of the given dir and points the
+# peer's cache at another one through VIEWER_SERVE_CACHE. Those fixtures include
+# child/root symlinks (skipped only for the named Windows privilege limit), a
+# configured-Python start counter, and a three-peer file handshake that consumes
+# B's key through META/TILE before stale A and producer C are released.
 viewer_selftest(rreader NOGL --rreader-selftest tools/testdata
                         --remote-exe $<TARGET_FILE:viewer-serve>)
 

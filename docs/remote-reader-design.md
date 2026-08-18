@@ -252,9 +252,12 @@ MSG_TILE は元から「復号済み画素を source dtype で返す。ファイ
 RUN handler は `core/adapter.cpp` をそのまま使う (このために viewer 状態フリーに
 作られている — adapter.h 冒頭)。期限は **300 s、ローカルと同じ定数** (session.inc
 :1617/:1622)。期限も政策も wire に載せない — 政策はコードの居る側に置く。
-interpreter は `adapter::findPython` (numpy import が probe)。peer には設定 UI が
+interpreter は未指定時に `adapter::findPython` で探索する。peer には設定 UI が
 無いので上書きは環境変数 `VIEWER_SERVE_PYTHON` (VIEWER_SERVE_PLUGINS と同じ
-「peer 側の設定は env」の前例)。
+「peer 側の設定は env」の前例)。指定時は予備の `import numpy` を別プロセスで
+行わず、各 RUN につき 1 回だけ provenance probe を実行する。この probe が
+numpy の import と Python/numpy の版取得を兼ね、失敗・timeout・空出力はいずれも
+`RO_NO_PYTHON` である。パス文字列を provenance の代用品にはしない。
 
 client 側は **reader ジョブのスレッドが自前の session を開いて** RUN を投げる
 (App::ReaderJob の既存の非同期形 :1606-1620 のまま。UI session に載せない理由は
@@ -288,25 +291,54 @@ harness の出力は凍結済みの枠付きストリーム v1 (`VIEWERSTREAM 1`
 
 ### 5.3 キャッシュ — §4.12 の鍵の remote 版
 
+現在の実装 (`serve.cpp` の `readerHash`) は FNV-1a 型の 64-bit 更新則を使う。
+初期値は現行コードどおり `1469598103934665603`、各 byte `b` について
+`h = (h xor b) * 1099511628211 (mod 2^64)` である (標準 FNV-1a の offset basis
+とは異なるため、この初期値も鍵式の一部である)。各呼び出しの間に長さや区切り byte
+は追加せず、式中に明記した `|` だけが区切りである。したがって、下記を順に連結した
+byte 列が現行の鍵式そのものである。
+
 ```
-key = H( peerPath,
-         peer の stat (mtime, fsize),          ← stat は peer が持つ。client の
-                                                  stat では NAS の二重マウントで
-                                                  同一性が嘘になる
-         sha256(reader.py), sha256(viewer_import.py), sha256(run_adapter.py),
-         func, module VERSION (adapter::moduleVersion を運ばれた本文に適用) )
+key = FNV64( "viewer-serve reader 14",
+             peerPath,
+             decimal(peer mtime) + "|" + decimal(peer size),
+             folder のときだけ "dir|" + folderIdentity,
+             reader.py 本文, viewer_import.py 本文, run_adapter.py 本文,
+             func,
+             選択した interpreter 文字列,
+             "Python x.y.z (<実行ファイル>), numpy a.b.c",
+             identity の無い folder のときだけ
+               "uncacheable|" + pid + "|" + process 内連番 + "|" + steady-clock )
 ```
 
+最後の 64-bit 値を `%016llx` 相当の 16 桁小文字 hex にして wire 上の `key` とする。
+
+stat は peer が取る。client の stat では NAS の二重マウントで同一性が嘘になる。
+通常ファイルは mtime/size、folder は通常 stat を 0/0 とし、全子孫の相対パス・種別・
+通常ファイルの size/mtime を整列して得た `folderIdentity` を使う。folder の根自身、
+または子孫に symlink が 1 つでもあれば identity は作らない。reader は link を辿る一方、
+鍵側で安全・有限に同じ対象を要約できないためである。この場合は RUN ごとの nonce を
+足し、materialisation を鍵で読めるようにはするが、後続 RUN の cache hit にはしない。
+このときも `"dir|"` は混ぜ、`folderIdentity` の部分だけが空文字になる。
+`module VERSION` は reader.py 本文に含まれるので別項目にはしない。
+
 - 置き場: `~/.viewer-serve/reader-cache/` (env `VIEWER_SERVE_CACHE` で上書き)。
-- **2 度目の RUN は Python を起動しない** — stat と鍵計算だけでヒットし、応答に
-  「read from cache - the reader was not re-run」を返す (ローカル :1567 と同文)。
-- 並行書き: 同一鍵は同一バイトを書く (鍵に stat と全ハッシュが入るため —
-  adapter-transport-review A 系末尾の議論がそのまま成立)。壊れた・途中で切れた
-  キャッシュは検査 (上の 1) で落として作り直す (session.inc :1571 と同じ自己回復)。
+- **cache hit でも Python は provenance probe のため 1 回起動する**。起動しないのは
+  reader/harness であり、応答も
+  「reader and harness were not re-run; Python ran only the environment provenance probe」
+  と区別して述べる。provenance は鍵の一部なので、probe を省く hit は認めない。
+- 並行書き: 各 producer は固有の `.part` に書き、検査後だけ正規の `.vstream` へ
+  publish する。さらに鍵ごとの OS file lock (`<key>.lock`) を、壊れた正規ファイルの
+  **lock 後の再検査・削除**と、全 producer の**再検査・publish**の双方で共有する。
+  したがって、古い「壊れていた」という判定や、先に走り始めた producer が、発行済み
+  の鍵が指す正常ファイルを後から移動・削除・置換することはない。lock は process 異常
+  終了時に OS が解放する。lock file 自体は削除しない (waiter が古い inode を保持中に
+  path を作り直すと lock が二つに割れるため)。
 - 掃除: v1 は作らない (ローカルの adapter-cache と同じ)。**再訪条件**: 実地で
   キャッシュ肥大が報告されたら、両側同時に同じ方針で入れる。
 - 一時ファイル (運ばれた .py) は run の成否に関わらず削除。キャッシュに残るのは
-  `.vstream` だけ — peer のディスクに**コードを常設しない**ことが §3 の形を守る。
+  materialisation の `.vstream` と同期メタデータの `.lock` だけで、運ばれたコードは
+  常設しない。これが §3 の形を守る。
 
 ### 5.4 常駐ワーカ・共有メモリはここに入れない
 
@@ -382,9 +414,10 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 
 > 実装 2026-08-17 (issue #180 stage 1-2)。試験は `--rreader-selftest`
 > (`core/selftest/rreader.inc`)。設計との差分 3 点:
-> ① 鍵の中身はハッシュ関数が sha256 でなく `adapterHash` と同じ 64-bit FNV
->    (ローカルのキャッシュ鍵と 1 つの関数に揃えた)。入力は設計より強く、
->    reader の**本文そのもの**を混ぜているので `moduleVersion` は不要。
+> ① 鍵の中身はハッシュ関数が sha256 でなく、`adapterHash` と同じ 64-bit FNV-1a 型
+>    更新則 (`readerHash` という別 helper だが初期値・乗数も同じ)。入力は設計より強く、
+>    reader の**本文そのもの**を混ぜているので `moduleVersion` は不要。現在の全項目と
+>    順序は §5.3 の式を正典とする。
 > ② `VIEWER_SERVE_PYTHON` は peer では**厳格**(指定が失敗したら PATH に
 >    落ちない)。peer 側には設定窓が無く、黙って別の python で走った結果は
 >    再現できないため。
@@ -402,7 +435,8 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   R1 fixture の 5 次元 `.npy` + permute reader を RUN → outcome 0、stderr に
   `read 1 stack`、peer 側キャッシュファイル実在。
   R2 同じ RUN をもう一度 → 応答が cache 文、**キャッシュファイルの mtime が
-  動かない** (= Python 不起動の観測)。
+  動かない** (= reader/harness 不再実行の観測)。Python は provenance probe のため
+  1 回だけ起動する。
   R3 `VIEWER_SERVE_PROTOCOL=11` → client が**送信前に** readerTooOldText。
   R4 旗なし起動 → gate の一文 (R3 と別文であること)。
   R5 `VIEWER_SERVE_PYTHON=/nonexistent` → §6 の一文が host 名を含む。

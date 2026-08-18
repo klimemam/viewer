@@ -99,14 +99,14 @@ std::vector<std::string> moduleFunctions(const std::string& pyFile);
 // its kind, and - for a regular file - its size and mtime; the rows are sorted
 // before they are hashed, because no directory iteration order is promised.
 //
-// A SYMLINK ANYWHERE BELOW `dir` MEANS NO IDENTITY (#180 codex review). The
-// reader follows links; this walk does not and will not (following them is an
-// unbounded stat of somebody else's tree, plus a cycle set, plus a rule for
-// what a directory link means when the directory is walked too). Summarising a
-// link by its target AS WRITTEN - which is what this did first - made the hash
-// blind to the target's CONTENTS changing, so both cache keys stood still while
-// every pixel a reader returned changed. Refusing to have an identity is the
-// honest answer: the reader then runs every time.
+// A SYMLINK AT `dir` OR ANYWHERE BELOW IT MEANS NO IDENTITY (#180 codex
+// review). The reader follows links; this walk does not and will not (following
+// them is an unbounded stat of somebody else's tree, plus a cycle set, plus a
+// rule for what a directory link means when the directory is walked too).
+// Summarising a link by its target AS WRITTEN - which is what this did first -
+// made the hash blind to the target's CONTENTS changing, so both cache keys
+// stood still while every pixel a reader returned changed. Refusing to have an
+// identity is the honest answer: the reader then runs every time.
 //
 // FALSE means NO IDENTITY COULD BE ESTABLISHED - the path is not a directory,
 // the walk hit an error, an entry's stat failed, an entry is a symlink or of a

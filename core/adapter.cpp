@@ -424,7 +424,12 @@ bool folderIdentity(const std::string& dir, std::string& out) {
     namespace fs = std::filesystem;
     std::error_code ec;
     const fs::path root = u8p(dir);
-    if (!fs::is_directory(root, ec) || ec) return false;
+    // Test the ENTRY before asking whether its target is a directory. The
+    // is_directory(path) overload follows a root symlink, while the recursive
+    // iterator only reports entries below that root; without this explicit
+    // check a symlink at `dir` itself escaped the rule applied to child links.
+    const fs::file_status rootStatus = fs::symlink_status(root, ec);
+    if (ec || fs::is_symlink(rootStatus) || !fs::is_directory(rootStatus)) return false;
 
     // A ceiling, because this runs before Python does and a person who points a
     // reader at their home directory deserves a refusal rather than a walk of
