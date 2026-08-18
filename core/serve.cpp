@@ -14,6 +14,8 @@
 #include "npzfile.h"                 // the zip walk and the header peek both ends use
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -32,10 +34,16 @@
 #include "miniz.h"
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <process.h>                 // _getpid: the scratch directory a run owns
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>                  // getpid, same
 #endif
 
@@ -643,13 +651,23 @@ static bool g_serveReaders = false;
 void setServeReaders(bool on) { g_serveReaders = on; }
 bool serveReadersOpen() { return g_serveReaders; }
 
-// The same 64-bit FNV the local adapter cache keys with (core/app/session.inc
-// adapterHash). The design named sha256; this is the weaker hash and it is the
-// one the other half of this feature already uses, so the two caches are keyed
-// by one function rather than by two that must be argued about separately. The
-// inputs are what matters and they are stronger than the local key's: the
-// reader's whole TEXT is hashed, not its mtime, so "the same bytes" is what the
-// key means and a module VERSION line is inside the thing being hashed.
+// The same 64-bit FNV-1a-style recurrence the local adapter cache uses in
+// core/app/session.inc (`adapterHash`). These are separate helpers because the
+// two caches have different owners and inputs; keeping the algorithm aligned
+// does not pretend their key formulas are interchangeable. The design named
+// sha256; the implementation hashes the reader's whole TEXT, not its mtime, so
+// "the same bytes" is what this key means and a module VERSION line is already
+// inside the thing being hashed.
+// This process's id, which several places below need in a file name so that
+// two peers on one disk cannot write into one another's scratch.
+static unsigned long servePid() {
+#if defined(_WIN32)
+    return (unsigned long)_getpid();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
 static uint64_t readerHash(const std::string& s, uint64_t h = 1469598103934665603ull) {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
@@ -692,6 +710,146 @@ static bool cacheFileFor(const std::string& key, const std::string& leaf, std::s
 }
 static bool readerCachePath(const std::string& key, std::string& out) {
     return cacheFileFor(key, ".vstream", out);
+}
+
+// The persistent rendezvous file for every mutation of one canonical cache
+// entry. The file stays behind: unlinking a lock file after unlock creates two
+// different inodes when a waiter already has the old one open and a third
+// process opens the newly-created path. Keeping one inode per key is what makes
+// this a lock rather than a best-effort marker.
+static bool readerLockPath(const std::string& key, std::string& out) {
+    return cacheFileFor(key, ".lock", out);
+}
+
+// An OS-owned, interprocess lock. The kernel releases it if viewer-serve exits
+// or crashes, unlike an O_EXCL marker which can strand a key forever. It is
+// deliberately held only while the canonical name is inspected or changed;
+// Python writes to a per-run .part without it, so two expensive producers may
+// overlap and the first complete result still wins.
+class ReaderKeyLock {
+public:
+    ReaderKeyLock() = default;
+    ReaderKeyLock(const ReaderKeyLock&) = delete;
+    ReaderKeyLock& operator=(const ReaderKeyLock&) = delete;
+    ~ReaderKeyLock() { release(); }
+
+    bool acquire(const std::string& key, std::string& why) {
+        std::string path;
+        if (!readerLockPath(key, path)) {
+            why = "cannot form the per-key cache lock path";
+            return false;
+        }
+#if defined(_WIN32)
+        handle_ = CreateFileW(std::filesystem::u8path(path).wstring().c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            why = "cannot open the per-key cache lock (Windows error " +
+                  std::to_string((unsigned long)GetLastError()) + ")";
+            return false;
+        }
+        OVERLAPPED ov{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+            why = "cannot take the per-key cache lock (Windows error " +
+                  std::to_string((unsigned long)GetLastError()) + ")";
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            return false;
+        }
+#else
+        fd_ = open(std::filesystem::u8path(path).c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd_ < 0) {
+            why = "cannot open the per-key cache lock: " +
+                  std::string(std::strerror(errno));
+            return false;
+        }
+        int rc;
+        do { rc = flock(fd_, LOCK_EX); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) {
+            why = "cannot take the per-key cache lock: " +
+                  std::string(std::strerror(errno));
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+#endif
+        return true;
+    }
+
+private:
+    void release() {
+#if defined(_WIN32)
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        OVERLAPPED ov{};
+        UnlockFileEx(handle_, 0, 1, 0, &ov);
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+#else
+        if (fd_ < 0) return;
+        flock(fd_, LOCK_UN);
+        close(fd_);
+        fd_ = -1;
+#endif
+    }
+
+#if defined(_WIN32)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
+// ...and where a run WRITES before it is anything (#218 review r3794154621).
+//
+// Two viewer sessions asking the same uncached key at the same time are two
+// viewer-serve processes, and both used to point their harness straight at the
+// cache file. One would then validate, delete or overwrite what the other was
+// still writing; when the two outputs happened to have compatible lengths the
+// mixture even passed the structural check, and a peer answered with pixels
+// that were half of one run and half of another.
+//
+// The leaf is UNIQUE to this process and this run and sits in the cache
+// DIRECTORY, which is the point: a rename within one filesystem is atomic, so
+// what appears under the key is a file that was already complete and already
+// checked. Nothing is ever published half-written, and no contender can touch
+// anything but its own temp.
+static bool readerTempPath(const std::string& key, std::string& out) {
+    static std::atomic<uint64_t> seq{ 0 };
+    char leaf[64];
+    snprintf(leaf, sizeof leaf, ".%lu.%llu.part", servePid(),
+             (unsigned long long)(seq.fetch_add(1) + 1));
+    return cacheFileFor(key, leaf, out);
+}
+
+// VIEWER_SERVE_CACHE_JUDGE_HOLD: a seam that stops this process between judging
+// an existing cache entry unusable and taking the per-key lock that makes it
+// safe to act on that judgement.
+//
+// The race it exists to test is a window of a few microseconds between two
+// processes on one disk. A selftest that started two peers and hoped would be a
+// test that passes because the machine was busy, so this is a HANDSHAKE rather
+// than a sleep: the peer writes `<path>.at` to say it has judged and is
+// waiting, and waits for `<path>` to appear before it goes on. The test then
+// knows exactly when the stale observation exists and closes it deliberately.
+// The handler MUST recheck after acquiring the lock. A minute,
+// and then it proceeds anyway - a seam may not be a way to hang a peer.
+//
+// Absent everywhere else, read once, exactly as VIEWER_SERVE_LAG_MS and
+// VIEWER_SERVE_PROTOCOL are.
+static void serveCacheJudgeHold() {
+    static const std::string path = [] {
+        const char* e = getenv("VIEWER_SERVE_CACHE_JUDGE_HOLD");
+        return std::string(e ? e : "");
+    }();
+    if (path.empty()) return;
+    { std::ofstream f(std::filesystem::u8path(path + ".at"), std::ios::binary);
+      f << "held\n"; }
+    std::error_code e;
+    for (int i = 0; i < 3000; i++) {
+        if (std::filesystem::exists(std::filesystem::u8path(path), e)) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
 }
 
 // One node of a reader's output, laid out for readNpyRegion.
@@ -3010,23 +3168,61 @@ static void handleMeasure(Buf& in) {
 // the words - except where the words are settled HERE, which is the gate (§2.1)
 // and the check of what the reader returned (§5.2, shared with the local door).
 
-// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". Asked once and kept: it is
-// a property of the interpreter, and a cache hit deserves the same line as a
-// run because the client prints it either way.
-static std::string pythonProvenance(const std::string& py) {
-    static std::string cached;
-    static std::string cachedFor;
-    if (!cached.empty() && cachedFor == py) return cached;
+// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". ASKED ONCE PER RUN.
+//
+// It was asked once per interpreter per process and kept (#180 codex review),
+// which is a claim about a peer's lifetime that a peer does not get to make.
+// viewer-serve outlives the session it answers - hours, on a machine where
+// somebody else may `pip install -U numpy` in the environment it was pointed at
+// - and this string is BOTH what the client prints beside the pixels AND part
+// of the cache key (§5.3). A stale one breaks the key in both directions: the
+// same origin and reader keep hitting a materialisation the old numpy produced,
+// and if anything else in the key does move, the NEW numpy's pixels are
+// published under the OLD environment's name. The second is the exact thing
+// putting `prov` in the key was for.
+//
+// The cost is one authoritative `python -c` provenance probe per READER_RUN -
+// a few hundred milliseconds, once per Load. A cache hit pays it too, and that
+// is the point: the hit is only a hit if the environment is still the one the
+// key was computed under. The configured interpreter used to be started once
+// merely to import numpy and then a second time to ask this question. Besides
+// doing twice the work, that admitted two different answers across an upgrade;
+// this one command both proves numpy is importable and supplies the key fact.
+// Failure or silence is RO_NO_PYTHON, never a made-up provenance equal to `py`.
+static bool pythonProvenance(const std::string& py, std::string& provenance,
+                             std::string& why, std::string& detail) {
     adapter::Run r = adapter::run({ py, "-c",
         "import sys,numpy;print('Python %d.%d.%d (%s), numpy %s' % "
         "(sys.version_info[0],sys.version_info[1],sys.version_info[2],"
         "sys.executable,numpy.__version__))" }, 30000);
-    std::string s = r.out;
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    if (s.empty()) s = py;               // it answered nothing: name what we ran
-    cached = s;
-    cachedFor = py;
-    return s;
+    detail = r.err;
+    if (!r.started) {
+        why = r.fail.empty() ? "the provenance probe could not start" : r.fail;
+        return false;
+    }
+    if (r.timedOut) {
+        why = "the provenance probe did not finish within 30 seconds";
+        return false;
+    }
+    if (r.exit != 0) {
+        why = r.err.find("numpy") != std::string::npos
+                ? "the provenance probe could not import or identify numpy"
+                : "the provenance probe exited with status " + std::to_string(r.exit);
+        return false;
+    }
+    provenance = r.out;
+    while (!provenance.empty() &&
+           (provenance.back() == '\n' || provenance.back() == '\r' ||
+            provenance.back() == ' ' || provenance.back() == '\t'))
+        provenance.pop_back();
+    const size_t first = provenance.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        provenance.clear();
+        why = "the provenance probe returned no Python/numpy identity";
+        return false;
+    }
+    if (first) provenance.erase(0, first);
+    return true;
 }
 
 static bool writeWholeFile(const std::filesystem::path& p, const std::string& body) {
@@ -3144,78 +3340,183 @@ static void handleReaderRun(Buf& in) {
     std::string why, py;
     const char* cfgPy = getenv("VIEWER_SERVE_PYTHON");
     if (cfgPy && *cfgPy) {
-        adapter::Run probe = adapter::run({ cfgPy, "-c", "import numpy" }, 30000);
-        if (probe.started && probe.exit == 0) {
-            py = cfgPy;
-        } else {
-            why = std::string("VIEWER_SERVE_PYTHON is ") + cfgPy +
-                  (!probe.started ? " (not found)"
-                   : probe.err.find("numpy") != std::string::npos
-                       ? " (no numpy)"
-                       : " (exit " + std::to_string(probe.exit) + ")");
-            reply(RO_NO_PYTHON, why, probe.err, "", "", "");
-            return;
-        }
+        // Do not run a preliminary `import numpy`: the provenance command below
+        // is the one authoritative observation for this RUN.
+        py = cfgPy;
     } else {
         py = adapter::findPython("", why);
         if (py.empty()) { reply(RO_NO_PYTHON, why, "", "", "", ""); return; }
     }
-    const std::string prov = pythonProvenance(py);
+    std::string prov, probeDetail;
+    if (!pythonProvenance(py, prov, why, probeDetail)) {
+        if (cfgPy && *cfgPy)
+            why = std::string("VIEWER_SERVE_PYTHON is ") + cfgPy + ": " + why;
+        reply(RO_NO_PYTHON, why, probeDetail, "", "", "");
+        return;
+    }
 
     // §5.3's key. The peer's OWN stat of the origin, because a client's stat of
     // a NAS mounted twice makes identity a lie; the reader's whole text, so
     // "the same reader" means the same bytes and not the same name; the
-    // function; and the version the key RULE was fixed at, so a peer that
-    // changes what a key covers cannot hand back a hit computed under the old
-    // one. That number stays 12: protocol 13 added a second family of keys
-    // (§10.6) and changed nothing about what a reader key means, and bumping it
-    // would invalidate every cache on every peer to say so.
+    // function; the ENVIRONMENT that produced the pixels; and the version the
+    // key RULE was fixed at, so a peer that changes what a key covers cannot
+    // hand back a hit computed under the old one.
+    //
+    // The current number is 14. Rule 13 first added `py` and `prov`; rule 14
+    // invalidates entries a long-lived peer could have issued from its former
+    // process-cached provenance. There is no fact in such an entry that can
+    // prove whether the environment was still the one printed beside it, so a
+    // current peer must never call it a hit.
+    //
+    // WHY THE ENVIRONMENT IS IN IT. The key covered the origin and the reader's
+    // text and stopped there, so the answer to "which python ran this" was not
+    // part of what made a hit a hit - while `prov` was reported beside the
+    // pixels on every reply, cached or not. Point VIEWER_SERVE_PYTHON at a
+    // different interpreter, or upgrade numpy under the one it names, and the
+    // peer handed back the OLD environment's pixels with the NEW environment's
+    // provenance printed next to them. That is not a stale cache; it is a
+    // provenance line that says something untrue about the numbers it labels,
+    // which is the one failure this project spends its refusals on.
+    //
+    // Both halves are here on purpose. `py` is the interpreter this peer was
+    // told to use - two paths are two environments even when they report the
+    // same versions. `prov` is what that interpreter SAYS it is (§4.3.1's
+    // sentence: "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4"), which is
+    // what moves when numpy is upgraded in place and the path does not. It is
+    // asked ON THIS RUN, not remembered from an earlier one (#180 codex
+    // review): a peer process lives for hours, an upgrade under it is an
+    // ordinary event, and a remembered answer would hand back the old
+    // environment's pixels - or publish the new environment's pixels under the
+    // old environment's name - for as long as that process lasted.
+    //
+    // A FOLDER ORIGIN is the third thing in it (#218 review). Its own mtime
+    // moves when a child is added or removed and not when one is REWRITTEN,
+    // which is the ordinary way a capture directory changes - so this key,
+    // which recorded that mtime and left oSize at 0, called a folder whose
+    // every frame had been replaced "the same input". adapter::folderIdentity
+    // is the answer, and it is the LOCAL door's answer too: adapterCacheKey
+    // had the identical hole, and one helper is what keeps the two ends from
+    // disagreeing about whether a directory changed.
+    //
+    // No identity, no cache. The reply still has to carry a KEY - that is how
+    // the client addresses the materialisation it is about to read - so the key
+    // is made UNIQUE to this run instead of being made up out of the directory
+    // mtime. It is written, it is addressable, and no later run can ever hit
+    // it, which is what "caching must be disabled" means for a peer that
+    // answers by key.
     std::error_code ec;
     const std::filesystem::path origin = std::filesystem::u8path(peerPath);
     uint64_t oMtime = 0, oSize = 0;
+    std::string folderId;
+    bool folder = false, uncacheable = false;
     {
         auto t = std::filesystem::last_write_time(origin, ec);
         if (!ec) oMtime = (uint64_t)t.time_since_epoch().count();
-        if (!std::filesystem::is_directory(origin, ec)) {
+        std::error_code de;
+        folder = std::filesystem::is_directory(origin, de) && !de;
+        if (!folder) {
             auto s = std::filesystem::file_size(origin, ec);
             if (!ec) oSize = (uint64_t)s;
+        } else {
+            oMtime = 0;                  // the very number that was the defect
+            uncacheable = !adapter::folderIdentity(peerPath, folderId);
         }
     }
-    uint64_t h = readerHash("viewer-serve reader 12");
+    uint64_t h = readerHash("viewer-serve reader 14");
     h = readerHash(peerPath, h);
     h = readerHash(std::to_string(oMtime) + "|" + std::to_string(oSize), h);
+    if (folder) h = readerHash("dir|" + folderId, h);
     for (int i = 0; i < 3; i++) h = readerHash(body[i], h);
     h = readerHash(func, h);
+    h = readerHash(py, h);
+    h = readerHash(prov, h);
+    if (uncacheable) {
+        static std::atomic<uint64_t> nonce{ 0 };
+        const uint64_t n = nonce.fetch_add(1) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        h = readerHash("uncacheable|" + std::to_string((unsigned long long)servePid()) +
+                       "|" + std::to_string(n) + "|" + std::to_string((long long)now), h);
+    }
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
     const std::string key = hex;
-    std::string cachePath;
-    if (!readerCachePath(key, cachePath)) {
+    std::string cachePath, tmpPath;
+    if (!readerCachePath(key, cachePath) || !readerTempPath(key, tmpPath)) {
         sendErr("this peer has nowhere to keep what a reader produces "
                 "(set VIEWER_SERVE_CACHE)");
         return;
     }
+    // Whatever happens below, THIS process's temp goes away and nothing else
+    // does. Every failure path used to delete `cachePath` - which is to say,
+    // a contender that timed out or whose Python raised deleted the file a
+    // DIFFERENT session had just published, and that session's next open then
+    // re-ran a reader that had already succeeded.
+    struct TempFile {
+        std::string p;
+        bool keep = false;
+        ~TempFile() {
+            if (keep || p.empty()) return;
+            std::error_code e;
+            std::filesystem::remove(std::filesystem::u8path(p), e);
+        }
+    } temp{ tmpPath };
 
+    // The cache answer, and the ONE sentence that says exactly what did and did
+    // not run. The reader and harness are skipped; the Python provenance probe
+    // above still runs, because its answer is part of this run's key.
+    auto replyFromCache = [&](const std::string& header) {
+        reply(RO_OK, "",
+              "read from cache - the reader and harness were not re-run; Python "
+              "ran only the environment provenance probe.\n"
+              "Edit the reader and press Load again to re-run it.",
+              prov, key, header);
+    };
+    bool observedInvalid = false;
+    ec.clear();
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string header;
         const std::string cerr = checkReaderOutput(cachePath, header);
         if (cerr.empty()) {
-            // §5.3: the second run does not start Python. The key covers the
-            // reader's whole text and the origin's stat, so "cached" cannot
-            // mean "stale" - and the sentence is the local one, because it is
-            // the same promise being kept.
-            reply(RO_OK, "",
-                  "read from cache - the reader was not re-run.\n"
-                  "Edit the reader and press Load again to re-run it.",
-                  prov, key, header);
+            replyFromCache(header);
             return;
         }
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);  // earn it again
+        observedInvalid = true;
+    }
+    if (observedInvalid) {
+        serveCacheJudgeHold();
+
+        // Every change to `<key>.vstream` is made while this lock is held. Most
+        // importantly, an INVALID observation made before the lock is never
+        // acted on directly: recheck after acquisition. Another producer may
+        // have replaced the bad bytes and already issued this key while we
+        // waited. An absent key needs no mutation here; its producer takes this
+        // same lock at publish time.
+        ReaderKeyLock lock;
+        std::string lockWhy;
+        if (!lock.acquire(key, lockWhy)) {
+            sendErr(lockWhy);
+            return;
+        }
+        ec.clear();
+        if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
+            std::string header;
+            if (checkReaderOutput(cachePath, header).empty()) {
+                replyFromCache(header);
+                return;
+            }
+            // Still invalid while exclusively owned. Removal is safe now: no
+            // conforming producer can publish between this verdict and act.
+            std::error_code de;
+            if (!std::filesystem::remove(std::filesystem::u8path(cachePath), de) || de) {
+                sendErr("cannot remove an unusable reader cache entry: " + de.message());
+                return;
+            }
+        }
     }
 
     // The three texts land in a directory of their own and leave with it. What
-    // stays on this disk is the .vstream and nothing else: §3's form is only
-    // honest if the peer does not accumulate other people's code.
+    // stays on this disk is the .vstream plus its empty lock rendezvous, never
+    // other people's code: that is the part §3's form requires.
     std::filesystem::path td = std::filesystem::temp_directory_path(ec);
     char nm[64];
     const unsigned long pid = (unsigned long)
@@ -3246,25 +3547,25 @@ static void handleReaderRun(Buf& in) {
     // 300 s, the local limit (core/app/session.inc). The policy lives with the
     // code that runs the process and never on the wire: one side deciding how
     // long the other side's patience is would be a setting with two owners.
-    adapter::Run r = adapter::run(argv, 300000, nullptr, cachePath, errFile, false);
+    adapter::Run r = adapter::run(argv, 300000, nullptr, tmpPath, errFile, false);
     // BEFORE the reply, not on the way out of this function. The client is
     // entitled to treat the answer as proof that the code it sent is no longer
     // on this disk, and a destructor that runs after the bytes are on the wire
     // makes that a race it can lose. Nothing below needs the directory: what
     // the reader printed is already in `r`.
     std::filesystem::remove_all(td, ec);
+    // Each of the three failures below leaves ONLY its own temp behind, which
+    // `temp` then removes. None of them touches `cachePath`: this run never
+    // published anything, so there is nothing of its own there to withdraw.
     if (!r.started) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_NOT_STARTED, r.fail, r.err, prov, "", "");
         return;
     }
     if (r.timedOut) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_TIMED_OUT, adapter::showCommand(argv), r.err, prov, "", "");
         return;
     }
     if (r.exit != 0) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         // The traceback travels WHOLE (§6). The line numbers in it are the
         // client's own file's, because the file is the one the client sent -
         // which is what carrying the reader buys that a peer-side copy could
@@ -3273,14 +3574,69 @@ static void handleReaderRun(Buf& in) {
               r.err, prov, "", "");
         return;
     }
+    // VALIDATED FIRST, then published under the SAME per-key exclusion used by
+    // invalid-entry removal. The shared lock is the promise: after any process
+    // has issued `key`, every later producer rechecks its valid canonical and
+    // leaves it in place. META/TILE can therefore use that key immediately,
+    // even while older producers are still finishing their own .part files.
     std::string header;
-    const std::string cerr = checkReaderOutput(cachePath, header);
+    const std::string cerr = checkReaderOutput(tmpPath, header);
     if (!cerr.empty()) {
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);
         reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
         return;
     }
-    reply(RO_OK, "", r.err, prov, key, header);
+    ReaderKeyLock publishLock;
+    std::string lockWhy;
+    if (!publishLock.acquire(key, lockWhy)) {
+        sendErr(lockWhy);
+        return;
+    }
+    ec.clear();
+    if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
+        std::string winnerHeader;
+        if (checkReaderOutput(cachePath, winnerHeader).empty()) {
+            reply(RO_OK, "",
+                  r.err.empty() ? std::string("another session published this key first.")
+                                : r.err,
+                  prov, key, winnerHeader);
+            return;
+        }
+        // An external writer, an old peer, or a crash may have left rubbish
+        // while this producer ran. It is owned, rechecked and removed under the
+        // same exclusion as every current producer's publish.
+        std::error_code de;
+        if (!std::filesystem::remove(std::filesystem::u8path(cachePath), de) || de) {
+            reply(RO_UNREADABLE,
+                  "the reader ran, but an unusable cache entry could not be removed: " +
+                      de.message(),
+                  r.err, prov, "", "");
+            return;
+        }
+    }
+    std::error_code re;
+    std::filesystem::rename(std::filesystem::u8path(tmpPath),
+                            std::filesystem::u8path(cachePath), re);
+    if (!re) {
+        temp.keep = true;                // it is the cache file now, not a temp
+        reply(RO_OK, "", r.err, prov, key, header);
+        return;
+    }
+    // This can now only be an I/O failure or a writer that ignores the lock.
+    // Recheck before reporting it: if a valid canonical nevertheless appeared,
+    // it answers this key and our own temp remains ours to remove.
+    std::string wheader;
+    const std::string werr = checkReaderOutput(cachePath, wheader);
+    if (werr.empty()) {
+        reply(RO_OK, "",
+              r.err.empty() ? std::string("another session published this key first.")
+                            : r.err,
+              prov, key, wheader);
+        return;
+    }
+    reply(RO_UNREADABLE,
+          "the reader ran, but its result could not be put where this peer keeps them: " +
+              re.message(),
+          r.err, prov, "", "");
 }
 
 // ---------------------------------------------------------------- npz scan
@@ -3295,6 +3651,39 @@ static void handleReaderRun(Buf& in) {
 // --serve-readers has nothing to do with this. The gate (§2) is about OTHER
 // PEOPLE'S CODE running here; what runs for a .npz is this binary, on a format
 // it already reads. A peer with the flag closed answers SCAN.
+// The ceiling on ONE NPZ_SCAN REPLY - the whole of it, all members together
+// (#221 review, corrected by #180's). The per-member rule cannot bound a reply:
+// nz::INLINE_MAX_BYTES lets each member through at 8 MiB and a perfectly valid
+// container may hold hundreds of them, so 68 axes of 2^20 f8 elements are
+// 544 MiB of a file nothing is wrong with - past the 512 MiB core/remote.cpp
+// will accept, which arrives as "oversized reply from the peer": a sentence
+// about the transport, for a file, that the person cannot act on.
+//
+// AND IT IS THE WHOLE REPLY, not the values in it. The first version of this
+// budgeted `f.bytes` alone, which left the NAMES unbudgeted - a zip member name
+// is a 16-bit length, so 5,000 members of 60,000 characters carry 300 MB of
+// name, and a file whose values summed to 238.4 MiB passed a 256 MiB ceiling
+// and put 524.5 MiB on the wire. So what is spent here is rp::
+// NPZ_SCAN_REPLY_FIXED plus, per member, rp::NPZ_SCAN_FACT_FIXED + name + err +
+// bytes: exactly the bytes handleNpzScan will append below, counted before one
+// of them is built.
+//
+// 256 MiB, which is half of the client's limit. A file above it is refused
+// WHOLE and by name - never trimmed to fit, because a picker missing rows is a
+// listing that lied - and the refusal is an MSG_ERR for the FILE, so the person
+// is told about the file rather than about the transport.
+//
+// VIEWER_SERVE_NPZ_SCAN_MAX may LOWER it, in bytes. That exists so the rule can
+// be tested without writing a quarter-gigabyte fixture; it must not raise the
+// ceiling past the transport bound the default was chosen to respect. The
+// strict parse and clamp live beside the protocol constant and are read once,
+// at the first scan, so the peer answers one number for its whole life.
+static uint64_t npzScanInlineMax() {
+    static const uint64_t n =
+        rp::npzScanCeilingFor(getenv("VIEWER_SERVE_NPZ_SCAN_MAX"));
+    return n;
+}
+
 static void handleNpzScan(Buf& in) {
     std::string path;
     if (!in.getStr(path)) { sendErr("bad NPZ_SCAN"); return; }
@@ -3309,7 +3698,28 @@ static void handleNpzScan(Buf& in) {
     if (!readWholeInto(path, zip, err)) { sendErr(err); return; }
     std::vector<nz::Entry> entries;
     if (!nz::list(zip, entries, err)) { sendErr(err); return; }
-    const std::vector<nz::Fact> facts = nz::readFacts(zip, entries);
+    // The budget is spent HERE - before a member is inflated, before the key is
+    // published and before one byte is copied into a reply. The order is the
+    // point: an aggregate ceiling enforced while filling the message would have
+    // already paid for everything it then refuses.
+    nz::InlineBudget budget;
+    budget.max = npzScanInlineMax();
+    // The message's own fields, charged before the first member is looked at,
+    // and what each member costs beyond its name, its error and its bytes. Both
+    // are rp::'s, next to the wire they describe, so this cannot drift from what
+    // the Buf below actually appends.
+    budget.used = rp::NPZ_SCAN_REPLY_FIXED;
+    budget.perFact = rp::NPZ_SCAN_FACT_FIXED;
+    const std::vector<nz::Fact> facts = nz::readFacts(zip, entries, &budget);
+    if (!budget.over.empty()) {
+        sendErr("this .npz needs more than one reply can hold: \"" +
+                budget.over + "\" needs " + std::to_string(budget.need) +
+                " bytes on top of " + std::to_string(budget.used) +
+                " already listed, over this peer's ceiling of " +
+                std::to_string(budget.max) + " bytes for one scan. Open " + path +
+                " on the machine it lives on.");
+        return;
+    }
     if (facts.empty()) { sendErr("no arrays in npz"); return; }
 
     // §10.6's key. The kind word is what keeps the two families apart in one
@@ -3336,22 +3746,20 @@ static void handleNpzScan(Buf& in) {
         // The version the file declares, read where the bytes are. The client
         // refuses a version it does not know with its own sentence - the check
         // stays at ONE gate (§5.2) - so this is carried, never judged here.
+        //
+        // Read with nz::elem, which is what the local loader reads its own
+        // members with. This used to be a switch of host-order memcpys written
+        // out here, and it ignored the byte order the descr states: `>i4`
+        // version 1 arrived as 16777216, the client refused a "version it does
+        // not know", and the same file opened locally was fine. Carrying a
+        // number is only harmless if it is the number the file says (#221
+        // review); bounds and byte order both belong to the decoder.
         for (const nz::Fact& f : facts) {
             if (f.name != "__viewer" || !f.whole) continue;
             nz::Head H;
             std::string e2;
             if (!nz::peekHeader(f.bytes, H, e2) || H.esize <= 0) break;
-            if (H.dataOff + (size_t)H.esize > f.bytes.size()) break;
-            double v = 0;
-            const uint8_t* p = f.bytes.data() + H.dataOff;
-            switch (H.esize) {
-                case 1: v = (double)*p; break;
-                case 2: { uint16_t u; memcpy(&u, p, 2); v = (double)u; break; }
-                case 4: { if (H.code == "f4") { float g; memcpy(&g, p, 4); v = (double)g; }
-                          else { uint32_t u; memcpy(&u, p, 4); v = (double)u; } break; }
-                case 8: { if (H.code == "f8") { double g; memcpy(&g, p, 8); v = g; }
-                          else { uint64_t u; memcpy(&u, p, 8); v = (double)u; } break; }
-            }
+            const double v = nz::elem(f.bytes, H, 0);
             if (v > 0 && v < 1e9) cver = (uint32_t)v;
             break;
         }
@@ -3371,6 +3779,22 @@ static void handleNpzScan(Buf& in) {
         out.putU32(f.whole ? 1u : 0u);
         out.putU32((uint32_t)f.bytes.size());
         out.putBlob(f.bytes.data(), f.bytes.size());
+    }
+    // THE BUDGET WAS A PREDICTION; this is the message. They must be the same
+    // number, and if they are not then something appended a byte the ceiling
+    // never saw - so the reply is refused rather than sent, and the peer says
+    // which of the two it trusts. A reply's length is also a u32 on the wire
+    // (rp::Header), and 256 MiB is far under that, but the bound is stated
+    // rather than assumed because the consequence of it being wrong is a
+    // session that ends instead of a file that is refused.
+    if (out.b.size() != (size_t)budget.used || (uint64_t)out.b.size() > budget.max ||
+        out.b.size() > 0xffffffffull) {
+        sendErr("this peer built a reply of " + std::to_string(out.b.size()) +
+                " bytes for " + path + " after budgeting " +
+                std::to_string(budget.used) + " against a ceiling of " +
+                std::to_string(budget.max) + ". It will not send it. Open the file "
+                "on the machine it lives on.");
+        return;
     }
     sendMsg(MSG_OK, out);
 }

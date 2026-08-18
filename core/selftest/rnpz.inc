@@ -380,6 +380,974 @@
                   "R17f a member inflated after the file moved is refused BY NAME");
         }
 
+        // ---- R18: a zip64 record that does not hold together -------------------
+        //
+        // #221 review r3794616476. The central directory says 0xffffffff for a
+        // size, which means "the real number is in the zip64 extra field", and
+        // the walk then read three 64-bit values out of that field having
+        // checked only that its four-byte HEADER fitted. An extra field with id
+        // 1 and a declared size of 0 - a truncated file, or a writer with a bug
+        // - therefore read up to 24 bytes past the end of the buffer. On the
+        // PEER that is a crash, caused by a file a client did no more than
+        // name; and a peer that dies takes the session with it.
+        //
+        // The fixtures are the three truncations in turn, because "which of the
+        // three values was missing" is what the sentence has to be able to say.
+        {
+            // A zip written the way a zip64 writer writes one: the 32-bit
+            // fields in the central directory are 0xffffffff and the real
+            // numbers live in the extra field. `z64n` is how many of the three
+            // u64s that field actually carries - 3 is well-formed.
+            auto writeZip64 = [&](const std::string& path, const std::string& member,
+                                  const std::vector<uint8_t>& body, int z64n) {
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff));
+                    z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                auto p64 = [&](uint64_t x) {
+                    for (int i = 0; i < 8; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                const std::string nm = member + ".npy";
+                const uint32_t crc =
+                    (uint32_t)mz_crc32(MZ_CRC32_INIT, body.data(), body.size());
+                const uint32_t lo = (uint32_t)z.size();
+                // The LOCAL header carries the real 32-bit sizes: the fixture is
+                // small, and what is under test is the CENTRAL directory's
+                // zip64 record, so nothing else is made strange.
+                p32(0x04034b50); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc); p32((uint32_t)body.size()); p32((uint32_t)body.size());
+                p16((uint32_t)nm.size()); p16(0);
+                z.insert(z.end(), nm.begin(), nm.end());
+                z.insert(z.end(), body.begin(), body.end());
+                const uint32_t cdOff = (uint32_t)z.size();
+                const uint32_t elen = (uint32_t)(4 + 8 * z64n);
+                p32(0x02014b50); p16(45); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc);
+                p32(0xffffffffu); p32(0xffffffffu);           // csize, usize: "see the extra"
+                p16((uint32_t)nm.size()); p16(elen); p16(0); p16(0); p16(0); p32(0);
+                p32(0xffffffffu);                             // localOff: the same
+                z.insert(z.end(), nm.begin(), nm.end());
+                p16(1); p16((uint32_t)(8 * z64n));            // the zip64 extra field
+                const uint64_t vals[3] = { (uint64_t)body.size(), (uint64_t)body.size(),
+                                           (uint64_t)lo };
+                for (int i = 0; i < z64n; i++) p64(vals[i]);
+                const uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                p32(0x06054b50); p16(0); p16(0); p16(1); p16(1);
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            const std::vector<uint8_t> imgNpy =
+                selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2);
+
+            if (!connect()) return 1;
+            // (a) the WELL-FORMED one still opens. A bounds check that refused
+            //     real zip64 files would be the same outage wearing a message.
+            const std::string z64ok = root + "/z64ok.npz";
+            writeZip64(z64ok, "img", imgNpy, 3);
+            {
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool got = readFileBytes(z64ok, zip) && npzList(zip, ents, zerr);
+                check(got && ents.size() == 1 && ents[0].usize == imgNpy.size() &&
+                          ents[0].csize == imgNpy.size(),
+                      "R18a a real zip64 record still reads: the sizes come out of the extra");
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(z64ok, sc, err);
+                check(sent && sc.members.size() == 1,
+                      "R18b ...and the peer lists it over the link");
+            }
+            // (b) the three truncations, each named.
+            const char* who[3] = { "uncompressed size", "compressed size",
+                                   "local header offset" };
+            const char* tag[3] = { "R18c a zip64 field with no room for the USIZE is refused BY NAME",
+                                   "R18d ...and one with no room for the CSIZE",
+                                   "R18e ...and one with no room for the LOCAL OFFSET" };
+            for (int n = 0; n < 3; n++) {
+                const std::string p = root + "/z64cut" + std::to_string(n) + ".npz";
+                writeZip64(p, "img", imgNpy, n);
+                // The LOCAL walk first - it is the same parser, and a peer that
+                // refused what this door accepted would be two answers again.
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool listed = readFileBytes(p, zip) && npzList(zip, ents, zerr);
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(p, sc, err);
+                fprintf(stderr, "rnpzselftest:   R18 cut%d local=\"%s\" peer=\"%s\"\n",
+                        n, zerr.c_str(), err.c_str());
+                check(!listed && !sent && has(err, "img.npy") && has(err, who[n]) &&
+                          err == zerr,
+                      tag[n]);
+            }
+            // (c) THE PEER IS STILL THERE. That is the whole point: an out-of-
+            //     bounds read ends the process, and a refusal does not.
+            remote::NpzScan sc;
+            std::string err;
+            const bool alive = app.uiSession.npzScan(many, sc, err);
+            check(alive && sc.members.size() == 5,
+                  "R18f the same session lists a good container afterwards: the peer lived");
+        }
+
+        // ---- R19: the container's version, in the byte order the file states ---
+        //
+        // #221 review r3794616468. The peer read `__viewer`'s value with a
+        // host-order memcpy written out at the call site, so a container whose
+        // version member is a valid big-endian dtype - `>i4`, which numpy
+        // writes the moment its author asks for it - arrived as 16777216 where
+        // the file says 1. The client carries that number straight into
+        // loadViewerNpz's ONE version gate (§5.2), which refused it as "written
+        // by a newer viewer": a file that opens perfectly well off this disk was
+        // unopenable over a link. Two machines, two readings of four bytes.
+        //
+        // The fix is not a second byte-order switch on the peer. There is ONE
+        // decoder now - nz::elem, beside the peekHeader that says which order
+        // the bytes are in - and both doors call it. R19a/b assert that decoder
+        // directly against the raw bytes, because that is the statement the fix
+        // makes; R19c carries it to the wire and R19d/e to the screen.
+        {
+            if (!connect()) return 1;
+            // `>i4` holding 1. The payload is 00 00 00 01, which is 16777216 to
+            // anything that reads it in this host's order.
+            auto i32be = [](int32_t v) {
+                const uint8_t b[4] = { (uint8_t)((v >> 24) & 0xff),
+                                       (uint8_t)((v >> 16) & 0xff),
+                                       (uint8_t)((v >> 8) & 0xff),
+                                       (uint8_t)(v & 0xff) };
+                return selftestNpyBytes(">i4", {}, b, 4);
+            };
+            const std::vector<uint8_t> vb = i32be(1);
+
+            // ---- R19a/b: the decoder, on the bytes, with no link in sight ----
+            nz::Head VH;
+            std::string vherr;
+            const bool peeked = nz::peekHeader(vb, VH, vherr);
+            uint32_t raw = 0;                       // what a host-order read says
+            if (peeked && VH.dataOff + 4 <= vb.size()) memcpy(&raw, vb.data() + VH.dataOff, 4);
+            const double dec = peeked ? nz::elem(vb, VH, 0) : -1.0;
+            fprintf(stderr, "rnpzselftest:   R19 __viewer as '>i4' 1: be=%d code=%s "
+                            "host-order=%u  nz::elem=%.0f\n",
+                    peeked && VH.be ? 1 : 0, peeked ? VH.code.c_str() : "?",
+                    (unsigned)raw, dec);
+            check(peeked && VH.be && VH.code == "i4" && VH.esize == 4,
+                  "R19a (setup) the fixture's __viewer really IS a big-endian i4");
+            check(raw == 16777216u,
+                  "R19a ...and a host-order read of those four bytes really says 16777216");
+            check(dec == 1.0,
+                  "R19b nz::elem - the one decoder both doors call - reads the 1 the file says");
+
+            // ---- the fixture: R16's container with that version member -------
+            // Everything else is byte-for-byte what tree.npz holds, so the only
+            // thing that can differ below is the version.
+            const std::string contBE = root + "/tree_be.npz";
+            selftestWriteNpz(contBE, {
+                { "__viewer",   vb },
+                { "__n",        i32(4) },
+                { "__layer_0",  str1("batch") },
+                { "__parent_0", i32(-1) },
+                { "__name_0",   str1("sweep") },
+                { "__layer_1",  str1("series") },
+                { "__parent_1", i32(0) },
+                { "__name_1",   str1("exposure sweep") },
+                { "__conditions_values_1", f64v({ 2.0, 8.0 }) },
+                { "__conditions_name_1",   str1("exposure") },
+                { "__conditions_unit_1",   str1("ms") },
+                { "__layer_2",  str1("stack") },
+                { "__parent_2", i32(1) },
+                { "__name_2",   str1("e2") },
+                { "__pixels_2", selftestNpyBytes("<u2", { 2, HH, WW }, sa.data(), sa.size() * 2) },
+                { "__layer_3",  str1("stack") },
+                { "__parent_3", i32(1) },
+                { "__name_3",   str1("e8") },
+                { "__pixels_3", selftestNpyBytes("<u2", { 2, HH, WW }, sb.data(), sb.size() * 2) },
+            });
+
+            // ---- R19c: what the PEER says the file declares -------------------
+            remote::NpzScan sc;
+            std::string err;
+            const bool got = app.uiSession.npzScan(contBE, sc, err);
+            fprintf(stderr, "rnpzselftest:   R19 peer: got=%d kind=%d version=%d \"%s\"\n",
+                    got ? 1 : 0, got ? sc.kind : -1, got ? sc.containerVersion : -1,
+                    err.c_str());
+            check(got && sc.kind == rp::NK_CONTAINER,
+                  "R19c the peer knows it is a viewer container");
+            check(got && sc.containerVersion == 1,
+                  "R19c ...and carries the version the FILE declares, not the host's reading");
+
+            // ---- R19d/e: and therefore it opens, both ways ---------------------
+            closeAll();
+            const size_t rFirst = app.images.size();
+            const bool ropen = openRemoteNpz(urlOf(contBE), std::string());
+            const size_t rDocs = app.images.size() - rFirst;
+            fprintf(stderr, "rnpzselftest:   R19 remote open=%d docs=%zu toast=\"%s\"\n",
+                    ropen ? 1 : 0, rDocs, app.toast.c_str());
+            check(ropen && rDocs == 4,
+                  "R19d a big-endian container opens over the LINK, every frame of it");
+            closeAll();
+            const std::string lerr = loadNpz(contBE);
+            fprintf(stderr, "rnpzselftest:   R19 local open docs=%zu \"%s\"\n",
+                    app.images.size(), lerr.c_str());
+            check(lerr.empty() && app.images.size() == 4,
+                  "R19e ...and the local door opens the same file the same way");
+            closeAll();
+
+            // ---- R19f: ANTI-VACUITY - the gate R19c feeds is a real gate ------
+            // A container that really does declare 16777216 is still refused. So
+            // R19d/e are not "the version check is gone"; they are "the number
+            // that reached the check was the file's".
+            const std::string contFuture = root + "/tree_future.npz";
+            selftestWriteNpz(contFuture, {
+                { "__viewer",   i32(16777216) },
+                { "__n",        i32(1) },
+                { "__layer_0",  str1("stack") },
+                { "__parent_0", i32(-1) },
+                { "__name_0",   str1("e2") },
+                { "__pixels_0", selftestNpyBytes("<u2", { 2, HH, WW }, sa.data(), sa.size() * 2) },
+            });
+            const std::string ferr = loadNpz(contFuture);
+            fprintf(stderr, "rnpzselftest:   R19 declared-16777216: \"%s\"\n", ferr.c_str());
+            check(has(ferr, "16777216") && has(ferr, "newer viewer"),
+                  "R19f a container that really declares 16777216 is still refused BY NUMBER");
+            closeAll();
+        }
+
+        // ---- R20: the SUM of the values, not just each one ---------------------
+        //
+        // #221 review r3794616480. Every member of an .npz can pass the
+        // per-member inline rule and the file still be unlistable:
+        // nz::INLINE_MAX_BYTES lets an 8 MiB axis through, a valid container may
+        // hold hundreds, and 68 axes of 2^20 f8 elements are 544 MiB of reply
+        // for a file nothing is wrong with. core/remote.cpp refuses anything over
+        // 512 MiB as "oversized reply from the peer" - a sentence about the
+        // transport, said about a file, that nobody can act on. So the total has
+        // an owner now, and it is the side that fills the message.
+        //
+        // THE FIXTURE IS SCALED, NOT SHAPED DIFFERENTLY. Writing the 256 MiB that
+        // trips the real ceiling to prove an arithmetic comparison is a test
+        // nobody would run, so the peer's ceiling is injected small
+        // (VIEWER_SERVE_NPZ_SCAN_MAX) and the members are kilobytes. What is
+        // being asserted is exactly the reported shape: every member is far under
+        // the per-member rule (R20a), and the file is still refused (R20b).
+        {
+            const std::vector<double> ax(200, 1.5);
+            const uint64_t one = (uint64_t)f64v(ax).size();   // header + payload
+            const std::string heavy = root + "/heavy.npz";
+            selftestWriteNpz(heavy, {
+                { "a", f64v(ax) }, { "b", f64v(ax) }, { "c", f64v(ax) },
+            });
+            // Two of the three fit and the third does not - so the refusal is
+            // provably about the SUM: it arrives with two members already
+            // counted, not on the first thing it looked at.
+            //
+            // What a member COSTS is the whole of what it puts on the wire
+            // (#180 codex review): its values, its one-character name, and the
+            // fields that frame them. Computed from rp::'s own two numbers, so
+            // this test and the peer read one definition of what a reply is.
+            const uint64_t cost = rp::NPZ_SCAN_FACT_FIXED + 1 + one;   // name "a"/"b"/"c"
+            const uint64_t twoFit = rp::NPZ_SCAN_REPLY_FIXED + cost * 2;
+            const uint64_t ceiling = twoFit + 1;
+            fprintf(stderr, "rnpzselftest:   R20 each member %llu B of values, %llu B "
+                            "on the wire, per-member rule %llu B, injected ceiling "
+                            "%llu B\n",
+                    (unsigned long long)one, (unsigned long long)cost,
+                    (unsigned long long)nz::INLINE_MAX_BYTES,
+                    (unsigned long long)ceiling);
+            check(cost * 3 + rp::NPZ_SCAN_REPLY_FIXED > ceiling &&
+                      one < nz::INLINE_MAX_BYTES / 16,
+                  "R20a every member passes the PER-MEMBER rule with room to spare");
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(ceiling));
+            if (!connect()) return 1;
+
+            auto notes = [&] {
+                int n = 0;
+                std::error_code lec;
+                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), lec)) {
+                    const std::string nm = d.path().filename().u8string();
+                    if (nm.size() > 7 && nm.compare(nm.size() - 7, 7, ".npzsrc") == 0) n++;
+                }
+                return n;
+            };
+            const int notesBefore = notes();
+            remote::NpzScan sc;
+            std::string err;
+            const bool got = app.uiSession.npzScan(heavy, sc, err);
+            const int notesAfter = notes();
+            fprintf(stderr, "rnpzselftest:   R20 heavy.npz: got=%d members=%zu key=\"%s\" "
+                            "notes %d->%d  \"%s\"\n",
+                    got ? 1 : 0, sc.members.size(), sc.key.c_str(), notesBefore,
+                    notesAfter, err.c_str());
+            check(!got && sc.members.empty() && sc.key.empty(),
+                  "R20b the whole scan is refused: no key, no rows, nothing trimmed to fit");
+            check(has(err, "\"c\"") && has(err, std::to_string(twoFit)) &&
+                      has(err, std::to_string(ceiling)) && has(err, "heavy.npz"),
+                  "R20b ...naming the member that crossed it, the sum so far and the file");
+            // The budget is spent BEFORE the key is published, so a refused file
+            // leaves nothing behind for a client to quote back at this peer.
+            check(notesAfter == notesBefore,
+                  "R20c ...before anything was materialised: the peer published no key");
+
+            // ANTI-VACUITY, both directions. Under the SAME tiny ceiling a file
+            // that fits still lists - the peer did not simply stop answering...
+            {
+                remote::NpzScan s2;
+                std::string e2;
+                const bool ok2 = app.uiSession.npzScan(lone, s2, e2);
+                fprintf(stderr, "rnpzselftest:   R20 lone.npz under the same ceiling: "
+                                "got=%d members=%zu \"%s\"\n",
+                        ok2 ? 1 : 0, s2.members.size(), e2.c_str());
+                check(ok2 && s2.members.size() == 1,
+                      "R20d ...and the peer lives: a file that FITS still lists under it");
+            }
+            // ...and the very same heavy.npz lists in full once the ceiling is
+            // the real one, so R20b was about the sum and not about the file.
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "");
+            if (!connect()) return 1;
+            {
+                remote::NpzScan s3;
+                std::string e3;
+                const bool ok3 = app.uiSession.npzScan(heavy, s3, e3);
+                bool whole = ok3 && s3.members.size() == 3;
+                for (const auto& m : s3.members) if (!m.whole) whole = false;
+                fprintf(stderr, "rnpzselftest:   R20 heavy.npz at the real ceiling: "
+                                "got=%d members=%zu \"%s\"\n",
+                        ok3 ? 1 : 0, s3.members.size(), e3.c_str());
+                check(whole,
+                      "R20e ...and the same file lists all three, values and all, at 256 MiB");
+            }
+            closeAll();
+        }
+
+        // ---- R21: the budget is the MESSAGE, not the values in it --------------
+        //
+        // #180 codex review of #224. R20 gave the reply a ceiling and then spent
+        // it on `f.bytes` alone - so everything else the message carries was
+        // unbudgeted, and a zip member name is a SIXTEEN-BIT length. 5,000
+        // members of 60,000 characters each are 300 MB of name; a file whose
+        // values summed to 238.4 MiB passed a 256 MiB ceiling and put 524.5 MiB
+        // on the wire, which came back to the person as "oversized reply from
+        // the peer" - a sentence about the transport, said about a file, that
+        // nobody can act on. R20's three members are named "a", "b" and "c", so
+        // it could not see it.
+        //
+        // The fixture is that shape at test scale: the VALUES are a few hundred
+        // bytes all together and the NAMES are the file. Same discipline as R20 -
+        // scale the ceiling, not the shape.
+        {
+            const size_t NLEN = 20000;
+            const std::string wa = "aaa_" + std::string(NLEN, 'a');
+            const std::string wb = "bbb_" + std::string(NLEN, 'b');
+            const std::string wc = "ccc_" + std::string(NLEN, 'c');
+            const std::vector<uint8_t> wval = f64v({ 1.5, 2.5 });
+            const std::string wide = root + "/wide.npz";
+            selftestWriteNpz(wide, { { wa, wval }, { wb, wval }, { wc, wval } });
+            // What each member COSTS on the wire, computed from the two numbers
+            // rp:: states beside the message it describes - so this test and the
+            // peer cannot disagree about what a reply is made of.
+            auto costOf = [&](const std::string& nm) {
+                return rp::NPZ_SCAN_FACT_FIXED + (uint64_t)nm.size() + (uint64_t)wval.size();
+            };
+            const uint64_t whole3 =
+                rp::NPZ_SCAN_REPLY_FIXED + costOf(wa) + costOf(wb) + costOf(wc);
+            // Two fit and the third does not, so the refusal is provably about
+            // the SUM and arrives with two members already counted.
+            const uint64_t ceiling =
+                rp::NPZ_SCAN_REPLY_FIXED + costOf(wa) + costOf(wb) + 1;
+            const uint64_t valuesOnly = 3 * (uint64_t)wval.size();
+            fprintf(stderr, "rnpzselftest:   R21 names %zu B each, values %llu B all "
+                            "together, ceiling %llu B, whole reply %llu B\n",
+                    wa.size(), (unsigned long long)valuesOnly,
+                    (unsigned long long)ceiling, (unsigned long long)whole3);
+            // THE REPORTED SHAPE, stated as an assertion: under this ceiling the
+            // old budget - which counted `f.bytes` and nothing else - had room
+            // for all three members many times over, and let the file through.
+            check(valuesOnly * 8 < ceiling && (uint64_t)wval.size() < nz::INLINE_MAX_BYTES,
+                  "R21a every member is far under the per-member rule, and their VALUES "
+                  "all together are far under the ceiling");
+            check(rp::NPZ_SCAN_INLINE_MAX < (512ull << 20),
+                  "R21b the peer's own ceiling is under what core/remote.cpp accepts, "
+                  "so a reply that fits it can never be \"oversized\"");
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(ceiling));
+            if (!connect()) return 1;
+            {
+                remote::NpzScan sc;
+                std::string err;
+                const bool got = app.uiSession.npzScan(wide, sc, err);
+                fprintf(stderr, "rnpzselftest:   R21 wide.npz: got=%d members=%zu "
+                                "key=\"%s\" err[0..120]=\"%s\"\n",
+                        got ? 1 : 0, sc.members.size(), sc.key.c_str(),
+                        err.substr(0, 120).c_str());
+                check(!got && sc.members.empty() && sc.key.empty(),
+                      "R21c the whole scan is refused: the NAMES are counted too");
+                check(has(err, "ccc_") &&
+                          has(err, std::to_string(rp::NPZ_SCAN_REPLY_FIXED +
+                                                  costOf(wa) + costOf(wb))) &&
+                          has(err, std::to_string(ceiling)) && has(err, "wide.npz"),
+                      "R21d ...naming the member that crossed it, the sum so far and the file");
+            }
+            // ...and at a ceiling one byte above the whole reply it lists, which
+            // is what makes R21c about the sum and not about the file. The
+            // WITNESS is the byte count: what came back over the link must be
+            // exactly what the budget said it would be, or the ceiling is an
+            // estimate again.
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", std::to_string(whole3));
+            if (!connect()) return 1;
+            {
+                const uint64_t rx0 = app.uiSession.bytesReceived();
+                remote::NpzScan sc;
+                std::string err;
+                const bool got = app.uiSession.npzScan(wide, sc, err);
+                const uint64_t rx = app.uiSession.bytesReceived() - rx0;
+                fprintf(stderr, "rnpzselftest:   R21 wide.npz at %llu B: got=%d "
+                                "members=%zu received %llu B (predicted %llu + %zu "
+                                "header)\n",
+                        (unsigned long long)whole3, got ? 1 : 0, sc.members.size(),
+                        (unsigned long long)rx, (unsigned long long)whole3,
+                        sizeof(rp::Header));
+                bool whole = got && sc.members.size() == 3;
+                for (const auto& m : sc.members) if (!m.whole) whole = false;
+                check(whole,
+                      "R21e ...and the same file lists all three, values and all, one "
+                      "byte above the reply it produces");
+                check(rx == whole3 + sizeof(rp::Header),
+                      "R21f ...and the reply that arrived is the size the budget "
+                      "predicted, to the byte");
+            }
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "");
+            if (!connect()) return 1;
+            closeAll();
+        }
+
+        // ---- R22: an offset near UINT64_MAX is not an offset --------------------
+        //
+        // #180 codex supplement. The zip64 EXTRA FIELD was made safe by #221's
+        // review (R18), but the offsets that field PRODUCES were then used in
+        // additions: `z64 + 56 <= buf.size()`, `p + 46`, `localOff + 30`,
+        // `at + csize`. Every one of those wraps for a value near UINT64_MAX, so
+        // a file could name an offset of 2^64 - 8, pass the check, and have the
+        // read happen there. On the peer that is not a refusal - it is a process
+        // that dies holding somebody's session, from a file a client only NAMED.
+        //
+        // R18's fixtures are well-formed offsets with a short extra body, so
+        // they cannot see this. These four are the four sums, each set to the
+        // value that wraps, and what is asserted is the same pair every time:
+        // the file is refused BY NAME (the member for a member's offset, the
+        // record for the container's), and the peer answers the next request.
+        {
+            // A zip64 writer's output with one number under this test's control.
+            // `badWhat`: 0 none, 1 the zip64 locator, 2 the central-directory
+            // offset inside the zip64 end record, 3 the member's local-header
+            // offset, 4 the member's compressed size.
+            auto writeZ64At = [&](const std::string& path, const std::string& member,
+                                  const std::vector<uint8_t>& body, int badWhat) {
+                const uint64_t NEARMAX = 0xfffffffffffffff8ull;   // + 56 wraps
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)(x & 0xff));
+                    z.push_back((uint8_t)((x >> 8) & 0xff));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                auto p64 = [&](uint64_t x) {
+                    for (int i = 0; i < 8; i++) z.push_back((uint8_t)((x >> (8 * i)) & 0xff));
+                };
+                const std::string nm = member + ".npy";
+                const uint32_t crc =
+                    (uint32_t)mz_crc32(MZ_CRC32_INIT, body.data(), body.size());
+                const uint32_t lo = (uint32_t)z.size();
+                p32(0x04034b50); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc); p32((uint32_t)body.size()); p32((uint32_t)body.size());
+                p16((uint32_t)nm.size()); p16(0);
+                z.insert(z.end(), nm.begin(), nm.end());
+                z.insert(z.end(), body.begin(), body.end());
+                const uint32_t cdOff = (uint32_t)z.size();
+                p32(0x02014b50); p16(45); p16(45); p16(0); p16(0); p16(0); p16(0);
+                p32(crc);
+                p32(0xffffffffu); p32(0xffffffffu);           // csize, usize
+                p16((uint32_t)nm.size()); p16(4 + 24); p16(0); p16(0); p16(0); p32(0);
+                p32(0xffffffffu);                             // localOff
+                z.insert(z.end(), nm.begin(), nm.end());
+                p16(1); p16(24);                              // the zip64 extra field
+                p64((uint64_t)body.size());                                    // usize
+                p64(badWhat == 4 ? NEARMAX : (uint64_t)body.size());           // csize
+                p64(badWhat == 3 ? NEARMAX : (uint64_t)lo);                    // localOff
+                const uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                // The zip64 END RECORD, then its locator, then the plain EOCD
+                // that defers to both. This is the shape a real zip64 writer
+                // produces, so the walk takes the same road it takes on a good
+                // file - only the one number under test is different.
+                const uint32_t z64at = (uint32_t)z.size();
+                p32(0x06064b50); p64(44); p16(45); p16(45); p32(0); p32(0);
+                p64(1); p64(1); p64(cdSize);
+                p64(badWhat == 2 ? NEARMAX : (uint64_t)cdOff);
+                p32(0x07064b50); p32(0);
+                p64(badWhat == 1 ? NEARMAX : (uint64_t)z64at);
+                p32(1);
+                p32(0x06054b50); p16(0); p16(0); p16(0xffff); p16(0xffff);
+                p32(cdSize); p32(0xffffffffu); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+            const std::vector<uint8_t> imgNpy =
+                selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2);
+            if (!connect()) return 1;
+
+            // (a) the WELL-FORMED zip64 - locator, end record and all - still
+            //     opens. A bounds rule that refused real zip64 files would be
+            //     the same outage wearing a message.
+            {
+                const std::string p = root + "/z64full.npz";
+                writeZ64At(p, "img", imgNpy, 0);
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool listed = readFileBytes(p, zip) && npzList(zip, ents, zerr);
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(p, sc, err);
+                fprintf(stderr, "rnpzselftest:   R22 full zip64: listed=%d \"%s\" "
+                                "peer=%d members=%zu\n",
+                        listed ? 1 : 0, zerr.c_str(), sent ? 1 : 0, sc.members.size());
+                check(listed && ents.size() == 1 && ents[0].usize == imgNpy.size() &&
+                          sent && sc.members.size() == 1,
+                      "R22a a real zip64 file - locator, end record, extra field - "
+                      "still reads on both sides");
+            }
+            // (b) the four wrapping offsets, each refused by name, and the peer
+            //     answering afterwards every time.
+            const char* who[4] = { "R22b a zip64 LOCATOR near UINT64_MAX is refused, "
+                                   "not followed",
+                                   "R22c ...and a central-directory offset that wraps",
+                                   "R22d ...and a member's local-header offset",
+                                   "R22e ...and a member's compressed size" };
+            const char* names[4] = { "zip64", "central directory", "img", "img" };
+            bool lived = true;
+            for (int b = 1; b <= 4; b++) {
+                const std::string p = root + "/z64wrap" + std::to_string(b) + ".npz";
+                writeZ64At(p, "img", imgNpy, b);
+                std::vector<uint8_t> zip;
+                std::vector<NpzEntry> ents;
+                std::string zerr;
+                const bool listed = readFileBytes(p, zip) && npzList(zip, ents, zerr);
+                remote::NpzScan sc;
+                std::string err;
+                const bool sent = app.uiSession.npzScan(p, sc, err);
+                // 1 and 2 break the CONTAINER's own records, so nothing lists at
+                // all and both doors say the same sentence. 3 and 4 break ONE
+                // member, which lists - and carries its own refusal, by name,
+                // exactly as a truncated member does.
+                bool refused;
+                if (b <= 2) {
+                    refused = !listed && !sent && has(err, names[b - 1]) && err == zerr;
+                } else {
+                    refused = listed && sent && sc.members.size() == 1 &&
+                              !sc.members[0].err.empty() &&
+                              has(sc.members[0].err, names[b - 1]);
+                }
+                fprintf(stderr, "rnpzselftest:   R22 wrap%d listed=%d peer=%d "
+                                "local=\"%s\" err=\"%s\" member-err=\"%s\"\n",
+                        b, listed ? 1 : 0, sent ? 1 : 0, zerr.c_str(), err.c_str(),
+                        sc.members.empty() ? "" : sc.members[0].err.c_str());
+                check(refused, who[b - 1]);
+                // THE PEER IS STILL THERE. That is the whole point: an
+                // out-of-bounds read ends the process, and a refusal does not.
+                remote::NpzScan alive;
+                std::string ae;
+                if (!(app.uiSession.npzScan(many, alive, ae) && alive.members.size() == 5))
+                    lived = false;
+            }
+            check(lived,
+                  "R22f the same session lists a good container after every one of "
+                  "them: the peer never read out of bounds");
+            closeAll();
+        }
+
+        // ---- R23: declared .npy prefixes; no full-member fallback -------------
+        {
+            // The parser accepts a header ending exactly at the buffer boundary
+            // and rejects the same declaration when one byte is missing.
+            std::vector<uint8_t> exact = f64v({ 1.25, 2.5 });
+            nz::Head eh;
+            std::string ee;
+            const bool fullPeek = nz::peekHeader(exact, eh, ee);
+            uint64_t declaredEnd = 0;
+            std::vector<uint8_t> twelve(exact.begin(), exact.begin() + 12);
+            const bool declared = nz::npyHeaderEnd(twelve, declaredEnd, ee);
+            if (fullPeek) exact.resize(eh.dataOff);
+            nz::Head atBoundary, oneShort;
+            std::string be1, be2;
+            const bool boundary = nz::peekHeader(exact, atBoundary, be1);
+            if (!exact.empty()) exact.pop_back();
+            const bool shortOne = nz::peekHeader(exact, oneShort, be2);
+            check(fullPeek && declared && declaredEnd == eh.dataOff && boundary && !shortOne,
+                  "R23a a declared header is accepted at its exact boundary and not one "
+                  "byte short");
+
+            // The deflate plausibility boundary is the old formula exactly,
+            // without ever forming its overflowing multiply-add.
+            check(nz::deflateSizePlausible(1024, 0) &&
+                      !nz::deflateSizePlausible(1025, 0) &&
+                      nz::deflateSizePlausible(2056, 1) &&
+                      !nz::deflateSizePlausible(2057, 1) &&
+                      nz::deflateSizePlausible(UINT64_MAX, UINT64_MAX),
+                  "R23b the 1032:1 allocation guard is exact at both edges and "
+                  "overflow-safe");
+            check(nz::fitsAlloc(0) && !nz::fitsAlloc(UINT64_MAX),
+                  "R23c a file length must fit size_t and vector::max_size before "
+                  "it becomes an allocation");
+
+            auto npyV2 = [](const char* descr, const std::string& shape,
+                            const void* data, size_t nbytes, size_t dictLen) {
+                std::string hdr = std::string("{'descr': '") + descr +
+                                  "', 'fortran_order': False, 'shape': " + shape + ", }";
+                if (hdr.size() + 1 < dictLen) hdr.append(dictLen - hdr.size() - 1, ' ');
+                hdr += '\n';
+                std::vector<uint8_t> out;
+                const uint8_t magic[8] = { 0x93, 'N', 'U', 'M', 'P', 'Y', 2, 0 };
+                out.insert(out.end(), magic, magic + 8);
+                const uint32_t hlen = (uint32_t)hdr.size();
+                for (int i = 0; i < 4; i++)
+                    out.push_back((uint8_t)((hlen >> (8 * i)) & 0xff));
+                out.insert(out.end(), hdr.begin(), hdr.end());
+                const uint8_t* p = (const uint8_t*)data;
+                out.insert(out.end(), p, p + nbytes);
+                return out;
+            };
+            auto writeDeflate1 = [&](const std::string& path, const std::string& member,
+                                     const std::vector<uint8_t>& raw,
+                                     uint32_t usizeSays) {
+                size_t clen = 0;
+                void* cp = tdefl_compress_mem_to_heap(raw.data(), raw.size(), &clen,
+                                                       TDEFL_DEFAULT_MAX_PROBES);
+                std::vector<uint8_t> comp;
+                if (cp) {
+                    comp.assign((const uint8_t*)cp, (const uint8_t*)cp + clen);
+                    mz_free(cp);
+                }
+                std::vector<uint8_t> z;
+                auto p16 = [&](uint32_t x) {
+                    z.push_back((uint8_t)x); z.push_back((uint8_t)(x >> 8));
+                };
+                auto p32 = [&](uint32_t x) {
+                    for (int i = 0; i < 4; i++) z.push_back((uint8_t)(x >> (8 * i)));
+                };
+                const std::string nm = member + ".npy";
+                const uint32_t crc =
+                    (uint32_t)mz_crc32(MZ_CRC32_INIT, raw.data(), raw.size());
+                p32(0x04034b50); p16(20); p16(0); p16(8); p16(0); p16(0);
+                p32(crc); p32((uint32_t)comp.size()); p32(usizeSays);
+                p16((uint32_t)nm.size()); p16(0);
+                z.insert(z.end(), nm.begin(), nm.end());
+                z.insert(z.end(), comp.begin(), comp.end());
+                const uint32_t cdOff = (uint32_t)z.size();
+                p32(0x02014b50); p16(20); p16(20); p16(0); p16(8); p16(0); p16(0);
+                p32(crc); p32((uint32_t)comp.size()); p32(usizeSays);
+                p16((uint32_t)nm.size()); p16(0); p16(0); p16(0); p16(0); p32(0);
+                p32(0); z.insert(z.end(), nm.begin(), nm.end());
+                const uint32_t cdSize = (uint32_t)z.size() - cdOff;
+                p32(0x06054b50); p16(0); p16(0); p16(1); p16(1);
+                p32(cdSize); p32(cdOff); p16(0);
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+                return (uint64_t)comp.size();
+            };
+
+            // A v2 header beyond the old 64 KiB guess, two wanted values, then
+            // a megabyte of irrelevant trailing bytes.  The directory claims
+            // 300 MiB, making a full extract hit the ratio guard; the prefix
+            // path must still return exactly header + values.
+            const double vals[2] = { 2.5, -4.25 };
+            std::vector<uint8_t> longBody =
+                npyV2("<f8", "(2,)", vals, sizeof vals, 70000);
+            const size_t needed = longBody.size();
+            longBody.resize(longBody.size() + (1u << 20), 0);
+            const uint32_t lie = 300u << 20;
+            const std::string longPath = root + "/long-header-trailing.npz";
+            const uint64_t compressed = writeDeflate1(longPath, "long", longBody, lie);
+            std::vector<uint8_t> longZip;
+            std::vector<nz::Entry> longEntries;
+            std::string longErr;
+            const bool longListed = readFileBytes(longPath, longZip) &&
+                                    nz::list(longZip, longEntries, longErr);
+            nz::InlineBudget longBudget;
+            longBudget.max = 2u << 20;
+            longBudget.used = rp::NPZ_SCAN_REPLY_FIXED;
+            longBudget.perFact = rp::NPZ_SCAN_FACT_FIXED;
+            const std::vector<nz::Fact> longFacts =
+                longListed ? nz::readFacts(longZip, longEntries, &longBudget)
+                           : std::vector<nz::Fact>();
+            check(compressed < lie && !nz::deflateSizePlausible(lie, compressed),
+                  "R23d (setup) a full extract would reject the directory's 300 MiB "
+                  "claim");
+            check(longFacts.size() == 1 && longFacts[0].err.empty() &&
+                      longFacts[0].whole && longFacts[0].bytes.size() == needed &&
+                      longFacts[0].usize == lie && needed > 65536 &&
+                      needed < longBody.size(),
+                  "R23e readFacts uses the 12-byte declaration, accepts a long header, "
+                  "and reads only the wanted value span before trailing bytes");
+
+            // A declared header longer than the bytes actually produced is a
+            // .npy error.  It must not fall through to extract() and report the
+            // unrelated full-member ratio rule instead.
+            std::vector<uint8_t> broken(50, ' ');
+            const uint8_t magic[8] = { 0x93, 'N', 'U', 'M', 'P', 'Y', 2, 0 };
+            memcpy(broken.data(), magic, 8);
+            const uint32_t bh = 200000;
+            for (int i = 0; i < 4; i++) broken[8 + i] = (uint8_t)(bh >> (8 * i));
+            const std::string brokenPath = root + "/declared-header-short.npz";
+            writeDeflate1(brokenPath, "broken", broken, lie);
+            std::vector<uint8_t> brokenZip;
+            std::vector<nz::Entry> brokenEntries;
+            std::string brokenListErr;
+            readFileBytes(brokenPath, brokenZip);
+            const bool brokenListed = nz::list(brokenZip, brokenEntries, brokenListErr);
+            const std::vector<nz::Fact> brokenFacts =
+                brokenListed ? nz::readFacts(brokenZip, brokenEntries)
+                             : std::vector<nz::Fact>();
+            check(brokenFacts.size() == 1 &&
+                      has(brokenFacts[0].err, "corrupt npy header") &&
+                      !has(brokenFacts[0].err, "compressed run"),
+                  "R23f an incomplete declared header is refused without a full-member "
+                  "inflate");
+        }
+
+        // ---- R24: complete directories and the local header they name ---------
+        {
+            auto read32 = [](const std::vector<uint8_t>& z, size_t at) {
+                return (uint32_t)z[at] | (uint32_t)z[at + 1] << 8 |
+                       (uint32_t)z[at + 2] << 16 | (uint32_t)z[at + 3] << 24;
+            };
+            auto read64 = [](const std::vector<uint8_t>& z, size_t at) {
+                uint64_t v = 0;
+                for (int i = 0; i < 8; i++) v |= (uint64_t)z[at + i] << (8 * i);
+                return v;
+            };
+            auto write16 = [](std::vector<uint8_t>& z, size_t at, uint16_t v) {
+                z[at] = (uint8_t)v; z[at + 1] = (uint8_t)(v >> 8);
+            };
+            auto write32 = [](std::vector<uint8_t>& z, size_t at, uint32_t v) {
+                for (int i = 0; i < 4; i++) z[at + i] = (uint8_t)(v >> (8 * i));
+            };
+            auto write64 = [](std::vector<uint8_t>& z, size_t at, uint64_t v) {
+                for (int i = 0; i < 8; i++) z[at + i] = (uint8_t)(v >> (8 * i));
+            };
+            auto writeBytes = [](const std::string& path, const std::vector<uint8_t>& z) {
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                f.write((const char*)z.data(), (std::streamsize)z.size());
+            };
+
+            const std::string base = root + "/local-base.npz";
+            selftestWriteNpz(base, { { "aa", f64v({ 1.0, 2.0 }) },
+                                     { "bb", f64v({ 9.0, 8.0 }) } });
+            std::vector<uint8_t> baseZip;
+            std::vector<nz::Entry> baseEntries;
+            std::string baseErr;
+            readFileBytes(base, baseZip);
+            const bool baseListed = nz::list(baseZip, baseEntries, baseErr);
+            if (!baseListed || baseEntries.size() != 2) {
+                check(false, "R24a (setup) two complete central and local records still list");
+                return 1;
+            }
+            const size_t eocd = baseZip.size() - 22;
+            const size_t cdOff = read32(baseZip, eocd + 16);
+            const uint64_t firstSpan = 46 + (uint64_t)baseEntries[0].name.size();
+            check(baseListed && baseEntries.size() == 2,
+                  "R24a (setup) two complete central and local records still list");
+
+            // Count says two while cdSize contains one complete record.  No
+            // partial prefix is allowed to escape through `out`.
+            std::vector<uint8_t> partial = baseZip;
+            write32(partial, eocd + 12, (uint32_t)firstSpan);
+            const std::string partialPath = root + "/central-partial.npz";
+            writeBytes(partialPath, partial);
+            std::vector<nz::Entry> partialEntries;
+            std::string partialErr;
+            const bool partialListed = nz::list(partial, partialEntries, partialErr);
+            check(!partialListed && partialEntries.empty() && has(partialErr, "declares 2") &&
+                      has(partialErr, "holds 1"),
+                  "R24b a partial central directory is refused whole, with no prefix rows");
+
+            // The count can be internally consistent while the declared
+            // directory size cuts through the variable part of that one
+            // record.  This directly exercises the full-span guard rather
+            // than the exact-count guard above.
+            std::vector<uint8_t> shortRecord = baseZip;
+            write16(shortRecord, eocd + 8, 1);
+            write16(shortRecord, eocd + 10, 1);
+            write32(shortRecord, eocd + 12, (uint32_t)(firstSpan - 1));
+            std::vector<nz::Entry> shortRecordEntries;
+            std::string shortRecordErr;
+            check(!nz::list(shortRecord, shortRecordEntries, shortRecordErr) &&
+                      shortRecordEntries.empty() && has(shortRecordErr, "declares 1") &&
+                      has(shortRecordErr, "holds 0"),
+                  "R24c a central record cut inside its name is refused whole");
+
+            // cdSize's sentinel is a request for zip64, not a four-gigabyte
+            // numeric directory length that may be ignored.
+            std::vector<uint8_t> sizeSentinel = baseZip;
+            write32(sizeSentinel, eocd + 12, 0xffffffffu);
+            std::vector<nz::Entry> sentinelEntries;
+            std::string sentinelErr;
+            check(!nz::list(sizeSentinel, sentinelEntries, sentinelErr) &&
+                      sentinelEntries.empty() && has(sentinelErr, "zip64"),
+                  "R24d a central-directory size sentinel requires a complete zip64 "
+                  "end record");
+
+            std::vector<uint8_t> shortZ64;
+            readFileBytes(root + "/z64full.npz", shortZ64);
+            if (shortZ64.size() < 42) {
+                check(false, "R24e (setup) the complete zip64 fixture is present");
+                return 1;
+            }
+            const size_t z64Eocd = shortZ64.size() - 22;
+            const size_t locator = z64Eocd - 20;
+            const uint64_t z64At = read64(shortZ64, locator + 8);
+            write64(shortZ64, (size_t)z64At + 4, UINT64_MAX);
+            std::vector<nz::Entry> shortZ64Entries;
+            std::string shortZ64Err;
+            check(!nz::list(shortZ64, shortZ64Entries, shortZ64Err) &&
+                      shortZ64Entries.empty() && has(shortZ64Err, "zip64"),
+                  "R24e a zip64 end record whose declared body is incomplete "
+                  "is refused before its fields are read");
+
+            // Corrupt the first member four ways: no local signature, a method
+            // disagreement, a repeated-name disagreement, and a directory
+            // entry explicitly pointing at the other member.
+            const char* labels[4] = { "signature", "method", "name", "member" };
+            const char* words[4] = { "local header", "compressed", "another member",
+                                     "another member" };
+            bool allNamed = true;
+            std::vector<std::string> corruptPaths;
+            for (int mode = 0; mode < 4; mode++) {
+                std::vector<uint8_t> z = baseZip;
+                if (mode == 0) write32(z, (size_t)baseEntries[0].localOff, 0);
+                if (mode == 1) write16(z, (size_t)baseEntries[0].localOff + 8, 8);
+                if (mode == 2) z[(size_t)baseEntries[0].localOff + 30] ^= 1;
+                if (mode == 3) write32(z, cdOff + 42,
+                                       (uint32_t)baseEntries[1].localOff);
+                const std::string path = root + "/local-bad-" + labels[mode] + ".npz";
+                writeBytes(path, z);
+                corruptPaths.push_back(path);
+                std::vector<nz::Entry> entries;
+                std::string le;
+                const bool listed = nz::list(z, entries, le);
+                const std::vector<nz::Fact> facts =
+                    listed ? nz::readFacts(z, entries) : std::vector<nz::Fact>();
+                if (!(facts.size() == 2 && has(facts[0].err, "aa") &&
+                      has(facts[0].err, words[mode]) && facts[0].bytes.empty()))
+                    allNamed = false;
+            }
+            check(allNamed,
+                  "R24f wrong local signature, method, name, and member are each "
+                  "refused by the affected member's name");
+
+            // A long member name makes the error string long too.  The budget
+            // and the bytes actually received must include both, exactly.
+            const std::string longName = "long_" + std::string(20000, 'n');
+            const std::string longBadPath = root + "/long-error.npz";
+            selftestWriteNpz(longBadPath, { { longName, f64v({ 3.0 }) } });
+            std::vector<uint8_t> longBadZip;
+            std::vector<nz::Entry> longBadEntries;
+            std::string longBadListErr;
+            readFileBytes(longBadPath, longBadZip);
+            if (!nz::list(longBadZip, longBadEntries, longBadListErr) ||
+                longBadEntries.size() != 1) {
+                check(false, "R24g (setup) the long-name member lists before corruption");
+                return 1;
+            }
+            write32(longBadZip, (size_t)longBadEntries[0].localOff, 0);
+            writeBytes(longBadPath, longBadZip);
+            nz::InlineBudget errorBudget;
+            errorBudget.max = 1u << 20;
+            errorBudget.used = rp::NPZ_SCAN_REPLY_FIXED;
+            errorBudget.perFact = rp::NPZ_SCAN_FACT_FIXED;
+            const std::vector<nz::Fact> errorFacts =
+                nz::readFacts(longBadZip, longBadEntries, &errorBudget);
+            const uint64_t exactPayload = rp::NPZ_SCAN_REPLY_FIXED +
+                rp::NPZ_SCAN_FACT_FIXED + (uint64_t)longName.size() +
+                (errorFacts.empty() ? 0 : (uint64_t)errorFacts[0].err.size());
+            check(errorFacts.size() == 1 && !errorFacts[0].err.empty() &&
+                      errorFacts[0].bytes.empty() && errorBudget.used == exactPayload,
+                  "R24g a nonempty long error is part of the exact whole-wire budget");
+
+            if (!connect()) return 1;
+            bool peerRefused = true;
+            {
+                remote::NpzScan sc;
+                std::string pe;
+                peerRefused = !app.uiSession.npzScan(partialPath, sc, pe) &&
+                              has(pe, "declares 2");
+            }
+            for (size_t i = 0; i < corruptPaths.size(); i++) {
+                remote::NpzScan sc;
+                std::string pe;
+                if (!(app.uiSession.npzScan(corruptPaths[i], sc, pe) &&
+                      sc.members.size() == 2 && has(sc.members[0].err, words[i])))
+                    peerRefused = false;
+            }
+            check(peerRefused,
+                  "R24h the peer returns the same named refusals for partial and wrong "
+                  "records");
+            {
+                const uint64_t before = app.uiSession.bytesReceived();
+                remote::NpzScan sc;
+                std::string pe;
+                const bool sent = app.uiSession.npzScan(longBadPath, sc, pe);
+                const uint64_t received = app.uiSession.bytesReceived() - before;
+                check(sent && sc.members.size() == 1 &&
+                          received == exactPayload + sizeof(rp::Header),
+                      "R24i the long-error reply received matches its budget to the byte");
+            }
+            {
+                remote::NpzScan alive;
+                std::string ae;
+                check(app.uiSession.npzScan(many, alive, ae) && alive.members.size() == 5,
+                      "R24j the same peer lists a good container after every corrupt one");
+            }
+            closeAll();
+        }
+
+        // ---- R25: the scan override is strict and lower-only -------------------
+        {
+            check(rp::npzScanCeilingFor(nullptr) == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor("") == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor("4096") == 4096,
+                  "R25a unset uses the shipped ceiling and a smaller decimal lowers it");
+            check(rp::npzScanCeilingFor("629145600") == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor("-1") == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor("4096x") == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor(" 4096") == rp::NPZ_SCAN_INLINE_MAX &&
+                      rp::npzScanCeilingFor("99999999999999999999999") ==
+                          rp::NPZ_SCAN_INLINE_MAX,
+                  "R25b raised, signed, partial, spaced, and overflowing overrides cannot "
+                  "weaken the ceiling");
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "629145600");
+            if (!connect()) return 1;
+            remote::NpzScan sc;
+            std::string se;
+            check(app.uiSession.npzScan(many, sc, se) && sc.members.size() == 5,
+                  "R25c a peer given a raised override clamps it and continues serving");
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_NPZ_SCAN_MAX", "");
+            if (!connect()) return 1;
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

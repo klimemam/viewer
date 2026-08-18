@@ -304,6 +304,52 @@ enum NpzKind : uint32_t {
                         // the reply carries every reserved member verbatim
 };
 
+// WHAT A MSG_NPZ_SCAN REPLY COSTS BESIDES ITS VARIABLE-LENGTH PIECES (#180
+// codex review). The aggregate ceiling (docs/remote-reader-design.md §10.2) has
+// to be spent on the WHOLE message, and the whole message is not the member
+// values: it is those values plus every name, every error string, and the fixed
+// fields that frame them. Counting only the values let a file whose values
+// summed to 238 MiB produce 524 MiB of wire and arrive at the person as
+// "oversized reply from the peer" - a sentence about the transport, said about
+// a file, that nobody can act on.
+//
+// The two numbers live HERE, next to the message they describe, so the peer that
+// budgets and the selftest that checks the budget read one definition. They are
+// the payload's own bytes; the 12-byte rp::Header is outside the u32 length that
+// core/remote.cpp bounds, and outside these.
+//
+//   per member: [u32 nameLen][name][u32 usizeLo][u32 usizeHi][u32 entry]
+//               [u32 errLen][err][u32 whole][u32 nBytes][bytes]
+//               -> 4 + 8 + 4 + 4 + 4 + 4 = 28 fixed, plus name + err + bytes
+static const uint64_t NPZ_SCAN_FACT_FIXED = 28;
+//   ahead of them: [u32 keyLen][key][u32 kind][u32 version][u32 nMembers]
+//               -> 4 + 16 + 4 + 4 + 4 = 32, the key being the 16 hex characters
+//                  readerHash is always formatted to
+static const uint64_t NPZ_SCAN_REPLY_FIXED = 32;
+// ...and the ceiling those two are spent against. VIEWER_SERVE_NPZ_SCAN_MAX may
+// lower it for tests, never raise it. Half of the 512 MiB core/remote.cpp will
+// accept, so a reply that fits this cannot become "oversized reply from the
+// peer" no matter how the remaining halves are divided between values, names
+// and errors.
+static const uint64_t NPZ_SCAN_INLINE_MAX = 256ull << 20;
+
+// Parse the test override strictly and clamp it in the only safe direction.
+// Accepting a prefix ("4096x"), a sign ("-1" becomes UINT64_MAX in strtoull),
+// or an overflowing digit string can silently raise the ceiling beyond the
+// transport limit this constant is meant to stay below.
+inline uint64_t npzScanCeilingFor(const char* env) {
+    if (!env || !*env) return NPZ_SCAN_INLINE_MAX;
+    uint64_t v = 0;
+    for (const char* p = env; *p; p++) {
+        if (*p < '0' || *p > '9') return NPZ_SCAN_INLINE_MAX;
+        const uint64_t d = (uint64_t)(*p - '0');
+        if (v > (UINT64_MAX - d) / 10) return NPZ_SCAN_INLINE_MAX;
+        v = v * 10 + d;
+    }
+    if (!v || v >= NPZ_SCAN_INLINE_MAX) return NPZ_SCAN_INLINE_MAX;
+    return v;
+}
+
 // What a MSG_READER_RUN reply says happened, and it is `adapter::Run`'s own
 // four facts plus the two the caller cannot see from here. Split rather than
 // folded into one string because the client writes a DIFFERENT sentence for
