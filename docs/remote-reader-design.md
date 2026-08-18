@@ -122,7 +122,7 @@ handler が意図的に転送非依存 (serve.cpp :641「same requests, same rep
 `viewer_import.py`、`run_adapter.py`。peer は一時ディレクトリに書き、
 `python -u run_adapter.py <file>:<func> <peerPath> --stream` を走らせ
 (ローカルの argv、session.inc :1588 と同一形)、終わったら一時ディレクトリを消す。
-残るのはキャッシュの `.vstream` だけ。
+残るのはキャッシュの `.vstream` と、同じ鍵の排他制御に使う `.lock` である。
 
 ### 3.2 なぜ peer 側常設 (名前で解決) ではないか
 

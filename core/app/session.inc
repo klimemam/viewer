@@ -2908,7 +2908,8 @@ static std::string loadSession(const std::string& path) {
                     // image sharing the url: see readerSlot (#219 review). The
                     // RUN itself is the one stage 1 built: the peer answers a
                     // repeat out of its cache, so a restore does not re-execute
-                    // Python either.
+                    // the reader/harness.  The peer still runs its one
+                    // provenance probe to verify the producing environment.
                     readerLine = true;
                     const bool already = readerSlot(p, pendingMember, nullptr) >= 0;
                     err = already ? std::string() : openRemoteWithReader(p, remoteMemo);

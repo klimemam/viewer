@@ -513,9 +513,11 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 (`readerhint`、PR #209、試験 V25p2)、その線は link を越えても 1 文字も動かない
 —— #180 stage 4 (PR、2026-08-17、試験 `--rreader-selftest` V25p-r1/r2)。**
 peer 側で reader が作った doc の復元も、走らせるのは **memo だけ**である:
-memo が引ければ RUN を再依頼して開き直し (peer のキャッシュが答えるので Python
-は両側で起動しない)、引けなければ hint を名乗って失敗する —— **peer には要求
-すら出さない** (`bytesReceived()` 不変で観測)。「どの reader か」は client の
+memo が引ければ RUN を再依頼して開き直す。peer のキャッシュが答えるため、viewer
+側では Python を起動せず、peer 側も reader / harness は再実行しない。ただし peer は
+環境同一性を確認する provenance probe を 1 回起動する。memo が引けなければ hint を
+名乗って失敗する —— **peer には要求すら出さない** (`bytesReceived()` 不変で観測)。
+「どの reader か」は client の
 memo/picker、「走ってよいか」は peer 起動者の `--serve-readers`、という
 `docs/remote-reader-design.md` §2.2 の 2 段の門の、client 側の段である。
 
