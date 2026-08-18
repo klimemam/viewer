@@ -1356,10 +1356,11 @@
             check(member.rfind("__pixels_", 0) == 0 && has(imageLine, url),
                   "V25p-r1b ...beside the member, on a line whose file is the URL");
 
-            // ---- WITH the memo: it comes back, and no Python starts anywhere --
+            // ---- WITH the memo: it comes back without re-running the reader ----
             // The RUN is sent again and the peer answers out of its cache (R2's
-            // observation, one layer up): the materialisation's mtime is the
-            // witness that the reader was not re-executed over there, and
+            // observation, one layer up). The peer still starts its one
+            // provenance probe: the materialisation's mtime is the witness that
+            // the reader/harness was not re-executed over there, and
             // g_adapterRuns is the witness that it was not executed here.
             closeAll();
             // THIS reader's materialisation, by the key R1 saw the peer issue -

@@ -701,8 +701,9 @@ stack を個別に指し、conditions・名前・単位がローカル実行と�
 
 **stage 4 済 (2026-08-17)。** memo / session 復元の remote 版。memo (url 鍵) が
 引ければ復元が peer 側で reader を走らせ直す——ただし RUN キャッシュが答えるので
-Python はどちらのマシンでも起動しない。memo が無ければ `readerhint` を**名指す
-だけ**で、要求すら線に出ない (#179 裁定 C はリンクを越えても同じ)。試験は
+viewer 側では Python を起動せず、peer 側も reader / harness は再実行しない。
+peer は環境同一性を確認する provenance probe だけを 1 回起動する。memo が無ければ
+`readerhint` を**名指すだけ**で、要求すら線に出ない (#179 裁定 C はリンクを越えても同じ)。試験は
 `--rreader-selftest` V25p-r0〜r2d。
 
 **stage 5 済 (2026-08-17)。** protocol **14**。MEASURE がファイルしか名指せなかった
