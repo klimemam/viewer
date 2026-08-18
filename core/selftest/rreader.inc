@@ -1306,6 +1306,165 @@
             closeAll();
         }
 
+        {   // ---- R19: a folder with a LINK in it has no identity --------------
+            //
+            // #180 codex review of #224. adapter::folderIdentity summarised a
+            // symlink by its TARGET AS WRITTEN and returned success. That is a
+            // fact about the link, and the reader does not read the link - it
+            // follows it. So rewriting the target's CONTENTS left this hash, and
+            // therefore both cache keys, exactly where they were, and the run
+            // that followed handed back the previous acquisition's pixels. A
+            // capture directory holding a `latest` link is the ordinary case;
+            // R16 is all regular files and cannot see it.
+            //
+            // The repair is a refusal: a folder with a link below it is
+            // UNCACHEABLE. Following links to hash what they resolve to means an
+            // unbounded walk of somebody else's tree, a visited set so a cycle
+            // is not an identity, and a rule for directory links - three ways to
+            // be quietly wrong, against a cost of "the reader runs every time".
+            closeAll();
+            const std::string linked = root + "/linked";
+            const std::string outside = root + "/outside";
+            std::filesystem::create_directories(pathFromUtf8(linked), ec);
+            std::filesystem::create_directories(pathFromUtf8(outside), ec);
+            const int LH = 4, LW = 6;
+            auto writeLFrame = [&](const std::string& p, uint16_t v) {
+                std::vector<uint16_t> px((size_t)LH * LW, v);
+                std::vector<uint8_t> b = selftestNpyBytes("<u2", { LH, LW },
+                                                          px.data(), px.size() * 2);
+                std::ofstream f(pathFromUtf8(p), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            };
+            const std::string target = outside + "/target.npy";
+            const std::string link = linked + "/aaa_link.npy";   // sorts first
+            const std::string plain = linked + "/zzz_plain.npy";
+            writeLFrame(target, 77);
+            writeLFrame(plain, 5);
+            std::error_code se;
+            // ABSOLUTE. A symlink's target is resolved relative to the LINK's
+            // own directory, not to this process's working directory, and every
+            // path in this test is relative to the latter (tools/testdata/...) -
+            // so the written-as-given target produced a DANGLING link, and the
+            // reader met FileNotFoundError instead of the target's pixels.
+            const std::filesystem::path targetAbs =
+                std::filesystem::absolute(pathFromUtf8(target), ec).lexically_normal();
+            std::filesystem::create_symlink(targetAbs, pathFromUtf8(link), se);
+            bool haveLink = !se;
+            if (haveLink) {
+                std::error_code le;
+                haveLink = std::filesystem::is_symlink(pathFromUtf8(link), le) && !le;
+                // ...and it has to RESOLVE, or this test would assert that a
+                // reader cannot read a broken link, which is not the question.
+                if (haveLink && !std::filesystem::exists(pathFromUtf8(link), le))
+                    haveLink = false;
+            }
+            if (!haveLink) {
+                // NAMED, never silent: on Windows a symlink needs Developer Mode
+                // or an elevated process, and a machine that has neither cannot
+                // run this. It runs on the Linux and macOS jobs.
+                fprintf(stderr, "rreaderselftest:   R19 cannot create a symlink here "
+                                "(%s): SKIPPING R19a-R19h\n",
+                        se ? se.message().c_str() : "not a link once created");
+            } else {
+                const std::string rdLink = root + "/linkfolder.py";
+                writeText(rdLink,
+                          "import numpy as np, os\n"
+                          "from viewer_import import Stack\n"
+                          "VERSION = 1\n"
+                          "def load(path):\n"
+                          "    fs = []\n"
+                          "    for r, d, f in os.walk(path):\n"
+                          "        for n in f:\n"
+                          "            if n.endswith('.npy'):\n"
+                          "                fs.append(os.path.join(r, n))\n"
+                          "    a = np.stack([np.load(p) for p in sorted(fs)])\n"
+                          "    return Stack(np.ascontiguousarray(a.astype(np.uint16)),\n"
+                          "                 name='linked')\n");
+                const std::string linkSpec = rdLink + ":load";
+                std::string linkText[3] = { std::string(), files[1], files[2] };
+                check(slurp(rdLink, linkText[0]),
+                      "R19a (setup) the link-walking reader is readable");
+
+                std::string fid;
+                check(!adapter::folderIdentity(linked, fid),
+                      "R19b a folder with a link below it has NO identity, so nothing "
+                      "may cache it");
+                std::string pid;
+                check(adapter::folderIdentity(outside, pid) && !pid.empty(),
+                      "R19c ...while the folder without one still has, so R19b is about "
+                      "the link and not about walking");
+
+                // ---- the LOCAL door ---------------------------------------------
+                auto firstPx = [&]() -> float {
+                    return cur() && !cur()->src->data.empty() ? cur()->src->data[0] : -1.0f;
+                };
+                const std::string o1 = openWithReader(linked, linkSpec);
+                check(o1.empty() && firstPx() == 77.0f,
+                      "R19d the local door reads it: the link's TARGET is the first frame");
+                closeAll();
+                // ONLY the target's bytes change. The link still says the same
+                // thing, the folder still holds the same two names, and every
+                // stat inside `linked` is what it was.
+                {
+                    const auto was = std::filesystem::last_write_time(pathFromUtf8(target), ec);
+                    writeLFrame(target, 88);
+                    std::filesystem::last_write_time(pathFromUtf8(target),
+                                                     was + std::chrono::seconds(10), ec);
+                }
+                const int lruns = g_adapterRuns;
+                const std::string o2 = openWithReader(linked, linkSpec);
+                fprintf(stderr, "rreaderselftest:   R19 local: err=\"%s\" runs %d -> %d "
+                                "px0=%g\n",
+                        o2.c_str(), lruns, g_adapterRuns, (double)firstPx());
+                check(o2.empty() && g_adapterRuns > lruns,
+                      "R19e a target rewritten behind the link re-runs the reader here");
+                check(firstPx() == 88.0f,
+                      "R19f ...and what comes back is the new target, not the cached one");
+                closeAll();
+                forgetReader(linked);
+
+                // ---- the PEER's key ---------------------------------------------
+                // Over there the reply must always carry a key (that is how the
+                // client addresses what it is about to read), so "uncacheable"
+                // means the key is unique to the RUN: two asks with nothing
+                // changed are two keys and two runs, and a rewritten target can
+                // never be answered out of the cache.
+                auto linkRun = [&](std::string& keyOut, bool& cachedOut) {
+                    remote::Session s;
+                    if (!openSession(s, true)) return false;
+                    remote::ReaderRun r;
+                    std::string e;
+                    const bool sent = s.readerRun(linked, "load", linkText, r, e);
+                    const bool got = sent && r.outcome == rp::RO_OK;
+                    if (got) { keyOut = r.key; cachedOut = has(r.stderrText, "read from cache"); }
+                    s.stop();
+                    return got;
+                };
+                std::string pk1, pk2, pk3;
+                bool pc1 = false, pc2 = false, pc3 = false;
+                const bool p1 = linkRun(pk1, pc1);
+                {
+                    const auto was = std::filesystem::last_write_time(pathFromUtf8(target), ec);
+                    writeLFrame(target, 99);
+                    std::filesystem::last_write_time(pathFromUtf8(target),
+                                                     was + std::chrono::seconds(10), ec);
+                }
+                const bool p2 = linkRun(pk2, pc2);
+                const bool p3 = linkRun(pk3, pc3);
+                fprintf(stderr, "rreaderselftest:   R19 peer keys %s / %s / %s "
+                                "cached %d/%d/%d\n",
+                        pk1.c_str(), pk2.c_str(), pk3.c_str(), pc1 ? 1 : 0, pc2 ? 1 : 0,
+                        pc3 ? 1 : 0);
+                check(p1 && p2 && pk2 != pk1 && !pc2,
+                      "R19g a target rewritten behind the link is a different key over "
+                      "there too, and a miss");
+                check(p3 && pk3 != pk2 && !pc3,
+                      "R19h ...and the peer never caches such a folder at all: even "
+                      "unchanged, it runs");
+            }
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

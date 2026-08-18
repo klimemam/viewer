@@ -443,17 +443,29 @@ bool folderIdentity(const std::string& dir, std::string& out) {
         const fs::path& p = it->path();
         const std::string rel = p.lexically_relative(root).generic_u8string();
         if (rel.empty() || rel == ".") return false;      // a walk that lost its way
-        // symlink_status, not status: a link is summarised as ITSELF (its
-        // target as written), because following it would make a loop an
-        // identity and a network mount a stat storm.
+        // symlink_status, not status: this asks about the ENTRY, not about
+        // whatever it points at.
         const fs::file_status st = fs::symlink_status(p, ec);
         if (ec) return false;
-        if (fs::is_symlink(st)) {
-            const fs::path tgt = fs::read_symlink(p, ec);
-            if (ec) return false;
-            rows.push_back(rel + "|l|" + tgt.generic_u8string());
-            continue;
-        }
+        // A SYMLINK MEANS NO IDENTITY (#180 codex review). The first version
+        // summarised a link as its target AS WRITTEN, which is a fact about the
+        // link and not about the bytes a reader will get: the reader follows
+        // it, so rewriting the target's contents changed every pixel and left
+        // this hash - and therefore both cache keys - exactly where they were.
+        // A capture directory holding a `latest` link is the ordinary case, and
+        // it returned the previous acquisition's pixels on this disk and on the
+        // peer's.
+        //
+        // The other repair - hashing what the link RESOLVES to - was weighed
+        // and refused: it means following links out of the tree being walked
+        // (whose stat cost nobody bounded, on a network mount), keeping a set
+        // of visited inodes so a cycle is not an infinite identity, and
+        // deciding what a link to a directory means when its own children are
+        // also walked. Every one of those is a way for this function to be
+        // wrong in a manner nobody would notice, and the price of not doing it
+        // is that a reader over a folder with a link in it runs every time,
+        // which is the cost of an input this cannot summarise honestly.
+        if (fs::is_symlink(st)) return false;
         if (fs::is_directory(st)) { rows.push_back(rel + "|d"); continue; }
         if (!fs::is_regular_file(st)) return false;       // fifo, socket, device
         const uintmax_t sz = fs::file_size(p, ec);

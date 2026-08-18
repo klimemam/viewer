@@ -98,16 +98,22 @@ std::vector<std::string> moduleFunctions(const std::string& pyFile);
 // DETERMINISTIC: every entry below `dir` contributes its path relative to it,
 // its kind, and - for a regular file - its size and mtime; the rows are sorted
 // before they are hashed, because no directory iteration order is promised.
-// Directory symlinks are not followed (that is the iterator's default and it is
-// what keeps a loop from being an identity); a symlink itself contributes its
-// target as written.
+//
+// A SYMLINK ANYWHERE BELOW `dir` MEANS NO IDENTITY (#180 codex review). The
+// reader follows links; this walk does not and will not (following them is an
+// unbounded stat of somebody else's tree, plus a cycle set, plus a rule for
+// what a directory link means when the directory is walked too). Summarising a
+// link by its target AS WRITTEN - which is what this did first - made the hash
+// blind to the target's CONTENTS changing, so both cache keys stood still while
+// every pixel a reader returned changed. Refusing to have an identity is the
+// honest answer: the reader then runs every time.
 //
 // FALSE means NO IDENTITY COULD BE ESTABLISHED - the path is not a directory,
-// the walk hit an error, an entry's stat failed, an entry is of a kind this
-// cannot summarise, or the tree is larger than it will walk. A caller that gets
-// false must treat the input as UNCACHEABLE. It must not fall back to the
-// directory's own mtime: that is the defect, and a quiet fallback to it would
-// be the same wrong answer arrived at more slowly.
+// the walk hit an error, an entry's stat failed, an entry is a symlink or of a
+// kind this cannot summarise, or the tree is larger than it will walk. A caller
+// that gets false must treat the input as UNCACHEABLE. It must not fall back to
+// the directory's own mtime: that is the defect, and a quiet fallback to it
+// would be the same wrong answer arrived at more slowly.
 bool folderIdentity(const std::string& dir, std::string& out);
 
 }  // namespace adapter
