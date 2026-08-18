@@ -600,23 +600,24 @@ struct SettingsReport {
 static SettingsReport g_settings;     // what the last load said
 
 // ---- the origin ledger (docs/preferences-panel-design.md §5.2) --------------
-// WHO decided the value this key currently has. Four layers can
-// (defaults < prefs.txt < settings.jsonc < CLI), and #50's symptom is exactly
+// WHO decided the value this key currently has. Normally four layers can
+// (defaults < prefs.txt < settings.jsonc < CLI); gamma/grid also have a fifth
+// Session layer. #50's symptom is exactly
 // that a user cannot see which one won: they change a thing, it works, they
 // restart, it is back, and nothing ever said why.
 //
-// Only the two SPEAKING layers are recorded. A file or a flag NAMES a key -
-// that is a fact about the request and it is knowable. "The default" and "this
-// machine" are not statements anybody made; they are what is left, and they are
-// told apart by the VALUE (settingsCurrentValue() empty = the default). Storing
-// them here would be storing a derivation, which goes stale the moment the
-// value moves.
+// Only the SPEAKING layers are recorded. A file, a flag, or a session record
+// NAMES a key - that is a fact about the request and it is knowable. "The
+// default" and "this machine" are not statements anybody made; they are what
+// is left, and they are told apart by the VALUE (settingsCurrentValue() empty =
+// the default). Storing them here would be storing a derivation, which goes
+// stale the moment the value moves.
 //
 // This is NOT SettingsReport::overrode, which stays. That list answers "what
 // did the file CHANGE" (prefs held something else); this answers "who decides
 // it now". A key the file sets to the value prefs already had is absent from
 // one and present in the other, and both are right.
-enum class SetOrigin { None, File, Cli };
+enum class SetOrigin { None, File, Cli, Session };
 struct OriginEntry {
     SetOrigin who = SetOrigin::None;
     int line = 0;                     // settings.jsonc line, File only
@@ -644,6 +645,17 @@ static void settingsOriginCli(SKey id, const char* flag) {
         g_settingsOrigin[id].who = SetOrigin::Cli;
         g_settingsOrigin[id].cliFlag = flag;
         g_settingsOrigin[id].line = 0;
+    }
+}
+// A loaded session speaks after every startup layer. Only gamma/grid call this
+// helper, and only after their lines have actually been parsed. GUI edits leave
+// this claim in place: they edit display state that save/autosave writes back to
+// the open session, while PrefsBase separately receives the machine preference.
+static void settingsOriginSession(SKey id) {
+    if (id > SK_None && id < SK_Count) {
+        g_settingsOrigin[id].who = SetOrigin::Session;
+        g_settingsOrigin[id].line = 0;
+        g_settingsOrigin[id].cliFlag = nullptr;
     }
 }
 static const OriginEntry& settingsOriginOf(SKey id) {
@@ -1412,15 +1424,18 @@ static SWidget settingsWidgetFor(SKey id) {
     }
 }
 
-// WHO decides this key's value right now (§5.1). Four answers, and the
-// asymmetry between them is a fact about the formats rather than a choice:
-// settings.jsonc and the CLI NAME keys, so their claim is recorded (the
-// ledger); prefs.txt is rewritten whole on every save, so the presence of a key
+// WHO decides this key's value right now (§5.1). Normally four answers, plus
+// Session for gamma/grid. The asymmetry between them is a fact about the
+// formats rather than a choice: .vsession, settings.jsonc, and the CLI NAME
+// keys, so their claim is recorded (the ledger); prefs.txt is rewritten whole
+// on every save, so the presence of a key
 // there says nothing about whether a human chose it - only the VALUE can be
 // compared, against settingsCurrentValue()'s "empty means the built-in
 // default".
 static std::string settingsBadgeFor(SKey id) {
     const OriginEntry& o = settingsOriginOf(id);
+    if (o.who == SetOrigin::Session)
+        return "session (.vsession)";
     if (o.who == SetOrigin::Cli)
         return std::string("command line (") + (o.cliFlag ? o.cliFlag : "?") + ")";
     if (o.who == SetOrigin::File)
@@ -1511,6 +1526,18 @@ static void prefEnumSet(SKey id, int idx) {
         default: break;
     }
 }
+
+// Update exactly one member of the lower prefs.txt layer after a GUI change.
+// The effective App fields may carry a session value, so capturing both fields
+// wholesale would accidentally make an untouched session neighbour permanent.
+static void prefsBaseUpdate(SKey id) {
+    switch (id) {
+        case SK_gamma:     g_prefsBase.dispGamma = app.dispGamma; break;
+        case SK_pixelGrid: g_prefsBase.showGrid = app.showGrid; break;
+        default: break;
+    }
+}
+
 // The side effect a change owes the rest of the program. The SAME helpers the
 // menu calls - the helper is the shared thing, and a panel that re-implemented
 // "apply the theme" would be a second theme applier.
@@ -1535,7 +1562,30 @@ static void prefAfterChange(SKey id) {
         case SK_editor: adapter::setSettingsEditor(g_settingsEditorCmd); break;
         default: break;
     }
+    prefsBaseUpdate(id);
     app.prefsDirty = true;             // prefs.txt is the GUI's only write target
+}
+
+// One path for every real gamma/grid GUI mutation (Preferences, Inspector,
+// menus, and the G shortcut). It updates the lower preference and side effects,
+// but deliberately does not replace a Session origin: the edited value remains
+// display state of the open session and will be saved/autosaved there as well.
+static void settingsDisplayGuiChanged(SKey id, const char* path) {
+    if (id != SK_gamma && id != SK_pixelGrid) return;
+    prefAfterChange(id);
+    settingsWarnIfSticky(id, path);
+}
+
+// session.inc is included before this file and therefore cannot name SKey.
+// Resolve the canonical setting path here, beside the schema that owns it.
+static void settingsOriginSessionPath(const char* path) {
+    if (!path) return;
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++)
+        if (SETTING_KEYS[k].id != SK_None && SETTING_KEYS[k].path &&
+            strcmp(path, SETTING_KEYS[k].path) == 0) {
+            settingsOriginSession(SETTING_KEYS[k].id);
+            return;
+        }
 }
 // The two keys that are LISTS with panels of their own.
 static void prefOpenLink(SKey id) {

@@ -99,6 +99,7 @@ static int settingsSelftest() {
         // seventh key and T3's count would be measuring the previous group.
         g_rawLibrary.clear();
         adapter::setSettingsEditor({});
+        g_prefsBaseActive = false;
     };
 
     // ======================================================================
@@ -951,6 +952,169 @@ static int settingsSelftest() {
         check(settingsOriginOf(SK_showFps).who == SetOrigin::None &&
               settingsOriginOf(SK_pixelGrid).who == SetOrigin::File,
               "O4 a reload forgets what the previous file said");
+    }
+
+    // O5: a loaded document is a fifth, later authority for the two display
+    // values .vsession actually carries. Gamma starts under a CLI claim and
+    // grid under a File claim, so this pins precedence rather than merely the
+    // new enum value.
+    {
+        auto displayLines = [](const std::string& text) {
+            float gamma = -1.0f;
+            int grid = -1;
+            std::istringstream in(text);
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                std::string key;
+                ls >> key;
+                if (key == "gamma") ls >> gamma;
+                else if (key == "grid") ls >> grid;
+            }
+            return std::pair<float, int>{ gamma, grid };
+        };
+
+        // Before any session, prefs writing must retain its historical use of
+        // the effective startup values. The first valid session header freezes
+        // those same non-default values; merely setting the active bit without
+        // copying them makes both assertions fail.
+        baseline();
+        loadSettingsFrom(writeFix(
+            "{ \"appearance\": { \"displayGamma\": 2.2, \"pixelGrid\": true } }\n"));
+        app.dispGamma = 1.75f;                // simulate an accepted CLI value
+        settingsOriginCli(SK_gamma, "--synthetic-gamma");
+        std::ostringstream prefsBeforeSession;
+        writePrefsTo(prefsBeforeSession);
+        const auto startupBeforeSession = displayLines(prefsBeforeSession.str());
+        check(!g_prefsBaseActive && startupBeforeSession.first == 1.75f &&
+              startupBeforeSession.second == 1,
+              "O5 prefs without a session preserve effective File and CLI values");
+
+        const std::string missingDisplay = writeFix(
+            "viewer-session 1\n"
+            "zoom 2\n");
+        const std::string missingErr = loadSession(missingDisplay);
+        check(missingErr.empty() && app.dispGamma == 1.75f && app.showGrid &&
+              settingsOriginOf(SK_gamma).who == SetOrigin::Cli &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::File,
+              "O5 an initial session with missing keys creates no Session claim");
+        std::ostringstream prefsAfterMissing;
+        writePrefsTo(prefsAfterMissing);
+        const auto startupAfterMissing = displayLines(prefsAfterMissing.str());
+        check(g_prefsBaseActive && g_prefsBase.dispGamma == 1.75f &&
+              g_prefsBase.showGrid && startupAfterMissing.first == 1.75f &&
+              startupAfterMissing.second == 1,
+              "O5 the first session boundary captures effective startup values");
+
+        baseline();
+        loadSettingsFrom(writeFix(
+            "{ \"appearance\": { \"displayGamma\": 2.2, \"pixelGrid\": true } }\n"));
+        app.dispGamma = 1.5f;
+        settingsOriginCli(SK_gamma, "--synthetic-gamma");
+        const std::string invalidDisplay = writeFix(
+            "viewer-session 1\n"
+            "gamma 0\n"
+            "grid not-a-number\n");
+        const std::string invalidErr = loadSession(invalidDisplay);
+        check(invalidErr.empty() && app.dispGamma == 1.5f && app.showGrid &&
+              settingsOriginOf(SK_gamma).who == SetOrigin::Cli &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::File &&
+              g_prefsBaseActive && g_prefsBase.dispGamma == 1.5f &&
+              g_prefsBase.showGrid,
+              "O5 invalid initial display lines leave values and origins unchanged");
+
+        baseline();
+        loadSettingsFrom(writeFix(
+            "{ \"appearance\": { \"displayGamma\": 2.2, \"pixelGrid\": false } }\n"));
+        app.dispGamma = 1.75f;
+        settingsOriginCli(SK_gamma, "--synthetic-gamma");
+        const std::string session = writeFix(
+            "viewer-session 1\n"
+            "gamma 1.25\n"
+            "grid 1\n");
+        const std::string sessionErr = loadSession(session);
+        check(sessionErr.empty() && app.dispGamma == 1.25f && app.showGrid &&
+              displayGammaPreset(app.dispGamma) < 0 &&
+              settingsOriginOf(SK_gamma).who == SetOrigin::Session &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::Session,
+              "O5 valid session gamma/grid beat File and CLI without losing Custom");
+        check(settingsBadgeFor(SK_gamma) == "session (.vsession)" &&
+              settingsBadgeFor(SK_pixelGrid) == "session (.vsession)",
+              "O5 both Preferences rows name the loaded .vsession");
+
+        // Loading a session changes only the effective display state. Until a
+        // real GUI edit occurs, an unrelated prefs save must keep the effective
+        // startup values rather than baking the session into prefs.txt.
+        std::ostringstream prefsBefore;
+        writePrefsTo(prefsBefore);
+        const auto lowerBefore = displayLines(prefsBefore.str());
+        check(lowerBefore.first == 1.75f && lowerBefore.second == 0,
+              "O5 session restore alone preserves File and CLI startup values");
+
+        // This is the shared helper called by Preferences, Inspector, menus,
+        // and the G shortcut. It updates the lower preference and side effects,
+        // but the current document still owns the session display state.
+        app.prefsDirty = false;
+        app.dispGamma = 2.2f;
+        settingsDisplayGuiChanged(SK_gamma, "appearance.displayGamma");
+        check(settingsOriginOf(SK_gamma).who == SetOrigin::Session &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::Session &&
+              g_prefsBase.dispGamma == app.dispGamma && !g_prefsBase.showGrid &&
+              app.showGrid &&
+              app.prefsDirty,
+              "O5 the gamma helper keeps Session origin and updates only gamma prefs base");
+
+        std::ostringstream sessionAfterGamma, prefsAfterGamma;
+        writeSessionTo(sessionAfterGamma);
+        writePrefsTo(prefsAfterGamma);
+        const auto savedAfterGamma = displayLines(sessionAfterGamma.str());
+        const auto prefsAfterGammaDisplay = displayLines(prefsAfterGamma.str());
+        check(savedAfterGamma.first == app.dispGamma && savedAfterGamma.second == 1 &&
+              prefsAfterGammaDisplay.first == app.dispGamma &&
+              prefsAfterGammaDisplay.second == 0,
+              "O5 changing gamma does not leak the session grid into prefs");
+
+        // The effective Session value is true while its lower File value is
+        // false. Updating the row must exercise the bool branch and persist 1.
+        settingsDisplayGuiChanged(SK_pixelGrid, "appearance.pixelGrid");
+        check(settingsOriginOf(SK_gamma).who == SetOrigin::Session &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::Session &&
+              g_prefsBase.dispGamma == app.dispGamma && g_prefsBase.showGrid,
+              "O5 the grid helper keeps Session origin and records true in prefs base");
+
+        std::ostringstream sessionAfter, prefsAfter;
+        writeSessionTo(sessionAfter);          // Save and autosave share this renderer
+        writePrefsTo(prefsAfter);
+        const auto savedDisplay = displayLines(sessionAfter.str());
+        const auto prefsDisplay = displayLines(prefsAfter.str());
+        check(savedDisplay.first == app.dispGamma && savedDisplay.second == 1 &&
+              prefsDisplay.first == app.dispGamma && prefsDisplay.second == 1,
+              "O5 session save/autosave and prefs save both carry GUI values");
+
+        // A later legacy session with no display lines keeps the values the
+        // reader has always kept. The claims stay too; changing only the badge
+        // would make the displayed origin disagree with the inherited value.
+        const std::string laterMissing = writeFix("viewer-session 1\n");
+        const std::string laterMissingErr = loadSession(laterMissing);
+        check(laterMissingErr.empty() && app.dispGamma == 2.2f && app.showGrid &&
+              settingsOriginOf(SK_gamma).who == SetOrigin::Session &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::Session,
+              "O5 a later missing-key session preserves Session value and origin");
+
+        // Per-key application: a valid gamma line can claim Session while a
+        // malformed grid line neither changes the value nor steals its File claim.
+        baseline();
+        loadSettingsFrom(writeFix(
+            "{ \"appearance\": { \"displayGamma\": 2.2, \"pixelGrid\": true } }\n"));
+        const std::string oneMalformed = writeFix(
+            "viewer-session 1\n"
+            "gamma 1.5\n"
+            "grid not-a-number\n");
+        const std::string malformedErr = loadSession(oneMalformed);
+        check(malformedErr.empty() && app.dispGamma == 1.5f && app.showGrid &&
+              settingsOriginOf(SK_gamma).who == SetOrigin::Session &&
+              settingsOriginOf(SK_pixelGrid).who == SetOrigin::File,
+              "O5 only successfully restored keys claim Session origin");
     }
 
     // ---- W1..W4: the Preferences panel's ROW MODEL --------------------------

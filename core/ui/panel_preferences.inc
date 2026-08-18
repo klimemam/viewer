@@ -14,8 +14,9 @@
 //
 // TWO THINGS THIS PANEL DOES THAT A LIST OF TOGGLES WOULD NOT:
 //
-//   IT NAMES WHO DECIDES. Four layers can (defaults < prefs.txt <
-//   settings.jsonc < CLI) and #50's actual symptom was that the operator
+//   IT NAMES WHO DECIDES. Normally four layers can (defaults < prefs.txt <
+//   settings.jsonc < CLI); gamma/grid also have a fifth Session layer.
+//   #50's actual symptom was that the operator
 //   cannot see which one won - they change a thing, it works, they restart,
 //   it is back. Every row carries its badge.
 //
@@ -42,10 +43,11 @@ static std::string prefLabelOf(const char* path) {
 }
 
 // The badge, dimmed except when something is actually deciding the value from
-// outside this machine's prefs - those two are the ones a reader needs to spot
-// while scanning, because they are the ones that explain a change not sticking.
+// outside this machine's prefs. File, CLI, and Session are the ones a reader
+// needs to spot while scanning.
 static void prefBadge(const PrefRow& r) {
-    const bool loud = r.badge.rfind("settings.jsonc:", 0) == 0 ||
+    const bool session = r.badge == "session (.vsession)";
+    const bool loud = session || r.badge.rfind("settings.jsonc:", 0) == 0 ||
                       r.badge.rfind("command line", 0) == 0;
     if (loud) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", r.badge.c_str());
     else      ImGui::TextDisabled("%s", r.badge.c_str());
@@ -55,6 +57,9 @@ static void prefBadge(const PrefRow& r) {
         else if (r.badge == "this machine")
             ImGui::SetTooltip("prefs.txt on this machine holds it. Changing it here is\n"
                               "permanent for this user.");
+        else if (session)
+            ImGui::SetTooltip("The loaded .vsession owns this display value. Changes here\n"
+                              "remain session-owned and are included in save/autosave.");
         else if (loud && r.badge[0] == 's')
             ImGui::SetTooltip("settings.jsonc sets this key, and the file wins at every\n"
                               "start. A change here lasts until the next one.");
@@ -75,8 +80,12 @@ static void prefWidget(const PrefRow& r) {
             // step that this panel exists to avoid.
             bool* b = prefBoolField(r.id);
             if (b && ImGui::Checkbox("##v", b)) {
-                prefAfterChange(r.id);
-                settingsWarnIfSticky(r.id, r.path);
+                if (r.id == SK_pixelGrid)
+                    settingsDisplayGuiChanged(r.id, r.path);
+                else {
+                    prefAfterChange(r.id);
+                    settingsWarnIfSticky(r.id, r.path);
+                }
             }
             break;
         }
@@ -146,8 +155,7 @@ static void prefWidget(const PrefRow& r) {
                 ImGui::SetTooltip("Enter a positive finite number. Press Enter or leave "
                                   "the field to apply it.");
             if (changed) {
-                prefAfterChange(r.id);
-                settingsWarnIfSticky(r.id, r.path);
+                settingsDisplayGuiChanged(r.id, r.path);
             }
             break;
         }
