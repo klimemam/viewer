@@ -45,9 +45,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iterator>
@@ -68,6 +71,71 @@
 // in the spine, so its remaining functions keep seeing it.
 inline std::filesystem::path pathFromUtf8(const std::string& s) {
     return std::filesystem::u8path(s);
+}
+
+// Display gamma has two convenient presets, but its persisted value is not an
+// enum: Preferences, prefs.txt, settings.jsonc and .vsession all accept the
+// same positive finite float domain (#226). Keep the validation and the exact
+// preset test here so no entry point can quietly round a Custom value to 1.0
+// or 2.2.
+inline bool displayGammaValue(double candidate, float& out) {
+    if (!(candidate > 0.0) || !std::isfinite(candidate) ||
+        candidate > (double)std::numeric_limits<float>::max())
+        return false;
+    const float value = (float)candidate;
+    // The double may overflow to infinity, or a tiny positive value may
+    // underflow to zero when stored in App. Both would break 1/gamma.
+    if (!(value > 0.0f) || !std::isfinite(value)) return false;
+    out = value;
+    return true;
+}
+
+inline int displayGammaPreset(float value) {
+    if (value == 1.0f) return 0;
+    if (value == 2.2f) return 1;
+    return -1;                         // Custom: neither preset is selected
+}
+
+inline bool displayGammaNeedsTransform(float value) {
+    return value != 1.0f;
+}
+
+inline uint32_t displayGammaBits(float value) {
+    uint32_t bits = 0;
+    static_assert(sizeof bits == sizeof value, "float32 display gamma");
+    std::memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+inline bool parseDisplayGamma(const char* text, float& out) {
+    if (!text) return false;
+    char* end = nullptr;
+    const double candidate = std::strtod(text, &end);
+    if (end == text) return false;
+    while (*end && std::isspace((unsigned char)*end)) ++end;
+    return *end == '\0' && displayGammaValue(candidate, out);
+}
+
+// Shortest ordinary decimal (up to float::max_digits10) that reads back to the
+// same float. This keeps Custom 1.25 readable without losing less tidy values
+// on a prefs/session round trip. At the finite upper boundary, a rounded
+// 9-digit decimal can sit just above FLT_MAX; the exact-double fallback stays
+// inside the accepted domain while still returning the same float.
+inline std::string displayGammaText(float value) {
+    if (value == 1.0f) return "1.0";
+    if (value == 2.2f) return "2.2";
+    char buf[64] = {};
+    for (int precision = 1; precision <= std::numeric_limits<float>::max_digits10;
+         ++precision) {
+        const int n = std::snprintf(buf, sizeof buf, "%.*g", precision, (double)value);
+        float roundTrip = 0;
+        if (n > 0 && n < (int)sizeof buf && parseDisplayGamma(buf, roundTrip) &&
+            roundTrip == value)
+            return buf;
+    }
+    std::snprintf(buf, sizeof buf, "%.*g", std::numeric_limits<double>::max_digits10,
+                  (double)value);
+    return buf;
 }
 
 // ---------------------------------------------------------------- image model
@@ -667,7 +735,7 @@ struct App {
     int current = -1;
     ViewState view;
     bool showGrid = false;
-    float dispGamma = 1.0f;           // 1.0 or 2.2
+    float dispGamma = 1.0f;           // positive finite; presets are 1.0 and 2.2
     float uiScale = 1.0f;
     int themeVariant = ui_theme::VariantDark;   // View > Theme
     int themeAccent = 0;                        // index into ui_theme::accents()

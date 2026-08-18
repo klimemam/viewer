@@ -71,7 +71,7 @@ PR #122 で消え、`docs/manual.md` は既に「ビルドを切り替えるフ�
 | `membudget` | stack ローダの RAM 上限 [GB] | **0 = 自動 (物理 RAM の 60%、最低 2 GiB)** | ★ **数値を動かす** — 上限に当たると読むフレームが減り、σ_t の N が変わる |
 | `procpolicy` | 測定をどちら側で走らせるか | `PolAuto` | 設計上どちらでも同じ数値 (正典) |
 | `linunit` | 新しい series の単位の**prefill** | `"lx"` | ★ **片道** — 下記 |
-| `gamma` | 表示ガンマ (1.0 か 2.2 のみ) | 1.0 | 表示のみ |
+| `gamma` | 表示ガンマ（正の有限な float。1.0 / 2.2 はプリセット） | 1.0 | 表示のみ |
 | `grid` | 画素グリッド | false | 見れば分かる |
 | `frame` | タイトルバー (0 = system / 1 = integrated) | **1 = integrated** | 見れば分かる |
 | `window` | 位置 (raw) + 大きさ (logical) + 最大化 | 1600×1000、位置なし | 見れば分かる |
@@ -474,7 +474,8 @@ measuring 級の設定は、この規則と**構造的に衝突しうる唯一�
     "titleBar": "integrated",     // "integrated" | "system"
     "showFps": false,
     "pixelGrid": false,
-    "displayGamma": 1.0           // 1.0 | 2.2 のみ。表示だけで、測定値は動きません
+    "displayGamma": 1.0           // 0より大きい有限値。1.0 / 2.2 はプリセット
+                                  // 表示だけに適用し、測定値は変えません
   },
 
   "input": {

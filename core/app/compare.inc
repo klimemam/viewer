@@ -1039,7 +1039,10 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
     const float ib = effBlack(im), iw = effWhite(im);
     float inv = 1.0f / std::max(iw - ib, 1e-20f);
     float invGamma = 1.0f / app.dispGamma;
-    bool doGamma = fabsf(app.dispGamma - 1.0f) > 1e-3f;
+    // Custom values remain Custom even when close to 1.0. Only the exact
+    // linear preset bypasses gamma; otherwise a value such as 1.0005 must
+    // affect the view as entered.
+    bool doGamma = displayGammaNeedsTransform(app.dispGamma);
     // Gamma through a table instead of 36 million powf() calls at 12 Mpx (235 ms
     // -> 76 ms measured), which is what makes dragging the range slider usable at
     // gamma 2.2. The table is in the SQRT domain: x^(1/g) is vertical at x=0, so

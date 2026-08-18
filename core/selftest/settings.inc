@@ -656,14 +656,47 @@ static int settingsSelftest() {
               "R12 an unknown enum word is refused, value unchanged");
         check(anyNote(r, "\"ask\"") && anyNote(r, "\"always\"") && anyNote(r, "\"never\""),
               "R12 ...listing every word it would have taken");
-        // ...and displayGamma, where a plausible wrong number is the hazard:
-        // 1.8 silently rounded to 2.2 is "I set it and nothing happened".
+        // displayGamma is not an enum: 1.0 and 2.2 are presets, while every
+        // other positive finite float is Custom (#226). A Custom value must be
+        // accepted exactly, never rounded to the nearer preset.
         baseline();
         std::string p2 = writeFix("{ \"appearance\": { \"displayGamma\": 1.8 } }\n");
         SettingsReport r2 = loadSettingsFrom(p2);
         dumpNotes(r2);
-        check(r2.rejected == 1 && app.dispGamma == 1.0f,
-              "R12 displayGamma 1.8 is refused, not rounded to 2.2");
+        check(r2.rejected == 0 && app.dispGamma == (float)1.8 &&
+              displayGammaPreset(app.dispGamma) == -1,
+              "R12 displayGamma 1.8 is Custom, not rounded to a preset");
+
+        // Zero, negative, overflow-to-infinity and underflow-to-zero all keep
+        // the previous value. The last two catch validation done only before
+        // narrowing JSON's double to App's float.
+        const char* badGamma[] = { "0", "-1", "1e39", "1e999", "1e-50", "1e-999" };
+        bool badKept = true;
+        for (const char* bad : badGamma) {
+            baseline();
+            app.dispGamma = 1.25f;
+            const SettingsReport br = loadSettingsFrom(writeFix(
+                std::string("{ \"appearance\": { \"displayGamma\": ") + bad + " } }\n"));
+            badKept = badKept && br.rejected == 1 && app.dispGamma == 1.25f;
+        }
+        check(badKept, "R12 invalid gamma values are refused and leave the value unchanged");
+
+        float parsedGamma = 0;
+        const float awkward = 1.2345678f;
+        const std::string saidGamma = displayGammaText(awkward);
+        check(parseDisplayGamma(saidGamma.c_str(), parsedGamma) &&
+              displayGammaBits(parsedGamma) == displayGammaBits(awkward),
+              "R12 Custom gamma text round-trips the exact float");
+        const float maxGamma = std::numeric_limits<float>::max();
+        const std::string maxSaid = displayGammaText(maxGamma);
+        check(parseDisplayGamma(maxSaid.c_str(), parsedGamma) && parsedGamma == maxGamma,
+              "R12 the largest finite Custom gamma also round-trips");
+        check(displayGammaPreset(1.0f) == 0 && displayGammaPreset(2.2f) == 1 &&
+              displayGammaPreset(1.25f) == -1 &&
+              displayGammaNeedsTransform(1.0005f),
+              "R12 presets are exact and every nearby Custom value is transformed");
+        check(displayGammaBits(1.01f) != displayGammaBits(1.02f),
+              "R12 nearby Custom values have distinct change stamps");
     }
 
     {
@@ -973,9 +1006,9 @@ static int settingsSelftest() {
         check(noted == later + notHere,
               "W2 every 'later' / 'not here' row carries its sentence");
         // Spot checks, each with its derivation:
-        //   displayGamma is an ENUM, not a range - sjApplyKey refuses anything
-        //   but 1.0 and 2.2 by name, so a slider would offer values the file
-        //   itself rejects.
+        //   displayGamma is a compound control: the two presets remain quick
+        //   actions and Custom accepts the same positive finite domain as the
+        //   file. It is not a slider and never clamps.
         //   rawRecipes is a LINK - it is a list with its own panel (#166), and
         //   editing an array of objects in a row is not a control this panel has.
         auto rowOf = [&](SKey id) -> const PrefRow* {
@@ -989,7 +1022,8 @@ static int settingsSelftest() {
                         "compact widget=%d\n",
                 rg ? (int)rg->widget : -1, rr ? (int)rr->widget : -1,
                 rb ? (int)rb->widget : -1);
-        check(rg && rg->widget == SW_Enum, "W3 displayGamma is a two-value enum");
+        check(rg && rg->widget == SW_Gamma,
+              "W3 displayGamma has two presets and a Custom numeric input");
         check(rr && rr->widget == SW_Link, "W3 rawRecipes is a link, not an editor");
         check(rb && rb->widget == SW_Bool, "W3 a boolean key gets a checkbox");
         // ...and the badge, which is the whole reason this panel exists: the
@@ -1033,6 +1067,18 @@ static int settingsSelftest() {
               "W5 the copied text is a document this build reads");
         check(rr.applied == 1 && app.themeVariant == ui_theme::VariantLight,
               "W5 ...and it puts the value back, exactly (parse o emit = identity)");
+        // The same inverse property for a Custom float. This specifically
+        // guards settingsCurrentValue's decimal precision rather than only the
+        // parser's acceptance of a friendly value such as 1.25.
+        baseline();
+        const float customGamma = 1.2345678f;
+        app.dispGamma = customGamma;
+        const std::string gtxt = settingsKeyAsJsonc(SK_gamma);
+        baseline();
+        const SettingsReport gr = loadSettingsFrom(writeFix(gtxt));
+        check(gr.parsed && gr.rejected == 0 && gr.applied == 1 &&
+              displayGammaBits(app.dispGamma) == displayGammaBits(customGamma),
+              "W5 Custom gamma copies as JSONC and returns bit-for-bit");
         // A key at its DEFAULT is copied as a COMMENT, not as a line: writing a
         // default and leaving it unset are different acts the day the default
         // moves (判断9). So the round trip of a defaulted key applies nothing -

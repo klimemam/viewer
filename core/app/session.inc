@@ -38,7 +38,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                            int* lostSetRolesOut = nullptr) {
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
-    f << "gamma " << app.dispGamma << "\n";
+    f << "gamma " << displayGammaText(app.dispGamma) << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "zoom " << app.view.zoom << "\n";
     f << "center " << app.view.center.x << " " << app.view.center.y << "\n";
@@ -973,7 +973,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "membudget " << app.memBudgetGB << "\n";
     f << "procpolicy " << app.procPolicy << "\n";
     f << "linunit " << app.lin.unit << "\n";
-    f << "gamma " << app.dispGamma << "\n";
+    f << "gamma " << displayGammaText(app.dispGamma) << "\n";
     f << "grid " << (app.showGrid ? 1 : 0) << "\n";
     f << "frame " << app.frameMode << "\n";
     // The window: logical size, raw position, then the maximized flag (see
@@ -1110,7 +1110,12 @@ static void loadPrefs() {
             if (!u.empty())
                 snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str());
         }
-        else if (key == "gamma")       { ls >> app.dispGamma; }
+        else if (key == "gamma")       {
+            double candidate = 0;
+            float gamma = 0;
+            if ((ls >> candidate) && displayGammaValue(candidate, gamma))
+                app.dispGamma = gamma;
+        }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;
                                          app.frameMode = std::clamp(app.frameMode, 0, 1); }
@@ -1174,7 +1179,6 @@ static void loadPrefs() {
     app.themeVariant = std::clamp(app.themeVariant, 0, 1);
     app.themeAccent = std::clamp(app.themeAccent, 0, ui_theme::accentCount() - 1);
     app.seqLoadMode = std::clamp(app.seqLoadMode, 0, 2);
-    app.dispGamma = app.dispGamma > 1.5f ? 2.2f : 1.0f;
 }
 
 // ---- input adapters: running one, and remembering which one ------------------
@@ -2358,7 +2362,12 @@ static std::string loadSession(const std::string& path) {
         std::string key; ls >> key;
         const int refTarget = refFor;   // only the line DIRECTLY above may be qualified
         refFor = RM_NONE;
-        if      (key == "gamma")   ls >> app.dispGamma;
+        if      (key == "gamma") {
+            double candidate = 0;
+            float gamma = 0;
+            if ((ls >> candidate) && displayGammaValue(candidate, gamma))
+                app.dispGamma = gamma;
+        }
         else if (key == "grid")  { int g = 0; ls >> g; app.showGrid = g != 0; }
         else if (key == "zoom")  { ls >> zoom; haveView = true; }
         else if (key == "center")  ls >> center.x >> center.y;

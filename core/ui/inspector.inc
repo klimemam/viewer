@@ -865,10 +865,14 @@ static void drawInspector() {
             if (ImGui::Button("0-65535", ImVec2(bw, 0))) setRange(*im, 0, 65535);
         }
 
-        int g = app.dispGamma > 1.5f ? 1 : 0;
+        const int g = displayGammaPreset(app.dispGamma);
         ImGui::TextUnformatted("gamma"); ImGui::SameLine();
-        if (ImGui::RadioButton("1.0", g == 0)) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
-        if (ImGui::RadioButton("2.2", g == 1)) { app.dispGamma = 2.2f; markAllTexDirty(); }
+        if (ImGui::RadioButton("1.0", g == 0) && g != 0) { app.dispGamma = 1.0f; markAllTexDirty(); } ImGui::SameLine();
+        if (ImGui::RadioButton("2.2", g == 1) && g != 1) { app.dispGamma = 2.2f; markAllTexDirty(); }
+        if (g < 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("custom %s", displayGammaText(app.dispGamma).c_str());
+        }
         {   // only share the row if the checkbox actually fits (fails at 200% DPI)
             const ImGuiStyle& st = ImGui::GetStyle();
             float need = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x +

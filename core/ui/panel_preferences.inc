@@ -92,6 +92,64 @@ static void prefWidget(const PrefRow& r) {
             }
             break;
         }
+        case SW_Gamma: {
+            // Presets remain one-click actions, while Custom is an exact text
+            // buffer so incomplete/invalid input never reaches 1/gamma. The
+            // mode is derived from the value; there is no separate flag that
+            // could drift from a .vsession value such as 1.25.
+            const int preset = displayGammaPreset(app.dispGamma);
+            bool changed = false, chosePreset = false;
+            if (ImGui::RadioButton("1.0 (linear)", preset == 0) && preset != 0) {
+                app.dispGamma = 1.0f; changed = chosePreset = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("2.2", preset == 1) && preset != 1) {
+                app.dispGamma = 2.2f; changed = chosePreset = true;
+            }
+
+            static char custom[64] = {};
+            static uint32_t sourceBits = 0;
+            static bool editing = false;
+            const uint32_t bits = displayGammaBits(app.dispGamma);
+            if (!editing || chosePreset || sourceBits != bits) {
+                snprintf(custom, sizeof custom, "%s", displayGammaText(app.dispGamma).c_str());
+                sourceBits = bits;
+            }
+            ImGui::TextUnformatted("Custom:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            const bool submitted = ImGui::InputText(
+                "##custom", custom, sizeof custom, ImGuiInputTextFlags_EnterReturnsTrue);
+            const bool deactivated = ImGui::IsItemDeactivatedAfterEdit();
+            const bool active = ImGui::IsItemActive();
+            if (!chosePreset && (submitted || deactivated)) {
+                float gamma = 0;
+                if (parseDisplayGamma(custom, gamma)) {
+                    if (gamma != app.dispGamma) {
+                        app.dispGamma = gamma;
+                        changed = true;
+                    }
+                    sourceBits = displayGammaBits(app.dispGamma);
+                    snprintf(custom, sizeof custom, "%s",
+                             displayGammaText(app.dispGamma).c_str());
+                } else {
+                    toast("Display gamma must be a positive finite number; "
+                          "the value was not changed.", true);
+                    snprintf(custom, sizeof custom, "%s",
+                             displayGammaText(app.dispGamma).c_str());
+                    sourceBits = displayGammaBits(app.dispGamma);
+                }
+            }
+            editing = active && !chosePreset;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enter a positive finite number. Press Enter or leave "
+                                  "the field to apply it.");
+            if (changed) {
+                prefAfterChange(r.id);
+                settingsWarnIfSticky(r.id, r.path);
+            }
+            break;
+        }
         case SW_Int: {
             int* v = prefIntField(r.id);
             if (v && ImGui::InputInt("##v", v)) {
