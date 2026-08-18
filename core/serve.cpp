@@ -3097,13 +3097,26 @@ static void handleMeasure(Buf& in) {
 // the words - except where the words are settled HERE, which is the gate (§2.1)
 // and the check of what the reader returned (§5.2, shared with the local door).
 
-// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". Asked once and kept: it is
-// a property of the interpreter, and a cache hit deserves the same line as a
-// run because the client prints it either way.
+// "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4". ASKED EVERY RUN.
+//
+// It was asked once per interpreter per process and kept (#180 codex review),
+// which is a claim about a peer's lifetime that a peer does not get to make.
+// viewer-serve outlives the session it answers - hours, on a machine where
+// somebody else may `pip install -U numpy` in the environment it was pointed at
+// - and this string is BOTH what the client prints beside the pixels AND part
+// of the cache key (§5.3). A stale one breaks the key in both directions: the
+// same origin and reader keep hitting a materialisation the old numpy produced,
+// and if anything else in the key does move, the NEW numpy's pixels are
+// published under the OLD environment's name. The second is the exact thing
+// putting `prov` in the key was for.
+//
+// The cost is one `python -c "import numpy"` per READER_RUN - a few hundred
+// milliseconds, once per Load, on the side that was about to run a reader
+// anyway. A cache hit pays it too, and that is the point: the hit is only a hit
+// if the environment is still the one the key was computed under, and there is
+// no cheaper honest way to find that out. "The second run does not start
+// Python" (§5.3) stays true of the READER, which is what it was ever about.
 static std::string pythonProvenance(const std::string& py) {
-    static std::string cached;
-    static std::string cachedFor;
-    if (!cached.empty() && cachedFor == py) return cached;
     adapter::Run r = adapter::run({ py, "-c",
         "import sys,numpy;print('Python %d.%d.%d (%s), numpy %s' % "
         "(sys.version_info[0],sys.version_info[1],sys.version_info[2],"
@@ -3111,8 +3124,6 @@ static std::string pythonProvenance(const std::string& py) {
     std::string s = r.out;
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     if (s.empty()) s = py;               // it answered nothing: name what we ran
-    cached = s;
-    cachedFor = py;
     return s;
 }
 
@@ -3277,9 +3288,11 @@ static void handleReaderRun(Buf& in) {
     // same versions. `prov` is what that interpreter SAYS it is (§4.3.1's
     // sentence: "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4"), which is
     // what moves when numpy is upgraded in place and the path does not. It is
-    // asked once per interpreter per PROCESS, so an upgrade is noticed by the
-    // next peer process - which is exactly the case the persistent cache makes
-    // dangerous, since that is the cache that outlives the upgrade.
+    // asked ON THIS RUN, not remembered from an earlier one (#180 codex
+    // review): a peer process lives for hours, an upgrade under it is an
+    // ordinary event, and a remembered answer would hand back the old
+    // environment's pixels - or publish the new environment's pixels under the
+    // old environment's name - for as long as that process lasted.
     //
     // A FOLDER ORIGIN is the third thing in it (#218 review). Its own mtime
     // moves when a child is added or removed and not when one is REWRITTEN,

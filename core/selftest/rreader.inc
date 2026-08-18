@@ -818,6 +818,100 @@
                       "R15i (setup) the same interpreter path now reports another numpy");
                 check(okB3 && kB3 != kB && !cachedB3,
                       "R15j an upgrade under one interpreter path is a miss, not a hit");
+
+                // ---- R15k-n: the same PEER PROCESS, and numpy moves under it --
+                //
+                // #180 codex review of #224. R15i/j start a new viewer-serve for
+                // each environment, so they can only ever show that the NEXT
+                // process notices an upgrade. The peer that matters is the one
+                // that does not restart: a --serve session lives for hours, and
+                // `prov` was asked once per interpreter per process and kept.
+                // While that string stood still the key stood still with it, so
+                // the peer kept answering out of a materialisation the OLD numpy
+                // produced - and had anything else in the key moved, it would
+                // have published the NEW numpy's pixels under the OLD
+                // environment's name, which is the exact thing putting `prov` in
+                // the key was for.
+                //
+                // So: ONE session, held open across the change, and a reader
+                // whose PIXELS carry numpy's own version number. "The generated
+                // pixels and the provenance line beside them come from the same
+                // environment" is then a number, not a story.
+                const std::string rdNpv = root + "/npver.py";
+                writeText(rdNpv,
+                          "import numpy as np\n"
+                          "from viewer_import import Stack\n"
+                          "VERSION = 1\n"
+                          "def load(path):\n"
+                          "    tag = int(np.__version__.split('.')[0])\n"
+                          "    a = np.load(path).astype(np.uint16) + tag\n"
+                          "    return Stack(np.ascontiguousarray(a), name='npver')\n");
+                std::string npFiles[3] = { std::string(), files[1], files[2] };
+                const bool haveNpv = slurp(rdNpv, npFiles[0]);
+                check(haveNpv, "R15k (setup) the numpy-tagging reader is readable");
+                if (haveNpv) {
+                    setEnv("VIEWER_SERVE_PYTHON", pyB);
+                    remote::Session one;
+                    if (!openSession(one, true)) return 1;
+                    auto sameProcess = [&](std::string& k, std::string& pv, double& px,
+                                           bool& cached) {
+                        remote::ReaderRun r;
+                        std::string e;
+                        const bool sent = one.readerRun(envOrigin, "load", npFiles, r, e);
+                        bool got = sent && r.outcome == rp::RO_OK;
+                        if (got) {
+                            k = r.key;
+                            pv = r.provenance;
+                            cached = has(r.stderrText, "read from cache");
+                            got = keyedFirst(one, r.key, px);
+                        }
+                        return got;
+                    };
+                    // sitecustomize runs at interpreter startup, so this is what
+                    // the provenance probe AND the reader both see - exactly as a
+                    // real `pip install -U numpy` under this path would be seen.
+                    //
+                    // __pycache__ GOES WITH IT. Python validates a .pyc against
+                    // the source's mtime AND SIZE, both of which are unchanged
+                    // when one version string is overwritten by another of the
+                    // same length within the same second - so the interpreter
+                    // re-ran the PREVIOUS version and this test measured its own
+                    // fixture instead of the peer.
+                    auto setNumpyVersion = [&](const char* v) {
+                        writeText(sp + "/sitecustomize.py",
+                                  std::string("import numpy\nnumpy.__version__ = '") +
+                                      v + "'\n");
+                        std::error_code pe;
+                        std::filesystem::remove_all(pathFromUtf8(sp + "/__pycache__"), pe);
+                    };
+                    setNumpyVersion("31.0.0");
+                    std::string k1, pv1;
+                    double px1 = 0;
+                    bool c1 = false;
+                    const bool r1 = sameProcess(k1, pv1, px1, c1);
+                    check(r1 && has(pv1, "31.0.0") && px1 == (double)(EBASE + 31),
+                          "R15l one peer process, numpy 31: the pixels carry 31 and the "
+                          "provenance says 31");
+
+                    setNumpyVersion("42.0.0");
+                    std::string k2, pv2;
+                    double px2 = 0;
+                    bool c2 = false;
+                    const bool r2 = sameProcess(k2, pv2, px2, c2);
+                    fprintf(stderr, "rreaderselftest:   R15 same process: "
+                                    "%s/\"%s\"/%g -> %s/\"%s\"/%g cached=%d\n",
+                            k1.c_str(), pv1.c_str(), px1, k2.c_str(), pv2.c_str(),
+                            px2, c2 ? 1 : 0);
+                    check(r2 && has(pv2, "42.0.0"),
+                          "R15m ...numpy is upgraded under it and THIS process sees it");
+                    check(r2 && k2 != k1 && !c2,
+                          "R15n ...so the very next run is a MISS, not a hit on the old "
+                          "environment's materialisation");
+                    check(r2 && px2 == (double)(EBASE + 42),
+                          "R15o ...and the pixels that come back were made by the numpy "
+                          "the provenance line names");
+                    one.stop();
+                }
             }
             setEnv("VIEWER_SERVE_PYTHON", "");
             closeAll();
