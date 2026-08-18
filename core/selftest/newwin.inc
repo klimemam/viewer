@@ -374,6 +374,42 @@
                       "N12 the series unit prefill survives prefs.txt");
             }
 
+            // N12c: prefs.txt has the same Custom domain as settings.jsonc and
+            // .vsession. Use a value that needs more than the stream's former
+            // default six digits, then demand the exact float after restart.
+            {
+                const float customGamma = 1.2345678f;
+                app.dispGamma = customGamma;
+                savePrefs();
+                app.dispGamma = 1.0f;
+                reload();
+                check(displayGammaBits(app.dispGamma) == displayGammaBits(customGamma),
+                      "N12 Custom gamma survives prefs.txt bit-for-bit");
+
+                // The reverse direction is part of the UI contract too: a
+                // Custom value can be replaced by either preset, and the
+                // persisted value must come back as that exact preset rather
+                // than reviving the old Custom value.
+                app.dispGamma = 1.0f;
+                savePrefs();
+                std::vector<uint8_t> presetBytes;
+                const bool readPreset = readFileBytes(pp, presetBytes);
+                const std::string presetFile(presetBytes.begin(), presetBytes.end());
+                app.dispGamma = customGamma;
+                reload();
+                check(readPreset && presetFile.find("\ngamma 1.0\n") != std::string::npos &&
+                      app.dispGamma == 1.0f && displayGammaPreset(app.dispGamma) == 0,
+                      "N12 Custom to linear preset is saved and reloads as the preset");
+
+                std::ofstream bad(pathFromUtf8(pp), std::ios::binary);
+                bad << "viewer-prefs 1\ngamma -2\n";
+                bad.close();
+                app.dispGamma = customGamma;
+                reload();
+                check(app.dispGamma == customGamma,
+                      "N12 an invalid prefs gamma is ignored, value unchanged");
+            }
+
             app.winX = sx; app.winY = sy; app.winW = sw; app.winH = sh;
             app.winMax = sm;
             snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx");
@@ -477,15 +513,29 @@
 
             // (c) the same save, unobstructed, still lands - and comes back.
             {
-                app.dispGamma = 1.75f;
+                const float customGamma = 1.2345678f;
+                app.dispGamma = customGamma;
                 app.showGrid = false;
                 saveSession(sp, true);
                 app.dispGamma = 0.5f;
                 app.showGrid = true;
                 std::string lerr = loadSession(sp);
-                check(lerr.empty() && app.dispGamma > 1.74f && app.dispGamma < 1.76f &&
+                check(lerr.empty() &&
+                      displayGammaBits(app.dispGamma) == displayGammaBits(customGamma) &&
                       !app.showGrid,
-                      "N9 a normal save still round-trips through the file");
+                      "N9 a Custom gamma round-trips through the session bit-for-bit");
+
+                // A hand-edited or damaged session must not put zero into the
+                // denominator used by rendering. The rest of the session may
+                // still load; this key alone keeps the prior valid value.
+                {
+                    std::ofstream bad(pathFromUtf8(sp), std::ios::binary);
+                    bad << "viewer-session 1\ngamma 0\n";
+                }
+                app.dispGamma = customGamma;
+                lerr = loadSession(sp);
+                check(lerr.empty() && app.dispGamma == customGamma,
+                      "N9 an invalid session gamma is ignored, value unchanged");
             }
 
             // (d) the autosave file is held OPEN by the crash handler for the

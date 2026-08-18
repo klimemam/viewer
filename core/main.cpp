@@ -2201,7 +2201,8 @@ static bool g_watchSuppressed = false;
                          (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
                          (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
                          (app.lowBandwidth ? 1u : 0u) * 43 +
-                         (uint64_t)(app.dispGamma * 10) * 37 + (app.showGrid ? 1u : 0u) * 41 + 1;
+                         (uint64_t)displayGammaBits(app.dispGamma) * 37 +
+                         (app.showGrid ? 1u : 0u) * 41 + 1;
             if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
             lastPrefs = h;
         }
@@ -2256,7 +2257,8 @@ static bool g_watchSuppressed = false;
             uint64_t state = app.imagesRev * 1000003ull + app.annRev * 31ull +
                              (uint64_t)(app.current + 1) + (app.linkRange ? 7ull : 0) +
                              (uint64_t)(app.view.zoom * 1000) + (uint64_t)app.view.center.x +
-                             (uint64_t)app.view.center.y + (uint64_t)(app.dispGamma * 10) +
+                             (uint64_t)app.view.center.y +
+                             (uint64_t)displayGammaBits(app.dispGamma) * 65537ull +
                              (uint64_t)(app.abStatsLayout * 8192 + (app.histPlane + 1) * 65536) +
                              (uint64_t)(app.showGrid + app.histLog * 2 + app.anaSel * 4 +
                                         app.projMode * 64 + app.projYMode * 256 +

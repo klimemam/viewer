@@ -531,9 +531,15 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Display Gamma")) {
-            bool lin = app.dispGamma < 1.5f;
-            if (ImGui::MenuItem("1.0 (linear)", nullptr, lin) && !lin) { app.dispGamma = 1.0f; markAllTexDirty(); }
-            if (ImGui::MenuItem("2.2", nullptr, !lin) && lin)         { app.dispGamma = 2.2f; markAllTexDirty(); }
+            const int preset = displayGammaPreset(app.dispGamma);
+            if (ImGui::MenuItem("1.0 (linear)", nullptr, preset == 0) && preset != 0)
+                { app.dispGamma = 1.0f; markAllTexDirty(); }
+            if (ImGui::MenuItem("2.2", nullptr, preset == 1) && preset != 1)
+                { app.dispGamma = 2.2f; markAllTexDirty(); }
+            if (preset < 0) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Custom: %s", displayGammaText(app.dispGamma).c_str());
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Theme")) {

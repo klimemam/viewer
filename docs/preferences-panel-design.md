@@ -85,7 +85,7 @@ bool → チェックボックス、列挙 → コンボ、数値 → 入力、�
 | appearance.titleBar | 列挙 system/integrated | integrated | frame | presentation |
 | appearance.showFps | bool | false | showfps | presentation |
 | appearance.pixelGrid | bool | false | grid | presentation |
-| appearance.displayGamma | 列挙 1.0/2.2 | 1.0 | gamma | presentation |
+| appearance.displayGamma | 1.0 / 2.2 プリセット + Custom 数値入力 | 1.0 | gamma | presentation |
 | input.dragPans | bool | false | dragpans | presentation |
 | input.wheelZoomPlain | bool | false | wheelzoom | presentation |
 | input.fitOnSwitch | bool | false | fitonswitch | presentation |
@@ -358,9 +358,10 @@ prefs.txt を書くテストが共有 home を汚してはならない。
     隣に書き写す)。
   - 全 `SS_Read` 行に widget 種がある (S1 と同型:「表に足してパネルに
     足し忘れ」で赤になる)。
-  - スポット: displayGamma の widget は2値列挙 (導出: applier が
-    1.0/2.2 以外を名指しで断る、範囲ではない)。searchPath / rawRecipes は
-    リンク行 (P7)。
+  - スポット: displayGamma の widget は 1.0 / 2.2 のプリセットと Custom
+    数値入力を持つ複合行。Custom は float へ変換した後も 0 より大きく有限な値だけを
+    受理し、無効値をクランプしたり近いプリセットへ丸めたりしない。
+    searchPath / rawRecipes はリンク行 (P7)。
   - 台帳 File のキーの行がバッジ文字列に「settings.jsonc:」を含む。
 - **単独の意味**: #50 の「1箇所に集める」がここで果たされる (inventory §6 の 3)。
 

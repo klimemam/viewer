@@ -972,14 +972,15 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
         case SK_gamma: {
             double n = 0;
             if (!A.wantNum(v, path, n)) break;
-            // Two values, not a range: the display path has exactly these. A
-            // 1.8 silently rounded to 2.2 is the "I set it and nothing
-            // happened" shape this whole file exists to stop.
-            if (n != 1.0 && n != 2.2) {
-                A.rangeErr(v, path, "1.0 or 2.2 (the only two the display path has)");
+            float gamma = 0;
+            // Presets are conveniences, not the persisted value domain. The
+            // conversion is checked after narrowing too: a huge/tiny JSON
+            // number must not become infinity/zero and reach 1/gamma.
+            if (!displayGammaValue(n, gamma)) {
+                A.rangeErr(v, path, "a positive finite number representable as float");
                 break;
             }
-            A.setF(app.dispGamma, (float)n, path);
+            A.setF(app.dispGamma, gamma, path);
             break;
         }
         case SK_dragPans:    { bool b; if (A.wantBool(v, path, b)) A.setB(app.dragPans, b, path); break; }
@@ -1363,7 +1364,7 @@ static std::string settingsCurrentValue(SKey id);   // fwd: defined below, one s
 // window: what a row SAYS is the part that can be wrong, and drawing it is not.
 enum SWidget {
     SW_None = 0,   // SS_Later / SS_NotHere: the note replaces the control
-    SW_Bool, SW_Enum, SW_Int, SW_Float, SW_Text,
+    SW_Bool, SW_Enum, SW_Gamma, SW_Int, SW_Float, SW_Text,
     SW_Link        // a list this panel points at rather than edits (recipes, paths)
 };
 struct PrefRow {
@@ -1379,17 +1380,18 @@ struct PrefRow {
 // The widget a key takes. A switch rather than a column on SKeyDef: the kind is
 // a fact about what the APPLIER accepts, and it belongs beside
 // settingsCurrentValue(), which is the other per-key fact this file keeps in
-// one place. displayGamma is an ENUM and not a range because sjApplyKey refuses
-// anything but 1.0 and 2.2 by name - a slider would offer values the file
-// itself rejects.
+// one place. displayGamma gets a compound control: two convenient presets and
+// a Custom positive finite number, exactly the domain sjApplyKey accepts.
 static SWidget settingsWidgetFor(SKey id) {
     switch (id) {
         // browse.grouped is an ENUM and not a bool: the key is "grouped" while
         // the field is rbFlat, so a checkbox would be inverted against its own
         // name. Two words beat a negated tick.
         case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
-        case SK_gamma: case SK_grouped:
+        case SK_grouped:
             return SW_Enum;
+        case SK_gamma:
+            return SW_Gamma;
         case SK_compact: case SK_showFps: case SK_pixelGrid: case SK_dragPans:
         case SK_wheelZoom: case SK_fitOnSwitch: case SK_tree:
         case SK_naturalSort: case SK_lowBandwidth:
@@ -1491,12 +1493,6 @@ static void prefEnumChoices(SKey id, std::vector<const char*>& out, int& cur) {
             out = { "auto", "local-fetch" };
             cur = app.procPolicy == App::PolLocalFetch ? 1 : 0;
             break;
-        case SK_gamma:
-            // TWO values, not a range: sjApplyKey names 1.0 and 2.2 and refuses
-            // the rest, so this is an enumeration wearing a number's clothes.
-            out = { "1.0 (linear)", "2.2" };
-            cur = app.dispGamma > 1.5f ? 1 : 0;
-            break;
         case SK_grouped:
             out = { "grouped", "flat" };
             cur = app.rbFlat ? 1 : 0;
@@ -1511,7 +1507,6 @@ static void prefEnumSet(SKey id, int idx) {
         case SK_titleBar: app.frameMode = idx ? 0 : 1; break;
         case SK_stackPrompt: app.seqLoadMode = std::clamp(idx, 0, 2); break;
         case SK_policy: app.procPolicy = idx ? App::PolLocalFetch : App::PolAuto; break;
-        case SK_gamma:  app.dispGamma = idx ? 2.2f : 1.0f; break;
         case SK_grouped: app.rbFlat = idx != 0; break;
         default: break;
     }
@@ -1616,7 +1611,9 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_titleBar: return app.frameMode == 1 ? "" : "\"system\"";
         case SK_showFps: return app.showFps ? "true" : "";
         case SK_pixelGrid: return app.showGrid ? "true" : "";
-        case SK_gamma: return app.dispGamma > 1.5f ? "2.2" : "";
+        case SK_gamma:
+            return displayGammaPreset(app.dispGamma) == 0 ? "" :
+                   displayGammaText(app.dispGamma);
         case SK_dragPans: return app.dragPans ? "true" : "";
         case SK_wheelZoom: return app.wheelZoomPlain ? "true" : "";
         case SK_fitOnSwitch: return app.fitOnSwitch ? "true" : "";
