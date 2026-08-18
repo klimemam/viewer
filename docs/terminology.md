@@ -106,7 +106,7 @@ Yes なら series、No なら batch。
 
 | 操作 | frame | stack | series | AnalysisSet | batch |
 |---|---|---|---|---|---|
-| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](reader-analysisset.md) §6） | 含む stack / frame をすべて破棄 |
+| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](features/adapters/reader-analysisset.md) §6） | 含む stack / frame をすべて破棄 |
 | **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
 | **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — |  | 同 = everything（全体で共有） |
 | **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） |  | — （条件混在は平均に意味がない） |

@@ -149,7 +149,7 @@ stack を1枚に畳むときは **mean と sum を選べます**。NaN が混ざ
 | 形式 | 備考 |
 |---|---|
 | `.npy` | `u1 i1 b1 u2 i2 u4 i4 f4 f8`、ビッグエンディアン、fortran order |
-| `.npz` | zip 内の各メンバ。名前は `file.npz:key`。画像でないメンバは開かず、フレーム数と長さの合う1次元配列は**軸として使えます** ([docs/npz-design.md](docs/npz-design.md)) |
+| `.npz` | zip 内の各メンバ。名前は `file.npz:key`。画像でないメンバは開かず、フレーム数と長さの合う1次元配列は**軸として使えます** ([docs/features/adapters/npz-design.md](docs/features/adapters/npz-design.md)) |
 | `.bin` `.raw` `.yuv` `.dat` `.rggb` | ヘッダ無し。dtype・解釈 (gray/rgb/bayer/quad-bayer)・寸法・オフセット・クロップを指定 |
 | `.png` `.jpg` | 8/16-bit。値は保存されたまま、スケールもトーンカーブも掛けません |
 | `.tif` | 自前実装。8/16-bit 整数と 32-bit float、strip、LZW/Deflate/PackBits。**multi-page は stack** |
@@ -214,7 +214,7 @@ File > Open With a Reader...        (Browse で読めないファイルをダブ
   `[change...]` `[edit]` `[native]` でいつでも変えられます
 
 Python は `numpy` があるものを探して使います。無ければ**どれを試して何が足りなかったか**を
-名指しで言います。仕様は [docs/input-adapters.md](docs/input-adapters.md)。
+名指しで言います。仕様は [docs/features/adapters/input-adapters.md](docs/features/adapters/input-adapters.md)。
 
 ---
 
@@ -232,7 +232,7 @@ viewer ssh://user@host                             ホームから
   stack 全体の測定は**計算機側で走り**、返るのは数値です
 - 計算機に `viewer-serve` が無ければ、初回に置きにいきます
 
-詳しくは [docs/remote.md](docs/remote.md)。
+詳しくは [docs/features/remote/remote.md](docs/features/remote/remote.md)。
 
 ---
 
@@ -257,7 +257,7 @@ viewer ssh://user@host                             ホームから
 
 analyzer は **peer 側でも同じものが走ります**。リモート実行は **name + 版の等値**で
 照合し、食い違えば**両方の版を引用して断ります** — 黙ってローカルに振り替えることは
-しません。仕様は [docs/abi-v3.md](docs/abi-v3.md)、書き方は [docs/analyzers.md](docs/analyzers.md)。
+しません。仕様は [docs/reference/abi-v3.md](docs/reference/abi-v3.md)、書き方は [docs/reference/analyzers.md](docs/reference/analyzers.md)。
 
 ---
 
@@ -297,16 +297,16 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 | | |
 |---|---|
 | [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
-| [docs/manual.md](docs/manual.md) | 操作の手引き |
+| [docs/guides/manual.md](docs/guides/manual.md) | 操作の手引き |
 | [docs/analysis-layers.md](docs/analysis-layers.md) | AnalysisSet と解析の4種 (General / Specific / PreProcessor / SetAnalyzer) |
-| [docs/flat-field-stats.md](docs/flat-field-stats.md) | σ_fpn・DSNU・PRNU の推定量と detrend |
-| [docs/npz-design.md](docs/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
-| [docs/input-adapters.md](docs/input-adapters.md) | リーダの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
-| [docs/reader-analysisset.md](docs/reader-analysisset.md) | リーダから AnalysisSet を書く |
-| [docs/remote.md](docs/remote.md) | ssh プロトコルと peer |
-| [docs/abi-v3.md](docs/abi-v3.md) | プラグイン ABI v3 の寸法と契約 |
-| [docs/analyzers.md](docs/analyzers.md) | プラグインの書き方 |
-| [docs/stats-taxonomy.md](docs/stats-taxonomy.md) | どの統計が何の性質か |
+| [docs/features/analysis/flat-field-stats.md](docs/features/analysis/flat-field-stats.md) | σ_fpn・DSNU・PRNU の推定量と detrend |
+| [docs/features/adapters/npz-design.md](docs/features/adapters/npz-design.md) | **他人が作った** `.npz` をどう読むか (メンバの分類・軸候補) |
+| [docs/features/adapters/input-adapters.md](docs/features/adapters/input-adapters.md) | リーダの仕様。§4.11 は **viewer 自身が書く** npz 容器 |
+| [docs/features/adapters/reader-analysisset.md](docs/features/adapters/reader-analysisset.md) | リーダから AnalysisSet を書く |
+| [docs/features/remote/remote.md](docs/features/remote/remote.md) | ssh プロトコルと peer |
+| [docs/reference/abi-v3.md](docs/reference/abi-v3.md) | プラグイン ABI v3 の寸法と契約 |
+| [docs/reference/analyzers.md](docs/reference/analyzers.md) | プラグインの書き方 |
+| [docs/features/analysis/stats-taxonomy.md](docs/features/analysis/stats-taxonomy.md) | どの統計が何の性質か |
 | [docs/tasks.csv](docs/tasks.csv) | 課題表 (対応済み / 進行中 / 残課題 / 暫定 / 要レビュー) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | データモデル・フレームループ・不変条件 |
 
