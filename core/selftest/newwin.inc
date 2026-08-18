@@ -386,6 +386,21 @@
                 check(displayGammaBits(app.dispGamma) == displayGammaBits(customGamma),
                       "N12 Custom gamma survives prefs.txt bit-for-bit");
 
+                // The reverse direction is part of the UI contract too: a
+                // Custom value can be replaced by either preset, and the
+                // persisted value must come back as that exact preset rather
+                // than reviving the old Custom value.
+                app.dispGamma = 1.0f;
+                savePrefs();
+                std::vector<uint8_t> presetBytes;
+                const bool readPreset = readFileBytes(pp, presetBytes);
+                const std::string presetFile(presetBytes.begin(), presetBytes.end());
+                app.dispGamma = customGamma;
+                reload();
+                check(readPreset && presetFile.find("\ngamma 1.0\n") != std::string::npos &&
+                      app.dispGamma == 1.0f && displayGammaPreset(app.dispGamma) == 0,
+                      "N12 Custom to linear preset is saved and reloads as the preset");
+
                 std::ofstream bad(pathFromUtf8(pp), std::ios::binary);
                 bad << "viewer-prefs 1\ngamma -2\n";
                 bad.close();

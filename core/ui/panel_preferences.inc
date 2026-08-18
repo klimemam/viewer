@@ -115,6 +115,7 @@ static void prefWidget(const PrefRow& r) {
                 snprintf(custom, sizeof custom, "%s", displayGammaText(app.dispGamma).c_str());
                 sourceBits = bits;
             }
+            ImGui::SameLine();
             ImGui::TextUnformatted("Custom:");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
