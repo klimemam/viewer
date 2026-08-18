@@ -193,6 +193,35 @@ inline std::string zip64Bad(const std::string& member, const std::string& why) {
     return "corrupt zip64 record for member \"" + member + "\": " + why;
 }
 
+// ...and the same sentence for the records that belong to the CONTAINER rather
+// than to any one member (#180 codex supplement). The end record, its zip64
+// locator and the central directory's own offset are read before a name exists,
+// so "which member" has no answer - but "which record" does, and a person
+// holding a file another program wrote needs that word to know who to ask.
+inline std::string zipBad(const std::string& why) {
+    return "corrupt zip container: " + why;
+}
+
+// ---- THE ONE BOUNDS RULE, and every read in this file goes through it -------
+//
+// #180 codex supplement. A zip64 record states its offsets as 64-bit numbers
+// that a file - or an attacker - may set to anything, and the walk asked
+// "does offset + needed fit?". Near UINT64_MAX that sum WRAPS: `z64 + 56 <=
+// buf.size()` is true for z64 = 2^64 - 8, and the rd32() that follows reads at
+// 2^64 - 8. The peer runs this on a file a client merely NAMED, so the wrap is
+// an out-of-bounds read on the machine that holds the data, and a peer that
+// reads out of bounds does not send a refusal - it dies, and takes the session.
+//
+// So no bound in this file is ever written as a sum. `off <= size` first, then
+// `needed <= size - off`: both operands of every comparison are values that
+// already exist, the subtraction cannot wrap because the first test established
+// off <= size, and the rule reads the same at every call site. Everything is
+// done in uint64_t and only converted to size_t AFTER it has been bounded, so a
+// 32-bit build cannot truncate an offset into range either.
+inline bool zipFits(uint64_t off, uint64_t needed, uint64_t size) {
+    return off <= size && needed <= size - off;
+}
+
 // Minimal zip reader for npz: central-directory walk, stored (0) and deflate
 // (8), with zip64 sizes. Inflate comes from miniz.
 inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::string& err) {
@@ -207,6 +236,7 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
         return v;
     };
     if (buf.size() < 22) { err = "not a zip file"; return false; }
+    const uint64_t bsz = (uint64_t)buf.size();
     size_t eocd = SIZE_MAX;
     size_t start = buf.size() > 65557 ? buf.size() - 65557 : 0;
     for (size_t i = buf.size() - 22 + 1; i-- > start;)
@@ -214,25 +244,51 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
     if (eocd == SIZE_MAX) { err = "not a zip file (no end record)"; return false; }
     uint64_t count = rd16(eocd + 10);
     uint64_t cdOff = rd32(eocd + 16);
+    // 0xffffffff in the end record is not a number: it is the file SAYING "the
+    // real one is in the zip64 record". So a file that says it and then does
+    // not hold a zip64 record that fits is refused HERE, by that name - the old
+    // code fell through with cdOff still 0xffffffff and produced "zip contains
+    // no entries", which is a sentence about the wrong thing.
+    //
+    // A count of 0xffff alone is NOT that claim (a plain zip may legitimately
+    // hold exactly 65535 members), so it still only opts into the lookup.
     if (cdOff == 0xffffffffu || count == 0xffffu) {          // zip64
+        bool got64 = false;
         if (eocd >= 20 && rd32(eocd - 20) == 0x07064b50) {
-            uint64_t z64 = rd64(eocd - 20 + 8);
-            if (z64 + 56 <= buf.size() && rd32((size_t)z64) == 0x06064b50) {
+            const uint64_t z64 = rd64(eocd - 20 + 8);
+            // 56 = the fixed part of the zip64 end record, up to and including
+            // the central-directory offset at +48. SUBTRACTION: z64 is a number
+            // out of the file and `z64 + 56` wraps for anything near UINT64_MAX.
+            if (zipFits(z64, 56, bsz) && rd32((size_t)z64) == 0x06064b50) {
                 count = rd64((size_t)z64 + 32);
                 cdOff = rd64((size_t)z64 + 48);
+                got64 = true;
             }
         }
+        if (!got64 && cdOff == 0xffffffffu) {
+            err = zipBad("its end record defers to a zip64 end record that is not "
+                         "there, or that starts past the end of the file");
+            return false;
+        }
     }
-    size_t p = (size_t)cdOff;
-    for (uint64_t i = 0; i < count && p + 46 <= buf.size(); i++) {
-        if (rd32(p) != 0x02014b50) break;
+    // ...and the central directory's own offset, which after the block above may
+    // be any 64-bit number the file chose. Refused by name rather than left to
+    // wrap into range inside the loop condition.
+    if (count && !zipFits(cdOff, 46, bsz)) {
+        err = zipBad("its central directory starts past the end of the file");
+        return false;
+    }
+    uint64_t p = cdOff;
+    for (uint64_t i = 0; i < count && zipFits(p, 46, bsz); i++) {
+        if (rd32((size_t)p) != 0x02014b50) break;
         Entry e{};
-        e.method = rd16(p + 10);
-        e.csize = rd32(p + 20);
-        e.usize = rd32(p + 24);
-        uint16_t nlen = rd16(p + 28), elen = rd16(p + 30), clen = rd16(p + 32);
-        e.localOff = rd32(p + 42);
-        if (p + 46 + nlen > buf.size()) break;
+        e.method = rd16((size_t)p + 10);
+        e.csize = rd32((size_t)p + 20);
+        e.usize = rd32((size_t)p + 24);
+        uint16_t nlen = rd16((size_t)p + 28), elen = rd16((size_t)p + 30),
+                 clen = rd16((size_t)p + 32);
+        e.localOff = rd32((size_t)p + 42);
+        if (!zipFits(p + 46, nlen, bsz)) break;   // p + 46 <= sz: the loop said so
         // data() + off again: a central-directory header that ends exactly at
         // the last byte with a zero-length name satisfies both bounds above and
         // then subscripts one past the end.
@@ -253,7 +309,7 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
             // (`buf.size()`, which is the truth). They are different questions
             // - a record can promise more than the file contains - and the
             // arithmetic is done by SUBTRACTION so that no sum can wrap.
-            const size_t ep0 = p + 46 + nlen;                 // <= buf.size(), above
+            const size_t ep0 = (size_t)(p + 46) + nlen;                 // <= buf.size(), above
             if ((size_t)elen > buf.size() - ep0) {
                 err = zip64Bad(e.name, "its extra field runs past the end of the file");
                 return false;
@@ -312,11 +368,28 @@ inline bool list(const std::vector<uint8_t>& buf, std::vector<Entry>& out, std::
 // without the extraction (it copies the compressed run out to a cache file).
 inline bool dataStart(const std::vector<uint8_t>& zip, const Entry& e, size_t& at,
                       std::string& err) {
-    if (e.localOff + 30 > zip.size()) { err = "corrupt local header"; return false; }
+    // localOff and csize come out of the zip64 extra field, so both are numbers
+    // the FILE chose and either may be near UINT64_MAX. `localOff + 30` and
+    // `at + csize` both wrapped there and let a read through at an offset the
+    // buffer never held (#180 codex supplement) - so every bound here is
+    // zipFits, and the member is NAMED, because a person holding a container of
+    // forty arrays needs to know which one their writer got wrong.
+    const uint64_t zsz = (uint64_t)zip.size();
+    if (!zipFits(e.localOff, 30, zsz)) {
+        err = "corrupt local header for member \"" + e.name +
+              "\": it starts past the end of the file";
+        return false;
+    }
     auto rd16 = [&](size_t o) { return (uint16_t)(zip[o] | zip[o + 1] << 8); };
-    size_t nlen = rd16((size_t)e.localOff + 26), elen = rd16((size_t)e.localOff + 28);
-    at = (size_t)e.localOff + 30 + nlen + elen;
-    if (at + e.csize > zip.size()) { err = "truncated zip member"; return false; }
+    const uint64_t nlen = rd16((size_t)e.localOff + 26), elen = rd16((size_t)e.localOff + 28);
+    // 30 fits (above) and nlen/elen are 16-bit, so this sum is formed in 64 bits
+    // out of numbers that cannot carry it past UINT64_MAX.
+    const uint64_t start = e.localOff + 30 + nlen + elen;
+    if (!zipFits(start, e.csize, zsz)) {
+        err = "truncated zip member \"" + e.name + "\"";
+        return false;
+    }
+    at = (size_t)start;
     return true;
 }
 
@@ -329,6 +402,18 @@ inline bool extract(const std::vector<uint8_t>& zip, const Entry& e,
         return true;
     }
     if (e.method != 8) { err = "unsupported zip compression method"; return false; }
+    // ...and the DECLARED uncompressed size is a 64-bit number out of the same
+    // zip64 record, so it is bounded before it becomes an allocation. Deflate
+    // cannot expand by more than 1032:1, so anything above that is a claim the
+    // compressed run could not possibly redeem - refused as a fact about the
+    // member instead of thrown as a bad_alloc from the middle of a walk.
+    // (csize was bounded against the buffer by dataStart above, so the product
+    // below is formed out of a number smaller than the file and cannot wrap.)
+    if (e.usize > e.csize * 1032 + 1024) {
+        err = "corrupt zip member \"" + e.name +
+              "\": it declares more uncompressed bytes than its compressed run can hold";
+        return false;
+    }
     // zip members are RAW deflate (no zlib header), and the uncompressed size is
     // known from the directory, so decompress straight into the output buffer
     out.resize((size_t)e.usize);
