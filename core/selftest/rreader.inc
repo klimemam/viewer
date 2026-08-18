@@ -1465,6 +1465,158 @@
             closeAll();
         }
 
+        {   // ---- R20: an unusable entry is TAKEN first, then judged -----------
+            //
+            // #180 codex review of #224. #218's fix made publishing atomic, but
+            // the removal of an entry judged unusable was still a check-then-act
+            // across two system calls. Process A reads the entry, finds it
+            // rubbish, and stalls; process B makes the same judgement, removes
+            // it, runs the reader and PUBLISHES; A then removes what is at that
+            // path - which is now B's whole, valid result. B's session had
+            // already been handed that key. R17 starts from an EMPTY cache and
+            // cannot see this: there is no invalid entry for anyone to judge.
+            //
+            // Both contenders are real viewer-serve processes, started from an
+            // INVALID existing entry, and the ordering is a handshake rather
+            // than a hope: VIEWER_SERVE_CACHE_JUDGE_HOLD stops A exactly in the
+            // window and this test closes it deliberately, so the race is
+            // reproduced every run on every machine rather than when the
+            // scheduler happens to cooperate.
+            //
+            // The reader takes an O_EXCL lock and the SECOND caller raises. That
+            // is what makes the assertion sharp: if A deletes B's result it
+            // cannot replace it, so the cache ends up EMPTY and the key B
+            // answered with names nothing.
+            closeAll();
+            const std::string rdOnce = root + "/once.py";
+            writeText(rdOnce,
+                      "import numpy as np, os\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    lock = path + '.once'\n"
+                      "    try:\n"
+                      "        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))\n"
+                      "    except FileExistsError:\n"
+                      "        raise ValueError('once-2: this reader had already run')\n"
+                      "    a = np.load(path)\n"
+                      "    return Stack(np.ascontiguousarray(\n"
+                      "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='once')\n");
+            std::string onceText[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdOnce, onceText[0]), "R20a (setup) the run-once reader is readable");
+            const std::string lock = origin + ".once";
+            const std::string hold = root + "/judge.hold";
+            std::filesystem::remove(pathFromUtf8(hold), ec);
+            std::filesystem::remove(pathFromUtf8(hold + ".at"), ec);
+
+            // ---- the setup: learn the key, then put rubbish under it ----------
+            std::string onceKey;
+            {
+                std::filesystem::remove(pathFromUtf8(lock), ec);
+                setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
+                remote::Session s;
+                if (!openSession(s, true)) return 1;
+                remote::ReaderRun r;
+                std::string e;
+                const bool sent = s.readerRun(origin, "load", onceText, r, e);
+                if (sent && r.outcome == rp::RO_OK) onceKey = r.key;
+                s.stop();
+            }
+            const std::string oncePath = cacheDir + "/" + onceKey + ".vstream";
+            check(!onceKey.empty() &&
+                      std::filesystem::exists(pathFromUtf8(oncePath), ec),
+                  "R20b (setup) one run publishes under a key this test can now name");
+            // ...rubbish, and the lock released so that exactly ONE more run can
+            // succeed. Whoever gets it is the winner; the other must not be able
+            // to replace what the winner published.
+            writeText(oncePath, "this is not a viewer stream at all");
+            std::filesystem::remove(pathFromUtf8(lock), ec);
+
+            struct Side { bool sent = false; int outcome = -1; std::string key, text; };
+            Side A, B;
+            // A is held IN the window; B is not.
+            setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", hold);
+            remote::Session sa;
+            if (!openSession(sa, true)) return 1;
+            setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
+            remote::Session sb;
+            if (!openSession(sb, true)) return 1;
+
+            std::thread ta([&] {
+                remote::ReaderRun r;
+                std::string e;
+                A.sent = sa.readerRun(origin, "load", onceText, r, e);
+                if (A.sent) { A.outcome = (int)r.outcome; A.key = r.key; A.text = r.stderrText; }
+            });
+            // A has read the entry, called it rubbish, and is now standing in
+            // the window. That is not a guess: the peer says so by writing this
+            // file, so what follows really is "another process publishes while
+            // the first still believes there is nothing here".
+            bool held = false;
+            for (int i = 0; i < 1500 && !held; i++) {
+                held = std::filesystem::exists(pathFromUtf8(hold + ".at"), ec);
+                if (!held) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            check(held, "R20c the first peer judged the entry unusable and is in the window");
+            {
+                remote::ReaderRun r;
+                std::string e;
+                B.sent = sb.readerRun(origin, "load", onceText, r, e);
+                if (B.sent) { B.outcome = (int)r.outcome; B.key = r.key; B.text = r.stderrText; }
+            }
+            check(B.sent && B.outcome == (int)rp::RO_OK && B.key == onceKey &&
+                      !has(B.text, "read from cache"),
+                  "R20d the other peer removes the rubbish, runs the reader and PUBLISHES");
+            // ...and now A acts on a judgement that is no longer true.
+            writeText(hold, "go\n");
+            ta.join();
+            int vstreams = 0, parts = 0, bads = 0;
+            {
+                std::error_code de;
+                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), de)) {
+                    const std::string nm = d.path().filename().u8string();
+                    auto ends = [&](const std::string& s) {
+                        return nm.size() > s.size() &&
+                               nm.compare(nm.size() - s.size(), s.size(), s) == 0;
+                    };
+                    if (ends(".vstream")) vstreams++;
+                    else if (ends(".part")) parts++;
+                    else if (ends(".bad")) bads++;
+                }
+            }
+            fprintf(stderr, "rreaderselftest:   R20 A outcome=%d key=\"%s\" \"%s\" | "
+                            "B outcome=%d | cache %d vstream / %d part / %d bad\n",
+                    A.outcome, A.key.c_str(), A.text.c_str(), B.outcome, vstreams,
+                    parts, bads);
+            check(A.sent && A.outcome == (int)rp::RO_OK && A.key == onceKey,
+                  "R20e the held peer is answered on the same key, not with a failure");
+            check(A.sent && has(A.text, "read from cache"),
+                  "R20f ...out of what the other one published: it recovered rather "
+                  "than re-ran");
+            check(std::filesystem::exists(pathFromUtf8(oncePath), ec),
+                  "R20g and the published result is STILL THERE - the stale judgement "
+                  "did not remove another process's winner");
+            check(bads == 0 && parts == 0,
+                  "R20h nothing quarantined and nothing half-written is left behind");
+            {   // ...and it still answers, which is the whole point of R20g.
+                remote::Session s;
+                if (!openSession(s, true)) return 1;
+                remote::ReaderRun r;
+                std::string e;
+                const bool sent = s.readerRun(origin, "load", onceText, r, e);
+                check(sent && r.outcome == rp::RO_OK && r.key == onceKey &&
+                          has(r.stderrText, "read from cache"),
+                      "R20i a later ask is a HIT on it: the key the winner issued still "
+                      "names a whole result");
+                s.stop();
+            }
+            sa.stop();
+            sb.stop();
+            setEnv("VIEWER_SERVE_CACHE_JUDGE_HOLD", "");
+            std::filesystem::remove(pathFromUtf8(lock), ec);
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

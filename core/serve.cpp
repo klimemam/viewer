@@ -727,6 +727,60 @@ static bool readerTempPath(const std::string& key, std::string& out) {
     return cacheFileFor(key, leaf, out);
 }
 
+// ...and where an entry this process has decided is UNUSABLE goes while that
+// decision is acted on (#180 codex review).
+//
+// The publish path above made the winner safe; the REMOVAL path was still a
+// check-then-act. A process that read an existing cache entry, found it
+// unreadable, and then removed it, removed whatever was at that path AT THE
+// MOMENT OF THE REMOVE - which, in the window between the two, may be a
+// different file entirely: another process that made the same judgement, ran
+// the reader and published a perfectly good result. The good result vanished
+// and the session that had just been told "here is your key" found nothing
+// under it.
+//
+// A rename takes the file AWAY from the shared name in one step and gives it a
+// name only this process knows, so from then on the bytes are unambiguously
+// this process's to delete. It does not, on its own, prove they are the bytes
+// that were judged - so the judgement is made AGAIN on the quarantined file,
+// and an entry that turns out to be whole is put straight back. Ownership
+// first, verdict second: that ordering is the entire fix.
+static bool readerQuarantinePath(const std::string& key, std::string& out) {
+    static std::atomic<uint64_t> seq{ 0 };
+    char leaf[64];
+    snprintf(leaf, sizeof leaf, ".%lu.%llu.bad", servePid(),
+             (unsigned long long)(seq.fetch_add(1) + 1));
+    return cacheFileFor(key, leaf, out);
+}
+
+// VIEWER_SERVE_CACHE_JUDGE_HOLD: a seam that stops this process between judging
+// an existing cache entry unusable and acting on that judgement.
+//
+// The race it exists to test is a window of a few microseconds between two
+// processes on one disk. A selftest that started two peers and hoped would be a
+// test that passes because the machine was busy, so this is a HANDSHAKE rather
+// than a sleep: the peer writes `<path>.at` to say it has judged and is
+// waiting, and waits for `<path>` to appear before it goes on. The test then
+// knows exactly when the window is open and closes it deliberately. A minute,
+// and then it proceeds anyway - a seam may not be a way to hang a peer.
+//
+// Absent everywhere else, read once, exactly as VIEWER_SERVE_LAG_MS and
+// VIEWER_SERVE_PROTOCOL are.
+static void serveCacheJudgeHold() {
+    static const std::string path = [] {
+        const char* e = getenv("VIEWER_SERVE_CACHE_JUDGE_HOLD");
+        return std::string(e ? e : "");
+    }();
+    if (path.empty()) return;
+    { std::ofstream f(std::filesystem::u8path(path + ".at"), std::ios::binary);
+      f << "held\n"; }
+    std::error_code e;
+    for (int i = 0; i < 3000; i++) {
+        if (std::filesystem::exists(std::filesystem::u8path(path), e)) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
 // One node of a reader's output, laid out for readNpyRegion.
 //
 // This is openRaw's shape exactly and for openRaw's reason: the blob is C-order
@@ -3299,21 +3353,88 @@ static void handleReaderRun(Buf& in) {
         }
     } temp{ tmpPath };
 
+    // The cache answer, and the ONE sentence that says it (§5.3: the second run
+    // does not start Python; the key covers the reader's whole text and the
+    // origin's stat, so "cached" cannot mean "stale"). Written once because
+    // both the plain hit and the recovered-from-quarantine hit are the same
+    // promise being kept and must not read differently.
+    auto replyFromCache = [&](const std::string& header) {
+        reply(RO_OK, "",
+              "read from cache - the reader was not re-run.\n"
+              "Edit the reader and press Load again to re-run it.",
+              prov, key, header);
+    };
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string header;
         const std::string cerr = checkReaderOutput(cachePath, header);
         if (cerr.empty()) {
-            // §5.3: the second run does not start Python. The key covers the
-            // reader's whole text and the origin's stat, so "cached" cannot
-            // mean "stale" - and the sentence is the local one, because it is
-            // the same promise being kept.
-            reply(RO_OK, "",
-                  "read from cache - the reader was not re-run.\n"
-                  "Edit the reader and press Load again to re-run it.",
-                  prov, key, header);
+            replyFromCache(header);
             return;
         }
-        std::filesystem::remove(std::filesystem::u8path(cachePath), ec);  // earn it again
+        // UNUSABLE - and now the interesting part (#180 codex review). The old
+        // code removed `cachePath` here, which is a check-then-act across two
+        // system calls: another process that judged the same rubbish, removed
+        // it, ran the reader and PUBLISHED had its result deleted by this one,
+        // and the session it had just answered found nothing under its key.
+        //
+        // So: take the file away first (a rename to a name only this process
+        // knows - one step, and afterwards the bytes are unambiguously ours),
+        // and only then decide what they are.
+        serveCacheJudgeHold();
+        std::string badPath;
+        std::error_code qe;
+        if (!readerQuarantinePath(key, badPath)) {
+            sendErr("this peer has nowhere to keep what a reader produces "
+                    "(set VIEWER_SERVE_CACHE)");
+            return;
+        }
+        std::filesystem::rename(std::filesystem::u8path(cachePath),
+                                std::filesystem::u8path(badPath), qe);
+        if (qe) {
+            // Somebody else moved it while we were deciding, or this platform
+            // will not rename a file another process holds open. Either way
+            // this process never owned it and must not delete it. Ask the path
+            // again: whatever is there now is either a good answer (use it) or
+            // nothing (run).
+            std::string h2;
+            if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec) &&
+                checkReaderOutput(cachePath, h2).empty()) {
+                replyFromCache(h2);
+                return;
+            }
+        } else {
+            // OURS. Judge it again, because a rename proves ownership and not
+            // identity: in the window above another process may have published
+            // a whole, valid result under this key, and that is the file we
+            // have just taken. Put it back rather than delete it - it answers
+            // the key, and it was never ours to withdraw.
+            std::string h3;
+            if (checkReaderOutput(badPath, h3).empty()) {
+                std::error_code be;
+                std::filesystem::rename(std::filesystem::u8path(badPath),
+                                        std::filesystem::u8path(cachePath), be);
+                if (!be) {
+                    replyFromCache(h3);
+                    return;
+                }
+                // It would not go back, which on Windows means something else
+                // is already published under the key. Check THAT, and if it is
+                // good, answer on it; our copy is redundant either way.
+                std::string h4;
+                const bool other =
+                    std::filesystem::exists(std::filesystem::u8path(cachePath), ec) &&
+                    checkReaderOutput(cachePath, h4).empty();
+                std::filesystem::remove(std::filesystem::u8path(badPath), be);
+                if (other) {
+                    replyFromCache(h4);
+                    return;
+                }
+            } else {
+                // It really was rubbish, and it really was ours: earn it again.
+                std::error_code be;
+                std::filesystem::remove(std::filesystem::u8path(badPath), be);
+            }
+        }
     }
 
     // The three texts land in a directory of their own and leave with it. What
