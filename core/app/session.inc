@@ -1810,10 +1810,36 @@ static std::string remoteReaderPrepare(const std::string& url, const std::string
 static std::string remoteReaderLand(const std::string& url, const std::string& spec,
                                     const std::string& host, const remote::ReaderRun& run);
 
+// How many reader RUNS were started through this door. The point of issue #232
+// stage 1 is that a path stopped taking the synchronous door, and "it did not
+// happen" is only testable by counting the thing that replaced it: a headless
+// selftest cannot watch a window fail to freeze, but it can watch this move.
+static int g_readerStarts = 0;
+
 // Start a reader without waiting for it. The panel shows how long it has been
 // running, what it has printed so far, and a Stop.
-static void startReader(const std::string& src, const std::string& spec) {
-    if (app.rdJob) { toast("a reader is already running", true); return; }
+//
+// `blame` is what a failure is prefixed with; see App::ReaderJob::blame.
+static void startReader(const std::string& src, const std::string& spec,
+                        const std::string& blame = {}) {
+    if (app.rdJob) {
+        // Already running. The Reader panel's Load cannot get here (it is
+        // disabled while a job is up), so this is a LOOP over several paths -
+        // and a loop that opened five files before must still open five.
+        // Asking for what is already running or already waiting is folded in
+        // rather than queued twice: a double-click that landed twice, or the
+        // same file named twice in one multi-select, is one open. The identity
+        // is the PATH - a remote job keeps the url it was asked for in `url`
+        // and the peer's own path in `src`, and it is the url that was asked
+        // for. Which reader is not part of the question: only one is
+        // remembered per path, and the panel's Load is disabled meanwhile.
+        if ((app.rdJob->remote ? app.rdJob->url : app.rdJob->src) == src) return;
+        for (const auto& w : app.rdQueue) if (w.src == src) return;
+        app.rdQueue.push_back({ src, spec, blame });
+        toast(baseName(src) + ": waiting for the reader ahead of it");
+        return;
+    }
+    g_readerStarts++;
     if (isRemoteUrl(src)) {
         // A REMOTE run, and the thread opens a session of its OWN. Not
         // app.uiSession, for that session's two documented reasons: a 300 s
@@ -1827,10 +1853,11 @@ static void startReader(const std::string& src, const std::string& spec) {
         std::string rpath;
         std::string e = remoteReaderPrepare(src, spec, j->spec, j->host, rpath, j->port,
                                             j->files);
-        if (!e.empty()) { app.readerLastOut = e; toast(e, true); return; }
+        if (!e.empty()) { app.readerLastOut = e; toast(blame + e, true); return; }
         j->remote = true;
         j->src = rpath;
         j->url = src;
+        j->blame = blame;
         j->startedAt = nowSec();
         app.readerLastOut = "running " + baseName(readerFileOf(j->spec)) + " on " +
                             (j->host.empty() ? std::string("the local peer") : j->host) +
@@ -1859,19 +1886,31 @@ static void startReader(const std::string& src, const std::string& spec) {
         return;
     }
     app.rdJob.reset(new App::ReaderJob());
+    app.rdJob->blame = blame;
     std::string e = openWithReader(src, spec, true, app.rdJob.get());
     // A cache hit, or a failure before Python was reached, finishes with no
     // thread: there is nothing to wait for and nothing to stop.
     if (!app.rdJob->th.joinable()) {
         app.rdJob.reset();
-        if (!e.empty()) toast(e, true);
+        if (!e.empty()) toast(blame + e, true);
     }
+}
+
+// The queue in front of the one door. Taken one per frame, from pollReader, so
+// that a drop of ten files runs ten readers in a row with the window answering
+// between them - and never recursively out of startReader, whose stack would
+// then be as deep as the drop was wide.
+static void startNextQueuedReader() {
+    if (app.rdJob || app.rdQueue.empty()) return;
+    const App::ReaderWait w = app.rdQueue.front();
+    app.rdQueue.erase(app.rdQueue.begin());
+    startReader(w.src, w.spec, w.blame);
 }
 
 // Called once per frame. Until the child exits this only refreshes what it has
 // printed; the loading itself happens here, on the UI thread, when it is done.
 static void pollReader() {
-    if (!app.rdJob) return;
+    if (!app.rdJob) { startNextQueuedReader(); return; }
     App::ReaderJob* j = app.rdJob.get();
     if (j->remote) {
         // No tail: a RUN is ONE round trip, so the harness's stderr arrives
@@ -1882,6 +1921,7 @@ static void pollReader() {
         const std::string url = j->url, spec = j->spec, host = j->host;
         const bool rok = j->rok;
         const std::string rerr = j->rerr;
+        const std::string blame = j->blame;
         const remote::ReaderRun run = j->rrun;
         app.rdJob.reset();
         // The landing is on THIS thread and through app.uiSession, because it
@@ -1889,7 +1929,7 @@ static void pollReader() {
         // between its worker and readerFinish.
         std::string e = rok ? remoteReaderLand(url, spec, host, run) : rerr;
         if (!rok) app.readerLastOut = rerr;
-        if (!e.empty()) toast(e, true);
+        if (!e.empty()) toast(blame + e, true);
         return;
     }
     if (!j->done.load()) {
@@ -1908,10 +1948,25 @@ static void pollReader() {
     jStat.mtime = j->srcMtime;
     jStat.fsize = j->srcFsize;
     std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r, jStat);
+    const std::string blame = j->blame;
     std::error_code ec;
     std::filesystem::remove(pathFromUtf8(j->errFile), ec);
     app.rdJob.reset();
-    if (!e.empty()) toast(e, true);
+    if (!e.empty()) toast(blame + e, true);
+}
+
+// Drive a started reader to the end on THIS thread. The frame loop is the only
+// other caller of pollReader, and a run with no frame loop - a selftest, or the
+// command line before the window exists - would otherwise leave the job hanging
+// and the file unopened. The waiting is the ONLY thing this puts back: the job,
+// the cancel flag and readerFinish are the same ones the window drives, so a
+// test that calls this is testing the path the user takes.
+static void waitForReader() {
+    while (app.rdJob || !app.rdQueue.empty()) {
+        pollReader();
+        if (app.rdJob && !app.rdJob->done.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 // §4.13: only an explicitly chosen adapter runs, and the first time a given one

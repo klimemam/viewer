@@ -1996,6 +1996,7 @@ static bool g_watchSuppressed = false;
         bool busy = app.seqRunning || !app.seqQueue.empty() || app.rfPending > 0 ||
                     rbAnyBusy() || app.mPending > 0 ||
                     app.rdJob != nullptr ||          // a reader is running
+                    !app.rdQueue.empty() ||          // ...or is the next one waiting
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
@@ -2097,6 +2098,10 @@ static bool g_watchSuppressed = false;
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
                 working |= app.anyFileDialog();   // pollFileDialog lives in the frame
                 working |= app.rdJob != nullptr;  // and so does pollReader
+                // ...including the queue behind it: pollReader takes the next
+                // one, so a frame that is never drawn is a drop of five files
+                // that opens one and stops.
+                working |= !app.rdQueue.empty();
                 working |= app.seriesEdit.open;   // the create/edit modal wants a frame
                 working |= !app.rbOpenQueue.empty() || !app.seqQueue.empty();
                 working |= !app.seqRestore.empty();

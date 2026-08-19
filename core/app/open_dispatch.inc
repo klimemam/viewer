@@ -3220,12 +3220,27 @@ static void openPath(const std::string& path) {
     // extension is consulted at all - that is the point of remembering, and it
     // is what lets a .dat or a folder open at all. It is a RECORD OF A CHOICE,
     // never a discovery: nothing puts an entry here except the user picking one.
+    //
+    // STARTED, not waited for (issue #232). This is the ordinary open - the
+    // command line, a double-click, every open after the first - and it used to
+    // run Python here, on the UI thread, for as long as the user's data took.
+    // Measured: 1.65 s of a window answering nothing on a 768 MB file, the worst
+    // of every open path in this tool, and up to the five-minute timeout in
+    // principle. There is no second machinery for this: startReader is the door
+    // the Reader panel's Load has used since #180, and it brings its running
+    // timer, its Stop and its live output along - all of which this path had
+    // none of, because nothing can be drawn by a thread that is inside Python.
+    //
+    // The failure still arrives; it arrives from pollReader instead of from
+    // here, wearing the same sentence (App::ReaderJob::blame). Nothing FALLS
+    // THROUGH to the extension table on a failure, which is what the
+    // synchronous form did too: a file the user chose a reader for is that
+    // reader's to refuse, and guessing again from the extension afterwards
+    // would open something they did not ask for.
     {
         std::string spec = readerFor(path);
         if (!spec.empty()) {
-            std::string err = openWithReader(path, spec);
-            if (err.empty()) return;
-            toast(baseName(path) + " via " + spec + ": " + err, true);
+            startReader(path, spec, baseName(path) + " via " + spec + ": ");
             return;
         }
     }
