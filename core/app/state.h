@@ -2207,6 +2207,13 @@ struct App {
         size_t shown = 0;                  // how much of the live output is on screen
         int64_t srcMtime = 0;              // the origin's stat, taken BEFORE the
         uint64_t srcFsize = 0;             // reader ran (identity before bytes)
+        // What to put in FRONT of a failure, if anything (issue #232). The
+        // Reader panel's Load needs none: the file and the reader are both on
+        // screen above the button that was pressed. A MEMO REPLAY does - the
+        // user opened a file and a reader they chose weeks ago ran because of
+        // it, so "x.dat via r.py:load: ..." is the sentence, and it must not
+        // change just because the wait moved off the UI thread.
+        std::string blame;
         // ---- the reader ran on a PEER (issue #180) --------------------------
         // The same job, with the process on the other machine. The thread owns
         // a SESSION OF ITS OWN rather than borrowing app.uiSession, for that
@@ -2220,8 +2227,29 @@ struct App {
         remote::ReaderRun rrun;            // what came back
         bool rok = false;                  // ...or the link failed, and why
         std::string rerr;
+        // Quitting with a reader still going. A joinable std::thread that is
+        // DESTROYED is std::terminate, and this object is owned by the global
+        // App, so "close the window while Python is running" would abort on the
+        // way out - reported as a crash, and a crash at exit is the kind nobody
+        // can reproduce on purpose. Ask it to stop and wait: adapter::run polls
+        // the flag every 25 ms and kills the child, and remote::Session takes
+        // the same flag as its abort, so this is a short wait and not the
+        // five-minute timeout. Here rather than at the exit paths because there
+        // are many of them - every selftest returns from main on its own.
+        ~ReaderJob() {
+            cancel.store(true);
+            if (th.joinable()) th.join();
+        }
     };
     std::unique_ptr<ReaderJob> rdJob;
+    // Opening SEVERAL files at once - a drop of five, or a multi-select in File
+    // > Open - calls openPath in a LOOP, and one reader runs at a time. The
+    // rest wait here rather than being refused, which is what the loop got
+    // when the run was synchronous. Exactly npzPickQueue's shape and its
+    // reason (issue #232): the second request must not be lost, and it must
+    // not silently displace the first.
+    struct ReaderWait { std::string src, spec, blame; };
+    std::vector<ReaderWait> rdQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
                folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;

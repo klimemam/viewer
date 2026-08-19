@@ -2799,9 +2799,19 @@ static void drawReaderPanel() {
         double el = nowSec() - app.rdJob->startedAt;
         const char* spin = "|/-\\";
         ImGui::Text("%c  running  %.1f s", spin[(int)(nowSec() * 8) & 3], el);
+        if (!app.rdQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d file%s)", (int)app.rdQueue.size(),
+                                app.rdQueue.size() == 1 ? "" : "s");
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Stop")) {
             app.rdJob->cancel.store(true);
+            // Stop means stop. Starting the next file of a drop the instant
+            // this one is cancelled would look exactly like the button not
+            // working, so the queue goes with it - the same rule the sequence
+            // loader's Stop follows with app.seqQueue.
+            app.rdQueue.clear();
             toast("stopping the reader...");
         }
     } else {

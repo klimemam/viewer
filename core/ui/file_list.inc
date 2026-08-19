@@ -273,6 +273,28 @@ static void drawFileList() {
         ImGui::SameLine();
         if (ImGui::SmallButton("Stop##rq")) app.rbOpenQueue.clear();
     }
+    // A reader is running (issue #232). The Reader panel says this too, in more
+    // detail and with what the reader has printed so far - but a MEMO REPLAY
+    // opens no panel and produces no document until it is done, so without a
+    // line here the ordinary case (a double-click, the command line) would spend
+    // its whole run showing nothing at all. This list is the one place always on
+    // screen, and it already carries the other two waits for the same reason.
+    if (app.rdJob) {
+        ImGui::TextDisabled("reader: %s  %.1f s",
+                            baseName(readerFileOf(app.rdJob->spec)).c_str(),
+                            nowSec() - app.rdJob->startedAt);
+        if (!app.rdQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d file%s)", (int)app.rdQueue.size(),
+                                app.rdQueue.size() == 1 ? "" : "s");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##rd")) {
+            app.rdJob->cancel.store(true);
+            app.rdQueue.clear();     // Stop means stop - see the panel's Stop
+            toast("stopping the reader...");
+        }
+    }
     if (!app.seqNote.empty()) {          // why the stack is short, kept in view
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
         ImGui::PushTextWrapPos(0.0f);

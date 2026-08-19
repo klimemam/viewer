@@ -2496,6 +2496,137 @@
                               "V25n the same reader, registered, is found and read");
                         app.readerPlaces = ps;
                     }
+
+                    // ---- V25t: the memo replay does not WAIT for Python ------
+                    // Issue #232. Opening a file the user once chose a reader
+                    // for is the ordinary open - the command line, a
+                    // double-click, every open after the first - and that door
+                    // ran Python on the UI THREAD. Measured on this repo: 1.65 s
+                    // of a window answering nothing, the worst of every open
+                    // path there is. The Reader panel's Load has had a job, a
+                    // running timer and a Stop since #180; the memo replay was
+                    // the other door, and stage 1 is that there is now one.
+                    //
+                    // A headless selftest cannot watch a window fail to freeze.
+                    // It CAN watch which door was taken. startReader is the only
+                    // thing that makes a ReaderJob, so g_readerStarts moving
+                    // means "went through the asynchronous door", and a job
+                    // still alive on the line after openPath means "returned
+                    // before the reader finished". Both are 0 and null on the
+                    // synchronous version - this case is red before the change
+                    // and is the only thing that holds the door shut after it.
+                    {
+                        // A key that has never been used, so this is a real run:
+                        // a cache hit finishes with no thread at all and would
+                        // prove nothing about waiting. The key covers the
+                        // reader's mtime, which is the handle V25l uses too.
+                        writeReader("1");
+                        auto asyncAt = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                        std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                         asyncAt + std::chrono::seconds(23), tec);
+                        closeAll();
+                        rememberReader(srcPath, spec);   // the record of the earlier choice
+                        const int starts0 = g_readerStarts, runs0 = g_adapterRuns;
+                        openPath(srcPath);
+                        // Nothing has been read yet and that is the POINT:
+                        // readerFinish runs on this thread and nothing has
+                        // polled it, so an empty app.images here is the proof
+                        // that openPath returned instead of blocking.
+                        const bool async = g_readerStarts - starts0 == 1 &&
+                                           app.rdJob != nullptr && app.images.empty();
+                        fprintf(stderr, "verifyselftest: V25t after openPath: starts+%d "
+                                        "job=%d %zu doc(s)\n",
+                                g_readerStarts - starts0, (int)(app.rdJob != nullptr),
+                                app.images.size());
+                        check(async, "V25t a memo replay STARTS the reader and returns: "
+                                     "the wait is off the UI thread");
+                        // ...and the same job, driven to the end the way the
+                        // frame loop drives it, opens what it always opened.
+                        waitForReader();
+                        fprintf(stderr, "verifyselftest: V25t landed: runs+%d %zu doc(s) "
+                                        "ok=%d\n", g_adapterRuns - runs0, app.images.size(),
+                                (int)app.readerLastOk);
+                        check(g_adapterRuns - runs0 == 1 && app.readerLastOk &&
+                                  app.images.size() == 6 && app.series.size() == 1,
+                              "V25t ...and finishing it opens what the reader declared");
+                    }
+
+                    // ---- V25u: a memo replay that fails says the same thing --
+                    // The sentence is "<file> via <reader>: <why>", and it has
+                    // to STAY that sentence. The panel's Load needs no such
+                    // preamble - its file and its spec are on screen above the
+                    // button that was pressed - but a memo replay is a user who
+                    // opened a FILE and got a traceback out of a reader they
+                    // chose weeks ago, and the two names are what connect the
+                    // two. Moving the wait off the UI thread moved this toast
+                    // into pollReader, so it is asserted rather than assumed.
+                    {
+                        {
+                            std::ofstream pf(pathFromUtf8(pyPath), std::ios::binary);
+                            pf << "def load(path):\n"
+                               << "    raise ValueError('V25u refuses on purpose')\n";
+                        }
+                        auto badAt = std::filesystem::last_write_time(pathFromUtf8(pyPath), tec);
+                        std::filesystem::last_write_time(pathFromUtf8(pyPath),
+                                                         badAt + std::chrono::seconds(37), tec);
+                        closeAll();
+                        app.toast.clear();
+                        app.toastErr = false;
+                        openPath(srcPath);           // the memo from V25t is still there
+                        waitForReader();
+                        const bool named = app.toastErr &&
+                            app.toast.find(baseName(srcPath) + " via ") != std::string::npos &&
+                            app.toast.find("vfy_reader.py") != std::string::npos &&
+                            app.toast.find("V25u refuses on purpose") != std::string::npos;
+                        fprintf(stderr, "verifyselftest: V25u toast: \"%s\"\n",
+                                app.toast.substr(0, 160).c_str());
+                        check(named, "V25u a memo replay that fails still names the file, "
+                                     "the reader it went through, and why");
+                        check(app.images.empty(),
+                              "V25u ...and nothing landed: a refusal is not a partial open");
+                        forgetReader(srcPath);
+                        writeReader("1");            // leave the fixture readable
+                    }
+
+                    // ---- V25v: opening SEVERAL still opens several -----------
+                    // A drop of five files, or a multi-select in File > Open,
+                    // calls openPath in a loop, and one reader runs at a time.
+                    // The synchronous form got this right by accident - it
+                    // simply finished each one before the loop went round. The
+                    // asynchronous one has to say what happens instead, and
+                    // "refused, a reader is already running" would turn a
+                    // working multi-open into one file and four toasts. They
+                    // WAIT, and the same path asked for twice is one open.
+                    {
+                        const std::string second = (adir / "sweep_src2.npz").u8string();
+                        std::filesystem::copy_file(
+                            pathFromUtf8(srcPath), pathFromUtf8(second),
+                            std::filesystem::copy_options::overwrite_existing, tec);
+                        closeAll();
+                        rememberReader(srcPath, spec);
+                        rememberReader(second, spec);
+                        const int starts0 = g_readerStarts;
+                        openPath(srcPath);
+                        openPath(second);
+                        openPath(srcPath);      // asked for twice: still one open
+                        const bool queued = app.rdJob != nullptr &&
+                                            app.rdQueue.size() == 1 &&
+                                            g_readerStarts - starts0 == 1;
+                        fprintf(stderr, "verifyselftest: V25v three opens -> starts+%d "
+                                        "job=%d queued=%zu\n", g_readerStarts - starts0,
+                                (int)(app.rdJob != nullptr), app.rdQueue.size());
+                        check(queued, "V25v a second file WAITS behind the first, and the "
+                                      "same file asked for twice is one open");
+                        waitForReader();
+                        fprintf(stderr, "verifyselftest: V25v drained: starts+%d %zu doc(s) "
+                                        "%zu series\n", g_readerStarts - starts0,
+                                app.images.size(), app.series.size());
+                        check(g_readerStarts - starts0 == 2 && app.images.size() == 12 &&
+                                  app.series.size() == 2,
+                              "V25v ...and draining the queue opens BOTH of them");
+                        forgetReader(srcPath);
+                        forgetReader(second);
+                    }
                 }
             }
 
