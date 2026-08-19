@@ -97,7 +97,7 @@ set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 # ...and .exr is where that same reasoning comes out the OTHER way, which is why
 # both blocks are here to be read together.
 #
-# docs/media-support.md §1 studied this and recommended tinyexr; the user
+# docs/features/media/media-support.md §1 studied this and recommended tinyexr; the user
 # overruled that and chose the official library. That decision stands and the
 # reason is the compression: a real .exr off a renderer is PIZ or DWA, and a
 # hand-rolled reader that did "NONE and ZIP" would produce a stream of files
@@ -107,7 +107,7 @@ set(stb_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 #
 # So this is BY FAR the heaviest dependency in the tree, and the only one that
 # is neither a single file nor a header. Its measured cost is recorded in
-# docs/media-support.md §1 rather than left for someone to rediscover.
+# docs/features/media/media-support.md §1 rather than left for someone to rediscover.
 #
 # Order of resolution, and why:
 #   1. find_package(OpenEXR) - a distro/vcpkg/brew OpenEXR is used as-is. A
@@ -145,7 +145,7 @@ if(OpenEXR_FOUND)
   message(STATUS "OpenEXR ${OpenEXR_VERSION}: using the installed copy (no download)")
 else()
   message(STATUS "OpenEXR: not installed - fetching v3.4.13 + Imath v3.2.2 "
-                 "(docs/media-support.md §1 carries the measured cost; "
+                 "(docs/features/media/media-support.md §1 carries the measured cost; "
                  "FETCHCONTENT_SOURCE_DIR_* points this at a local tree)")
   # Static, no install rules, no tools/examples/tests: we want the reader and
   # nothing else. BUILD_TESTING is CTest's own switch and this repo turns
@@ -429,7 +429,7 @@ else()
   set(VIEWER_STRICT -Werror=format -Werror=format-security)
 endif()
 
-# core/browse/*.cpp: Browse as real TUs since P7 (docs/split-plan.md §5 - the
+# core/browse/*.cpp: Browse as real TUs since P7 (docs/background/project/split-plan.md §5 - the
 # two files the plan budgets; instances.inc is #included by nav.cpp). The .inc
 # fragments and headers stay off this list on purpose: the compiler depfile
 # tracks them, so touching state.h or a fragment rebuilds exactly the TUs that
@@ -538,7 +538,7 @@ target_compile_definitions(viewer PRIVATE VIEWER_REPO_URL="${VIEWER_REPO_URL}")
 target_include_directories(viewer PRIVATE ${pfd_SOURCE_DIR} ${miniz_SOURCE_DIR} ${stb_SOURCE_DIR})
 # Both binaries read .exr now. This used to say that viewer-serve deliberately
 # did not link it - "the remote peer serves .npy only" - which was plan (a) of
-# docs/media-support.md §1: local-only until the loaders moved to a shared TU.
+# docs/features/media/media-support.md §1: local-only until the loaders moved to a shared TU.
 # They have, and issue #148's judgment B is that the peer reads what the viewer
 # reads, so the line that used to be held here is now held by the format table
 # itself (core/imagefile.h) and by ONE column of it for the one format whose
@@ -599,7 +599,7 @@ endif()
 # analyzer plugins the local host runs (plugin_host is verified GL-free).
 # ...and version.cpp, since MOP_SET_FOLD's provenance trailer is the PEER's own
 # build: a set analyzer is a built-in, so "which build computed this" is the
-# viewer version and there is no dll to name instead (#46, docs/abi-v3.md §11).
+# viewer version and there is no dll to name instead (#46, docs/reference/abi-v3.md §11).
 #
 # ...and, since issue #148's judgment B, the SAME readers the viewer has: the
 # peer decodes what this viewer decodes, so that one folder does not read one
@@ -672,7 +672,7 @@ if(MSVC)
   # other toolchain has an equivalent to keep in step.
   #
   # This flag is PERMANENT, and that is measured rather than assumed - see
-  # docs/split-plan.md 10, which carries the numbers and the method. The short
+  # docs/background/project/split-plan.md 10, which carries the numbers and the method. The short
   # version, because the obvious structural fix looks so much better than it is:
   #
   #   - giving every selftest its own TU removes 34.7% of this object's
@@ -811,7 +811,7 @@ else()
 endif()
 
 # The third, and the only one whose subject is not arithmetic: the probe rule
-# (docs/abi-v3.md §2.2) is a claim about hosts this repo does not contain - an
+# (docs/reference/abi-v3.md §2.2) is a claim about hosts this repo does not contain - an
 # ABI-1 host, an ABI-2 host, a v3 host with the seat still empty. The test
 # builds those four hosts as structs and asks the real plugin what it does with
 # each, which no test driven through plugin_host can do: that one can only ever
@@ -898,7 +898,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   endif()
 endif()
 
-# Hermetic config dir. docs/verify-functional.md E-5: a scripted selftest that
+# Hermetic config dir. docs/verification/functional.md E-5: a scripted selftest that
 # does not blank io.IniFilename writes the OPERATOR'S real
 # %APPDATA%/viewer/layout.ini, and claimAutosaveSlot() drops a lock file there
 # for every run. Pointing the config dir into the build tree keeps `ctest` from
@@ -1150,11 +1150,11 @@ viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
 # rows the panel laid out actually are - the delete button's rect and the clicks
 # that have to reach it past a span-all-columns Selectable.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)
-# AnalysisSet (docs/reader-analysisset.md): transport read, Ref binding order,
+# AnalysisSet (docs/features/adapters/reader-analysisset.md): transport read, Ref binding order,
 # close semantics, session block + adopt. Fixtures are built by the test
 # itself under a scratch dir, so the argument is only a place to put them.
 viewer_selftest(aset        NOGL --aset-selftest tools/testdata)
-# The SetAnalyzers over a bound set (docs/flat-field-stats.md (b), #57 judgment
+# The SetAnalyzers over a bound set (docs/features/analysis/flat-field-stats.md (b), #57 judgment
 # 4): direct DSNU / PRNU, every refusal path, and the scan that keeps the bare
 # famous names in one file. The argument is tools/testdata/multi, whose injected
 # fixed pattern is SHARED between its three stacks and is therefore ground truth
@@ -1162,7 +1162,7 @@ viewer_selftest(aset        NOGL --aset-selftest tools/testdata)
 # scan walks the sources relative to WORKING_DIRECTORY, which viewer_selftest
 # already pins to the source root.
 viewer_selftest(setanalysis NOGL --setanalysis-selftest tools/testdata/multi)
-# The detrend AnalysisPreProcessor (docs/flat-field-stats.md 判断6/7): the raw
+# The detrend AnalysisPreProcessor (docs/features/analysis/flat-field-stats.md 判断6/7): the raw
 # default, the shading figure that is printed whether or not anything was
 # removed, the product and the predicted direction its statistics move in, and
 # the recipe a session brings it back by. The argument is only a place to write
@@ -1179,7 +1179,7 @@ viewer_selftest(detrend     NOGL --detrend-selftest tools/testdata)
 viewer_selftest(roistats    NOGL --roistats-selftest)
 # ...and the same table as a DOCUMENT (issue #67). It had no clipboard surface
 # at all: readable on screen, unreachable from a report. The subject is the
-# STRING the two buttons produce - the sectioned format docs/export-design.md 2
+# STRING the two buttons produce - the sectioned format docs/features/export/export-design.md 2
 # confirmed, and the rectangle this table alone carries as a value (x/y/w/h as
 # columns, in the convention documented in 10). Windowless for the roistats
 # reasons and one more: the builder draws no frame at all. Analytic in-memory
@@ -1190,7 +1190,7 @@ viewer_selftest(roi-export  NOGL --roi-export-selftest)
 # roistats - it asserts what the panel prints, not where it landed - and the
 # same analytic in-memory fixtures, so it needs no fixture directory either.
 viewer_selftest(abeq        NOGL --abeq-selftest)
-# The value highlight (#68, docs/histogram-select-design.md): a value interval
+# The value highlight (#68, docs/features/histogram/histogram-select-design.md): a value interval
 # dragged on the histogram's x axis, and the pixels in it painted on the image.
 # NOGL and fixture-free for abeq's reasons - the documents are analytic and
 # built in memory, and every assertion is a byte of RGBA, a count derived by
@@ -1198,7 +1198,7 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # count == sum of the selected bins, inside the grid and at the folded end bin)
 # are the reason it is a test at all rather than a demo.
 viewer_selftest(histhl      NOGL --histhl-selftest)
-# settings.jsonc (issue #50 stage 1, docs/settings-inventory.md): the JSONC
+# settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
 # (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of
 # refusal - a whole file that will not parse, and one key with a bad value.
@@ -1237,7 +1237,7 @@ viewer_selftest(anaprov     NOGL --anaprov-selftest)
 # decided. Registered here rather than folded into anaprov because a failure
 # should name the mouth it is about.
 viewer_selftest(stackana    NOGL --stackana-selftest)
-# The V3 migration of the five SHIPPED analyzers (docs/abi-v3.md §1). Same NOGL
+# The V3 migration of the five SHIPPED analyzers (docs/reference/abi-v3.md §1). Same NOGL
 # and same in-memory reasoning as anaprov, and it deliberately loads NO fixture
 # directory: its subject is what a user actually gets from build/plugins, and a
 # twin standing in for one of them would prove something about the twin. Its own
@@ -1306,7 +1306,7 @@ viewer_selftest(newwin      NOGL --newwin-selftest tools/testdata)
 # writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
 viewer_selftest(sweepfile   NOGL --sweepfile-selftest tools/testdata/levelfiles)
 
-# The 23rd: which document holds which pixels (docs/verify-functional.md
+# The 23rd: which document holds which pixels (docs/verification/functional.md
 # D-1/D-2/D-7). multi/ because it is three stacks of five frames - enough
 # documents for "N documents, N sources" to say something - and its parent
 # carries the .raw fixture the second decode path needs. NOGL: it dumps a
@@ -1329,7 +1329,7 @@ viewer_selftest(media NOGL --media-selftest tools/testdata/media)
 viewer_selftest(reload NOGL --reload-selftest tools/testdata)
 
 # ...and NOTICING that a file was rewritten in the first place (項目20,
-# docs/watch-design.md §10). W1-W12 drive watch::observe by hand - no filesystem
+# docs/features/watch/watch-design.md §10). W1-W12 drive watch::observe by hand - no filesystem
 # at all - so the not-equal rule (an OLDER file with the same size is a change),
 # §4's two readings that must agree, appeared, vanished and the baseline are
 # each asserted on numbers written out beside them. W13-W22 run the same rule
@@ -1363,7 +1363,7 @@ viewer_selftest(rwatch NOGL --rwatch-selftest tools/testdata
                        --remote-exe $<TARGET_FILE:viewer-serve>)
 
 # A READER sent to the peer and run there (issue #180, docs/
-# remote-reader-design.md stages 1 and 2). The gate that is closed unless the
+# docs/features/remote/remote-reader-design.md stages 1 and 2). The gate that is closed unless the
 # peer's own launcher opened it, the cache that skips the reader/harness while
 # still probing Python provenance once per RUN, the per-key interprocess lock
 # shared by invalid-entry removal and every publish, the four failures each as
@@ -1430,7 +1430,7 @@ viewer_selftest(remote NOGL --remote-selftest tools/testdata/bench_stack.npy
 # not shipped. VIEWER_SERVE_PIN_BUDGET_MB=1 is the arithmetic: bench_stack's
 # frames are 0.3125 MB, so the eight the test asks for cannot be resident at
 # once inside 1 MB, and the run only succeeds because the fixture releases each
-# frame and the peer's window really recycles the slot (docs/abi-v3.md §9.2).
+# frame and the peer's window really recycles the slot (docs/reference/abi-v3.md §9.2).
 viewer_selftest(rplugin NOGL
                 ENV VIEWER_SERVE_PLUGINS=${VIEWER_ABITEST_PLUGIN_DIR}
                 ENV VIEWER_SERVE_PIN_BUDGET_MB=1

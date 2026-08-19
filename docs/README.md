@@ -85,8 +85,9 @@
 2. 機能文書にはフェーズを示し、未決事項は [tasks.csv](tasks.csv) の行を参照します。
 3. 検証仕様には、再実行できる手順と期待結果を記します。検証結果は、1つのコミット、
    1台の実行機、1回のマトリクス実施を単位として固定し、後日の状態で書き換えません。
-4. 文書全体を移動した場合（`whole-file`）、旧パスには3行だけの転送案内（`stub`）を
-   残します。本文は現在パスにだけ置きます。
+4. 文書全体を移動した場合（`whole-file`）、下の恒久対応表に登録します。`stub` が
+   `required` の間だけ旧パスに3行の転送案内を残し、本文は現在パスにだけ置きます。
+   現行参照をすべて移行したら転送案内を削除し、対応表を `none` にします。
 5. 移動後も、コード、CI、ツール、課題台帳、README の参照を現在パスへ更新します。
    旧パスを歴史的記録として残す場合は、下の恒久対応表に登録して追跡可能にします。
 6. 外部向け契約は、公開ヘッダと実装の両方に照合します。
@@ -95,57 +96,57 @@
 
 ## 旧パス → 現在パス
 
-この表は、転送案内（stub）を将来削除した後も残す恒久対応表です。パス欄に表示する
-リンク名は、リポジトリルートからの相対パスです。種別が `whole-file` の行では、
-旧パスに stub を残します。
+この表は、転送案内（stub）を削除した後も残す恒久対応表です。パス欄に表示する
+リンク名は、リポジトリルートからの相対パスです。`stub` が `required` の行では旧パスに
+転送案内を残し、`none` の行では旧パスを削除済みです。
 
 <!-- DOCS-MOVE-MAP:START -->
 | 旧パス | 現在パス | 種別 | stub |
 |---|---|---|---|
-| [docs/ab-stats-plan.md](ab-stats-plan.md) | [docs/features/compare/ab-stats-plan.md](features/compare/ab-stats-plan.md) | whole-file | required |
-| [docs/abi-v3.md](abi-v3.md) | [docs/reference/abi-v3.md](reference/abi-v3.md) | whole-file | required |
-| [docs/adapter-transport-review.md](adapter-transport-review.md) | [docs/background/reviews/adapter-transport-review.md](background/reviews/adapter-transport-review.md) | whole-file | required |
-| [docs/analyzers.md](analyzers.md) | [docs/reference/analyzers.md](reference/analyzers.md) | whole-file | required |
-| [docs/browse-as-file-manager.md](browse-as-file-manager.md) | [docs/features/browse/browse-as-file-manager.md](features/browse/browse-as-file-manager.md) | whole-file | required |
-| [docs/browse-display-candidates.md](browse-display-candidates.md) | [docs/background/browse/browse-display-candidates.md](background/browse/browse-display-candidates.md) | whole-file | required |
-| [docs/browse-extract-design.md](browse-extract-design.md) | [docs/features/browse/browse-extract-design.md](features/browse/browse-extract-design.md) | whole-file | required |
-| [docs/browse-inventory.md](browse-inventory.md) | [docs/background/browse/browse-inventory.md](background/browse/browse-inventory.md) | whole-file | required |
-| [docs/browse-topbar-design.md](browse-topbar-design.md) | [docs/features/browse/browse-topbar-design.md](features/browse/browse-topbar-design.md) | whole-file | required |
+| [docs/ab-stats-plan.md](ab-stats-plan.md) | [docs/features/compare/ab-stats-plan.md](features/compare/ab-stats-plan.md) | whole-file | none |
+| [docs/abi-v3.md](abi-v3.md) | [docs/reference/abi-v3.md](reference/abi-v3.md) | whole-file | none |
+| [docs/adapter-transport-review.md](adapter-transport-review.md) | [docs/background/reviews/adapter-transport-review.md](background/reviews/adapter-transport-review.md) | whole-file | none |
+| [docs/analyzers.md](analyzers.md) | [docs/reference/analyzers.md](reference/analyzers.md) | whole-file | none |
+| [docs/browse-as-file-manager.md](browse-as-file-manager.md) | [docs/features/browse/browse-as-file-manager.md](features/browse/browse-as-file-manager.md) | whole-file | none |
+| [docs/browse-display-candidates.md](browse-display-candidates.md) | [docs/background/browse/browse-display-candidates.md](background/browse/browse-display-candidates.md) | whole-file | none |
+| [docs/browse-extract-design.md](browse-extract-design.md) | [docs/features/browse/browse-extract-design.md](features/browse/browse-extract-design.md) | whole-file | none |
+| [docs/browse-inventory.md](browse-inventory.md) | [docs/background/browse/browse-inventory.md](background/browse/browse-inventory.md) | whole-file | none |
+| [docs/browse-topbar-design.md](browse-topbar-design.md) | [docs/features/browse/browse-topbar-design.md](features/browse/browse-topbar-design.md) | whole-file | none |
 | docs/browse-topbar-mockup.html | [docs/features/browse/browse-topbar-mockup.html](features/browse/browse-topbar-mockup.html) | asset | none |
-| [docs/compare-n-design.md](compare-n-design.md) | [docs/features/compare/compare-n-design.md](features/compare/compare-n-design.md) | whole-file | required |
-| [docs/compare-n.md](compare-n.md) | [docs/features/compare/compare-n.md](features/compare/compare-n.md) | whole-file | required |
-| [docs/docs-restructure-handoff.md](docs-restructure-handoff.md) | [docs/background/documentation/docs-restructure-handoff.md](background/documentation/docs-restructure-handoff.md) | whole-file | required |
-| [docs/docs-restructure-review.md](docs-restructure-review.md) | [docs/background/documentation/docs-restructure-review.md](background/documentation/docs-restructure-review.md) | whole-file | required |
-| [docs/docs-split-review.md](docs-split-review.md) | [docs/background/documentation/docs-split-review.md](background/documentation/docs-split-review.md) | whole-file | required |
-| [docs/export-design.md](export-design.md) | [docs/features/export/export-design.md](features/export/export-design.md) | whole-file | required |
-| [docs/flat-field-stats-review.md](flat-field-stats-review.md) | [docs/background/reviews/flat-field-stats-review.md](background/reviews/flat-field-stats-review.md) | whole-file | required |
-| [docs/flat-field-stats.md](flat-field-stats.md) | [docs/features/analysis/flat-field-stats.md](features/analysis/flat-field-stats.md) | whole-file | required |
-| [docs/histogram-select-design.md](histogram-select-design.md) | [docs/features/histogram/histogram-select-design.md](features/histogram/histogram-select-design.md) | whole-file | required |
-| [docs/imgui_modern_design.md](imgui_modern_design.md) | [docs/features/theme/imgui_modern_design.md](features/theme/imgui_modern_design.md) | whole-file | required |
-| [docs/input-adapters.md](input-adapters.md) | [docs/features/adapters/input-adapters.md](features/adapters/input-adapters.md) | whole-file | required |
-| [docs/layers-plan.md](layers-plan.md) | [docs/background/project/layers-plan.md](background/project/layers-plan.md) | whole-file | required |
-| [docs/manual.md](manual.md) | [docs/guides/manual.md](guides/manual.md) | whole-file | required |
-| [docs/measure-ux.md](measure-ux.md) | [docs/features/analysis/measure-ux.md](features/analysis/measure-ux.md) | whole-file | required |
-| [docs/media-support.md](media-support.md) | [docs/features/media/media-support.md](features/media/media-support.md) | whole-file | required |
-| [docs/npz-design.md](npz-design.md) | [docs/features/adapters/npz-design.md](features/adapters/npz-design.md) | whole-file | required |
-| [docs/picker-ux.md](picker-ux.md) | [docs/features/browse/picker-ux.md](features/browse/picker-ux.md) | whole-file | required |
-| [docs/preferences-panel-design.md](preferences-panel-design.md) | [docs/features/settings/preferences-panel-design.md](features/settings/preferences-panel-design.md) | whole-file | required |
-| [docs/reader-analysisset.md](reader-analysisset.md) | [docs/features/adapters/reader-analysisset.md](features/adapters/reader-analysisset.md) | whole-file | required |
-| [docs/remote-headerless-design.md](remote-headerless-design.md) | [docs/features/remote/remote-headerless-design.md](features/remote/remote-headerless-design.md) | whole-file | required |
-| [docs/remote-reader-design.md](remote-reader-design.md) | [docs/features/remote/remote-reader-design.md](features/remote/remote-reader-design.md) | whole-file | required |
-| [docs/remote.md](remote.md) | [docs/features/remote/remote.md](features/remote/remote.md) | whole-file | required |
-| [docs/review-lenses/session-20260806.md](review-lenses/session-20260806.md) | [docs/background/reviews/session-20260806.md](background/reviews/session-20260806.md) | whole-file | required |
-| [docs/review-new-code.md](review-new-code.md) | [docs/background/reviews/review-new-code.md](background/reviews/review-new-code.md) | whole-file | required |
-| [docs/settings-inventory.md](settings-inventory.md) | [docs/features/settings/settings-inventory.md](features/settings/settings-inventory.md) | whole-file | required |
-| [docs/split-plan.md](split-plan.md) | [docs/background/project/split-plan.md](background/project/split-plan.md) | whole-file | required |
-| [docs/startup.md](startup.md) | [docs/guides/startup.md](guides/startup.md) | whole-file | required |
-| [docs/stats-taxonomy.md](stats-taxonomy.md) | [docs/features/analysis/stats-taxonomy.md](features/analysis/stats-taxonomy.md) | whole-file | required |
-| [docs/todo-open.md](todo-open.md) | [docs/background/project/todo-open.md](background/project/todo-open.md) | whole-file | required |
-| [docs/verify-functional.md](verify-functional.md) | [docs/verification/functional.md](verification/functional.md) | whole-file | required |
-| [docs/verify-matrix.md](verify-matrix.md) | [docs/verification/matrix.md](verification/matrix.md) | whole-file | required |
-| [docs/verify-ui.md](verify-ui.md) | [docs/verification/ui.md](verification/ui.md) | whole-file | required |
-| [docs/video-support.md](video-support.md) | [docs/features/media/video-support.md](features/media/video-support.md) | whole-file | required |
-| [docs/watch-design.md](watch-design.md) | [docs/features/watch/watch-design.md](features/watch/watch-design.md) | whole-file | required |
+| [docs/compare-n-design.md](compare-n-design.md) | [docs/features/compare/compare-n-design.md](features/compare/compare-n-design.md) | whole-file | none |
+| [docs/compare-n.md](compare-n.md) | [docs/features/compare/compare-n.md](features/compare/compare-n.md) | whole-file | none |
+| [docs/docs-restructure-handoff.md](docs-restructure-handoff.md) | [docs/background/documentation/docs-restructure-handoff.md](background/documentation/docs-restructure-handoff.md) | whole-file | none |
+| [docs/docs-restructure-review.md](docs-restructure-review.md) | [docs/background/documentation/docs-restructure-review.md](background/documentation/docs-restructure-review.md) | whole-file | none |
+| [docs/docs-split-review.md](docs-split-review.md) | [docs/background/documentation/docs-split-review.md](background/documentation/docs-split-review.md) | whole-file | none |
+| [docs/export-design.md](export-design.md) | [docs/features/export/export-design.md](features/export/export-design.md) | whole-file | none |
+| [docs/flat-field-stats-review.md](flat-field-stats-review.md) | [docs/background/reviews/flat-field-stats-review.md](background/reviews/flat-field-stats-review.md) | whole-file | none |
+| [docs/flat-field-stats.md](flat-field-stats.md) | [docs/features/analysis/flat-field-stats.md](features/analysis/flat-field-stats.md) | whole-file | none |
+| [docs/histogram-select-design.md](histogram-select-design.md) | [docs/features/histogram/histogram-select-design.md](features/histogram/histogram-select-design.md) | whole-file | none |
+| [docs/imgui_modern_design.md](imgui_modern_design.md) | [docs/features/theme/imgui_modern_design.md](features/theme/imgui_modern_design.md) | whole-file | none |
+| [docs/input-adapters.md](input-adapters.md) | [docs/features/adapters/input-adapters.md](features/adapters/input-adapters.md) | whole-file | none |
+| [docs/layers-plan.md](layers-plan.md) | [docs/background/project/layers-plan.md](background/project/layers-plan.md) | whole-file | none |
+| [docs/manual.md](manual.md) | [docs/guides/manual.md](guides/manual.md) | whole-file | none |
+| [docs/measure-ux.md](measure-ux.md) | [docs/features/analysis/measure-ux.md](features/analysis/measure-ux.md) | whole-file | none |
+| [docs/media-support.md](media-support.md) | [docs/features/media/media-support.md](features/media/media-support.md) | whole-file | none |
+| [docs/npz-design.md](npz-design.md) | [docs/features/adapters/npz-design.md](features/adapters/npz-design.md) | whole-file | none |
+| [docs/picker-ux.md](picker-ux.md) | [docs/features/browse/picker-ux.md](features/browse/picker-ux.md) | whole-file | none |
+| [docs/preferences-panel-design.md](preferences-panel-design.md) | [docs/features/settings/preferences-panel-design.md](features/settings/preferences-panel-design.md) | whole-file | none |
+| [docs/reader-analysisset.md](reader-analysisset.md) | [docs/features/adapters/reader-analysisset.md](features/adapters/reader-analysisset.md) | whole-file | none |
+| [docs/remote-headerless-design.md](remote-headerless-design.md) | [docs/features/remote/remote-headerless-design.md](features/remote/remote-headerless-design.md) | whole-file | none |
+| [docs/remote-reader-design.md](remote-reader-design.md) | [docs/features/remote/remote-reader-design.md](features/remote/remote-reader-design.md) | whole-file | none |
+| [docs/remote.md](remote.md) | [docs/features/remote/remote.md](features/remote/remote.md) | whole-file | none |
+| [docs/review-lenses/session-20260806.md](review-lenses/session-20260806.md) | [docs/background/reviews/session-20260806.md](background/reviews/session-20260806.md) | whole-file | none |
+| [docs/review-new-code.md](review-new-code.md) | [docs/background/reviews/review-new-code.md](background/reviews/review-new-code.md) | whole-file | none |
+| [docs/settings-inventory.md](settings-inventory.md) | [docs/features/settings/settings-inventory.md](features/settings/settings-inventory.md) | whole-file | none |
+| [docs/split-plan.md](split-plan.md) | [docs/background/project/split-plan.md](background/project/split-plan.md) | whole-file | none |
+| [docs/startup.md](startup.md) | [docs/guides/startup.md](guides/startup.md) | whole-file | none |
+| [docs/stats-taxonomy.md](stats-taxonomy.md) | [docs/features/analysis/stats-taxonomy.md](features/analysis/stats-taxonomy.md) | whole-file | none |
+| [docs/todo-open.md](todo-open.md) | [docs/background/project/todo-open.md](background/project/todo-open.md) | whole-file | none |
+| [docs/verify-functional.md](verify-functional.md) | [docs/verification/functional.md](verification/functional.md) | whole-file | none |
+| [docs/verify-matrix.md](verify-matrix.md) | [docs/verification/matrix.md](verification/matrix.md) | whole-file | none |
+| [docs/verify-ui.md](verify-ui.md) | [docs/verification/ui.md](verification/ui.md) | whole-file | none |
+| [docs/video-support.md](video-support.md) | [docs/features/media/video-support.md](features/media/video-support.md) | whole-file | none |
+| [docs/watch-design.md](watch-design.md) | [docs/features/watch/watch-design.md](features/watch/watch-design.md) | whole-file | none |
 <!-- DOCS-MOVE-MAP:END -->
 
 ### 節移動履歴

@@ -38,7 +38,7 @@
 // CRX alone is an inverse wavelet transform. There is no small honest reader
 // here, so the choice is the library or nothing.
 //
-// The cost of that is real and is not hidden: docs/input-adapters.md §3.6.5
+// The cost of that is real and is not hidden: docs/features/adapters/input-adapters.md §3.6.5
 // carries the measured build and binary cost, and THIRD-PARTY-NOTICES.md the
 // licence - LibRaw is dual LGPL-2.1 / CDDL-1.0, and this project takes the
 // CDDL, because a single statically-linked exe published automatically by CI

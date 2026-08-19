@@ -468,7 +468,7 @@ static void drawPanelProjection() {
         if (app.showProjH) onePlot(true, which);
         if (app.showProjV) onePlot(false, which);
     } else {
-        // equal widths, slot order, A first (docs/ab-stats-plan.md 3 at N):
+        // equal widths, slot order, A first (docs/features/compare/ab-stats-plan.md 3 at N):
         // arming a letter appends a pane and moves nobody
         float childH = ImGui::GetTextLineHeight() + 8 * app.uiScale
                      + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
@@ -508,7 +508,7 @@ static void drawPanelProjection() {
         // silence issue #60 caught here was slots getting table rows while the
         // plots drew A and B and said NOTHING about the letters they left off.
         // The plots now take every side the shared axis can carry (the N
-        // overlay, docs/compare-n-design.md D5); what a spoken limit keeps off
+        // overlay, docs/features/compare/compare-n-design.md D5); what a spoken limit keeps off
         // is named right here, under the plot that does not have it, in the
         // same wording shape and the same amber as the histogram's.
         std::string got, off;
@@ -685,7 +685,7 @@ static void drawPanelProjection() {
             } else tsv += "; whole image";
             const char* pmodes[3] = { "mean", "max", "min" };
             tsv += std::string("; reduce=") + pmodes[std::clamp(app.projMode, 0, 2)] + "; DN\n";
-            // Provenance (stats-taxonomy.md §8 判断5). This is the ONE export
+            // Provenance (docs/features/analysis/stats-taxonomy.md §8 判断5). This is the ONE export
             // surface that could not say which build produced it, and it is
             // also the surface whose sigma_row / sigma_col change meaning with
             // this release (ddof 0 -> 1). A number in a report has to be
@@ -833,7 +833,7 @@ static void drawPanelProjection() {
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
         // one row per (side, axis, plane). The table's axis is the QUANTITY, so
         // A and B cannot be a column pair here - they are rows, and the side
-        // column says which is which (docs/ab-stats-plan.md 4).
+        // column says which is which (docs/features/compare/ab-stats-plan.md 4).
         if (anySide)
             ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                     ImGui::GetFontSize() * 1.6f);
@@ -1762,7 +1762,7 @@ static void linRecompute(int seriesId) {
 }
 
 // The SNR curve: the rows linRecompute already measured, presented against the
-// noise they carry (docs/stats-taxonomy.md gap #2 - no new measurement, a new
+// noise they carry (docs/features/analysis/stats-taxonomy.md gap #2 - no new measurement, a new
 // presentation of the fit's own rows). One point per lit member per CFA plane,
 // planes never mixed. x = dark-corrected mean signal [DN], y = x / sigma_t,
 // dimensionless. The dark convention is linRecompute's own: a level-0 member is

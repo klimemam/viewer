@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ------------------------------------------------- AnalysisPreProcessor: detrend (#57 判断6/7)
 //
-// docs/flat-field-stats.md "シェーディング除去 — 全部の土台に置く" (確定
+// docs/features/analysis/flat-field-stats.md "シェーディング除去 — 全部の土台に置く" (確定
 // 2026-08-09, #57) and docs/analysis-layers.md §5. This file is the STAGE and
 // nothing else: pure functions over a sample buffer, no app state, no ImGui.
 // The product that carries it (core/app/preprocess.inc) and the readout that
@@ -31,7 +31,7 @@
 // judgment, and it is the default-constructed value of the other fields.
 //
 // -------- the order this stage sits in ---------------------------------------
-// docs/flat-field-stats.md "順序 (この順でしか安全に積めない)":
+// docs/features/analysis/flat-field-stats.md "順序 (この順でしか安全に積めない)":
 //     0 black level -> 1a saturation mask (on RAW values) -> 2 dark subtraction
 //     -> 2b linearity -> 3 SHADING REMOVAL -> 3b defect mask -> 4 statistics
 // with the branch that the column drawing hides: sigma_t comes off BEFORE 3 and

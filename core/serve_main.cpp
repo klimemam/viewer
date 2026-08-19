@@ -10,7 +10,7 @@
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
-        // docs/remote-reader-design.md §2. The consent for "code sent from a
+        // docs/features/remote/remote-reader-design.md §2. The consent for "code sent from a
         // client may run on this machine" belongs to whoever STARTED this
         // process, and the only thing that carries their decision this far is
         // the argv they wrote. Default closed: on the day a transport arrives

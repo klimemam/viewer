@@ -1953,7 +1953,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // makeRemoteUrl and comes through here, so routing at the door means none
     // of them had to learn the rule and none of them can drift from it.
     // A headerless file crosses the link only WITH a declaration (protocol 11,
-    // docs/remote-headerless-design.md). peerServesName is still the predicate
+    // docs/features/remote/remote-headerless-design.md). peerServesName is still the predicate
     // for "answerable with nothing else said" - it is what the listing and the
     // one-click preview ask - so the door adds the second half here rather than
     // widening that predicate underneath them.
@@ -2108,7 +2108,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     //   simply fills the same ones, which is why this feature needed no new
     //   identity machinery at all.
     //
-    //   M1 (docs/settings-inventory.md §4.1). A headerless read is nothing but
+    //   M1 (docs/features/settings/settings-inventory.md §4.1). A headerless read is nothing but
     //   measuring-class settings, so it declares itself in the note - and the
     //   note has to be the SAME sentence the local door writes, or one file
     //   would describe itself two ways depending on which end opened it.
@@ -2127,14 +2127,14 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     // frame"). The sibling frames are minted by pumpRemoteFetch, so this string
     // travels to them through RFetchJob::note.
     // Two things are deliberately NOT in it. The SIZE: the row immediately above
-    // already prints "%dx%d %dch %s", and docs/todo-open.md item 11 asked for the
+    // already prints "%dx%d %dch %s", and docs/background/project/todo-open.md item 11 asked for the
     // duplicate to go. The HOST when there is none: a local:// peer serves files
     // off this disk and was not fetched "from" anywhere, which is the same call
     // the "opened X" toast at the end of this function makes.
     doc->note = "remote";
     if (!host.empty()) doc->note += " " + host;
     // ...and, for a headerless file, the DECLARATION the numbers were read
-    // under (M1, docs/settings-inventory.md §4.1). The same sentence the local
+    // under (M1, docs/features/settings/settings-inventory.md §4.1). The same sentence the local
     // door writes, from the same helper: a size, a header offset and a byte
     // order each change every number on the screen, and a file that described
     // itself one way from disk and another over a link would be the "two
@@ -2292,7 +2292,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     return true;
 }
 
-// ---- a reader that runs on the PEER (issue #180, docs/remote-reader-design.md)
+// ---- a reader that runs on the PEER (issue #180, docs/features/remote/remote-reader-design.md)
 //
 // The local door is openWithReader (core/app/session.inc): find the reader,
 // start Python here, read the .vstream it writes. This is the same door with
@@ -2381,7 +2381,7 @@ static std::string remoteReaderPrepare(const std::string& url, const std::string
 // ONE ARRAY of something the peer materialised, as a .npy buffer this process
 // can hand to the decoder every other array goes through.
 //
-// Shared by both things that produce a key (docs/remote-reader-design.md
+// Shared by both things that produce a key (docs/features/remote/remote-reader-design.md
 // §10.5): a reader's tree node and a .npz member. What it does is what stage 2
 // wrote for the reader and #217 needed unchanged - ask META what the peer makes
 // of this array, check that against the shape the DECLARATION says it has (a
@@ -2716,7 +2716,7 @@ static std::string openRemoteWithReader(const std::string& url, const std::strin
 // ---- a CONTAINER that lives on the peer (issue #217, §10) -------------------
 //
 // A .npz is a zip of .npy arrays: the file is a batch and each member is a
-// stack or a frame (docs/npz-design.md §2). Nothing about that is new here -
+// stack or a frame (docs/features/adapters/npz-design.md §2). Nothing about that is new here -
 // what was missing was a way to ASK a peer what is inside one, and a way to
 // address a member once it had. Both exist now and neither is npz-shaped: the
 // SCAN returns facts, and a member is reached by the same [key][node] trailer a

@@ -368,7 +368,7 @@ if WANT_BENCH:
             (np.random.default_rng(0).random((3000, 4000)) * 4095).astype(np.float32))
 
     # bench_ab_a.npy / bench_ab_b.npy - the A/B step-throttle experiment of
-    # docs/ab-stats-plan.md 1: TWO stacks of 12 Mpx u16 frames, opened together
+    # docs/features/compare/ab-stats-plan.md 1: TWO stacks of 12 Mpx u16 frames, opened together
     # with --compare split (+ follow-frame) and stepped by --bench-step, so
     # every benched frame is a real cache miss on BOTH slots. That is the only
     # shape that measures what the throttle removes; a single big frame keeps
@@ -473,7 +473,7 @@ g16 = ((myy * mw + mxx) * 21 % 65536).astype(np.uint16)
 write_png(media / "gray16.png", g16, bit=16, ctype=0)
 
 # 8-bit greyscale: one frame, ONE channel (the last-axis rule, docs/
-# input-adapters.md 3.1) - not one RGBA frame with three copies of it.
+# docs/features/adapters/input-adapters.md 3.1) - not one RGBA frame with three copies of it.
 g8 = ((mxx * 4 + myy) % 256).astype(np.uint8)
 write_png(media / "gray8.png", g8, bit=8, ctype=0)
 
@@ -878,7 +878,7 @@ write_bigtiff_gray8(media / "big.tif", g8)
 
 
 # ------------------------------------------------------------------ y4m ----
-# The one video container this build reads (docs/video-support.md). It is here
+# The one video container this build reads (docs/features/media/video-support.md). It is here
 # and not in tools/mkexr.cpp - and not shelled out to ffmpeg, which CI does not
 # have - because a y4m IS a text header plus raw planes: writing one from its
 # own samples is twenty lines, and that is the same property that makes it the
@@ -1000,7 +1000,7 @@ for _f in range(4):
 #
 # What they do NOT exercise is the vendor decompressors: Canon's wavelet,
 # Nikon's Huffman, Sony's delta. Those are LibRaw's, they cannot be synthesised,
-# and this repository trusts them - docs/input-adapters.md §3.6.5 records which
+# and this repository trusts them - docs/features/adapters/input-adapters.md §3.6.5 records which
 # real camera files were opened by hand and where a clean clone fetches the same
 # ones. Naming the gap is the point; a fixture that pretended to cover it would
 # be worse than none.

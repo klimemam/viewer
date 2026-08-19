@@ -180,7 +180,7 @@ static int anaProvSelftest() {
     // Stage 1 (above) answered "which file". The other half of the citation is
     // the version, and it is the half the host CANNOT source itself: only the
     // plugin knows what it calls itself, which is why it waited for an ABI
-    // field (docs/abi-v3.md §3.1, §11). What follows measures the same fixture
+    // field (docs/reference/abi-v3.md §3.1, §11). What follows measures the same fixture
     // with the V2 twin and the V3 twin - one measurement, two ABI paths - so
     // "the version surfaces" and "V2 still works" are asked of the same grid.
     int v2i = -1, v3i = -1;

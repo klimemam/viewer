@@ -338,7 +338,7 @@ static void drawPanelSeriesAnalysis() {
 
     // ---- SNR curve: the same rows, the mean set against the noise it carries.
     // A SECTION of this panel, not a new one: the material is the fit's own rows
-    // (docs/stats-taxonomy.md gap #2, and its §4 sends LM curves here first).
+    // (docs/features/analysis/stats-taxonomy.md gap #2, and its §4 sends LM curves here first).
     {
         std::vector<LinSnrPt> sp;
         bool snrDark = false;

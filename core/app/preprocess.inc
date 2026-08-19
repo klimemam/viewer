@@ -23,7 +23,7 @@
 // `image` line for it and cannot hand back a capture under this name.
 //
 // -------- why the surface is fitted ONCE, on the temporal mean ---------------
-// docs/flat-field-stats.md 約束3: "sigma_t には適用しない ... detrend は空間
+// docs/features/analysis/flat-field-stats.md 約束3: "sigma_t には適用しない ... detrend は空間
 // 統計にだけ掛かる段とする". A stack is detrended by fitting the surface on the
 // stack's per-pixel temporal mean and removing THAT ONE SURFACE from every
 // frame. Removing a per-pixel constant from every frame cannot change a
@@ -41,7 +41,7 @@
 // 0 / 1a / 2b / 3b are not built: skipping an unbuilt stage is legal, and the
 // value of the cutoff field is where that skip stops being silent (約束1).
 static const char* kDetrendChainNote =
-    "chain (docs/flat-field-stats.md \"順序\"): black level and saturation "
+    "chain (docs/features/analysis/flat-field-stats.md \"順序\"): black level and saturation "
     "masking are not built, dark subtraction is a reader's today, this is "
     "stage 3, defect masking is not built, statistics follow";
 
@@ -159,7 +159,7 @@ static bool detrendStackProduct(int seqId, const DetrendSpec& sp, std::string& e
                        "captured. cutoff: " + cutoff +
                        ". The surface was fitted ONCE on the per-pixel temporal mean of " +
                        ofN + " frame(s) and removed from every frame, so sigma_t is "
-                       "unchanged (docs/flat-field-stats.md 約束3); each plane's mean "
+                       "unchanged (docs/features/analysis/flat-field-stats.md 約束3); each plane's mean "
                        "level is added back, so mean_spatial is unchanged too. shading";
     for (int p = 0; p < P.nPl; p++) {
         char b[192];
@@ -180,7 +180,7 @@ static bool detrendStackProduct(int seqId, const DetrendSpec& sp, std::string& e
     if (sp.divide)
         note += "; DIVIDED, so the noise is scaled by 1/s and the spatial variance is "
                 "no longer uniform - the estimators downstream assume it is "
-                "(docs/flat-field-stats.md 約束6)";
+                "(docs/features/analysis/flat-field-stats.md 約束6)";
     if (st.nonFinite)
         note += "; " + std::to_string((unsigned long long)st.nonFinite) +
                 " non-finite sample(s) were excluded from the fold the surface was "

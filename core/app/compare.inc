@@ -147,7 +147,7 @@ static bool abSideBySide() {
 //
 // It also gives N-blink one line to land in. `flipShowB` is a two-image
 // spelling - a bool cannot name C - so when the cycle generalises
-// (docs/compare-n.md 12, "巡回順は A -> B -> C -> ...") the position is computed
+// (docs/features/compare/compare-n.md 12, "巡回順は A -> B -> C -> ...") the position is computed
 // HERE, and every reader follows it without being touched.
 static int blinkSideIndex() {
     if (app.compareMode != App::CmpFlip) return -1;
@@ -180,7 +180,7 @@ static float abCurveW(float base, bool emph) { return emph ? base * 2.2f : base;
 // same range - same origin and same length. Anything else would have to be
 // stretched to line up, and stretching invents a correspondence between two
 // captures that nothing in the data supports. False means: side by side, and
-// say why (docs/ab-stats-plan.md 5).
+// say why (docs/features/compare/ab-stats-plan.md 5).
 static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) {
     return A.rx == B.rx && A.rw == B.rw && A.ry == B.ry && A.rh == B.rh;
 }
@@ -189,7 +189,7 @@ static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) 
 // measured on the same binary instead of quoted from an older one.
 static bool g_abNoThrottle = false;
 // True while frames are being stepped continuously. The B slots skip their
-// recompute then; whoever draws B must say "stale" (docs/ab-stats-plan.md 1).
+// recompute then; whoever draws B must say "stale" (docs/features/compare/ab-stats-plan.md 1).
 static bool abStepBusy() {
     return !g_abNoThrottle && app.abStepBusyUntil > nowSec();
 }
@@ -503,7 +503,7 @@ enum class EscTook { Nothing, RoiDeselected, CompareOff };
 // only ever checkable for the two that end in escapePressed(). A14/A14b assert
 // the ROI/compare pair and, separately, that a popup went away; neither can
 // say that ONE press did not do two of them, which is the whole rule.
-// (docs/verify-ui.md E7.) Recorded at the point each layer acts, so a press
+// (docs/verification/ui.md E7.) Recorded at the point each layer acts, so a press
 // consumed twice appears as two entries rather than being reasoned away.
 static std::string g_escProbe;
 static int g_escProbeN = 0;              // entries, so a caller can take a delta
@@ -789,7 +789,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
             (nowSec() - t0) * 1000);
 }
 
-// ---- value highlight (#68, docs/histogram-select-design.md) ----------------
+// ---- value highlight (#68, docs/features/histogram/histogram-select-design.md) ----------------
 // The ink, in ONE constant, because §11 left the colour as the single thing the
 // user might want to change after seeing it on a real image.
 //

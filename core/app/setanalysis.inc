@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ------------------------------------------------- SetAnalyzer: direct DSNU / PRNU (#57 判断4)
 //
-// docs/flat-field-stats.md (b) "直接 DSNU / PRNU" (確定 2026-08-09, #57) and the
+// docs/features/analysis/flat-field-stats.md (b) "直接 DSNU / PRNU" (確定 2026-08-09, #57) and the
 // role table of docs/analysis-layers.md §6. Two SetAnalyzers over ONE bound
 // AnalysisSet:
 //
@@ -33,7 +33,7 @@
 // (SetResult::form, a required field, printed on every row).
 //
 // NO STANDARD IS NAMED HERE, and none may be: naming one is a gate that is
-// still shut (docs/flat-field-stats.md (c), docs/analysis-layers.md §6). What
+// still shut (docs/features/analysis/flat-field-stats.md (c), docs/analysis-layers.md §6). What
 // this file may say is what it computes.
 //
 // -------- the famous names live HERE, and only here --------------------------
@@ -58,7 +58,7 @@ enum SetAnalyzerKind {
 static const int kSetDirectCount = 2;
 
 // Every Stack role of every row here demands 2 frames: the correction is made
-// of s_t, and one frame has no s_t (docs/flat-field-stats.md (b)).
+// of s_t, and one frame has no s_t (docs/features/analysis/flat-field-stats.md (b)).
 static const int kSetMinFrames = 2;
 
 struct SetAnalyzerDef {
@@ -97,7 +97,7 @@ static const SetAnalyzerDef kSetAnalyzers[SA_COUNT] = {
       "intercept is the point); only mu is dark-corrected" },
 };
 
-// "カットオフを必ず言う" (docs/flat-field-stats.md 約束1) makes the cutoff a
+// "カットオフを必ず言う" (docs/features/analysis/flat-field-stats.md 約束1) makes the cutoff a
 // REQUIRED field of the result, so a value and the spatial band it was measured
 // over never travel apart. Stage 2 landed the field with one possible value;
 // the detrend stage (判断6/7) has since landed, and the wording now comes from
@@ -297,7 +297,7 @@ static const App::ASetRole* aSetRoleNamed(const App::ASet& S, const char* role) 
 }
 
 // "" = this role is a stack that can be folded; otherwise the ONE-LINE refusal,
-// in the words docs/flat-field-stats.md (b) fixes where it fixes them.
+// in the words docs/features/analysis/flat-field-stats.md (b) fixes where it fixes them.
 static std::string setRoleRefusal(const App::ASet& S, const char* role, int* seqIdOut) {
     *seqIdOut = 0;
     const App::ASetRole* r = aSetRoleNamed(S, role);
@@ -312,7 +312,7 @@ static std::string setRoleRefusal(const App::ASet& S, const char* role, int* seq
         return q + " is unbound - " +
                (r->reason.empty() ? std::string("no reason recorded") : r->reason);
     if (r->frameUid != 0)
-        // the settled refusal, verbatim (docs/flat-field-stats.md (b)); the
+        // the settled refusal, verbatim (docs/features/analysis/flat-field-stats.md (b)); the
         // math is spelled in ASCII because every key and unit on this screen is
         // (sigma_t, sigma_fpn, DN - flat-field-stats (a) "ASCII キー + 単位")
         return q + ": 1 frame has no time axis - "
@@ -387,7 +387,7 @@ struct SetResult {
     std::string computedBy;
     std::vector<SetRoleUse> used;
     // ...and, for a row whose input is a SWEEP, the settled second half of the
-    // tag: "- sweep: <series>, M levels" (docs/flat-field-stats.md (c),
+    // tag: "- sweep: <series>, M levels" (docs/features/analysis/flat-field-stats.md (c),
     // docs/analysis-layers.md §7). levels == 0 = this row took no sweep, and
     // the clause does not appear.
     std::string sweep;
@@ -415,7 +415,7 @@ static std::string sepDualClause(const std::vector<std::string>& names) {
 }
 
 // The result's own name (canon invariant (a): "解析結果は自分の層と (set 解析
-// なら) set を名乗る"). docs/flat-field-stats.md (b) fixes the tag as
+// なら) set を名乗る"). docs/features/analysis/flat-field-stats.md (b) fixes the tag as
 // "— set: image n/N, dark n/N" and forbids dropping it in a table; the SET NAME
 // is added in front of the roles because the invariant asks the result to name
 // its set, and a tag that lists roles alone cannot tell two sets apart in one
@@ -500,7 +500,7 @@ static std::string setShortRoleRefusal(const SetRoleFold& F) {
 // var_spatial at ddof=1 minus the temporal residual C, clamped at 0 with the
 // clamp DECLARED - never a silent 0, which would read as "this sensor has no
 // fixed pattern" when what happened is "this stack cannot see one under its own
-// temporal floor" (docs/flat-field-stats.md (a)'s guard rule).
+// temporal floor" (docs/features/analysis/flat-field-stats.md (a)'s guard rule).
 struct SetPlaneFpn { double var = 0, corr = 0, fvar = 0; bool clamped = false; };
 static SetPlaneFpn setPlaneFpn(double s1, double s2, double corrSum, double n) {
     SetPlaneFpn o;
@@ -529,7 +529,7 @@ static SetResult composeDirectDsnu(const std::string& setName, const SetRoleFold
     // there is no illumination, so there is no shading to remove, and the
     // low-frequency structure a dark does carry (a temperature gradient) IS part
     // of the DSNU rather than something to subtract off it
-    // (docs/flat-field-stats.md (b)).
+    // (docs/features/analysis/flat-field-stats.md (b)).
     R.nPl = D.nPl; R.cfa = D.cfa; R.cfaPattern = D.cfaPattern;
     for (int p = 0; p < R.nPl; p++) {
         const SetPlaneFpn f = setPlaneFpn(D.pl[p].s1, D.pl[p].s2, D.pl[p].cs, D.pl[p].n);
@@ -543,7 +543,7 @@ static SetResult composeDirectDsnu(const std::string& setName, const SetRoleFold
     // centre usually has no level to be a ratio of, and the p-p carries it
     // instead - which is the honest reading anyway: a dark's low-frequency
     // structure (a temperature gradient) IS part of this quantity and is not
-    // something to remove (docs/flat-field-stats.md (b)). The figure is here so
+    // something to remove (docs/features/analysis/flat-field-stats.md (b)). The figure is here so
     // it can be SEEN, not so it can be subtracted.
     setShadingFrom(R, D.shade);
     R.cutoff = D.cutoff.empty() ? kSetCutoffRaw : D.cutoff;
@@ -700,7 +700,7 @@ static SetResult runSetAnalyzer(const App::ASet& S, int kind) {
 
 // ---- the separation fit: {"sweep": Series(), "dark": Stack()} (#57 判断5) ----
 //
-// docs/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09, #57).
+// docs/features/analysis/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09, #57).
 // One flat level cannot tell an additive fixed pattern from a multiplicative
 // one; several levels can, because the two enter the SAME measured quantity
 // differently:
@@ -749,7 +749,7 @@ static SetResult runSetAnalyzer(const App::ASet& S, int kind) {
 //     different sweep.
 static const char* kSepModel = "sigma_fpn^2 = DSNU^2 + (PRNU*mu)^2";
 // The assumption the two-parameter model rides on, carried IN the result
-// (docs/flat-field-stats.md (c): "無相関を仮定していることを結果の note に
+// (docs/features/analysis/flat-field-stats.md (c): "無相関を仮定していることを結果の note に
 // 明記する"). It lives in this file with the famous names it uses.
 static const char* kSepNote =
     "the additive and the multiplicative fixed pattern are assumed "
@@ -1032,7 +1032,7 @@ static SepFit& sepComposeFit(SepFit& F, const SetRoleFold& dark) {
     // ---- the two named outputs ---------------------------------------------
     // Both coefficients are variances, so both can come out negative on data
     // whose fixed pattern is under the fit's own scatter. Clamped at 0 with the
-    // clamp DECLARED - the guard rule of docs/flat-field-stats.md (a), and the
+    // clamp DECLARED - the guard rule of docs/features/analysis/flat-field-stats.md (a), and the
     // same one the direct rows follow.
     for (int i = 0; i < 2; i++) {
         SetResult& R = i ? F.prnu : F.dsnu;

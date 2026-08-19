@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ---- --histhl-selftest: the value highlight (#68) ---------------------------
 // Drag a value interval on the histogram's x axis; the pixels in it are painted
-// on the image and the count is declared. docs/histogram-select-design.md is
+// on the image and the count is declared. docs/features/histogram/histogram-select-design.md is
 // the specification and §9 is this file's running order.
 //
 // Windowless, on the abEqSelftest pattern and for the same reason: every claim

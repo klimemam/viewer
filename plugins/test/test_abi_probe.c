@@ -1,4 +1,4 @@
-/* test_abi_probe.c - the probe rule (docs/abi-v3.md §2.2) from the plugin's
+/* test_abi_probe.c - the probe rule (docs/reference/abi-v3.md §2.2) from the plugin's
  * side, which is the side nobody can observe from inside the viewer.
  *
  * §2.2 is the reason v3 is meant to be the last version bump: new host
@@ -43,7 +43,7 @@ static int32_t takeAnalyzer2(void* ctx, const psAnalyzerV2* a) {
     g_fails++;
     return 1;
 }
-/* The stack mouth's seat (docs/abi-v3.md §5). A frame analyzer must never
+/* The stack mouth's seat (docs/reference/abi-v3.md §5). A frame analyzer must never
  * arrive here: the two seats are adjacent, so a one-slot offset error lands
  * exactly in this function, and reaching it silently is precisely the failure
  * an already-built dll would suffer. */

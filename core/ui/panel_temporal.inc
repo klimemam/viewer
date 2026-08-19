@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ---- sigma_fpn, and the two things that make it readable -------------------
-// #57 judgment 2 (docs/flat-field-stats.md (b)) made the sigma_fpn ROW ITSELF
+// #57 judgment 2 (docs/features/analysis/flat-field-stats.md (b)) made the sigma_fpn ROW ITSELF
 // the corrected quantity. A corrected number that does not say what was taken
 // off it cannot be checked, and a clamped one that prints a bare 0 is worse
 // than useless - it reads as "this sensor has no fixed pattern" when what
@@ -18,11 +18,11 @@ static const char* FPN_TIP =
     "without the subtraction that leftover is read as fixed pattern (at n=16,\n"
     "sigma_t=10 DN a true 5 DN pattern reads 5.59 DN).\n"
     "Still includes scene detail unless the region is flat.\n"
-    "docs/flat-field-stats.md (b) - #57 judgment 2";
+    "docs/features/analysis/flat-field-stats.md (b) - #57 judgment 2";
 
 // The four rows every Temporal table prints, with sigma_fpn's declaration.
 // A clamped plane says so IN ITS CELL: the canon's guard rule is that a clamp
-// is never a silent 0 (flat-field-stats.md (a)).
+// is never a silent 0 (docs/features/analysis/flat-field-stats.md (a)).
 // `splitValid` false = the region is one pixel, which has a sigma_t and no
 // spatial extent for a fixed-pattern spread to be a spread OVER. The two rows
 // that need one are refused BY NAME instead of printing the zeros the
@@ -72,7 +72,7 @@ static void temporalPointNote() {
         "one pixel: sigma_t is this pixel's own temporal noise and stands. The "
         "fixed-pattern\n"
         "split is the SPATIAL spread of the time-averaged frame "
-        "(docs/flat-field-stats.md (b)),\n"
+        "(docs/features/analysis/flat-field-stats.md (b)),\n"
         "and one pixel has no spatial extent for it to be a spread over - so it "
         "is not 0,\n"
         "it is not measured. Draw a rectangle ROI to get the split back.");
@@ -393,7 +393,7 @@ static bool applyFrameAxis(int seqId, const char* name, const char* unit,
 // members. The frame axis KEEPS its monitor role in this panel (the per-frame
 // mean curve below), which is all §3.3 leaves at the stack layer.
 
-// ---- Temporal export: one document, two sinks (docs/export-design.md) -------
+// ---- Temporal export: one document, two sinks (docs/features/export/export-design.md) -------
 // A CSV/TSV document under construction. ONE builder produces the cells; the
 // delimiter is the only thing the two sinks disagree about. TSV: tabs (and
 // newlines) inside a cell are squashed to spaces. CSV: RFC 4180 minimal - a
@@ -442,7 +442,7 @@ static std::string expNum(double v) {
 // the profile-statistics section). Everything in a row is computable from that
 // frame alone - deliberately NO temporal columns: sigma_t is a property of
 // the stack, not of a frame (a per-frame "temporal noise" would be a category
-// error - see docs/stats-taxonomy.md 3). Full-pixel scan of the region, so an
+// error - see docs/features/analysis/stats-taxonomy.md 3). Full-pixel scan of the region, so an
 // independent numpy implementation can reproduce every number
 // (--framestats-selftest prints exactly this block).
 struct PerFrameBlock {
@@ -457,7 +457,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
     int rx = 0, ry = 0, rw = 0, rh = 0;
     // ...and a POI is that region with rw = rh = 1. It has to be read here as
     // well as in recomputeTemporalIfNeeded: the panel and the file it exports
-    // describing different regions is exactly the defect docs/verify-matrix.md
+    // describing different regions is exactly the defect docs/verification/matrix.md
     // was built to find, and this is the same question asked at two doors.
     if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) { rx = a->x; ry = a->y; rw = a->w; rh = a->h; res.roiUsed = true; }
@@ -489,7 +489,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
                 const char* pn = cfa ? CFA_CH_NAMES[p] : (C > 1 ? CHN[p] : "");
                 std::string sfx = *pn ? std::string("_") + pn : std::string();
                 h.push_back("mean" + sfx + " [DN]");
-                // Each sigma names its ddof (stats-taxonomy.md 8, ruling 4).
+                // Each sigma names its ddof (docs/features/analysis/stats-taxonomy.md 8, ruling 4).
                 // Two conventions sit next to each other in this row: `sigma`
                 // is the region's own pixels (ddof=0) and sigma_col / sigma_row
                 // are the sigma of the column and row MEANS (ddof=1). In the
@@ -522,7 +522,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
         if (ax.custom) r.insert(r.begin() + 1, expNum(ax.at(d->seqIndex)));
         for (int p = 0; p < nPl; p++) {
             double m = cnt[p] ? sum[p] / (double)cnt[p] : 0.0;
-            // ddof=0 (stats-taxonomy.md §8 判断1). This was the ONE site out of
+            // ddof=0 (docs/features/analysis/stats-taxonomy.md §8 判断1). This was the ONE site out of
             // twelve computing the region's own sigma with ddof=1, and it made
             // this panel disagree with ITSELF: the frame-std graph beside it
             // (temporal_model.inc, T.frameStd) is ddof=0, so the same sigma of
@@ -570,7 +570,7 @@ static PerFrameBlock exportPerFrameBlock(int seqId, ExportDoc& doc) {
 // The old per-frame clipboard surface, kept as the thin wrapper the
 // --framestats-selftest contract rides on: the per-frame block, alone, as TSV.
 // The Temporal panel's buttons now go through buildTemporalExport instead
-// (docs/export-design.md), whose per-frame section is this very block.
+// (docs/features/export/export-design.md), whose per-frame section is this very block.
 static void copyPerFrameStats(int seqId) {
     ExportDoc doc('\t');
     PerFrameBlock r = exportPerFrameBlock(seqId, doc);
@@ -653,19 +653,19 @@ static AbTemporal abTemporalOf(const ImageDoc* d, const App::TemporalState& T,
 // A difference only means something when both sides measured the same quantity.
 // A 1-channel stack's sigma_t and a 3-channel one's are not the same number, so
 // the delta columns stay empty rather than subtract two unlike things
-// (docs/ab-stats-plan.md 5).
+// (docs/features/compare/ab-stats-plan.md 5).
 static bool abDeltaMeaningful(const ImageDoc* a, const ImageDoc* b) {
     return a && b && a->ch == b->ch;
 }
 
-// ---- the unified Temporal export (docs/export-design.md) --------------------
+// ---- the unified Temporal export (docs/features/export/export-design.md) --------------------
 // Everything the Temporal question is answered with, in ONE document: the
 // stack statistics (sigma_t / sigma_fpn / sigma_tot per plane), the H/V
 // profile statistics of the same image/ROI (from the Projection state - the
 // SAME structs that panel draws, never re-derived), and the per-frame S1
 // series. Labelled '#' sections, each section its own rectangle: the three
 // tables have different row axes, and one rectangle would either put sigma_t
-// on frame rows (the category error stats-taxonomy.md 3 forbids) or pad
+// on frame rows (the category error docs/features/analysis/stats-taxonomy.md 3 forbids) or pad
 // itself unreadable. Every compare side rides along with a side column - an
 // export that silently dropped B would not reproduce the screen.
 struct TExpSide {
@@ -832,7 +832,7 @@ static std::string buildTemporalExport(char delim) {
             doc.comment(b);
         }
         // the swept parameter, when this stack is a series member: the one
-        // piece of +meta the file does not carry (docs/stats-taxonomy.md)
+        // piece of +meta the file does not carry (docs/features/analysis/stats-taxonomy.md)
         if (App::Series* S = seriesOfStack(d->seqId))
             for (const auto& m : S->members)
                 if (m.seqId == d->seqId) {
@@ -890,7 +890,7 @@ static std::string buildTemporalExport(char delim) {
                 "same estimator local and server); sigma_fpn = "
                 "sqrt(max(0, var_spatial(per-pixel temporal means, ddof=1) - "
                 "fpn_corr^2)) with fpn_corr = sqrt(mean(s_t,i^2/n_i)) - the "
-                "temporal residual C subtracted (docs/flat-field-stats.md (b), "
+                "temporal residual C subtracted (docs/features/analysis/flat-field-stats.md (b), "
                 "#57 item 2); still includes scene detail unless the region is "
                 "flat; sigma_tot = quadrature sum");
     doc.comment("the uncorrected upper bound this used to print is recoverable "
@@ -937,7 +937,7 @@ static std::string buildTemporalExport(char delim) {
         // side-major, pooled "all" last of its side - the same walk the panel's
         // two layouts share (projForEachRow), spelled once more here because
         // that walk is a lambda inside the panel. The rule, not the code, is
-        // what the two exports share (docs/export-design.md 7).
+        // what the two exports share (docs/features/export/export-design.md 7).
         auto prow = [&](int i) {
             const App::ProjState::Stats& f = P.fStat[i];
             const App::ProjState::Stats& vv = P.vStat[i];
@@ -989,7 +989,7 @@ static std::string buildTemporalExport(char delim) {
 
 // The Temporal panel's export surface: one builder, two sinks. This replaced
 // the per-frame-only "Copy per-frame stats": the numbers a report needs
-// travel together (docs/export-design.md).
+// travel together (docs/features/export/export-design.md).
 static void temporalExportButtons() {
     if (ImGui::SmallButton("Copy (TSV)")) {
         std::string s = buildTemporalExport('\t');
@@ -1130,7 +1130,7 @@ static bool temporalChartVisible() {
 }
 
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
-// (docs/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
+// (docs/features/compare/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     recomputeTemporalIfNeeded(im, app.temporal[0]);
     // NOT throttled: temporal is keyed on the STACK and its ROI, so stepping
@@ -1190,7 +1190,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     temporalExportButtons();   // covers every side on screen, not only A
     if (A.isStack) { ImGui::SameLine(); frameAxisPopupButton(im); }
     // B's server aggregate is never fired automatically - one explicit press,
-    // one remote job (docs/ab-stats-plan.md 4).
+    // one remote job (docs/features/compare/ab-stats-plan.md 4).
     if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
         if (serverComputes(*sb)) {
             ImGui::SameLine();

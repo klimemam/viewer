@@ -33,7 +33,7 @@
 static const int kDetrendProbeDegree = 2;
 
 // ---- the figure -------------------------------------------------------------
-// docs/flat-field-stats.md (a)'s table: "シェーディング | 低周波成分の p-p /
+// docs/features/analysis/flat-field-stats.md (a)'s table: "シェーディング | 低周波成分の p-p /
 // 中心比 | %". Both halves are reported, because only one of them is always
 // defined: the p-p of the low-frequency component is a DN spread and exists on
 // any picture, while the ratio needs a level to be a ratio OF, and a dark has

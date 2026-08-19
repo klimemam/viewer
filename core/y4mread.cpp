@@ -239,18 +239,18 @@ std::string videoRefusal(const std::string& path) {
     }
     if (!k) return {};
     // Named, reasoned, and with the way out attached - the same three parts
-    // every refusal in docs/input-adapters.md §3.2 has. The numbers are
-    // MEASURED (docs/video-support.md §1), not asserted, because "lossy is bad"
+    // every refusal in docs/features/adapters/input-adapters.md §3.2 has. The numbers are
+    // MEASURED (docs/features/media/video-support.md §1), not asserted, because "lossy is bad"
     // is an opinion and "a sigma_t of 40 DN16 comes back 0.00" is a result.
     std::string m = std::string(k->name) +
         " needs a video codec this build does not link. Decoded 8-bit video is "
         "display-referred, not DN - a known sigma_t of 40 DN16 comes back as 0.00, "
         "and noise that IS representable at 8 bits is attenuated 11% with a "
-        "GOP-periodic bias (docs/video-support.md §1).";
+        "GOP-periodic bias (docs/features/media/video-support.md §1).";
     if (k->mayBeLossless)
         m += " This container can also hold a LOSSLESS codec (FFV1, v210), whose values "
              "would be DN - reading that still needs libavcodec, which this build weighs "
-             "at 95.6 MB against a 7.6 MB viewer (docs/video-support.md §4).";
+             "at 95.6 MB against a 7.6 MB viewer (docs/features/media/video-support.md §4).";
     m += " Convert the frames you want to measure and open the .y4m:\n"
          "    ffmpeg -i \"" + path + "\" -pix_fmt gray16le -strict -1 out.y4m";
     return m;

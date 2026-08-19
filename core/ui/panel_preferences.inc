@@ -2,7 +2,7 @@
 // ---- File > Preferences... : the one place a setting can be changed --------
 //
 // Issue #50. The panel does NOT decide what a setting is - that argument was
-// settled once, in docs/settings-inventory.md 判断19, and its result is the
+// settled once, in docs/features/settings/settings-inventory.md 判断19, and its result is the
 // SETTING_KEYS table. This file draws that table's rows and nothing else, which
 // is the whole reason it can be short: every question about which keys exist,
 // what they are called and what they accept was answered upstream.

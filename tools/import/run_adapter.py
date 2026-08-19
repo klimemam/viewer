@@ -24,7 +24,7 @@ condition themselves (4.5).
     __viewer                   container format version; its PRESENCE is what
                                distinguishes a viewer container from a plain npz.
                                1, or 2 when an analysisset is aboard (ONLY then:
-                               set-free files stay 1, docs/reader-analysisset.md 4)
+                               set-free files stay 1, docs/features/adapters/reader-analysisset.md 4)
     __n                        number of nodes
     __layer_<i>                "frame" | "stack" | "series" | "batch" | "analysisset"
     __parent_<i>               parent node index, -1 for the root
@@ -621,7 +621,7 @@ def write_npz(path, nodes):
     # __viewer is the discriminator (4.11.1): with it this npz is a viewer
     # container and the layer tree below is authoritative; without it the file is
     # an ordinary npz and the viewer classifies its members by shape
-    # (docs/npz-design.md).  It is written FIRST and always, because "is this a
+    # (docs/features/adapters/npz-design.md).  It is written FIRST and always, because "is this a
     # container?" must be answerable without understanding anything else here.
     out = {"__viewer": np.array(CONTAINER_VERSION_SET if carries_set(nodes)
                                 else CONTAINER_VERSION, dtype="int32"),

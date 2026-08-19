@@ -64,7 +64,7 @@ struct Meta {
 
 // Which ARRAY INSIDE A MATERIALISATION a request is about (protocol 12 for a
 // reader's output, 13 for a member of a .npz, 14 for a MEASURE of either -
-// docs/remote-reader-design.md §10.5). The key is the peer's own opaque token:
+// docs/features/remote/remote-reader-design.md §10.5). The key is the peer's own opaque token:
 // it is issued there, quoted back here and never recomputed, because two
 // implementations of a cache key is two answers to "is this the same thing"
 // (#71). It names an entry in the peer's cache directory and carries no path,
@@ -100,7 +100,7 @@ struct MeasureSeries {
 struct MeasureResult {
     int serverLoc = 0;            // 0 = CPU, 1 = CUDA (provenance)
     int framesUsed = 0;           // n
-    // MOP_PLUGIN_ANALYZE and MOP_SET_FOLD (docs/abi-v3.md §10/§11): WHO
+    // MOP_PLUGIN_ANALYZE and MOP_SET_FOLD (docs/reference/abi-v3.md §10/§11): WHO
     // computed this, read off the PEER's ledger - its plugin row for the first,
     // its own viewer version for the second, since a built-in has no dll.
     // Empty for every other op: those never claimed a provenance trailer.
@@ -133,7 +133,7 @@ struct MeasureReq {
     // measured again (docs/terminology.md), so a per-frame geometry would not
     // be a stack. A SET names several stacks and could need one per role, which
     // this grammar cannot say - so it is refused rather than approximated
-    // (docs/remote-headerless-design.md §7.3).
+    // (docs/features/remote/remote-headerless-design.md §7.3).
     bool hasRecipe = false;
     rp::RawWire recipe{};
     // MOP_SET_FOLD only. A set is {role: stack}, and the flat `paths` list
@@ -165,7 +165,7 @@ struct MeasureReq {
 // What MSG_READER_RUN answered. Every field is a FACT the peer observed; the
 // sentences a person reads are written by the client from these, because the
 // peer does not know whose machine it is being called from and half the fixes
-// are on the other end (docs/remote-reader-design.md §6).
+// are on the other end (docs/features/remote/remote-reader-design.md §6).
 struct ReaderRun {
     int outcome = 0;              // rp::ReaderOutcome
     std::string err;              // the peer's one line for outcome != 0
@@ -265,7 +265,7 @@ public:
     // peer sent them, in the source dtype, with no narrowing to float32.
     //
     // It exists for the reader path and for one assertion (docs/
-    // remote-reader-design.md stage 2 R8): a reader's output opened locally and
+    // docs/features/remote/remote-reader-design.md stage 2 R8): a reader's output opened locally and
     // through a peer must be BIT-IDENTICAL. The local door hands the .vstream
     // blob to loadNpyBuffer; the remote door has to hand it the same bytes, and
     // a round trip through float32 and back is exactly what would make a u4
@@ -280,7 +280,7 @@ public:
     // `files` are the three texts rp::READER_RUN_FILES names, in that order:
     // the user's reader, viewer_import.py and run_adapter.py. They are CARRIED
     // rather than resolved by name over there, so the bytes that ran are the
-    // bytes the memo names (docs/remote-reader-design.md §3).
+    // bytes the memo names (docs/features/remote/remote-reader-design.md §3).
     //
     // Returns false only when the LINK failed; a reader that could not run is a
     // true return with an outcome that says so.
@@ -305,7 +305,7 @@ public:
     // Start the peer with --serve-readers (the default). Turned OFF only by the
     // test that has to observe a CLOSED gate: the flag is written by the side
     // that starts the process, so "a peer without it" is not something a client
-    // can reach any other way. docs/remote-reader-design.md §2.2 is why the
+    // can reach any other way. docs/features/remote/remote-reader-design.md §2.2 is why the
     // client writing it is not a contradiction - over ssh it is the exercise of
     // a permission the user already has.
     void setServeReaders(bool on) { serveReaders_ = on; }

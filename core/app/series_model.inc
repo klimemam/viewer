@@ -340,7 +340,7 @@ static void pruneDeadFrameMembers() {
     pruneEmptySeries();
 }
 
-// ---- AnalysisSet (docs/reader-analysisset.md, "ras"): the model --------------
+// ---- AnalysisSet (docs/features/adapters/reader-analysisset.md, "ras"): the model --------------
 // No UI here, the series-model rule: the invariants have to hold before
 // anything can draw them. Sets are few and roles are a handful each, so every
 // lookup is a plain walk.

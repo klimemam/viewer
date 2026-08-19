@@ -5,7 +5,7 @@
     python tools/import/test_adapters.py --messages # + every validation message produced
 
 No test framework: plain asserts and a main().  numpy is required (the harness
-needs it anyway); nothing else.  Every case is written against docs/input-adapters.md
+needs it anyway); nothing else.  Every case is written against docs/features/adapters/input-adapters.md
 section 4 and is annotated with the paragraph it comes from.
 """
 
@@ -970,8 +970,8 @@ def shipped_adapters_run():
     assert m["__pixels_0"].shape == (4, 5, 3)
 
 
-# ------------------------------------------- reader-analysisset.md 1 / 4
-# The fifth type.  Every case below is written against docs/reader-analysisset.md
+# ------------------------------------------- docs/features/adapters/reader-analysisset.md 1 / 4
+# The fifth type.  Every case below is written against docs/features/adapters/reader-analysisset.md
 # and annotated with the section it comes from ("ras" = that document).
 
 @case

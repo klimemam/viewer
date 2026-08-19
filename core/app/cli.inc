@@ -96,7 +96,7 @@ static std::string g_detrendSelftest;     // --detrend-selftest <dir>: the detre
 static bool g_roiStatsSelftest = false;
 
 // --roi-export-selftest: the ROIs table as a DOCUMENT (issue #67) - the
-// sectioned format docs/export-design.md 2 confirmed, and above all the
+// sectioned format docs/features/export/export-design.md 2 confirmed, and above all the
 // rectangle the table carries as a value (x/y/w/h as columns). Takes no
 // directory and no window for the --roistats-selftest reasons: analytic
 // fixtures, and every assertion is a string. See roiExportSelftest().
@@ -152,7 +152,7 @@ static bool g_anaProvSelftest = false;
 // built in memory, and every assertion is a number or a string.
 static bool g_stackAnaSelftest = false;
 
-// --bundled-selftest: the five SHIPPED analyzers on the v3 mouth (docs/abi-v3.md
+// --bundled-selftest: the five SHIPPED analyzers on the v3 mouth (docs/reference/abi-v3.md
 // §1's migration) - each declares a version, that version reaches the status
 // line and the Copy-table document, and nothing else about the results moved.
 // The second half is the reason it prints its whole result set to stdout: the
@@ -206,7 +206,7 @@ static bool g_bundledSelftest = false;
 // was never expanded on ANY frame in between), chkfocus:0|1 - any FAIL fails
 // the run.
 //
-// The "more" drawer's removal (docs/browse-topbar-design.md 10.2/10.3) is
+// The "more" drawer's removal (docs/features/browse/browse-topbar-design.md 10.2/10.3) is
 // asserted by chktitle (the panel is named after its machine, both directions,
 // with the ### id untouched), chkstat:N (the bottom status line's item and
 // selected counts, both directions, and one line only), chkstar:0|1 (the star
@@ -266,7 +266,7 @@ static int g_rbImgMark = -1;
 static std::string g_browseKeysActs =
     "down,down,down,enter,flat,down,down,down,flat,down,tree,down,right,down,"
     "left,end,home,up,down,down,back,"
-    // ---- what PREVIEW means for a stack row (docs/todo-open.md items 1/26).
+    // ---- what PREVIEW means for a stack row (docs/background/project/todo-open.md items 1/26).
     // Floated first (w400): the click actions aim real mouse events at the
     // cursor row's rectangle, and the user's saved layout must not decide
     // where that is. A grouped row previews as a poster + a 24-frame scrub,
@@ -386,7 +386,7 @@ static std::string g_browseKeysActs =
     "viewreset,flat,tree,natorder,"
     "w271,w200,w180,w420,w700,w1150,w271,w700,w180,w0,"
     "viewreset,rctx,esc,fmenu,esc,disc,"
-    // ---- INSTANCES (docs/todo-open.md item 17: the panel stopped being a
+    // ---- INSTANCES (docs/background/project/todo-open.md item 17: the panel stopped being a
     // singleton). Reconnect the primordial panel, then open a SECOND Browse
     // standing in a DIFFERENT place at the same moment - the one sentence a
     // singleton can never make true (one App::rbrowse.dir = one place, ever).
@@ -415,7 +415,7 @@ static std::string g_browseKeysActs =
     // ...and the LAST one closing only hides: View > Panels > Browse reopens
     // it with its place, listing and cursor intact
     "hidep,chkshown:0,showp,chkshown:1,chkdir:rb,focus,up,chkatrow:..,"
-    // ---- THE DRAWER IS GONE (docs/browse-topbar-design.md 10.2/10.3). Each
+    // ---- THE DRAWER IS GONE (docs/features/browse/browse-topbar-design.md 10.2/10.3). Each
     // of these asserts one of its contents in the place it moved to, which is
     // the only way to tell "rehomed" from "deleted". Floated first so the path
     // line has room for the star and the click can be aimed at it.
@@ -470,7 +470,7 @@ static std::string g_browseKeysActs =
     "end,chkpin:a;b;c;,"
     "imgmark,pinclick,chkimgmark,chkpin:-,"
     "h0,w0,viewreset,back,waitdir:expset,back,waitdir:rb,"
-    // ---- "Open with reader..." on a row (docs/input-adapters.md §4.13) -----
+    // ---- "Open with reader..." on a row (docs/features/adapters/input-adapters.md §4.13) -----
     // The reader had ONE way in from this panel: double-click something the
     // viewer cannot read. That serves the file nobody can open and nobody
     // else - there was no way to re-bind a file already bound to a reader,
@@ -582,11 +582,11 @@ static void printUsage() {
         "  --settings-template         print a settings.jsonc carrying the settings\n"
         "                              that differ from the defaults, and exit. It\n"
         "                              writes nothing: redirect it to the file (see\n"
-        "                              docs/settings-inventory.md)\n"
+        "                              docs/features/settings/settings-inventory.md)\n"
         "  --zoom <z>                  initial zoom (1 = 100%%)\n"
         "  --center <x,y>              initial view center in image pixels\n"
         "  -h, --help                  show this help\n"
-        // All of them, always. docs/manual.md 9 promises this list is the canon,
+        // All of them, always. docs/guides/manual.md 9 promises this list is the canon,
         // and it said 8 of 22 for long enough that --verify-selftest could be
         // believed not to exist. Adding a flag means adding its line here.
         //
@@ -744,7 +744,7 @@ static void parseCli(int argc, char** argv) {
             cliQuad = true;                        // applied at load; order-independent
             rawReady = true;
         } else if (a == "--npy-axis") {
-            // docs/input-adapters.md §3.4. One global flag decided the meaning
+            // docs/features/adapters/input-adapters.md §3.4. One global flag decided the meaning
             // of every 3-D array in a run, so a session holding one file to read
             // as a stack and another to read as colour could not be expressed at
             // all. Say so and carry on - silence would leave the user believing
@@ -1412,7 +1412,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
                 bad2 ? "FAIL" : "ok", local.size());
         bad += bad2 ? 1 : 0;
         // ...and the same again with the frame declared MOSAICED. CFA planes
-        // are never mixed (docs/stats-taxonomy.md), so stats/moments must
+        // are never mixed (docs/features/analysis/stats-taxonomy.md), so stats/moments must
         // bucket by plane (R/Gr/Gb/B) instead of pooling into one "ch0" - and
         // both sides must do it identically, or a remote measurement and a
         // local one of the same pixels disagree.
@@ -1519,7 +1519,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
         double ns = (double)samples;
         double refMean = aM / ns;
         double refSt = sqrt(aV / ns);
-        // The CORRECTED sigma_fpn (#57 judgment 2, docs/flat-field-stats.md (b)):
+        // The CORRECTED sigma_fpn (#57 judgment 2, docs/features/analysis/flat-field-stats.md (b)):
         // var_spatial(M) at ddof=1 minus C = mean_i(s_t,i^2/n_i), clamped at 0.
         // This reference exists to disagree with serve.cpp if serve.cpp drifts,
         // so it is written from the settled formula rather than copied from it.
@@ -1815,7 +1815,7 @@ static int remoteSelfTest(const char* exe, const char* path) {
         //
         // The two blocks above pin what the doors accept and what they refuse.
         // This one pins the third case, which had no remote half at all: the
-        // file OPENED, and it opened the wrong way round. docs/input-adapters.md
+        // file OPENED, and it opened the wrong way round. docs/features/adapters/input-adapters.md
         // §3.3 built the way out of that - the Inspector says how the array was
         // read and offers the other readings the shape permits - and §4.13.1
         // decided remote is in from v1, but FrameSource::npyShape was only ever

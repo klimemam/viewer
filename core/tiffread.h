@@ -20,7 +20,7 @@
 //     something this program should read anyway. What is left after refusing
 //     tiles, CCITT, JPEG-in-TIFF, palettes and CFA is: walk the IFD chain,
 //     un-RLE or inflate some strips, undo a difference, widen to float.
-//   * the refusals ARE the deliverable here (docs/input-adapters.md §3.6). A
+//   * the refusals ARE the deliverable here (docs/features/adapters/input-adapters.md §3.6). A
 //     library hands back an error code; this file hands back the sentence a
 //     user reads, naming the feature and the tag it came from.
 //

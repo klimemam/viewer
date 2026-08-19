@@ -3,7 +3,7 @@
  * Deliberately written the way a THIRD-PARTY dll built before v3 was written:
  * V2 descriptor, `host->abi_version < 2u` gate, register_analyzer2. Nothing in
  * this file knows that v3 exists, and nothing in it may ever need to - that is
- * what docs/abi-v3.md §2.1 promises ("既存バイナリの動作そのもの。何も要らない")
+ * what docs/reference/abi-v3.md §2.1 promises ("既存バイナリの動作そのもの。何も要らない")
  * and what --anaprov-selftest checks against the v3 host it is loaded into.
  *
  * Not shipped: CMake puts it in build/plugins-abitest, which only the selftest

@@ -67,7 +67,7 @@
 namespace setfold {
 
 // Every Stack role of every set analyzer demands 2 frames: the correction is
-// made of s_t, and one frame has no s_t (docs/flat-field-stats.md (b)).
+// made of s_t, and one frame has no s_t (docs/features/analysis/flat-field-stats.md (b)).
 static const int kMinFrames = 2;
 // computeStackStats' own ceiling, and the local fold's. Two folds of this size
 // is ~1 GB of accumulators on the peer, which is the honest price of the
@@ -145,7 +145,7 @@ inline void differenceImage(const double* Ma, const double* Mb, size_t samples,
 }
 
 // ---- the parity declaration --------------------------------------------------
-// docs/abi-v3.md §10 matches a plugin by name AND version because two machines
+// docs/reference/abi-v3.md §10 matches a plugin by name AND version because two machines
 // with the same folder of dlls and different builds inside them answered the
 // same question differently and nothing said so. A set analyzer is a BUILT-IN,
 // so there is no dll and no descriptor version to compare - and the viewer's

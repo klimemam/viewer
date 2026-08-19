@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ImageView/compare
-    // ---- A/B statistics caches (docs/ab-stats-plan.md, section 6) -------------
+    // ---- A/B statistics caches (docs/features/compare/ab-stats-plan.md, section 6) -------------
     // The five statistics panels keep TWO cache slots now: 0 = A (the current
     // frame), 1 = B (the compare side). Headless, what has to hold:
     //   A1  both slots fill, each keyed to its OWN document
@@ -42,7 +42,7 @@
         }
 
         // ---- the reference implementations, written from the rule, not shared
-        // with the panel: 256 bins on the SNAPPED grid (docs/todo-open.md 9 -
+        // with the panel: 256 bins on the SNAPPED grid (docs/background/project/todo-open.md 9 -
         // an integer number of DN per bin, or a power of two for float), one
         // sample every `step`-th pixel of the resolved rect, CFA planes never
         // mixed.
@@ -173,7 +173,7 @@
                 // because the PANEL was the side that was wrong - two copies of
                 // one mistake reading as a confirmation. The number this
                 // reference exists to check is defined once, in
-                // docs/stats-taxonomy.md, and the definition is the unbiased
+                // docs/features/analysis/stats-taxonomy.md, and the definition is the unbiased
                 // one; the whole point of computing it here rather than calling
                 // the panel's code is that it is written from the DEFINITION.
                 double v = std::max(0.0, s2[k] / used - m * m) *
@@ -1650,7 +1650,7 @@
             // curves nor any sentence. The first fix was to make it SAY so, and
             // this assert pinned "AB" as the spoken limit of the day.
             //
-            // The limit is now gone (docs/compare-n-design.md D5, unblocked by
+            // The limit is now gone (docs/features/compare/compare-n-design.md D5, unblocked by
             // ruling 2 of 2026-08-14): with one plane on the axis - which the
             // shared plane selector is what makes reachable - every side takes
             // the shared axis in its own slot ink. Derivation of the expected
@@ -1806,7 +1806,7 @@
         }
 
         // ---- W: the bin GRID - integer / power-of-two bin widths ------------
-        // (docs/todo-open.md 9, user report 2026-07-29.) 256 bins spread evenly
+        // (docs/background/project/todo-open.md 9, user report 2026-07-29.) 256 bins spread evenly
         // over [black, white] gives a FRACTIONAL bin width whenever the range is
         // not a multiple of 256: at 64..1023 that is 3.746 DN, so one bin
         // swallows 4 integer DN values and the next swallows 3, and the panel

@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // The AnalysisSet layer's home (docs/analysis-layers.md §2, "住処" = set の操作):
-// the SetAnalyzers of docs/flat-field-stats.md (b) over ONE bound set. The
+// the SetAnalyzers of docs/features/analysis/flat-field-stats.md (b) over ONE bound set. The
 // arithmetic is core/app/setanalysis.inc; this file only reads it out.
 //
 // It follows its sibling panels rather than inventing a shape:
@@ -9,8 +9,8 @@
 //   - Temporal recomputes on a KEY (subject + stackRev + frame count) instead of
 //     every frame, and never on its own initiative beyond that;
 //   - the refusal of an analysis whose signature is unmet is a greyed row with
-//     one line of reason, never a hidden row (measure-ux.md).
-// What is NOT borrowed is a detrend option: docs/flat-field-stats.md 判断6 puts
+//     one line of reason, never a hidden row (docs/features/analysis/measure-ux.md).
+// What is NOT borrowed is a detrend option: docs/features/analysis/flat-field-stats.md 判断6 puts
 // detrend in the PreProcessor stage and nowhere else, so there is no switch here
 // that could change what these numbers mean.
 struct SetPanelCache {
@@ -141,7 +141,7 @@ static void setPanelRow(const SetResult& R) {
             ImGui::TableNextColumn();
             // never a ratio without a level: a dark has no centre level to be
             // a percentage OF, and the p-p beside it is the figure that always
-            // exists (docs/flat-field-stats.md (a)'s "低周波成分の p-p / 中心比")
+            // exists (docs/features/analysis/flat-field-stats.md (a)'s "低周波成分の p-p / 中心比")
             if (R.shadePctOk[p]) ImGui::Text("%.4g", R.shadePct[p]);
             else                 ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); ImGui::Text("%.4g", R.shadePp[p]);
@@ -396,7 +396,7 @@ static void drawPanelSetAnalysis() {
                            "from a folder name or from level 0.");
         ImGui::Spacing();
         ImGui::TextDisabled("A set binds roles to data. Today they are made by a reader");
-        ImGui::TextDisabled("that returns AnalysisSet(...) - docs/reader-analysisset.md.");
+        ImGui::TextDisabled("that returns AnalysisSet(...) - docs/features/adapters/reader-analysisset.md.");
         return;
     }
     if (!aSetById(g_setPanel.setId)) g_setPanel.setId = app.analysisSets.front().id;

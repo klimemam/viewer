@@ -128,7 +128,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
       << (app.showHistogram ? 1 : 0) << " " << (app.showTemporal ? 1 : 0) << " "
       << (app.showProjection ? 1 : 0) << " " << (app.showSeriesAnalysis ? 1 : 0) << " "
       << (app.showRemote ? 1 : 0) << " " << (app.showSetAnalysis ? 1 : 0) << "\n";
-    // Browse places (docs/todo-open.md item 10, user decision A5: auto-
+    // Browse places (docs/background/project/todo-open.md item 10, user decision A5: auto-
     // reconnect): one "rbplace <num> <url>" line per instance that stands
     // somewhere. placeUrl keeps the port. On load each instance reconnects
     // THROUGH ITS OWN WORKER, asynchronously - the UI never blocks on ssh,
@@ -328,7 +328,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
           << s.dt.spec.block << " " << (s.dt.spec.divide ? 1 : 0) << " "
           << s.dt.ofPath << "\n";                   // path last: may contain spaces
         if (!s.dt.ofMember.empty()) f << "refmember " << s.dt.ofMember << "\n";
-        // The node is renameable (docs/reader-analysisset.md's rule for every
+        // The node is renameable (docs/features/adapters/reader-analysisset.md's rule for every
         // node), so the session owns the name the way seqname does.
         f << "detrendname " << s.name << "\n";
     }
@@ -450,7 +450,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                         "restore them from\n", lostSeries, lostMembers);
     if (lostSeriesOut) *lostSeriesOut = lostSeries;
     if (lostMembersOut) *lostMembersOut = lostMembers;
-    // ---- analysis sets (docs/reader-analysisset.md §5), AFTER the series ----
+    // ---- analysis sets (docs/features/adapters/reader-analysisset.md §5), AFTER the series ----
     // blocks: a set may bind a series, and the referenced side writes first.
     // The four rules are the series block's, by name (§5): flat unique keys;
     // members travel by first-frame path (stack) / path (frame) / (batch,
@@ -1206,7 +1206,7 @@ static void loadPrefs() {
 }
 
 // ---- input adapters: running one, and remembering which one ------------------
-// docs/input-adapters.md §4.12 / §4.13. The viewer never goes looking for an
+// docs/features/adapters/input-adapters.md §4.12 / §4.13. The viewer never goes looking for an
 // adapter and never applies one it was not told to apply: everything below
 // starts from a spec the user chose, or from the record of a choice they made
 // earlier. That is the whole trust model, and it is why there is no search path.
@@ -1267,7 +1267,7 @@ static std::string runAdapterScript() {
     return {};
 }
 
-// ---- where readers are looked for (docs/input-adapters.md §4.13.2) ----------
+// ---- where readers are looked for (docs/features/adapters/input-adapters.md §4.13.2) ----------
 // The ruling on issue #51 (2026-08-10): 「reader のファイルもしくはフォルダを
 // 登録できるようにすればよいですかね.」 Before it the search path was ONE user
 // folder plus one hard-coded folder beside the harness, so a person with
@@ -1562,7 +1562,7 @@ static std::string adapterCacheDir() {
 // ---- the four sentences a run that did not work produces -------------------
 //
 // Pulled out of readerFinish when the SAME four became reachable from a peer
-// (issue #180, docs/remote-reader-design.md §6). `where` is "" for this machine
+// (issue #180, docs/features/remote/remote-reader-design.md §6). `where` is "" for this machine
 // and " on <host>" for a peer, and it is the only difference: the same failure
 // must not get two sentences depending on which end hit it, and naming the
 // machine is what makes the remote ones actionable at all - "which python is
@@ -2733,7 +2733,7 @@ static std::string loadSession(const std::string& path) {
                 refFor = RM_SERIES;               // a `refmember` may follow
             }
         }
-        // ---- analysisset block (docs/reader-analysisset.md §5.1): collected
+        // ---- analysisset block (docs/features/adapters/reader-analysisset.md §5.1): collected
         // here, resolved at the drain gate (resolveASetRestore). A reader-read
         // origin re-runs its reader through the image lines above, so the
         // adopt rule (§5.2) has both declarations in hand by the time it fires.

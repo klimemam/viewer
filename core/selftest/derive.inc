@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
-    // ---- derive a stack from a stack (docs/todo-open.md item 0) ---------------
+    // ---- derive a stack from a stack (docs/background/project/todo-open.md item 0) ---------------
     // Two synthesised stacks: A = f_000..f_007 (8 frames, pixel value = number),
     // B = f_000,001,002,004,006,007,009 (gaps at 3 and 5, one alien file, pixel
     // value = number + 100). B loads with CONTIGUOUS 0..6 frame numbers, which

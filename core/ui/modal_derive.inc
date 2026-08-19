@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
-// ==== derive a stack from a stack (docs/todo-open.md item 0) ================
+// ==== derive a stack from a stack (docs/background/project/todo-open.md item 0) ================
 // A NEW stack from a subset of an existing one, so two stacks with mismatched
 // membership can be lined up and compared frame by frame. BY REFERENCE since
 // stage 3 (docs/reference-design.md §6.1): the source stays intact, and a

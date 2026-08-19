@@ -3,7 +3,7 @@
 //
 // The subject is the sharpest promise this program makes. README's first
 // paragraph and docs/terminology.md both rest on the number shown being the
-// number in the file; docs/input-adapters.md §4.8 states it outright - "an
+// number in the file; docs/features/adapters/input-adapters.md §4.8 states it outright - "an
 // integer rides onto f32 with its value intact" - and lists i32 and f64 among
 // the dtypes it displays. FrameSource::data is std::vector<float>, float32
 // carries a 24-bit significand, and so §4.8's sentence is FALSE above 2^24 and

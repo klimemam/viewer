@@ -131,7 +131,7 @@ jobs:
           retention-days: 30
       - name: Adapter suite
         # 36 cases over viewer_import.py and run_adapter.py that nothing ran.
-        # They were written against docs/input-adapters.md section 4 and are the
+        # They were written against docs/features/adapters/input-adapters.md section 4 and are the
         # only check on what a user's reader is allowed to return - and they had
         # never gated a merge, so a change that broke them would have landed
         # green. numpy is already installed for gen_testdata.py, so this costs a

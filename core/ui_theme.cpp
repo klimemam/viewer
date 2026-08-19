@@ -1,4 +1,4 @@
-// "Aurora" theme — C++ port of the design study in docs/imgui_modern_design.md.
+// "Aurora" theme — C++ port of the design study in docs/features/theme/imgui_modern_design.md.
 //
 // Design rules (see the doc for the full rationale):
 //   1. Layered neutrals (app bg -> panel -> control), never pure black/white,

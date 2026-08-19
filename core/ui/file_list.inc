@@ -310,7 +310,7 @@ static void drawFileList() {
                                 // it appends to app.images, which this walk is
                                 // iterating over
     int pendingSumSeq = 0;      // the sum fold, deferred identically
-    // The detrend stage's product (docs/flat-field-stats.md 判断6): a NEW stack,
+    // The detrend stage's product (docs/features/analysis/flat-field-stats.md 判断6): a NEW stack,
     // so it appends to app.images and defers for the same reason as the two
     // above. The spec rides with the id - "which removal" is the whole content
     // of the request, and a product made with the wrong one is not fixable by
@@ -747,7 +747,7 @@ static void drawFileList() {
             //     2026-07-30, 「B,Cは薄く表示」). B's seat is the PIN
             //     (bSeatUid), never cmpB(): the letter must not vanish while
             //     A stands on the pin (paused) or while compare is off.
-            //   - A is the CURSOR, not a seat (docs/compare-n.md §1). It
+            //   - A is the CURSOR, not a seat (docs/features/compare/compare-n.md §1). It
             //     marks the current row only while a comparison is ACTIVE:
             //     compare off means nothing is being compared, so no A.
             const bool cmpOn = app.compareMode != App::CmpOff;
@@ -1164,7 +1164,7 @@ static void drawFileList() {
               !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
               ImGui::IsKeyPressed(ImGuiKey_F2, false))
               ImGui::OpenPopup("seqctx");
-          // ---- Watch (docs/watch-design.md §5) --------------------------------
+          // ---- Watch (docs/features/watch/watch-design.md §5) --------------------------------
           // The stack's files moved on disk. Amber, directly under the header
           // row, and it does NOT expire: the toast that fired once already has,
           // and "3 file(s) changed on disk" is the kind of fact seqNote's
@@ -1308,7 +1308,7 @@ static void drawFileList() {
             g_filesSpans.push_back({ group.batch, S.id, sy0, shy, ImGui::GetCursorPos().y });
         }
         // ---- the batch's SETS: one node each, its role rows under it --------
-        // (docs/reader-analysisset.md §6). Reading order inside the node: set
+        // (docs/features/adapters/reader-analysisset.md §6). Reading order inside the node: set
         // -> role -> member. A role row is the BINDING's display; the member's
         // home stays the member's own stack row - the tree is not duplicated,
         // so a role row jumps (double-click) rather than re-parents.

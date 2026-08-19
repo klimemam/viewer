@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
     // ---- --detrend-selftest: the AnalysisPreProcessor stage (#57 判断6/7) -----
-    // docs/flat-field-stats.md "シェーディング除去" (確定 2026-08-09). The whole
+    // docs/features/analysis/flat-field-stats.md "シェーディング除去" (確定 2026-08-09). The whole
     // point of judgment 7 is that the DEFAULT DOES NOTHING and says how much it
     // would have done, so the two things this file must not let slip are the
     // default and the figure. What is asserted:

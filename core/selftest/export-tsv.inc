@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
     // The Temporal panel's unified export, verifiable without a human
-    // (docs/export-design.md 9 「検証」). This machine cannot screenshot GL, so the
+    // (docs/features/export/export-design.md 9 「検証」). This machine cannot screenshot GL, so the
     // assertions are on the STRING the buttons put on the clipboard: the
     // provenance fields, the section order, the per-plane rows, the units,
     // n-of-N honesty, the region statements (including the temporal-vs-profile
@@ -92,7 +92,7 @@
         // sigma_fpn row itself, so what the export owes a reader is the
         // opposite statement - which correction, off which variance, and
         // recoverably. An export that still carried the old sentence would be
-        // the failure docs/export-design.md exists to prevent (the file
+        // the failure docs/features/export/export-design.md exists to prevent (the file
         // describing a number it no longer holds).
         check(!has(tsv, "no sigma_t^2/N subtraction"),
               "E1 the old 'no subtraction' claim is gone");
@@ -133,7 +133,7 @@
         }
 
         // ---- E11: the per-frame sigma is ddof=0, and every sigma column says
-        // which ddof it is (stats-taxonomy.md §8 判断1/4/7) -------------------
+        // which ddof it is (docs/features/analysis/stats-taxonomy.md §8 判断1/4/7) -------------------
         //
         // 判断7 exists because this number was UNPINNED: --framestats-selftest
         // prints the table and leaves verification to an outside numpy script,

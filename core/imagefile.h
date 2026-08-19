@@ -20,7 +20,7 @@
 // Three rules this interface exists to enforce:
 //
 //  1. VALUES ARE AS STORED. An 8-bit PNG arrives as 0..255 and a 16-bit PNG as
-//     0..65535 - never divided by anything. docs/input-adapters.md §8-9 fixed
+//     0..65535 - never divided by anything. docs/features/adapters/input-adapters.md §8-9 fixed
 //     the pixel unit at [DN] and §4.8 says an integer rides into f32 with its
 //     value intact; a decoder that normalised to 0..1 would make the same file
 //     measure differently depending on which library was linked, which is the
@@ -52,7 +52,7 @@
 //     than flattening them into one it can. The same file also declares a black
 //     level, a white level and a bit depth - and those are SHOWN, in `note`,
 //     never applied: a NEF that declares black 0 with samples at 80 is a
-//     measured fact (docs/input-adapters.md §3.6.5), and a reader that
+//     measured fact (docs/features/adapters/input-adapters.md §3.6.5), and a reader that
 //     subtracted the declared value would be wrong there and silent everywhere.
 // ---------------------------------------------------------------------------
 #include <cstddef>
@@ -166,7 +166,7 @@ bool peerServes(const std::string& path);
 // Why the peer will not serve it, as a sentence; "" when it will. The reason a
 // format is refused over the link is not always the reason it is refused here -
 // vendor RAW is READ on this machine - so the sentence is built where the
-// column that knows lives, in the register of docs/input-adapters.md §3.2.
+// column that knows lives, in the register of docs/features/adapters/input-adapters.md §3.2.
 std::string peerRefusal(const std::string& path);
 
 // Which format the NAME claims (extension, lower-cased). Null = not one of ours,
@@ -185,7 +185,7 @@ const Backend* forBytes(const uint8_t* p, size_t n);
 // than one, and what to do with that is the caller's decision and vocabulary:
 // several pictures out of one file are the frames of a stack.
 //
-// The error is the reason ALONE, in the register of docs/input-adapters.md
+// The error is the reason ALONE, in the register of docs/features/adapters/input-adapters.md
 // §3.2 - the caller prefixes the file name, exactly as the .npy door does, so
 // that one file's refusal is worded identically wherever it is raised:
 //
@@ -212,7 +212,7 @@ std::string dialogPattern();
 // would it take to" - its `absent` state is a format this build COULD read if
 // something were linked, and its dispatch is by BYTES. These are formats this
 // build has decided not to read even though a library could: an 8-bit lossy
-// round trip destroys the measurement (docs/video-support.md §1 measured a
+// round trip destroys the measurement (docs/features/media/video-support.md §1 measured a
 // sigma_t of 40 DN16 coming back as 0.00), so linking a codec would not change
 // the answer. They are matched by NAME, they have no decoder to point at, and
 // putting twenty-one of them in the table would also march *.mp4 into
@@ -240,7 +240,7 @@ std::string videoRefusal(const std::string& path);
 // decide" and stays where it is.
 bool isHeaderless(const std::string& path);
 // A CONTAINER: a zip of .npy arrays, so it has members rather than a geometry
-// (docs/npz-design.md §2). Named here for isHeaderless's reason - since
+// (docs/features/adapters/npz-design.md §2). Named here for isHeaderless's reason - since
 // protocol 13 the peer lists one (MSG_NPZ_SCAN, issue #217) and it does not
 // compile the client's loader, so "what is a .npz" has to be one answer both
 // binaries read.
@@ -250,8 +250,8 @@ bool isNpz(const std::string& path);
 // peerServes stays what it was - "answerable with nothing else said" - because
 // that is what a LISTING and a one-click preview ask: widening it would make a
 // .raw row claim a preview it cannot make (the geometry has to come first,
-// docs/remote-headerless-design.md §5.3) and a .npz row claim one for a file
-// that has no single geometry to preview (docs/remote-reader-design.md §10.4).
+// docs/features/remote/remote-headerless-design.md §5.3) and a .npz row claim one for a file
+// that has no single geometry to preview (docs/features/remote/remote-reader-design.md §10.4).
 // This is the second half, asked where a door is about to be opened rather than
 // where a row is drawn.
 bool peerServesDeclared(const std::string& path);

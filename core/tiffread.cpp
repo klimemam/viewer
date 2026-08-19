@@ -13,7 +13,7 @@
 // a sentence into `err` that names the tag, its value and what this build does
 // read instead. `err` is the reason alone; core/imagefile.cpp prefixes the
 // format and the reader, and the caller prefixes the file name
-// (docs/input-adapters.md §3.2).
+// (docs/features/adapters/input-adapters.md §3.2).
 //
 // What is read: classic TIFF (magic 42), either byte order, strip layouts,
 // 8- and 16-bit unsigned integer and 32-bit IEEE float samples, greyscale

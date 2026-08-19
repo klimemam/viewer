@@ -216,7 +216,7 @@ static void openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
 
 // The whole recipe, as the sentence that travels with the numbers it produced.
 //
-// docs/settings-inventory.md §4.1 M1: a measuring-class setting has to appear
+// docs/features/settings/settings-inventory.md §4.1 M1: a measuring-class setting has to appear
 // in its own results, and a headerless read is nothing BUT measuring-class
 // settings - the file states none of it. The note used to say "Bayer RGGB u16"
 // and stop, which named the two fields already visible on screen and left out
@@ -267,7 +267,7 @@ static std::string rawRecipeNote(const RawDialog& d, int cfa, int cfaPattern) {
 //
 // crop is deliberately absent: it re-scopes a frame rather than being one, and
 // the local registry already refuses to share a cropped raw source
-// (docs/remote-headerless-design.md §3.2). A crop asked for on the command line
+// (docs/features/remote/remote-headerless-design.md §3.2). A crop asked for on the command line
 // therefore applies to what came back, not to what was fetched.
 static rp::RawWire rawWireFrom(const RawDialog& d) {
     rp::RawWire w{};
@@ -287,7 +287,7 @@ static rp::RawWire rawWireFrom(const RawDialog& d) {
 // second vocabulary for the same things: the words a recipe is written in are
 // RAW_DTYPE_NAMES / RAW_INTERP_CLI / CFA_PATTERNS - the same three tables
 // --raw-dtype, --raw-interp and --bayer-pattern already spell, and the same
-// ones docs/settings-inventory.md §5.5 sketched for `loading.raw`.
+// ones docs/features/settings/settings-inventory.md §5.5 sketched for `loading.raw`.
 //
 // TWO THINGS LIVE HERE AND THEIR LIFETIMES ARE OPPOSITE. That split is the
 // whole feature (the user's ruling, 2026-08-11):

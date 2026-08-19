@@ -9,7 +9,7 @@
 # exit 1 and print FAIL; the right one must exit 0 and print ok.
 #
 # The recipe below is also the template for every new --browse-keys script
-# (docs/verify-ui.md section C uses it verbatim). Two non-obvious rules:
+# (docs/verification/ui.md section C uses it verbatim). Two non-obvious rules:
 #
 #   PROLOG  waitdir:<leaf>,viewreset,w400,home
 #           viewreset is the ABSOLUTE grouped+list+folded pin (the flat/tree/

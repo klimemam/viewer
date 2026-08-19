@@ -607,7 +607,7 @@
         }
 
         {   // ---- V27: sigma_fpn is the CORRECTED quantity (#57 judgment 2) --
-            // docs/flat-field-stats.md (b) pins the estimator:
+            // docs/features/analysis/flat-field-stats.md (b) pins the estimator:
             //
             //     C         = mean_i(s_t,i^2 / n_i)
             //     sigma_fpn = sqrt(max(0, var_spatial(M) - C))      ... var ddof=1
@@ -1375,7 +1375,7 @@
         }
 
         // ---- V21: an .npz is a BATCH of members; a 1-D key is not a picture --
-        // docs/npz-design.md §1: loadNpz opened EVERY *.npy member in silence and
+        // docs/features/adapters/npz-design.md §1: loadNpz opened EVERY *.npy member in silence and
         // decodeNpyBuffer maps a 1-D (N,) array to H=1,W=N - so a per-frame
         // exposure vector arrived as a one-pixel-tall PICTURE and a scalar as a
         // 1x1 one. That is fabrication, which this project forbids.
@@ -1549,7 +1549,7 @@
             check(app.images.size() == 5, "V21 only the image-shaped members opened");
             // ...and every one of them carries the Watch baseline of the FILE
             // it came out of. This is the third of statSourceFile's decode
-            // paths; docs/verify-functional.md A-12 traced all three by eye and
+            // paths; docs/verification/functional.md A-12 traced all three by eye and
             // recorded 要probe because nothing printed mtime/fsize. srcMapDump
             // prints them, so the npz path is now checked by execution, against
             // the container's own size on disk.
@@ -1779,7 +1779,7 @@
         }
 
         // ---- V22: native reads FOUR shapes, and SAYS SO when it will not -----
-        // docs/input-adapters.md §3.1: the decision is RANK and the LAST AXIS,
+        // docs/features/adapters/input-adapters.md §3.1: the decision is RANK and the LAST AXIS,
         // and nothing else. The LEADING axis is never consulted - "a small
         // leading axis must be channels" is the guess that turned three frames
         // into one 3-channel picture, and a 1-D exposure vector into a
@@ -2058,7 +2058,7 @@
             closeAll();
         }
 
-        // ---- V25: an npz that declares its own layers (docs/input-adapters.md §4.11)
+        // ---- V25: an npz that declares its own layers (docs/features/adapters/input-adapters.md §4.11)
         // The container is built BY HAND here, with no Python involved, because
         // what is under test is the READER: given the reserved members, does the
         // viewer build the layers they declare, and does it put the conditions on

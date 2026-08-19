@@ -284,7 +284,7 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        // ---- Watch (docs/watch-design.md 項目20) ---------------------------
+        // ---- Watch (docs/features/watch/watch-design.md 項目20) ---------------------------
         // One switch, and what it governs is NOTICING - never acting. The
         // settled semantics are "notify, then a manual Reload" (A6/A6b), so
         // there is nothing here that can change a pixel behind the user; the
@@ -495,7 +495,7 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::MenuItem("Files", nullptr, &app.showFiles);
             ImGui::MenuItem("Browse", nullptr, &app.showRemote);
             // a SECOND (third, ...) view onto another place - each Browse
-            // window stands somewhere of its own (docs/todo-open.md item 17)
+            // window stands somewhere of its own (docs/background/project/todo-open.md item 17)
             if (ImGui::MenuItem("New Browse Panel")) rbNewInstance();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("another Browse window with its own place -\n"
@@ -741,7 +741,7 @@ bool rbNameIsHeaderless(const std::string& n) { return imagefile::isHeaderless(n
 // Why the peer will NOT serve this file; "" when it will. A sentence and not a
 // bool, because #111's ruling is that a remote listing SHOWS what the peer
 // cannot serve and says why - this repository refuses by name and never
-// silently omits (docs/input-adapters.md §3.2), and a row dimmed with no reason
+// silently omits (docs/features/adapters/input-adapters.md §3.2), and a row dimmed with no reason
 // is the silent omission wearing different clothes.
 // The wording lives beside the column that decides it (core/imagefile.cpp), for
 // the reason the predicate above does: a refusal that quoted ".npy only" from

@@ -1,4 +1,4 @@
-// core/browse/nav.cpp — Browse 実 TU その 1 (P7, docs/split-plan.md §3/§5)。担当: Browse
+// core/browse/nav.cpp — Browse 実 TU その 1 (P7, docs/background/project/split-plan.md §3/§5)。担当: Browse
 // instance 管理 (instances.inc) + worker / pump / navigation (この下)。
 // viewer への呼び出しは g_browseHost (host.h) 経由のみ — S3 が置いた
 // BrowseHost 注記 15 箇所はここで潰れた。GLFW への依存も一緒に消えている

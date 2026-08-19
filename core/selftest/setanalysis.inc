@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
     // ---- direct DSNU / PRNU: the SetAnalyzers of #57 judgment 4 ---------------
-    // docs/flat-field-stats.md (b), settled 2026-08-09. What is asserted here:
+    // docs/features/analysis/flat-field-stats.md (b), settled 2026-08-09. What is asserted here:
     //
     //   E1  the famous names are ENFORCED, not merely followed: a scan of the
     //       shipping sources for bare "PRNU"/"DSNU" in UI-visible string
@@ -506,7 +506,7 @@
                     setResultTitle(D).c_str(), setResultTitle(P).c_str());
             // the canon's invariant (a): a result names its layer and its set.
             // The extra role bound for PRNU does not stop DSNU running, and the
-            // tag names only the roles it USED (docs/reader-analysisset.md §1.5).
+            // tag names only the roles it USED (docs/features/adapters/reader-analysisset.md §1.5).
             check(setResultTitle(D) == "DSNU [DN] - set \"10lx vs dark\": dark 4/4",
                   "S7 DSNU names its set and the one role it used");
             check(setResultTitle(P) ==
@@ -629,7 +629,7 @@
                       "S6f shape disagreement is refused, and NAMES both shapes");
             }
             // (g) mu <= 0. Binding one stack to both roles is LEGAL
-            // (docs/reader-analysisset.md §1.2 refuses to forbid it) - so the
+            // (docs/features/adapters/reader-analysisset.md §1.2 refuses to forbid it) - so the
             // analysis is the thing that answers, with a number and a reason.
             {
                 int sid = makeSet("R-mu", { { "image", good }, { "dark", good } });
@@ -658,7 +658,7 @@
 
 
         // ================= the separation fit (#57 judgment 5) ================
-        // docs/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09).
+        // docs/features/analysis/flat-field-stats.md (c) "加法性と乗法性の分離" (確定 2026-08-09).
         // The model is sigma_fpn^2(mu) = DSNU^2 + (PRNU*mu)^2, a straight line
         // in mu^2, fitted by UNWEIGHTED OLS over the levels of a sweep. What is
         // asserted:

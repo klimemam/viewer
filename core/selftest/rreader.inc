@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
-    // ---- READERS RUN ON THE PEER (issue #180, docs/remote-reader-design.md) ---
+    // ---- READERS RUN ON THE PEER (issue #180, docs/features/remote/remote-reader-design.md) ---
     //
-    // docs/input-adapters.md §4.13.1 settled on 2026-08-03 that an adapter runs
+    // docs/features/adapters/input-adapters.md §4.13.1 settled on 2026-08-03 that an adapter runs
     // where the file lives. This is the door, stages 1 and 2: the RUN op and
     // the gate, then a document opening over the link out of what a reader
     // produced on the far side.

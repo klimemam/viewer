@@ -53,4 +53,4 @@ pip install -e tools/import
 | `adapters/npz_keys.py` `adapters/color_hwc.py` | 動く例 |
 | `test_adapters.py` | 30件の検査 |
 
-仕様は [../../docs/input-adapters.md](../../docs/input-adapters.md) です。
+仕様は [../../docs/features/adapters/input-adapters.md](../../docs/features/adapters/input-adapters.md) です。

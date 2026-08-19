@@ -48,7 +48,7 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // 6: the MEANING again, and this time of a number people paste into reports.
 // MOP_TEMPORAL_STATS' `sigma_fpn [DN]` is now the CORRECTED quantity - the
 // temporal residual mean(s_t,i^2/n_i) subtracted, ddof=1 spatial variance,
-// clamped at 0 and saying so (#57 judgment 2, docs/flat-field-stats.md (b)) -
+// clamped at 0 and saying so (#57 judgment 2, docs/features/analysis/flat-field-stats.md (b)) -
 // and the reply carries `fpn_corr [DN]` / `fpn_clamped` beside it. A v5 peer
 // answers the same key with the UNCORRECTED upper bound, which the panel would
 // then print under a label declaring a correction it never had: the same folder
@@ -57,7 +57,7 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // solely to make an installed peer update itself on connect.
 //
 // 7: MOP_PLUGIN_ANALYZE - plugin analysis run on the peer under name+version
-// PARITY, with the peer's own ledger returned as provenance (docs/abi-v3.md
+// PARITY, with the peer's own ledger returned as provenance (docs/reference/abi-v3.md
 // §10, #104 judgment 8). This is FRAMING, like 2 (adds MEASURE) and 3 (adds
 // GLOB/SCAN) and unlike 4/5/6: no answer a v6 peer already gives changes
 // meaning, and MOP_ANALYZER keeps computing exactly what it computed.
@@ -160,7 +160,7 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // by one byte - the discipline every append in this header has kept.
 //
 // 12: READERS RUN ON THE PEER (issue #180 judgment B, docs/
-// remote-reader-design.md). docs/input-adapters.md §4.13.1 settled on
+// docs/features/remote/remote-reader-design.md). docs/features/adapters/input-adapters.md §4.13.1 settled on
 // 2026-08-03 that "an adapter runs where the file lives"; until now there was
 // no door for it. MSG_READER_RUN carries the reader's THREE TEXTS to the peer,
 // the peer runs the harness there under a gate its own launcher opened
@@ -188,7 +188,7 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // by the peer that has the flag and not the consent, and a v11 peer's "unknown
 // request" is neither of those and says so.
 //
-// 13: A CONTAINER CROSSES THE LINK (issue #217, docs/remote-reader-design.md
+// 13: A CONTAINER CROSSES THE LINK (issue #217, docs/features/remote/remote-reader-design.md
 // §10). An .npz is a zip of .npy arrays and the wire has only ever addressed
 // FILES, so a .npz row was refused with "the peer serves one array per file,
 // not a container" - a true sentence about a door nobody had built.
@@ -212,7 +212,7 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // discipline this header does not bend.
 //
 // 14: MEASURE REACHES ONE ARRAY INSIDE A MATERIALISATION (issue #180 stage 5,
-// docs/remote-reader-design.md §8). Twelve and 13 taught META and TILE to
+// docs/features/remote/remote-reader-design.md §8). Twelve and 13 taught META and TILE to
 // address a reader's node and a .npz member; MEASURE could still only name
 // FILES, so the one thing a document opened that way could not do was the thing
 // the link exists for - have its statistics computed where its pixels are. The
@@ -256,7 +256,7 @@ enum MsgType : uint32_t {
     // -> (origin path, func, 3 named texts)  <- (outcome, err, stderr,
     //                                            python provenance, key, header)
     // The reader itself crosses the link; the pixels it makes do not. See
-    // docs/remote-reader-design.md §3 for why the file is CARRIED rather than
+    // docs/features/remote/remote-reader-design.md §3 for why the file is CARRIED rather than
     // resolved by name on the peer, and §4.2 for the field-by-field wire.
     MSG_READER_RUN = 8,
     // -> (path)  <- (key, kind, one FACT per member of the .npz)
@@ -294,7 +294,7 @@ enum MsgType : uint32_t {
     MSG_ERR        = 129,
 };
 
-// MSG_NPZ_SCAN reply: which of the two readings docs/input-adapters.md §4.11.1
+// MSG_NPZ_SCAN reply: which of the two readings docs/features/adapters/input-adapters.md §4.11.1
 // splits an .npz into. The peer decides it from the NAMES alone (`__viewer` is
 // present or it is not) - the same discriminator the local door uses, asked
 // before anything is inflated.
@@ -305,7 +305,7 @@ enum NpzKind : uint32_t {
 };
 
 // WHAT A MSG_NPZ_SCAN REPLY COSTS BESIDES ITS VARIABLE-LENGTH PIECES (#180
-// codex review). The aggregate ceiling (docs/remote-reader-design.md §10.2) has
+// codex review). The aggregate ceiling (docs/features/remote/remote-reader-design.md §10.2) has
 // to be spent on the WHOLE message, and the whole message is not the member
 // values: it is those values plus every name, every error string, and the fixed
 // fields that frame them. Counting only the values let a file whose values
@@ -354,7 +354,7 @@ inline uint64_t npzScanCeilingFor(const char* env) {
 // four facts plus the two the caller cannot see from here. Split rather than
 // folded into one string because the client writes a DIFFERENT sentence for
 // each and one of them (2) names a fix that is on the other machine
-// (docs/remote-reader-design.md §6).
+// (docs/features/remote/remote-reader-design.md §6).
 enum ReaderOutcome : uint32_t {
     RO_OK            = 0,   // it ran, and `key` names what it produced
     RO_GATE_CLOSED   = 1,   // this peer was started without --serve-readers
@@ -392,7 +392,7 @@ enum ReqTrailer : uint32_t {
     // in it - and the wire does not know, or need to know, what produced
     // either. Protocol 12 issued keys from MSG_READER_RUN only, which is why
     // this was spelled RQ_READER; 13 issues them from MSG_NPZ_SCAN too, and a
-    // native .npz has no reader anywhere near it (docs/remote-reader-design.md
+    // native .npz has no reader anywhere near it (docs/features/remote/remote-reader-design.md
     // §10.5). THE VALUE IS UNCHANGED - a v12 peer and a v13 client mean the
     // same 2 by it, and the rename costs no byte on any wire.
     RQ_KEYED      = 2,
@@ -420,7 +420,7 @@ enum MeasureOp : uint32_t {
     MOP_ANALYZER        = 0,   // run a named plugin analyzer on ONE frame
     MOP_TEMPORAL_STATS  = 1,   // per-pixel mean/var over N frames (noise vs FPN)
     MOP_FRAME_ROI_STATS = 2,   // per-frame per-ROI mean/var (PTC / linearity)
-    // docs/abi-v3.md §10. MOP_ANALYZER matches an analyzer by NAME, which is
+    // docs/reference/abi-v3.md §10. MOP_ANALYZER matches an analyzer by NAME, which is
     // all there was to match on before #46 gave a descriptor a version: two
     // machines with the same folder of dlls and different builds inside them
     // answered the same question differently and nothing anywhere said so.
@@ -531,7 +531,7 @@ struct MeasureReqHead {
 //       [u32 col][u32 hasX][u32 n] (hasX ? [f32*n xs]) [f32*n ys]
 //
 // MOP_PLUGIN_ANALYZE appends a provenance trailer, and it is the point of the
-// op as much as the numbers are (docs/abi-v3.md §10/§11): a remote measurement
+// op as much as the numbers are (docs/reference/abi-v3.md §10/§11): a remote measurement
 // used to arrive with no answer at all to "which plugin, which build, which
 // file" - the one thing #46 stage 1 gave every LOCAL result.
 //   [str name][str version][str file][str path]   the PEER's ledger row
@@ -603,7 +603,7 @@ struct TileReq {
 // renumbering would make one build's u16 the next one's i16 - the same hazard
 // the DType note below spells out.
 //
-// What is NOT here, each with its reason (docs/remote-headerless-design.md §3.2):
+// What is NOT here, each with its reason (docs/features/remote/remote-headerless-design.md §3.2):
 //   cfaPattern - RGGB vs BGGR changes no sample, only the planes' NAMES. It
 //                rides on MeasureReqHead where it already does, and it is not
 //                part of §6.2 identity locally either.
@@ -653,7 +653,7 @@ static const uint32_t MRF_RAW_RECIPE = 1u;
 // bit0: the blocks behind the rois are read in bit order and each one's
 // presence is declared in the head, never inferred from bytes remaining.
 //
-// The spelling is KEYED and not READER. docs/remote-reader-design.md §4.2
+// The spelling is KEYED and not READER. docs/features/remote/remote-reader-design.md §4.2
 // called it MRF_READER when a reader's output was the only thing a key could
 // name; §10.5 fixed the meaning of the pair to "the peer materialised
 // something, and this is one array in it", and a native .npz stack measured
@@ -751,7 +751,7 @@ uint32_t dtypeFromName(const char* s);
 // loses digits unconditionally - and can lose the whole number, since 1e300
 // becomes inf and 1e-300 becomes 0.
 //
-// docs/input-adapters.md §4.8 already fixes the rule for this situation:
+// docs/features/adapters/input-adapters.md §4.8 already fixes the rule for this situation:
 // something that does not fit is converted AND THE CONVERSION IS RECORDED IN
 // THE NOTE. It says it about bfloat16. It was never said about u32/i32/f64,
 // which is the defect - not the narrowing itself (that is a storage decision)
@@ -866,7 +866,7 @@ inline std::string f32LossNote(const F32Loss& L, const std::string& dtype) {
 // ASCII "C<=4" rather than U+2264: this string is printed to consoles whose
 // codepage may be cp932 (which cannot encode that character at all) and is
 // quoted back verbatim through a pipe by tools/import/run_adapter.py.
-// docs/input-adapters.md §4.13.0 draws the same forms with the real character.
+// docs/features/adapters/input-adapters.md §4.13.0 draws the same forms with the real character.
 static const char* const NPY_NATIVE_FORMS =
     "(H,W) / (H,W,C<=4) / (F,H,W) / (F,H,W,C<=4)";
 
@@ -883,7 +883,7 @@ inline std::string npyShapeText(const std::vector<int64_t>& shape) {
     return s + ")";
 }
 
-// docs/input-adapters.md §3.2: name the shape that ARRIVED, and name what
+// docs/features/adapters/input-adapters.md §3.2: name the shape that ARRIVED, and name what
 // native DOES read. A refusal that says only "cannot open" sends the reader
 // nowhere - which is how a 1-D exposure vector stayed a one-pixel-tall image
 // for as long as it did.
@@ -905,7 +905,7 @@ inline std::string npyNotNativeText(const std::vector<int64_t>& shape) {
 
 // ---- HOW an array is read, spelled once for both doors ---------------------
 //
-// docs/input-adapters.md §3.3, the successor to --npy-axis: the shape rule
+// docs/features/adapters/input-adapters.md §3.3, the successor to --npy-axis: the shape rule
 // (§3.1) decides, and where it guessed wrong the user DECLARES a different
 // reading per file. The declaration used to exist only in this process, because
 // only the local decoder ever knew a file's shape; since protocol 9 it crosses
@@ -1024,7 +1024,7 @@ inline std::string rawTooOldText(int peerVersion, const std::string& name) {
 }
 
 // The peer predates readers running on it (issue #180, docs/
-// remote-reader-design.md §4.1). Written BEFORE anything is sent, from the
+// docs/features/remote/remote-reader-design.md §4.1). Written BEFORE anything is sent, from the
 // number the peer announced in HELLO, and for the reason the three sentences
 // above are - but here the failure an unrefused send produces is the WORST of
 // the four. A v11 peer does not refuse MSG_READER_RUN usefully ("unknown
@@ -1046,7 +1046,7 @@ inline std::string readerTooOldText(int peerVersion, const std::string& name) {
 }
 
 // The peer predates a container crossing the link (issue #217, docs/
-// remote-reader-design.md §10.4). Same discipline as the four sentences above,
+// docs/features/remote/remote-reader-design.md §10.4). Same discipline as the four sentences above,
 // and the failure it prevents is the one MSG_NPZ_SCAN's own absence would
 // produce: a v12 peer answers the verb with "unknown request" - the sentence it
 // also gives for a typo - and answers a META that addresses the whole .npz as

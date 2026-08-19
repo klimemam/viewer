@@ -1,5 +1,5 @@
 // core/browse/host.h — BrowseHost: browse → viewer の継ぎ目。担当: Browse
-// P7 (docs/split-plan.md §3): 「一覧して選ぶ」までが Browse、「開いて何をする
+// P7 (docs/background/project/split-plan.md §3): 「一覧して選ぶ」までが Browse、「開いて何をする
 // か」が viewer。S3 が panel.inc / nav.inc に置いた [BrowseHost] 注記 55 箇所が
 // この構造体経由になった。browse の実 TU が viewer に対して見るのはこのヘッダ
 // (と remote_proto.h / state.h の共有状態)だけで、逆向きの宣言は browse.h。
@@ -25,7 +25,7 @@ struct BrowseHost {
     // ---- registered opens (the viewer's open dispatch) ----------------------
     // npyRead is rp::NpyRead and is 0 from every browse call site: Browse opens
     // a file, and "read it another way" is a thing said to a document that is
-    // already open (docs/input-adapters.md §3.3, Inspector). The parameter is
+    // already open (docs/features/adapters/input-adapters.md §3.3, Inspector). The parameter is
     // here only because the pointer has to have the function's type.
     bool (*openRemote)(const std::string& url, bool asPreview, int frame, int npyRead);
     // A HEADERLESS row's double-click. Not openRemote with an extra argument:
@@ -89,7 +89,7 @@ bool peerServesName(const std::string& n);           // ...core/serve.cpp can se
 // ...and can serve it IF the request declares its geometry (protocol 11). The
 // row gate asks this one; the one-click preview still asks the plain
 // peerServesName, because a preview cannot be made before the geometry exists
-// (docs/remote-headerless-design.md §5.3).
+// (docs/features/remote/remote-headerless-design.md §5.3).
 bool peerServesDeclaredName(const std::string& n);
 // ...and which of those need the declaration. The panel routes a double-click
 // on one of these to openRemoteRaw instead of openRemote; it does not know why

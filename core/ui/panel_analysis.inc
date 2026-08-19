@@ -36,7 +36,7 @@ static std::string unitForAnalysisKey(const std::string& key, const std::string&
 // The number the user came for, per analyzer: mtf50, prnu%, the noise floor.
 // Host knowledge, and it stays host knowledge for exactly as long as the
 // analyzer cannot speak: ABI v3 gives descriptors a `headline` field, so this
-// table is now the V1/V2 fallback only (docs/abi-v3.md §3.2 - "宣言できるなら
+// table is now the V1/V2 fallback only (docs/reference/abi-v3.md §3.2 - "宣言できるなら
 // 宣言が勝つ"). It is not deleted and must not be: the bundled analyzers are
 // V2 registrations and third-party V1/V2 dlls are loadable forever.
 static const char* analyzerHeadlineSuffix(const std::string& name) {
@@ -180,7 +180,7 @@ static void drawPanelAnalysis() {
                 char err[256] = { 0 };
                 int32_t rc;
                 if (anas[app.anaSel].abi == 3) {
-                    // sink3's three emits ARE sink2's (docs/abi-v3.md §4: the
+                    // sink3's three emits ARE sink2's (docs/reference/abi-v3.md §4: the
                     // call contract is unchanged from V2), so the same ctx and
                     // the same three callbacks serve both. The seats after them
                     // stay zero - §8 is a later stage, and a v3 analyzer is
@@ -287,7 +287,7 @@ static void drawPanelAnalysis() {
                 // where a report actually cites it.
                 //
                 // The version is angle-bracketed and sits between the two
-                // (docs/abi-v3.md §11), and it is ABSENT, not blank, for a
+                // (docs/reference/abi-v3.md §11), and it is ABSENT, not blank, for a
                 // V1/V2 analyzer: those descriptors have no version field, and
                 // an empty <> would read as "declared nothing" where the truth
                 // is "was never asked". Nothing here guesses one.

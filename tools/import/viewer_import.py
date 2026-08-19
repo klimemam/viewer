@@ -18,7 +18,7 @@ other vocabulary is introduced; see docs/terminology.md.
 The fifth layer of the canon is here too: AnalysisSet, a set of role bindings
 ({"image": Stack(arr), "dark": Ref("darks/")}), with Ref as the way to bind
 data the viewer already has open without re-reading it.  Both are specified in
-docs/reader-analysisset.md ("ras" in comments below).  A role value is Frame /
+docs/features/adapters/reader-analysisset.md ("ras" in comments below).  A role value is Frame /
 Stack / Series (inline: this call carries the pixels) or Ref (a path: the
 viewer resolves it against what is open, 2.2).  A bare array is NOT a role
 value (ras decision 2): the role dict is a declaration, and the one place that
@@ -33,7 +33,7 @@ while the viewer, run_adapter.py and core/serve.cpp all said "4 or fewer", and
 an adapter author reading only this line would have expected a stack.  Naming a
 type is what you do when you want to kill an ambiguity yourself.
 
-Promises this file keeps (docs/input-adapters.md 4.10):
+Promises this file keeps (docs/features/adapters/input-adapters.md 4.10):
 
   * single file, standard library only.  It does NOT import numpy or torch.
     Arrays are carried, never inspected element by element: only `.shape` and
@@ -491,7 +491,7 @@ class Batch:
 
 
 # ------------------------------------------------------------------------ Ref
-# docs/reader-analysisset.md 2: "this role is THAT, over there" -- said by path,
+# docs/features/adapters/reader-analysisset.md 2: "this role is THAT, over there" -- said by path,
 # never by name (names are renameable and not unique, the session file's rule).
 
 @dataclass(frozen=True, eq=False, repr=False)

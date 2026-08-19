@@ -3,7 +3,7 @@
 //
 // WHAT THIS FILE IS FOR, in one line: the numbers in the file arrive in the
 // document unchanged, and everything this build will not read is refused BY
-// NAME with a reason (docs/input-adapters.md §3.2).
+// NAME with a reason (docs/features/adapters/input-adapters.md §3.2).
 //
 // The first half of that is the whole reason .exr is worth having. It is the
 // only format behind this seam whose samples are floating point and scene

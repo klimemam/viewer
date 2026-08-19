@@ -489,7 +489,7 @@
                   "T12 narrow: the name elides from the front or drops, never overflows");
 
             // ---- T13: the footer strip, through the same real frames --------
-            // docs/verify-ui.md E3. Everything here goes straight to AddText
+            // docs/verification/ui.md E3. Everything here goes straight to AddText
             // and was kept nowhere, so the whole strip was untestable and the
             // row had to be moved out of the A section. g_footerProbe records
             // the strings as drawn, and these are the claims about them.

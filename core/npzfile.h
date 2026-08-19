@@ -1,5 +1,5 @@
 // The .npz, in the part BOTH binaries need (issue #217, docs/
-// remote-reader-design.md §10).
+// docs/features/remote/remote-reader-design.md §10).
 //
 // A .npz is a zip of .npy members. Reading one has always been core/app/
 // loader_npz.inc's job, because a container becomes DOCUMENTS and only the
@@ -23,7 +23,7 @@
 //   not shared  the CLASSIFICATION - which member is pixels, which is an axis
 //               candidate, which is metadata, and the words a picker row shows
 //               for each. That vocabulary (RImage / RAxis / RMeta / RAmbig /
-//               RBad) is docs/npz-design.md §2.1's and it stays in ONE place,
+//               RBad) is docs/features/adapters/npz-design.md §2.1's and it stays in ONE place,
 //               core/app/loader_npz.inc, fed by these facts whether they came
 //               out of a zip on this disk or out of a MSG_NPZ_SCAN reply. The
 //               picker's rows therefore cannot read differently depending on
@@ -602,7 +602,7 @@ inline bool extractPrefix(const std::vector<uint8_t>& zip, const Entry& e,
 
 // ---- the facts a member states, and the rule for which VALUES ride along ----
 //
-// docs/remote-reader-design.md §10.2: "SCAN が返すのは事実 (name・shape・descr・
+// docs/features/remote/remote-reader-design.md §10.2: "SCAN が返すのは事実 (name・shape・descr・
 // usize・展開可否・小さい値) で、役割はその事実から client が判定する".
 //
 // `bytes` is the member's own .npy bytes - its HEADER always, and its values too
@@ -625,7 +625,7 @@ struct Fact {
 // A 1-D member longer than this cannot be any stack's frame axis (a served
 // stack tops out at 2^20 frames - core/serve.cpp serveLayout), so its values
 // are not worth carrying and not worth reading. THE LOCAL DOOR USED 2^24 and
-// this tightens it, which docs/remote-reader-design.md §10.2 decides on purpose:
+// this tightens it, which docs/features/remote/remote-reader-design.md §10.2 decides on purpose:
 // the observable difference is the wording of members that were called axis
 // candidates and could never have been promoted.
 static const uint64_t INLINE_MAX_ELEMS = 1ull << 20;
@@ -677,7 +677,7 @@ struct InlineBudget {
 };
 
 // `__viewer` and nothing else decides which of the two readings an .npz gets
-// (docs/input-adapters.md §4.11.1). Asked from the NAMES alone, so the peer can
+// (docs/features/adapters/input-adapters.md §4.11.1). Asked from the NAMES alone, so the peer can
 // answer it before it inflates anything.
 inline bool hasContainerMark(const std::vector<Entry>& entries) {
     for (const Entry& e : entries) if (e.name == "__viewer.npy") return true;
@@ -686,7 +686,7 @@ inline bool hasContainerMark(const std::vector<Entry>& entries) {
 
 // Is this member one whose VALUES the far side will need? Pixels never are -
 // that is the whole point of the link - and everything else is small by
-// construction (docs/remote-reader-design.md §10.2).
+// construction (docs/features/remote/remote-reader-design.md §10.2).
 inline bool wantsValues(const std::string& name, const Head& H, bool container) {
     if (container) {
         // A container's reserved members ARE its declaration: layers, parents,

@@ -1,5 +1,5 @@
 // core/browse/browse_state.h — Browse の状態型。担当: Browse
-// P7 (docs/split-plan.md §3): App::BrowseInstance ほか rb 系ネスト型の本体は
+// P7 (docs/background/project/split-plan.md §3): App::BrowseInstance ほか rb 系ネスト型の本体は
 // ここに住む。App 側には using BrowseInstance = browse::Instance; などの alias
 // が残るので、既存の App::BrowseInstance / App::RbJob / App::RbConnect 参照は
 // 全て無傷で通る — 数千行の参照 churn なしで型を外へ出す方式(§1 の「移動のみ」
@@ -165,13 +165,13 @@ struct RemoteSearch {
     int skippedDirs = 0;
 };
 // ==== ONE Browse instance: a view onto ONE place =========================
-// Decision record: docs/todo-open.md item 17 ("instance-able views").
+// Decision record: docs/background/project/todo-open.md item 17 ("instance-able views").
 // The Browse panel stopped being a singleton: every instance holds a place
 // (RemoteBrowse), the listing state that used to be ~21 function-local
 // statics of drawPanelRemote and five g_rb* globals, and its OWN worker
 // thread with its OWN Session. Local vs remote is where an instance
 // STANDS, never a panel type - the place vocabulary of
-// docs/browse-as-file-manager.md survives, only the panel count changed.
+// docs/features/browse/browse-as-file-manager.md survives, only the panel count changed.
 struct Instance {
     // identity. num 1 is the primordial instance: it wears the original
     // ImGui id "Browse###Remote" (existing layouts and the dock builder
