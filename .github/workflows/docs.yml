@@ -1,0 +1,25 @@
+name: Documentation
+
+on:
+  # The checker scans repo-wide source comments and Markdown, not only docs/.
+  # It is cheap enough to run on every PR, which avoids a second, inevitably
+  # incomplete copy of its file-suffix scope in this workflow.
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  links-and-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Calibrate documentation gate
+        run: python tools/check_doc_links.py --selftest
+      - name: Check documentation graph
+        run: python tools/check_doc_links.py

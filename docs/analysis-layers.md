@@ -72,7 +72,7 @@ v1 は「dark / flat は stack の宣言属性」を提案していた (旧判�
   `{"dark": Stack()}` という1役割の set で済む (§6)。
 
 「level 0 = dark」の既存則は linearity の後方互換に閉じ、新しい解析へは
-広げない ([flat-field-stats.md](flat-field-stats.md) (c) の原則、据え置き)。
+広げない ([flat-field-stats.md](features/analysis/flat-field-stats.md) (c) の原則、据え置き)。
 
 ### 1.3 評価値マップ (#49) の家
 
@@ -107,7 +107,7 @@ No なら 1 か 2 (層の中の解析)。Yes なら 3 か 4 (set の解析)。
 v1 の中心定義はそのまま生きる: **解析の層 = その解析の入力が丸ごと必要とする
 最小の層 = 結果が属性として付く層**。入力の広がりと結果の帰属がずれる解析は
 存在しない。4種はこの定義の上の分類で、「層」の列に AnalysisSet が加わった形。
-[stats-taxonomy.md](stats-taxonomy.md) との対応も素直になった:
+[stats-taxonomy.md](features/analysis/stats-taxonomy.md) との対応も素直になった:
 S1/TN/LM = 層 (General/Specific の縦軸)、**+meta/+ref はこれまで行き場の
 無かった軸で、それが役割スキーマそのもの**。+cal はツールの外 (据え置き)。
 
@@ -136,7 +136,7 @@ v2 での姿である。なお基準は「**参照役割の有無**」であっ�
 > 今と同じで，Histogram, Projection, ROIsで．
 
 Histogram / Projection / ROIs、今と同じ。frame 層が正直に言えることの限界も
-確定済み ([flat-field-stats.md](flat-field-stats.md) (a)): 1枚の空間σは常に
+確定済み ([flat-field-stats.md](features/analysis/flat-field-stats.md) (a)): 1枚の空間σは常に
 `σ_t² + σ_fpn²` の合成で、固定パターンとしては**上界**にしかならない。
 
 ### 3.2 Stack — Stack Histogram / Projection / ROIs / Stack Temporal (新規スコープ)
@@ -165,7 +165,7 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
   — 共通なのは蓄積器 (sum / sum² / cnt) の方だけである。「絵の下の数と表の数が
   食い違えない」の原則は**名前の側**が担う: ROIs の列は畳み方修飾つきの中立名
   `sigma [DN] (mean_t)`、Temporal の行は補正とクランプを申告する `sigma_fpn`
-  ([flat-field-stats.md](flat-field-stats.md) (b))。
+  ([flat-field-stats.md](features/analysis/flat-field-stats.md) (b))。
   **【実装時の照合 2026-08-10 — PR #127】** 畳み方修飾は着地した。ただし**語幹は
   `std`** である: ROIs パネルの2列は確定済みの名前 `std` / `std / mean [%]`
   (flat-field-stats.md (a)、旧 `PRNU [σ %]` からの改名) を既に持っており、上の
@@ -176,7 +176,7 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
   画像の行/列 FPN (同 (b) の「列 FPN は平均画像に (a) の分解を掛ければ出る」が
   そのまま画面になる)。
 - **per-frame の重ね / 並べ表示**: N 枚それぞれの frame 解析を重ねる。
-  これは S1×N の**見せ方** ([stats-taxonomy.md](stats-taxonomy.md) §3) で、
+  これは S1×N の**見せ方** ([stats-taxonomy.md](features/analysis/stats-taxonomy.md) §3) で、
   ドリフト・外れ frame の発見用。新しい量は出さない。
 - **pooled (全 frame 全画素を1母集団に) は保留**: σ_tot の分布として意味は
   あるが、用途が実物として出るまで作らない。
@@ -303,7 +303,7 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
   に従う。読み戻したものは「撮ったもの」ではないので、その旨をファイル自身が
   運ぶ形式にする — 細部は実装仕様と #49。
 - 前処理の順序 (黒レベル → 飽和マスク → dark 減算 → detrend → …) は
-  [flat-field-stats.md](flat-field-stats.md) の「順序」節が既に持っている。
+  [flat-field-stats.md](features/analysis/flat-field-stats.md) の「順序」節が既に持っている。
   PreProcessor 連鎖はそれを型にする器で、順序の中身は #57 の凍結解除後に
   そちらで確定する。
 <!-- 【実装 2026-08-10 — detrend PreProcessor (#57 判断6/7)】この種は宣言だけの
@@ -366,7 +366,7 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 | DSNU [e⁻] / PRNU の e⁻ 系 | 上に `{"sweep": Series()}` を足す | K が要る、を役割が語る | sc |
 
 - **"EMVA 1288" の文字列は、規格原文と照合するまでどの画面にも出さない**
-  ([flat-field-stats.md](flat-field-stats.md) の確定規則の再掲。フレーム
+  ([flat-field-stats.md](features/analysis/flat-field-stats.md) の確定規則の再掲。フレーム
   リニアリティの「-style を必ず付ける」と同じ線)。照合が済むまでの名乗りは
   ツール固有カテゴリ。
 - 1役割の set (DSNU など) の実行は**メニュー1クリックでよい**: クリックの場で
@@ -389,9 +389,9 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 | 量 | 種と層 | 名前 | 扱い |
 |---|---|---|---|
 | ROI の σ/mean (そのまま) | General / frame (ROIs 列) | **`std / mean [%]`** | **改名済み・main 済み** (`5d8cb72`。ユーザー裁定 2026-08-06、旧 `PRNU [σ %]`)。素の名前になり、General から有名名が消えた |
-| 9×9 ローパス残差の σ/mean | Specific / frame | `uniformity/prnu-fpn` の `prnu_pct` | 現名のまま。proxy と自己申告済み ([analyzers.md](analyzers.md))。改名は報告書の連続性を壊すだけ |
+| 9×9 ローパス残差の σ/mean | Specific / frame | `uniformity/prnu-fpn` の `prnu_pct` | 現名のまま。proxy と自己申告済み ([analyzers.md](reference/analyzers.md))。改名は報告書の連続性を壊すだけ |
 | dark を引いた flat の固定パターン | **SetAnalyzer** | 裸の `PRNU` (+ set タグ: `— set: image n/N, dark n/N`) | **着地済み (PR #130)**。Set Analysis パネル。タグは set 名も名乗る (不変条件 (a)) |
-| σ_fpn²(μ) フィットの傾き / 切片 | **SetAnalyzer** | 裸の `PRNU` / `DSNU` (+ set タグ: `— sweep: <series>, M levels`) | 未実装。加法・乗法の**分離**はここでしか出来ない ([flat-field-stats.md](flat-field-stats.md) (c)) |
+| σ_fpn²(μ) フィットの傾き / 切片 | **SetAnalyzer** | 裸の `PRNU` / `DSNU` (+ set タグ: `— sweep: <series>, M levels`) | 未実装。加法・乗法の**分離**はここでしか出来ない ([flat-field-stats.md](features/analysis/flat-field-stats.md) (c)) |
 
 直接推定と分離フィットは**推定量が違う**ので、set タグがそのまま区別になる。
 同じ表に並べるときはタグを省略しない。改名で **#66 は単純になった**:

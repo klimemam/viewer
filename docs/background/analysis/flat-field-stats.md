@@ -1,4 +1,4 @@
-現行ドキュメント: [flat-field-stats.md](../../flat-field-stats.md) の背景 — #57 の判断record (7項 + 分離フィットの追加2項) と、実施済みの実装計画。
+現行ドキュメント: [flat-field-stats.md](../../features/analysis/flat-field-stats.md) の背景 — #57 の判断record (7項 + 分離フィットの追加2項) と、実施済みの実装計画。
 
 # 平坦画像を前提とする統計 — 背景
 

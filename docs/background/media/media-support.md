@@ -1,4 +1,4 @@
-現行ドキュメント: [media-support.md](../../media-support.md) の背景 — EXR リーダの候補比較と、ユーザーが覆した tinyexr 推奨。
+現行ドキュメント: [media-support.md](../../features/media/media-support.md) の背景 — EXR リーダの候補比較と、ユーザーが覆した tinyexr 推奨。
 
 # メディア対応の設計検討 — 背景
 

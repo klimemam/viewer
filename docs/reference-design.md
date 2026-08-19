@@ -2,11 +2,11 @@
 
 対象: todo 週末項目「参照設計 (seqId→共有参照。項目0のコピーを置き換え) + 項目20
 Watch」の前半。本書が仕様で、実装はここに書いた形と理由に従う。Watch は
-docs/watch-design.md が本書の上に組む。行番号はすべて `eb5609a` 時点の
+docs/features/watch/watch-design.md が本書の上に組む。行番号はすべて `eb5609a` 時点の
 `core/main.cpp`(別ファイルはその都度言う)。数値は grep で数えた実測値。
 
 前提とする正典: docs/terminology.md (frame ⊂ stack ⊂ series ⊂ batch、厳密包含、
-操作マトリクスの Close 行、σ_t は stack の属性)、docs/todo-open.md 項目0
+操作マトリクスの Close 行、σ_t は stack の属性)、docs/background/project/todo-open.md 項目0
 (derive はコピーが暫定で、`materializeDerivedFrame` が交換用の継ぎ目)、項目20
 (Watch の確定仕様)、項目28 (別プロセスが同じファイルを持ち得る)。
 
@@ -387,7 +387,7 @@ membership を配る形。remote の derive がミスなく効くのはここか
 | 3 | **derive をコピーから参照へ** (§6.1)。1関数 + 文言 | ~15 行 | `--derive-selftest` 既存の assert (両方向の数、seqIndex 順、元 stack 無傷、follow 収束) + 新規「派生がバイトを増やさない」「派生後に元を crop しても派生は変わらない (CoW)」 |
 | 4 | **セッションの明示メンバー** (§5.2): stackmember/stackrule/cmpslotstack の書き読み | writer ~25 行 / loader ~40 行 | 派生 stack の保存→全撤去→復元でメンバーが一致 (§5.1 の欠陥の回帰テスト)。旧キーのみのファイルが今日と同じに開く |
 | 5 | **reload の walk** (§3.2) + temporal 鍵の stackRev + temporalExtra の forget 修正 + Files 右クリック「Reload from disk」(手動再読込 — Watch の前に単独で有用) | ~90 行 | 新 `--reload-selftest`: 画素差し替えで uid 不変・全キャッシュ再計算・σ_t が変わる・fit が落ちる・共有先 stack も同じ一歩で更新される |
-| 6 | **Watch** (docs/watch-design.md) | 同書 §7 | 同書 §8 |
+| 6 | **Watch** (docs/features/watch/watch-design.md) | 同書 §7 | 同書 §8 |
 
 ステージ 2 と 3 は入れ替え可能。4 は 3 の後 (書くものができてから)。
 5 は 1 だけに依存する — Watch を急ぐなら 5 を 2/3/4 と並行にできる。
