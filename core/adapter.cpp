@@ -1,6 +1,6 @@
 // See adapter.h. The one rule that shapes this file: the viewer must never make
 // a console window flash, and must never claim a program failed when it never
-// started (docs/input-adapters.md §4.13 - "if Python is missing, say so").
+// started (docs/features/adapters/input-adapters.md §4.13 - "if Python is missing, say so").
 #include "adapter.h"
 
 #include <algorithm>                 // sort: a folder identity may not depend on walk order

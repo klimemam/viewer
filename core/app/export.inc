@@ -6,7 +6,7 @@
 //                 image-quality reader needs: the noise is the subject, and a
 //                 scaled screenshot invents and destroys exactly that.
 //   as displayed - the canvas as it sits, zoom and overlays included. Not here
-//                 yet (see docs/todo-open.md): it needs a framebuffer readback
+//                 yet (see docs/background/project/todo-open.md): it needs a framebuffer readback
 //                 after the frame is rendered, and this machine cannot verify
 //                 the result today.
 // Both go through renderDocRGBA, so what leaves the app is what the screen

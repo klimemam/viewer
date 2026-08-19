@@ -49,7 +49,7 @@ static size_t claimedImageBytes() {
 // place (residentImageBytes' dedupe, just above), use_count() in exactly one
 // (the crop CoW), rev in none at all, and none of the three has a printing
 // path - so "these two stacks are one source" cannot be asserted from a CLI,
-// which is why docs/verify-functional.md D-1/D-2/D-7 stand at 要probe and A-12
+// which is why docs/verification/functional.md D-1/D-2/D-7 stand at 要probe and A-12
 // could be settled only by reading the code. This writes down what the
 // documents ACTUALLY point at, one line per membership.
 //
@@ -214,7 +214,7 @@ std::string stackNameFor(const std::string& dir, const std::string& pattern) {
 // THE RULE, over names already in hand: no filesystem, no directory_iterator.
 // findSequenceSiblings below is this function plus one listing, and the split
 // exists because Watch re-derives a stack's membership every few seconds
-// (docs/watch-design.md §1: "the member list is taken again with the SAME
+// (docs/features/watch/watch-design.md §1: "the member list is taken again with the SAME
 // function the open used") over a listing it has ALREADY taken - §2 wants one
 // listing per directory per poll however many stacks live in it, and calling
 // the IO version per stack would take one apiece. Splitting it also puts the
@@ -849,7 +849,7 @@ static void migrateLegacyLevels() {
     }
 }
 
-// ---- AnalysisSet: the binds that had to wait (docs/reader-analysisset.md) ----
+// ---- AnalysisSet: the binds that had to wait (docs/features/adapters/reader-analysisset.md) ----
 // A folder Ref (or a session's stack role) opens its head at once and its
 // siblings through the queued rescan; the BIND lands here, at the same drain
 // gate seriesRestore resolves at - and a bind that still cannot land becomes
@@ -1396,7 +1396,7 @@ static const char* SELFDESC_EXTS[]   = { ".npy", ".npz" };
 // ...and the headerless five, which have MOVED to core/imagefile.h. The array
 // is one array still - it is simply in the only format home BOTH binaries
 // compile, because the peer asks the same question and does not compile this
-// file (docs/remote-headerless-design.md §4.2). Everything below reads it
+// file (docs/features/remote/remote-headerless-design.md §4.2). Everything below reads it
 // through these helpers exactly as before, and F4c - which walks the array and
 // checks every extension reaches the file dialog - is unedited by this move,
 // which is what makes the move provable rather than merely plausible.
@@ -2042,7 +2042,7 @@ static void pickerAccept() {
     }
 }
 
-// ---- the .npz member picker's answer (docs/npz-design.md §2.3) --------------
+// ---- the .npz member picker's answer (docs/features/adapters/npz-design.md §2.3) --------------
 // The same shape as pickerAccept above, one layer down: no ImGui, so the
 // headless selftests and every auto-accept go through this exact function.
 //
@@ -2532,7 +2532,7 @@ static void drawFolderPickModal() {
     ImGui::EndPopup();
 }
 
-// ---- the Reader panel (docs/input-adapters.md §4.13.0) -----------------------
+// ---- the Reader panel (docs/features/adapters/input-adapters.md §4.13.0) -----------------------
 // Four entrances, one destination, and IT DOES NOT CLOSE. Writing an adapter is
 // a loop - write, load, read the failure, fix, load again - and the first design
 // here was a modal, which cut that loop every time the author went to their

@@ -1,6 +1,6 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
     // ---- MEASURE WHERE THE DATA IS, FOR A DOCUMENT THAT IS NOT A FILE --------
-    // (issue #180 stage 5, docs/remote-reader-design.md §8, protocol 14)
+    // (issue #180 stage 5, docs/features/remote/remote-reader-design.md §8, protocol 14)
     //
     // Twelve taught META and TILE to address a node of what a reader produced on
     // the peer; 13 added a member of a container it listed. Both open, both
@@ -175,7 +175,7 @@
         });
 
         // ---- the independent reference (rtemporal's third implementation) -----
-        // Written against the settled formula (docs/flat-field-stats.md (b)) and
+        // Written against the settled formula (docs/features/analysis/flat-field-stats.md (b)) and
         // not against either of the two under test, because its job is to
         // disagree with them if either drifts. u16 widens to float32 exactly, so
         // accumulating the integers in f64 is accumulating the samples.

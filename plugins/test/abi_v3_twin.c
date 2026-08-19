@@ -1,5 +1,5 @@
 /* abi_v3_twin.c - the V3 half of the ABI compatibility pair, and the worked
- * example of the probe rule (docs/abi-v3.md §2.2).
+ * example of the probe rule (docs/reference/abi-v3.md §2.2).
  *
  * Same measurement as abi_v2_twin.c, reached through the v3 descriptor: it
  * declares a version (§3.1) and a headline (§3.2), and it registers through
@@ -22,7 +22,7 @@
 
 static int32_t analyzeV3(const psFrame* in, const psRect* roi,
                          const psAnalyzeSink3* sink, char* err, size_t err_cap) {
-    /* The probe rule applies inside the sink too: the seats docs/abi-v3.md §8
+    /* The probe rule applies inside the sink too: the seats docs/reference/abi-v3.md §8
      * spends on emit_number_u / emit_map are NULL until that stage lands, so
      * this analyzer emits through the three that abi_version 3 promises and
      * touches no seat it has not tested. §8.2 keeps the key-name unit

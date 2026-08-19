@@ -1,6 +1,6 @@
 // Running an input adapter: finding Python, starting it without a console
 // flashing up, and opening a reader in the user's editor.
-// docs/input-adapters.md §4.13. Everything here is free of the viewer's state so
+// docs/features/adapters/input-adapters.md §4.13. Everything here is free of the viewer's state so
 // that the parts that touch the process table stay testable on their own.
 #pragma once
 #include <atomic>
@@ -61,7 +61,7 @@ void setSettingsEditor(const std::string& cmd);
 // falls through to `code -g` and then the OS association.
 //
 // It exists as its own function so the ORDER can be asserted: docs/
-// settings-inventory.md 判断18, rewritten 2026-08-11, is that precedence is
+// docs/features/settings/settings-inventory.md 判断18, rewritten 2026-08-11, is that precedence is
 // "specific beats general" rather than "env vs file", and $EDITOR is the
 // GENERIC variable - git's own order (GIT_EDITOR > core.editor > VISUAL >
 // EDITOR) is the model. Asserting that by launching an editor is not something
@@ -85,7 +85,7 @@ std::string moduleVersion(const std::string& pyFile);
 // when a reader is chosen. Text again, for the same reason.
 std::vector<std::string> moduleFunctions(const std::string& pyFile);
 
-// The identity of a FOLDER used as a reader's input (docs/input-adapters.md
+// The identity of a FOLDER used as a reader's input (docs/features/adapters/input-adapters.md
 // §4.1), for the cache keys on BOTH sides of the link (#218 review).
 //
 // A directory's own mtime moves when a child is added or removed and NOT when

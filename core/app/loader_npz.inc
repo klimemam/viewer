@@ -80,7 +80,7 @@ static std::string npyWriteFile(const std::string& path, const char* descr,
 }
 
 // ---- which axis is what -----------------------------------------------------
-// docs/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
+// docs/features/adapters/input-adapters.md §3: native reads FOUR shapes and refuses the rest by
 // name. The decision is RANK and the LAST AXIS, and never the first axis's
 // size. "A leading axis of 4 or less must be channels" is the guess that read
 // (3,H,W) - three frames, an ordinary thing to save - as one 3-channel picture,
@@ -358,7 +358,7 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     return {};
 }
 
-// ---- classifying an .npz's members (docs/npz-design.md §2.1) ----------------
+// ---- classifying an .npz's members (docs/features/adapters/npz-design.md §2.1) ----------------
 // One element as a DOUBLE, byte order included - nz::elem, which core/serve.cpp
 // reads the same bytes with. The name stays because the call sites are about
 // .npy members; the decoding lives beside the header parse that says which
@@ -417,7 +417,7 @@ static std::string npzTextValue(const std::vector<uint8_t>& buf, const NpyHead& 
 // into the image path.
 //
 // It takes FACTS (nz::Fact) rather than a zip, and that split is issue #217's
-// (docs/remote-reader-design.md §10.2). The facts can come from a file on this
+// (docs/features/remote/remote-reader-design.md §10.2). The facts can come from a file on this
 // disk or from a MSG_NPZ_SCAN reply, and the vocabulary below - RImage / RAxis
 // / RMeta / RAmbig / RBad, and every word a picker row shows - is computed from
 // them HERE, once. So a member listed by a peer and the same member listed off
@@ -506,7 +506,7 @@ static std::vector<NpzMember> npzClassify(const std::vector<nz::Fact>& facts) {
             // 2^20 frames - so a longer 1-D member cannot be one whatever else
             // is true of it, and is not worth carrying or inflating to find
             // out. The ceiling used to be 2^24 here and nz::INLINE_MAX_ELEMS is
-            // 2^20; docs/remote-reader-design.md §10.2 tightened it deliberately
+            // 2^20; docs/features/remote/remote-reader-design.md §10.2 tightened it deliberately
             // when the rule was shared, and what changes on screen is the
             // wording of members that were called axis candidates and could
             // never have been promoted.
@@ -591,7 +591,7 @@ static std::string npzOpenMember(const std::string& path, const std::vector<uint
 }
 
 // Members that are not pixels, kept against the FILE so the Inspector can show
-// them beside the frame that did open (docs/npz-design.md §4 item 3 - metadata
+// them beside the frame that did open (docs/features/adapters/npz-design.md §4 item 3 - metadata
 // は Inspector の Image 節に、開いた frame の隣。専用パネルは作らない).
 static void npzRememberMeta(const std::string& path, const std::vector<NpzMember>& mem) {
     std::vector<std::pair<std::string, std::string>> items;
@@ -645,15 +645,15 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
 }
 
 // ---- the viewer container: an npz that declares its own layers ---------------
-// docs/input-adapters.md §4.11. This is the ONE npz that does not have to be
+// docs/features/adapters/input-adapters.md §4.11. This is the ONE npz that does not have to be
 // guessed at: the reserved members name the layer of every node, so the file
 // answers the question §1 says a file normally cannot answer about itself.
 //
 // The discriminator is `__viewer` and nothing else (§4.11.1). Without it the
 // file is an ordinary npz and the shape classifier owns it exactly as before -
-// the two readings never overlap, so npz-design.md §2.5's human-written form is
+// the two readings never overlap, so docs/features/adapters/npz-design.md §2.5's human-written form is
 // untouched by anything here.
-// 2 since AnalysisSet (docs/reader-analysisset.md §4, "ras"): a version this
+// 2 since AnalysisSet (docs/features/adapters/reader-analysisset.md §4, "ras"): a version this
 // build WRITES nowhere - the harness names 2 on set-bearing files only, and
 // set-free files stay 1, so nothing that has no set moves at all. Reading 2
 // is what this constant grants; a 3 is still refused by name.
@@ -698,7 +698,7 @@ struct VnzNode {
 // reserved member verbatim (they are words, numbers and short vectors - the
 // declaration, never the pixels). The reader of the declaration is ONE, so a
 // container opened over a link and the same file opened off this disk cannot
-// build two different trees (docs/remote-reader-design.md §10.2).
+// build two different trees (docs/features/remote/remote-reader-design.md §10.2).
 using VnzMemberFetch = std::function<bool(const std::string& name,
                                           std::vector<uint8_t>& out, std::string& err)>;
 
@@ -777,7 +777,7 @@ static int vnzCfaPattern(const std::string& cfa, int& kind) {
     return -1;
 }
 
-// ---- the set members (docs/reader-analysisset.md §4) ------------------------
+// ---- the set members (docs/features/adapters/reader-analysisset.md §4) ------------------------
 // __role_<i> is a role name: identifier-shaped, the same charset that lets a
 // session line be split on whitespace (ras §1.2).
 static bool vnzRoleName(const std::string& s) {
@@ -974,7 +974,7 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
             if (v.parent >= 0 && nodes[(size_t)v.parent].layer != "batch")
                 return "node " + si + " is an analysisset inside a " +
                        nodes[(size_t)v.parent].layer + ": a set is a node of a "
-                       "batch, or the whole return value (reader-analysisset.md §1.4)";
+                       "batch, or the whole return value (docs/features/adapters/reader-analysisset.md §1.4)";
             if (v.hasPixels)
                 return "__pixels_" + si + " on an analysisset: a set has no "
                        "pixels - it binds members, it does not contain them";
@@ -991,7 +991,7 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
             return "__role_" + si + ": only a child of an analysisset plays a role";
         if (!v.role.empty() && !vnzRoleName(v.role))
             return "__role_" + si + " is \"" + v.role + "\": a role name is "
-                   "[A-Za-z0-9_]+ (reader-analysisset.md §1.2)";
+                   "[A-Za-z0-9_]+ (docs/features/adapters/reader-analysisset.md §1.2)";
         if (!v.refsJson.empty() && v.layer != "analysisset")
             return "__refs_" + si + " on a " + v.layer + ": refs belong to the set node";
     }
@@ -1002,7 +1002,7 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
         return "this container holds an analysis set but names version " +
                std::to_string(version) + " - a set-bearing container is version 2, "
                "so an older viewer refuses it whole instead of silently dropping "
-               "the set (reader-analysisset.md §4)";
+               "the set (docs/features/adapters/reader-analysisset.md §4)";
     return {};
 }
 
@@ -1246,7 +1246,7 @@ static std::string loadViewerStream(const std::string& path, const std::string& 
                     meta, originStat);
 }
 
-// A viewer container, whatever is carrying it (docs/input-adapters.md §4.11).
+// A viewer container, whatever is carrying it (docs/features/adapters/input-adapters.md §4.11).
 //
 // `byName` says which reserved members EXIST and, for `__pixels_<i>`, gives the
 // carrier its own address for them; `mem` hands over the bytes of one; `pixels`
@@ -1392,7 +1392,7 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
                     nodesOut != nullptr);
 }
 
-// ---- Ref resolution (docs/reader-analysisset.md §2.2) ------------------------
+// ---- Ref resolution (docs/features/adapters/reader-analysisset.md §2.2) ------------------------
 // The order is the source registry's, not a new invention: identity tuple
 // match -> share the open copy (no decode, no copy - "読み直さない" is this one
 // step); path match with a moved tuple -> bind the OPEN copy and SAY the disk
@@ -1958,7 +1958,7 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
     return {};
 }
 
-// An .npz is a CONTAINER, not a picture (docs/npz-design.md §2): the FILE is a
+// An .npz is a CONTAINER, not a picture (docs/features/adapters/npz-design.md §2): the FILE is a
 // batch and each member is a stack or a frame. Members are classified by shape
 // first, and nothing that is not an image is opened as one - the (N,) exposure
 // vector that used to arrive as a one-pixel-tall picture is offered as the

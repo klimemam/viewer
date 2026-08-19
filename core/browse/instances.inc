@@ -1,11 +1,11 @@
 // core/browse/nav.cpp から #include される断片。単独ではコンパイルしない。担当: Browse
 // P7 で背骨の TU から Browse の TU へ移った。ここの関数は背骨・メニュー・selftest が呼ぶので
 // extern (宣言は browse.h)。static は rbStopWorkerOf の前方宣言だけ残る。
-// ---- Browse instances (docs/todo-open.md item 17: instance-able views) -----
+// ---- Browse instances (docs/background/project/todo-open.md item 17: instance-able views) -----
 // What a Browse panel is CALLED. The host is the most important fact about a
 // panel and it used to live inside the "more" drawer, which meant that with two
 // panels open the two were pixel-identical until you unfolded one
-// (docs/browse-topbar-design.md 10.3). It belongs in the title: a title is read
+// (docs/features/browse/browse-topbar-design.md 10.3). It belongs in the title: a title is read
 // once, changes rarely, and costs no row.
 //
 //   Browse                    - this machine (local:// is LOCAL, not a remote:

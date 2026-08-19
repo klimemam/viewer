@@ -9,7 +9,7 @@
 // numbers nobody could place. So x / y / w / h are first-class COLUMNS here,
 // and the assertions below are as much about them as about the statistics.
 //
-// The format is the one docs/export-design.md 2 confirmed for the Temporal
+// The format is the one docs/features/export/export-design.md 2 confirmed for the Temporal
 // export (issue #61): '#'-headed sections, each section a complete rectangle,
 // %.9g, ASCII. This is that format applied, never a second one - the builder
 // uses the same ExportDoc / expCell / expNum.
@@ -53,7 +53,7 @@ static int roiExportSelftest() {
         check(got == want, what);
     };
     // every non-'#' line between two offsets carries the same number of cells as
-    // its header: docs/export-design.md 2's "each section is itself a complete
+    // its header: docs/features/export/export-design.md 2's "each section is itself a complete
     // rectangle". Same reader as --export-tsv-selftest's.
     auto rect = [&](const std::string& d, size_t from, size_t to, const char* what) {
         int want = -1;
@@ -147,14 +147,14 @@ static int roiExportSelftest() {
     check(has(tsv, "64x48 u16"), "X1 provenance: size and dtype");
     // THE statement this issue turns on: a pasted rectangle means nothing until
     // the file says which corner and which direction. Top-left, 0-based, y down,
-    // half-open - and it is docs/export-design.md 10 that this quotes.
+    // half-open - and it is docs/features/export/export-design.md 10 that this quotes.
     check(has(tsv, "x,y = the ROI's TOP-LEFT pixel") &&
           has(tsv, "0-based") && has(tsv, "x to the right and y downwards"),
           "X1 the coordinate convention is STATED, corner and direction");
     check(has(tsv, "x..x+w-1") && has(tsv, "[x, x+w)"),
           "X1 ...and its inclusivity, both ways of saying it");
-    check(has(tsv, "docs/export-design.md"), "X1 ...and where it is documented");
-    // ASCII ONLY (docs/export-design.md 3). Not decoration: this document is
+    check(has(tsv, "docs/features/export/export-design.md"), "X1 ...and where it is documented");
+    // ASCII ONLY (docs/features/export/export-design.md 3). Not decoration: this document is
     // pasted into Excel and read by pandas, and a section sign or a sigma
     // arrives there as whatever the reader's code page makes of it. Caught by
     // this assertion on the first implementation, which cited "§10" and put a
@@ -184,7 +184,7 @@ static int roiExportSelftest() {
 
     // The All row: the whole 64x48 frame. Values 29998 / 30002 / 30998 / 31002
     // in equal quarters -> mean 30500, var = 500^2 + 2^2 = 250004 (population,
-    // ddof=0 - docs/stats-taxonomy.md 7 item 1), min 29998, max 31002,
+    // ddof=0 - docs/features/analysis/stats-taxonomy.md 7 item 1), min 29998, max 31002,
     // n = 3072 with no decimation (3072 < the 200000-sample budget) at stride 1.
     rowIs(tsv, "A\tAll (whole image)\t",
           "A\tAll (whole image)\t0\t0\t64\t48\tall\t-\t" + num(30500.0) + "\t" +
@@ -248,7 +248,7 @@ static int roiExportSelftest() {
             tsv2.size(), (int)std::count(tsv2.begin(), tsv2.end(), '\n'));
     check(has(tsv2, "# sides: A, B, C"), "X2 every side on screen is in the document");
     // side-major, the order every export in this application uses
-    // (docs/export-design.md 3.2): the file's row order never depends on what
+    // (docs/features/export/export-design.md 3.2): the file's row order never depends on what
     // the panel is doing with its column groups.
     size_t pA = tsv2.find("\nA\tAll"), pB = tsv2.find("\nB\tAll"), pC = tsv2.find("\nC\tAll");
     check(pA != npos && pB != npos && pC != npos && pA < pB && pB < pC,
@@ -334,7 +334,7 @@ static int roiExportSelftest() {
     // named the wrong plane would be off by a thousand DN.
     rowIs(tsv3, "A\tP1\t", "A\tP1\t5\t7\tB\t" + num(3997.0) + "\t",
           "X3 POI on a mosaic: the plane it lands on, and that plane's value");
-    check(has(tsv3, "ddof=0") && has(tsv3, "flat-field-stats.md"),
+    check(has(tsv3, "ddof=0") && has(tsv3, "docs/features/analysis/flat-field-stats.md"),
           "X3 the note says which sigma this is, and where the named one lives");
 
     // ======================================================================
@@ -367,7 +367,7 @@ static int roiExportSelftest() {
     app.annRev++;
     // The channel combo is a DISPLAY control - it keeps the table narrow enough
     // to scan. The export is for reproduction, so it carries every plane
-    // whatever the combo says (docs/export-design.md 3, the same rule that
+    // whatever the combo says (docs/features/export/export-design.md 3, the same rule that
     // makes the decimals setting not apply). Compared from the first section
     // marker on: the provenance genuinely differs, because it reports the
     // selector, and the generated-at stamp cannot be compared to itself.

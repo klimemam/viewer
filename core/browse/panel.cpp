@@ -1,4 +1,4 @@
-// core/browse/panel.cpp — Browse 実 TU その 2 (P7, docs/split-plan.md §3/§5)。担当: Browse
+// core/browse/panel.cpp — Browse 実 TU その 2 (P7, docs/background/project/split-plan.md §3/§5)。担当: Browse
 // drawPanelRemote 一式。viewer への呼び出しは g_browseHost (host.h) 経由のみ —
 // S3 が置いた BrowseHost 注記 40 箇所はここで潰れた。RbRow と view builder 群
 // は NOGL selftest が直接叩くので browse.h に出ている。
@@ -849,7 +849,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // count: where am I (the path, with the bookmark star at its end) and
     // narrow it down (the filter, the count, the "..." menu). Everything that
     // is state rather than navigation reports on the bottom status line, and
-    // the "more" drawer is gone - see docs/browse-topbar-design.md 10.2/10.3.
+    // the "more" drawer is gone - see docs/features/browse/browse-topbar-design.md 10.2/10.3.
     // Server-side search: a different thing from the filter (which only narrows
     // what is already listed). Referenced up here because the path bar's context
     // menu can aim it at a folder.
@@ -1253,7 +1253,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
         // Navigation has no buttons: back / forward are mouse 4 / 5 and
         // Alt+Left / Alt+Right, the parent is the ".." row and Backspace, home
         // is a place in the places popup. Five buttons that answered no
-        // question were charging every glance (docs/browse-topbar-design.md
+        // question were charging every glance (docs/features/browse/browse-topbar-design.md
         // 10.2). Refresh and the two view modes moved into the menu below, and
         // a mode that is NOT the default says so with a chip instead - a
         // setting that changes what you see must name itself when it is on.
@@ -1414,7 +1414,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // The panel's own menu ENDS the toolbar row: the verbs that are real but
     // rare. They used to be buttons charging every glance - and behind them sat
     // the "more" drawer, whose contents have all gone to the place each one
-    // belongs (docs/browse-topbar-design.md 10.2): the host to the title,
+    // belongs (docs/features/browse/browse-topbar-design.md 10.2): the host to the title,
     // disconnect to the status line and the root crumb, the star to the path
     // line, open folder to File, and the server search to the popup below.
     rbFlow(rbMenuW);
@@ -2444,7 +2444,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 // runs on the peer, so the same item on a remote row is a true
                 // offer; whether that peer will run it is the peer's own answer
                 // (--serve-readers), said by the Reader panel when Load is
-                // pressed, in the words §2 of docs/remote-reader-design.md
+                // pressed, in the words §2 of docs/features/remote/remote-reader-design.md
                 // already chose. Refusing here as well would be a second, worse
                 // spelling of a sentence that exists.
                 if (!r.isDir() && !r.isGroup()) {
@@ -2565,7 +2565,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
         if (ImGui::IsKeyPressed(ImGuiKey_Comma, true))  g_browseHost.stepPreviewFrame(-1);
         if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) g_browseHost.stepPreviewFrame(+1);
     }
-    // ---- the bottom status line (docs/browse-topbar-design.md 10.3) --------
+    // ---- the bottom status line (docs/features/browse/browse-topbar-design.md 10.3) --------
     // One permanent thin row under the listing, carrying the facts that are
     // rarely true and had no home: which machine this panel stands on, how much
     // is in front of you, how much of it you have picked - and, only when they

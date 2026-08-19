@@ -5,7 +5,7 @@
     // load path: Open Folder -> picker -> stacks.
     // ---- --export-selftest: getting a picture OUT ---------------------------
     // Every claim here is one I cannot see on this machine (the GL client area
-    // captures white, see docs/todo-open.md), so each is asserted on the bytes.
+    // captures white, see docs/background/project/todo-open.md), so each is asserted on the bytes.
     if (!g_exportSelftest.empty()) {
         bool ok = true;
         auto check = [&](bool c, const char* what) {

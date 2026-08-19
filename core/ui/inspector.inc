@@ -587,7 +587,7 @@ static void drawInspector() {
             ImGui::PopStyleColor();
         }
         // ---- how this file was read, and how to read it differently ----------
-        // docs/input-adapters.md §4.13. Every file answers this, including the
+        // docs/features/adapters/input-adapters.md §4.13. Every file answers this, including the
         // ones read natively: "reader native" is a fact about this file, and a
         // row that only appeared for adapter-read files would leave the user
         // guessing whether the question even applies to the others.
@@ -630,7 +630,7 @@ static void drawInspector() {
         // container held. An .npz member's provenance is the file PLUS the array
         // name, and the members that are not pixels (exposure, gain, a note) are
         // the reason the file was written that way - so they belong beside it
-        // rather than in a panel of their own (docs/npz-design.md §4 item 3).
+        // rather than in a panel of their own (docs/features/adapters/npz-design.md §4 item 3).
         if (!im->src->member.empty()) {
             // One FIELD holds the name, because "a named part inside one
             // container file" is one idea and the session, the identity tuple
@@ -655,7 +655,7 @@ static void drawInspector() {
             }
         }
         // ---- how this array was read, and how else this SHAPE could be read --
-        // docs/input-adapters.md §3.3. The successor to --npy-axis: what the
+        // docs/features/adapters/input-adapters.md §3.3. The successor to --npy-axis: what the
         // viewer decided is on screen, and the ways out are computed from the
         // actual shape, so a reading this array cannot support is never offered.
         //

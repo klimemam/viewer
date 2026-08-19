@@ -1,5 +1,5 @@
 #!/bin/bash
-# docs/verify-ui.md section A/B driver: run every UI item that is automatable
+# docs/verification/ui.md section A/B driver: run every UI item that is automatable
 # on a machine that cannot screenshot OpenGL, and print one line per 項番.
 #
 #   bash tools/verify/run_ui_matrix.sh [<checkout-dir>]
@@ -7,7 +7,7 @@
 # WHY THE APPDATA DANCE (do not remove it):
 # the periodic autosave in the frame loop (core/main.cpp, guarded only by
 # !benchFrames) means a --browse-keys-selftest run WRITES a real
-# autosave.vsession - see docs/verify-ui.md defect D-1. The layout.ini half of
+# autosave.vsession - see docs/verification/ui.md defect D-1. The layout.ini half of
 # that defect is closed (#206): io.IniFilename is now nullptr for any scripted
 # run. The session half is not, so every run below is still pointed at a
 # throwaway config dir and the suite can never touch the operator's own state.

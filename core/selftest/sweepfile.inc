@@ -284,7 +284,7 @@
                             "\"%s\"\n", stacks, frames, shown.c_str());
             check("every frame of a remote stack carries the SAME note",
                   stacks == 7 && noteConst);
-            // ...and it does not repeat the size. docs/todo-open.md item 11 point 3:
+            // ...and it does not repeat the size. docs/background/project/todo-open.md item 11 point 3:
             // the row directly above the note already prints "%dx%d %dch %s", so the
             // note carrying WxH put the same number twice in two adjacent rows. The
             // needle is taken from the doc, not typed in, because that is exactly

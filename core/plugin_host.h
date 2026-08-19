@@ -21,7 +21,7 @@ struct AnalyzerPluginInfo  {
     std::string version;
     std::string headline;            // v3 §3.2: the accented key, plugin-declared.
                                      // Empty for V1/V2 - those still go through
-                                     // the host's own table (analyzers.md).
+                                     // the host's own table (docs/reference/analyzers.md).
     uint32_t abi = 1;                // which descriptor registered it: 1 / 2 / 3
     psAnalyzerV1 v1{};
     psAnalyzerV2 v2{};
@@ -35,7 +35,7 @@ struct AnalyzerPluginInfo  {
 // is the plugin's declaration (#46 stage 2) and stays verbatim.
 struct StackAnalyzerPluginInfo {
     std::string name, desc, file, path, version, headline;
-    // The DECLARATION the host gates on before it calls (docs/abi-v3.md §6).
+    // The DECLARATION the host gates on before it calls (docs/reference/abi-v3.md §6).
     // Never defaulted: 0 is refused at registration, so a value here was
     // written by the plugin's author on purpose.
     uint32_t minFrames = 1;

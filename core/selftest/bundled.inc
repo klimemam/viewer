@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ---- --bundled-selftest: the five shipped analyzers on the v3 mouth --------
 //
-// docs/abi-v3.md §1 calls migrating them "機械的作業 — 判断の外", and the
+// docs/reference/abi-v3.md §1 calls migrating them "機械的作業 — 判断の外", and the
 // mechanics really are small. What is NOT small is the pair of claims the
 // migration makes, and this file exists to hold both of them to a number:
 //
@@ -194,7 +194,7 @@ static int bundledSelftest() {
         return 1;
     }
 
-    // ---- 1. what each one now DECLARES (docs/abi-v3.md §3.1) ---------------
+    // ---- 1. what each one now DECLARES (docs/reference/abi-v3.md §3.1) ---------------
     {
         bool v3 = true, versioned = true;
         for (int b = 0; b < nBundled; b++) {

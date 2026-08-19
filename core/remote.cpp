@@ -338,7 +338,7 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     p->idleTimeout = idleTimeout_;    // ...and a bounded one for the UI thread's
     impl_ = p;
     std::vector<std::string> argv;
-    // --serve-readers: docs/remote-reader-design.md §2. The peer's consent is
+    // --serve-readers: docs/features/remote/remote-reader-design.md §2. The peer's consent is
     // "whoever started this process said so", and over ssh the person who
     // started it is this user - who already has a shell there and could start
     // python by hand. So the client writes the flag: not a new permission, the

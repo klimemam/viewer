@@ -1,7 +1,7 @@
 /* analyzer_stats.c — sample Analyzer plugin (解析系):
  * per-channel mean/std/min/max + p1/p50/p99 over finite values, ROI-aware.
  * CFA-aware: a 1-channel mosaiced frame is bucketed by PLANE (R/Gr/Gb/B), not
- * pooled into one "ch0". docs/stats-taxonomy.md's iron rule - on a Bayer flat
+ * pooled into one "ch0". docs/features/analysis/stats-taxonomy.md's iron rule - on a Bayer flat
  * field a pooled .std is mostly the inter-plane level difference, i.e. a
  * plausible-looking number that measures the wrong thing, and it rides into
  * the clipboard verbatim through "Copy table (TSV)". The mapping is lifted
@@ -189,7 +189,7 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V3 registration (docs/abi-v3.md §3-§4). Two fields are new and neither is a
+/* V3 registration (docs/reference/abi-v3.md §3-§4). Two fields are new and neither is a
  * formality:
  *
  *   version  - the one thing the host cannot source for itself, and the one
@@ -204,7 +204,7 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
  *              this file refuse each other - the failure parity exists to
  *              prevent, arriving from the other side. 1.0.0 is not a claim that
  *              this analyzer is new; it is the first version it has ever
- *              DECLARED. The full rule is in docs/analyzers.md.
+ *              DECLARED. The full rule is in docs/reference/analyzers.md.
  *   headline  - NULL here, and NULL is an answer: every row this emits is a
  *              peer of every other, and §3.2 honours a declared "none" instead
  *              of falling back to the host's V1/V2 table.

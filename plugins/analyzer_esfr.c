@@ -221,10 +221,10 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V3 registration (docs/abi-v3.md §3-§4). The version names THE COMPUTATION -
+/* V3 registration (docs/reference/abi-v3.md §3-§4). The version names THE COMPUTATION -
  * it changes when an input could produce a different result document and never
  * for a commit or a compiler (the rule, and why it is not the build id, is in
- * docs/analyzers.md; the long form is in analyzer_stats.c). Note that a change
+ * docs/reference/analyzers.md; the long form is in analyzer_stats.c). Note that a change
  * to any of the simplifications this file documents - the missing sinc
  * correction, the Hamming window, the 4x binning - moves the curve and is
  * therefore a version change, which is the case the field was added for.

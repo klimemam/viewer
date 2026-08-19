@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
-// ---- Watch: the source files, on disk (docs/watch-design.md 項目20) -----------
+// ---- Watch: the source files, on disk (docs/features/watch/watch-design.md 項目20) -----------
 // core/watch.h holds the DECISION (what "changed" means, §1/§4). This file holds
 // the three things that decision needs and it does not: where to look, when to
 // look, and who is told.

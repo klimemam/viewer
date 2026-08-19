@@ -1,7 +1,7 @@
 // The framed stream a reader returns (`VIEWERSTREAM 1`), in the part BOTH
 // binaries need.
 //
-// docs/adapter-transport-review.md froze the format: a line-based header, then
+// docs/background/reviews/adapter-transport-review.md froze the format: a line-based header, then
 // the pixel blobs raw and in the order their `pixels` lines named them. The
 // viewer has always read it (core/app/loader_npz.inc). Since issue #180 the
 // PEER writes one too - a reader runs where the file lives and its result stays
@@ -46,7 +46,7 @@ struct TreeNode {
     int parent = -1;
 };
 
-// docs/reader-analysisset.md's A3 gate, and the ONE spelling of its refusals.
+// docs/features/adapters/reader-analysisset.md's A3 gate, and the ONE spelling of its refusals.
 // Called by the local carrier (core/app/loader_npz.inc vnzCheckTree, which
 // projects its richer node onto this one) and by the peer before it accepts
 // what a reader wrote. Same sentence from both, by construction rather than by

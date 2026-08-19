@@ -104,7 +104,7 @@ static bool sniffExr(const uint8_t* p, size_t n) {
 // stb_image gives back 8-bit or 16-bit samples with the file's own channel
 // count (req_comp = 0), which is what the channel rule wants: a greyscale PNG
 // is ONE frame of ONE channel, RGBA is one frame of four
-// (docs/input-adapters.md §3.1, "the last axis, four or fewer, is channels").
+// (docs/features/adapters/input-adapters.md §3.1, "the last axis, four or fewer, is channels").
 // Asking stb for 4 channels always - the usual way to call it - would have made
 // every mono capture a 4-channel image and every per-channel statistic a lie.
 
@@ -269,7 +269,7 @@ const std::vector<Backend>& backends() {
         { "OpenEXR", ".exr", EXR_LIBRARY, sniffExr, exrDecode,
           nullptr, "exr layer", true },
         // y4m is a VIDEO container in a picture-format table, and it belongs
-        // here because after docs/video-support.md's question it is one: a text
+        // here because after docs/features/media/video-support.md's question it is one: a text
         // header plus raw planes, no compression, no inter-frame prediction -
         // so a file is N pictures of one shape in order, which is precisely
         // what a multi-page TIFF is and what this table's `member` rule already
@@ -367,7 +367,7 @@ static std::string listFormats(const char* conjunction, bool decodableOnly) {
 
 // The last line of every refusal here, and the same words the .npy door uses
 // (core/main.cpp npyNotNative): the message that says no is also the place the
-// way out is offered (docs/input-adapters.md §3.2 / §4.13).
+// way out is offered (docs/features/adapters/input-adapters.md §3.2 / §4.13).
 static const char* CHOOSE_A_READER = "\n  choose a reader to read it another way";
 
 static std::string whatIsRead() {
@@ -419,7 +419,7 @@ bool peerServesDeclared(const std::string& path) {
 
 std::string peerRefusal(const std::string& path) {
     if (peerServes(path)) return {};
-    // Named, reasoned, way out attached - docs/input-adapters.md §3.2's three
+    // Named, reasoned, way out attached - docs/features/adapters/input-adapters.md §3.2's three
     // parts. The way out is real for the first two cases: the file IS readable
     // here, just not over this link.
     static const char* const WAY_OUT =
@@ -438,7 +438,7 @@ std::string peerRefusal(const std::string& path) {
         return why + WAY_OUT;
     }
     // A CONTAINER, and since protocol 13 the peer lists what is inside one
-    // (issue #217, docs/remote-reader-design.md §10.4). This sentence used to
+    // (issue #217, docs/features/remote/remote-reader-design.md §10.4). This sentence used to
     // be "the peer serves one array per file, not a container" - true when
     // nothing could address a member, and FALSE the day MSG_NPZ_SCAN shipped.
     // A refusal that denies a door which exists is verify-matrix G11 all over
@@ -469,7 +469,7 @@ std::string peerRefusal(const std::string& path) {
     // rule G9 (PR #176) settled.
     //
     // The wording changes the day the wire can carry a recipe
-    // (docs/remote-headerless-design.md §4.4, stage 2): then the fact is "this
+    // (docs/features/remote/remote-headerless-design.md §4.4, stage 2): then the fact is "this
     // request carried no recipe", not "this link cannot carry one".
     if (isHeaderless(path))
         return "a headerless " + lowerExt(path) + " states its shape in a recipe on "
@@ -489,7 +489,7 @@ std::string peerRefusal(const std::string& path) {
     }
     // The fall-through: a name with no row, no decoder here, and no measured
     // refusal of its own - headerless RAW today, whatever is unrecognised
-    // tomorrow. It got the first two parts of docs/input-adapters.md §3.2 and
+    // tomorrow. It got the first two parts of docs/features/adapters/input-adapters.md §3.2 and
     // not the third, so it was the one refusal in this function that left the
     // operator with nowhere to go (verify-matrix G9).
     //
@@ -502,7 +502,7 @@ std::string peerRefusal(const std::string& path) {
     //
     // ...and the second half of the way out, which is the one that actually
     // applies here: nothing that reaches this line is read natively on EITHER
-    // machine, so the door is a reader (docs/input-adapters.md §4.13), and what
+    // machine, so the door is a reader (docs/features/adapters/input-adapters.md §4.13), and what
     // this refusal owes the operator is the state of that door. It was DECIDED
     // on 2026-08-03 (§4.13.1: "adapter は peer 側で走る" - the file is where the
     // data is, and shipping raw bytes here to convert them defeats the tool),
@@ -519,7 +519,7 @@ std::string peerRefusal(const std::string& path) {
     // having one.
     //
     // The --serve-readers clause is not a hedge, it is the second half of the
-    // truth (docs/remote-reader-design.md §2): the peer's own launcher decides
+    // truth (docs/features/remote/remote-reader-design.md §2): the peer's own launcher decides
     // whether code sent from here may run there, and a person told to choose a
     // reader without being told that would meet the gate's refusal with no idea
     // what it was about. It NAMES the flag rather than promising an outcome -
@@ -529,7 +529,7 @@ std::string peerRefusal(const std::string& path) {
            "\n  this link carries those formats only - copy the file to this "
            "machine to open it with everything else this viewer reads"
            "\n  choose a reader: it is sent to the peer and runs where the file "
-           "lives (docs/input-adapters.md §4.13.1), and only the pixels a screen "
+           "lives (docs/features/adapters/input-adapters.md §4.13.1), and only the pixels a screen "
            "needs come back - if that peer was started with --serve-readers"
            "\n  copy the file here to use a reader on this machine instead";
 }

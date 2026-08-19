@@ -1,4 +1,4 @@
-/* abi_stack_twin.c - a REAL stack analyzer, written against docs/abi-v3.md §5
+/* abi_stack_twin.c - a REAL stack analyzer, written against docs/reference/abi-v3.md §5
  * and §6, and the fixture the host side of both is tested against.
  *
  * It exists because the interesting half of §5 is not the struct: it is what a

@@ -26,7 +26,7 @@
 
 namespace fs = std::filesystem;
 
-// The v3 promise, asked of the compiler instead of trusted (docs/abi-v3.md
+// The v3 promise, asked of the compiler instead of trusted (docs/reference/abi-v3.md
 // §2.1: "psHostApi の寸法は変わらない"). A third-party dll built against the v1
 // or v2 header is a fixed byte layout on someone's disk; v3 renames reserved
 // slots and adds structs, and MUST move nothing. If a future edit inserts a
@@ -34,7 +34,7 @@ namespace fs = std::filesystem;
 // time, in the host, rather than as garbage read out of an old plugin.
 static_assert(sizeof(psHostApi) == 2 * sizeof(uint32_t) + 15 * sizeof(void*),
               "psHostApi changed size - every already-built plugin now reads "
-              "the wrong bytes (docs/abi-v3.md §2.1, §12)");
+              "the wrong bytes (docs/reference/abi-v3.md §2.1, §12)");
 static_assert(offsetof(psHostApi, register_analyzer2) ==
                   2 * sizeof(uint32_t) + 7 * sizeof(void*),
               "the v2 register slot moved - v2 plugins would call the wrong one");
@@ -44,7 +44,7 @@ static_assert(offsetof(psHostApi, register_analyzer3) ==
 static_assert(offsetof(psHostApi, register_stack_analyzer3) ==
                   offsetof(psHostApi, register_analyzer3) + sizeof(void*),
               "the stack mouth must be the seat right after register_analyzer3 "
-              "(docs/abi-v3.md §12) - a plugin built against a header that said "
+              "(docs/reference/abi-v3.md §12) - a plugin built against a header that said "
               "so would otherwise call whatever moved into it");
 
 namespace {
@@ -139,7 +139,7 @@ int32_t hostRegisterAnalyzer2(void*, const psAnalyzerV2* a) {
 }
 int32_t hostRegisterAnalyzer3(void*, const psAnalyzerV3* a) {
     if (!a || !validCommon(a->abi_version, 3, a->caps, a->name, (const void*)a->analyze)) return 1;
-    // The one check v3 adds (docs/abi-v3.md §3.1). Declaring v3 IS declaring a
+    // The one check v3 adds (docs/reference/abi-v3.md §3.1). Declaring v3 IS declaring a
     // version: the freedom to stay anonymous lives in V1/V2, which load
     // forever, so a v3 descriptor without one is a contradiction. Refused with
     // its reason on the line rather than filled in by the host - a version the
@@ -217,7 +217,7 @@ psHostApi g_api = {
     hostRegisterDisplay, hostRegisterAnalyzer, hostRegisterProcessor,
     hostRegisterAnalyzer2, hostRegisterAnalyzer3, hostRegisterStackAnalyzer3,
     {}                                // the seats after it stay NULL on purpose:
-                                      // docs/abi-v3.md §7 (series) and §8 are later
+                                      // docs/reference/abi-v3.md §7 (series) and §8 are later
                                       // stages, and a plugin asks by NULL test, not
                                       // by version
 };

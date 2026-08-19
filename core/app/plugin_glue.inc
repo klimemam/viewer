@@ -51,7 +51,7 @@ static void ana2Series(void* ctx, const char* name, const char* xl, const char* 
     c->ana->series.push_back(std::move(s));
 }
 
-// ---- serving a stack to a plugin (docs/abi-v3.md §5.1, §9.1) ----------------
+// ---- serving a stack to a plugin (docs/reference/abi-v3.md §5.1, §9.1) ----------------
 //
 // The host end of the PULL mouth. In this build the answer to "where do the
 // frames live" is the easy one - §9.1: the viewer already holds every loaded
@@ -115,7 +115,7 @@ static void stackServeRelease(void* ctx, uint32_t index) {
 // `err` is always a sentence someone can act on - the two refusals below are
 // the host's own and never reach the plugin.
 //
-// THE ORDER IS THE CONTRACT (docs/abi-v3.md §6, 判断3). min_frames is a
+// THE ORDER IS THE CONTRACT (docs/reference/abi-v3.md §6, 判断3). min_frames is a
 // DECLARATION and the host settles it BEFORE the call; frames/expected are
 // FACTS and the plugin reads them after it has been called. Neither replaces
 // the other: with the declaration alone, 8 of 24 is indistinguishable from 8

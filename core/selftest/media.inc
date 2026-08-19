@@ -12,7 +12,7 @@
     //   * where the decoder DID change the scale (a 4-bit PNG, expanded x17)
     //     the note says so, because the Inspector is where a user finds out
     //     what happened to their numbers;
-    //   * a refusal names the file and the reason (docs/input-adapters.md
+    //   * a refusal names the file and the reason (docs/features/adapters/input-adapters.md
     //     §3.2) - "unsupported" is not a message, and TIFF being absent from
     //     this build is a different sentence from a file being corrupt.
     //
@@ -91,7 +91,7 @@
         }
 
         // ---- M3: the channel rule, all four ways ----------------------------
-        // docs/input-adapters.md §3.1: the last axis, four or fewer, is
+        // docs/features/adapters/input-adapters.md §3.1: the last axis, four or fewer, is
         // channels. Greyscale is 1 - asking the decoder for RGBA always (the
         // usual way to call one) would have made every mono capture 4-channel
         // and every per-channel statistic meaningless.
@@ -539,7 +539,7 @@
         }
 
         // ---- M19: the compressed paths, which are the whole argument ---------
-        // docs/media-support.md §1 chose the official library over a hand-rolled
+        // docs/features/media/media-support.md §1 chose the official library over a hand-rolled
         // reader because real .exr files are PIZ or DWA, and "NONE and ZIP only"
         // would produce a stream of files that will not open. That reasoning is
         // worth nothing unless the compressed paths are actually exercised.
@@ -718,7 +718,7 @@
         }
 
         // ---- M24-M28: y4m, and the video this build will NOT read -----------
-        // docs/video-support.md is the argument; this is the enforcement of it.
+        // docs/features/media/video-support.md is the argument; this is the enforcement of it.
         // The question that decides whether a video may be loaded is not "can it
         // be decoded" but "are the numbers still the numbers": an 8-bit lossy
         // round trip turns a known sigma_t of 40 DN16 into 0.00 - not degraded,
@@ -855,7 +855,7 @@
             // Never a bare "cannot open", and never the RAW dialog - which would
             // invite the operator to type a width and a height for an H.264
             // bitstream and would then show them a picture made of entropy-coded
-            // bytes. The reason is a MEASUREMENT (docs/video-support.md §1), not
+            // bytes. The reason is a MEASUREMENT (docs/features/media/video-support.md §1), not
             // an opinion about lossy compression.
             {
                 ImageDoc* d = open1("capture.mp4");
@@ -903,7 +903,7 @@
         // one vendor RAW that can be written without a camera, and it declares
         // those four things in exactly the tags a NEF or a CR3 does. What it
         // cannot cover is a vendor DECOMPRESSOR, and that gap is named in
-        // docs/media-support.md §2.4 rather than papered over here.
+        // docs/features/adapters/input-adapters.md §3.6.5 rather than papered over here.
 
         // ---- M29: the samples are the sensor's counts ------------------------
         // (y*W+x)*7 % 16384 went in. A reader that normalised to 0..1, that

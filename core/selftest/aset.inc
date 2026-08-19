@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 横断
-    // AnalysisSet (docs/reader-analysisset.md, "ras"): the viewer side.
+    // AnalysisSet (docs/features/adapters/reader-analysisset.md, "ras"): the viewer side.
     // Containers are built BY HAND, no Python involved, for the V25 reason:
     // what is under test is the READER of the transport - given the reserved
     // members (§4), does the viewer build the set, bind the roles in §2.2

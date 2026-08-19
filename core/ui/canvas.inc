@@ -391,7 +391,7 @@ static std::string g_paneBadgeProbe;
 // g_paneBadgeProbe, and the same rule: it records the STRINGS that went to
 // AddText, not the numbers they were built from - the zoom readout has two
 // formats and the one it chose is the thing worth asserting, which a test
-// re-deriving "zoom * 100" would never see. (docs/verify-ui.md E3: the row was
+// re-deriving "zoom * 100" would never see. (docs/verification/ui.md E3: the row was
 // moved out of the A section precisely because nothing here was observable.)
 static std::string g_footerProbe;
 static std::string elideFront(const std::string& s, size_t keep);   // fwd
@@ -1528,7 +1528,7 @@ static void drawCanvas(ImVec2 avail) {
 // one bin swallows FOUR integer DN values and its neighbour swallows three, and
 // the panel draws a periodic comb that is not in the data. Reading the shape of
 // a noise distribution is what the histogram is for, so that is fatal
-// (docs/todo-open.md 9, user report 2026-07-29).
+// (docs/background/project/todo-open.md 9, user report 2026-07-29).
 //
 // So the grid is snapped to a round width and a round origin:
 //   integer dtype  w = ceil(span/256) as a whole number, at least 1 - one bin
@@ -1715,7 +1715,7 @@ struct PlotRect {
 //
 // The quantity and the wording are NOT new. A detrend product's note already
 // says "p-p 12.3% -> 4.5% (p-p 100 -> 40 DN)", and its denominator is the
-// plane's mean LEVEL (docs/flat-field-stats.md). Using the same pair here means
+// plane's mean LEVEL (docs/features/analysis/flat-field-stats.md). Using the same pair here means
 // a reader who has seen one has seen both, and nobody has to learn a second
 // spelling of "how flat is this".
 //
@@ -1792,7 +1792,7 @@ static bool zoomRangeFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
 }
 
 // A drag on the histogram's x axis -> the value interval it selects (#68,
-// docs/histogram-select-design.md §2). Pure, and here beside zoomRangeFromDrag
+// docs/features/histogram/histogram-select-design.md §2). Pure, and here beside zoomRangeFromDrag
 // for its reason: a selftest can then pin the whole mapping with no mouse.
 //
 // Three rules, and each earns its place:
@@ -1900,7 +1900,7 @@ static const char* AB_STALE_TOKEN = "[stale]";
 static const ImVec4 RELOAD_FAIL_RED(0.92f, 0.36f, 0.33f, 1.0f);
 static const ImU32  RELOAD_FAIL_RED32 = IM_COL32(235, 92, 84, 255);
 
-// ...and AMBER, one step down from it (docs/watch-design.md §5: 「琥珀の1行」).
+// ...and AMBER, one step down from it (docs/features/watch/watch-design.md §5: 「琥珀の1行」).
 // The two say different things and must not wear one colour: red is "what is on
 // screen is wrong", amber is "what is on screen is fine, and the FILES behind it
 // have moved". Nothing about the pixels in memory is in doubt when this shows -

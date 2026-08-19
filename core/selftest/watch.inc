@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
-    // ---- Watch: source files that moved on disk (docs/watch-design.md §10) -----
+    // ---- Watch: source files that moved on disk (docs/features/watch/watch-design.md §10) -----
     // Two halves, and the split is the point.
     //
     //   W1-W12  the RULE, with no filesystem and no clock: watch::observe fed

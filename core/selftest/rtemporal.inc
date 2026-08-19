@@ -86,7 +86,7 @@
             refSt = sqrt(aV / ns);
             refCorr = aC / ns;                     // C = mean_i(s_t,i^2 / n_i)
             // var_spatial(M) at ddof=1, minus C, clamped and DECLARED
-            // (docs/flat-field-stats.md (b))
+            // (docs/features/analysis/flat-field-stats.md (b))
             double sVar = std::max(0.0, aM2 / ns - refMean * refMean) * (ns / (ns - 1.0));
             refClamp = sVar - refCorr < 0.0;
             refFpn = sqrt(std::max(0.0, sVar - refCorr));

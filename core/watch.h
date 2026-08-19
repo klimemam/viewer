@@ -1,5 +1,5 @@
 #pragma once
-// Watch: what "the source files changed on disk" MEANS (docs/watch-design.md
+// Watch: what "the source files changed on disk" MEANS (docs/features/watch/watch-design.md
 // §1 and §4), decided with no clock, no filesystem and no thread.
 //
 // Everything in this header is a pure function of the readings it is handed.

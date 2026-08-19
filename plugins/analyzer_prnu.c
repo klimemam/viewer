@@ -185,7 +185,7 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
                     for (x = 0; x < pw; x++) a += plane[(size_t)y * pw + x];
                     m1[y] = (float)(a / pw);
                 }
-                /* ddof=1 (stats-taxonomy.md section 8, ruling 2): these are the
+                /* ddof=1 (docs/features/analysis/stats-taxonomy.md section 8, ruling 2): these are the
                    sigma of the row / column MEANS, the same quantity the canon
                    calls A and B, so they follow the estimator convention and
                    not the descriptive one.
@@ -222,10 +222,10 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V3 registration (docs/abi-v3.md §3-§4). The version names THE COMPUTATION -
+/* V3 registration (docs/reference/abi-v3.md §3-§4). The version names THE COMPUTATION -
  * it changes when an input could produce a different result document and never
  * for a commit or a compiler (the rule, and why it is not the build id, is in
- * docs/analyzers.md; the long form is in analyzer_stats.c). The headline is
+ * docs/reference/analyzers.md; the long form is in analyzer_stats.c). The headline is
  * declared channel-stripped, so "R.prnu_pct" and "ch0.prnu_pct" are both
  * accented and "R.row_fpn_pct" is not - the same rows the host's V1/V2 table
  * picked with the suffix ".prnu_pct", now declared by the only party that

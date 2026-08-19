@@ -189,7 +189,7 @@
         // (verify-matrix G7).
         //
         // And the fall-through itself: whatever lands there is refused with the
-        // first two parts of docs/input-adapters.md §3.2 and, until G9, without
+        // first two parts of docs/features/adapters/input-adapters.md §3.2 and, until G9, without
         // the third. A refusal with no way out is where an operator stops.
         {
             const std::string rw = rbRowWhyNot("trc2", "capture.mp4");
@@ -414,7 +414,7 @@
         // PNG, ..." - a list the operator can already see this file is not in.
         //
         // This stage does not open the door (that is protocol 11,
-        // docs/remote-headerless-design.md stage 2). It makes the refusal TRUE:
+        // docs/features/remote/remote-headerless-design.md stage 2). It makes the refusal TRUE:
         // the shape of this file is a declaration that lives on this machine
         // and the wire has no field to carry it, which is one step more
         // specific than the fall-through and names a door that does work.
@@ -509,14 +509,14 @@
 
         // ---- F4d2: the fall-through says what was DECIDED about readers ------
         // verify-matrix G11 / issue #180 ruling B, stage 0 of
-        // docs/remote-reader-design.md. F4d moved headerless files OFF the
+        // docs/features/remote/remote-reader-design.md. F4d moved headerless files OFF the
         // fall-through; this is about what still lands on it - a name with no
         // row, no decoder here, and no measured refusal of its own.
         //
         // For such a file the served list is true and useless: the operator can
         // already see this name is not in it, and carrying the file over does
         // not make this build read it natively either. The door that would read
-        // it is a READER (docs/input-adapters.md §4.13) - and §4.13.1 decided,
+        // it is a READER (docs/features/adapters/input-adapters.md §4.13) - and §4.13.1 decided,
         // on 2026-08-03, that readers run where the file lives. That decision
         // has no implementation. Until this the refusal did not mention it, so
         // "decided and not built" was indistinguishable from "never considered":
@@ -944,7 +944,7 @@
             // verify-matrix G1, and the user report behind it. Everything
             // before this line is a format that states its own shape; this one
             // states nothing, so the geometry travels with the request
-            // (protocol 11, docs/remote-headerless-design.md).
+            // (protocol 11, docs/features/remote/remote-headerless-design.md).
             //
             // The fixture is written HERE, byte by byte, and the expected
             // samples are the ones this test wrote - not a second decoder's

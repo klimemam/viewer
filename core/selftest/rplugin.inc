@@ -68,7 +68,7 @@ static int rpluginSelfTest(const char* exe, const char* path) {
     // --stackana-selftest load them - out of their own directory, through the
     // real loader. The peer loads the same directory from its own side; that
     // the two lists agree is not assumed anywhere below, it is asked.
-    // ...and, since the bundled analyzers migrated to v3 (docs/abi-v3.md §1),
+    // ...and, since the bundled analyzers migrated to v3 (docs/reference/abi-v3.md §1),
     // the SHIPPED directory as well. This selftest returns before main() reaches
     // the startup load, so without this line the client knows only the fixtures
     // - and section 5 below is exactly the case the fixtures cannot stand in
@@ -369,7 +369,7 @@ static int rpluginSelfTest(const char* exe, const char* path) {
     // analyzers were V2 registrations with an empty version, so the parity rule
     // - correct, and correctly refusing an undeclared version (#134 judgment 2)
     // - could not be used with anything a user actually has. The migration
-    // (docs/abi-v3.md §1) is what closes that, and this is where it is asked.
+    // (docs/reference/abi-v3.md §1) is what closes that, and this is where it is asked.
     //
     // The peer needs no new plumbing to find them: ensurePlugins() already
     // searches <exedir>/plugins, viewer-serve sits beside build/plugins, and
@@ -381,7 +381,7 @@ static int rpluginSelfTest(const char* exe, const char* path) {
         for (const auto& a : plugin_host::analyzers())
             if (a.name == "stats/moments") sh = &a;
         check(sh && sh->abi == 3 && !sh->version.empty(),
-              "RP23 a SHIPPED analyzer declares a version at all (docs/abi-v3.md §1)");
+              "RP23 a SHIPPED analyzer declares a version at all (docs/reference/abi-v3.md §1)");
         if (sh && !sh->version.empty()) {
             std::vector<std::pair<std::string, std::string>> shLocal;
             {

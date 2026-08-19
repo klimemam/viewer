@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 設定ファイル
 //
 // --settings-selftest: settings.jsonc, issue #50 stage 1.
-// The spec is docs/settings-inventory.md; the 判断 numbers below are its §9.
+// The spec is docs/features/settings/settings-inventory.md; the 判断 numbers below are its §9.
 //
 // FIXTURES GO IN THIS TEST'S OWN TEMP DIRECTORY, and that is not housekeeping -
 // it is the subject. VIEWER_TEST_HOME is ONE folder shared by every selftest
@@ -891,7 +891,7 @@ static int settingsSelftest() {
               "T4 reading settings.jsonc writes nothing to prefs.txt");
     }
 
-    // ---- O1..O4: WHO decides this value (docs/preferences-panel-design.md §5)
+    // ---- O1..O4: WHO decides this value (docs/features/settings/preferences-panel-design.md §5)
     // #50's symptom is "I set it and it did not take". Four layers can decide a
     // key and until now nothing could say which one did - so the Preferences
     // panel's first requirement is not a widget, it is an answer.
@@ -1145,7 +1145,7 @@ static int settingsSelftest() {
         check(rows.size() == SETTING_KEY_COUNT,
               "W1 the panel has exactly one row per table key");
         // ...and the spot check the design derives by hand
-        // (docs/preferences-panel-design.md §3.1): prefs writes 27 keys, minus
+        // (docs/features/settings/preferences-panel-design.md §3.1): prefs writes 27 keys, minus
         // 5 history = 22 settings; membudget/watchfiles/watchauto are not read
         // yet = 19; `theme` splits into theme + accent = 20; plus the 3 that
         // exist only in settings.jsonc (remote.repoUrl, loading.rawRecipes,

@@ -139,10 +139,10 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         // out sqrt(N/(N-1)) larger or smaller depending on WHERE it was
         // measured: 6.9% at N=8, 3.3% at N=16. "local" and "server" are a
         // transport, not a quantity, and the canon names sigma_t once
-        // (docs/terminology.md, docs/stats-taxonomy.md), so this is a parity
+        // (docs/terminology.md, docs/features/analysis/stats-taxonomy.md), so this is a parity
         // repair and not a change of behaviour - the number this returned was
         // simply the wrong one of two. The unbiased form is also what the
-        // -sigma_t^2/N correction of docs/flat-field-stats.md is written
+        // -sigma_t^2/N correction of docs/features/analysis/flat-field-stats.md is written
         // against; ddof=0 would leave it (N-1)/N short.
         // Clamp BEFORE scaling, exactly as serve.cpp does: a rounding-negative
         // variance is 0 either way, and doing it in the same order keeps the
@@ -156,14 +156,14 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
     T.nonFinite = nonFinite;
     T.dropped = offs.size() - (plc[0] + plc[1] + plc[2] + plc[3]);
     // IS THERE A SPLIT TO REPORT? sigma_fpn is the SPATIAL spread of the
-    // time-averaged frame (docs/flat-field-stats.md (b)), so it needs a region
+    // time-averaged frame (docs/features/analysis/flat-field-stats.md (b)), so it needs a region
     // with spatial extent. One pixel has none - and the arithmetic below does
     // not say so: with a single sample the ddof=1 spatial variance is 0, the
     // correction is subtracted from it, the result goes negative and is clamped,
     // and the panel would print "sigma_fpn = 0, clamped". That sentence means
     // "no fixed pattern resolvable above this stack's temporal floor", which is
     // a MEASUREMENT. Here there is no measurement to make. The two are refused
-    // differently on purpose (docs/stats-taxonomy.md: a quantity is named by
+    // differently on purpose (docs/features/analysis/stats-taxonomy.md: a quantity is named by
     // what it is a spread OVER).
     //
     // Stated over the SAMPLE COUNT, not over the annotation type: a 1x1
@@ -178,7 +178,7 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         double corr = corrSum[p] / n;                     // C = mean_i(s_t,i^2 / n_i)
         double pmean = pmSum[p] / n;
         // ddof=1 on the SPATIAL variance too, as the settled estimator writes it
-        // (docs/flat-field-stats.md (b): "var は ddof=1", and (a)'s "ddof は全部
+        // (docs/features/analysis/flat-field-stats.md (b): "var は ddof=1", and (a)'s "ddof は全部
         // ddof=1" is stated to carry into (b)/(c)). It is not decoration: the
         // subtraction below is exact only against an UNBIASED spatial variance.
         // E[S^2_ddof1] = sigma_fpn^2 + C, so S^2 - C is unbiased for sigma_fpn^2;
@@ -205,7 +205,7 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
         if (fvar < 0.0) fvar = 0.0;
         T.fpnCorr[p] = sqrt(corr);      // in DN, so it reads beside sigma_fpn
         T.fixedPattern[p] = sqrt(fvar);
-        // sigma_tot's DEFINITION is unchanged (flat-field-stats.md (b)): it is
+        // sigma_tot's DEFINITION is unchanged (docs/features/analysis/flat-field-stats.md (b)): it is
         // sqrt(<sigma_t^2> + sigma_fpn^2) as it always was. It only becomes the
         // honest "expected spatial sigma of ONE frame" now - before the
         // correction it counted sigma_t^2/N twice.

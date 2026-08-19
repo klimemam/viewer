@@ -1,7 +1,7 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 設定ファイル
 //
 // settings.jsonc - THE FILE THE USER WRITES BY HAND (issue #50 stage 1).
-// docs/settings-inventory.md is the spec; the numbers below are its 判断 list.
+// docs/features/settings/settings-inventory.md is the spec; the numbers below are its 判断 list.
 //
 // The whole point of this file is a split (判断3): settings.jsonc is written by
 // a HUMAN and never written back by the app, because savePrefs() rewrites
@@ -599,7 +599,7 @@ struct SettingsReport {
 
 static SettingsReport g_settings;     // what the last load said
 
-// ---- the origin ledger (docs/preferences-panel-design.md §5.2) --------------
+// ---- the origin ledger (docs/features/settings/preferences-panel-design.md §5.2) --------------
 // WHO decided the value this key currently has. Normally four layers can
 // (defaults < prefs.txt < settings.jsonc < CLI); gamma/grid also have a fifth
 // Session layer. #50's symptom is exactly
@@ -1365,10 +1365,10 @@ static std::string sjQuote(const std::string& s) {
 // or "" when that value is the built-in default (and so must not be written).
 static std::string settingsCurrentValue(SKey id);   // fwd: defined below, one switch
 
-// ---- the Preferences panel's row model (docs/preferences-panel-design.md §8)
+// ---- the Preferences panel's row model (docs/features/settings/preferences-panel-design.md §8)
 // A pure function over SETTING_KEYS, so the panel is the table's FOURTH
 // consumer (after the applier, the schema walk and the template) rather than a
-// fifth list. browse-topbar-design.md §10.8's premise - "a second registration
+// fifth list. docs/features/browse/browse-topbar-design.md §10.8's premise - "a second registration
 // always rots" - is the reason, and it is the same reason the template is
 // generated instead of typed.
 //

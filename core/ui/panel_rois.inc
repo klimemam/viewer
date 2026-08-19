@@ -81,7 +81,7 @@ static bool roiPrnuPct(const RoiStat& s, double* out) {
 // Statistics panel builds its own - same letters, same inks, same divergence -
 // because a slot is one thing wearing one colour across the application, and a
 // second construction here would be a second answer to the question "what is
-// C" (docs/compare-n.md 10, "colour is the slot's property").
+// C" (docs/features/compare/compare-n.md 10, "colour is the slot's property").
 struct RoiSide {
     ImageDoc* doc = nullptr;
     std::string letter;          // "A", "B", "C", ... - the POSITION, not a name
@@ -144,7 +144,7 @@ static const char* roiChannelName(const ImageDoc& im, int chSel) {
 // a different population, a different n, printed under the same ROI's name in
 // the next column along. That is abProjOverlayable's refusal, one panel over:
 // a correspondence the data does not support is declined and SAID, never
-// invented (docs/ab-stats-plan.md 5).
+// invented (docs/features/compare/ab-stats-plan.md 5).
 static bool roiSideCovers(const ImageDoc& d, const App::Ann& a) {
     if (a.x < 0 || a.y < 0) return false;
     if (a.type != 0) return a.x < d.w && a.y < d.h;          // POI: one pixel
@@ -172,7 +172,7 @@ static bool roiSidePlane(const ImageDoc& a, const ImageDoc& d, int chSel) {
 // The sides this panel measures, resolved exactly as the Statistics panel's
 // are. ONE construction, because the table and its export must never disagree
 // about who is on screen - a second list here would be a second answer to the
-// question "what is C" (docs/compare-n.md §10). The channel-specific mute is
+// question "what is C" (docs/features/compare/compare-n.md §10). The channel-specific mute is
 // NOT applied here: it is the panel's, about the plane it is showing, and the
 // export has no single plane to be muted about.
 static std::vector<RoiSide> roiSidesFor(ImageDoc* im) {
@@ -210,7 +210,7 @@ struct RoiCell {
 // This ratio keeps the longest note in this panel because its OLD name claimed more than
 // one frame can deliver: what is on screen is the spatial spread of one region
 // as displayed, so the tooltip has to hand back the conditions the name implies
-// and this layer does not have (docs/flat-field-stats.md).
+// and this layer does not have (docs/features/analysis/flat-field-stats.md).
 // planesMixed: channel = "all" on a multi-plane frame pools planes into one
 // population, so the plane LEVELS are inside that sd - the ratio then measures
 // the mosaic more than the sensor, and it must say so where it is read.
@@ -261,7 +261,7 @@ static void roiStatTooltip(const std::vector<RoiCell>& cells, bool planesMixed) 
                         "from above and is not a measurement of it. The named\n"
                         "fixed-pattern measurements live a layer above the frame -\n"
                         "an image stack and a dark stack, bound as roles, in the\n"
-                        "Set Analysis panel (docs/flat-field-stats.md).");
+                        "Set Analysis panel (docs/features/analysis/flat-field-stats.md).");
     // The one case where that bound has a named counterpart on screen: a frame
     // average IS the time-folded picture the Temporal panel's sigma_fpn is
     // measured on, off the same accumulator - and since #57 judgment 2 the two
@@ -375,7 +375,7 @@ static RoiCell roiCellOf(const ImageDoc& ref, const RoiSide& sd, const App::Ann*
     return c;
 }
 
-// ---- the ROIs table as a document (docs/export-design.md 10, issue #67) ----
+// ---- the ROIs table as a document (docs/features/export/export-design.md 10, issue #67) ----
 // This table had no clipboard surface at all: every number in it was readable
 // on screen and unreachable from a report. What makes it different from every
 // other table the viewer exports is that it carries WHERE the measurement was
@@ -468,7 +468,7 @@ static std::string buildRoiExport(char delim) {
                 "are its size in pixels, so the region is the pixels x..x+w-1 by "
                 "y..y+h-1 - half-open, [x, x+w) x [y, y+h). These are exactly the "
                 "numbers the panel prints as \"WxH @X,Y\" and the x/y/w/h editor "
-                "takes (docs/export-design.md 10)");
+                "takes (docs/features/export/export-design.md 10)");
     doc.comment("the ROIs are ONE shared set of rectangles, in A's coordinates "
                 "(issue #76): every side is measured over the same region. A side "
                 "whose frame does not contain it says so in its note column "
@@ -479,7 +479,7 @@ static std::string buildRoiExport(char delim) {
                 roiChannelName(*im, app.roiChannel) +
                 " - the export carries every plane whatever the selector says, "
                 "the same reason the display's decimals do not apply "
-                "(docs/export-design.md 3): the screen is for scanning, a file "
+                "(docs/features/export/export-design.md 3): the screen is for scanning, a file "
                 "is for reproduction");
 
     // ---- section 1: the regions --------------------------------------------
@@ -494,7 +494,7 @@ static std::string buildRoiExport(char delim) {
         // side-major, and within a side the panel's own row order: the All row,
         // then the annotations in the order they were placed. The file comes out
         // the same way whatever the panel is doing with its column groups - the
-        // rule docs/export-design.md 3.2 fixes for the Projection walk.
+        // rule docs/features/export/export-design.md 3.2 fixes for the Projection walk.
         auto emit = [&](const App::Ann* a, const std::string& name) {
             const int rx = a ? a->x : 0, ry = a ? a->y : 0;
             const int rw = a ? a->w : sd.doc->w, rh = a ? a->h : sd.doc->h;
@@ -524,7 +524,7 @@ static std::string buildRoiExport(char delim) {
     doc.comment("std is the PLAIN spatial sigma (ddof=0) of ONE frame as "
                 "displayed: no dark subtraction, no flat-field correction. "
                 "Temporal noise is inside it, so it BOUNDS the fixed pattern from "
-                "above and is not a measurement of it (docs/flat-field-stats.md); "
+                "above and is not a measurement of it (docs/features/analysis/flat-field-stats.md); "
                 "the named fixed-pattern measurements live a layer above the "
                 "frame. The Temporal panel's sigma_fpn comes off the same "
                 "accumulator with the temporal residual subtracted and is a "

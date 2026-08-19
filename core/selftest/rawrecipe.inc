@@ -474,7 +474,7 @@ static int rawRecipeSelftest() {
     }
 
     // ======================================================================
-    //  M — THE READ DECLARES ITSELF (docs/settings-inventory.md §4.1 M1)
+    //  M — THE READ DECLARES ITSELF (docs/features/settings/settings-inventory.md §4.1 M1)
     //
     //  Everything a headerless read uses is a measuring-class setting: the
     //  file states none of it, so every number taken off the picture depends

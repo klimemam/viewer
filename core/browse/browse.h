@@ -1,5 +1,5 @@
 // core/browse/browse.h — viewer → browse の入口宣言。担当: Browse
-// P7 (docs/split-plan.md §3): S3 まで remote_client.inc の static 前方宣言が
+// P7 (docs/background/project/split-plan.md §3): S3 まで remote_client.inc の static 前方宣言が
 // 担っていた役をヘッダに移す。背骨(フレームループ・teardown・browse-keys
 // ドライバ)、menus / session / open_dispatch / cli、そして selftest 群が呼ぶ
 // browse 側シンボルは全部ここ。browse の 2 TU (nav.cpp / panel.cpp) も互いを

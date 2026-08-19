@@ -25,7 +25,7 @@
 #include "ui_theme.h"
 #include "version.h"                 // the commit this binary was built from
 #include "remote.h"
-#include "adapter.h"                 // running an input adapter (docs/input-adapters.md §4)
+#include "adapter.h"                 // running an input adapter (docs/features/adapters/input-adapters.md §4)
 #include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
 #include "vstream.h"                 // the reader stream's tree check, shared with the peer
@@ -84,11 +84,11 @@
 // state.h first (P6): self-contained, and util.inc below uses its pathFromUtf8.
 #include "app/state.h"
 // THE App instance. state.h declares it extern; the definition stays in the
-// spine (docs/split-plan.md §6) — external linkage since P6, so the real TUs
+// spine (docs/background/project/split-plan.md §6) — external linkage since P6, so the real TUs
 // state.h exists for (core/analysis/, #84) link against this one object.
 App app;
 
-// P7 (docs/split-plan.md §3): Browse compiles as its own two TUs
+// P7 (docs/background/project/split-plan.md §3): Browse compiles as its own two TUs
 // (core/browse/nav.cpp, core/browse/panel.cpp). What the spine, the fragments
 // below and the selftests inside main() may call of it is declared in
 // browse.h; the seam the browse side calls back through is g_browseHost
@@ -118,7 +118,7 @@ static void settingsOriginSessionPath(const char* path);
 
 #include "app/session.inc"
 
-// settings.jsonc (issue #50 stage 1, docs/settings-inventory.md). AFTER
+// settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md). AFTER
 // session.inc, which owns viewerConfigDir() - the settings file deliberately
 // does NOT resolve the config directory a third time (§3.4 already carries two
 // copies of that rule, board row 185). BEFORE open_dispatch.inc, which asks it
@@ -129,7 +129,7 @@ static void settingsOriginSessionPath(const char* path);
 
 #include "app/temporal_model.inc"
 
-// The detrend STAGE (docs/flat-field-stats.md 判断6/7): pure, no app state,
+// The detrend STAGE (docs/features/analysis/flat-field-stats.md 判断6/7): pure, no app state,
 // and BEFORE setanalysis.inc because that file gets its cutoff wording and its
 // shading figure from here - one definition of what was done to the pixels,
 // and one spelling of how it is declared.
@@ -140,7 +140,7 @@ static void settingsOriginSessionPath(const char* path);
 #include "app/setanalysis_remote.inc"
 
 #include "app/open_dispatch.inc"
-// Watch (docs/watch-design.md): after open_dispatch because the [Reload] its
+// Watch (docs/features/watch/watch-design.md): after open_dispatch because the [Reload] its
 // line offers is that file's reloadStackFromDisk, and after sequence.inc
 // because the membership it re-derives every poll uses that file's sibling rule.
 #include "app/watch.inc"
@@ -236,7 +236,7 @@ static std::string fmtVal(float v, const std::string& dtype) {
 #include "app/cli.inc"
 
 // ---------------------------------------------------------------- BrowseHost
-// The browse -> viewer seam, filled (docs/split-plan.md §3 P7). Every target
+// The browse -> viewer seam, filled (docs/background/project/split-plan.md §3 P7). Every target
 // is a static function of THIS TU: the addresses cross the TU boundary, the
 // internal linkage stays - de-statics were only paid where browse calls a
 // helper by name (host.h lists those). Plain function pointers, so the table
@@ -249,7 +249,7 @@ const BrowseHost g_browseHost = {
     &browseWakeUi,
     // The Browse panel's door takes no recipe: a headerless row needs one and
     // the panel does not have one to give yet (that is stage 4 of
-    // docs/remote-headerless-design.md, where the double-click raises the RAW
+    // docs/features/remote/remote-headerless-design.md, where the double-click raises the RAW
     // dialog). A trampoline rather than widening core/browse/host.h now, so
     // the panel's ABI moves once, when it has something to put in the field.
     &browseOpenRemote,
@@ -665,7 +665,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--serve")) {
             // ...and the gate the launcher opened, read out of the same argv
-            // (docs/remote-reader-design.md §2). Same flag, same default, same
+            // (docs/features/remote/remote-reader-design.md §2). Same flag, same default, same
             // meaning as core/serve_main.cpp: which binary is being the peer is
             // an installation detail and must not change what it consents to.
             for (int k = 1; k < argc; k++)
@@ -790,7 +790,7 @@ int main(int argc, char** argv) {
     // true if the layout code changes again.
     //
     // --bench-panels is still accepted, and still means what it says: the
-    // recorded commands in docs/ab-stats-plan.md 1 and on the task board all
+    // recorded commands in docs/features/compare/ab-stats-plan.md 1 and on the task board all
     // carry it, and a flag that names the arrangement is worth keeping even
     // once the default agrees with it.
     bool benchPanels = benchFrames > 0;
@@ -813,7 +813,7 @@ int main(int argc, char** argv) {
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
     // ...and settings.jsonc immediately after it, which IS the precedence
-    // (docs/settings-inventory.md 判断13/18, and --settings-selftest L2/L5):
+    // (docs/features/settings/settings-inventory.md 判断13/18, and --settings-selftest L2/L5):
     //
     //     built-in defaults  <  prefs.txt  <  settings.jsonc  <  command line
     //
@@ -945,7 +945,7 @@ int main(int argc, char** argv) {
         // `!g_browseKeys.empty()` instead, which is set BELOW this point and so
         // was always false here: every GUI selftest read and wrote a layout.ini,
         // and only the APPDATA that CMakeLists.txt pins kept ctest off the
-        // developer's own (docs/verify-ui.md measured the md5 changing on a run
+        // developer's own (docs/verification/ui.md measured the md5 changing on a run
         // by hand). Closing that hole used to make selftest.browse-dbl fail
         // every time, because its scripted double-click was aimed at a panel
         // whose place came from the layout.ini an EARLIER test in the shared
@@ -1135,7 +1135,7 @@ int main(int argc, char** argv) {
     // a number derived by hand and the order two decisions are made in.
     if (g_stackAnaSelftest) return stackAnaSelftest();
 
-    // The five SHIPPED analyzers on the v3 mouth (docs/abi-v3.md §1): what each
+    // The five SHIPPED analyzers on the v3 mouth (docs/reference/abi-v3.md §1): what each
     // declares, where the declaration surfaces, and - the larger half - that
     // moving them there moved no result. Windowless for the anaprov reasons.
     if (g_bundledSelftest) return bundledSelftest();
@@ -2856,7 +2856,7 @@ static bool g_watchSuppressed = false;
                         g_expNeverPath.clear();
                     }
                     // ---- the "more" drawer is gone, and each thing it held is
-                    // asserted in its NEW home (docs/browse-topbar-design.md
+                    // asserted in its NEW home (docs/features/browse/browse-topbar-design.md
                     // 10.3). These are the only checks that can tell "moved"
                     // from "deleted".
                     else if (a == "chktitle") {
@@ -3086,7 +3086,7 @@ static bool g_watchSuppressed = false;
                         // dropping an ROI or leaving a comparison underneath -
                         // the exact failure the one-step-outward rule forbids,
                         // and the one thing this test could not see before
-                        // g_escProbe existed (docs/verify-ui.md E7).
+                        // g_escProbe existed (docs/verification/ui.md E7).
                         int took = g_escProbeN - escProbeAtPress;
                         std::string chain = g_escProbe.size() > 60
                             ? g_escProbe.substr(g_escProbe.size() - 60) : g_escProbe;

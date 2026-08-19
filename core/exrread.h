@@ -23,7 +23,7 @@
 //
 // The cost of that is real and is not hidden: OpenEXR + Imath is the heaviest
 // dependency in this tree. CMakeLists.txt carries the fetch, docs/
-// media-support.md §1 carries the measured build and binary cost, and
+// docs/features/media/media-support.md §1 carries the measured build and binary cost, and
 // THIRD-PARTY-NOTICES.md carries the licence.
 //
 // AND THERE IS NO SWITCH TO TURN IT OFF (#53, 2026-08-09: 「既定ONで。OFFに

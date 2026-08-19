@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
-    // ---- Watch, the REMOTE half (docs/watch-design.md §1's remote bullet) ------
+    // ---- Watch, the REMOTE half (docs/features/watch/watch-design.md §1's remote bullet) ------
     //
     // --watch-selftest is the same rule over a local disk. This is the same rule
     // again with a PEER on the other side of it, and it is a separate test for

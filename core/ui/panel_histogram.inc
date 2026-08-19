@@ -123,7 +123,7 @@ struct HistSide {
 // that the projection's plane selector and this one are one setting.
 static std::string g_histSideProbe;
 
-// ---- value highlight, the plot side (#68, docs/histogram-select-design.md) --
+// ---- value highlight, the plot side (#68, docs/features/histogram/histogram-select-design.md) --
 // The band and the gesture. Both derive their colour from HL_INK rather than
 // spelling magenta again, so §11's "one constant" really is one constant.
 static ImU32 histHlBandInk(int alpha) {
@@ -282,7 +282,7 @@ static void drawPanelHistogram() {
         // The SIDE is a row, never a column pair: a column pair has exactly two
         // operands - which is what a delta needs and what A|B|delta is - and
         // there are N sides. The Projection table settled this axis already
-        // (docs/ab-stats-plan.md 4); the rows are the axis that grows.
+        // (docs/features/compare/ab-stats-plan.md 4); the rows are the axis that grows.
         const bool anySide = sides.size() > 1;
         if (ImGui::BeginTable("quickstats", anySide ? 5 : 4,
                               ImGuiTableFlags_SizingFixedFit |
@@ -402,7 +402,7 @@ static void drawPanelHistogram() {
         // to be SPOKEN, never applied in silence:
         //   - PLANES. Four CFA planes times five slots is twenty curves, which
         //     is not a comparison, it is a texture. So slots overlay when ONE
-        //     plane is on the axis (docs/compare-n.md 4 - the general form of
+        //     plane is on the axis (docs/features/compare/compare-n.md 4 - the general form of
         //     ab-stats-plan 2's "eight curves are unreadable"), and the plane
         //     selector above is how you get there.
         //   - INK. slotInk can tell slotInkCount() slots apart and then wraps;
@@ -965,9 +965,9 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             }
             if (!n) continue;
             st.mean = sum / n;
-            // ddof=1 (stats-taxonomy.md §8 判断2). These are the row and column
+            // ddof=1 (docs/features/analysis/stats-taxonomy.md §8 判断2). These are the row and column
             // MEANS, not the pixels: sigma of them is A and B of the flat-field
-            // decomposition T = sigma_p^2 + A + B, and flat-field-stats.md fixes
+            // decomposition T = sigma_p^2 + A + B, and docs/features/analysis/flat-field-stats.md fixes
             // A and B at ddof=1 with a reason - taking T at ddof=0 puts an
             // O(1/W) inconsistency back. Leaving these at ddof=0 would mean the
             // decomposition, when it lands, either does not add up or silently

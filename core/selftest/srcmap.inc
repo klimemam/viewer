@@ -1,5 +1,5 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 全テーマ共有
-    // ---- who holds which pixels (docs/verify-functional.md D-1/D-2/D-7) ------
+    // ---- who holds which pixels (docs/verification/functional.md D-1/D-2/D-7) ------
     // The probe this test exists to exercise is srcMapDump(); the asserts below
     // are what it makes sayable. Every one of them is about a fact that had no
     // printing path at all before: the number of SOURCES behind N documents,

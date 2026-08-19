@@ -161,7 +161,7 @@ struct ServedFile {
 };
 
 // The layout decision, under a DECLARED reading (issue #124, docs/
-// input-adapters.md §3.3). This is core/app/loader_npz.inc's npyLayout, which
+// docs/features/adapters/input-adapters.md §3.3). This is core/app/loader_npz.inc's npyLayout, which
 // the peer had no equivalent of: openNpy hard-coded the native
 // interpretation, so the escape hatch the Inspector offers for a file opened
 // through File > Open did not exist for the same file opened through a peer.
@@ -640,7 +640,7 @@ static bool openRaw(ServedFile& n, const std::string& path, std::string& err,
 
 // ---------------------------------------------------------------- readers here
 //
-// docs/remote-reader-design.md, issue #180 judgment B. An adapter runs where
+// docs/features/remote/remote-reader-design.md, issue #180 judgment B. An adapter runs where
 // the file lives; what it produced stays here as a cache file, and the client
 // reaches its pixels through the SAME two requests every other file uses.
 //
@@ -912,7 +912,7 @@ static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node
 
 // ---------------------------------------------------------------- containers
 //
-// issue #217, docs/remote-reader-design.md §10. A .npz is a zip of .npy
+// issue #217, docs/features/remote/remote-reader-design.md §10. A .npz is a zip of .npy
 // members, so the peer's job is exactly two things it can do and the client
 // cannot: LIST what is in the file, and turn ONE named member into bytes that
 // readNpyRegion can decimate. Everything else - which member is pixels, which
@@ -2113,7 +2113,7 @@ bool clampRoi(const ServedFile& n, const std::vector<RoiRect>& rois, uint32_t c,
 }
 }  // namespace
 
-// Who computed it, from the peer's OWN ledger (docs/abi-v3.md §10/§11). Empty
+// Who computed it, from the peer's OWN ledger (docs/reference/abi-v3.md §10/§11). Empty
 // name = not a plugin op, and then not one byte of trailer is written: the
 // three ops that came before this one send the reply they always sent.
 struct MeasureProv {
@@ -2160,7 +2160,7 @@ static void sendMeasureReply(uint32_t framesUsed,
 // Temporal noise vs fixed pattern: per-pixel mean/var over the frame range.
 // sigma_t = sqrt(mean per-pixel temporal variance); sigma_fpn = the spatial
 // sigma of the per-pixel temporal means with the temporal residual STILL IN
-// that mean subtracted (#57 judgment 2, docs/flat-field-stats.md (b)):
+// that mean subtracted (#57 judgment 2, docs/features/analysis/flat-field-stats.md (b)):
 //
 //     C        = mean_i(s_t,i^2 / n_i)              ... per pixel, per its own n_i
 //     sigma_fpn = sqrt(max(0, var_spatial(M) - C))  ... var ddof=1, clamp declared
@@ -2650,7 +2650,7 @@ static void runSetFold(const MeasureReqHead& head,
     sendMeasureReply(usedTotal, cols, {}, &prov);
 }
 
-// ---- plugin analysis on the peer (docs/abi-v3.md §10) ---------------------
+// ---- plugin analysis on the peer (docs/reference/abi-v3.md §10) ---------------------
 //
 // One frame, materialized as f32 exactly as the local host would, handed to
 // whichever descriptor generation registered the analyzer. Shared by
@@ -2730,7 +2730,7 @@ static bool runFrameAnalyzerOn(const AnalyzerPluginInfo& ana,
 }
 
 namespace {
-// A psStack served from the peer's own streaming reader (docs/abi-v3.md §9.3 +
+// A psStack served from the peer's own streaming reader (docs/reference/abi-v3.md §9.3 +
 // §5.1). This is what pull was FOR: the local host returns a pointer because
 // every frame is already resident, and the peer - which holds nothing resident
 // and may be asked about 300 frames of 48 MB - reads frame i on demand and
@@ -2909,7 +2909,7 @@ static bool runStackAnalyzerOn(const StackAnalyzerPluginInfo& sa,
     return true;
 }
 
-// ---- parity (docs/abi-v3.md §10, #104 judgment 8) -------------------------
+// ---- parity (docs/reference/abi-v3.md §10, #104 judgment 8) -------------------------
 //
 // name + version equality, and a mismatch is refused with BOTH versions on the
 // line and no fallback of any kind. The reasoning the spec records: a version
@@ -3163,7 +3163,7 @@ static void handleMeasure(Buf& in) {
 // including the failures, because the four facts adapter::Run separates
 // (started / timedOut / exit / stderr) are FACTS about a run that happened on
 // this machine, and an MSG_ERR string would fold them back into one sentence
-// the client would have to parse. docs/remote-reader-design.md §6 maps each
+// the client would have to parse. docs/features/remote/remote-reader-design.md §6 maps each
 // outcome to the words a person reads; this end supplies the facts and never
 // the words - except where the words are settled HERE, which is the gate (§2.1)
 // and the check of what the reader returned (§5.2, shared with the local door).
@@ -3641,7 +3641,7 @@ static void handleReaderRun(Buf& in) {
 
 // ---------------------------------------------------------------- npz scan
 //
-// issue #217, docs/remote-reader-design.md §10.2. What is in this container -
+// issue #217, docs/features/remote/remote-reader-design.md §10.2. What is in this container -
 // facts only. The peer classifies nothing, builds no tree and inflates no
 // pixels: it walks the zip directory, peeks each member's .npy header, and
 // carries the VALUES of the small members (a scalar, a string, a short 1-D

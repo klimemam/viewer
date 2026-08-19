@@ -1,5 +1,5 @@
 /* The measurement the ABI compatibility twins perform - ONE implementation,
- * reached through two ABI paths (docs/abi-v3.md §2.1: "V1/V2 構造体と登録経路は
+ * reached through two ABI paths (docs/reference/abi-v3.md §2.1: "V1/V2 構造体と登録経路は
  * 永久に不変").
  *
  * abi_v2_twin.c registers it as a psAnalyzerV2 - the exact shape every bundled

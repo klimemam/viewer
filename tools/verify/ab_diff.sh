@@ -5,7 +5,7 @@
 # unfiltered difference can be inspected before any rule is justified.
 #
 # Normalization rules (each one exists because the raw diff proved the text is
-# run-specific, never because it was convenient - see docs/verify-functional.md):
+# run-specific, never because it was convenient - see docs/verification/functional.md):
 #   N1  the --remote-exe path: each build must launch ITS OWN viewer-serve.exe,
 #       so this argument is different by construction, not by behavior.
 #   N2  the pinned per-pass APPDATA / TMP / capture directory paths.

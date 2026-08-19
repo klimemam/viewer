@@ -1,5 +1,5 @@
 // core/app/state.h — 共有状態の自己完結ヘッダ。担当: 全テーマ共有
-// P6 (docs/split-plan.md §5): state.inc がこのヘッダになった。単独で include できる
+// P6 (docs/background/project/split-plan.md §5): state.inc がこのヘッダになった。単独で include できる
 // (必要なものは全て自分で include する)ので、新規コードは実 TU として生まれられる
 // (core/analysis/、最初の客は #84)。App app の定義は §6 により背骨(main.cpp)に
 // 残る — ここにあるのは extern 宣言だけ。
@@ -191,7 +191,7 @@ struct FrameSource {
                                       // (npy frame axis; npz members too). With path +
                                       // member it completes the provenance a reload
                                       // re-decodes - remoteFrame is the remote twin
-    // How this array was READ (docs/input-adapters.md §3.1/§3.3). npyShape is
+    // How this array was READ (docs/features/adapters/input-adapters.md §3.1/§3.3). npyShape is
     // the shape the FILE declared, kept so the Inspector can compute which
     // other readings that shape permits instead of offering a fixed list; empty
     // = these pixels did not come from a .npy. npyRead is NR_NATIVE until a
@@ -260,7 +260,7 @@ inline void statSourceFile(FrameSource& s) {
 //
 // "An empty host means this machine" is the rule the remote layer already runs
 // on - makeRemoteUrl mints "local://<path>" for an empty host and
-// remote::parseUrl is its inverse (docs/watch-design.md §13.7) - so it is asked
+// remote::parseUrl is its inverse (docs/features/watch/watch-design.md §13.7) - so it is asked
 // HERE, once, through that inverse, rather than by yet another literal prefix
 // test. The two callers that used to spell it themselves (statLocalUrl below
 // and watchLocalPathOf, the FrameSource-level form) now come through this, and
@@ -385,7 +385,7 @@ inline std::string srcKeyCanonical(const std::string& p) {
 // rules - it would rewrite, or silently absolutize, a name that never touches
 // this disk. A url is not a filesystem path.
 //
-// local:// IS this disk, though (docs/watch-design.md §13.7 - the same "empty
+// local:// IS this disk, though (docs/features/watch/watch-design.md §13.7 - the same "empty
 // host means this machine" every other consumer runs on), so it was never one
 // of those, and passing it through was the defect: the local:// url EMBEDS an
 // on-disk path, so the file it names is the same file the local door opens,
@@ -534,7 +534,7 @@ inline std::shared_ptr<FrameSource> srcRegistryAdd(const std::shared_ptr<FrameSo
 // warning, and both folds carry the exclusion count and the valid frame count.
 enum StackFold { FOLD_MEAN = 0, FOLD_SUM = 1 };
 
-// The detrend stage's parameters (docs/flat-field-stats.md 判断6/7, settled
+// The detrend stage's parameters (docs/features/analysis/flat-field-stats.md 判断6/7, settled
 // 2026-08-09). Here rather than in core/app/detrend.inc for the reason
 // StackFold is here: SeqInfo carries one, and SeqInfo is declared below. The
 // arithmetic, and the reasoning behind every default, live in detrend.inc.
@@ -704,7 +704,7 @@ struct ViewState {
 // state types, P7 §3.)
 
 // One array inside a .npz, CLASSIFIED BY SHAPE before anything is opened
-// (docs/npz-design.md §2.1). An .npz is a container: the file is a batch, a
+// (docs/features/adapters/npz-design.md §2.1). An .npz is a container: the file is a batch, a
 // member is a stack or a frame - and a member that is not pixels must never
 // become pixels. (Defined up here because App carries the member picker; the
 // scanner that fills these lives with the zip reader.)
@@ -866,7 +866,7 @@ struct App {
     // split, diff, flip) still means exactly two images and still works
     // untouched. The extras are for the numeric side, which extends to N
     // without argument, and for side-by-side, which is the one image layout
-    // that does. docs/todo-open.md item 19 holds the shape this should
+    // that does. docs/background/project/todo-open.md item 19 holds the shape this should
     // eventually take.
     std::vector<uint64_t> cmpExtra;          // uids, in slot order (C, D, ...)
     uint64_t lastCompareBUid = 0;            // the B last CHOSEN, kept across compare being off
@@ -981,7 +981,7 @@ struct App {
     // are computed for every plane either way.
     int histPlane = -1;
 
-    // ---- value highlight (#68, docs/histogram-select-design.md) -------------
+    // ---- value highlight (#68, docs/features/histogram/histogram-select-design.md) -------------
     // Drag a value interval on the histogram's x axis and the pixels that fall
     // in it are painted on the image, in one colour, with the count declared.
     //
@@ -1123,7 +1123,7 @@ struct App {
         int reloadOk = 0;                 // ...and members it re-read, same attempt
         std::string reloadFirstErr;       // "a_003.npy: cannot read file"
         std::string reloadWhen;           // wall clock of that attempt
-        // ---- Watch (docs/watch-design.md §5) ---------------------------------
+        // ---- Watch (docs/features/watch/watch-design.md §5) ---------------------------------
         // What the watcher has CONFIRMED about this stack's files on disk, and
         // it is a fact about the DISK, not about these pixels: the frames in
         // memory are exactly what they always were, and the line this drives
@@ -1172,7 +1172,7 @@ struct App {
         std::string axisName, axisUnit;
         std::vector<double> axisVals;     // axisVals[i] belongs to seqIndex i
         // Empty on every stack that was OPENED. Filled only on a stack this
-        // program COMPUTED with the detrend stage (docs/flat-field-stats.md
+        // program COMPUTED with the detrend stage (docs/features/analysis/flat-field-stats.md
         // 判断6): the method, the window, the shading it measured before and
         // after, and the recipe a session recomputes it from.
         DetrendProduct dt;
@@ -1342,7 +1342,7 @@ struct App {
     std::vector<Series> series;
     int nextSeriesId = 1;
     int curSeriesId = 0;              // which series the Linearity panel shows
-    // ---- AnalysisSet (docs/reader-analysisset.md, "ras"): role bindings ------
+    // ---- AnalysisSet (docs/features/adapters/reader-analysisset.md, "ras"): role bindings ------
     // A set is a NODE of one batch (ras 1.4) and its identity is (batch, set
     // name) - never its contents. Each role BINDS a member that keeps living
     // wherever it lives: binding is not containment, and it legitimately
@@ -1444,7 +1444,7 @@ struct App {
     std::string lastRemoteUrl;        // last host, prefilled next time (prefs)
     // ---- Browse (rb) state types: core/browse/browse_state.h since P7 ------
     // The rb-family nested types are the Browse TUs' own state now (docs/
-    // split-plan.md §3, the #47 carve-out owning its state). The aliases keep
+    // docs/background/project/split-plan.md §3, the #47 carve-out owning its state). The aliases keep
     // every existing App::BrowseInstance / App::RbJob / App::RbConnect
     // reference compiling verbatim - the alias way of moving a type without
     // touching its ~140 qualified references (churn zero; §1's "move only"
@@ -1536,7 +1536,7 @@ struct App {
     std::condition_variable mCv;
     std::vector<MJob> mQueue;
     std::vector<MDone> mDone;
-    // ---- Watch (docs/watch-design.md §2/§3) ---------------------------------
+    // ---- Watch (docs/features/watch/watch-design.md §2/§3) ---------------------------------
     // ONE watched set. The UI thread rebuilds this list from the open stacks;
     // the worker only reads it, so nothing here is a pointer into app state.
     //
@@ -1605,7 +1605,7 @@ struct App {
     //   this one governs acting on what was noticed.
     //
     // Persisted in prefs.txt beside watchfiles, in that toggle's shape
-    // (docs/settings-inventory.md 9 is still open; this pre-empts nothing).
+    // (docs/features/settings/settings-inventory.md 9 is still open; this pre-empts nothing).
     bool watchAutoReload = false;
     // §2's interval, in seconds, as a value rather than a literal so
     // --watch-selftest never has to live through one. prefs is §9's "later".
@@ -1743,7 +1743,7 @@ struct App {
     bool rbFlat = false;
     // (rbAdvanced - whether the Browse header's "more" drawer started open -
     // is gone with the drawer. Its contents each moved to the place they are
-    // about: docs/browse-topbar-design.md 10.2.)
+    // about: docs/features/browse/browse-topbar-design.md 10.2.)
     // Tree mode: a directory expands IN PLACE instead of replacing the listing,
     // so a folder of folders can be compared without losing your place. LAZY -
     // expanding a node costs exactly one LIST, issued on the browse worker and
@@ -2106,7 +2106,7 @@ struct App {
     char pickSweepParam[64] = "";
     char pickSweepUnit[16] = "";
     std::string folderPickBatchBase;  // leaf of the scanned root: batch name stem
-    // ---- .npz member picker (docs/npz-design.md §2.3) ----------------------
+    // ---- .npz member picker (docs/features/adapters/npz-design.md §2.3) ----------------------
     // The SAME dialog as the folder picker, one layer down: an .npz is a batch
     // and its members are the stacks and frames inside it, so the vocabulary,
     // the All/None/Invert row and the accept path are the folder picker's.
@@ -2127,10 +2127,10 @@ struct App {
     char npzAxisUnit[16] = "";
     // Members that are NOT pixels, kept per .npz file so the Inspector can show
     // the file's provenance next to the frame it opened
-    // (docs/npz-design.md §4 item 3 「実装で答えたこと (v1)」).
+    // (docs/features/adapters/npz-design.md §4 item 3 「実装で答えたこと (v1)」).
     struct NpzMeta { std::string path; std::vector<std::pair<std::string, std::string>> items; };
     std::vector<NpzMeta> npzMeta;
-    // ---- input adapters (docs/input-adapters.md §4.12 / §4.13) ---------------
+    // ---- input adapters (docs/features/adapters/input-adapters.md §4.12 / §4.13) ---------------
     // v1 remembers ONE thing: which reader read which file. Folder and glob
     // RULES are deliberately absent (§8 item 7) - they need a trust rule first,
     // because a rule living in a shared data folder would run someone else's
@@ -2154,7 +2154,7 @@ struct App {
     bool rawRecipeListOpen = false;
     // #50: the one place a setting can be changed. Not modal - gamma, compact
     // and the theme are judged by looking at the picture behind the window,
-    // which a modal takes away (docs/preferences-panel-design.md §8). Not in
+    // which a modal takes away (docs/features/settings/preferences-panel-design.md §8). Not in
     // the session either: it is chrome for changing settings, not part of a
     // workspace, and putting it in `panels` would add a resident to the
     // "what should a clean start look like" argument that has nothing to do
@@ -2245,7 +2245,7 @@ struct App {
         size_t dropped = 0;                       // samples with < 2 valid frames
         std::vector<float> idx, frameMean, frameStd;
         double tempNoise[4] = {}, fixedPattern[4] = {}, totalNoise[4] = {};
-        // #57 judgment 2 (docs/flat-field-stats.md (b)): sigma_fpn is the
+        // #57 judgment 2 (docs/features/analysis/flat-field-stats.md (b)): sigma_fpn is the
         // CORRECTED quantity - the temporal residual left in an n-frame mean is
         // subtracted from the spatial variance. Both halves of that subtraction
         // are part of the result, not implementation detail:
@@ -2255,7 +2255,7 @@ struct App {
         // A clamped sigma_fpn is a STATEMENT about the measurement ("no fixed
         // pattern resolvable above this stack's own temporal floor"), and the
         // canon's guard rule is explicit that a clamp is never silent
-        // (flat-field-stats.md (a) "0 でクランプし、クランプしたことを結果に出す").
+        // (docs/features/analysis/flat-field-stats.md (a) "0 でクランプし、クランプしたことを結果に出す").
         double fpnCorr[4] = {};
         bool fpnClamped[4] = {};
         // The region is ONE PIXEL (a POI, or a 1x1 rectangle - the same thing
@@ -2317,7 +2317,7 @@ struct App {
     // alignment rather than precision: %g gives every cell its own length, so
     // a column of numbers can be neither scanned down nor pasted into a report
     // as a column. What the app should do about number formats in GENERAL is
-    // docs/todo-open.md.
+    // docs/background/project/todo-open.md.
     int projDecimals = -1;
     // an extra row over every pixel of the ROI, planes mixed. Off by default:
     // it is a different measurement from the per-plane rows and reading it as
@@ -2333,7 +2333,7 @@ struct App {
     std::vector<ImageDoc*> texLru;    // GPU textures kept for the N most recent frames
     int roiChannel = -1;              // channel shown in the ROI table (-1 = all)
     // (npyAxis lived here: one global override for every 3-D .npy in a run.
-    //  docs/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
+    //  docs/features/adapters/input-adapters.md §3.4 replaced it with FrameSource::npyRead, which
     //  is per file, visible in the Inspector, and saved with that image.)
     // shared display range: every open image (and every newly loaded one) uses it
     bool linkRange = false;

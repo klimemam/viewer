@@ -135,10 +135,10 @@ static int32_t analyze(const psFrame* in, const psRect* roi,
     return 0;
 }
 
-/* V3 registration (docs/abi-v3.md §3-§4). The version names THE COMPUTATION -
+/* V3 registration (docs/reference/abi-v3.md §3-§4). The version names THE COMPUTATION -
  * it changes when an input could produce a different result document and never
  * for a commit or a compiler (the rule, and why it is not the build id, is in
- * docs/analyzers.md; the long form is in analyzer_stats.c). The headline is the
+ * docs/reference/analyzers.md; the long form is in analyzer_stats.c). The headline is the
  * number this analyzer exists to produce, declared channel-stripped: the host
  * accents "R.noise" / "ch0.noise" alike by stripping the prefix and comparing
  * whole strings. It is what the host's own V1/V2 table used to supply as the

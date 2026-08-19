@@ -3,7 +3,7 @@
 // table, and the one function it points at.
 //
 // WHY A VIDEO CONTAINER IS IN THE PICTURE-FORMAT TABLE. Because after the
-// question docs/video-support.md asks, it is one: y4m is a one-line text header
+// question docs/features/media/video-support.md asks, it is one: y4m is a one-line text header
 // followed by raw planes, with no compression and no inter-frame prediction, so
 // a file is N pictures of one shape in order - which is byte for byte the same
 // thing a multi-page TIFF is, and the seam already has a word for it (unnamed
@@ -13,7 +13,7 @@
 // needs no second door, no second vocabulary and no lazy-decode machinery; it
 // needs a decoder that returns a vector<Image>.
 //
-// WHY ONLY THIS ONE, AND NOT libavcodec. docs/video-support.md measured it
+// WHY ONLY THIS ONE, AND NOT libavcodec. docs/features/media/video-support.md measured it
 // rather than argued it: an 8-bit lossy round trip turns a known sigma_t of 40
 // DN16 into 0.00 - not degraded, GONE - and noise that IS representable at 8
 // bits comes back 11% low with a GOP-periodic bias, I-frames retaining 3.9%

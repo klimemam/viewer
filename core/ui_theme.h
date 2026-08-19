@@ -1,4 +1,4 @@
-// "Aurora" modern theme for the viewer (design study: docs/imgui_modern_design.md).
+// "Aurora" modern theme for the viewer (design study: docs/features/theme/imgui_modern_design.md).
 // Plain ImGui style values only — no extensions, works on vanilla ImGui 1.91+.
 #pragma once
 #include "imgui.h"

@@ -49,4 +49,4 @@ Add `-RemoteHost user@server` / `--host user@server` for a second
 shortcut that connects to that machine on startup. The shortcuts point
 at the binary in place, so `update.cmd` keeps them current.
 
-See docs/startup.md on main for how ssh:// viewing fits together.
+See docs/guides/startup.md on main for how ssh:// viewing fits together.

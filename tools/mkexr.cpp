@@ -6,7 +6,7 @@
 // DECLARES and what it HOLDS are both known exactly on this side of the round
 // trip. OpenEXR cannot be written that way at a sane price: NONE and ZIP are a
 // header plus zlib, but PIZ is a wavelet and a Huffman table and DWAB is a DCT,
-// and those two are the ONLY reason docs/media-support.md §1 rejected a
+// and those two are the ONLY reason docs/features/media/media-support.md §1 rejected a
 // hand-rolled reader - real .exr files off a renderer are PIZ or DWA, and a
 // build that reads "NONE and ZIP" would produce a stream of files that will not
 // open. Coverage that stops exactly where the argument starts is worth little.
