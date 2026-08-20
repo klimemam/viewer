@@ -1,11 +1,16 @@
 # リモートのヘッダ無し RAW — レシピがリンクを渡る設計 (G1)
 
-**出発点はユーザの実報告 (2026-08-11)「remoteで、.rawが開けないね」。**
+> **状態: 実装済み (2026-08-13、protocol 11)。** §1 の決定7件と §11 の4段は
+> すべて main に実装された。§0〜§11 は実装前に判断根拠を固定した設計記録、
+> §12 は実装後の差分一覧である。現行の利用契約は
+> [remote.md](remote.md) §8 と本書 §12 を先に読む。
+
+**出発点はユーザーからの報告 (2026-08-11)「remoteで、.rawが開けないね」。**
 [verify-matrix.md](../../verification/matrix.md) §7 G1 が確定したとおり、これは判断ではなく
-**落穂**である — ヘッダ無し RAW (`.bin .raw .yuv .dat .rggb`) は
+**未対応箇所**である — ヘッダ無し RAW (`.bin .raw .yuv .dat .rggb`) は
 `core/imagefile.h` の表に行が無く、`imagefile::peerServes()` が false を返し、
-拒否文は generic な fall-through に落ちる。**誰もこの形式がリンクを渡れないと
-決めていない。** この文書はその道を開く設計であり、G1 の選択肢 (b)
+拒否文は generic な fall-through 処理に入る。**誰もこの形式がリンクを渡れないと
+決めていない。** この文書はその対応方法を設計し、G1 の選択肢 (b)
 「レシピを wire に載せる」を採る。ただし (a) の半分 — **断りに名前を付ける** —
 を第1段として先に出荷する (§11)。
 
@@ -30,7 +35,7 @@ G2 [PR #174 済] と共有する local 側 2セルは含まない)。§1–§6 �
    「生バイトを送って手元で解釈する」は既存規約に反するし、要らない —
    ヘッダ無し RAW の「復号」は宣言された幾何での seek + サンプル読みであり、
    peer 側で `.npy` と同じ形 (`readNpyRegion`) にそのまま載る (§7.2)。
-3. **拒否は三部構成** — 名指し・理由・逃げ道 ([input-adapters.md](../adapters/input-adapters.md) §3.2)。
+3. **拒否は三部構成** — 名指し・理由・代替手段 ([input-adapters.md](../adapters/input-adapters.md) §3.2)。
 4. **measuring 級は結果に自分を書く (M1)** ([settings-inventory.md](../settings/settings-inventory.md) §4.1)。
    幾何・ヘッダ長・バイト順・dtype は画素の値そのものを変えるので、リモートで
    開いた doc も宣言文 (`rawRecipeSummary` の一句) を持つ (§9)。
@@ -46,13 +51,13 @@ G2 [PR #174 済] と共有する local 側 2セルは含まない)。§1–§6 �
 
 | 問い | 決定 | 節 |
 |---|---|---|
-| 1. レシピはどこに載るか | **(a) 各要求に毎回積む** (META / TILE / MEASURE のトレーラ)。セッション登録の口は作らない。識別子: レシピは `srcIdentityKey` に**既に**入っている (raw 枝)。リモート raw doc が同じ欄を埋めるだけで、新機構ゼロ | §3 |
+| 1. レシピはどこに載るか | **(a) 各要求に毎回積む** (META / TILE / MEASURE のトレーラ)。セッション登録機構は作らない。識別子: レシピは `srcIdentityKey` に**既に**入っている (raw 枝)。リモート raw doc が同じ欄を埋めるだけで、新機構ゼロ | §3 |
 | 2. `peerServes` を割るか | **割る。** `peerServes` (無宣言で答える) はそのまま、`peerServesDeclared` (宣言が届けば答える) を足す。`peerRefusal` はヘッダ無し専用の一節を得る | §4 |
-| 3. 戸 (UI) | ダブルクリック → #166 の size 束縛 → 無ければ RawDialog (サイズは `MSG_LIST` が**既に**返している)。1クリックは選択のまま (preview 無し、判断として記録) | §5 |
-| 4. stack と preview | ファイル内 frame 軸は**無し** (ローカルの戸が無いから)。stack はフォルダ連番 (peer の SCAN/LIST grouping を widening)。preview の step 循環は「幾何は人から、META より前に来る」ので**存在しない** | §6 |
+| 3. 操作経路 (UI) | ダブルクリック → #166 の size 束縛 → 無ければ RawDialog (サイズは `MSG_LIST` が**既に**返している)。1クリックは選択のまま (preview 無し、判断として記録) | §5 |
+| 4. stack と preview | ファイル内 frame 軸は**無し** (ローカル実装に無いから)。stack はフォルダ連番 (peer の SCAN/LIST grouping を widening)。preview の step 循環は「幾何は人から、META より前に来る」ので**存在しない** | §6 |
 | 5. プロトコル番号 | **10 → 11 で足りる。** 4通りの組み合わせは §8 の表 | §8 |
 | 6. MEASURE | **要る。** 同じ経路 (トレーラ、`head.flags` bit0)。v1 は `MOP_TEMPORAL_STATS` / `MOP_FRAME_ROI_STATS` のみ、set/plugin は名指しで断って記録 | §7.3 |
-| 7. 段階分け | **4段。** ①断りに名前 (wire 不変) ②protocol 11 の wire + peer + CLI 戸 ③MEASURE + stack ④Browse 戸 + 束縛 + セッション | §11 |
+| 7. 段階分け | **4段。** ①断りに名前 (wire 不変) ②protocol 11 の wire + peer + CLI 経路 ③MEASURE + stack ④Browse 経路 + 束縛 + セッション | §11 |
 
 ---
 
@@ -74,29 +79,29 @@ G2 [PR #174 済] と共有する local 側 2セルは含まない)。§1–§6 �
 
 ## 3. 問い1 — レシピはどこに載るか
 
-### 3.1 決定: (a) 各要求に毎回積む。セッション登録の口 (b) は作らない
+### 3.1 決定: (a) 各要求に毎回積む。セッション登録機構 (b) は作らない
 
-**(a) にする。(b) だと peer が状態を持つことになり、今日ゼロである状態が
-生えるから。** 具体的に:
+**(a) にする。(b) だと peer が状態を持つことになり、現在は存在しない状態管理が
+必要になるから。** 具体的に:
 
 - 今日の peer は**要求ごとに無状態**である。`ServedFile` は 1要求の寿命しか
   持たず (`core/serve.cpp` の struct コメント)、handleMeta / handleTile /
   handleMeasure はどれも毎回ファイルを開き直す。「この path はこの形で読む」と
   いう登録を作った瞬間、(i) client が落ちたら誰が消すのか、(ii) 再接続で
   登録は残るのか、(iii) 2つの client が同じ peer に別のレシピを登録したら
-  どちらが勝つのか、という**寿命と所有の問い**が 3つ生える。毎回積めば 3つとも
+  どちらが勝つのか、という**寿命と所有の問い**が 3つ発生する。毎回積めば 3つとも
   存在しない。
 - **前例がそう決めている。** #124 の declared reading はまさにこの形で入った:
   `[str path][TileReq][u32 read]`、「the reading has to travel with them or
   they mean a different region than the caller meant」(remote_proto.h の
-  TileReq コメント)。レシピはこの論理の**強い版**である — TILE の rect と
+  TileReq コメント)。レシピはこの論理の**より厳しい例**である — TILE の rect と
   step は幾何の**内側の座標**であり、その幾何はレシピが決める。レシピを
   別便で送れば、rect が何を指すかが要求だけからは読めなくなる。
-- **コストは測って小さい。** wire レシピは u32×6 = **24 バイト/要求** (§7.1)。
+- **測定上のコストも小さい。** wire レシピは u32×6 = **24 バイト/要求** (§7.1)。
   4K フレーム 1枚の TILE 応答 (u16 で 16.6 MB) の 0.00014% であり、
   節約する価値のある数字ではない。
 
-(c)「両方」は (b) を含むので同じ理由で落ちる。
+(c)「両方」は (b) を含むので、同じ理由で採用しない。
 
 ### 3.2 識別子との関係 — レシピは §6.2 の鍵に既に入っている
 
@@ -119,7 +124,7 @@ if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
 
 - 第1欄は `srcKeyPath(url)` — ssh:// は逐語、local:// はディスクパスに解決
   (reference-design.md §6.2 の 2026-08-11 追記のまま)。つまり **local:// の
-  raw open と File ▸ Open の raw open は同じ tuple** に落ちる — が、実際には
+  raw open と File ▸ Open の raw open は同じ tuple** になる — が、実際には
   local:// の raw は #111 分岐で `openPath` に再ルートされる (§5.4) ので、
   この一致は保険であって経路ではない。
 - ssh:// は mtime/fsize 0/0 のまま (peer のディスクは stat できない)。同じ
@@ -130,7 +135,7 @@ if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
 **鍵に入れないものが 2つあり、どちらも理由がある:**
 
 - **cfaPattern。** RGGB と BGGR は**画素の値を 1ビットも変えない** — 変わるのは
-  プレーンの名札だけである。現実装がそう扱っている: `decodeRawFrame` は
+  プレーンのラベルだけである。現実装がそう扱っている: `decodeRawFrame` は
   pattern を `ImageDoc` (membership 層) に置き、`FrameSource` には置かず、
   鍵にも入れていない。MEASURE は `MeasureReqHead.cfaType/cfaPattern` で要求ごとに
   運ぶ (これも現行のまま)。wire レシピに pattern を入れないのは同じ判断の
@@ -144,12 +149,12 @@ if (s.rawDtype >= 0)    // the raw recipe (incl. its dims) decides the pixels
 
 束縛 (`g_rawSizeRecipe`) は**プロセス内のみ・書き残さない**が #166 の核心
 (loader_npy_raw.inc の長コメント: 「安全なのはユーザが数分前に自分で選んだ
-ことをまだ憶えているから」)。この性質は**ユーザについての事実**であって、
+ことをまだ憶えているから」)。この性質は**ユーザーについての事実**であって、
 バイト列がどちらのディスクに在るかと無関係である。だから:
 
 - 束縛は**リモートのファイルにも効く** (§5.2)。鍵は同じくバイト数。
-- 束縛は **peer に送らない・peer は憶えない**。憶える peer は (b) の
-  セッション登録を裏口から作ることになる。
+- 束縛は **peer に送らない・peer は憶えない**。peer が憶えると、(b) の
+  セッション登録を別経路で作ることになる。
 
 ---
 
@@ -172,24 +177,24 @@ imagefile::peerServesDeclared(name)// 新設: peerServes(name) || isHeaderless(n
 ```
 
 **なぜ表 (`HEADERLESS_EXTS`) が `imagefile` に移るか。** 今この配列は
-`core/app/sequence.inc` の頭にいる (G8 / PR #175 が 6箇所のリテラルを畳んだ
+`core/app/sequence.inc` の冒頭にある (G8 / PR #175 が 6箇所のリテラルを集約した
 場所) — が、**peer のバイナリは sequence.inc をコンパイルしない**。peer は
 SCAN の grouping (`seqSegKey`) と openServed の分岐で同じ問いを訊くので、
-表が client 側にしか無ければ #148 が潰した「一覧が2つあればずれる」を
+表が client 側にしか無ければ #148 が解消した「一覧が2つあればずれる」を
 そのまま再演する。`imagefile.cpp` は**両方のバイナリがコンパイルする唯一の
-形式の家**なので、そこへ移す。`sequence.inc` の `extIsHeaderless` /
+形式定義の共有場所**なので、そこへ移す。`sequence.inc` の `extIsHeaderless` /
 `headerlessExtList` は**呼ぶだけ**になる (G8 の F4c は配列を歩くので、移設は
 F4c が緑のまま通ることが移設の正しさの証明になる)。`SELFDESC_EXTS`
-(`.npy .npz`) は動かさない — あれは client 自身の戸の話で、peer は `.npy` を
+(`.npy .npz`) は動かさない — あれは client 自身の対応形式の話で、peer は `.npy` を
 inline に読み `.npz` を断る現状のまま。
 
 ### 4.3 各所が引く述語
 
 | 場所 | 述語 | 変更 |
 |---|---|---|
-| Browse `rbRowOpenable(host, name)` (host 非空) | `peerServesDeclared` | **変更** — `.raw` の行が生きる |
-| Browse 1クリック preview 門 (`rbActivateRow` の `peerServesName` 門) | `peerServes` | 不変 — raw は 1クリック選択のみ (§5.3) |
-| `openRemote` の門 (`open_dispatch.inc:1771`) | `peerServesDeclared` + レシピの有無 | **変更** (§5) |
+| Browse `rbRowOpenable(host, name)` (host 非空) | `peerServesDeclared` | **変更** — `.raw` の行を選択できる |
+| Browse 1クリック preview の判定 (`rbActivateRow` の `peerServesName`) | `peerServes` | 不変 — raw は 1クリック選択のみ (§5.3) |
+| `openRemote` の判定 (`open_dispatch.inc:1771`) | `peerServesDeclared` + レシピの有無 | **変更** (§5) |
 | peer の walk/grouping (`isServedSuffix` / `seqSegKey`) | `peerServes` ∪ (client≥11 なら `isHeaderless`) | **変更** (§6.2) |
 | `viewerReadsName` | 不変 (G2/PR #174 で既にヘッダ無しを含む) | — |
 
@@ -217,22 +222,22 @@ carried no recipe (a protocol-11 client sends one; update this viewer)
 ```
 
 client 側 (新 client / 旧 peer) は §8 の `rawTooOldText` で**送る前に**断る。
-G9 (PR #176) の裁定を引き継ぎ、逃げ道は**リンクの限界**を述べる形を保つ —
-「browse it locally」はこの分岐に落ちる名前について常に真とは限らない、が
+G9 (PR #176) の裁定を引き継ぎ、代替手段は**リンクの限界**を述べる形を保つ —
+「browse it locally」はこの分岐で拒否される名前について常に真とは限らない、が
 あの PR の学びだった。ヘッダ無しはローカルで開く名前だと**分かっている**ので、
 第1段の文は File ▸ Open を名指しできる (fall-through より一段具体的に言える
-ことが、この一節を生やす価値である)。
+ことが、この一節を追加する価値である)。
 
 ---
 
-## 5. 問い3 — 戸 (UI)
+## 5. 問い3 — 操作経路 (UI)
 
 ### 5.1 ダブルクリックの流れ
 
 Browse (ssh://) で `.raw` をダブルクリック (`rbOpenRow`):
 
 ```
-1. rbRowOpenable → peerServesDeclared → true (行は生きている)
+1. rbRowOpenable → peerServesDeclared → true (行を開ける)
 2. peer が古い (HELLO < 11) → rawTooOldText を toast、終わり
 3. バイト数 sz = 行の Entry::size (MSG_LIST v3 が既に運んでいる)
 4. rawRecipeForSize(sz) が答える → そのレシピで openRemote(url, recipe)。
@@ -244,7 +249,7 @@ Browse (ssh://) で `.raw` をダブルクリック (`rbOpenRow`):
 
 **ローカルの RAW ダイアログをそのまま立てる。** 別のダイアログを作らない —
 候補寸法の推定 (`rawGuessDims`) はバイト数だけで動き、バイト数はある。
-変わるのは Load の着地 (`rawDialogAccept`) が path の「://」で分岐して
+変わるのは Load の処理 (`rawDialogAccept`) が path の「://」で分岐して
 `loadRaw` ではなく `openRemote(url, recipe)` を呼ぶことだけ。束縛の成立条件
 (「成功した decode だけが束縛を作る」) も同文のまま — openRemote の成功が
 それに当たる。
@@ -259,11 +264,11 @@ Browse (ssh://) で `.raw` をダブルクリック (`rbOpenRow`):
   **メンバ総和** (`SeqGroup::bytes`) なので先頭メンバのサイズにならない。
   先頭メンバのサイズは **`MSG_LIST` をそのファイルの path に対して 1回引く**
   ことで取る — handleList はディレクトリでない path を「その 1エントリ」として
-  返す (`core/serve.cpp` handleList 冒頭の else 枝)。既存の口・既存の形で、
+  返す (`core/serve.cpp` handleList 冒頭の else 枝)。既存の要求と応答を使い、
   round trip 1回。総和 ÷ 枚数で代用しない — メンバのサイズが揃っている保証は
   無く、割り切れたときだけ動く推定は「もっともらしい絵が出る」側の失敗
   (G3 の教訓) だから。
-- **peer 側の検算が最後の門**: レシピの `offset + W×H×ch×elem` がファイルの
+- **peer 側の検算が最後の判定**: レシピの `offset + W×H×ch×elem` がファイルの
   実サイズを超えれば、両方の数を名指しして断る (§7.2)。LIST のサイズが
   古かった (書き込み中だった) 場合もここで捕まる。
 
@@ -289,14 +294,14 @@ Browse (ssh://) で `.raw` をダブルクリック (`rbOpenRow`):
 F9/F10 × O1 の `local://` 側が「再ルート後は表B」になるのは `.npz` や
 vendor RAW の行と同じ形。
 
-### 5.5 CLI の戸
+### 5.5 CLI の操作経路
 
 `viewer ssh://host/data/x.raw --raw-size 4096x3000 --raw-dtype u16
 --raw-interp bayer` — `--raw-*` 群 (cli.inc:620 の蓄積) がそのまま wire
 レシピになり、ダイアログ無しで開く。**`--raw-size` が無い ssh:// の raw は
 断る** (「state the geometry with --raw-size, or open it from the Browse
-panel」) — CLI は非対話の戸なので、LIST を引いてダイアログを立てるより
-名指しで断るほうが正直 (第2段で入るのはここまで。Browse の戸は第4段)。
+panel」) — CLI は非対話の経路なので、LIST を引いてダイアログを立てるより
+名指しで断るほうが正直 (第2段で入るのはここまで。Browse 経路は第4段)。
 
 ---
 
@@ -304,30 +309,30 @@ panel」) — CLI は非対話の戸なので、LIST を引いてダイアログ
 
 ### 6.1 ファイル内 frame 軸は**持たない** (判断、記録)
 
-ローカルの戸がそう決めている — 「a raw file is one frame, always」
+ローカル実装がそう決めている — 「a raw file is one frame, always」
 (`core/app/sequence.inc:1941`)。`decodeRawFrame` に frame パラメータは無く、
-offset は「ヘッダを飛ばす」ためであって「N 枚目に seek する」ためではない。
+offset は「ヘッダを読み飛ばす」ためであって「N 枚目に seek する」ためではない。
 リモートがローカルより多く読めるのは §0-6 (同じファイルに2つの答え) の
 違反なので、**META は常に frames=1 を返す**。
 
-- 多フレーム `.yuv` を stack にしたい要望が来たら: それは**ローカルの戸の
+- 多フレーム `.yuv` を stack にしたい要望が来たら: それは**ローカル側の
   機能追加** (レシピに frames / frameStride を足す) であって、wire はその日に
   フィールドを**追記**する (remote_proto.h の規律「append, never renumber」。
   wire レシピのトレーラは末尾追記が既定の進化路 — §7.1)。v1 では作らない。
-  逃げ道は reader (§4.13.1、G11 裁定待ち) か、ファイル分割。
+  代替手段は reader (§4.13.1、G11 裁定待ち) か、ファイル分割。
 
-### 6.2 stack = フォルダ連番。grouping の widening は client 版数で門する
+### 6.2 stack = フォルダ連番。grouping の widening は client 版数で制御する
 
 peer の walk は 1述語 (`isServedSuffix` = `imagefile::peerServes`) を
-`handleScan` の収集と `seqSegKey` (LIST/SCAN 両方の grouping の門) で引く。
+`handleScan` の収集と `seqSegKey` (LIST/SCAN 両方の grouping 判定) で引く。
 これを「`peerServes` ∪ (**HELLO の client 版数 ≥ 11** なら `isHeaderless`)」に
 widening する。
 
-**なぜ client 版数で門するか。** 門しないと、v10 の client の一覧に `.raw` の
-グループ行が現れる。旧 client はそれを「Open as stack」と申し出て、押すと
-generic 拒否に落ちる — 「出して押させて断るより出さない」(§3.6.4 の stack 動詞の
+**なぜ client 版数で制御するか。** 制御しないと、v10 の client の一覧に `.raw` の
+グループ行が現れる。旧 client はそれを「Open as stack」と表示し、押すと
+generic 拒否となる — 「出して押させて断るより出さない」(§3.6.4 の stack 動詞の
 裁定) に反する。LIST の形を `g_clientVersion` で出し分ける前例は v2/v3 で
-確立済み (`handleList` 冒頭)。**旧 client の一覧は今日とバイト同一**が門の
+確立済み (`handleList` 冒頭)。**旧 client の一覧は今日とバイト同一**が互換性の
 仕様である。
 
 開く側: グループ行のダブルクリック →「レシピは Open ごとに 1回」— ローカルの
@@ -335,7 +340,7 @@ generic 拒否に落ちる — 「出して押させて断るより出さない�
 the OPEN that answered for it」) をそのまま使う。束縛が先に答えるのも同じ
 (startNextQueuedGroup:1578 と同文の分岐)。全メンバの META/TILE/MEASURE に
 同じレシピが載る。**サイズの合わないメンバは peer が名指しで断り** (§7.2)、
-client はその 1 frame を落として stack は n/N を言い続ける — §3.2 の
+client はその 1 frame を除外し、stack は n/N を言い続ける — §3.2 の
 「形の違う兄弟」の規則の raw 版で、文もその形に倣う。
 
 ### 6.3 preview の間引きの循環は存在しない
@@ -346,23 +351,23 @@ client はその 1 frame を落として stack は n/N を言い続ける — §
 ```
 束縛/ダイアログ (バイト数だけが要る。バイト数は LIST が持っている)
   → レシピ確定
-  → META (レシピ同乗) → w/h/ch/frames=1
+  → META (レシピ付き) → w/h/ch/frames=1
   → step = ceil(max(w,h)/1600)   ← openRemote:1826 の式そのまま
-  → TILE (レシピ同乗、step 付き)
+  → TILE (レシピと step 付き)
   → 全解像度の follow-up (requestFullRemote、レシピは FrameSource の
     raw 欄から再構成 — RFetchJob が npyRead を rfInheritRead で運ぶのと同型)
 ```
 
 META がレシピを受けるのは #124 と同じ理由 — 「META's whole job is to say how
 big the picture is before a pixel moves, and a reading changes exactly that」
-(remote_proto.h の META 注記)。レシピは reading の強い版なので、META に
+(remote_proto.h の META 注記)。レシピは reading のより厳しい例なので、META に
 載らない設計はそもそも成立しない。
 
-crop 付きレシピ: wire には載せない (§3.2)。全解像度が着地してから
+crop 付きレシピ: wire には載せない (§3.2)。全解像度の取得が完了してから
 `cropInPlace` — `remoteStep > 1` の拒否と G10 (PR #177) の RestoreWait park を
 **そのまま**使う。同じ状況に 2つの答えを作らない (G10 の裁定の言葉のまま)。
 
-preview export の嘘は G4 (PR #170) が既に全形式で塞いでいる。継承のみ、作業なし。
+preview の誤った export は G4 (PR #170) が既に全形式で防いでいる。継承のみで、作業はない。
 
 ---
 
@@ -417,7 +422,7 @@ META/TILE の有無判定は `getRead` と同じ「残りバイトがあれば�
 | dtype/interp が表の外、W/H が 0 か MAX_DIM 超 | 拒否: 値を quote する。clamp しない (`getRead` の「refused rather than clamped」と同じ理由 — 両端の解釈がずれた印であり、そこから絵を返してはならない) |
 | offset + W×H×ch×elem > 実ファイルサイズ | 拒否: `file is N bytes: this recipe needs M (offset O + WxH x C ch x E B/sample)` — 両方の数を言う。ローカルの `file too small for this size/format` より具体的なのは、リモートは LIST のサイズが古び得る分、数字が診断になるから |
 
-### 7.2 peer 側の読み — `.npy` の器で読む
+### 7.2 peer 側の読み — `.npy` の処理を再利用する
 
 `openRaw(ServedFile&, path, RawWire)` は `openNpy` より**簡単**である
 (verify-matrix G1 (b) の見立てどおり):
@@ -453,7 +458,7 @@ return openNpy(n, path, err, read);
 「teaching those two a second format teaches LIST, SCAN, META, TILE, MEASURE
 and the plugin mouth at once. TILE without MEASURE would be a peer that can
 show a TIFF and cannot measure it - two answers for one file」。だから peer 側
-は META/TILE/MEASURE を**1段で**覚える (§11 段2)。client 側の MEASURE 配線が
+は META/TILE/MEASURE に**1段で**対応する (§11 段2)。client 側の MEASURE 配線が
 別段 (段3) なのは実装量の分割であって、peer の能力の分割ではない。
 
 ### 7.3 問い6 — MEASURE
@@ -474,7 +479,7 @@ frame 読みは openServed / readRegion を通る (§7.2 で自動的に学ぶ) 
   and this build sends one recipe per request - run it on copied files, or
   wait for per-role recipes`。再訪条件: per-role レシピは role block と同じ
   形の追記で足せる (§10)。
-- 部分 stack の規律は不変: framesUsed / expected は今日の器のまま。
+- 部分 stack の規律は不変: framesUsed / expected は現在の構造のまま。
 
 ---
 
@@ -504,12 +509,12 @@ inline std::string rawTooOldText(int peerVersion, const std::string& name) {
 | client | peer | 振る舞い |
 |---|---|---|
 | 11 | 11 | 全機能。fmtgate 型のビット一致検査が守る |
-| 11 | ≤10 | client が **HELLO の数から送る前に** `rawTooOldText` で断る (`Session::formatServable` の拡張 — picture の protocol-10 門と同じ場所・同じ規律)。番号は接続時に入った peer を自己更新させる — それがこの番号の存在理由の半分 (VERSION 注記の定型) |
-| ≤10 | 11 | 旧 client は `.raw` を自分の `peerServesName` で門前拒否する (今日の挙動そのまま)。peer 側: LIST/SCAN の grouping widening は client 版数 ≥ 11 で門する (§6.2) ので、**旧 client の一覧はバイト同一**。万一旧 client が META を送っても (送らないが)、レシピ無しの §4.4 第2段の文が返る |
+| 11 | ≤10 | client が **HELLO の数から送る前に** `rawTooOldText` で断る (`Session::formatServable` の拡張 — picture の protocol-10 判定と同じ場所・同じ規律)。番号は接続時に入った peer を自己更新させる — それがこの番号の存在理由の半分 (VERSION 注記の定型) |
+| ≤10 | 11 | 旧 client は `.raw` を自分の `peerServesName` で拒否する (今日の挙動そのまま)。peer 側: LIST/SCAN の grouping widening は client 版数 ≥ 11 で制御する (§6.2) ので、**旧 client の一覧はバイト同一**。万一旧 client が META を送っても (送らないが)、レシピ無しの §4.4 第2段の文が返る |
 | ≤10 | ≤10 | 今日の G1 の実測のまま |
 
 `VIEWER_SERVE_PROTOCOL=10` は v11 ビルドを v10 peer として振る舞わせる —
-トレーラを読まず、grouping を widening せず、raw の META を今日の文で断う。
+トレーラを読まず、grouping を widening せず、raw の META を今日の文で断る。
 「a refusal nobody runs is a refusal that rots」(servedVersion の注記) —
 新旧文の両側を selftest が実 peer で踏む (§11)。
 
@@ -537,8 +542,8 @@ doc が持つもの:
   `openRemote(url, recipe)`」を覚える。M2 (セッションが勝つ) はこれで成立 —
   復元はダイアログも束縛も通らない。復元直後の crop / seqframe は G5/G10 の
   RestoreWait に乗る (§6.3)。
-- **export の provenance**: 既存機構が FrameSource から printしており、raw 欄が
-  埋まれば追加作業なし。preview 中の export は G4 の門がそのまま塞ぐ。
+- **export の provenance**: 既存機構が FrameSource から出力しており、raw 欄が
+  埋まれば追加作業なし。preview 中の export は G4 の既存判定がそのまま防ぐ。
 
 ---
 
@@ -546,15 +551,15 @@ doc が持つもの:
 
 | 断ったもの | 理由 | 再訪の鍵 |
 |---|---|---|
-| ファイル内 frame 軸 (多フレーム .yuv) | ローカルの戸に無い。リモートが先行すれば「同じファイルに2つの答え」 | ローカルに frames/stride がレシピとして入った日。wire は末尾追記 (§6.1) |
+| ファイル内 frame 軸 (多フレーム .yuv) | ローカル実装に無い。リモートが先行すれば「同じファイルに2つの答え」 | ローカルに frames/stride がレシピとして入った日。wire は末尾追記 (§6.1) |
 | set / plugin MEASURE のレシピ | 1要求1レシピの文法で role 別レシピは言えない。近似しない | role block と同型の per-role 追記 (§7.3) |
 | raw 行の 1クリック preview | レシピ無しでは作れず、束縛条件付きは第3の挙動 | ユーザ裁定。§5.3 を読み直す |
 | crop を wire に載せる | crop は client の再スコープ (cropInPlace) で、G10 の機構が既にある | 載せる動機が観測されたら §3.2 と §6.3 を読み直す |
 | cfaPattern を wire レシピ / identity に載せる | 画素値を変えない。MEASURE head が既に運ぶ | — (構造的に不要) |
-| peer 側のセッション登録 (問い1の (b)) | 無状態の peer に寿命と所有の問いを 3つ生やす | 毎回 24B が問題になる測定が出たら (出ない) |
-| `--raw-size` 無しの CLI ssh raw を LIST→ダイアログで救う | CLI は非対話の戸。断って Browse を指す方が正直 | Browse 戸 (段4) が入れば実害が無い |
+| peer 側のセッション登録 (問い1の (b)) | 無状態の peer に寿命と所有の問いを 3つ発生させる | 毎回 24B が問題になる測定が出たら (出ない) |
+| `--raw-size` 無しの CLI ssh raw を LIST→ダイアログで救う | CLI は非対話の経路。断って Browse を指す方が正直 | Browse 経路 (段4) が入れば実害が無い |
 
-これらは着地時に verify-matrix §8 (判断が記録されている拒否の一覧) へ 1行ずつ
+これらは実装時に verify-matrix §8 (判断が記録されている拒否の一覧) へ 1行ずつ
 足すこと。
 
 ---
@@ -565,15 +570,15 @@ doc が持つもの:
 何が赤で、直すと何が緑になるかを各段に書く。期待値は手で導出して assert の
 隣に導出を書く (この repo の流儀)。
 
-### 段1 — 断りに名前を付け、拡張子の表を両バイナリの家に移す (wire 不変)
+### 段1 — 断りに名前を付け、拡張子の表を両バイナリの共有場所に移す (wire 不変)
 
 **変更**: `core/imagefile.h/.cpp` に `isHeaderless` / `headerlessExts` と
 `peerRefusal` のヘッダ無し一節 (§4.4 第1段の文)。`core/app/sequence.inc` の
 `HEADERLESS_EXTS` / `extIsHeaderless` / `headerlessExtList` を imagefile 呼び
 出しに置換 (配列の実体が移るだけ、答えは 1つも変わらない)。
 
-**単独の意味**: G1 の「×落」が「×決」になる — 道が開く前でも、拒否文が
-偽 (generic) から真 (名指し + 実の逃げ道) に変わる。verify-matrix G1 の
+**単独の意味**: G1 の「×落」が「×決」になる — 対応実装の前でも、拒否文が
+generic から具体的な拒否 (名指し + 実際の代替手段) に変わる。verify-matrix G1 の
 選択肢 (a) の実装であり、(b) が入った日に文を差し替える前提も §4.4 に明記済み。
 
 **赤→緑** (`selftest.fmtgate` に F4d を足す):
@@ -586,17 +591,17 @@ doc が持つもの:
 - 回帰の守り: 既存 F4c (openImagesFilter が両配列+表の全拡張子を含む) が
   **無編集で**緑のまま — 移設が答えを変えていない証明。
 
-### 段2 — protocol 11: wire + peer + client の版門 + CLI の戸
+### 段2 — protocol 11: wire + peer + client の版判定 + CLI 経路
 
 **変更**: `remote_proto.h` (VERSION=11、RawWire、rawTooOldText、拒否文群)。
 `serve.cpp` (`getRecipe`、`openRaw`、openServed dispatch、§7.1 の検査表、
 `VIEWER_SERVE_PROTOCOL≤10` で今日の振る舞い)。`remote.h/.cpp`
-(`Session::meta/tile` にレシピ引数、`formatServable` の protocol-11 門)。
+(`Session::meta/tile` にレシピ引数、`formatServable` の protocol-11 判定)。
 `open_dispatch.inc` (`openRemote` にレシピ引数、FrameSource raw 欄 + note の
 宣言句 §9)。`cli.inc` (ssh:// positional raw + `--raw-*` → レシピ、
 `--raw-size` 無しは名指しで断る §5.5)。
 
-**単独の意味**: CLI から ssh の raw が開く (最初のユーザ可視の道)。wire が
+**単独の意味**: CLI から ssh の raw が開く (ユーザーが最初に利用できる経路)。wire が
 確定し、以降の段は client 側の配線だけになる。
 
 **赤→緑** (新 `--rawremote-selftest`、fmtgate P1/P2 の型に倣い local:// で実
@@ -609,11 +614,11 @@ peer を spawn):
   - `g4.raw`: g1 の前に 64B のゴミ — offset の検出。
 - 赤 (今日): client が `.raw` を `formatServable` 以前に generic 拒否。
 - 緑:
-  1. 各 fixture: META (レシピ同乗) の w/h/ch/dtype/frames がレシピの宣言と
+  1. 各 fixture: META (レシピ付き) の w/h/ch/dtype/frames がレシピの宣言と
      一致、frames == 1。
   2. TILE step=1 全域の画素が、同じファイル + 同じ値の RawDialog を
      `decodeRawFrame` に通した結果と**ビット一致** (fmtgate の local-vs-peer
-     assert と同じ器)。
+     assert と同じ検証方法)。
   3. step=2 の間引きが `readNpyRegion` の式 `(x1-x0+step-1)/step` から手で
      導いた寸法・サンプル位置と一致。
   4. `VIEWER_SERVE_PROTOCOL=10` の peer: client が送る**前に**断り、文が
@@ -621,7 +626,7 @@ peer を spawn):
   5. v11 peer に `a.npy` + レシピ: `does not apply` を含む拒否。
   6. v11 peer に `.raw` + レシピ無し (Session を直接駆動): `recipe` を含む
      拒否 (§4.4 第2段)。
-  7. サイズ嘘 (w×h を実ファイルの 2倍に): 拒否文が実バイト数と要求バイト数の
+  7. サイズ不一致 (w×h を実ファイルの 2倍に指定): 拒否文が実バイト数と要求バイト数の
      **両方の数字**を含む。
   8. identity: 同 url を同レシピで 2度開いて source が共有される (registry
      の refs を数える — scan S5d の型)、幅だけ変えたレシピで開くと**別 tuple**
@@ -639,23 +644,23 @@ client 側事前拒否 (§7.3 の文)。
 
 **単独の意味**: 表C O4 が raw に開く — 「300 frame の統計が画素でなく数百
 バイトで渡る」という remote の存在理由が raw stack にも効く。段4 の Browse が
-無くても、段2 の CLI 戸 + セッションで作った stack が server 集計できる。
+無くても、段2 の CLI 経路 + セッションで作った stack が server 集計できる。
 
 **赤→緑** (新 `--rtemporal-raw-selftest`、rtemporal-png の型):
 - fixture: 8 frame の u16 raw フォルダ、画素 (x,y) の時系列を
   `mean + (f が偶数 ? +d : -d)` で書く (d = 8)。導出を隣に書く:
   ddof=1 で σ_t = d·√(N/(N−1)) = 8·√(8/7)、f64 で閉形式。
 - 赤: MEASURE が raw パスを開けない (peer 拒否)。
-- 緑: (i) server σ_t が f64 独立参照と一致 (許容は rtemporal と同じ器)、
+- 緑: (i) server σ_t が f64 独立参照と一致 (許容は rtemporal と同じ基準)、
   (ii) 同じ stack をローカルで測った値と**ビット一致**、(iii) plugin op を
   raw パスに要求すると送る前に断られ、文が `recipe` を含む。
 
-### 段4 — Browse の戸 + size 束縛 + セッション復元
+### 段4 — Browse 経路 + size 束縛 + セッション復元
 
 **変更**: `imagefile` の `peerServesDeclared` を `browse/host.h` 経由で公開、
 `rbRowOpenable` の remote 枝 (§4.3)。`rbOpenRow` の raw 分岐 (§5.1: 束縛 →
 ダイアログ、fileSize は行の size / グループは先頭メンバへの LIST 1回)。
-`rawDialogAccept` の url 分岐。peer の grouping widening (client≥11 門、
+`rawDialogAccept` の url 分岐。peer の grouping widening (client≥11 の版判定、
 §6.2)。`openRemoteStack` のレシピ 1回/Open。session 復元の url-raw3 dispatch
 (§9)。crop park は G10 の機構をそのまま (§6.3)。
 
@@ -676,36 +681,36 @@ client 側事前拒否 (§7.3 の文)。
   5. セッション保存 → 復元: ダイアログを経ずに同レシピで開き直る (raw3 行の
      往復。導出: 行のフィールド = レシピの全フィールド)。
   6. 旧 client の一覧パリティ: HELLO を 10 で送る駆動で SCAN 応答に raw
-     グループが**含まれない** (バイト同一の門、§6.2)。
+     グループが**含まれない** (バイト同一という互換性条件、§6.2)。
 
 段の依存: 1←2←3←4 の直列。どの段も前段まで入った main で CI 緑、後段を
 待たずに出荷できる。
 
 ---
 
-## 12. 着地後の帳簿
+## 12. 実装後の記録
 
-**着地 (2026-08-13)。4段すべて main。** 実装が設計を訂正した点は無い ——
+**実装完了 (2026-08-13)。4段すべて main に反映済み。** 実装が設計を訂正した点は無い ——
 §1 の決定7つはそのまま通った。実装で分かった追加が2つあるので記録する:
 
 - **リモートで開いた doc の note が M1 を破っていた。** 段2b の試験 (F4e) が
   捕まえた。`openRemote` の note は `"remote"` だけで、幾何もヘッダ長も
   バイト順も名乗らないまま数値が出ていた —— 同じファイルが開いた端によって
-  違う自己記述をする状態で、#148 が1段上で潰した欠陥そのもの。今は
-  `rawRecipeNote` を通すので**ローカルの扉と一字一句同じ文**である。
+  違う自己記述をする状態で、#148 が1段上で解消した欠陥そのもの。今は
+  `rawRecipeNote` を通すので**ローカル経路と一字一句同じ文**である。
   §9 が「宣言が結果に付いて回る」と書いていた所は、書いただけでは
   足りず、試験が要る箇所だった。
 - **レシピ無しの `local://` は「黙って何も起きない」ではない。** #111 の
-  再ルートで**幾何を訊くダイアログ**に行く。それが逃げ道であり、「推測
+  再ルートで**幾何を訊くダイアログ**に進む。それが代替手段であり、「推測
   しない」という規則の残り半分である (F4e が主張)。
 
 | 段 | PR | 試験 |
 |---|---|---|
 | 1 断りに名前 + 表の引っ越し | #185 | F4d |
-| 2a wire + peer + 版門 | #186 | P8 / P9 |
-| 2b 戸 (openRemote) + CLI | #187 | F4e |
+| 2a wire + peer + 版判定 | #186 | P8 / P9 |
+| 2b `openRemote` + CLI 経路 | #187 | F4e |
 | 3 MEASURE | #189 | P8b |
-| 4 Browse の戸 + 束縛 | #188 | F4d(行) / F4f |
+| 4 Browse 経路 + 束縛 | #188 | F4d(行) / F4f |
 
 **v1 で断ったもの** (§10 と併せて再訪の鍵): 1クリック preview、ファイル内
 frame 軸、set/plugin op の per-role レシピ。
@@ -713,7 +718,7 @@ frame 軸、set/plugin op の per-role レシピ。
 
 
 - verify-matrix §7 G1 の状態行を段ごとに更新する (§1–6 のセルは 2026-08-11 の
-  記録なので触らない)。全段着地で「済」、試験名は §11 の各段のもの。
+  記録なので触らない)。全段実装済みなら「済」、試験名は §11 の各段のもの。
 - §10 の表の各行を verify-matrix §8 に転記する。
 - `docs/features/remote/remote.md` にレシピの節を 1つ (wire の形は remote_proto.h が正、
   remote.md は動線の説明のみ — 二重定義を作らない)。

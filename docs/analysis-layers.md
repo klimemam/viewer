@@ -1,9 +1,12 @@
-# 解析の層 — Frame / Stack / Series / AnalysisSet と4種のアナライザ (#48)
+# 解析モデル — 3つのデータ層 (Frame / Stack / Series)、AnalysisSet と4種のアナライザ (#48)
 
-> **状態: 確定 (2026-08-06)。** #48 の判断は全項目回答済みで、**§12 が
-> 判断record** — もう「待ち」ではない。実装はこの文書を根拠に並列で始めてよい。
-> 正典 (terminology.md) への修正は承認済み・適用待ち (§11 が適用パッケージ)。
+> **状態: 確定 (2026-08-06、関係モデルは #230 で 2026-08-19 改訂)。** #48 の
+> 判断は全項目回答済みで、**§12 が判断record**。その直接引用は保持し、#230 の
+> `frame ≼ stack ≼ series` / `managed-by` / `role-ref` を現行契約とする (§1, §11)。
 > 個々の推定量の数式・補正・表示の細部はここでは決めない (§10 — #57 の領分)。
+> AnalysisSet、direct DSNU/PRNU、detrend PreProcessor、分離 fit まで主要部は実装済み。
+> 画素 map の公開契約は #49 で取り下げ済み。未実装境界は series analyzer の公開 ABI、
+> 手動 role 束縛 UI、Set Analysis panel から remote fold を要求する配線である。
 >
 > 経緯: v1 はデータ3層に解析を割り当て、8つの判断を諮った。ユーザー提案
 > (2026-08-06, #48) の **AnalysisSet と解析の4種**という再定式化で半分が
@@ -13,26 +16,33 @@
 
 正典 ([terminology.md](terminology.md)) は「**σ_t は stack の属性。frame の属性
 として出力しない**」を不変条件に持ち、操作マトリクスの測定 (analyzer) 行は既に
-層で分かれている。ところが解析の側にはこの区別を言う場所が無い — プラグイン
-ABI は `analyze(const psFrame* in, …)` の1枚受け取り
-([ps_plugin.h](../include/ps/ps_plugin.h)) で、stack から欠陥マップを作る解析は
-**表現できない**。層を型にすると、間違った測定が表現できなくなる。
-ここまでが v1 の出発点で、変わらない。
+層で分かれている。設計開始時の plugin ABI は
+`analyze(const psFrame* in, …)` の1枚受け取りだけで、stack 解析を表現できなかった。
+現在の v3 ([ps_plugin.h](../include/ps/ps_plugin.h)) は frame / stack のシグネチャを
+区別する。series analyzer はまだ公開しておらず、画素 map の返却 API は #49 で
+いったん取り下げた。
+層を型にすると、間違った測定が表現できなくなる、という出発点は変わらない。
 
 v2 で加わった認識 (ユーザー提案の核):
 **Frame / Stack / Series は「dark が要る」「固定パターン除去の前処理が要る」を
 表現できない。** それはデータがどれだけ並んでいるかの話ではなく、解析への
-**入力の役割**の話だから。役割を表現する型をデータ階層に1つ足すと、
+**入力の役割**の話だから。役割を表現する型をデータ層の順序とは別に置くと、
 3層は「一般的な解析だけを、余計なことを考えずに」担えるようになる —
 参照や前処理を含意する解析は全部、役割を束ねた型の上でだけ始められる。
 
-## 1. データの階層 — AnalysisSet が入る
+## 1. データ層の順序と、管理・役割参照
 
-Files 内のデータ型の階層 (ユーザー提案どおり):
+正典の関係は3本に分ける:
 
-    Frame < Stack < Series < AnalysisSet < Batch
+    frame ≼ stack ≼ series
+    frame / stack / series --managed-by--> batch
+    AnalysisSet --role-ref--> frame / stack / series
 
-**AnalysisSet = 解析への入力を役割 (role) で束ねる型。** 例:
+`≼` は集合包含ではない。途中の stack は省略でき、standalone frame と stack を
+同じ series のメンバにできるが、存在する層の順序は逆転できない。batch は管理境界で
+あって上位データ層ではない。series と全メンバは同じ batch に管理される。
+
+**AnalysisSet = 解析への入力を役割 (role) で参照する型。** 例:
 
     PRNU 用:   {"image": Frame()|Stack(), "dark": Frame()|Stack()}
     DSNU 用:   {"dark": Stack()}
@@ -41,21 +51,20 @@ Files 内のデータ型の階層 (ユーザー提案どおり):
 役割スキーマは解析ごとに定義され、AnalysisSet はそのベース型。名前は
 ユーザーが仮置きした語をそのまま採る (改名はいつでも安い — 型が先、名は後)。
 
-### 1.1 メンバは包含ではなく束縛 — 厳密包含の唯一の例外
+### 1.1 メンバは role-ref — データ層の順序とは別の関係
 
-正典の包含は厳密 (frame ⊂ stack ⊂ series ⊂ batch、例外を作らない)。
-AnalysisSet をそのまま厳密包含 (メンバは高々1つの set に属す) にすると
-壊れる具体例が最初からある: **1本の dark stack を、PRNU の set と欠陥画素の
-set が同時に参照する。** 参照データの再利用は例外ではなく通常運用 —
-dark は1回撮って全解析で使う — なので、「高々1つ」は置けない。よって:
+AnalysisSet をデータ層の順序へ入れると、「メンバは高々1つの set に属す」と誤読
+される。しかし **1本の dark stack を、PRNU の set と欠陥画素の set が同時に
+参照する**のが通常運用である。よって role-ref は包含の例外ではなく、初めから
+別の関係として扱う:
 
-- **set 自身は層のノード**: 1つの batch に属し、Files に1ノードとして現れ、
+- **set 自身は管理されるノード**: 1つの batch に属し、Files に1ノードとして現れ、
   リネーム可、セッション保存 (形式は実装仕様 — series ブロックの先例に従う)。
-- **メンバは束縛 (参照)**: メンバの frame / stack / series は自分の batch の
-  下に住み続け、**複数の set から参照されてよい**。束縛は所有でも移動でもない。
+- **メンバは role-ref**: メンバの frame / stack / series は自分の batch に
+  管理され続け、**複数の set から参照されてよい**。参照は所有でも移動でもない。
   メンバを閉じたら set は束縛を失い、そう表示する (黙って空にしない)。
-- これは階層の中で AnalysisSet だけが持つ性質で、正典には**例外として明記**
-  する (§11。判断record 1: **参照で裁定済み**)。黙って混ぜない。
+- 参照先は set 自身とは別の batch にあってよい。管理関係と role-ref を混ぜない
+  (§11。判断record 1: **参照で裁定済み**)。
 
 ### 1.2 役割の束縛が宣言である — 「dark は stack の属性」を取り下げる
 
@@ -74,7 +83,10 @@ v1 は「dark / flat は stack の宣言属性」を提案していた (旧判�
 「level 0 = dark」の既存則は linearity の後方互換に閉じ、新しい解析へは
 広げない ([flat-field-stats.md](features/analysis/flat-field-stats.md) (c) の原則、据え置き)。
 
-### 1.3 評価値マップ (#49) の家
+### 1.3 評価値マップ (#49) の分類先
+
+> **後続裁定 (#49, 2026-08-11):** map / `emit_map` の公開契約は取り下げた。
+> 以下は #48 時点の帰属案で、現行 API の契約ではない。再導入には新たな裁定が要る。
 
 読み込んだ評価値マップ (欠陥マップ・ゲインマップ・マスク・信頼度…) は
 **AnalysisSet に役割付きで束ねる**。生成は §5 / §6 が担う。画素が何の量かは
@@ -94,7 +106,7 @@ PreProcessor の capture 役割 (`Frame()` / `Stack()` / `Series()`) には
 
 ## 2. 解析の4種
 
-| 種 | 入力 | 出力 | 宣言のしかた | 住処 |
+| 種 | 入力 | 出力 | 宣言のしかた | 表示・操作箇所 |
 |---|---|---|---|---|
 | **1 General Analyzer** | 選択中の frame / stack / series **1つ** | 中立な量 (mean, σ, σ_t, histogram, projection, …) | 層ごとの定義 (§3) | Histogram / Projection / ROIs / Temporal / Series Analysis の各パネル |
 | **2 Specific Analyzer** | シグネチャが要求する層の対象**1つ** | 解析固有の量 | **シグネチャ** (frame / stack / series) | Analysis パネル (プラグイン) |
@@ -106,7 +118,8 @@ No なら 1 か 2 (層の中の解析)。Yes なら 3 か 4 (set の解析)。
 
 v1 の中心定義はそのまま生きる: **解析の層 = その解析の入力が丸ごと必要とする
 最小の層 = 結果が属性として付く層**。入力の広がりと結果の帰属がずれる解析は
-存在しない。4種はこの定義の上の分類で、「層」の列に AnalysisSet が加わった形。
+存在しない。4種はこの定義の上の分類で、AnalysisSet は層の列ではなく役割参照の軸を
+加える。
 [stats-taxonomy.md](features/analysis/stats-taxonomy.md) との対応も素直になった:
 S1/TN/LM = 層 (General/Specific の縦軸)、**+meta/+ref はこれまで行き場の
 無かった軸で、それが役割スキーマそのもの**。+cal はツールの外 (据え置き)。
@@ -116,7 +129,7 @@ batch を使うことはある — 構造は主張しないまま、複数の生
 
 **名前の規則** (ユーザー提案を規則化): General は中立な量の名前だけを出す。
 **前処理・参照を含意して広く周知されている名前 (PRNU, DSNU, 欠陥画素数, …) は
-SetAnalyzer だけが名乗る。** 役割が束ばれていなければその名前の計算が
+SetAnalyzer だけが名乗る。** 役割が束縛されていなければその名前の計算が
 始められない — 名前の要求と型の要求が一致する、が v1 の「裸名の予約」の
 v2 での姿である。なお基準は「**参照役割の有無**」であって「規格に載って
 いるか」ではない: e-SFR/MTF50 はチャートを**シーンとして**要するが参照役割を
@@ -124,7 +137,7 @@ v2 での姿である。なお基準は「**参照役割の有無**」であっ�
 
 この規則に唯一残っていた例外 — ROIs の `PRNU [σ %]` 列 — はユーザー裁定
 (2026-08-06) で **`std / mean [%]` に改名**され、例外は消えた。
-**General に有名名は1つも無い。**
+**General Analyzer には、前処理・参照を含意する定義済みの指標名を付けない。**
 
 ## 3. General Analyzer — 層ごとのパネル
 
@@ -147,15 +160,15 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
 
 - **畳み方は mean / sum の選択。NaN 混入時は Warning を出す** (裁定
   2026-08-06)。当初案は「Sum は NaN の画素毎除外の下で正直に定義できない」
-  だったが、指摘のとおり **Mean も同罪** — 母集団が画素ごとに違う事実は、
+  だったが、指摘のとおり **Mean にも同じ問題がある** — 母集団が画素ごとに違う事実は、
   正規化で見えなくなるだけで消えてはいない。正直さは畳み方の選別ではなく
   **申告**で担保する: NaN が混入していたら警告し、どちらの畳み方も除外数と
-  有効枚数を必ず運ぶ (frame 平均が既にしている申告と同じ。黙って除外だけ
+  有効枚数を必ず結果に含める (frame 平均が既にしている申告と同じ。黙って除外だけ
   しない)。
 - Sum に残る注意は1つ: **有効枚数が画素ごとに違う Sum は、画素間で比べると
-  別の物を比べている** (8枚の和の隣に 24枚の和が並ぶ)。だから Sum には
-  **画素ごとの有効枚数マップ**を添えられるようにする (器の形は #49 の話、
-  「添えて申告できること」は本書の要件)。
+  別の物を比べている** (8枚の和の隣に 24枚の和が並ぶ)。#48 時点では
+  **画素ごとの有効枚数マップ**を添える案だったが、公開 map 契約は #49 で取り下げた。
+  現行版は総数・除外数を申告し、画素mapの再導入は新たな裁定に委ねる。
 - **既定は Mean。** `0e4d4ec` の frame 平均が既に作った機構そのもの
   (`computeStackStats` の蓄積器・double 蓄積・NaN 画素毎除外・n/N)。
   時間平均画像の空間σが σ_fpn なので、**Stack ROIs の σ 列は Temporal
@@ -181,8 +194,8 @@ Stack Temporal は既存の Temporal パネル (σ_t / σ_fpn / ドリフト / p
 - **pooled (全 frame 全画素を1母集団に) は保留**: σ_tot の分布として意味は
   あるが、用途が実物として出るまで作らない。
 
-表示列・出力列の名前には畳み方が付く (例 `sigma [DN] (mean_t)`)。同じ表の
-顔で別の量を出さない。畳んだ表の σ/mean 列が本物の PRNU に**ならない**こと
+表示列・出力列の名前には畳み方が付く (例 `sigma [DN] (mean_t)`)。同じ表示形式・
+列名で別の量を出さない。畳んだ表の σ/mean 列が本物の PRNU に**ならない**こと
 (dark 役割が無い) は §7 のとおり — 列名は修飾のまま。
 
 ### 3.3 Series — Series Analysis パネル
@@ -206,9 +219,9 @@ fit に入る値は従来どおりメンバの mean 統計 (`linRecompute` が�
 sum は n 倍の尺度を持つので、n が揃わない series では点ごとに別の量になる —
 sum 立ちのメンバを fit に入れようとしたら、実行せずにそう言う。
 
-フレームリニアリティ (暫定実装 `frameLinCollect`) の最終形もここに落ちる:
+フレームリニアリティ (暫定実装 `frameLinCollect`) も最終的にここへ統合する:
 条件を振った並びは定義上 series であり、「メンバが1枚ずつの series」に
-対する linearity fit になる。暫定の stack + frame 軸という器は移行まで維持、
+対する linearity fit になる。暫定の stack + frame 軸というデータ構造は移行まで維持、
 frame 軸は monitor 用途 (経過時間・温度に対する mean の曲線 = §3.2 の cv)
 に純化する。
 
@@ -216,7 +229,7 @@ frame 軸は monitor 用途 (経過時間・温度に対する mean の曲線 = 
 
 パネルの実体は解析の族 (Histogram / Projection / ROIs / Temporal / Series
 Analysis) で、**Files パネルの選択が応答の層を切り替える** (ユーザー提案
-どおり)。階層は包含なので、series の中の stack を選べば stack の応答。
+どおり)。データ層の順序に従い、series の中の stack を選べば stack の応答。
 単発 frame を選んだ Temporal は「1枚に時間軸はない」を言う (グレーアウト+
 理由の既存規則)。
 
@@ -238,10 +251,11 @@ Analysis) で、**Files パネルの選択が応答の層を切り替える** (�
 - **remote の stack 集計は画素の居る側 (peer) で走る** (`MOP_TEMPORAL_STATS`
   の先例。未オープン stack は `not opened` タグ)。プラグインの stack 解析
   (`MOP_PLUGIN_ANALYZE`, abi-v3.md §10) と set の集計 (`MOP_SET_FOLD`) も
-  同じ線で着地済み。set の要求文法だけは既存の頭では書けなかった —
+  同じ方針で実装済み。set の要求文法だけは既存の request header では表現できなかった —
   `MeasureReqHead` の平坦なパス列には「どこで1つの stack が終わるか」を
   書く場所が無いので、rois の後ろに**役割ブロック** (役割名 + そのパス数 +
-  frame 範囲) が付き、`rp::VERSION` が 8 に上がった。古い peer は op 番号で
+  frame 範囲) が付いた。この経路は protocol 8 で実装済みだが、**現行番号は
+  `core/remote_proto.h::VERSION` を正とする**。古い peer は op 番号で
   拒否するので、client は**送る前に**数から拒否して、どの不一致かを名指す。
 
 ## 4. Specific Analyzer — シグネチャが要求を宣言する
@@ -254,7 +268,9 @@ v1 の推奨だったが、ユーザー提案が「Specific Analyzer のシグ�
 
 frame シグネチャは今の `analyze(const psFrame*, …)` のまま (V1/V2 は永久に
 ロード可能 — ヘッダの約束)。現行プラグインは全部 frame の Specific である。
-stack シグネチャは **ABI v3** の新しい登録型:
+stack シグネチャは **ABI v3** の新しい登録型。以下は設計時の骨格で、コピー可能な
+現行宣言ではない。正典は [abi-v3.md](reference/abi-v3.md) と
+[`include/ps/ps_plugin.h`](../include/ps/ps_plugin.h):
 
 ```c
 /* 方向を示す骨格。フィールドの確定は実装仕様で行う (§10) */
@@ -295,17 +311,17 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 特別な解析を書かない。
 
 - **frame 平均は最初の PreProcessor** と型づけ直せる: `{"image": Stack()} →
-  Frame`。`0e4d4ec` が確立した不変条件 — **計算で作った frame は撮ったものの
-  顔をしてはならない**。由来を名前と note の両方に、ファイルは持たず、
+  Frame`。`0e4d4ec` が確立した不変条件 — **計算で作った frame を撮影データと
+  誤認させてはならない**。由来を名前と note の両方に記録し、ファイルは持たず、
   セッションにはレシピを書いて再計算する — は、**PreProcessor の生成物
   すべての規約**に昇格する (dark 減算画像・detrend 済み画像・時間平均、全部)。
-- 生成物をストレージへ書き出すときは export の家風 (provenance ブロック付き)
+- 生成物をストレージへ書き出すときは既存の export 規約 (provenance ブロック付き)
   に従う。読み戻したものは「撮ったもの」ではないので、その旨をファイル自身が
-  運ぶ形式にする — 細部は実装仕様と #49。
+  運ぶ形式にする。公開 map 出力は現行契約に含めない。
 - 前処理の順序 (黒レベル → 飽和マスク → dark 減算 → detrend → …) は
   [flat-field-stats.md](features/analysis/flat-field-stats.md) の「順序」節が既に持っている。
-  PreProcessor 連鎖はそれを型にする器で、順序の中身は #57 の凍結解除後に
-  そちらで確定する。
+  PreProcessor 連鎖はそれを型として表す仕組みで、具体的な順序は同節と #57 の
+  確定済み判断に従う。
 <!-- 【実装 2026-08-10 — detrend PreProcessor (#57 判断6/7)】この種は宣言だけの
      存在ではなくなった。detrend 段 (`core/app/detrend.inc`) の生成物は
      **detrend 済みの stack** (`core/app/preprocess.inc`) で、本節の不変条件を
@@ -322,7 +338,7 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
   前処理は入力アダプタ (reader) で書ける — dark と image を受け取り、引いた
   stack を返す reader は、Python で書いた AnalysisPreProcessor そのものである
   (ユーザー明言 2026-08-06)。Files / Browse から set を組む UI は追って作る。
-  reader の生成物にも本節の不変条件 (由来を運ぶ・撮ったものの顔をしない) は
+  reader の生成物にも本節の不変条件 (由来を記録し、撮影データと誤認させない) は
   掛かる。
 
 ## 6. SetAnalyzer — set から KPI まで一発
@@ -332,23 +348,31 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 
     SetAnalyzer = PreProcessor 連鎖 (§5) → General / Specific の適用 (§3, §4) → KPI の取り出し
 
-これは v1 の合成則 — series 解析はメンバ stack の stack 解析結果から作る、
-`linRecompute` が既にこの形 — の一般化で、理由も持ち上がる:
+これは v1 の合成則 — series 解析は frame の統計またはメンバ stack を畳んだ
+stack 解析結果から作る、`linRecompute` が既にこの形 — の一般化で、理由も持ち上がる:
 **数が食い違えない** (同じ蓄積器から出る)、**remote で自然に分業する**
 (画素に触る段は peer、fit・KPI はスカラの上で手元)。
 
-有名名の表 (役割スキーマが要求を語る):
+定義済みの指標名の表 (役割スキーマが要求を示す):
 
 | SetAnalyzer | 役割スキーマ | 実装 (1–3 の再利用) | 出力 |
 |---|---|---|---|
-| **DSNU [DN]** | `{"dark": Stack()}` | 時間 Mean (§5) → 空間σ (§3.2) | sc (+map) |
-| **PRNU (直接)** | `{"image": Stack(), "dark": Stack()}` | Mean → dark 減算 (§5) → σ/μ (§3.2) | sc (+map) |
-<!-- 【実装 2026-08-10 — PR #130】上の2行は着地した (map はまだ: 器は #49)。
+| **DSNU [DN]** | `{"dark": Stack()}` | 時間 Mean (§5) → 空間σ (§3.2)。**実装済み** | sc |
+| **PRNU (直接)** | `{"image": Stack(), "dark": Stack()}` | Mean → dark 減算 (§5) → σ/μ (§3.2)。**実装済み** | sc |
+| **DSNU / PRNU 分離** | `{"sweep": Series(), "dark": Stack()}` | level 毎 σ_fpn → σ_fpn²–μ² 線形回帰。**実装済み** | sc |
+| read noise (dark 実測) | `{"dark": Stack()}` | σ_t (§3.2 Temporal) | sc |
+| **暗電流 [DN/s]** | `{"darks": Series(unit=s/ms)}` | level 毎 Mean → 線形 fit (§3.3) | sc + cv |
+| **欠陥画素 (正式)** | `{"dark": Stack(), "flat"?: Stack()}` | Mean → 閾値判定。**map 出力は現行 ABI に無く、再導入には新たな裁定が必要** | 将来: sc + map |
+| full well | `{"sweep": Series()}` | PTC の K + 飽和レベル | sc |
+| DSNU [e⁻] / PRNU の e⁻ 系 | 上に `{"sweep": Series()}` を足す | K が要る、を役割が語る | sc |
+
+<!-- 【実装 2026-08-10 — PR #130】上の2行は着地した (当時 map は #49 待ち。
+     後に公開契約を取り下げた)。
      「実装は 1–3 の再利用」は文字どおりで、DSNU は **dark stack に掛けた
      補正済み sigma_fpn そのもの** — selftest がパネルの値と bit 単位で
      一致することを確かめている。 -->
 <!-- 【実装 2026-08-10 — 本 PR】remote (§3.5 の「画素の居る側で走る」) も
-     着地した: `MOP_SET_FOLD` (`rp::VERSION = 8`)。**畳み込みだけ** が peer に
+     着地した: `MOP_SET_FOLD` (protocol 8 で導入)。**畳み込みだけ** が peer に
      移り、名前を持つ量は全部こちらで合成する — この節の「画素に触る段は
      peer、fit・KPI はスカラの上で手元」がそのまま実装の分割線である。
      役割ごとの平面別 (ΣM, ΣM², ΣC, n) が渡り、直接 PRNU が要る
@@ -358,12 +382,9 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
      組み込みのパリティは「畳み込みが宣言する form の等値」 —
      プラグインの name+version (abi-v3.md §10) に対応する組み込みの答え。 -->
 
-| **DSNU / PRNU 分離** | `{"sweep": Series(), "dark": Stack()}` | level 毎 σ_fpn → σ_fpn²–μ² 線形回帰 | sc |
-| read noise (dark 実測) | `{"dark": Stack()}` | σ_t (§3.2 Temporal) | sc |
-| **暗電流 [DN/s]** | `{"darks": Series(unit=s/ms)}` | level 毎 Mean → 線形 fit (§3.3) | sc + cv |
-| **欠陥画素 (正式)** | `{"dark": Stack(), "flat"?: Stack()}` | Mean → 閾値判定 → **map** | sc + map |
-| full well | `{"sweep": Series()}` | PTC の K + 飽和レベル | sc |
-| DSNU [e⁻] / PRNU の e⁻ 系 | 上に `{"sweep": Series()}` を足す | K が要る、を役割が語る | sc |
+`MOP_SET_FOLD` transport と parity selftest は実装済みだが、Set Analysis panel は
+まだこの op を要求せず、現行 UI の fold は local で走る。追跡先は
+[tasks.csv](tasks.csv) の remote Set Analysis 行。
 
 - **"EMVA 1288" の文字列は、規格原文と照合するまでどの画面にも出さない**
   ([flat-field-stats.md](features/analysis/flat-field-stats.md) の確定規則の再掲。フレーム
@@ -384,14 +405,14 @@ AnalysisSet → frame / stack / series / batch。**生成物は一級のデー�
 
 「General に有名名を付けない」というユーザー自身の規則により、v1 の
 「裸名の予約」は型の帰結になった: **裸の `PRNU` / `DSNU` を出せるのは、
-役割が束ばれた SetAnalyzer だけ**。4つの数の配置:
+役割が束縛された SetAnalyzer だけ**。4つの数の配置:
 
 | 量 | 種と層 | 名前 | 扱い |
 |---|---|---|---|
 | ROI の σ/mean (そのまま) | General / frame (ROIs 列) | **`std / mean [%]`** | **改名済み・main 済み** (`5d8cb72`。ユーザー裁定 2026-08-06、旧 `PRNU [σ %]`)。素の名前になり、General から有名名が消えた |
 | 9×9 ローパス残差の σ/mean | Specific / frame | `uniformity/prnu-fpn` の `prnu_pct` | 現名のまま。proxy と自己申告済み ([analyzers.md](reference/analyzers.md))。改名は報告書の連続性を壊すだけ |
 | dark を引いた flat の固定パターン | **SetAnalyzer** | 裸の `PRNU` (+ set タグ: `— set: image n/N, dark n/N`) | **着地済み (PR #130)**。Set Analysis パネル。タグは set 名も名乗る (不変条件 (a)) |
-| σ_fpn²(μ) フィットの傾き / 切片 | **SetAnalyzer** | 裸の `PRNU` / `DSNU` (+ set タグ: `— sweep: <series>, M levels`) | 未実装。加法・乗法の**分離**はここでしか出来ない ([flat-field-stats.md](features/analysis/flat-field-stats.md) (c)) |
+| σ_fpn²(μ) フィットの傾き / 切片 | **SetAnalyzer** | 裸の `PRNU` / `DSNU` (+ set タグ: `— sweep: <series>, M levels`) | **実装済み**。加法・乗法の**分離**はここでしか出来ない ([flat-field-stats.md](features/analysis/flat-field-stats.md) (c)) |
 
 直接推定と分離フィットは**推定量が違う**ので、set タグがそのまま区別になる。
 同じ表に並べるときはタグを省略しない。改名で **#66 は単純になった**:
@@ -419,7 +440,7 @@ measure-ux.md の原則 (出力はそれ単体で証拠になる) の層別具�
 |---|---|
 | frame | frame 名 (path)、領域 (whole / ROI 矩形)、dtype、CFA 解釈 |
 | stack | stack 名 + **先頭フレームの path** (セッションを跨ぐ同定の既定 — series メンバ・frame 平均レシピの先例)、**n of N**、除外した非有限サンプル数、領域、全画素かサンプリング格子か (export-design §3.1 と同じ理由) |
-| series | series 名、kind、パラメータ名+単位、メンバ表 (stack・値・include)、fit の式 — **測定時点の series の中身** (編集で数値を破棄する規則の裏面: 破棄されずに残る唯一のものが provenance の写し) |
+| series | series 名、kind、パラメータ名+単位、メンバ表 (frame / stack・値・include・stack の fold)、fit の式 — **測定時点の series の中身** (編集で数値を破棄する規則の裏面: 破棄されずに残る唯一のものが provenance の写し) |
 | **AnalysisSet** | set 名、**役割 → メンバの対応** (各メンバは上の各層の欄を再帰的に運ぶ)、適用した PreProcessor 連鎖と版、中間生成物の所在 (保存したなら) |
 | 画像出力 (frame / map) | 名前と note に由来、セッションにはレシピ (§5。`0e4d4ec` の不変条件) |
 
@@ -443,37 +464,34 @@ SetAnalyzer の結果は自分の set を指せば provenance の大半が済む
 | 5 部分ロード n/N | **存続 → 裁定済み** (判断record 5) — §3.5 のまま |
 | 6 provenance 2段 (#46) | **存続 → 裁定済み** (判断record 6) — set が構造化 provenance になる分、内容はむしろ強まった (§8) |
 | 7 フレームリニアリティ | **存続 → 裁定済み** (判断record 7) — frame \| stack 混在の series へ (§3.3) |
-| 8 正典への3行追記 | **変換・拡大 → 承認済み** (判断record 8) — 階層挿入と束縛例外を含む正典修正パッケージになった (§11) |
+| 8 正典への3行追記 | **変換・拡大 → 承認済み、#230 で関係モデル改訂** — データ層の順序、管理、role-ref を分離する正典修正パッケージになった (§11) |
 
 ## 10. この文書が決めないこと
 
-- **map の細部** (#49): 語彙の確定 (評価値マップ / map)、表示レンジ、
-  セッション、export、読み込み経路 (リーダが set の役割へ届ける形)。
-  帰属先 (set) は決まった (§1.3)。
-- **推定量の細部** (#57): σ_fpn の −σ_t²/N 補正、detrend の既定と置き場所
-  (B2/B4/B5)、直接 PRNU の式 (分散差か画素毎減算か)。前処理の**順序**の中身も
-  flat-field-stats の節をそのまま凍結解除で。本書は住所と名前だけ確定した。
+- **map の公開契約**: #49 で取り下げ済み。§1.3 の set 帰属は #48 時点の歴史案で、
+  再導入時は新たな裁定が必要である。
+- **推定量の細部** (#57): 本書の境界外のままだが、
+  [flat-field-stats.md](features/analysis/flat-field-stats.md) で確定し、σ_fpn 補正、
+  detrend、直接 PRNU、分離 fit は実装済み。本書は現在も分類先と命名規則を定める。
 - **EMVA 1288 準拠の照合**: 規格原文に当たる作業そのもの (§6 のゲート)。
-- **ABI v3 の構造体の確定**、stack をプラグインに見せる運搬 (共有メモリ、
-  Python 常駐ワーカ #45)、remote MEASURE op の拡張。§4 は方向であって寸法
-  ではない。kind 3/4 のプラグイン口も同じ棚。
-- **AnalysisSet の実装細部**: セッション形式 (series ブロックの先例に従う、
-  までを方針として)、Files の見え方、束縛 UI、picker との関係。
+- **ABI の範囲**: frame / stack の v3 API と remote `MOP_PLUGIN_ANALYZE` は実装済み。
+  series と kind 3/4 は現行ヘッダにない。画素 map の公開 API は #49 で取り下げ済みで、
+  再導入には新たな裁定が必要である。
+- **AnalysisSet の実装細部**: session 往復、Files の set node、Set Analysis panel は
+  実装済み。role 束縛を手動で作る UI は未実装で、現行の作成経路は Reader である。
 - **series 横断・batch 横断の表** (正典が「将来」と記す欄)。2軸掃引
   (温度×PTC) を set の役割で表す誘惑もここに置く — 役割は名義 (nominal) で
   あって軸 (ordinal) ではないので、安易にやると series をもう1回発明する
   ことになる。必要が実物として現れるまで作らない。
 
-## 11. 正典 ([terminology.md](terminology.md)) への修正提案
+## 11. 正典 ([terminology.md](terminology.md)) への適用
 
-いずれも**修正として明示的に**入れる。**承認済み** (判断record 8) —
-これが適用パッケージで、適用は別コミットの機械的作業として切り出す:
+判断record 8 の承認後、関係モデルだけは #230 の A + 補足で改訂された。現行の
+適用パッケージは次のとおり:
 
-1. **階層の挿入**: 4つの層の表に **AnalysisSet** を加え、包含関係を
-   `frame ⊂ stack ⊂ series ⊂ AnalysisSet ⊂ batch` に改める。ただし
-   **AnalysisSet のメンバ関係だけは束縛 (参照)** で、メンバは複数の set から
-   参照されてよい — 厳密包含の唯一の例外として、理由 (参照データの再利用が
-   通常運用) と共に明記する。set 自身は1つの batch に属する。
+1. **関係の分離**: データ層は `frame ≼ stack ≼ series`（中間省略可・逆転不可）。
+   frame / stack / series は batch に managed-by され、AnalysisSet はそれらを
+   role-ref する。set 自身は1つの batch に管理されるが、参照先は別 batch でもよい。
 2. **用語の追加**: AnalysisSet と解析の4種 (General Analyzer / Specific
    Analyzer / AnalysisPreProcessor / SetAnalyzer) を用語表に載せ、
    1物1名を守る (それぞれの和名を与えるかは表で決める)。
@@ -493,7 +511,8 @@ SetAnalyzer の結果は自分の set を指せば provenance の大半が済む
 「」内は回答の原文。
 
 1. **AnalysisSet のメンバ** — 「参照．」 **参照で確定** (§1.1)。同じ dark
-   stack を複数の set が参照できる。厳密包含の唯一の例外として正典に明記 (§11)。
+   stack を複数の set が参照できる。データ層の順序とは別の role-ref として
+   正典に明記 (§11)。
 2. **set の作成経路** — 「Files パネル内 / Browse パネルから作れる UI は
    追々作るとして、Reader で作るをとりあえず用意する．」 **Reader が当面の
    作成経路で確定** (§5)。dark 減算のような共通前処理も reader で書ける
@@ -514,5 +533,5 @@ SetAnalyzer の結果は自分の set を指せば provenance の大半が済む
    **成立する。frame | stack 混在で確定** (§3.3)。stack メンバは §3.2 の
    畳み方で frame に立つ — 機構は `0e4d4ec` の frame 平均と §4.2 の合成則
    そのもの。fit に入るのは mean 統計 (n が違う sum は点ごとに別の量)。
-8. **正典の修正** — 「修正お願いします．」 **承認** (§11 が適用パッケージ)。
-   適用は別コミットの機械的作業として切り出す。
+8. **正典の修正** — 「修正お願いします．」 **承認**。関係モデルは後の #230 で
+   改訂され、現行の適用パッケージは §11。

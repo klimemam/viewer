@@ -54,23 +54,25 @@ win64\install_shortcut.cmd                    Windows
 ## 用語 — frame / stack / series / AnalysisSet / batch
 
 この5語がこの道具の骨格で、パネルもファイルも測定もこの語彙で動きます。
-包含は `frame ⊂ stack ⊂ series ⊂ AnalysisSet ⊂ batch` で**厳密**です。例外は1つ、
-**AnalysisSet のメンバ関係だけは包含ではなく束縛 (参照)** — 同じ dark を複数の set が
-参照できないと、「1回撮った dark を全解析で使う」が成立しないからです。
+構造の順序は `frame ≼ stack ≼ series` です。`≼` は集合包含ではなく、存在する
+データ層がこの順序を守るという意味です。途中の stack は省略でき、逆転はできません。
+batch はこれらを管理する単位 (`managed-by`) で、構造の層ではありません。
+AnalysisSet は frame / stack / series を役割付きで参照 (`role-ref`) します。同じ dark を
+複数の set から参照できないと、「1回撮った dark を全解析で使う」が成立しないからです。
 
 | 語 | 何か | 例 |
 |---|---|---|
 | **frame** | 画面に見えている最小単位。1枚 | `dark_0007.npy` |
 | **stack** | **同一条件で繰り返し**撮った frame の集まり | `dark_0000‥0479` (480枚) |
-| **series** | **条件を振った** stack の集まり。振った量と単位を持つ | 露光 1,2,5,10,20 ms の5つの stack |
+| **series** | **条件を振った** stack / frame の並び。振った量と単位を持つ | 露光 1,2,5,10,20 ms の5つのメンバ |
 | **AnalysisSet** | 解析の**入力の役割**を束ねたもの。データが dark 「である」のではなく、set の中で dark を**演じる** | `{"image": 10lx, "dark": dark}` |
 | **batch** | 一緒に開いたもの。構造の主張はしない | あるフォルダを開いた結果 |
 
 この区別が効くのはここです:
 
 - **時間ノイズ σ_t は stack の性質**です。条件の違うものを混ぜて計算すると、
-  「振った条件」を「ノイズ」として報告してしまいます。だから series は stack の
-  集まりで、σ_t を条件またぎでは計算しません
+  「振った条件」を「ノイズ」として報告してしまいます。だから series では
+  σ_t を条件またぎで計算しません
 - **series の値 (露光・照度) と単位は series が持ちます**。stack にもアプリにも
   持たせません。単位が無ければフィットしません — 単位は推測しないからです
 - **batch は構造を主張しません**。「一緒に開いた」だけなので、閉じる単位に使えます
@@ -78,7 +80,7 @@ win64\install_shortcut.cmd                    Windows
   束ねることはしません
 
 正典は [docs/terminology.md](docs/terminology.md) です (Close の意味論もそこ)。
-解析の層と4種の設計は [docs/analysis-layers.md](docs/analysis-layers.md)。
+解析モデルと4種の設計は [docs/analysis-layers.md](docs/analysis-layers.md)。
 
 ---
 
@@ -99,9 +101,10 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 
 ### 見る
 
-- **Image View** — 中央。ホイールで拡大、ドラッグで移動。値は [DN] のまま表示され、
-  トーンマップはしません
-- **Files** — 開いているものが frame / stack / series / batch の木で並びます
+- **Image View** — 中央。ホイールで拡大、ドラッグで移動。整数データは [DN]、
+  float データは単位を仮定せず保存値のまま表示し、トーンマップはしません
+- **Files** — batch の管理下に frame / stack / series がデータ順序どおり並び、
+  AnalysisSet はそれらを役割参照する別ノードとして見えます
 - **Browse** — ファイルを探すパネル。ローカルもリモートも同じ形で扱います。
   **クリックで選択、ダブルクリックで確定** (開く・降りる)
 - **Inspector** — 座標・画素値・そのファイルがどう読まれたか
@@ -121,7 +124,8 @@ viewer ssh://user@host/data/run42       計算機の上のフォルダ
 | **Set Analysis** | AnalysisSet の SetAnalyzer。**DSNU / PRNU** と、掃引からの分離フィット |
 | **Analysis** | プラグインの測定結果 |
 
-数値には**必ず量と単位**が付きます。画素値は保存形式が何であれ [DN] です。
+解析結果は**量を示す名前**を持ち、定義できる単位を併記します。整数の画素値は [DN]、
+float の画素値は単位を仮定せず、保存された値として扱います。
 部分的にしか読めていない stack は **n/N** と言います。
 
 stack を1枚に畳むときは **mean と sum を選べます**。NaN が混ざっていれば警告し、
@@ -132,8 +136,9 @@ stack を1枚に畳むときは **mean と sum を選べます**。NaN が混ざ
 
 ### 比べる
 
-`B` で B を設定して A/B 比較、`C` 以降でスロットを増やせます。比較中は
-**表示レンジを揃えます** (違う伸ばし方をした2枚は比べられないので)。
+`\`（または `C`）で比較モードを巡回し、`Shift+\` で A/B を入れ替え、
+`Shift+C` で C, D, … の比較スロットを表示します。比較中は既定で
+**全比較枠の表示レンジを揃えます** (各画像を違う伸ばし方にすると比較できないため)。
 `ESC` で一段ずつ外側に戻ります。
 
 ### 取り出す
@@ -185,7 +190,8 @@ CFA は `--cfa bayer --bayer-pattern RGGB` の**順**で書いてください
 **書ける**: PNG (表示のとおり)、CSV / TSV、`.vsession`。
 
 **Browse の一覧は、ローカルでは「この viewer が読めるか」、リモートでは「この peer が
-配れるか」を訊きます** (peer は `.npy` のみ)。開けない行も消さずに残し、理由を言います。
+その形式または宣言を扱えるか」を確認します**。対応範囲は protocol と形式表で判定します。
+開けない行も消さずに残し、理由を表示します。
 
 ### 読めない形式を読ませる — リーダ
 
@@ -199,7 +205,8 @@ def load(path):
                   conditions=Values(z["exp"], "exposure", "ms"))
 ```
 
-返り値の**型が層を名乗る**ので、形の推測が要りません (配列をそのまま返すこともできます)。
+返り値の**型がデータ層や関係を明示する**ので、形だけに意味を推測させません
+(配列をそのまま返す互換経路もあります)。
 
 ```
 File > Open With a Reader...        (Browse で読めないファイルをダブルクリックしても同じ)
@@ -276,17 +283,20 @@ analyzer は **peer 側でも同じものが走ります**。リモート実行�
 
 ## セルフテスト
 
-40 本あり、CI が3つの OS で全部走らせます。手元でも同じものが1コマンドで走ります。
+CMake に selftest として 55 本登録され、別に GL capability gate の `glprobe` が1本あります。
+登録数と一覧の正典は [CMakeLists.txt](CMakeLists.txt) です。CI の3つの OS と手元は
+同じ入口を使い、GL が無い環境では該当する検査を名指しで skip します。
 
 ```
 tools/run_selftests.sh [build-dir]
 ```
 
 GUI を実際に描いてクリックを注入するものも含みます (Browse のキー操作、比較、タイル表示)。
-測定の不変条件 — **σ_t は stack の性質・CFA プレーンを混ぜない・部分ロードは n/N と言う** —
-は、この検査で守られています。加えて規則そのものを検査するものがあります: 有名名
-(PRNU/DSNU) が表の外に現れていないか、ローカルと peer が同じ数を返すか、走らなかった
-テストが黙っていないか。
+測定の不変条件 — **σ_t は stack の性質・CFA プレーンは個別系列で保つ・明示的な
+`all` 集計は別測定と名乗る・部分ロードは n/N と言う** — は、この検査で守られています。
+さらに、PRNU / DSNU などの定義済みの指標名が許可された表以外に現れていないか、
+ローカルと peer が同じ数値を返すか、実行されなかったテストが黙って成功扱いに
+なっていないかも検査します。
 
 **走らなかったものは必ず名指しします** — skip も quarantine も、緑の中に埋もれません。
 
@@ -296,7 +306,7 @@ GUI を実際に描いてクリックを注入するものも含みます (Brows
 
 | | |
 |---|---|
-| [docs/terminology.md](docs/terminology.md) | 層モデルの正典。Close の意味論も |
+| [docs/terminology.md](docs/terminology.md) | データモデルの正典。Close の意味論も |
 | [docs/guides/manual.md](docs/guides/manual.md) | 操作の手引き |
 | [docs/analysis-layers.md](docs/analysis-layers.md) | AnalysisSet と解析の4種 (General / Specific / PreProcessor / SetAnalyzer) |
 | [docs/features/analysis/flat-field-stats.md](docs/features/analysis/flat-field-stats.md) | σ_fpn・DSNU・PRNU の推定量と detrend |

@@ -1,15 +1,19 @@
 # 設定の棚卸し — 何が設定になりうるか、どう分けるか、どの形で置くか
 
-> **状態: 提案 (2026-08-10, #50)。** [issue #50](https://github.com/klimemam/viewer/issues/50)
+> **状態: 原提案 (2026-08-10, #50)／現行帳簿あり。** [issue #50](https://github.com/klimemam/viewer/issues/50)
 > の指示 —— 「設定としてでてきそうなものを列挙 → 分類 → コメントアウト許容の
 > json (vscode みたいな形)」—— の**前半2つと、形式の提案まで**である。
-> **コードには1行も手を入れない。** 移行 (prefs.txt を読む側・書く側の
+> **この原提案ではコードに1行も手を入れなかった。** 移行 (prefs.txt を読む側・書く側の
 > 差し替え) は別の変更で、この棚卸しが合意されてからでよい。理由は単純で、
 > 今 prefs.txt に無いものが**設定として存在しないのか、散っているだけなのか**
 > が誰にも分かっていないからである (§3.8 がその答えで、これが本書で一番
 > 重い節になった)。
 >
 > 判断が要るものは **§9 の判断リスト**にまとめてある。番号で答えられる。
+>
+> **現行追記 (2026-08-20)。** 上は 2026-08-10 時点の提案文、§10 は
+> 2026-08-11 の stage 1 着地記録である。後から実装された機能で当時の記録を
+> 書き換えず、現在の実装との差分は §11 に集約する。
 
 ## 1. 非目標
 
@@ -274,18 +278,13 @@ F10 は特に読む値打ちがある —— **設定にしないと決めた記
 | Compare (A/B) | 7 | 4 (`diffAbs` / `diffGain` / `compareFollowFrame` / `compareRangeMode`) |
 | Inspector | 1 | 1 (`rangeScope` + `linkRange`) |
 | Browse | 1 | 0 (**ソート列と向きはどこにも保存されない** —— 起動のたびに Name 昇順に戻る) |
-| **計** | **43** | **11 + Blink = 12** (+ 部分 4) |
+| **計** | **43** | **11** (+ 部分 4) |
 
 (`compareMode` 自体は `--compare` で与えられるので上の 43 に数えていない。
-ただし5つ目の値 **Blink だけは CLI からも prefs からも到達できない**ので、
-数値を動かすものの側では 12 番目として数えている。)
+現行 CLI は `blink` と互換 alias `flip` も受理する。)
 
-2つ、名指しに値するもの:
+名指しに値するもの:
 
-- **Blink (`CmpFlip` = 4) には CLI も prefs も無い。** `--compare` は
-  `off|wipe|split|diff` の4つしか受けず (`core/app/cli.inc:723`)、5つ目の
-  Blink はメニューをクリックする (か、そうして保存したセッションを開き直す)
-  以外に到達できない。**起動時から Blink** という指定が存在しない。
 - **Browse のソート列/向きだけが完全に揮発する。** `rbFlat`/`rbTree`/
   `rbNatural` は prefs.txt に載るのに、同じテーブルのソートは載らない。
 
@@ -710,6 +709,9 @@ vendored ライブラリを入れるより自前を薦める理由は大きさ�
 **状態: 実装済み (2026-08-11)。** 読む側だけ。`core/app/settings.inc` と
 `--settings-selftest` (77 アサーション)。
 
+> **この節は 2026-08-11 の stage 1 実装時スナップショット。** 後続で解消した
+> 「まだ」は書き換えず、§11 の現行帳簿で訂正する。
+
 ### 10.1 採った方言 —— VS Code の JSONC であって JSON5 ではない
 
 JSON + `//` `/* */` + 末尾カンマ、それだけ。**単引用符・裸のキー・16進・
@@ -833,6 +835,9 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 
 ### 10.7 まだやっていないこと (この PR の外)
 
+> この一覧は stage 1 時点の記録。Preferences、measuring / watch、folder scan
+> depth はその後実装された。現行は §11 を参照。
+
 - **Preferences パネル** (§6 の 3)。#50 の「1箇所に集める」はそこで果たされる。
 - **`measuring` 節** (判断10/11)。M1 の「申告を伴う」が先で、申告なしに
   読めるようにすると初日に M1 を破る。
@@ -841,3 +846,42 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 - **`loading.raw` の 10 キー** (§3.3)。measuring 級。
 - **`browse.folderActivate` / `sortColumn` / `sortDescending` / `panels`** ——
   機構そのものが無い。設定にしても効かないので、v1 は「まだ」と名指しする。
+
+## 11. 現行の実装帳簿 (2026-08-20)
+
+§10.7 は stage 1 当時の「まだ」であり、現在形ではない。現在は JSONC reader、
+`File > Preferences...`、出所バッジ、Copy as JSONC / Copy template、
+`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
+`loading.folderScanDepth` まで実装されている。`SETTING_KEYS` の現行照合は
+**27 Read / 5 Later / 2 NotHere = 34行**。`prefs.txt` は
+`writePrefsTo` が28キーを書き、`loadPrefs` が互換入力を含む30キーを読む。
+
+出所は通常の `default` / `this machine` / `settings.jsonc:<line>` /
+`command line (--flag)` に、gamma と grid だけ `session (.vsession)` が加わる。
+現行 `--settings-selftest` の台帳は O1–O5、行モデルとコピーは W1–W5、
+memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。§10 の22キー、27書き/29読み、
+「Preferences 未実装」は、いずれもその時点の履歴として残している。
+
+ただし「キーを読む」と「Preferences から完全に扱える」はまだ同義ではない。
+phase④ で閉じる現行差分は次のとおり。
+
+- `measuring.memoryBudgetGB` は JSONC/CLI/prefs の読み書き対象だが、パネルの
+  `SW_Int` に対応する実フィールドが無く、行から編集できない。実効予算の表示も無い。
+- `remote.repoUrl` と `readers.editor` はパネルで編集できるが、`writePrefsTo` が
+  その2値を保存しないため、再起動を越えない。
+- 値セルの右クリックは **Copy as JSONC** だけで、設計にある
+  **Reset to default** は未実装。値ウィジェットの無い行では popup の入口自体も無い。
+- `panels` は `SETTING_KEYS` に無く、Read 行の補足文も現在の表では保持していない。
+  そのため設計した節注・行注の一部はパネルへ出ない。
+- 粘る `settings.jsonc` の警告は Preferences と gamma/grid の共通変更経路にはあるが、
+  それ以外の既存メニュー変更すべてには接続されていない。
+- 最初の有効な `.vsession` header 後の gamma/grid だけが下位 prefs 値を別に保持する。
+  それ以外は、別のGUI設定を保存したときに App 上の File/CLI 実効値まで
+  `prefs.txt` へ焼き付く余地がある。
+- CLI 出所台帳は `--stack` / `--remote-policy` / `--remote-exe` だけで、
+  `--frame` / `--mem-budget` は同じ5層表示へまだ接続されていない。
+
+未実装の設定そのものは、stage 1 から継続する `state.json`、`loading.raw`、
+`input.keyBindings`、既定表示レンジ、`browse.folderActivate` / sort 2キー /
+`panels` である。上の差分は「未実装キー」ではなく、既に読めるキーとGUIの
+契約を最後まで揃える仕事として区別する。

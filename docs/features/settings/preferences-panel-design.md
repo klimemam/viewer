@@ -1,15 +1,19 @@
 # Preferences パネル — 設定を変える場所と、値が誰のものかの申告 (issue #50 段2)
 
-> **状態: 提案 (2026-08-13, #50 段2)。**
+> **状態: 確定・実装済み（原設計 2026-08-13, #50 段2）。**
 > [settings-inventory.md](settings-inventory.md) §10.7「まだやっていないこと」の
 > 1つ目がこの設計である。前提は2つとも満たされている: 段1 の読む層 (PR #167、
 > `core/app/settings.inc`、優先順位 defaults < prefs.txt < settings.jsonc < CLI)
 > と、M1「申告を伴う」の先行実装 (PR #182 — ヘッダ無しの読みが note に全部を
 > 名乗る)。
 >
-> 判断が要るものは **§10 の判断リスト** (P1〜P13) にまとめた。番号で答えられる。
-> **裁定を仰ぐのは P11 の1件だけ**で、残りは既裁定 (inventory §9 の 20件) の
+> 原設計時、判断が要るものは **§10 の判断リスト** (P1〜P13) にまとめた。
+> **当時、裁定を仰いだのは P11 の1件だけ**で、残りは既裁定 (inventory §9 の 20件) の
 > 適用である。
+>
+> **現行追記 (2026-08-20)。** 本書は 2026-08-13 の設計・段階記録として
+> 当時の数と試験名を保存する。段2a〜2e と後続の session origin / Custom gamma /
+> folder scan depth は実装済みで、現在の照合と残差は §11.6 に記す。
 
 ## 1. 非目標
 
@@ -491,8 +495,8 @@ prefs.txt を書くテストが共有 home を汚してはならない。
   その声が出たとき、1キーずつ判断19 に掛ける。
 - **`panels` 節を読む。** layout.ini との決着 (まっさらな起動のとき、開閉の
   真実はどちらか) が先 (§10.7)。パネルには注1行だけ出す。
-- **Blink の起動時指定** (§3.7 の名指し1つ目)。要望の記録が無い。再訪条件:
-  要望が出たら `--compare blink` の1語追加が先で、設定キーはその後。
+- **比較モードの設定キー化。** 起動時指定は `--compare blink`（`flip` も互換 alias）
+  まで実装済み。毎回の既定として保持したい要望が出たときに設定キーを検討する。
 - **settings.jsonc を書く編集器。** §4 で断った。再訪条件も §4。
 - **履歴 (bookmarks / recent / readerfor / window) の表示。** state.json の
   段の入口で「見せるか」ごと再訪。
@@ -530,6 +534,25 @@ prefs.txt を書くテストが共有 home を汚してはならない。
 Preferences のショートカット、`loading.raw` の 10キー、パネル開閉のセッション
 保存。
 
+### 11.6 後続実装を含む現行照合 (2026-08-20)
+
+現在の `SETTING_KEYS` は **27 Read / 5 Later / 2 NotHere = 34行**。
+実行する試験は別バイナリ案の `--prefspanel-selftest` ではなく、統合された
+`--settings-selftest` の O1–O5、W1–W5、M1–M3、D1–D6 である。O5 は gamma/grid の
+`session (.vsession)` 出所と下位 prefs の凍結、W3/W5 は Custom gamma と
+Copy as JSONC の往復、D1–D6 は folder scan depth を固定する。prefs の現行照合は
+28書き/30読み。§9 と §11.5 の 23/31、26/33、O1–O4、旧試験名は当時の着地記録で、
+この現行値へ書き換えない。
+
+実装は表から34行を描くところまで着地しているが、設計全体との残差がある。
+`memoryBudgetGB` は行があっても編集フィールドへ結び付かず、`repoUrl` / `editor` は
+編集後に prefs へ永続化されない。popup は Copy as JSONC のみで Reset は無い。
+`panels` 注と Read 行注は表へ載らず、粘るキーの即時警告も Preferences と
+gamma/grid 以外の全GUI変更経路には届いていない。さらに最初の有効な `.vsession`
+header 後の gamma/grid 以外は下位 prefs 層を分離していないため、無関係なGUI変更時に
+File/CLI の実効値を prefs へ焼き付け得る。これらは設計変更ではなく、phase④ の
+実装・回帰対象である。
+
 ## 12. 数の扱い
 
 本書の数 (23 / 31 / 33 / 27−5=22 …) はすべて §3.1 の数え方とセットである。
@@ -537,3 +560,6 @@ Preferences のショートカット、`loading.raw` の 10キー、パネル開
 パネル自体が表から生成される (P1) ので、実装後は「パネルの行数」がこの数の
 生きた写しになり、`--prefspanel-selftest` の構造 assert が写しの腐りを
 検出する。
+
+これは当初案の試験名である。現行では `--settings-selftest` の W1–W5 に統合され、
+W1 が全34行、W2 が全 Read 行の widget 種を構造的に検査する。

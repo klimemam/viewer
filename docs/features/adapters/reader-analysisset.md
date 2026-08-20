@@ -1,9 +1,14 @@
-# Reader 発の AnalysisSet — 返り値の形・参照・部分束縛・セッション
+# Reader が返す AnalysisSet — 返り値の形・参照・部分束縛・セッション
 
-> **状態: 確定 (2026-08-07)。** #97 の判断は全11項回答済みで、**§9 が
+> **状態: 確定・実装済み。** #97 の判断は全11項回答済みで、**§9 が
 > 判断record** — もう「待ち」ではない。回答時の確認1件 (同一 batch 内の
-> 複数 set) は §1.4 / §5.2 の規範文になった。§8 の機械的追記も適用済み
-> (同ブランチ)。実装はこの文書を根拠に始めてよい。
+> 複数 set) は §1.4 / §5.2 の規範文になった。Python の `AnalysisSet` / `Ref`、
+> vstream / viewer-npz、viewer 側の Ref 解決・Files 表示・Close / rename・session、
+> ローカル Reader 経由の読み込みまで実装されている。**set を返す remote Reader は
+> 現在も名指しで拒否**する ([remote-reader-design.md](../remote/remote-reader-design.md) §7 /
+> `--rreader-selftest` R11)。
+> **#49 後続裁定:** 公開 map / `emit_map` は取り下げ済み。以下の「#49 後」は
+> 設計時の再訪条件であり、現行の実装予定ではない。
 > 前提はすべて確定文書:
 > [analysis-layers.md](../../analysis-layers.md) (§12 判断record — 特に record 2
 > 「Reader で作るをとりあえず用意する」)、[terminology.md](../../terminology.md)
@@ -28,7 +33,7 @@
 
 決めないこと (既に決まっているか、他所の領分):
 
-- **set の意味論そのもの** — 束縛であって包含ではない、メンバは複数の set
+- **set の意味論そのもの** — `role-ref` であってデータ層の親子ではない、メンバは複数の set
   から参照されてよい、メンバを閉じたら束縛を失いそう表示する — は
   analysis-layers.md §1.1 で確定済み。本書は再定義しない。
 - **役割スキーマの中身** (どの解析がどの役割を要るか) は analysis-layers.md
@@ -43,8 +48,9 @@
 
 ### 1.1 型と引数
 
-`viewer_import` に5つ目の型を足す。層モデルの語がそのまま型名になる規則
-(§4.2) は、正典の階層が5層になった今も同じ。名前は正典の1物1名に従い
+`viewer_import` に5つ目の公開型を足す。正典の5語がそのまま型名になる規則
+(§4.2) は同じだが、順序付きデータ層は `frame ≼ stack ≼ series` の3つだけである。
+`Batch` は `managed-by`、この型は `role-ref` を表す。名前は正典の1物1名に従い
 **`AnalysisSet`** — 別名・短縮名は作らない (`set` は Python の組み込み語
 でもある)。
 
@@ -112,14 +118,15 @@ set にも適用する。構築時 TypeError / ValueError:
 ### 1.4 どこに住むか、そして同一性
 
 reader 1呼び出しは今までどおり batch を1つ作り (正典「1回の Open 操作は
-batch を1つだけ作る」)、**set はその batch の1ノード**になる
-(analysis-layers.md §1.1: set 自身は層のノードで、1つの batch に属す)。
+batch を1つだけ作る」)、**set 自身もその1つの batch に管理される**。
+AnalysisSet は運搬・Files 表示では1ノードを持つが、順序付きデータ層に加わる
+わけではない。
 
 - **インラインの役割メンバも同じ batch に住む。** set の「下」に住むのでは
-  ない — 束縛は包含ではないから。運搬の木 (§4) では set の子として旅をするが、
-  着地先は batch で、set はそれらを束縛する。
+  ない — `role-ref` はデータ層の親子ではないから。運搬の木 (§4) では set の子
+  として旅をするが、着地先では batch に管理され、set はそれらを参照する。
 - **Ref で束ねたメンバは自分の batch に住み続ける。** 束縛が batch をまたぐ
-  のは §1.1 の例外そのもので、合法。
+  のは `role-ref` の通常の形であり、合法。`managed-by` を付け替えない。
 
 **同一性と多重性** (裁定 2026-08-07, #97):
 
@@ -234,11 +241,15 @@ reader の返した数字を identity に使うと、reader の実行時間ぶ�
 
 ### 2.3 remote
 
-reader は peer 側で走る (§4.13.1)。peer で走った reader の Ref は peer の
-名前空間のパスであり、viewer はそれを remote 側の identity
-(url / remoteFrame / …) の tuple に写して**同じ順序**で解決する。set の集計が
-画素の居る側で走る線は analysis-layers.md §3.5 のまま、細部は実装時
-(同 §10)。本書が約束するのは「Ref の解決順序が local と remote で同型」まで。
+reader 自体は peer 側で走る (§4.13.1) が、**AnalysisSet を含む remote Reader の
+返り値は v1 の境界として拒否する**。Ref は peer の名前空間を指し、client 側の
+registry / identity tuple へ安全に写す契約が未実装だからである。拒否は Reader 全体の
+登録前に処理を止め、不完全な set や member を残さない
+([remote-reader-design.md](../remote/remote-reader-design.md) §7、`--rreader-selftest` R11)。
+
+これは、すでに束縛された remote stack の set 集計を peer で行う
+`MOP_SET_FOLD` (protocol 8) とは別の境界である。transport と parity selftest は実装済みだが、
+Set Analysis panel はまだこの op を要求せず、現行 UI の fold は local で走る。
 
 ## 3. 部分束縛 — 無いものは無いと言う
 
@@ -281,7 +292,8 @@ reader は peer 側で走る (§4.13.1)。peer で走った reader の Ref は p
 harness の木 (§4.11) に足すもの:
 
 - `__layer_<i>` の新しい値 **`analysisset`**。set はノードで、親は batch
-  (または根 — set 単体の返り値ではノード 0)。
+  (または根 — set 単体の返り値ではノード 0)。これは運搬タグの名前であり、
+  AnalysisSet を4つ目の順序付きデータ層にするものではない。
 - インラインの役割メンバは set ノードの**子ノード** + **`__role_<i>`**
   (役割名の文字列)。木は木のまま — 「束縛であって包含ではない」は viewer 側
   のモデルの話で、運搬の木が先取りする必要は無い (着地の規則が §1.4)。
@@ -292,6 +304,13 @@ harness の木 (§4.11) に足すもの:
 - viewer は set ノードの meta に reader の spec を記録する (loader が origin
   の meta に `reader` を足している先例)。set の provenance の「計算者」欄
   (analysis-layers.md §8) はこれで埋まる。
+
+**現実装の境界 (#230 phase ④):** `Series([Frame(...), ...])` は正典でも
+Reader の木でも合法で、木の検査も series の frame 子を受け入れる。しかし現行
+viewer は着地後の series メンバ登録で `seqId` を持つ stack 子だけを拾い、
+standalone frame 子の `frameUid` を登録しないため、その frame は series から
+落ちる。phase ④ で `frameUid` と条件値を同じ順序で登録するまでは、Reader の
+frame-series が end-to-end で保存されるとは主張しない。
 
 **版**: set を含む stream / viewer-npz **だけ**が `__viewer 2` を名乗る。
 含まなければ 1 のまま — set の無いファイルの互換は1ミリも動かない。旧 viewer
@@ -412,9 +431,12 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
 2. terminology.md の操作マトリクスに AnalysisSet 列を足した (Close = 束縛の
    破棄・メンバ無傷、rename = 可・セッション保存、他は空欄)。§11 の適用
    パッケージと同じく、修正として明示的に。
-3. `tools/import/viewer_import.py` の docstring に AnalysisSet / Ref の所在
-   (本書) と未実装である事実を足した。`__all__` への型追加と README の型一覧
-   は実装と同時 (存在しない型を輸出可能と言わない)。
+3. `tools/import/viewer_import.py` は `AnalysisSet` / `Ref` を実装・公開し、
+   `run_adapter.py` は `analysisset` / `__role_<i>` / `__refs_<i>` と
+   `__viewer 2` を出力する。viewer と selftest も同じ契約を読む。
+4. **後続改訂 (2026-08-19, #230):** 5語を、3つの順序付きデータ層
+   (`frame ≼ stack ≼ series`) と、`managed-by` / `role-ref` の2関係へ再整理した。
+   2026-08-07時点の適用記録は上記のまま保持する。
 
 ## 9. 判断record (2026-08-07 確定 — もう「待ち」ではない)
 

@@ -31,10 +31,10 @@ Measure メニューは `description` をツールチップに出す
   逆に、誰も上げない定数は「違うのに一致」を作る。**上げ過ぎと上げなさすぎの
   両方が parity を壊す**、というのがこの欄の難しさである。
 - 粒度は**記述子ごと**(判断record 1)。同梱5本はいずれも
-  **`1.0.0`** —— これは「新しい」という主張ではなく、「初めて版を名乗った」
+  **`1.0.0`** —— これは「新しい」という主張ではなく、「version を初めて宣言した」
   という意味である。
-- 機械的な歯止めは `--bundled-selftest` の B4: 各 version を、それが名乗って
-  いる**キー/単位の契約と並べて**ピン留めしてある。キーや単位が動けば赤くなり、
+- 機械的な歯止めは `--bundled-selftest` の B4: 各 version を、その版が宣言して
+  いる**キー/単位の契約と並べて**固定してある。キーや単位が変わればテストが失敗し、
   version 行と同時に直せと言う。値の変化まではここでは掴めない(丸めは3つの
   コンパイラで一致しないので、可搬な期待値が書けない)ので、そちらは同 selftest
   の stdout を移行前後で diff する形で担保した。
@@ -78,7 +78,7 @@ Measure メニューは `description` をツールチップに出す
 (`AnalyzerPluginInfo::version`、[abi-v3.md §3.1/§11](abi-v3.md))。
 
 - Analysis パネルの provenance 行は末尾に
-  **`アナライザ名 <version> (ファイル名)`** を刻む。
+  **`アナライザ名 <version> (ファイル名)`** を表示する。
 - 行のホバー(ツールチップ)と Copy (TSV) / Export (CSV) の `# plugin:` 行は
   **`<version> フルパス`**。version 前置はパスに空白がありうるため
   (後置だとパスの一部と区別できない)。
@@ -131,11 +131,14 @@ Measure メニューは `description` をツールチップに出す
 ローパス除去をしないぶんシェーディングと絵柄を含みます。ここの `prnu_pct` は
 9×9 ボックスのローパスを引いた**残差**の σ/mean なので、同じ ROI でも一致しません。
 
-制約: **単一フレーム法のため prnu_pct は温度ノイズを含む**。EMVA 1288 厳密値には
-複数フレーム平均が必要(マルチフレーム ABI 導入後に `emva1288/` 系として実装予定)。
+制約: **このアナライザは単一フレーム法のため prnu_pct に時間ノイズを含む**。
+公開 ABI には現在 `psStackAnalyzerV3` があり、組み込みの Set Analysis には
+dark-referenced DSNU/PRNU の直接推定と分離フィットが実装済みである。ただし、
+それらを EMVA 1288 準拠値と呼ぶには参照規格との照合が残る。現行機能と残件は
+[flat-field-stats.md](../features/analysis/flat-field-stats.md) を正典とする。
 時間ノイズを下げたい場合は、Files で stack を右クリック > **Open frame average**
-(時間平均を1枚の frame として開く — [manual.md §5.2c](../guides/manual.md))に掛ける手が
-ある: σ_t が 1/√n に落ちる。dark 減算はしないので、EMVA 準拠を名乗るものではない。
+(時間平均を1枚の frame として開く — [manual.md §5.2c](../guides/manual.md))を使う方法が
+ある: σ_t は元の 1/√n になる。dark 減算はしないため、EMVA 準拠とは表記しない。
 CFA は Bayer=パリティ分離 / Quad=4px 周期サブサンプルで各チャンネル独立に処理。
 
 ## sharpness/gradient
@@ -170,5 +173,7 @@ CFA は Bayer=パリティ分離 / Quad=4px 周期サブサンプルで各チャ
 ## 予定
 
 - `iso14524/oecf` — グレーチャートのパッチ列 → OECF カーブ
-- `emva1288/*` — 複数フレームによる温度/固定パターン分離(analyze_seq 前提)
+- `emva1288/*` — 規格原文との式・前提条件の照合後に命名する候補。実装経路は
+  組み込み Set Analysis または現行 `psStackAnalyzerV3` であり、未定義の
+  `analyze_seq` を前提にしない
 - `iso19567/dead-leaves` — テクスチャ SFR

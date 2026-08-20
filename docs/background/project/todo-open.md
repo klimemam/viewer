@@ -118,6 +118,10 @@ A/B のフレーム追従 (`compareFollowFrame`) は **B の stack に A と同�
 ### 名前 (正典の語彙に合わせる)
 
 `docs/terminology.md` の層は frame ⊂ stack ⊂ series ⊂ batch。
+
+> **現行追記 (2026-08-19, #230):** 上はこの履歴記録を書いた時点の語彙である。
+> 現行正典の順序付きデータ層は `frame ≼ stack ≼ series`、batch は包含層ではなく
+> `managed-by` の管理単位である。
 既存の操作語は Close / ungroup / Move to batch / rename。
 新しいのは「**既存の stack から部分集合の stack を作る**」操作なので、
 `Derive stack...` / `Filter stack...` / `Rebuild stack...` あたり。

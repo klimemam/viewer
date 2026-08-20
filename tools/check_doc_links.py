@@ -31,6 +31,9 @@ EXC_END = "<!-- DOCS-PATH-EXCEPTIONS:END -->"
 
 MD_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 REPO_DOC_RE = re.compile(r"(?<![A-Za-z0-9_.-])(docs/[A-Za-z0-9_.\-/]+\.(?:md|csv|html))")
+BARE_DOC_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+\.(?:md|csv|html))(?![A-Za-z0-9_./-])"
+)
 SECTION_RE = re.compile(
     r"(?P<path>docs/[A-Za-z0-9_.\-/]+\.md)\s+(?:§|#)(?P<section>[0-9]+(?:\.[0-9]+)*)"
 )
@@ -337,6 +340,7 @@ def run_checks(root: Path, files: list[Path] | None = None) -> list[Problem]:
     portal = root / "docs" / "README.md"
     moves, exceptions, problems = _read_policy(portal)
     move_by_old = {m.old: m for m in moves}
+    move_by_old_basename = {PurePosixPath(m.old).name: m for m in moves}
 
     # The migration table is an executable contract, including absent stubs.
     for move in moves:
@@ -457,11 +461,16 @@ def run_checks(root: Path, files: list[Path] | None = None) -> list[Problem]:
             for row_no, row in enumerate(rows[1:], 2):
                 if len(row) < 4 or row[0].strip() == "対応済み":
                     continue
-                for ref in REPO_DOC_RE.findall(row[3]):
+                live_text = "\n".join(row[1:])
+                for ref in REPO_DOC_RE.findall(live_text):
                     if ref in move_by_old:
                         problems.append(Problem("BOARD_OLD_PATH", f"docs/tasks.csv:{row_no}", f"{ref} -> {move_by_old[ref].current}"))
                     elif ref not in existing and ref not in exceptions:
                         problems.append(Problem("BOARD_PATH_MISSING", f"docs/tasks.csv:{row_no}", ref))
+                for basename in BARE_DOC_RE.findall(live_text):
+                    move = move_by_old_basename.get(basename)
+                    if move is not None:
+                        problems.append(Problem("BOARD_OLD_PATH", f"docs/tasks.csv:{row_no}", f"{basename} -> {move.current}"))
         except csv.Error as exc:
             problems.append(Problem("BOARD_CSV", "docs/tasks.csv", str(exc)))
 
@@ -577,7 +586,11 @@ def selftest() -> int:
         (root / "ARCHITECTURE.md").write_text(old_path + "\n", encoding="utf-8")
         (root / "docs" / "tasks.csv").write_text(
             "分類,項目,内容,参照,実装ブランチ,備考\n"
-            f"進行中,case,case,{old_path},,\n",
+            f"進行中,reference,case,{old_path},,\n"
+            f"進行中,{PurePosixPath(old_path).name},case,{new_path},,\n"
+            f"進行中,content,{old_path},{new_path},,\n"
+            f"進行中,branch,case,{new_path},{PurePosixPath(old_path).name},\n"
+            f"進行中,note,case,{new_path},,{PurePosixPath(old_path).name}\n",
             encoding="utf-8",
         )
         bad_portal_link = "\n[bad old portal link](old.md)\n"
@@ -588,7 +601,8 @@ def selftest() -> int:
         rejected = {p.path for p in problems if p.code in {"OLD_PATH", "BOARD_OLD_PATH"}}
         required_rejections = {
             current_source, "README.md", "ARCHITECTURE.md",
-            "docs/tasks.csv:2",
+            "docs/tasks.csv:2", "docs/tasks.csv:3", "docs/tasks.csv:4",
+            "docs/tasks.csv:5", "docs/tasks.csv:6",
         }
         if not required_rejections.issubset(rejected):
             print("selftest case 2: current source escaped old-path gate", file=sys.stderr)
@@ -634,13 +648,15 @@ def selftest() -> int:
         )
         (root / "docs" / "tasks.csv").write_text(
             "分類,項目,内容,参照,実装ブランチ,備考\n"
-            f"対応済み,case,case,{old_path},,\n",
+            f"対応済み,{PurePosixPath(old_path).name},{old_path},{old_path},"
+            f"{PurePosixPath(old_path).name},{PurePosixPath(old_path).name}\n",
             encoding="utf-8",
         )
         problems = scan()
         historical_paths = {
             background_source,
             result_source,
+            "docs/tasks.csv",
             "docs/tasks.csv:2",
         }
         if any(p.path in historical_paths and

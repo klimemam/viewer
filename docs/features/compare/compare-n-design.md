@@ -1,6 +1,8 @@
 # compare-n 設計 — N 比較のあるべき姿 (#60 仕様)
 
-**状態: 仕様 (2026-08-13, issue #60 レビュー回答)。実装はしない。**
+**状態: 設計仕様（2026-08-13、issue #60 レビュー回答）。** A+6 の上限を含む
+未実装項目がある。現行コードへの実装状況は [compare-n.md](compare-n.md)
+§11〜§12 に分離して記録する。
 
 ## この文書の役割
 
@@ -22,8 +24,9 @@
 **A+6（合計7面）**へ切り下げる。
 理由と計数結果は§4に示す。それ以外の判断は、`compare-n.md`から引き継ぐ。
 
-前提とする正典: [terminology.md](../../terminology.md) (frame ⊂ stack ⊂ series ⊂
-batch、「compare (A/B): frame 対 frame。フレーム番号を保って stack 間比較」)、
+前提とする正典: [terminology.md](../../terminology.md)
+(`frame ≼ stack ≼ series` と batch の `managed-by`、「compare (A/B): frame 対
+frame。フレーム番号を保って stack 間比較」)、
 [ab-stats-plan.md](ab-stats-plan.md) (数値側の A/B 仕様)、
 [settings-inventory.md](../settings/settings-inventory.md) §4.1 (「数値の意味は、どこで・
 どうやって見せたかに依存してはならない」)。
