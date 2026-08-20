@@ -243,7 +243,20 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // unwritable. The design assigned this bit the value 2 when it expected to
 // arrive inside 12 (§4.2's MRF_READER); the VALUE is kept, because no byte of
 // it has ever been on a wire, and only the number that gates it moves.
-static const uint32_t VERSION = 14;
+//
+// 15: TYPED READER / CONTAINER AXES (issue #230 phase 4). A reader may declare
+// Frame/CHW or Stack/FCHW.  Before 15 a peer ignored that named metadata and
+// served the same bytes through its native rank/last-axis guess, so CHW could
+// come back as F frames and FCHW as FHWC.  NR_FCHW is appended, and a keyed
+// .npz request may now carry its declared reading.  The client refuses a typed
+// keyed request before sending it to an older peer; symmetrically, a current
+// peer refuses a typed RUN/cache before issuing key/header to a pre-15 client.
+// Returning no image is the only safe compatibility behaviour when the
+// alternative is real pixels under false axes. Safe canonical empty/native
+// requests retain their earlier wire. One narrow exception is an empty-layout
+// typed Stack(F,H,W) whose W <= 4: the old native guess calls it an HWC Frame,
+// so its layer declaration also requires 15.
+static const uint32_t VERSION = 15;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -512,6 +525,10 @@ enum MeasureTarget : uint32_t {
 //                         cache and is never a second way to name a file on its
 //                         disk, and a measurement that carried an origin path
 //                         beside a key would be a request with two subjects.
+// Protocol 15 appends [u32 read] to that keyed block when both peers are 15.
+// It is NR_NATIVE for reader caches (their typed header owns the axes), and the
+// declared keyed .npz reading otherwise, so MEASURE and TILE address the same
+// logical frames. No v14 parser sees the word: the client gates it on HELLO.
 struct MeasureReqHead {
     uint32_t op;                 // MeasureOp
     uint32_t frame0, frameCount; // range in a frame-axis file; frameCount 0 = all
@@ -909,7 +926,7 @@ inline std::string npyNotNativeText(const std::vector<int64_t>& shape) {
 // (§3.1) decides, and where it guessed wrong the user DECLARES a different
 // reading per file. The declaration used to exist only in this process, because
 // only the local decoder ever knew a file's shape; since protocol 9 it crosses
-// the wire (issue #124), which is what puts these four numbers and the axis
+// the wire (issue #124), which is what puts these append-only numbers and the axis
 // rule underneath them in the header BOTH binaries include.
 //
 // That placement is #71's lesson rather than tidiness. The "3|4" spelling
@@ -926,6 +943,10 @@ enum NpyRead : uint32_t {
     NR_STACK  = 1,   // leading axis is frames: (F,H,W) / (F,H,W,C)
     NR_HWC    = 2,   // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
     NR_CHW    = 3,   // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
+    // Container/reader-internal declaration.  It is not added to the loose
+    // .npy Inspector menu: a user re-read and a typed Stack are different
+    // boundaries even though both use the same decoder.
+    NR_FCHW   = 4,   // leading frames, planes first:      (F,C,H,W), C = 1..4
 };
 
 // Which axis is F/H/W/C under reading r, as indices into a shape of this rank.
@@ -941,6 +962,9 @@ inline bool npyReadAxes(size_t rank, int r, int& iF, int& iH, int& iW, int& iC) 
         return false;
     case NR_HWC: if (rank == 3) { iH = 0; iW = 1; iC = 2; return true; } return false;
     case NR_CHW: if (rank == 3) { iC = 0; iH = 1; iW = 2; return true; } return false;
+    case NR_FCHW:
+        if (rank == 4) { iF = 0; iC = 1; iH = 2; iW = 3; return true; }
+        return false;
     }
     return false;
 }
@@ -990,6 +1014,33 @@ inline std::string npyReReadTooOldText(int peerVersion) {
            " (update viewer-serve). Nothing was re-read - "
            "the peer would have returned the reading it chose itself, under the "
            "name of the one you asked for.";
+}
+
+// Protocol 15's typed boundary. `layout` is non-empty for CHW/FCHW; `kind`
+// also covers the one empty-layout Stack whose narrow W would make an older
+// peer's native rank heuristic choose HWC. In both cases this is emitted by
+// the client before META/TILE, never inferred from a peer error.
+inline std::string typedAxesTooOldText(int peerVersion, const std::string& name,
+                                       const std::string& kind) {
+    return name + ": the declared " + kind +
+           " axes cannot be sent to this remote peer - it speaks protocol " +
+           std::to_string(peerVersion) + ", and typed materialisation axes need 15 "
+           "(update viewer-serve). Nothing was fetched: an older peer would "
+           "return the same bytes under different axes.";
+}
+
+// The opposite seam: a current peer must not issue a typed Reader key/header
+// to a pre-15 client. Such a client ignores the layout in the header and asks
+// for native pixels, so serving typed pixels would put correct bytes under the
+// wrong axes just as surely as sending a typed request to an old peer.
+inline std::string typedAxesClientTooOldText(int clientVersion,
+                                             const std::string& kind) {
+    return "the declared " + kind +
+           " axes cannot be issued to this client - it speaks protocol " +
+           std::to_string(clientVersion) +
+           " and typed materialisation axes need 15 (update the viewer). "
+           "Nothing was issued: an older client would read the same bytes "
+           "under different axes.";
 }
 
 // The peer predates the picture formats (issue #148). The same discipline as

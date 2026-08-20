@@ -56,6 +56,51 @@ static std::vector<FileGroup> buildFileGroups(const std::vector<std::vector<int>
     return groups;
 }
 
+// Resolve a Series::Member to the ONE Files row that owns its identity. A
+// standalone frame cannot go through the seqId lookup: its seqId is zero, as
+// is every other loose frame's, so doing that repeats whichever loose frame
+// happens to be first and never reaches the member's uid.
+static const std::vector<int>* filesRowOfSeriesMember(
+        const FileGroup& group, const App::Series::Member& member) {
+    for (const auto* row : group.stacks) {
+        if (!row || row->empty()) continue;
+        const ImageDoc& head = *app.images[row->front()];
+        if (member.seqId != 0) {
+            if (head.seqId == member.seqId) return row;
+        } else if (head.seqId == 0 && head.uid == member.frameUid) {
+            return row;
+        }
+    }
+    return nullptr;
+}
+
+// Resolve one member to the image row that navigation should select. Series
+// roles use the first live member in declaration order; a standalone frame is
+// identified by frameUid, never by framesOfSeq(0) (which denotes loose rows).
+static int filesImageIndexOfSeriesMember(const App::Series::Member& member) {
+    if (member.seqId != 0) {
+        std::vector<int> frames = framesOfSeq(member.seqId);
+        return frames.empty() ? -1 : frames.front();
+    }
+    if (member.frameUid != 0)
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == member.frameUid) return i;
+    return -1;
+}
+
+static int filesImageIndexOfSeries(const App::Series& series) {
+    for (const auto& member : series.members) {
+        const int imageIdx = filesImageIndexOfSeriesMember(member);
+        if (imageIdx >= 0) return imageIdx;
+    }
+    return -1;
+}
+
+static bool filesRowBelongsToSeries(const ImageDoc& head) {
+    return head.seqId != 0 ? seriesOfStack(head.seqId) != nullptr
+                           : seriesOfFrame(head.uid) != nullptr;
+}
+
 // What letters each Files row carried on the last draw, "name=letters;" per
 // badged row. The panel is OpenGL this machine cannot screenshot, so the
 // letters are asserted as state (--abstats-selftest S4), like g_tilePanesDrawn.
@@ -200,6 +245,19 @@ static std::string filesMemberName(const std::string& name) {
     for (size_t i = c + 1; i < name.size(); i++)
         if (name[i] < '0' || name[i] > '9') return name;
     return name.substr(0, c);
+}
+
+// The visible lead shared by stack and standalone-frame member rows. Keeping
+// this in one function makes the member's [order] / condition / name contract
+// independent of which physical layer supplies the row.
+static std::string filesSeriesMemberLead(const App::Series& S,
+                                         const App::Series::Member& member,
+                                         int memberIndex,
+                                         const std::string& name) {
+    std::string value = conditionText(S, member.value);
+    if (std::isfinite(member.value) && S.unit[0]) value += " " + std::string(S.unit);
+    return "[" + std::to_string(memberIndex) + "]  " + value + "  " +
+           filesMemberName(name);
 }
 
 // ---- what the Files panel holds at the top while it scrolls ------------------
@@ -517,7 +575,7 @@ static void drawFileList() {
                           : IM_COL32(255, 184, 90, 255), smeta);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("series (系列): %d stack(s) of one swept %s\n\n"
+            ImGui::SetTooltip("series (系列): %d member(s) of one swept %s\n\n"
                               "(right-click: rename, edit, move, ungroup, close)",
                               (int)S.members.size(),
                               S.paramName.empty() ? "parameter" : S.paramName.c_str());
@@ -542,8 +600,8 @@ static void drawFileList() {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::Separator();
-            {   // the SERIES moves - every member with it, so that
-                // series ⊂ batch never stops being true on the way
+            {   // the SERIES moves - every member with it, so that its
+                // same-batch invariant never stops being true on the way
                 int t = moveToBatchMenu(S.batchId);
                 if (t) { pendingSerMove = S.id; pendingSerMoveTo = t; }
                 ImGui::TextDisabled("   (all %d member(s) move with it)",
@@ -552,15 +610,16 @@ static void drawFileList() {
             ImGui::Separator();
             // Two DIFFERENT operations, spelled out rather than one word
             // with a modifier: one keeps the data, the other destroys it.
-            if (ImGui::MenuItem("Ungroup (keep the stacks)")) pendingSerUngroup = S.id;
+            if (ImGui::MenuItem("Ungroup (keep the members)")) pendingSerUngroup = S.id;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Removes the series only. All %d stack(s) stay open,\n"
+                ImGui::SetTooltip("Removes the series only. All %d member(s) stay open,\n"
                                   "exactly where they are - they just stop being a sweep.",
                                   (int)S.members.size());
-            if (ImGui::MenuItem("Close series (discard its stacks)"))
+            if (ImGui::MenuItem("Close series (discard its members)"))
                 pendingSerClose = S.id;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Closes the %d stack(s) in it, every frame with them.",
+                ImGui::SetTooltip("Closes all %d member(s): each standalone frame, and\n"
+                                  "every frame of each stack.",
                                   (int)S.members.size());
             ImGui::EndPopup();
         }
@@ -741,8 +800,8 @@ static void drawFileList() {
         };
         // One row. mem != nullptr means the row is being drawn INSIDE a series
         // node: it is indented by the node and the member's VALUE leads the
-        // label. Everything else about the row is identical - a member is not
-        // a different kind of stack, it is a stack that is also in a sweep.
+        // label. Everything else about its physical layer stays identical: a
+        // stack remains a stack and a standalone frame remains a frame.
         auto drawStackRow = [&](const std::vector<int>& stack, const App::Series* ser,
                                 const App::Series::Member* mem, int memIdx) {
           const ImageDoc& head = *app.images[stack.front()];
@@ -782,8 +841,15 @@ static void drawFileList() {
                                 : avgIsStale(&head) ? "   (stale)"
                                 : head.avgGenChanged ? "   (recomputed from newer files)"
                                 : "";
-            snprintf(lb, 512, "%*s%s%s##%d", (int)std::max<size_t>(badge.size() * 2, 2),
-                     "", head.name.c_str(), genMark, i);
+            if (mem && ser) {
+                std::string lead = filesSeriesMemberLead(*ser, *mem, memIdx, head.name);
+                snprintf(lb, 512, "%*s%s%s##mf%llu", (int)(badge.size() * 2), "",
+                         lead.c_str(), genMark, (unsigned long long)head.uid);
+            } else {
+                snprintf(lb, 512, "%*s%s%s##%d",
+                         (int)std::max<size_t>(badge.size() * 2, 2),
+                         "", head.name.c_str(), genMark, i);
+            }
             std::string share;                 // §4: this frame's pixels, elsewhere
             {
                 auto sh = srcOwners.find(head.src->srcId);
@@ -810,8 +876,9 @@ static void drawFileList() {
                 selectImage(i);
                 if (app.fitOnSwitch) app.fitRequested = true;
             }
-            // a standalone frame hangs off the batch directly, so it gets the
-            // move menu itself (stacks move via seqctx below)
+            // A standalone frame gets the move menu itself, whether it hangs
+            // directly off the batch or appears as a series member (stacks
+            // move via seqctx below).
             if (ImGui::BeginPopupContextItem("imgctx")) {
                 if (compareBItem(app.images[i].get())) ImGui::Separator();
                 // a second, independent viewer on this frame (item 28)
@@ -917,16 +984,9 @@ static void drawFileList() {
               // does not reset its widget state. It does NOT protect the text:
               // ImGui cuts a label at the FIRST "##", so a stack the user
               // renames to "a##b" renders as "a" in either shape of row.
-              char vb[64];
-              {
-                  std::string vs = conditionText(*ser, mem->value);
-                  if (std::isfinite(mem->value) && ser->unit[0])
-                      snprintf(vb, sizeof vb, "%s %s", vs.c_str(), ser->unit);
-                  else
-                      snprintf(vb, sizeof vb, "%s", vs.c_str());
-              }
-              snprintf(lb, sizeof lb, "%*s[%d]  %s  %s%s##m%d", (int)(badge.size() * 2), "",
-                       memIdx, vb, filesMemberName(sname).c_str(), rmark, head.seqId);
+              std::string lead = filesSeriesMemberLead(*ser, *mem, memIdx, sname);
+              snprintf(lb, sizeof lb, "%*s%s%s##m%d", (int)(badge.size() * 2), "",
+                       lead.c_str(), rmark, head.seqId);
           } else {
               snprintf(lb, sizeof lb, "%*s%s%s", (int)std::max<size_t>(badge.size() * 2, 2),
                        "", sname, rmark);
@@ -1159,7 +1219,7 @@ static void drawFileList() {
                                   "frame by frame. Frames are SHARED by reference (no\n"
                                   "pixel copy); this stack keeps every frame it has.");
             ImGui::Separator();
-            {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
+            {   // the STACK moves whole; its frames never split across batches
                 if (const App::Series* mine = seriesOfStack(si->id))
                     ImGui::TextDisabled("in series \"%s\": moving it alone leaves it",
                                         mine->name.c_str());
@@ -1295,16 +1355,9 @@ static void drawFileList() {
           // lives at the bottom of the Image View now, where the frames are.
           ImGui::PopID();
         };
-        // The stack of one seqId, out of this batch's cached list (members are
-        // named by seqId; the panel walks by stack).
-        auto stackOfSeq = [&](int seqId) -> const std::vector<int>* {
-            for (const auto* sp : group.stacks)
-                if (app.images[sp->front()]->seqId == seqId) return sp;
-            return nullptr;
-        };
         // ---- the batch's series come FIRST, each with its members inside -----
-        // Non-member stacks keep their place and their indentation below: a
-        // sweep appearing must not push everything else down a level.
+        // Non-member stacks and frames keep their place and indentation below:
+        // a sweep appearing must not push everything else down a level.
         for (const auto& S : app.series) {
             if (S.batchId != group.batch) continue;
             float sy0 = ImGui::GetCursorPos().y;
@@ -1315,7 +1368,8 @@ static void drawFileList() {
                 // memIdx is the member's place in the series, and it is the
                 // row's leading column - see the label built in drawStackRow.
                 for (int mi = 0; mi < (int)S.members.size(); mi++)
-                    if (const std::vector<int>* sp = stackOfSeq(S.members[mi].seqId))
+                    if (const std::vector<int>* sp =
+                            filesRowOfSeriesMember(group, S.members[mi]))
                         drawStackRow(*sp, &S, &S.members[mi], mi);
                 ImGui::TreePop();
             }
@@ -1399,9 +1453,8 @@ static void drawFileList() {
                                 } else if (r.seriesId != 0) {
                                     for (const auto& s2 : app.series)
                                         if (s2.id == r.seriesId && !s2.members.empty()) {
-                                            std::vector<int> fr =
-                                                framesOfSeq(s2.members.front().seqId);
-                                            if (!fr.empty()) jump = fr.front();
+                                            jump = filesImageIndexOfSeries(s2);
+                                            break;
                                         }
                                 }
                                 if (jump >= 0) {
@@ -1423,7 +1476,7 @@ static void drawFileList() {
         // ---- then everything this batch holds that is NOT in a series -------
         for (const auto& stackPtr : group.stacks) {
             const ImageDoc& head = *app.images[stackPtr->front()];
-            if (head.seqId != 0 && seriesOfStack(head.seqId)) continue;   // drawn above
+            if (filesRowBelongsToSeries(head)) continue;  // already drawn above
             drawStackRow(*stackPtr, nullptr, nullptr, -1);
         }
       }

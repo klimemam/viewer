@@ -2592,15 +2592,15 @@ static std::string loadSession(const std::string& path) {
         else if (key == "npyread") {              // §3.3, applies to the next image line
             int r = NR_NATIVE;
             ls >> r;
-            pendingRead = (r >= NR_NATIVE && r <= NR_CHW) ? r : NR_NATIVE;
+            pendingRead = (r >= NR_NATIVE && r <= NR_FCHW) ? r : NR_NATIVE;
         }
         else if (key == "selann") ls >> selAnnIndex;
         else if (key == "imgbatch") {   // batch of the image above, by name
             std::string nm = restOfLine(ls);
             if (!nm.empty() && lastImageOk && cur()) {
                 int bid = batchReuse(nm);
-                // frame ⊂ stack ⊂ batch: a stack the FILE carries is already
-                // whole here (loadNpy/loadNpz/the container build it in one
+                // A stack the file carries is already wholly managed by one
+                // batch here (loadNpy/loadNpz/the container build it in one
                 // call), and assigning cur() alone moved its representative
                 // frame out on its own - the exact thing moveStackToBatch
                 // exists to prevent. "close batch" then closed the whole stack

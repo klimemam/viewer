@@ -117,6 +117,40 @@
                   "    a = np.load(path).reshape(3, 8, 6)\n"
                   "    return AnalysisSet({'dark': Stack(np.ascontiguousarray(a)),\n"
                   "                        'flat': Stack(np.ascontiguousarray(a))})\n");
+        // Phase 4's complete boundary in one return value: transposed Frame and
+        // Stack children in a MIXED Series. Values are axis-coded so an HWC
+        // memcpy wearing a CHW/FCHW header cannot accidentally pass parity.
+        const std::string rdTyped = root + "/typed.py";
+        writeText(rdTyped,
+                  "import numpy as np\n"
+                  "from viewer_import import Frame, Series, Stack, Values\n"
+                  "VERSION = 1\n"
+                  "def load(path):\n"
+                  "    f = (100 + np.arange(3*2*4, dtype=np.uint16)).reshape(3,2,4)\n"
+                  "    s = (1000 + np.arange(2*2*2*3, dtype=np.uint16)).reshape(2,2,2,3)\n"
+                  "    one = (2000 + np.arange(1*2*2*3, dtype=np.uint16)).reshape(1,2,2,3)\n"
+                  "    return Series([Frame(f, layout='CHW', name='colour'),\n"
+                  "                   Stack(s, layout='FCHW', name='burst'),\n"
+                  "                   Stack(one, layout='FCHW', name='singleton')],\n"
+                  "                  conditions=Values([1.25, 9.5, 11.0], 'exposure', 'ms'),\n"
+                  "                  name='mixed typed')\n");
+        // Blank-layout typed Stack whose last axis is <=4. Native shape
+        // inference calls this one HWC Frame, so its layer declaration itself
+        // is protocol-15 evidence even though no named layout is present.
+        const std::string rdNarrowA = root + "/narrow_a.py";
+        const std::string rdNarrowB = root + "/narrow_b.py";
+        auto writeNarrow = [&](const std::string& path, int base, const char* name) {
+            writeText(path,
+                      "import numpy as np\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    a = (" + std::to_string(base) +
+                      " + np.arange(2*2002*4, dtype=np.uint16)).reshape(2,2002,4)\n"
+                      "    return Stack(a, name='" + std::string(name) + "')\n");
+        };
+        writeNarrow(rdNarrowA, 300, "narrow-a");
+        writeNarrow(rdNarrowB, 40000, "narrow-b");
 
         const std::string exe = app.remoteExe.empty() ? app.exePath : app.remoteExe;
         const std::string url = "local://" + origin;
@@ -166,7 +200,7 @@
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "R1a the peer speaks the protocol this build does (14)");
+                  "R1a the peer speaks the protocol this build does (15)");
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);
@@ -251,19 +285,21 @@
                       "R6e a failed run leaves no .vstream materialisation behind");
             }
 
-            {   // ---- R7: what the reader returned is checked with the LOCAL
-                //          door's own sentence (§5.2, one shared TU) ------------
+            {   // ---- R7: Python rejects an impossible typed object before it
+                //          can become a misleading carrier ---------------------
                 std::string wf[3] = { std::string(), files[1], files[2] };
                 check(slurp(rdWideCh, wf[0]), "R7a (setup) the 6-channel reader is readable");
                 remote::ReaderRun wide;
                 std::string e4;
                 const bool got = ses.readerRun(origin, "load", wf, wide, e4);
-                const std::string both =
-                    rp::npyChannelCeilingText({ 2, 4, 3, 6 }, 6);
-                check(got && wide.outcome == rp::RO_UNREADABLE,
-                      "R7b a shape this viewer cannot show is outcome 6, not a traceback");
-                check(got && wide.err == both,
-                      "R7c ...and the peer's sentence IS the local door's, character for character");
+                const std::string direct =
+                    "Stack: layout \"FHWC\" reads C=6 from shape (2, 4, 3, 6) -- "
+                    "the viewer accepts C=1..4";
+                check(got && wide.outcome == rp::RO_EXITED &&
+                          wide.err == "the reader exited with status 2",
+                      "R7b typed C>4 is rejected by the carried Python boundary");
+                check(got && has(wide.stderrText, direct),
+                      "R7c ...with the declared layer/layout/shape and C=1..4 ceiling");
             }
             ses.stop();
         }
@@ -362,10 +398,85 @@
             FrameSource st;
             const std::string lerr = loadViewerStream(path, "x.py:load", origin, st);
             check(!got, "R7d a rank-5 node is refused by the peer");
-            check(perr == rp::npyNotNativeText({ 2, 2, 3, 4, 5 }),
+            const std::string rank5Err =
+                "node 0: " + rp::npyNotNativeText({ 2, 2, 3, 4, 5 });
+            check(perr == rank5Err,
                   "R7e ...with §3.2's sentence");
-            check(!lerr.empty() && has(lerr, rp::npyNotNativeText({ 2, 2, 3, 4, 5 })),
+            check(lerr == rank5Err,
                   "R7f ...and the local door refuses the same bytes with the same sentence");
+
+            // Construction normally catches this one (R7b/c). A hand-written
+            // old carrier proves the C++ materialiser independently enforces
+            // the same C=1..4 boundary rather than trusting its producer.
+            const std::string wideKey = "deadbeefdeadbee1";
+            const std::string widePath = cacheDir + "/" + wideKey + ".vstream";
+            std::string wideHdr = "VIEWERSTREAM 1\nn 1\nlayer 0 stack\nparent 0 -1\n"
+                                  "pixels 0 u2 4 2 4 3 6 288\nend\n";
+            {
+                std::ofstream f(pathFromUtf8(widePath), std::ios::binary);
+                f.write(wideHdr.data(), (std::streamsize)wideHdr.size());
+                std::vector<uint8_t> zero(288, 0);
+                f.write((const char*)zero.data(), 288);
+            }
+            remote::KeyedRef wideRef{ wideKey, 0 };
+            std::string widePeerErr;
+            FrameSource wideStat;
+            const bool wideGot = ses.meta(url, m, widePeerErr, 0, nullptr, &wideRef);
+            const std::string wideLocalErr =
+                loadViewerStream(widePath, "x.py:load", origin, wideStat);
+            const std::string wideWant =
+                "node 0: " + rp::npyChannelCeilingText({ 2, 4, 3, 6 }, 6);
+            check(!wideGot && widePeerErr == wideWant && wideLocalErr == wideWant,
+                  "R7f2 a hand-written C>4 carrier is refused identically by both C++ doors");
+
+            // Whole-declaration preflight. Missing and duplicate pixels lines
+            // used to be worse than a plain refusal: the client could choose
+            // the last duplicate while the peer chose the first, and a later
+            // missing node could be discovered after an earlier doc landed.
+            auto writeBadCarrier = [&](const std::string& p, const std::string& h,
+                                       size_t bytes) {
+                std::ofstream f(pathFromUtf8(p), std::ios::binary);
+                f.write(h.data(), (std::streamsize)h.size());
+                std::vector<uint8_t> zero(bytes, 0);
+                f.write((const char*)zero.data(), (std::streamsize)zero.size());
+            };
+            const std::string missingKey = "deadbeefdeadbee2";
+            const std::string missingPath = cacheDir + "/" + missingKey + ".vstream";
+            writeBadCarrier(missingPath,
+                "VIEWERSTREAM 1\nn 3\nlayer 0 batch\nparent 0 -1\n"
+                "layer 1 frame\nparent 1 0\npixels 1 u2 2 2 2 8\n"
+                "layer 2 frame\nparent 2 0\nend\n", 8);
+            remote::KeyedRef missingRef{ missingKey, 1 };
+            std::string missingPeer;
+            const bool missingGot = ses.meta(url, m, missingPeer, 0, nullptr, &missingRef);
+            closeAll();
+            FrameSource missingStat;
+            const std::string missingLocal =
+                loadViewerStream(missingPath, "x.py:load", origin, missingStat);
+            const std::string missingWant =
+                "node 2 is a frame with 0 pixels declaration(s): exactly one is required";
+            check(!missingGot && missingPeer == missingWant &&
+                      missingLocal == missingWant && app.images.empty(),
+                  "R7h a missing pixels node is refused whole and identically before any doc");
+
+            const std::string duplicateKey = "deadbeefdeadbee3";
+            const std::string duplicatePath = cacheDir + "/" + duplicateKey + ".vstream";
+            writeBadCarrier(duplicatePath,
+                "VIEWERSTREAM 1\nn 1\nlayer 0 frame\nparent 0 -1\n"
+                "pixels 0 u2 2 2 2 8\npixels 0 u2 2 2 2 8\nend\n", 16);
+            remote::KeyedRef duplicateRef{ duplicateKey, 0 };
+            std::string duplicatePeer;
+            const bool duplicateGot =
+                ses.meta(url, m, duplicatePeer, 0, nullptr, &duplicateRef);
+            closeAll();
+            FrameSource duplicateStat;
+            const std::string duplicateLocal =
+                loadViewerStream(duplicatePath, "x.py:load", origin, duplicateStat);
+            const std::string duplicateWant =
+                "node 0 is a frame with 2 pixels declaration(s): exactly one is required";
+            check(!duplicateGot && duplicatePeer == duplicateWant &&
+                      duplicateLocal == duplicateWant && app.images.empty(),
+                  "R7i duplicate pixels are refused whole, never first/last by endpoint");
             // A key that names nothing is a refusal too, and not a crash.
             remote::KeyedRef gone{ "0000000000000000", 0 };
             std::string gerr;
@@ -376,6 +487,9 @@
                   "R7g a key the peer has never issued is refused by name");
             ses.stop();
             std::filesystem::remove(pathFromUtf8(path), ec);
+            std::filesystem::remove(pathFromUtf8(widePath), ec);
+            std::filesystem::remove(pathFromUtf8(missingPath), ec);
+            std::filesystem::remove(pathFromUtf8(duplicatePath), ec);
         }
 
         // ---- stage 2: a document, over the link, out of what a reader made ----
@@ -499,6 +613,417 @@
             check(!offGot && has(bad, "node 99") && has(bad, "no pixels"),
                   "R13d ...and node 99 is refused BY NUMBER, never clamped onto one");
             ses.stop();
+        }
+
+        {   // ---- R21: typed axes + mixed Series, both carriers + session ------
+            closeAll();
+            const std::string spec = rdTyped + ":load";
+            const std::string rerr = openRemoteWithReader(url, spec);
+            check(rerr.empty() && app.images.size() == 4,
+                  "R21a CHW/FCHW Reader output opens as Frame + 2-frame + singleton Stack");
+            bool rShape = app.images.size() == 4 &&
+                          app.images[0]->w == 4 && app.images[0]->h == 2 && app.images[0]->ch == 3 &&
+                          app.images[1]->w == 3 && app.images[1]->h == 2 && app.images[1]->ch == 2 &&
+                          app.images[2]->w == 3 && app.images[2]->h == 2 && app.images[2]->ch == 2 &&
+                          app.images[3]->w == 3 && app.images[3]->h == 2 && app.images[3]->ch == 2;
+            check(rShape, "R21b ...with Frame=CHW and Stack=FCHW axes, never native guesses");
+            bool rPixels = rShape && app.images[0]->src->data.size() >= 4 &&
+                           app.images[0]->src->data[0] == 100 &&
+                           app.images[0]->src->data[1] == 108 &&
+                           app.images[0]->src->data[2] == 116 &&
+                           app.images[0]->src->data[3] == 101 &&
+                           app.images[1]->src->data[0] == 1000 &&
+                           app.images[1]->src->data[1] == 1006 &&
+                           app.images[2]->src->data[0] == 1012 &&
+                           app.images[2]->src->data[1] == 1018 &&
+                           app.images[3]->src->data[0] == 2000 &&
+                           app.images[3]->src->data[1] == 2006;
+            check(rPixels, "R21c ...and transposition puts each channel/sample at the declared pixel");
+            bool rMembers = app.series.size() == 1 && app.series[0].members.size() == 3 &&
+                            app.series[0].members[0].seqId == 0 &&
+                            app.series[0].members[0].frameUid == app.images[0]->uid &&
+                            app.series[0].members[1].seqId == app.images[1]->seqId &&
+                            app.series[0].members[1].frameUid == 0 &&
+                            app.series[0].members[2].seqId == app.images[3]->seqId &&
+                            app.series[0].members[2].frameUid == 0 &&
+                            app.images[3]->seqId != 0 &&
+                            app.images[3]->seqId != app.images[1]->seqId &&
+                            app.series[0].members[0].value == 1.25 &&
+                            app.series[0].members[1].value == 9.5 &&
+                            app.series[0].members[2].value == 11.0;
+            check(rMembers, "R21d mixed Series keeps Frame and singleton/multi Stack kinds in order");
+            bool rBoundary = app.images.size() == 4 &&
+                             app.images[0]->src->npyRead == NR_CHW &&
+                             app.images[0]->src->remoteKeyRead == NR_NATIVE &&
+                            app.images[0]->src->remoteKeyLayout == "CHW" &&
+                             app.images[0]->src->remoteKeyRequires15 &&
+                             app.images[1]->src->npyRead == NR_FCHW &&
+                             app.images[1]->src->remoteKeyRead == NR_NATIVE &&
+                             app.images[1]->src->remoteKeyLayout == "FCHW" &&
+                             app.images[1]->src->remoteKeyRequires15 &&
+                             app.images[3]->src->npyRead == NR_FCHW &&
+                             app.images[3]->src->remoteKeyRead == NR_NATIVE &&
+                             app.images[3]->src->remoteKeyLayout == "FCHW" &&
+                             app.images[3]->src->remoteKeyRequires15;
+            check(rBoundary,
+                  "R21e logical axes survive beside a Reader's native wire reading");
+            bool rNoReRead = app.images.size() == 4;
+            for (const auto& d : app.images)
+                rNoReRead = rNoReRead && !npyReReadAvailable(*d->src) &&
+                            !d->src->npyShape.empty();
+            check(rNoReRead,
+                  "R21e2 typed Reader shows its read-as fact without a re-read affordance");
+
+            std::vector<std::vector<float>> remotePixels;
+            std::vector<std::tuple<int,int,int>> remoteDims;
+            for (const auto& d : app.images) {
+                remotePixels.push_back(d->src->data);
+                remoteDims.emplace_back(d->w, d->h, d->ch);
+            }
+            // Save while these are still REMOTE sources. A restored reader
+            // reconnects, so this is where losing layout/wire separation would
+            // either turn identity native or let a later v14 peer serve it.
+            const std::string sess = root + "/typed-mixed.vsession";
+            { std::ofstream f(pathFromUtf8(sess), std::ios::binary); writeSessionTo(f); }
+            std::ifstream sf(pathFromUtf8(sess), std::ios::binary);
+            const std::string body((std::istreambuf_iterator<char>(sf)),
+                                   std::istreambuf_iterator<char>());
+            const size_t frameLine = body.find("seriesframe 1.25");
+            const size_t stackLine = body.find("seriesmember 9.5");
+            const size_t singletonLine = body.find("seriesmember 11");
+            check(frameLine != std::string::npos && stackLine != std::string::npos &&
+                      singletonLine != std::string::npos && frameLine < stackLine &&
+                      stackLine < singletonLine &&
+                      body.find("npyread " + std::to_string((int)NR_CHW)) != std::string::npos &&
+                      body.find("npyread " + std::to_string((int)NR_FCHW)) != std::string::npos,
+                  "R21f session writes mixed members and both logical typed readings");
+            closeAll();
+            const std::string sr = loadSession(sess);
+            bool restored = sr.empty() && app.series.size() == 1 &&
+                            app.series[0].members.size() == 3 &&
+                            app.series[0].members[0].seqId == 0 &&
+                            app.series[0].members[0].frameUid != 0 &&
+                            app.series[0].members[1].seqId != 0 &&
+                            app.series[0].members[1].frameUid == 0 &&
+                            app.series[0].members[2].seqId != 0 &&
+                            app.series[0].members[2].frameUid == 0 &&
+                            app.series[0].members[0].value == 1.25 &&
+                            app.series[0].members[1].value == 9.5 &&
+                            app.series[0].members[2].value == 11.0 &&
+                            app.images.size() == 4 &&
+                            app.images[0]->src->npyRead == NR_CHW &&
+                            app.images[0]->src->remoteKeyRead == NR_NATIVE &&
+                             app.images[0]->src->remoteKeyLayout == "CHW" &&
+                            app.images[0]->src->remoteKeyRequires15 &&
+                            app.images[1]->src->npyRead == NR_FCHW &&
+                            app.images[1]->src->remoteKeyRead == NR_NATIVE &&
+                            app.images[1]->src->remoteKeyLayout == "FCHW" &&
+                            app.images[1]->src->remoteKeyRequires15 &&
+                            app.images[3]->seqId == app.series[0].members[2].seqId &&
+                            app.images[3]->src->npyRead == NR_FCHW &&
+                            app.images[3]->src->remoteKeyRead == NR_NATIVE &&
+                            app.images[3]->src->remoteKeyLayout == "FCHW" &&
+                            app.images[3]->src->remoteKeyRequires15;
+            check(restored,
+                  "R21g remote session restores membership, logical identity and wire layout");
+            closeAll();
+
+            const std::string lerr = openWithReader(origin, spec, false);
+            bool parity = lerr.empty() && app.images.size() == remotePixels.size();
+            for (size_t i = 0; i < app.images.size() && parity; i++)
+                parity = std::make_tuple(app.images[i]->w, app.images[i]->h, app.images[i]->ch) ==
+                             remoteDims[i] && app.images[i]->src->data == remotePixels[i] &&
+                         !npyReReadAvailable(*app.images[i]->src) &&
+                         !app.images[i]->src->npyShape.empty();
+            check(parity, "R21h local stream and remote stream are dimension/pixel identical");
+            closeAll();
+
+            std::string tf[3] = { std::string(), files[1], files[2] };
+            check(slurp(rdTyped, tf[0]), "R21i (setup) the typed reader is readable");
+            std::string oldFiles[3] = { tf[0], tf[1], tf[2] };
+            auto replaceOnce = [](std::string& s, const std::string& a,
+                                  const std::string& b) {
+                const size_t p = s.find(a);
+                if (p == std::string::npos) return false;
+                s.replace(p, a.size(), b);
+                return true;
+            };
+            const bool oldHarness =
+                replaceOnce(oldFiles[2], "CONTAINER_VERSION = 3", "CONTAINER_VERSION = 1") &&
+                replaceOnce(oldFiles[2], "STREAM_VERSION = 3", "STREAM_VERSION = 1");
+            oldFiles[0] += "\n# distinct old-client compatibility run\n";
+            check(oldHarness, "R21k (setup) the v14 client harness seam is a v1 writer");
+
+            // Carrier and wire generations are distinct. A historical v14
+            // peer reads carriers through v2, so today's unconditional v3
+            // writer is refused whole before it can issue a key. With the v1
+            // harness that actually shipped in that generation, canonical
+            // pixels still work and only typed axes require protocol 15.
+            setEnv("VIEWER_SERVE_PROTOCOL", "14");
+            remote::Session old;
+            if (!openSession(old, true)) return 1;
+            remote::ReaderRun currentOnOld;
+            std::string currentOldErr;
+            const bool currentOldSent =
+                old.readerRun(origin, "load", tf, currentOnOld, currentOldErr);
+            check(currentOldSent && currentOnOld.outcome == rp::RO_UNREADABLE &&
+                      currentOnOld.key.empty() && currentOnOld.header.empty() &&
+                      currentOnOld.err == vns::versionError(3, 2),
+                  "R21j current v3 Reader carrier is refused whole by a v14 peer");
+
+            std::string oldPeerFiles[3] = { oldFiles[0], oldFiles[1], oldFiles[2] };
+            oldPeerFiles[0] += "\n# distinct old-peer typed compatibility run\n";
+            remote::ReaderRun run;
+            std::string oe;
+            const bool ran = old.readerRun(origin, "load", oldPeerFiles, run, oe);
+            remote::KeyedRef ref{ run.key, 1, remote::KeyedRef::FromReader };
+            ref.layout = "CHW";
+            ref.requires15 = true;
+            remote::Meta mm;
+            std::string ge;
+            const bool fetched = ran && run.outcome == rp::RO_OK &&
+                                 old.meta(url, mm, ge, NR_NATIVE, nullptr, &ref);
+            check(ran && run.outcome == rp::RO_OK && !fetched &&
+                      ge == rp::typedAxesTooOldText(14, url, "Reader CHW"),
+                  "R21j2 a typed v1 carrier reaches the v14 wire gate before META/TILE");
+
+            std::string safeOldFiles[3] = { files[0], oldFiles[1], oldFiles[2] };
+            safeOldFiles[0] += "\n# distinct old-peer canonical compatibility run\n";
+            remote::ReaderRun safeOldRun;
+            std::string safeOldErr;
+            const bool safeOldSent =
+                old.readerRun(origin, "load", safeOldFiles, safeOldRun, safeOldErr);
+            remote::KeyedRef safeOldRef{
+                safeOldRun.key, 0, remote::KeyedRef::FromReader };
+            remote::Meta safeOldMeta;
+            std::string safeOldMetaErr;
+            const bool safeOldFetched = safeOldSent &&
+                safeOldRun.outcome == rp::RO_OK &&
+                old.meta(url, safeOldMeta, safeOldMetaErr, NR_NATIVE, nullptr, &safeOldRef);
+            check(safeOldFetched && safeOldMeta.frames == 3 &&
+                      safeOldMeta.h == 8 && safeOldMeta.w == 6 && safeOldMeta.ch == 1,
+                  "R21j3 a canonical v1 Reader carrier remains usable on a v14 peer");
+            old.stop();
+            setEnv("VIEWER_SERVE_PROTOCOL", "");
+
+            // The reverse seam matters too: a current peer must not hand a
+            // typed header/key to a v14 CLIENT, which would ignore layout and
+            // ask for native pixels. Use the v1 carrier an actual v14 client
+            // shipped, not today's v3 writer wearing an old HELLO.
+
+            // Seed a valid canonical under the exact same hash with a v15
+            // client. The old-client refusal must not classify/delete it.
+            remote::Session seed;
+            if (!openSession(seed, true)) return 1;
+            remote::ReaderRun seeded;
+            std::string seedErr;
+            const bool seedSent = seed.readerRun(origin, "load", oldFiles, seeded, seedErr);
+            const std::string seededPath = cacheDir + "/" + seeded.key + ".vstream";
+            check(seedSent && seeded.outcome == rp::RO_OK && !seeded.key.empty() &&
+                      std::filesystem::exists(pathFromUtf8(seededPath), ec),
+                  "R21l a v15 client first publishes the typed v1 carrier canonical");
+            closeAll();
+            const std::string v1Land = seedSent && seeded.outcome == rp::RO_OK
+                                         ? remoteReaderLand(url, spec, std::string(), seeded)
+                                         : std::string("v1 seed did not run");
+            const bool v1Pixels = v1Land.empty() && app.images.size() == 4 &&
+                                  app.images[0]->w == 4 && app.images[0]->h == 2 &&
+                                  app.images[0]->ch == 3 &&
+                                  app.images[0]->src->data.size() >= 3 &&
+                                  app.images[0]->src->data[0] == 100 &&
+                                  app.images[0]->src->data[1] == 108 &&
+                                  app.images[0]->src->data[2] == 116 &&
+                                  app.images[1]->w == 3 && app.images[1]->h == 2 &&
+                                  app.images[1]->ch == 2 &&
+                                  app.images[1]->src->data[0] == 1000 &&
+                                  app.images[1]->src->data[1] == 1006;
+            check(v1Pixels,
+                  "R21l2 current reader materialises a typed v1 carrier with corrected axes");
+            closeAll();
+
+            remote::Session oldClient;
+            oldClient.setHelloVersionForTest(14);
+            if (!openSession(oldClient, true)) return 1;
+            remote::ReaderRun ocRun;
+            std::string ocErr;
+            const bool ocSent = oldClient.readerRun(origin, "load", oldFiles, ocRun, ocErr);
+            check(oldClient.peerVersion() == 15 && ocSent &&
+                      ocRun.outcome == rp::RO_UNREADABLE && ocRun.key.empty() &&
+                      ocRun.header.empty() &&
+                      ocRun.err == rp::typedAxesClientTooOldText(14, "Reader CHW"),
+                  "R21m a v15 peer refuses named typed output before issuing it to a v14 client");
+            remote::ReaderRun still;
+            std::string stillErr;
+            const bool stillSent = seed.readerRun(origin, "load", oldFiles, still, stillErr);
+            check(stillSent && still.outcome == rp::RO_OK && still.key == seeded.key &&
+                      has(still.stderrText, "read from cache") &&
+                      std::filesystem::exists(pathFromUtf8(seededPath), ec),
+                  "R21n the old-client refusal leaves the valid canonical cache untouched");
+
+            // Anti-vacuity: a canonical Stack(F,H,W), W>4, needs no typed wire
+            // capability and continues to work for the old client.
+            oldFiles[0] = files[0];
+            remote::ReaderRun ocSafe;
+            std::string ocSafeErr;
+            const bool ocSafeSent = oldClient.readerRun(
+                origin, "load", oldFiles, ocSafe, ocSafeErr);
+            check(ocSafeSent && ocSafe.outcome == rp::RO_OK && !ocSafe.key.empty() &&
+                      has(ocSafe.header, "VIEWERSTREAM 1"),
+                  "R21o a canonical safe Reader still passes to a v14 client");
+
+            check(slurp(rdNarrowA, oldFiles[0]),
+                  "R21p (setup) the narrow Stack reader is readable");
+            remote::ReaderRun ocNarrow;
+            std::string ocNarrowErr;
+            const bool ocNarrowSent = oldClient.readerRun(
+                origin, "load", oldFiles, ocNarrow, ocNarrowErr);
+            check(ocNarrowSent && ocNarrow.outcome == rp::RO_UNREADABLE &&
+                      ocNarrow.key.empty() && ocNarrow.header.empty() &&
+                      ocNarrow.err == rp::typedAxesClientTooOldText(
+                          14, "Reader Stack/FHW"),
+                  "R21q ...but refuses the blank-layout narrow Stack seam");
+            oldClient.stop();
+            seed.stop();
+        }
+
+        {   // ---- R22: loose remote .npy preview -> full keeps its reading -----
+            // (3,2002,4) is natively HWC, but both declarations below are
+            // deliberately different. The long axis forces a 1/2 preview, so
+            // the background Session has to quote the declaration again.
+            closeAll();
+            const int BH = 2002, BW = 4;
+            std::vector<uint16_t> big((size_t)3 * BH * BW);
+            for (size_t i = 0; i < big.size(); i++) big[i] = (uint16_t)(200 + i);
+            const std::string bigPath = root + "/full-reading.npy";
+            {
+                const std::vector<uint8_t> b = selftestNpyBytes(
+                    "<u2", { 3, BH, BW }, big.data(), big.size() * 2);
+                std::ofstream f(pathFromUtf8(bigPath), std::ios::binary);
+                f.write((const char*)b.data(), (std::streamsize)b.size());
+            }
+            const std::string bigUrl = "local://" + bigPath;
+            forgetReader(bigUrl);
+            auto settleFetch = [&]() {
+                const double begun = nowSec();
+                while (app.rfPending > 0 && nowSec() - begun < 30.0) {
+                    pumpRemoteFetch();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                pumpRemoteFetch();
+            };
+
+            const bool chwOpen = openRemote(bigUrl, false, 0, NR_CHW,
+                                            nullptr, nullptr, std::string());
+            const int chwPreviewStep = app.images.empty() ? 0 : app.images[0]->src->remoteStep;
+            settleFetch();
+            bool chwFull = chwOpen && app.images.size() == 1 && chwPreviewStep > 1 &&
+                           app.images[0]->src->remoteStep == 1 &&
+                           app.images[0]->src->npyRead == NR_CHW &&
+                           app.images[0]->w == BW && app.images[0]->h == BH &&
+                           app.images[0]->ch == 3 &&
+                           app.images[0]->src->data[0] == 200 &&
+                           app.images[0]->src->data[1] == 200 + BH * BW &&
+                           app.images[0]->src->data[2] == 200 + 2 * BH * BW;
+            check(chwFull,
+                  "R22a a non-keyed CHW preview refines under CHW, not native HWC");
+
+            closeAll();
+            const bool stackOpen = openRemote(bigUrl, false, 0, NR_STACK,
+                                              nullptr, nullptr, std::string());
+            const int stackPreviewStep = app.images.empty() ? 0 : app.images[0]->src->remoteStep;
+            settleFetch();
+            bool stackFull = stackOpen && app.images.size() == 3 && stackPreviewStep > 1;
+            for (const auto& d : app.images) {
+                stackFull = stackFull && d->src->remoteStep == 1 &&
+                            d->src->npyRead == NR_STACK && d->w == BW && d->h == BH &&
+                            d->ch == 1 && !d->src->data.empty() &&
+                            d->src->data[0] == 200 + d->seqIndex * BH * BW;
+            }
+            check(stackFull,
+                  "R22b a non-keyed NR_STACK preview and every sibling refine as that stack");
+            closeAll();
+            forgetReader(bigUrl);
+        }
+
+        {   // ---- R23: blank-layout typed gate survives worker reconnect -------
+            closeAll();
+            const int savedPolicy = app.procPolicy;
+            app.procPolicy = App::PolAuto;
+            auto settleWorkers = [&](double budget) {
+                const double begun = nowSec();
+                while ((app.rfPending > 0 || app.mPending > 0) &&
+                       nowSec() - begun < budget) {
+                    pumpRemoteFetch();
+                    pumpMeasure();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                pumpRemoteFetch();
+                pumpMeasure();
+            };
+
+            const std::string aerr = openRemoteWithReader(url, rdNarrowA + ":load");
+            settleWorkers(120.0);
+            const size_t bFirst = app.images.size();
+            const std::string berr = openRemoteWithReader(url, rdNarrowB + ":load");
+            settleWorkers(120.0);
+            bool distinct = aerr.empty() && berr.empty() && bFirst == 2 &&
+                            app.images.size() == 4 &&
+                            app.images[0]->src != app.images[bFirst]->src &&
+                            app.images[0]->src->data[0] == 300 &&
+                            app.images[bFirst]->src->data[0] == 40000 &&
+                            app.images[0]->src->remoteStep == 1 &&
+                            app.images[bFirst]->src->remoteStep == 1;
+            check(distinct,
+                  "R23a large same-origin outputs of two Readers stay distinct after full landing");
+
+            ImageDoc* seam = app.images.size() > bFirst ? app.images[bFirst].get() : nullptr;
+            bool carried = seam && seam->seqId != 0 &&
+                           seam->src->npyRead == NR_STACK &&
+                           seam->src->remoteKeyRead == NR_NATIVE &&
+                           seam->src->remoteKeyLayout.empty() &&
+                           seam->src->remoteKeyRequires15;
+            check(carried,
+                  "R23b a blank-layout narrow Stack retains independent requires15 evidence");
+
+            // The open used v15. Force only the two worker Sessions to restart
+            // as v14, then ask for pixels and statistics from the landed source.
+            // Neither may rely on app.uiSession's still-v15 HELLO.
+            stopRemoteFetcher();
+            stopMeasureWorker();
+            app.rfStop = false;
+            app.mStop = false;
+            setEnv("VIEWER_SERVE_PROTOCOL", "14");
+            std::vector<float> before;
+            int seq = 0;
+            if (seam) {
+                before = seam->src->data;
+                seam->src->remoteStep = 2;       // re-arm the exact refinement door
+                seam->src->remoteErr.clear();
+                seq = seam->seqId;
+                requestFullRemote(seam);
+                requestServerTemporal(seq, app.srvTemporal);
+            }
+            settleWorkers(30.0);
+            const bool fullRefused = seam && seam->src->remoteStep == 2 &&
+                                     seam->src->data == before &&
+                                     has(seam->src->remoteErr, "protocol 14") &&
+                                     has(seam->src->remoteErr,
+                                         "typed materialisation axes need 15");
+            check(fullRefused,
+                  "R23c a separately reconnected v14 full-fetch worker refuses before pixels");
+            check(seq != 0 && !app.srvTemporal.valid && !app.srvTemporal.pending &&
+                      has(app.srvTemporal.err, "protocol 14") &&
+                      has(app.srvTemporal.err, "typed materialisation axes need 15"),
+                  "R23d the separately reconnected v14 MEASURE worker refuses the same subject");
+
+            stopRemoteFetcher();
+            stopMeasureWorker();
+            app.rfStop = false;
+            app.mStop = false;
+            setEnv("VIEWER_SERVE_PROTOCOL", "");
+            app.procPolicy = savedPolicy;
+            closeAll();
+            forgetReader(url);
         }
 
         {   // ---- R11: a set does not cross the link in v1 (§7) ----------------

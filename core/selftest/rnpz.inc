@@ -79,7 +79,9 @@
         //     dialog, and the remote door has to make the same call (R15).
         const std::string lone = root + "/lone.npz";
         selftestWriteNpz(lone, {
-            { "img", selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2) },
+            // A reserved-looking name does not make this a Viewer-NPZ.  Only
+            // `__viewer` is the discriminator (§4.11.1).
+            { "__pixels_0", selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2) },
         });
         // (c) a VIEWER CONTAINER - a series of two stacks under a batch, with
         //     conditions and a unit. This is the one that proves the TREE code
@@ -108,6 +110,61 @@
             { "__parent_3", i32(1) },
             { "__name_3",   str1("e8") },
             { "__pixels_3", selftestNpyBytes("<u2", { 2, HH, WW }, sb.data(), sb.size() * 2) },
+        });
+        // (d) phase 4 typed axes, and a mixed Series so Frame membership is
+        // exercised by the NPZ carrier as well as the Reader stream carrier.
+        std::vector<uint16_t> tf(3 * 2 * 4), ts(2 * 2 * 2 * 3);
+        for (size_t i = 0; i < tf.size(); i++) tf[i] = (uint16_t)(100 + i);
+        for (size_t i = 0; i < ts.size(); i++) ts[i] = (uint16_t)(1000 + i);
+        const std::string typed = root + "/typed.npz";
+        selftestWriteNpz(typed, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(3) },
+            { "__layer_0",  str1("series") },
+            { "__parent_0", i32(-1) },
+            { "__name_0",   str1("mixed typed") },
+            { "__conditions_values_0", f64v({ 1.25, 9.5 }) },
+            { "__conditions_name_0",   str1("exposure") },
+            { "__conditions_unit_0",   str1("ms") },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__name_1",   str1("colour") },
+            { "__layout_1", str1("CHW") },
+            { "__pixels_1", selftestNpyBytes("<u2", { 3, 2, 4 }, tf.data(), tf.size() * 2) },
+            { "__layer_2",  str1("stack") },
+            { "__parent_2", i32(0) },
+            { "__name_2",   str1("burst") },
+            { "__layout_2", str1("FCHW") },
+            { "__pixels_2", selftestNpyBytes("<u2", { 2, 2, 2, 3 }, ts.data(), ts.size() * 2) },
+        });
+        // Two malformed typed declarations. rawSeries proves a Series cannot
+        // smuggle in a tensor beside an otherwise valid Frame child. lateBad
+        // puts a valid Frame first and a cross-layer layout second: validation
+        // has to reject the whole declaration before that first document lands.
+        const std::string rawSeries = root + "/raw-series.npz";
+        selftestWriteNpz(rawSeries, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(2) },
+            { "__layer_0",  str1("series") },
+            { "__parent_0", i32(-1) },
+            { "__pixels_0", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__pixels_1", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+        });
+        const std::string lateBad = root + "/late-bad-layout.npz";
+        selftestWriteNpz(lateBad, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(3) },
+            { "__layer_0",  str1("batch") },
+            { "__parent_0", i32(-1) },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__pixels_1", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+            { "__layer_2",  str1("stack") },
+            { "__parent_2", i32(0) },
+            { "__layout_2", str1("CHW") },
+            { "__pixels_2", selftestNpyBytes("<u2", { 3, 2, 4 }, tf.data(), tf.size() * 2) },
         });
 
         const std::string exe = app.remoteExe.empty() ? app.exePath : app.remoteExe;
@@ -144,7 +201,7 @@
         app.remoteExe = exe;
         if (!connect()) return 1;
         check(app.uiSession.peerVersion() == (int)rp::VERSION,
-              "R14a the peer speaks the protocol this build does (14)");
+              "R14a the peer speaks the protocol this build does (15)");
 
         // ---- R14: the same file, both doors -----------------------------------
         {
@@ -245,6 +302,15 @@
             check(got && app.images.size() == before + 1 && !app.npzPickOpen,
                   "R15 an npz holding one image opens with no dialog, remote as local");
             closeAll();
+
+            const std::string le = loadNpz(lone, "__pixels_0", NR_NATIVE,
+                                           std::string(), std::string());
+            check(le.empty() && app.images.size() == 1 &&
+                      app.images[0]->src->member == "__pixels_0" &&
+                      !app.images[0]->src->viewerMaterialized &&
+                      npyReReadAvailable(*app.images[0]->src),
+                  "R15a ordinary __pixels_0 remains an ordinary re-readable NPZ member");
+            closeAll();
         }
 
         // ---- R15b: the PICKER, end to end, over the link ----------------------
@@ -316,6 +382,141 @@
             check(rUnit == lUnit && rUnit == "ms" && rParam == lParam && rParam == "exposure",
                   "R16d ...and so are the condition's name and unit");
             closeAll();
+        }
+
+        // ---- R26: typed viewer NPZ, local/remote parity and v14 refusal ------
+        {
+            closeAll();
+            const bool ropen = openRemoteNpz(urlOf(typed), std::string());
+            bool rshape = ropen && app.images.size() == 3 &&
+                          app.images[0]->w == 4 && app.images[0]->h == 2 && app.images[0]->ch == 3 &&
+                          app.images[1]->w == 3 && app.images[1]->h == 2 && app.images[1]->ch == 2 &&
+                          app.images[2]->w == 3 && app.images[2]->h == 2 && app.images[2]->ch == 2;
+            check(rshape, "R26a remote viewer NPZ honours Frame/CHW and Stack/FCHW dimensions");
+            bool rpixels = rshape && app.images[0]->src->data[0] == 100 &&
+                           app.images[0]->src->data[1] == 108 &&
+                           app.images[0]->src->data[2] == 116 &&
+                           app.images[0]->src->data[3] == 101 &&
+                           app.images[1]->src->data[0] == 1000 &&
+                           app.images[1]->src->data[1] == 1006 &&
+                           app.images[2]->src->data[0] == 1012 &&
+                           app.images[2]->src->data[1] == 1018;
+            check(rpixels, "R26b remote tiles are scattered back to declaration order before decode");
+            bool rmembers = app.series.size() == 1 && app.series[0].members.size() == 2 &&
+                            app.series[0].members[0].seqId == 0 &&
+                            app.series[0].members[0].frameUid == app.images[0]->uid &&
+                            app.series[0].members[1].seqId == app.images[1]->seqId &&
+                            app.series[0].members[1].frameUid == 0;
+            check(rmembers, "R26c remote mixed Series preserves Frame/Stack identity and order");
+            bool rboundary = app.images.size() == 3 &&
+                             app.images[0]->src->npyRead == NR_CHW &&
+                             app.images[0]->src->remoteKeyRead == NR_CHW &&
+                             app.images[0]->src->remoteKeyLayout == "CHW" &&
+                             app.images[0]->src->remoteKeyRequires15 &&
+                             app.images[1]->src->npyRead == NR_FCHW &&
+                             app.images[1]->src->remoteKeyRead == NR_FCHW &&
+                             app.images[1]->src->remoteKeyLayout == "FCHW" &&
+                             app.images[1]->src->remoteKeyRequires15;
+            check(rboundary,
+                  "R26d logical axes survive on the source beside distinct NPZ wire axes");
+            bool rNoReRead = app.images.size() == 3;
+            for (const auto& d : app.images)
+                rNoReRead = rNoReRead && !npyReReadAvailable(*d->src) &&
+                            !d->src->npyShape.empty();
+            check(rNoReRead,
+                  "R26d2 typed container shows read-as without losing its member in re-read");
+
+            // Protocol 15's MEASURE suffix carries the same FCHW wire reading
+            // that META/TILE used.  Compare the returned statistic with the
+            // pixels now displayed, so dropping the appended word or ignoring
+            // it in openKeyed cannot pass as a merely well-formed reply.
+            remote::MeasureReq mq;
+            mq.op = rp::MOP_TEMPORAL_STATS;
+            mq.hasKeyed = app.images.size() >= 2;
+            if (mq.hasKeyed) {
+                const FrameSource& ks = *app.images[1]->src;
+                mq.keyed.key = ks.remoteKey;
+                mq.keyed.node = ks.remoteNode;
+                mq.keyed.kind = ks.remoteKeyKind;
+                mq.keyed.layout = ks.remoteKeyLayout;
+                mq.keyed.requires15 = ks.remoteKeyRequires15;
+                mq.keyedRead = ks.remoteKeyRead;
+            }
+            remote::MeasureResult mr;
+            std::string me;
+            const bool measured = mq.hasKeyed && app.uiSession.measure(mq, mr, me);
+            double peerSigT = -1.0;
+            if (measured && !mr.cols.empty())
+                for (const auto& it : mr.cols[0])
+                    if (it.kind == 0 && it.key == "sigma_t [DN]") peerSigT = it.num;
+            double displaySigT = -1.0;
+            if (app.images.size() >= 3 &&
+                app.images[1]->src->data.size() == app.images[2]->src->data.size()) {
+                double v = 0.0;
+                for (size_t i = 0; i < app.images[1]->src->data.size(); i++) {
+                    const double d = app.images[2]->src->data[i] -
+                                     app.images[1]->src->data[i];
+                    v += d * d / 2.0;             // unbiased variance, n=2
+                }
+                displaySigT = sqrt(v / app.images[1]->src->data.size());
+            }
+            fprintf(stderr, "rnpzselftest:   R26 typed MEASURE: peer=%g display=%g "
+                            "frames=%d read=%d err=\"%s\"\n",
+                    peerSigT, displaySigT, mr.framesUsed, mq.keyedRead, me.c_str());
+            check(measured && mr.framesUsed == 2 && mq.keyedRead == NR_FCHW &&
+                      peerSigT == displaySigT,
+                  "R26d3 v15 FCHW MEASURE matches the displayed stack and uses all frames");
+            std::vector<std::vector<float>> rpx;
+            std::vector<std::tuple<int,int,int>> rdims;
+            for (const auto& d : app.images) {
+                rpx.push_back(d->src->data);
+                rdims.emplace_back(d->w, d->h, d->ch);
+            }
+            closeAll();
+            const std::string le = loadNpz(typed);
+            bool parity = le.empty() && app.images.size() == rpx.size();
+            for (size_t i = 0; i < app.images.size() && parity; i++)
+                parity = std::make_tuple(app.images[i]->w, app.images[i]->h, app.images[i]->ch) ==
+                             rdims[i] && app.images[i]->src->data == rpx[i] &&
+                         !npyReReadAvailable(*app.images[i]->src) &&
+                         !app.images[i]->src->npyShape.empty();
+            check(parity, "R26e local and remote NPZ are dimension/pixel identical");
+            closeAll();
+
+            auto bothRefuseBeforeDocs = [&](const std::string& path,
+                                            const std::string& words) {
+                closeAll();
+                const std::string le2 = loadNpz(path);
+                const bool localClean = !le2.empty() && has(le2, words) && app.images.empty();
+                closeAll();
+                remote::NpzScan badScan;
+                std::string scanErr;
+                const bool scanned2 = app.uiSession.npzScan(path, badScan, scanErr);
+                const std::string re2 = scanned2
+                    ? openRemoteViewerNpz(urlOf(path), badScan) : scanErr;
+                return localClean && scanned2 && re2 == le2 && app.images.empty();
+            };
+            check(bothRefuseBeforeDocs(rawSeries, "series has no raw pixel tensor"),
+                  "R26f local/remote reject a Series tensor identically, before documents");
+            check(bothRefuseBeforeDocs(lateBad, "stack layout CHW belongs to a frame"),
+                  "R26g a later cross-layer layout cannot leave an earlier Frame behind");
+            closeAll();
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_PROTOCOL", "14");
+            if (!connect()) return 1;
+            remote::NpzScan sc;
+            std::string se;
+            const bool scanned = app.uiSession.npzScan(typed, sc, se);
+            const uint64_t beforeRx = app.uiSession.bytesReceived();
+            const std::string oe = scanned ? openRemoteViewerNpz(urlOf(typed), sc) : se;
+            check(scanned && !oe.empty() && has(oe, "protocol 14") &&
+                      has(oe, "typed materialisation axes need 15") &&
+                      app.uiSession.bytesReceived() == beforeRx && app.images.empty(),
+                  "R26h v14 is refused after declaration, before META/TILE or partial documents");
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_PROTOCOL", "");
+            if (!connect()) return 1;
         }
 
         // ---- R17: the two ways a container can be unreachable ------------------

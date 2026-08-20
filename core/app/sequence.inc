@@ -664,8 +664,8 @@ static void pumpSequence() {
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;
             doc->cfaColorize = ref->cfaColorize;
             doc->displayLut = ref->displayLut;
-            // frame ⊂ stack ⊂ batch: every frame carries its stack's batch, or
-            // "close batch" / "move to batch" sees only the head frame
+            // Every frame in a stack carries the same managed-by batch, or
+            // "close batch" / "move to batch" sees only the head frame.
             doc->batchId = ref->batchId;
         } else {
             defaultRange(*doc);
@@ -2103,8 +2103,8 @@ static void pickerAccept() {
 // The same shape as pickerAccept above, one layer down: no ImGui, so the
 // headless selftests and every auto-accept go through this exact function.
 //
-// The file is the BATCH (frame ⊂ stack ⊂ series ⊂ batch: an .npz is "what was
-// opened together", which is precisely a batch and nothing more). Members of
+// Opening the file creates one BATCH: the .npz members are managed together
+// because they were opened together, not because batch is a data layer. Members of
 // different shapes coexist inside it as separate stacks - that is the whole
 // point of a container.
 static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
@@ -2513,7 +2513,7 @@ static void drawFolderPickModal() {
                               "series as a whole.\n"
                               "Nothing is created unless this is ticked.", selGroups);
         if (app.pickSweep) {
-            app.pickBatchMode = 0;              // series ⊂ batch, strictly
+            app.pickBatchMode = 0;              // series and members share one batch
             ImGui::SameLine();
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
             ImGui::InputTextWithHint("##swparam", "parameter", app.pickSweepParam,

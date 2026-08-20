@@ -85,6 +85,12 @@ struct Buf {
 // handler unchanged.
 using ReplySink = bool (*)(uint32_t type, const Buf& payload);
 static ReplySink g_sink = nullptr;
+// Version the CLIENT announced in HELLO. It gates response shapes and, since
+// protocol 15, whether a typed Reader materialisation may be issued at all.
+// Defaulting to 2 keeps a client that never said hello on the safe format.
+static uint32_t g_clientVersion = 2;
+static uint32_t servedVersion();
+static int servedReaderStreamVersion();
 
 static bool readExact(void* p, size_t n) {
     uint8_t* q = (uint8_t*)p;
@@ -167,8 +173,8 @@ struct ServedFile {
 // through File > Open did not exist for the same file opened through a peer.
 //
 // It is written as ONE assignment through rp::npyReadAxes rather than as the
-// four hand-rolled cases that were here, because there are now twelve
-// (rank 2/3/4 x four readings) and hand-rolling twelve is how the two doors
+// hand-rolled cases that were here. The typed FCHW case makes another axis
+// assignment, and hand-rolling these combinations is how the two doors
 // disagreed the first time. The axis rule, the native rule and both refusal
 // sentences all come from remote_proto.h, so what this function contributes is
 // only the STRIDES - which is the one thing the local npyLayout cannot lend,
@@ -226,7 +232,7 @@ static bool serveLayout(ServedFile& n, const std::vector<int64_t>& dims, int rea
     // Per-axis element strides, computed for the DECLARED axes and then picked
     // off by role. C order: the last dimension is fastest. Fortran order: the
     // first. Everything downstream indexes through these four numbers, so the
-    // two layouts - and now the four readings - differ nowhere else.
+// two layouts - and now the five readings - differ nowhere else.
     std::vector<uint64_t> ax(rank, 0);
     uint64_t acc = 1;
     if (n.fortran) { for (size_t i = 0; i < rank; i++)  { ax[i] = acc; acc *= (uint64_t)dims[i]; } }
@@ -876,7 +882,7 @@ static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node
         return false;
     }
     vns::Scan sc;
-    const std::string serr = vns::scanHeader(n.f, sc);
+    const std::string serr = vns::scanHeader(n.f, sc, servedReaderStreamVersion());
     if (!serr.empty()) { err = serr; return false; }
     const vns::Blob* b = nullptr;
     for (const vns::Blob& q : sc.blobs) if ((uint32_t)q.node == node) { b = &q; break; }
@@ -890,8 +896,18 @@ static bool openReaderCache(ServedFile& n, const std::string& key, uint32_t node
     n.elemSize = dtypeSize(n.dtype);
     n.fortran = false;                 // the harness writes C order, LE, always
     n.bigEndian = false;               // (adapter-transport-review A2/A4)
+    if (node >= sc.nodes.size()) { err = "reader node is outside its tree"; return false; }
+    const vns::TreeNode& tn = sc.nodes[(size_t)node];
+    if (g_clientVersion < 15 && vns::requiresTypedAxes15(tn, b->shape)) {
+        err = rp::typedAxesClientTooOldText((int)g_clientVersion,
+                                             vns::typedAxesKind(tn));
+        return false;
+    }
+    int typedRead = tn.layout == "CHW" ? NR_CHW : tn.layout == "FCHW" ? NR_FCHW
+                    : tn.layer == "stack" ? NR_STACK
+                    : b->shape.size() == 3 ? NR_HWC : NR_NATIVE;
     bool fellBack = false;
-    if (!serveLayout(n, b->shape, NR_NATIVE, fellBack, err)) return false;
+    if (!serveLayout(n, b->shape, typedRead, fellBack, err)) return false;
     uint64_t want = n.elemSize;
     for (int64_t d : b->shape) want *= (uint64_t)(d > 0 ? d : 0);
     if (want != b->nbytes) {
@@ -990,7 +1006,7 @@ static bool readWholeInto(const std::string& path, std::vector<uint8_t>& out, st
 // the first request for (key, node) inflates that one array and nothing else,
 // so opening one member of a forty-member file costs one inflate.
 static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
-                          std::string& err) {
+                          std::string& err, int read = NR_NATIVE) {
     NpzSrc src;
     if (!npzSrcRead(key, src)) {
         err = "this peer has not listed a container under that key - reopen the "
@@ -1056,7 +1072,7 @@ static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
     // From here it is an ordinary .npy, which is the point of materialising:
     // the axis rule, the ceiling, both refusal sentences, the fortran strides
     // and the endian normalisation are the ones every other .npy gets.
-    return openNpy(n, memberPath, err, NR_NATIVE);
+    return openNpy(n, memberPath, err, read);
 }
 
 // Which family a key belongs to. The wire does not say (§10.5: a key names a
@@ -1102,10 +1118,9 @@ static bool readRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& ou
 // bottom of this file is one transport, and a WebSocket front end (the browser
 // client this project has always wanted) is another - same requests, same
 // replies, same code here. Only the framing differs.
-// Version the CLIENT announced in HELLO. A v2 viewer talking to this server
-// must get the LIST shape it knows how to parse; defaulting to 2 keeps a client
-// that never said hello (none of ours) on the safe format.
-static uint32_t g_clientVersion = 2;
+// g_clientVersion is stored above the keyed Reader door because it also gates
+// the peer -> pre-15-client direction there. A v2 viewer talking to this server
+// still gets the LIST shape it knows how to parse.
 
 // ...and the set a SCAN may fold into stacks, which is wider since protocol 11:
 // a headerless file has an answer here as soon as the request that opens it
@@ -1137,6 +1152,16 @@ static uint32_t servedVersion() {
         return (n == 0 || n > VERSION) ? VERSION : n;
     }();
     return v;
+}
+
+// Carrier v3 is the protocol-15 typed-semantics safety generation. The
+// VIEWER_SERVE_PROTOCOL seam must emulate the historical reader as well as its
+// wire number: a v14 build read v1/v2 and rejected v3 whole. This keeps tests
+// honest about two distinct compatibilities: an old v1/v2 canonical carrier
+// remains usable, while a current v3 writer requires an upgraded peer before
+// any key/header can be issued.
+static int servedReaderStreamVersion() {
+    return servedVersion() >= 15 ? vns::STREAM_VERSION : 2;
 }
 
 // C++17 has no portable file_clock -> system_clock conversion (that is C++20);
@@ -1716,7 +1741,7 @@ static void handleScan(Buf& in) {
 // NR_NATIVE, which is what every v8 and older client sends and what this peer
 // answered before there was anything else to answer.
 //
-// Refused rather than clamped when it is not one of the four: a reading is a
+// Refused rather than clamped when it is not one of the five: a reading is a
 // user's declaration and the client computed it from a menu, so a value this
 // peer does not recognise means the two ends disagree about what the numbers
 // mean - and the one answer that must not come back from that is a picture.
@@ -1724,7 +1749,7 @@ static bool getRead(Buf& in, int& read, std::string& err) {
     read = NR_NATIVE;
     uint32_t v = 0;
     if (!in.getU32(v)) return true;               // an older client: native
-    if (v > NR_CHW) { err = "unknown .npy reading " + std::to_string(v); return false; }
+    if (v > NR_FCHW) { err = "unknown .npy reading " + std::to_string(v); return false; }
     read = (int)v;
     return true;
 }
@@ -1794,8 +1819,12 @@ static bool getTrailers(Buf& in, ReqTrailers& t, std::string& err) {
 // resolved by exactly this, so a statistic and a tile of the same [key][node]
 // cannot come from two different arrays.
 static bool openKeyed(ServedFile& n, const std::string& key, uint32_t node,
-                      std::string& err) {
-    if (keyIsNpz(key)) return openNpzMember(n, key, node, err);
+                      std::string& err, int read = NR_NATIVE) {
+    if (keyIsNpz(key)) return openNpzMember(n, key, node, err, read);
+    if (read != NR_NATIVE) {
+        err = "a reader node gets its axes from its typed header, not from a .npy reading";
+        return false;
+    }
     return openReaderCache(n, key, node, err);
 }
 
@@ -1809,12 +1838,7 @@ static bool openRequested(ServedFile& n, const std::string& path, const ReqTrail
         err = "a raw recipe does not apply to an array inside a materialisation";
         return false;
     }
-    if (read != NR_NATIVE) {
-        err = "a declared .npy reading does not apply to an array inside a "
-              "materialisation";
-        return false;
-    }
-    return openKeyed(n, t.key, t.node, err);
+    return openKeyed(n, t.key, t.node, err, read);
 }
 
 static void handleMeta(Buf& in) {
@@ -2026,6 +2050,7 @@ std::string planeKey(const char* base, uint32_t cfaType, int plane) {
 struct MeasureKey {
     std::string key;
     uint32_t node = 0;
+    int read = NR_NATIVE;              // protocol 15, keyed .npz typed axes
 };
 
 // Frames from one frame-axis file, or one file per frame; ROI rows only, so the
@@ -2057,7 +2082,7 @@ struct FrameSource {
         recipe = rec;
         perFile = !kd && p.size() > 1;
         if (kd) {
-            if (!openKeyed(n, kd->key, kd->node, err)) return false;
+            if (!openKeyed(n, kd->key, kd->node, err, kd->read)) return false;
         } else if (!openServed(n, p[0], err, NR_NATIVE, recipe)) {
             return false;
         }
@@ -3062,6 +3087,14 @@ static void handleMeasure(Buf& in) {
             sendErr("truncated keyed trailer");
             return;
         }
+        if (servedVersion() >= 15 && g_clientVersion >= 15) {
+            uint32_t read = NR_NATIVE;
+            if (!in.getU32(read) || read > NR_FCHW) {
+                sendErr("bad keyed reading");
+                return;
+            }
+            mkey.read = (int)read;
+        }
         // Two declarations of what the pixels ARE. The words are META's, so a
         // person meets one sentence for one mistake wherever they meet it.
         if (haveMrw) {
@@ -3255,7 +3288,7 @@ static std::string checkReaderOutput(const std::string& cachePath, std::string& 
     std::ifstream f(std::filesystem::u8path(cachePath), std::ios::binary);
     if (!f) return "cannot open what the reader wrote";
     vns::Scan sc;
-    const std::string serr = vns::scanHeader(f, sc);
+    const std::string serr = vns::scanHeader(f, sc, servedReaderStreamVersion());
     if (!serr.empty()) return serr;
     if (sc.blobs.empty()) return "the container declares no pixels";
     std::error_code ec;
@@ -3267,14 +3300,40 @@ static std::string checkReaderOutput(const std::string& cachePath, std::string& 
         if (probe.dtype == DT_COUNT) return "unsupported dtype " + b.dtype;
         probe.elemSize = dtypeSize(probe.dtype);
         probe.fortran = false;
+        if (b.node < 0 || b.node >= sc.n) return "a pixels blob names a node outside its tree";
+        const vns::TreeNode& tn = sc.nodes[(size_t)b.node];
+        const int typedRead = tn.layout == "CHW" ? NR_CHW
+                            : tn.layout == "FCHW" ? NR_FCHW
+                            : tn.layer == "stack" ? NR_STACK
+                            : b.shape.size() == 3 ? NR_HWC : NR_NATIVE;
         bool fellBack = false;
         std::string err;
-        if (!serveLayout(probe, b.shape, NR_NATIVE, fellBack, err)) return err;
+        if (!serveLayout(probe, b.shape, typedRead, fellBack, err)) return err;
         if (!ec && b.at + b.nbytes > fsize)
             return "the stream ended " + std::to_string(b.at + b.nbytes - fsize) +
                    " byte(s) short of what it declared";
     }
     headerText = headOfFile(cachePath, sc.headerEnd);
+    return {};
+}
+
+// Structural validity and client capability are deliberately separate. A v14
+// client encountering a valid typed cache must be REFUSED, not cause that cache
+// to be classified as corrupt and deleted under the per-key lock.
+static std::string readerAxesForClientError(const std::string& cachePath) {
+    if (g_clientVersion >= 15) return {};
+    std::ifstream f(std::filesystem::u8path(cachePath), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote";
+    vns::Scan sc;
+    const std::string serr = vns::scanHeader(f, sc, servedReaderStreamVersion());
+    if (!serr.empty()) return serr;
+    for (const vns::Blob& b : sc.blobs) {
+        if (b.node < 0 || b.node >= sc.n) continue; // structural check owns this
+        const vns::TreeNode& node = sc.nodes[(size_t)b.node];
+        if (vns::requiresTypedAxes15(node, b.shape))
+            return rp::typedAxesClientTooOldText((int)g_clientVersion,
+                                                  vns::typedAxesKind(node));
+    }
     return {};
 }
 
@@ -3471,12 +3530,19 @@ static void handleReaderRun(Buf& in) {
               "Edit the reader and press Load again to re-run it.",
               prov, key, header);
     };
+    auto refuseOldClientAxes = [&](const std::string& path) {
+        const std::string why = readerAxesForClientError(path);
+        if (why.empty()) return false;
+        reply(RO_UNREADABLE, why, "", prov, "", "");
+        return true;
+    };
     bool observedInvalid = false;
     ec.clear();
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string header;
         const std::string cerr = checkReaderOutput(cachePath, header);
         if (cerr.empty()) {
+            if (refuseOldClientAxes(cachePath)) return;
             replyFromCache(header);
             return;
         }
@@ -3501,6 +3567,7 @@ static void handleReaderRun(Buf& in) {
         if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
             std::string header;
             if (checkReaderOutput(cachePath, header).empty()) {
+                if (refuseOldClientAxes(cachePath)) return;
                 replyFromCache(header);
                 return;
             }
@@ -3585,6 +3652,7 @@ static void handleReaderRun(Buf& in) {
         reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
         return;
     }
+    if (refuseOldClientAxes(tmpPath)) return;
     ReaderKeyLock publishLock;
     std::string lockWhy;
     if (!publishLock.acquire(key, lockWhy)) {
@@ -3595,6 +3663,7 @@ static void handleReaderRun(Buf& in) {
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string winnerHeader;
         if (checkReaderOutput(cachePath, winnerHeader).empty()) {
+            if (refuseOldClientAxes(cachePath)) return;
             reply(RO_OK, "",
                   r.err.empty() ? std::string("another session published this key first.")
                                 : r.err,
@@ -3627,6 +3696,7 @@ static void handleReaderRun(Buf& in) {
     std::string wheader;
     const std::string werr = checkReaderOutput(cachePath, wheader);
     if (werr.empty()) {
+        if (refuseOldClientAxes(cachePath)) return;
         reply(RO_OK, "",
               r.err.empty() ? std::string("another session published this key first.")
                             : r.err,

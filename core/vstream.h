@@ -1,4 +1,5 @@
-// The framed stream a reader returns (`VIEWERSTREAM 1`), in the part BOTH
+// The framed stream a reader returns (`VIEWERSTREAM 3` from current writers),
+// in the part BOTH
 // binaries need.
 //
 // docs/background/reviews/adapter-transport-review.md froze the format: a line-based header, then
@@ -36,15 +37,107 @@
 #include <istream>
 #include <string>
 #include <vector>
+#include "remote_proto.h"             // shared shape/channel refusal wording
 
 namespace vns {
+
+// v1 already carried layer/layout and v2 added AnalysisSet. v3 is the safety
+// generation requiring readers to enforce those existing typed semantics at
+// the materialisation boundary. Readers accept all three under the corrected
+// semantics; writers name v3 unconditionally so a pre-v3 reader refuses the
+// whole result instead of silently applying its native-axis heuristic.
+inline constexpr int STREAM_VERSION = 3;
+
+inline std::string versionError(int version, int maxVersion = STREAM_VERSION) {
+    if (version <= maxVersion) return {};
+    return "this stream is version " + std::to_string(version) +
+           " and this viewer reads " + std::to_string(maxVersion);
+}
 
 // The two fields a TREE is made of. Everything else a node declares is about
 // what it holds, not about where it sits.
 struct TreeNode {
     std::string layer;      // "frame" "stack" "series" "batch" "analysisset"
     int parent = -1;
+    // Empty is the layer's canonical order.  The only v1 transposed forms are
+    // frame/CHW and stack/FCHW.  Kept in the shared projection because a
+    // layout is a claim about the pixel axes, not client-only presentation.
+    std::string layout;
 };
+
+// One typed pixel node's axes in its DECLARATION order.  Both the local
+// container door and the peer's stream/cache door use this exact assignment;
+// otherwise (C,H,W) can silently become F frames on one side of the link.
+struct PixelAxes {
+    int iF = -1, iH = -1, iW = -1, iC = -1;
+};
+
+inline std::string shapeText(const std::vector<int64_t>& shape) {
+    return rp::npyShapeText(shape);
+}
+
+// Protocol 15 evidence carried by a typed Reader result. A named layout always
+// needs the typed wire contract. With an empty layout, only Stack(F,H,W) whose
+// W <= 4 differs from the old native rank heuristic (which calls it HWC).
+inline bool requiresTypedAxes15(const TreeNode& node,
+                                const std::vector<int64_t>& shape) {
+    if (!node.layout.empty()) return true;
+    return node.layer == "stack" && rp::npyNativeRead(shape) != rp::NR_STACK;
+}
+
+inline std::string typedAxesKind(const TreeNode& node) {
+    return !node.layout.empty() ? "Reader " + node.layout : "Reader Stack/FHW";
+}
+
+// Frame -> HWC (or CHW when declared), Stack -> FHWC (or FCHW when
+// declared).  Series has members and therefore deliberately has no raw tensor
+// layout.  A declaration that belongs to another layer is refused by name;
+// duck-typed adapters must not be allowed to turn it into a plausible but
+// different image.
+inline std::string pixelAxes(const TreeNode& v, const std::vector<int64_t>& shape,
+                             PixelAxes& a) {
+    a = PixelAxes{};
+    const std::string sh = shapeText(shape);
+    if (v.layer == "frame") {
+        if (v.layout.empty()) {
+            if (shape.size() == 2) { a.iH = 0; a.iW = 1; }
+            else if (shape.size() == 3) { a.iH = 0; a.iW = 1; a.iC = 2; }
+            else return rp::npyNotNativeText(shape);
+        } else if (v.layout == "CHW") {
+            if (shape.size() != 3)
+                return "frame layout CHW needs rank 3, not shape " + sh;
+            a.iC = 0; a.iH = 1; a.iW = 2;
+        } else if (v.layout == "FCHW") {
+            return "frame layout FCHW belongs to a stack, not a frame";
+        } else {
+            return "frame layout \"" + v.layout +
+                   "\" is not known (empty or CHW)";
+        }
+    } else if (v.layer == "stack") {
+        if (v.layout.empty()) {
+            if (shape.size() == 3) { a.iF = 0; a.iH = 1; a.iW = 2; }
+            else if (shape.size() == 4) {
+                a.iF = 0; a.iH = 1; a.iW = 2; a.iC = 3;
+            } else return rp::npyNotNativeText(shape);
+        } else if (v.layout == "FCHW") {
+            if (shape.size() != 4)
+                return "stack layout FCHW needs rank 4, not shape " + sh;
+            a.iF = 0; a.iC = 1; a.iH = 2; a.iW = 3;
+        } else if (v.layout == "CHW") {
+            return "stack layout CHW belongs to a frame, not a stack";
+        } else {
+            return "stack layout \"" + v.layout +
+                   "\" is not known (empty or FCHW)";
+        }
+    } else {
+        return v.layer + " has no raw pixel tensor layout; give it frame or stack members";
+    }
+    for (int64_t d : shape)
+        if (d < 1) return "a zero-length axis in shape " + sh + ": no pixels in it";
+    const int64_t c = a.iC >= 0 ? shape[(size_t)a.iC] : 1;
+    if (c > 4) return rp::npyChannelCeilingText(shape, c);
+    return {};
+}
 
 // docs/features/adapters/reader-analysisset.md's A3 gate, and the ONE spelling of its refusals.
 // Called by the local carrier (core/app/loader_npz.inc vnzCheckTree, which
@@ -66,6 +159,13 @@ inline std::string checkTree(const std::vector<TreeNode>& nodes, int n) {
         if (i != 0 && (v.parent < 0 || v.parent >= i))
             return "node " + si + "'s parent is " + std::to_string(v.parent) +
                    ": a parent must be an earlier node (depth first, root 0)";
+        if (v.layer == "series" && !v.layout.empty())
+            return "node " + si + " is a series with layout \"" + v.layout +
+                   "\": a series has no raw tensor layout; declare layout on its members";
+        if (v.layer != "frame" && v.layer != "stack" && v.layer != "series" &&
+            !v.layout.empty())
+            return "node " + si + " is a " + v.layer + " with layout \"" +
+                   v.layout + "\": only frame and stack pixels have a layout";
     }
     return {};
 }
@@ -81,6 +181,31 @@ struct Blob {
     uint64_t nbytes = 0;
     uint64_t at = 0;
 };
+
+// Pixel ownership is a tree fact, not a decoding detail. Every concrete image
+// node owns exactly one blob; structural nodes own none. Checking this only
+// while vnzBuild walks would be too late: a missing later node can leave an
+// earlier document behind, while duplicate lines make the client select the
+// last blob and the peer select the first. Both stream readers therefore feed
+// their per-node counts through this one gate before any materialisation.
+inline std::string checkPixelCounts(const std::vector<TreeNode>& nodes, int n,
+                                    const std::vector<int>& counts) {
+    if (n < 0 || (size_t)n > nodes.size() || (size_t)n > counts.size())
+        return "the node count does not match the pixel declaration counts";
+    for (int i = 0; i < n; i++) {
+        const TreeNode& v = nodes[(size_t)i];
+        const int count = counts[(size_t)i];
+        const bool pixelLayer = v.layer == "frame" || v.layer == "stack";
+        if (pixelLayer && count != 1)
+            return "node " + std::to_string(i) + " is a " + v.layer + " with " +
+                   std::to_string(count) + " pixels declaration(s): exactly one is required";
+        if (!pixelLayer && count != 0)
+            return "node " + std::to_string(i) + " is a " + v.layer + " with " +
+                   std::to_string(count) + " pixels declaration(s): only frame and stack "
+                   "nodes have pixels";
+    }
+    return {};
+}
 
 // What the peer reads out of a stream: the version, the tree, and where each
 // blob sits. Everything else is skipped by the rule the format already has -
@@ -100,7 +225,8 @@ struct Scan {
 // The refusals here are the local carrier's, word for word, for checkTree's
 // reason: loadViewerStream is the door most readers come through and a person
 // who sees one of these sentences must not be able to tell which end wrote it.
-inline std::string scanHeader(std::istream& f, Scan& out) {
+inline std::string scanHeader(std::istream& f, Scan& out,
+                              int maxVersion = STREAM_VERSION) {
     out = Scan{};
     std::string line;
     if (!std::getline(f, line)) return "the reader produced nothing";
@@ -108,6 +234,8 @@ inline std::string scanHeader(std::istream& f, Scan& out) {
     if (line.compare(0, 13, "VIEWERSTREAM ") != 0)
         return "not a viewer stream: first line is \"" + line.substr(0, 60) + "\"";
     out.version = atoi(line.c_str() + 13);
+    const std::string versionErr = versionError(out.version, maxVersion);
+    if (!versionErr.empty()) return versionErr;
     int n = -1;
     bool sawEnd = false;
     while (std::getline(f, line)) {
@@ -130,6 +258,7 @@ inline std::string scanHeader(std::istream& f, Scan& out) {
         TreeNode& v = out.nodes[(size_t)idx];
         if (key == "layer") { v.layer = val; continue; }
         if (key == "parent") { v.parent = atoi(val.c_str()); continue; }
+        if (key == "layout") { v.layout = val; continue; }
         if (key == "pixels") {
             Blob b;
             b.node = idx;
@@ -166,7 +295,24 @@ inline std::string scanHeader(std::istream& f, Scan& out) {
     // makes an offset computable at all rather than needing a directory.
     uint64_t at = out.headerEnd;
     for (Blob& b : out.blobs) { b.at = at; at += b.nbytes; }
-    return checkTree(out.nodes, out.n);
+    const std::string treeErr = checkTree(out.nodes, out.n);
+    if (!treeErr.empty()) return treeErr;
+    std::vector<int> pixelCounts((size_t)out.n, 0);
+    for (const Blob& b : out.blobs) {
+        if (b.node < 0 || b.node >= out.n)
+            return "a pixels blob names node " + std::to_string(b.node) +
+                   ", outside this tree";
+        pixelCounts[(size_t)b.node]++;
+    }
+    const std::string countErr = checkPixelCounts(out.nodes, out.n, pixelCounts);
+    if (!countErr.empty()) return countErr;
+    for (const Blob& b : out.blobs) {
+        PixelAxes a;
+        const std::string axesErr = pixelAxes(out.nodes[(size_t)b.node], b.shape, a);
+        if (!axesErr.empty())
+            return "node " + std::to_string(b.node) + ": " + axesErr;
+    }
+    return {};
 }
 
 }  // namespace vns

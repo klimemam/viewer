@@ -119,7 +119,11 @@ cmake --build build-mingw
 **通常はサーバ側の手作業は不要です。** 初回接続時は次の順で
 `~/.viewer/viewer-serve` を準備します。
 
-1. 既に動く protocol 14 以上の peer があればそのまま使う
+1. 既に動く protocol 15 の peer があればそのまま使う。protocol 14 は通常の
+   remote image/measure と既存 v1/v2 の canonical Reader carrier には互換だが、
+   現行 Reader writer は安全世代 v3 を常に出すため、新しい Reader 実行には peer の
+   更新が必要。v3 を v2 へ黙ってdowngradeしない。typed CHW/FCHW と blank-layout
+   narrow Stack の wire 自体も protocol 15 が必要で、旧peerには送信前に理由を表示する
 2. 手元の配布物／ビルドツリーにサーバ OS 用 `viewer-serve` があれば、ssh の標準入力で
    `.new` へ送り、実行権を付けて置き換える。**サーバ側の git / network は不要**
 3. 手元に対象バイナリが無い場合だけ、サーバ側の git + network で `binaries`

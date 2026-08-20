@@ -213,14 +213,17 @@
             check(!e2.empty() && e2.find("version 2") != std::string::npos,
                   "A3 a v1 file holding a set is refused, version named");
             // (c) a version from the future is refused by name, as ever
-            std::vector<std::pair<std::string, std::vector<uint8_t>>> v3 = v1;
-            v3[0] = { "__viewer", i32Npy(3) };
-            std::string p3 = (adir / "a3v3.npz").u8string();
-            writeNpz2(p3, v3);
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> v4 = v1;
+            v4[0] = { "__viewer", i32Npy(4) };
+            std::string p3 = (adir / "a3v4.npz").u8string();
+            writeNpz2(p3, v4);
             closeAll();
             std::string e3 = loadNpz(p3);
             check(!e3.empty() && e3.find("newer") != std::string::npos,
                   "A3 a future version is still refused by name");
+            check(!viewerNpzVersionError(3, 2).empty() &&
+                      !vns::versionError(3, 2).empty(),
+                  "A3 a generation-2 NPZ/stream reader refuses generation 3 whole");
         }
 
         // ---- A4: Ref resolution order (2.2), all three cases -------------------

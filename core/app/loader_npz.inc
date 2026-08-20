@@ -98,7 +98,8 @@ static std::string npyWriteFile(const std::string& path, const char* descr,
 //
 // The numbers now live in core/remote_proto.h, because since protocol 9 a
 // reading is also something this client SENDS (issue #124): the same four
-// values name the same four readings on the peer, and two lists of four
+// values name the same five readings on the peer (the fifth is typed-container
+// internal), and two lists of those
 // constants is exactly the shape of the bug #71 was. These names stay so that
 // every call site reads unchanged.
 enum NpyRead {
@@ -106,6 +107,7 @@ enum NpyRead {
     NR_STACK  = rp::NR_STACK,    // leading axis is frames: (F,H,W) / (F,H,W,C)
     NR_HWC    = rp::NR_HWC,      // 3-D as ONE frame, channels last:  (H,W,C), C = 1..4
     NR_CHW    = rp::NR_CHW,      // 3-D as ONE frame, planes first:   (C,H,W), C = 1..4
+    NR_FCHW   = rp::NR_FCHW,     // typed Stack only:                  (F,C,H,W), C = 1..4
 };
 
 // The four forms, spelled the way §3.2 spells them to a user.
@@ -236,7 +238,8 @@ static bool npyLayout(const std::vector<int64_t>& shape, const std::vector<int64
         if (iC >= 0) { C = shape[iC]; sc = strides[iC]; }
         // The transposed reading is never native (§3.4 deleted the implicit
         // CHW->HWC), so when it happens it happened because someone asked.
-        if (r == NR_CHW) addNote("planes first (C,H,W), as asked");
+        if (r == NR_CHW) addNote("planes first (C,H,W), as declared");
+        if (r == NR_FCHW) addNote("planes first (F,C,H,W), as declared");
     } else {                            // 0-D, 1-D, 5-D and up: not a picture
         err = npyNotNative(shape);
         return false;
@@ -269,6 +272,7 @@ static std::string npyReadLabel(const std::vector<int64_t>& shape, int r) {
     std::string note, err;
     if (!npyLayout(shape, st, r, F, sf, H, W, C, sh, sw, sc, note, err)) return {};
     const char* form = r == NR_HWC ? "(H,W,C)" : r == NR_CHW ? "(C,H,W)"
+                     : r == NR_FCHW ? "(F,C,H,W)"
                      : shape.size() == 4 ? "(F,H,W,C)" : shape.size() == 3 ? "(F,H,W)" : "(H,W)";
     return std::to_string((int)F) + (F == 1 ? " frame x " : " frames x ") +
            std::to_string((int)C) + " ch  " + form;
@@ -301,14 +305,18 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
 // frame axis, otherwise a single image. npyRead is the user's declaration
 // (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
 static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
-                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/) {
+                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/,
+                                 bool forceStack = false) {
     std::string err;
     int frames = 1;
     int64_t fstride = 0;
     auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
     if (!first) return err.empty() ? "decode failed" : err;
     std::string label = first->name;
-    if (frames <= 1) { addImage(std::move(first)); return {}; }
+    // A typed Stack remains a stack when F==1.  Layer identity is not inferred
+    // from cardinality: dropping this SeqInfo loses its timestamps, its Series
+    // member kind and its session identity.
+    if (frames <= 1 && !forceStack) { addImage(std::move(first)); return {}; }
 
     App::SeqInfo info;
     info.id = app.nextSeqId++;
@@ -653,11 +661,21 @@ static std::string npzSummary(const std::string& path, const std::vector<NpzMemb
 // file is an ordinary npz and the shape classifier owns it exactly as before -
 // the two readings never overlap, so docs/features/adapters/npz-design.md §2.5's human-written form is
 // untouched by anything here.
-// 2 since AnalysisSet (docs/features/adapters/reader-analysisset.md §4, "ras"): a version this
-// build WRITES nowhere - the harness names 2 on set-bearing files only, and
-// set-free files stay 1, so nothing that has no set moves at all. Reading 2
-// is what this constant grants; a 3 is still refused by name.
-static const int VIEWER_NPZ_VERSION = 2;
+// v1 already carried layer/layout and v2 added AnalysisSet. v3 is the safety
+// generation requiring their typed semantics to be enforced at materialise.
+// New harnesses always write 3; this reader accepts old v1 and v2 containers
+// under the same corrected boundary semantics as well.
+static const int VIEWER_NPZ_VERSION = 3;
+
+static std::string viewerNpzVersionError(int version,
+                                         int maxVersion = VIEWER_NPZ_VERSION) {
+    if (version <= maxVersion) return {};
+    char b[192];
+    snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
+                          "(this one reads %d) - the layer meanings may have changed",
+             version, maxVersion);
+    return b;
+}
 static std::string readerFileOf(const std::string& spec);   // fwd (§4.12, below)
 static std::string readerFuncOf(const std::string& spec);
 static std::string readerFor(const std::string& path);      // fwd (session.inc)
@@ -680,7 +698,7 @@ static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
 struct VnzNode {
     std::string layer;                 // "frame" "stack" "series" "batch" "analysisset"
     int parent = -1;
-    std::string name, note, cfa;
+    std::string name, note, cfa, layout;
     std::string role;                  // set child: the role it plays (ras §4)
     std::string refsJson;              // set node: the __refs_<i> JSON, verbatim
     bool hasPixels = false;
@@ -692,6 +710,39 @@ struct VnzNode {
     // filled while building
     int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
 };
+
+// Turn a typed node into the decoder reading that implements its declared
+// axes.  This is not the loose-.npy heuristic: an empty layout still means
+// Frame/HWC or Stack/FHWC because the layer is already known.  Validation is
+// shared with viewer-serve through vstream.h.
+static bool vnzPixelRead(const VnzNode& v, const std::vector<int64_t>& shape,
+                         int& read, std::string& err) {
+    vns::TreeNode t;
+    t.layer = v.layer;
+    t.parent = v.parent;
+    t.layout = v.layout;
+    vns::PixelAxes a;
+    err = vns::pixelAxes(t, shape, a);
+    if (!err.empty()) return false;
+    if (v.layout == "CHW") read = NR_CHW;
+    else if (v.layout == "FCHW") read = NR_FCHW;
+    else if (v.layer == "stack") read = NR_STACK;
+    else if (shape.size() == 3) read = NR_HWC;
+    else read = NR_NATIVE;                 // Frame (H,W)
+    return true;
+}
+
+// Only a loose .npy can be opened again under another axis declaration.  A
+// Viewer-NPZ / Reader document may retain the child array's npyShape so the
+// Inspector can truthfully say how it was read, but its path names the
+// container/origin rather than that child.  Re-running the loose-npy door
+// would therefore lose member/key identity (or create an unrelated document).
+// Keep the factual "read as" line and suppress only the re-read affordance.
+static bool npyReReadAvailable(const FrameSource& s) {
+    if (s.npyShape.empty()) return false;
+    if (!s.remoteKey.empty()) return false;
+    return !s.viewerMaterialized;
+}
 
 // How one RESERVED member's bytes are got. Two carriers since issue #217: the
 // zip in this process, and the MSG_NPZ_SCAN reply in which a peer sent every
@@ -957,6 +1008,7 @@ static std::string vnzCheckTree(const std::vector<VnzNode>& nodes, int n) {
     for (size_t i = 0; i < nodes.size(); i++) {
         t[i].layer = nodes[i].layer;
         t[i].parent = nodes[i].parent;
+        t[i].layout = nodes[i].layout;
     }
     return vns::checkTree(t, n);
 }
@@ -995,9 +1047,11 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
         if (!v.refsJson.empty() && v.layer != "analysisset")
             return "__refs_" + si + " on a " + v.layer + ": refs belong to the set node";
     }
-    // §4: only a set-bearing file names version 2 - and the converse holds
-    // too, so a hand-built "version 1 with a set" is refused rather than
-    // slipping past every viewer whose version gate is the whole protection.
+    // §4's historical minimum: AnalysisSet first became legal in carrier v2,
+    // so a hand-built "version 1 with a set" is refused rather than slipping
+    // past every viewer whose version gate is the whole protection. Current
+    // writers emit safety generation v3 for both set-free and set-bearing
+    // results; this predicate deliberately keeps existing v2 carriers valid.
     if (any && version < 2)
         return "this container holds an analysis set but names version " +
                std::to_string(version) + " - a set-bearing container is version 2, "
@@ -1022,6 +1076,13 @@ static std::string vnzCheckSets(const std::vector<VnzNode>& nodes, int n, int ve
 // is what keeps there from being two copies of the layer rules to drift apart.
 using VnzFetch = std::function<bool(int i, const VnzNode& v,
                                     std::vector<uint8_t>& out, std::string& err)>;
+// Header-only shape facts for every pixel member. The local carrier gets these
+// from nz::readFacts' bounded prefix inflate; the remote carrier gets the same
+// Fact bytes from SCAN. Keeping it separate from VnzFetch lets every node be
+// validated before the first potentially large pixel member is materialised.
+using VnzHeadFetch = std::function<bool(int i, const VnzNode& v,
+                                        std::vector<int64_t>& shape, std::string& err)>;
+using VnzPreflight = std::function<std::string(const std::vector<VnzNode>& nodes, int n)>;
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn,
@@ -1036,9 +1097,9 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
 // Header rules are the session file's: one key per line, the value is the rest
 // of the line, and a key this build does not know is skipped rather than
 // refused, so an older viewer still reads what it does understand.
-// 2 since AnalysisSet, same rule as the npz (ras §4): the harness writes 2 on
-// set-bearing streams ONLY; a set-free stream stays 1.
-static const int VIEWER_STREAM_VERSION = 2;
+// The local document parser shares the generation ceiling with the peer's
+// bounded scanner in vstream.h. It still reads the historical v1/v2 streams.
+static const int VIEWER_STREAM_VERSION = vns::STREAM_VERSION;
 
 // A .npy header for a blob the stream described, written into space reserved at
 // the front of the SAME buffer the bytes are read into. That is what lets the
@@ -1119,9 +1180,8 @@ static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (sscanf(line.c_str(), "VIEWERSTREAM %d", &ver) != 1)
         return "not a viewer stream: first line is \"" + line.substr(0, 60) + "\"";
-    if (ver > VIEWER_STREAM_VERSION)
-        return "this stream is version " + std::to_string(ver) + " and this viewer reads " +
-               std::to_string(VIEWER_STREAM_VERSION);
+    const std::string versionErr = vns::versionError(ver, VIEWER_STREAM_VERSION);
+    if (!versionErr.empty()) return versionErr;
     auto need = [&](int i) -> VnzNode* {
         if (i < 0 || i >= n) return nullptr;
         return &nodes[(size_t)i];
@@ -1166,6 +1226,7 @@ static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode
         else if (key == "name")   v->name = vnsUnescape(val);
         else if (key == "note")   v->note = vnsUnescape(val);
         else if (key == "cfa")    v->cfa = vnsUnescape(val);
+        else if (key == "layout") v->layout = vnsUnescape(val);
         else if (key == "range")  nums(val, v->range);
         else if (key == "timestamps") { nums(val, v->tsVals);   v->hasTs = true; }
         else if (key == "conditions") { nums(val, v->condVals); v->hasCond = true; }
@@ -1199,6 +1260,28 @@ static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode
         // inside its read loop; this carrier had no equivalent (F2).
         std::string terr = vnzCheckTree(nodes, n);
         if (!terr.empty()) return terr;
+    }
+    // Pixel ownership and axes are parts of the typed node boundary. Validate
+    // the whole declaration before vnzBuild creates the first document. The
+    // peer scanner runs these same vns gates; in particular, duplicate blobs
+    // cannot mean "last" here and "first" there.
+    std::vector<vns::TreeNode> typedNodes((size_t)n);
+    std::vector<int> pixelCounts((size_t)n, 0);
+    for (int i = 0; i < n; i++) {
+        typedNodes[(size_t)i].layer = nodes[(size_t)i].layer;
+        typedNodes[(size_t)i].parent = nodes[(size_t)i].parent;
+        typedNodes[(size_t)i].layout = nodes[(size_t)i].layout;
+    }
+    for (const VnzBlob& b : blobs) {
+        if (b.node < 0 || b.node >= n) return "a pixels blob names a node outside this tree";
+        pixelCounts[(size_t)b.node]++;
+    }
+    const std::string countErr = vns::checkPixelCounts(typedNodes, n, pixelCounts);
+    if (!countErr.empty()) return countErr;
+    for (const VnzBlob& b : blobs) {
+        vns::PixelAxes a;
+        const std::string aerr = vns::pixelAxes(typedNodes[(size_t)b.node], b.shape, a);
+        if (!aerr.empty()) return "node " + std::to_string(b.node) + ": " + aerr;
     }
     {   // the set structure, shared with the npz carrier (ras §4). This is the
         // door most sets arrive through - a reader's result comes down the pipe.
@@ -1266,15 +1349,12 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
                                  const std::map<std::string, size_t>& byName, int version,
                                  const std::string& readerSpec, const std::string& origin,
                                  const FrameSource& originStat, const VnzFetch& pixels,
+                                 const VnzHeadFetch& heads,
                                  std::vector<VnzNode>* nodesOut = nullptr,
-                                 int* nOut = nullptr) {
-    if (version > VIEWER_NPZ_VERSION) {
-        char b[192];
-        snprintf(b, sizeof b, "__viewer %d: this file was written by a newer viewer "
-                              "(this one reads %d) - the layer meanings may have changed",
-                 version, VIEWER_NPZ_VERSION);
-        return b;
-    }
+                                 int* nOut = nullptr,
+                                 const VnzPreflight& preflight = VnzPreflight{}) {
+    const std::string versionErr = viewerNpzVersionError(version);
+    if (!versionErr.empty()) return versionErr;
     std::string err;
     double nd = 0;
     if (!vnzNum(mem, byName, "__n", nd, err))
@@ -1312,6 +1392,7 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
         nd2.name = vnzStr(mem, byName, "__name_" + si);
         nd2.note = vnzStr(mem, byName, "__note_" + si);
         nd2.cfa  = vnzStr(mem, byName, "__cfa_" + si);
+        nd2.layout = vnzStr(mem, byName, "__layout_" + si);
         // the set members (ras §4). refs come back WHOLE (full=true): the JSON
         // is machine-read and a display cap would truncate a path mid-escape.
         if (byName.count("__role_" + si))
@@ -1360,11 +1441,11 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
         const VnzNode& v = nodes[(size_t)i];
         if (v.layer == "series") {
             if (!kids[(size_t)i])
-                return "node " + std::to_string(i) + " is a series with no stacks";
+                return "node " + std::to_string(i) + " is a series with no members";
             if (v.hasCond && (int)v.condVals.size() != kids[(size_t)i]) {
                 char b[192];
                 snprintf(b, sizeof b, "__conditions_values_%d has %d value(s) but the series "
-                                      "holds %d stack(s) - one condition per stack, and a "
+                                      "holds %d member(s) - one condition per member, and a "
                                       "partial mapping would lie about the rest",
                          i, (int)v.condVals.size(), kids[(size_t)i]);
                 return b;
@@ -1377,6 +1458,28 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
     {
         std::string serr = vnzCheckSets(nodes, n, version);
         if (!serr.empty()) return serr;
+    }
+    // The complete typed pixel boundary is checked before vnzBuild creates a
+    // batch, sequence or document. This is intentionally carrier-independent:
+    // a local .npz, its remote SCAN facts and a reader stream cannot disagree
+    // about Series having no tensor, CHW/FCHW ownership, or C=1..4. In
+    // particular, a malformed later node cannot leave earlier documents behind.
+    for (int i = 0; i < n; i++) {
+        const VnzNode& v = nodes[(size_t)i];
+        if (!v.hasPixels) continue;
+        std::vector<int64_t> shape;
+        std::string herr;
+        if (!heads(i, v, shape, herr))
+            return "__pixels_" + std::to_string(i) + ": " + herr;
+        int ignoredRead = NR_NATIVE;
+        if (!vnzPixelRead(v, shape, ignoredRead, herr))
+            return "__pixels_" + std::to_string(i) + ": " + herr;
+    }
+    // Transport-specific gates that depend only on the declaration run here,
+    // after it is valid but before vnzBuild creates a batch or a document.
+    if (preflight) {
+        const std::string perr = preflight(nodes, n);
+        if (!perr.empty()) return perr;
     }
 
     // __meta_* is a reserved member like any other, so it comes through the
@@ -1776,6 +1879,16 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
             firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
             break;
         }
+        NpyHead typedHead;
+        if (!npyPeekHeader(member, typedHead, mErr)) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+            break;
+        }
+        int typedRead = NR_NATIVE;
+        if (!vnzPixelRead(v, typedHead.shape, typedRead, mErr)) {
+            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+            break;
+        }
         size_t before = app.images.size();
         // The fallback name counts POSITION AMONG SIBLINGS, from zero - so the
         // first stack of a series is ":0" and lines up with stacks[0] in the
@@ -1790,7 +1903,8 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                 nodes[(size_t)k].layer != "analysisset")
                 ord++;
         std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(ord) : v.name;
-        std::string lErr = loadNpyBuffer(member, origin, label);
+        std::string lErr = loadNpyBuffer(member, origin, label, typedRead,
+                                         v.layer == "stack");
         if (!lErr.empty()) {
             firstErr = "__pixels_" + std::to_string(i) + ": " + lErr;
             break;
@@ -1807,6 +1921,11 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
         for (int k = 0; k < v.docCount; k++) {
             ImageDoc* d = app.images[(size_t)v.docFirst + (size_t)k].get();
             d->src->member = "__pixels_" + std::to_string(i);
+            // This fact comes from the successfully validated `__viewer`
+            // declaration that selected vnzBuild, never from the reserved-
+            // looking member name.  Ordinary NPZ is allowed to contain an
+            // array literally named "__pixels_0" (§4.11.1).
+            d->src->viewerMaterialized = true;
             // the CALLER's stat, taken before the origin's bytes were read
             // (identity before bytes, §6.2): a stat taken here, after the
             // multi-second container decode, could bind NEW disk state to OLD
@@ -1904,15 +2023,30 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
             VnzNode& par = nodes[(size_t)v.parent];
             int slot = par.memberSeen++;
             for (auto& s : app.series)
-                if (s.id == par.seriesId && v.seqId) {
+                if (s.id == par.seriesId) {
                     App::Series::Member m;
-                    m.seqId = v.seqId;
+                    if (v.layer == "stack") {
+                        if (!v.seqId) {
+                            firstErr = "node " + std::to_string(i) +
+                                       " is a stack but did not build a stack identity";
+                            break;
+                        }
+                        m.seqId = v.seqId;
+                    } else {
+                        if (v.seqId || v.docCount != 1 || v.docFirst < 0) {
+                            firstErr = "node " + std::to_string(i) +
+                                       " is a frame but did not build one standalone frame";
+                            break;
+                        }
+                        m.frameUid = app.images[(size_t)v.docFirst]->uid;
+                    }
                     // No unit does NOT mean no value (§4.3.2): Member::value is
                     // NaN when unset, and these are set.
                     if (par.hasCond && slot < (int)par.condVals.size())
                         m.value = par.condVals[(size_t)slot];
                     s.members.push_back(m);
                 }
+            if (!firstErr.empty()) break;
         }
     }
     // The sets, while the call's batch is still the load target: a Ref that
@@ -2005,6 +2139,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
             if (nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".npy") == 0)
                 byName[nm.substr(0, nm.size() - 4)] = i;
         }
+        const std::vector<nz::Fact> facts = nz::readFacts(zip, entries);
         auto mem = [&](const std::string& nm, std::vector<uint8_t>& out,
                        std::string& e) -> bool {
             auto it = byName.find(nm);
@@ -2015,7 +2150,19 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
                           std::string& e) {
             return npzExtract(zip, entries[v.pixelEntry], out, e);
         };
-        return loadViewerNpz(mem, byName, vver, readerSpec, src, zipStat, pixels);
+        auto heads = [&](int, const VnzNode& v, std::vector<int64_t>& shape,
+                         std::string& e) -> bool {
+            const nz::Fact* fact = nullptr;
+            for (const nz::Fact& f : facts)
+                if (f.entry == v.pixelEntry) { fact = &f; break; }
+            if (!fact) { e = "the pixel member has no header fact"; return false; }
+            if (!fact->err.empty()) { e = fact->err; return false; }
+            NpyHead H;
+            if (!npyPeekHeader(fact->bytes, H, e)) return false;
+            shape = H.shape;
+            return true;
+        };
+        return loadViewerNpz(mem, byName, vver, readerSpec, src, zipStat, pixels, heads);
     }
     std::vector<NpzMember> mem = npzScan(zip, entries);
     if (mem.empty()) return "no arrays in npz";

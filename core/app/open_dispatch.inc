@@ -514,6 +514,9 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
         j.key = kd->remoteKey;
         j.node = kd->remoteNode;
         j.keyKind = kd->remoteKeyKind;
+        j.keyedRead = kd->remoteKeyRead;
+        j.keyLayout = kd->remoteKeyLayout;
+        j.keyRequires15 = kd->remoteKeyRequires15;
     } else if (!si->remoteFiles.empty()) {
         j.url = makeRemoteUrl(si->remoteHost, si->remoteFiles[0], si->remotePort);
         for (const auto& f : si->remoteFiles) j.files.push_back(f);
@@ -2096,6 +2099,9 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         S.remoteKey = kd->key;
         S.remoteNode = kd->node;
         S.remoteKeyKind = kd->kind;
+        S.remoteKeyRead = npyRead;
+        S.remoteKeyLayout = kd->layout;
+        S.remoteKeyRequires15 = kd->requires15;
     }
     S.member = member;
     // The recipe this open was made under, recorded on the SOURCE. Two reasons
@@ -2409,6 +2415,9 @@ static std::string remoteReaderPrepare(const std::string& url, const std::string
 struct VnzWire {
     int node = 0;                 // what the PEER called this node's array
     int step = 1;                 // the decimation its first fetch settled on
+    int wireRead = NR_NATIVE;     // reading put on later META/TILE/MEASURE wires
+    std::string layout;           // local-only pre-v15 refusal evidence
+    bool requires15 = false;      // also covers blank-layout narrow Stack
 };
 
 static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>& nodes,
@@ -2416,14 +2425,21 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
                              const std::map<int, VnzWire>& wireOf);   // fwd (below)
 
 static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref,
-                             const std::vector<int64_t>& shape,
+                             const std::vector<int64_t>& shape, int logicalRead, int wireRead,
                              std::vector<uint8_t>& out, int& stepOut, std::string& e) {
     remote::Meta m;
-    if (!app.uiSession.meta(url, m, e, 0, nullptr, &ref)) return false;
+    if (!app.uiSession.meta(url, m, e, wireRead, nullptr, &ref)) return false;
     const size_t rank = shape.size();
     int iF = -1, iH = -1, iW = -1, iC = -1;
     if (rank == 2) { iH = 0; iW = 1; }
-    else if (!rp::npyReadAxes(rank, rp::npyNativeRead(shape), iF, iH, iW, iC)) {
+    else {
+        int r = logicalRead == NR_NATIVE ? rp::npyNativeRead(shape) : logicalRead;
+        if (!rp::npyReadAxes(rank, r, iF, iH, iW, iC)) {
+            e = rp::npyNotThatWayText(shape);
+            return false;
+        }
+    }
+    if (iH < 0 || iW < 0) {
         e = rp::npyNotNativeText(shape);
         return false;
     }
@@ -2450,7 +2466,8 @@ static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref
         // shape rule as (H,W,C) - the same samples under a different meaning,
         // which is the one thing decimation may never cost. So that case is
         // fetched whole instead.
-        if (rank < 3 || rp::npyNativeRead(dec) == rp::npyNativeRead(shape)) break;
+        if (logicalRead != NR_NATIVE || rank < 3 ||
+            rp::npyNativeRead(dec) == rp::npyNativeRead(shape)) break;
         step = 1;
     }
     stepOut = step;
@@ -2460,22 +2477,50 @@ static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref
     const size_t esz = rp::dtypeSize(dt);
     const size_t per = (size_t)dec[(size_t)iH] * (size_t)dec[(size_t)iW] *
                        (size_t)(iC >= 0 ? dec[(size_t)iC] : 1) * esz;
+    size_t elems = 1;
+    for (int64_t d : dec) {
+        if (d < 1 || (size_t)d > (size_t)-1 / elems) {
+            e = "typed array is too large to materialise";
+            return false;
+        }
+        elems *= (size_t)d;
+    }
+    if (esz && elems > ((size_t)-1 - 256) / esz) {
+        e = "typed array is too large to materialise";
+        return false;
+    }
     const size_t pre = writeNpyHeaderFor(out, npyDt, dec);
-    out.resize(pre + per * (size_t)wantF);
+    out.resize(pre + elems * esz);
+    // C-order strides in the declaration's own order. TILE is HWC per logical
+    // frame, so every sample is scattered back to the CHW/FCHW position the
+    // rebuilt .npy header declares. Direct memcpy would label HWC bytes CHW.
+    std::vector<size_t> stride(rank, 1);
+    for (size_t k = rank; k-- > 1; ) stride[k - 1] = stride[k] * (size_t)dec[k];
     for (int64_t f = 0; f < wantF; f++) {
         std::vector<uint8_t> raw;
         int tw = 0, th = 0, tch = 0;
         uint32_t rdt = 0;
         if (!app.uiSession.tileBytes(url, (int)f, 0, 0, m.w, m.h, step, raw,
-                                     tw, th, tch, rdt, e, 0, nullptr, &ref))
+                                     tw, th, tch, rdt, e, wireRead, nullptr, &ref))
             return false;
-        if (rdt != dt || raw.size() != per) {
+        if (rdt != dt || tw != (int)dec[(size_t)iW] ||
+            th != (int)dec[(size_t)iH] || tch != (int)wantC || raw.size() != per) {
             e = "the peer returned " + std::to_string(raw.size()) +
                 " bytes for frame " + std::to_string(f) + " and this viewer sized " +
                 std::to_string(per);
             return false;
         }
-        memcpy(out.data() + pre + per * (size_t)f, raw.data(), per);
+        for (int64_t y = 0; y < dec[(size_t)iH]; y++)
+            for (int64_t x = 0; x < dec[(size_t)iW]; x++)
+                for (int64_t c = 0; c < wantC; c++) {
+                    size_t dst = (size_t)y * stride[(size_t)iH] +
+                                 (size_t)x * stride[(size_t)iW];
+                    if (iF >= 0) dst += (size_t)f * stride[(size_t)iF];
+                    if (iC >= 0) dst += (size_t)c * stride[(size_t)iC];
+                    const size_t src = ((size_t)y * (size_t)tw + (size_t)x) *
+                                       (size_t)tch + (size_t)c;
+                    memcpy(out.data() + pre + dst * esz, raw.data() + src * esz, esz);
+                }
     }
     return true;
 }
@@ -2546,7 +2591,6 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
         app.readerLastOut = m;
         return m;
     }
-
     // The tiles come through the UI thread's session, not the job thread's -
     // that one has already been closed, and the pixels a document goes on
     // needing belong to the session every other document fetches through.
@@ -2558,6 +2602,28 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
         if (!ensureUiSession(h2, serr, port2)) {
             app.readerLastOut = "remote: " + serr;
             return "remote: " + serr;
+        }
+    }
+    // A real v12-v14 peer ignores named layout when it opens the cached blob.
+    // This check deliberately follows ensureUiSession: asynchronous RUN uses a
+    // different worker Session, and a previously connected UI session may name
+    // another host/version. The session that will send META/TILE is now the one
+    // whose HELLO we inspect. Decide before vnzBuild creates anything.
+    if (app.uiSession.peerVersion() < 15) {
+        for (const VnzBlob& b : blobs) {
+            if (b.node < 0 || b.node >= n) continue;
+            const VnzNode& v = nodes[(size_t)b.node];
+            int logicalRead = NR_NATIVE;
+            std::string aerr;
+            if (!vnzPixelRead(v, b.shape, logicalRead, aerr)) return aerr;
+            if (!v.layout.empty() || npyKeyRead(b.shape, logicalRead) != NR_NATIVE) {
+                const std::string kind = !v.layout.empty() ? "Reader " + v.layout
+                                                           : "Reader Stack/FHW";
+                const std::string m = rp::typedAxesTooOldText(
+                    app.uiSession.peerVersion(), baseName(url), kind);
+                app.readerLastOut = m;
+                return m;
+            }
         }
     }
     // identity BEFORE the bytes (§6.2). For a local:// url the peer reads this
@@ -2575,13 +2641,20 @@ static std::string remoteReaderLand(const std::string& url, const std::string& s
                      std::string& e) -> bool {
         if (v.pixelEntry >= blobs.size()) { e = "that node declared no pixels"; return false; }
         remote::KeyedRef ref{ run.key, i, remote::KeyedRef::FromReader };
+        ref.layout = v.layout;
+        int logicalRead = NR_NATIVE;
+        if (!vnzPixelRead(v, blobs[v.pixelEntry].shape, logicalRead, e)) return false;
+        const bool requires15 = !v.layout.empty() ||
+                                npyKeyRead(blobs[v.pixelEntry].shape, logicalRead) != NR_NATIVE;
+        ref.requires15 = requires15;
         int step = 1;
-        if (!remoteKeyedArray(url, ref, blobs[v.pixelEntry].shape, out, step, e)) return false;
+        if (!remoteKeyedArray(url, ref, blobs[v.pixelEntry].shape,
+                              logicalRead, NR_NATIVE, out, step, e)) return false;
         // A reader's address IS the tree index - the .vstream declares its
         // nodes with these very numbers - so the two halves of VnzWire are
         // equal here and differ for a container. Recorded either way, at the
         // one place that made the request, rather than assumed later.
-        wireOf[i] = { i, step };
+        wireOf[i] = { i, step, NR_NATIVE, v.layout, requires15 };
         return true;
     };
 
@@ -2653,6 +2726,14 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
             S.remoteNode = node;
             S.remoteKeyKind = kind;
             S.remoteProto = app.uiSession.peerVersion();
+            // Preserve vnzBuild's logical npyRead: it is identity, session and
+            // UI truth. Later peer requests use a separate wire reading. A
+            // reader owns its axes in its cached stream header (native wire),
+            // while a typed .npz member sends CHW/FCHW explicitly. The named
+            // layout rides locally so a new pre-15 Session refuses either one.
+            S.remoteKeyRead = it->second.wireRead;
+            S.remoteKeyLayout = it->second.layout;
+            S.remoteKeyRequires15 = it->second.requires15;
             if (step > 1) requestFullRemote(d);
             // The STACK's own facts, from the node that declared them. vnzBuild
             // puts a container's `__cfa_i` on every ImageDoc and leaves SeqInfo
@@ -2773,9 +2854,29 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
         // sibling frame, its statistics - has to quote the same number this one
         // did or it addresses a different array.
         remote::KeyedRef ref{ sc.key, (int)f.entry, remote::KeyedRef::FromNpz };
+        ref.layout = v.layout;
+        int logicalRead = NR_NATIVE;
+        if (!vnzPixelRead(v, H.shape, logicalRead, e)) return false;
+        const int wireRead = npyKeyRead(H.shape, logicalRead);
+        const bool requires15 = !v.layout.empty() || wireRead != NR_NATIVE;
+        ref.requires15 = requires15;
         int step = 1;
-        if (!remoteKeyedArray(url, ref, H.shape, out, step, e)) return false;
-        wireOf[i] = { (int)f.entry, step };
+        if (!remoteKeyedArray(url, ref, H.shape, logicalRead, wireRead,
+                              out, step, e)) return false;
+        wireOf[i] = { (int)f.entry, step, wireRead, v.layout, requires15 };
+        return true;
+    };
+    auto heads = [&](int, const VnzNode& v, std::vector<int64_t>& shape,
+                     std::string& e) -> bool {
+        if (v.pixelEntry >= sc.members.size()) {
+            e = "that node declared no pixels";
+            return false;
+        }
+        const nz::Fact& f = sc.members[v.pixelEntry];
+        if (!f.err.empty()) { e = f.err; return false; }
+        NpyHead H;
+        if (!npyPeekHeader(f.bytes, H, e)) { e = f.name + ": " + e; return false; }
+        shape = H.shape;
         return true;
     };
     // identity BEFORE the bytes (§6.2). For a local:// url the peer reads this
@@ -2787,14 +2888,35 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
     originStat.path = url;
     std::vector<VnzNode> nodes;
     int n = 0;
+    auto preflight = [&](const std::vector<VnzNode>& parsed, int count) -> std::string {
+        for (int i = 0; i < count; i++) {
+            const VnzNode& v = parsed[(size_t)i];
+            if (!v.hasPixels) continue;
+            std::vector<int64_t> shape;
+            std::string e;
+            if (!heads(i, v, shape, e)) return "__pixels_" + std::to_string(i) + ": " + e;
+            int logicalRead = NR_NATIVE;
+            if (!vnzPixelRead(v, shape, logicalRead, e))
+                return "__pixels_" + std::to_string(i) + ": " + e;
+            const int wireRead = npyKeyRead(shape, logicalRead);
+            if (app.uiSession.peerVersion() < 15 &&
+                (!v.layout.empty() || wireRead != NR_NATIVE)) {
+                const std::string kind = !v.layout.empty() ? "container " + v.layout
+                                                           : "container Stack/FHW";
+                return rp::typedAxesTooOldText(app.uiSession.peerVersion(),
+                                               baseName(url), kind);
+            }
+        }
+        return {};
+    };
     // vnzBuild fills docFirst/docCount on the nodes, which is what the refine
     // pass below needs - so the vector has to outlive the call, and
     // loadViewerNpz owns it. It is handed back through the two out-parameters
     // rather than rebuilt here, for the reason everything else in this file is
     // shared: a second reader of a declaration is a second tree.
     const std::string err = loadViewerNpz(mem, byName, sc.containerVersion,
-                                          std::string(), url, originStat, pixels,
-                                          &nodes, &n);
+                                          std::string(), url, originStat, pixels, heads,
+                                          &nodes, &n, preflight);
     if (!err.empty()) return err;
     remoteTreeRefine(url, nodes, n, sc.key, remote::KeyedRef::FromNpz, wireOf);
     return {};
