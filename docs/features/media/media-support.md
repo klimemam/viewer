@@ -1,13 +1,22 @@
-# メディア対応の設計検討 — OpenEXR / 動画再生 / click-to-open UX
+# メディア対応 — 現行仕様と実装前の判断記録
 
-将来判断のための調査メモ(LOW PRIORITY、実装なし)。前提: C++17 / FetchContent /
-重い依存を嫌う([CMakeLists.txt](../../../CMakeLists.txt))、ImageDoc は float32 plane
-1〜4ch([core/main.cpp](../../../core/main.cpp) `struct ImageDoc`)、stack = 時間解析の単位、
-remote は npy のみ配信([core/serve.cpp](../../../core/serve.cpp))。
+**状態: 実装済み。** 現行の native 形式は PNG / JPEG / ベンダ RAW / TIFF /
+OpenEXR / y4m で、`.npy` / `.npz` / ヘッダ無し RAW は別の native 経路にある。
+peer は protocol 10 以降 PNG / JPEG / TIFF / 単一 document の OpenEXR / y4m を配信する。
+複数 named layer の OpenEXR は現行 wire が layer を指せないためリモートでは拒否し、
+ベンダ RAW は LibRaw の配布条件により native ではローカル専用である。Browse の単クリック preview と
+正式 open の分離も実装済み。
+
+この文書の §1〜§3 は**実装前の候補比較・段階案**を、各節の「実装結果」注記とともに
+残した判断記録である。現行の読める範囲と拒否条件は
+[input-adapters.md](../adapters/input-adapters.md) §3.6、動画の現行契約は
+[video-support.md](video-support.md)、操作は [manual.md](../../guides/manual.md) §2.3b を正とする。
+当時の前提は C++17 / FetchContent / 重い依存を嫌う、ImageDoc は float32 plane
+1〜4ch、stack = 時間解析の単位、だった。
 
 ---
 
-## 1. OpenEXR 対応
+## 1. OpenEXR 対応 — 実装前比較と実装結果
 
 > **状態: 実装済み (2026-08-09、#53)。以下の比較検討は当時のまま残す。**
 >
@@ -32,15 +41,16 @@ remote は npy のみ配信([core/serve.cpp](../../../core/serve.cpp))。
 > | `viewer.exe` | 9,141,893 B | 12,293,548 B | **+3,151,655 B (+3.01 MiB、+34.5%)** |
 > | `viewer-serve.exe` | 3,352,097 B | 3,352,097 B | **0 —— sha256 まで同一** |
 >
-> ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、cold tree でしか
+> ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、クリーンなビルドでしか
 > 起きない。バイナリの増分は実コード(使わなければリンカが落とすため)。
 >
-> **この2つの数字を 0 に戻す方法はもう無い** (#53 の裁定、2026-08-09 ——
+> **この2つの増分を 0 に戻す構成はもう無い** (#53 の裁定、2026-08-09 ——
 > 「既定ONで。OFFにするパスは不要です」)。上の表の「なし」列は、この節が
 > 書かれた時点の測定として残す —— 再現できる構成ではない。`VIEWER_WITH_EXR`
 > option は削除済み。**代償**は「オフラインの clean clone が、システムに
-> OpenEXR/Imath が無いとビルドできない」こと (manual.md 付録「ビルドと
-> ネットワーク」、CMakeLists.txt の OpenEXR ブロック)。
+> OpenEXR/Imath が無いとビルドできない」こと ([manual.md](../../guides/manual.md)
+> 付録「ビルドとネットワーク」、[CMakeLists.txt](../../../CMakeLists.txt) の
+> OpenEXR ブロック)。
 >
 > **peer は形式を増やさない** (下の「remote への波及」の案 (a))。`viewer-serve`
 > が `core/imagefile.cpp` をコンパイルしないという1つの事実がそれを保証していて、
@@ -48,8 +58,9 @@ remote は npy のみ配信([core/serve.cpp](../../../core/serve.cpp))。
 > (#148 判断 B、下の「remote への波及」の追記)。peer は `core/imagefile.cpp` を
 > コンパイルする。
 
-必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
-読むことだけ。deep / tiled / multipart は当面対象外。
+当初の最小要件は scanline RGB/Y の half/float を**画素値そのまま**
+(トーンマップなし)で読むことだった。実装後は1レベル tiled も読み、deep / multipart /
+mipmap / ripmap は名指しで断る。
 
 ### 候補比較
 
@@ -75,7 +86,7 @@ remote は npy のみ配信([core/serve.cpp](../../../core/serve.cpp))。
 TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../../../core/remote_proto.h))なので、
 サーバ側で EXR→f32 に落として `DT_F32` を返せば**プロトコル変更ゼロ**(案 b)。
 ただし loader が main.cpp 内にある現状では serve.cpp から呼べない。
-**推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` 的な
+**推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` のような
 共有 TU へ切り出す整理(toFloatSamples と同じ共有パターン)ができた時点で (b) を足す。
 
 > **(b) に移行した (issue #148 判断 B, 2026-08-10)。** 共有 TU は
@@ -94,9 +105,13 @@ TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../../../core/rem
 
 ---
 
-## 2. 動画再生(再生だけ)
+## 2. 動画再生 — 実装前検討
 
-IQ エンジニアが動画にすること = scrub / frame step / A/B 比較 / per-frame stats。
+> **実装結果:** ffmpeg-pipe 案は採らず、非圧縮で画素値を保つ y4m の輝度プレーンだけを
+> native 対応した。現行仕様・実測・拒否理由は [video-support.md](video-support.md)。
+> y4m は peer でも開ける。
+
+IQ エンジニアが動画で必要とする操作は、scrub / frame step / A/B 比較 / per-frame stats。
 これは**既存の stack モデルそのもの**(動画 = 遅延デコードされる stack)。
 リアルタイム再生・音声は要件ではない。
 
@@ -104,7 +119,7 @@ IQ エンジニアが動画にすること = scrub / frame step / A/B 比較 / p
 |---|---|
 | (a) libav を FetchContent | 巨大(ビルド時間・バイナリとも)。静的リンクは LGPL 義務(再リンク手段の提供)+ GPL 部品混入リスク。この repo には過剰 |
 | (b) OS デコーダ (MF / AVFoundation) | OS 毎に別実装 ×2、**Linux に可搬な話がない**。remote peer は Linux 計算機なので致命的 |
-| (c) pl_mpeg 系単一ヘッダ | MIT・約 3000 行で見事だが **MPEG1 限定**。実務の H.264/265 が開けない。玩具止まり |
+| (c) pl_mpeg 系単一ヘッダ | MIT・約 3000 行と小規模だが **MPEG1 限定**。実務の H.264/265 が開けない。試用の範囲に留まる |
 | (d) **PATH 上の ffmpeg にパイプ** | リンク時依存ゼロ、ライセンス義務なし(別プロセス)、無ければ機能が消えるだけ。pfd が zenity に shell out するのと同じ、この repo の流儀 |
 
 **推奨: (d) ffmpeg-pipe。**
@@ -117,16 +132,22 @@ IQ エンジニアが動画にすること = scrub / frame step / A/B 比較 / p
   `gbrpf32le` 等)。「codec を通った値の測定」である旨と、色変換・range 指定を
   Inspector の note に記録する。
 - ffmpeg 不在時: 拡張子は見えるが「ffmpeg が PATH にありません」と言って開かない。
-  静かに劣化、依存は増えない。
+  動画機能だけを無効にし、依存は増やさない。
 - Phase 2(必要になったら): `-ss` シークで budget 窓をスライドする遅延デコード。
   remote は serve 側で同じ ffmpeg-pipe を張り f32 TILE を返す形に自然に伸びる。
 
 ---
 
-## 3. click-to-open UX(preview と登録 open の分離)
+## 3. click-to-open UX — 実装前案と実装結果
 
-現状: browser / Remote パネルの 1 クリック = 登録 open(Files に入り、remote なら
-step>1 preview + **裏でフル解像度 fetch まで走る**)。メディア閲覧には重い。
+> **実装結果:** Browse のファイル行は単クリック／矢印移動で使い捨て preview、
+> ダブルクリック／Enter で正式 open になった。preview は Files に登録せず、
+> 次の preview で置き換える。protocol 越しに geometry が分かる形式は local:// と
+> ssh:// の両方で同じ経路を使う。ベンダ RAW、ヘッダ無し RAW、`.npz` のように
+> preview 前の選択・宣言が要る形式は単クリックで選択だけを行う。
+
+以下は実装前の状態と段階案。当時は browser / Remote パネルの 1 クリックが登録 open
+(Files に入り、remote なら step>1 preview + 裏でフル解像度 fetch)だった。
 
 他ツールの解法: VSCode = single-click で斜体の transient tab(1 枠を再利用、編集で
 pin)/ FastStone・IrfanView = ブラウズペイン自体が viewer / macOS Quick Look =
@@ -141,20 +162,20 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
   走らせる / compare B に選ぶ / session 保存 — どれかで transient フラグが外れ
   通常 open になる(VSCode の「編集で pin」に対応。**測ったものは記録に残る**、
   という本ツールの性格に合う)。
-- remote との相互作用が一番おいしい: preview は既存の step>1 fetch **だけ**で止め、
+- remote では特に効果が大きい: preview は既存の step>1 fetch **だけ**で止め、
   フル解像度の背景 fetch は昇格まで遅延。現状「クリックのたびフル 1 枚転送」が消える。
 - stack / group: preview は先頭 1 フレームのみ。昇格で従来の budget 付き prefetch。
   動画: preview は poster frame 1 枚。
-- 移行リスク: 「1 クリック = open」に馴染んだ手が誤爆する。対応:
+- 移行リスク: 「1 クリック = open」に慣れた利用者が誤操作する可能性がある。対応:
   1. まず **Space = Quick Look 風 preview を追加するだけ**(クリック挙動不変、
-     リスクゼロ)で価値検証。
+     既存操作への影響なし)で価値検証。
   2. 次リリースで設定 `Browser click: preview first (new) / open immediately
      (classic)` を追加、classic 既定 + 初回 hint toast。
   3. 定着を見て new を既定に反転。double-click/Enter はどのモードでも登録 open。
 
 ---
 
-## 推奨フェージング(GO が出た場合)
+## 当初の推奨段階と実装結果
 
 | Phase | 内容 | 規模感 |
 |---|---|---|
@@ -164,7 +185,8 @@ Space で消える preview。共通原理は「**見るだけの状態を安く�
 | D | loader 共有 TU 化 + serve 側 EXR(f32 TILE、プロトコル不変) | S〜M |
 | E | 動画の窓デコード / remote 動画 | L(必要が立証されてから) |
 
-A→B→C の順を推す: A は独立で安い。B は C の前提(動画こそ preview が要る)。
+これは当時の提案順である。実際には OpenEXR は tinyexr ではなく公式 OpenEXR、
+動画は ffmpeg-pipe ではなく y4m、preview は Browse の一時 slot として実装した。
 
 参考: [tinyexr](https://github.com/syoyo/tinyexr) /
 [tinyexr CVE 一覧](https://www.cvedetails.com/product/46936/Tinyexr-Project-Tinyexr.html?vendor_id=18510) /

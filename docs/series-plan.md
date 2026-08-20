@@ -1,7 +1,13 @@
-# 実装計画: series (系列) — 第4の層をコードに入れる
+# 実装計画: series (系列) をコードに入れる
 
-正典は [terminology.md](terminology.md)。`frame ⊂ stack ⊂ series ⊂ batch` は**厳密**、層の省略は可・飛び越しは不可、
-**series は1つの batch に収まる**。各 phase は単独で出荷できる。
+> **状態: phase 1〜5 実装済み。** 任意の phase 6（Files の multi-select）だけは
+> 未実装である。§0 の「現状」と各 phase の予定形は、設計着手時の制約と実装順を
+> 保存した履歴として読む。現行のデータモデルは §1 の mixed frame / stack member。
+
+正典は [terminology.md](terminology.md)。順序付きデータ層は
+`frame ≼ stack ≼ series` (`≼` は集合包含ではない)。中間層の省略は可、逆転は
+不可。**series と各メンバは同じ1つの batch に `managed-by` される**。
+各 phase は単独で出荷できる。
 
 ## 0. 設計を縛る現状
 
@@ -17,19 +23,26 @@
 
 ```c++
 struct Series {
-    int id = 0, batchId = 0;                  // 属する batch (厳密包含)
+    int id = 0, batchId = 0;                  // この series を管理する batch
     std::string name;                         // 初期値 "<batch名> 掃引"、リネーム可
     std::string paramName;                    // "illuminance" / "exposure" ...
     char unit[16] = "";                       // 空 = 未設定。既定で "lx" にしない
     int kind = KLinearity;                    // linearity / PTC / temperature / other
-    struct Member { int seqId; double value = NaN; bool include = true; };
+    struct Member {
+        int seqId = 0;                        // stack メンバ
+        double value = NaN;
+        bool include = true;
+        uint64_t frameUid = 0;                // standalone frame メンバ
+        int fold = 0;                         // stack が frame として立つ集約
+    };                                        // seqId/frameUid は必ず片方だけ
     std::vector<Member> members;              // 順序 = 表示順（値順ソートはボタン）
 };
 std::vector<Series> series; int nextSeriesId = 1; int curSeriesId = 0;
 ```
 
 **メンバシップは `Series::members` が唯一の真実**。`SeqInfo::seriesId` は置かない（二重管理は必ずずれる）。逆引き
-`seriesOfStack(seqId)` は線形走査 — series は数個・メンバは数十、Files は `imagesRev`/`seriesRev` でキャッシュを作り直す。
+`seriesOfStack(seqId)` / `seriesOfFrame(frameUid)` は線形走査 — series は数個・
+メンバは数十、Files は `imagesRev`/`seriesRev` でキャッシュを作り直す。
 
 **`SeqInfo::level` は削除し、値は `Member::value` へ移す。** level は**単位とパラメータ名が無ければ意味を持たない量**で、それらは
 series の持ち物だから。stack に残すのは「単位はアプリで1つ、値は stack 毎」＝*暗黙の単一 series* を残すこと。値・順序・include
@@ -37,10 +50,14 @@ series の持ち物だから。stack に残すのは「単位はアプリで1つ
 
 不変条件（phase 1 の selftest で全数検査）:
 
-1. 全メンバの stack は実在し、その frame の `batchId == series.batchId`。
-2. 1 stack は**高々1つの** series に属する（追加時に旧 series から外す）。
-3. `closeStack` はメンバから外し、`closeBatch` は自分の series を消す。メンバ 0 は `pruneEmptySeries()` が削除。
-4. `moveStackToBatch(member)` は**その stack を series から外す**（toast で明示）。series ごと動かすのは series 行の方。
+1. 各メンバは実在する stack または standalone frame のどちらか一方で、
+   その `batchId == series.batchId` (`managed-by` の整合)。
+2. 1 stack / standalone frame は**高々1つの** series のメンバになる
+   （追加時に旧 series から外す）。
+3. stack / standalone frame を閉じればメンバから外し、`closeBatch` はその batch
+   が管理する series を消す。メンバ 0 は `pruneEmptySeries()` が削除。
+4. メンバだけを別 batch へ移すと、**そのメンバを series から外す**（toast で
+   明示）。series ごと動かすのは series 行の方。
 5. メンバ 1 個以下の series は**合法**（作りかけ）だが `seriesCanFit()==false`。
 6. `value` が NaN のメンバは「未設定」と表示し fit から除外。**0 として扱わない。**
 
@@ -97,6 +114,11 @@ seriesend
 - `seqctx` に「Series ▸」: **同じ batch の** series 一覧（他 batch のものは無効化＋tooltip「別 batch の series。先に Move to
   batch」）、区切り、「新しい series を作る…」。メンバの Move to batch は不変条件 4 の警告付き。
 
+> **現行実装 gap / phase④。** `moveSeriesToBatch()` / `closeSeries()` は現在
+> `seqId` だけを収集し、standalone frame (`frameUid`) を移動・破棄しない。
+> 上の「全メンバ」が正典であり、mixed series の Move / Close 回帰と
+> Files / toast の `member(s)` 語彙を同じ修正で固定する。
+
 ## 5. picker の「掃引として開く」（phase 5）と Files 複数選択（phase 6・任意）
 
 - footer 3行目、`pickMerge==0 && selGroups>=2` の時だけ出す: `掃引として開く (series を作る)` ＋ パラメータ名・単位・各
@@ -130,8 +152,10 @@ seriesend
 
 1. 表「実体」欄 `App::Series (SeqInfo::seriesId)` → `App::Series (Series::members)`。値と順序は stack の属性ではない（§1）。
 2. 操作マトリクス series/Close の欄に **解散 (ungroup)** を併記。「中身を捨てる Close」と「まとめを解く ungroup」は別操作。
-3. 不変条件に追加: **1 stack は高々1つの series に属する**（当面の制限。表示と操作が一意に決まる）。
-4. 不変条件に追加: **メンバを単独で別 batch へ移すと series から外れる**（厳密包含の帰結）。禁じるのではなく画面で告げる。
+3. 不変条件に追加: **1 stack / standalone frame は高々1つの series のメンバになる**
+   （当面の制限。表示と操作が一意に決まる）。
+4. 不変条件に追加: **メンバを単独で別 batch へ移すと series から外れる**
+   （series とメンバの `managed-by` を揃えるため）。禁じるのではなく画面で告げる。
 5. 「series が持つもの」に追記: **単位の既定は未設定（空）**。既定 `lx` は「単位を仮定しない」に反する（現 `LinState::unit` はプリフィルへ格下げ）。
 6. 命名の規則に追記: **series の既定名は `<batch名> 掃引`**（人が付けるまでの初期値。リネーム可）。
 7. [layers-plan.md](background/project/layers-plan.md) の修正提案 6（「リニアリティ/batch 欄は現状不可」）は phase 2 で解消するので**撤回**可。
