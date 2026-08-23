@@ -212,10 +212,17 @@ N=16、σ_t=10 DN なら残差 2.5 DN。**二乗和で効く**ので、真の FP
   ばらつくほど効く (数値検証済み)。
 - **画素ごとの時間分散は ddof = n_i−1 で取る。** ddof=0 だと補正量が
   (N−1)/N 倍になり、N=16 で 6.25% 引き足りない。
-  **履歴:** 2026-08-07 の実査で、peer は ddof=1、local は ddof=0
-  という parity 違反を発見した。判断3 に従い local も ddof=1 へ修正済み
-  (PR #123, `925f0d3`)。現行契約は、画素ごとの時間分散を
-  `ddof = n_i−1` で取り、local / peer とも同じ算術を通す、である。
+  **【コード実査 2026-08-07】ここに local/peer の実在の食い違いがある**:
+  serve.cpp (`runTemporalStats`) は ddof=1、local
+  (`core/app/temporal_model.inc` の `recomputeTemporalIfNeeded`) は ddof=0。
+  同じ stack の σ_t が local と server で √((N−1)/N) 倍ずれる。
+  **parity 違反として local を ddof=1 に直すことは確定済み (判断3)。ただし
+  コードの修正は本書とは別の PR が持つ** — 本書が確定させたのは規約
+  (画素ごとの時間分散は ddof = n_i−1、local と peer は同じ算術を通る) の
+  方であって、この一文はもう未決の問いではない。
+
+  > **現行追記:** PR #123 (`925f0d398cb85cf07fc0adcdf1ebeeb18ea4007a`) で
+  > local も ddof=1 へ修正済み。上記は発見時点の実査記録として保持する。
 - **n_i が画素で違うなら補正も画素ごと。** 補正項は `mean(s_t,i²/n_i)` で
   あって `⟨σ_t²⟩/mean(n_i)` ではない。蓄積器は per-pixel の cnt を既に
   持っているので追加コストは無い。

@@ -5,15 +5,14 @@
 - 実行環境: Windows / MinGW（実行機の識別情報は記録されていない）
 - 種別: 実施記録。後日の実装状態に合わせて書き換えない。
 - 再実行仕様: [../functional.md](../functional.md)
+- 記録原文: `67e626cd:docs/verify-functional.md`（blob `c1feb565232df15417864b3e477b1d1b908367c0`）
 
-## 1. 追加した観測面
+---
 
-`srcMapDump()` と `--srcmap-selftest <dir>` を追加し、membership ごとに
-`uid / seq / idx / src=#K / refs / rev / datarev / shape / bytes / mtime /
-fsize / name / member / path` を出すようにした。`src=#K` は実行依存の `srcId`
-そのものではなく、同じ source を同じ番号として示す密な通し番号である。
+### D節の更新 (2026-08-04) — probe を実装した (branch `verify-probes`)
 
-当時の出力契約は次の形だった。
+`srcMapDump()` と、それを回す `--srcmap-selftest <dir>` を追加した。開いている
+membership 1件につき1行を stderr へ出す:
 
 ```
 srcmap: <tag> uid=… seq=… idx=… src=#K refs=N rev=… datarev=… WxHxC bytes=…
@@ -21,74 +20,76 @@ srcmap: <tag> uid=… seq=… idx=… src=#K refs=N rev=… datarev=… WxHxC by
 srcmap: <tag> 15 doc(s), 15 source(s), 307200 resident byte(s)
 ```
 
-大域カウンタである `srcId` の数値は、その frame より先に何枚を復号したかで変わる。
-したがって数値自体を表明に使わず、同じ run 内で source が同じかだけを `#K` の一致で
-表す、というのが probe の契約だった。
+`src=#K` は **srcId そのものではなく密な通し番号**。srcId は大域カウンタで、その値は
+「この frame の前に何枚復号したか」に依存して実行ごとに変わり、表明に使えない。
+**共有とは2つの doc が同じ #K を出すこと**で、これは実行間で安定する。
 
-この probe により、機能仕様の D-1（共有）、D-2（Watch 基線）、D-7（rev）の
-観測口ができた。ただし、probe だけで当時の stage 2/3/5 の全受入条件が満たせる
-わけではない。決め手になるのは、共有 identity、membership close 後の生存、uid
-不変、共有先を含む walk など、identity を直接見る項目である。
+**D-1/D-2/D-7 の「観測手段が無い」は解消した。** ただし本行の提案文にあった
+「1本の probe で stage2/3/5 の受入行が**全部**解錠される」は、C節を1行ずつ読んだ
+結果**そのままでは正しくない** — C-1/C-2/C-3 の15行のうち、この probe が
+決め手になるのは**5行**である。
 
-## 2. 実測結果
-
-| 表明 | 結果 | 実測で確認したこと |
+| 受入行 | 解錠 | 理由 |
 |---|---|---|
-| M1 | PASS | stage 1 基線は N docs / N sources / 各1 holder |
-| M1 mirror | PASS | per-document mirror と source が一致 |
-| M2 | PASS | NPY の `mtime` / `fsize` がディスクの実値と一致 |
-| M3 | PASS | RAW の `mtime` / `fsize` がディスクの実値と一致 |
-| M4 | PASS | 共有した2 membership が同じ `#K`、`refs=2`、resident は1枚分 |
-| M5 | PASS | crop の CoW 後も他方の画素は不変 |
-| M6 | PASS | `cloneSource` は内容同一、identity 別、`rev=0` |
-| V21 | PASS | NPZ member は container の Watch 基線を持つ |
+| C1-1 同じフォルダ2回で source 共有 | **する** | 共有の有無は srcId でしか言えない。2行の `src=#K` が一致するかがそのまま判定になる |
+| C1-2 共有時バイトは1倍 | しない (既に観測可能) | `--verify-selftest` V14 が resident バイトを印字済み。probe は根拠を1行足すだけ |
+| C1-3 片方 close 後も画素が残る | 部分的 | 「残る」は統計が出るかで判る。probe は refs が 2→1 に落ちる証跡を足す |
+| C1-4 Ctrl+Alt+W が membership だけ消す | **する** | 「source は生きている」は use_count でしか見えない |
+| C1-5 compare の same-pixels 文 | しない | chip 文字列の probe が要る (verify-ui.md C4) |
+| C2-1 既存 derive 表明が無傷 | しない | 既存の表明そのもの |
+| C2-2 派生がバイトを増やさない | しない (既に観測可能) | resident バイト |
+| C2-3 crop CoW、派生側は不変 | **する。しかも今日実行した** | M4 が手で共有を作り (stage2 相当)、M5 が `cropInPlace` の `use_count()>1` 分岐を発火させて、他方の画素が1バイトも動かないことを表明する。stage1 では製品経路から到達不能な分岐で、規律だけが先に検査された |
+| C3-1 画素差し替えで uid 不変 | **する** | uid は probe 行が持つ |
+| C3-2 全キャッシュが再計算される | しない | 鍵の中身は出ない |
+| C3-3 σ_t が変わる | しない | |
+| C3-4 fit が落ちる | しない | |
+| C3-5 共有先 stack も同じ一歩で更新される | **する** | 全 membership の src と rev を並べれば walk の抜けがそのまま見える |
+| C3-6 temporalExtra も忘れる | しない | |
+| C3-7 手動 Reload (GUI) | しない | verify-ui.md 側の probe |
 
-実測範囲は frame 15/15、RAW 1件、NPZ 5 member。コンテナ経路 `.vnz` の
-increment 実行確認はこの run には含まれない。
+**D節の外で解錠したもの**
 
-## 3. CLI とタイムアウト
+- **A-12 / D-2 は「コード読みでしか言えない」ではなくなった。** `--srcmap-selftest` の
+  M2 が npy 経路、M3 が raw 経路を、**ディスクの `last_write_time`/`file_size` と
+  突き合わせて**表明する (0 では通らない)。npz 経路は `--verify-selftest` V21 に
+  同じ形の1件を足した (container のサイズと全メンバーの `fsize` の一致)。
+  実測 15/15 frame・raw 1件・npz 5メンバー。
+  **未実行はコンテナ経路 (`.vnz`, `main.cpp:4929`) の1つだけ** — A-12 が数えた3経路は
+  すべて実行で確認済み。
+- **D-7**: `rev` は probe 行に出る。ただし +1 させるには remote の preview→full 差し替えが
+  要るので、**インクリメントの実行確認は未了**。M6 は `cloneSource` が rev を 0 に戻し
+  新しい srcId を取ることだけを表明する。
+- **A-3 (CLI 表面)**: フラグが 52 → 53 に増えた (`--srcmap-selftest`)。selftest フラグは
+  22 → 23、ctest の本数は 22 → 23。
 
-`--srcmap-selftest` の追加により、当時の CLI は 52→53 flags、selftest flags は
-22→23、ctest は22→23となった。
+**新しい表明 (すべて実測 PASS)**
 
-前日の「Browse action phase は無限に待つ」という記録は訂正された。
-`waitdir` / `waitimg` は各60秒で終わるが、run 全体の上限がなく、既定列の15 waits
-では15分級になり得た。実測では不可能な waits 3個が3分03秒。修正後は listing
-成立から300秒で、停止 action と phase、directory、image count を名指しして rc=1
-で終了する。
-
-修正後の診断行は次の形だった。
-
-```
-browsekeys: action phase gave up after 300 s at action 12/275 'waitimg:44'
-(phase 0), dir=…, imgs=…: FAILED
-```
-
-健康な run は約35秒、ctest の上限は900秒だった。この修正は、失敗を単なる
-`Timeout` にせず、止まった action を証拠として残すためのものだった。
-
-## 4. 当時の受入行への効き方
-
-| 当時の受入行 | probe の役割 |
+| 表明 | 何が今日まで言えなかったか |
 |---|---|
-| 同じ folder を2回開いた source 共有 | `src=#K` 一致が判定になる |
-| 共有時の resident bytes | 既存 V14 が主証拠、probe は補助 |
-| 片方 close 後の生存 | 統計が主証拠、`refs 2→1` が補助 |
-| membership だけ close | source 生存を `refs` で直接確認 |
-| compare の same-pixels 文 | この probe ではなく chip 文字列の観測が必要 |
-| 既存 derive 表明 | 既存表明が主証拠 |
-| derive の resident bytes | 既存会計が主証拠 |
-| crop CoW | M4/M5 でこの run 中に実測 |
-| reload 後 uid 不変 | probe の `uid` が判定になる |
-| reload 後の全キャッシュ再計算 | 鍵の中身は出さないため、この probe だけでは判定できない |
-| reload 後の σ_t 更新 | 数値の表明が別に必要 |
-| reload 後の fit 破棄 | fit 状態の表明が別に必要 |
-| 共有先を含む walk | 全 membership の source/rev で欠落を検出 |
-| `temporalExtra` の破棄 | temporal slot の表明が別に必要 |
-| 手動 Reload の UI | UI 側の観測が必要 |
+| M1 「N docs, N sources, 各1 holder」 | stage1 の基線。stage2 が破る対象で、破れたら**目立つ**ように書いてある |
+| M1 mirror 一致 | §2.1 の per-doc ミラーが source とずれていないこと (印字経路が無かった) |
+| M2 npy の Watch 基線 = ディスクの実値 | A-12 は目視だった |
+| M3 raw の Watch 基線 = ディスクの実値 | 同上 |
+| M4 共有が **見える** (同じ #K・refs=2・resident が1枚分減る) | probe 自身の校正。refs=1 しか出せない probe は何も証明しない |
+| M5 crop CoW が分離し、他方の画素が不変 | **C2-3 そのもの**。stage1 では製品経路から起こせない |
+| M6 `cloneSource` は内容同じ・identity 別・rev=0 | D-7 の半分 |
+| V21 npz メンバーが container の Watch 基線を持つ | A-12 の3経路目 |
 
-`mtime` / `fsize` は NPY と RAW でディスクの `last_write_time` / `file_size` と
-突き合わせ、NPZ は V21 で container のサイズと全 member の `fsize` を突き合わせた。
-当時未実施だったのは `.vnz` container 経路の increment と、remote の
-preview→full 差し替えによる `rev` の +1 である。M6 が確認したのは
-`cloneSource` が別 identity を取り `rev=0` になるところまでだった。
+### E-6 の訂正と修正 (2026-08-04, branch `verify-probes`)
+
+**訂正**: 「無限に続く」は言い過ぎだった。action 段階で `hold` を立てるのは
+`waitdir` / `waitimg` の2つだけで、どちらも**個別に60秒**で諦める
+(`main.cpp` の `waitD0` / `waitT0`)。実測: 不可能な待ちを3つ並べた列は
+**3分03秒**で終わる (60秒×3 + 実行)。したがって停止は無限ではなく、
+**行の長さに比例して伸びる** — 上限が run に無く、待ちの個数にしか無い。
+既定の列は待ちを15個持つので、A-16 の形 (レイアウトが古く、注入クリックが
+別の場所に落ち、待ちが全部空振りする) では**15分級**になり、そこで
+ctest の TIMEOUT 900 に殺される。ctest は "Timeout" としか言わないので、
+**どのアクションで止まったかはどこにも残らない**。
+
+**修正**: action 段階に run 全体の壁時計 (300秒) を入れた。listing 段階の60秒と
+同じ形で、時計は**listing が揃った時点から**回る。切れたときは
+`browsekeys: action phase gave up after 300 s at action 12/275 'waitimg:44'
+(phase 0), dir=…, imgs=…: FAILED` と**止まったアクションを名指しして** rc=1 で
+終わる。健康な run (約35秒) の8倍、ctest の 900 秒の内側。**待つスイートは
+誰も読まないスイートである。**

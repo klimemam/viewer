@@ -280,7 +280,7 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | **batch (塊)** | 開いたものを人間が管理するための入れ物。**構造の主張を一切しません**。1 回の Open = 1 batch が既定 |
 
 データ層の順序は `frame ≼ stack ≼ series` です。集合包含ではなく、途中の stack を
-省略できるが逆転はできない、という順序です。batch はそれらを管理 (`managed-by`) し、
+省略でき、各層は単独でも存在できるが、逆転はできないという順序です。batch はそれらを管理 (`managed-by`) し、
 AnalysisSet は役割付きで参照 (`role-ref`) します。series とメンバは同じ batch に
 管理されますが、AnalysisSet の参照先は別 batch でも構いません。
 

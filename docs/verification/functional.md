@@ -23,7 +23,7 @@
 | `sigma_t` は frame ではなく stack の性質 | [用語](../terminology.md) | stack 集計にだけ現れ、per-frame 表には `sigma_t` 列がない |
 | CFA のプレーンを黙って混ぜない | [用語](../terminology.md) | R / Gr / Gb / B を独立して扱う。明示的な `all` 集計は別測定として表示・出力する |
 | 部分ロードを完全な stack と誤認させない | [用語](../terminology.md) | 常駐済み数（resident）と予定総数（expected）を `n/N` で示す |
-| 定義できる単位だけを明示する | [用語](../terminology.md) | 整数の画素値・ノイズは `[DN]`、相対量は `[%]`。float 入力には未定義の単位を仮定しない |
+| ラベルに乗った量は単位を伴う | [用語](../terminology.md) | 画素値・ノイズは `[DN]`、相対量は `[%]` と明示する |
 | 数値は、その数値を作った画素と同時に無効化する | [参照設計](../reference-design.md) | reload / crop / source 共有後に古い cache、fit、平均を再利用しない |
 
 ## 2. 標準の実行方法
@@ -88,7 +88,7 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 | 項番 | 検証項目 | 手順 / 絞り込み | 期待結果 |
 |---|---|---|---|
 | F1 | 合否判定（gate）の完全性 | `tools/run_selftests.sh <build-dir>` | ビルドとテストデータ生成が成功する。登録されたテストは実行、skip、quarantine、実行集合（run set）外のいずれかに必ず名指しされ、無言の欠落がない |
-| F2 | 測定不変条件 | `framestats`, `export-tsv`, `abstats`, `abstats-cfa-bayer`, `roistats`, `setanalysis` | §1 の `sigma_t`、CFA、`n/N`を満たす。現行fixtureは整数 `[DN]` と比率単位を固定する。A/B の各側は自分の数値を使い、隣側の値を付け替えない。float無単位の横断固定は §4.1 |
+| F2 | 測定不変条件 | `framestats`, `export-tsv`, `abstats`, `abstats-cfa-bayer`, `roistats`, `setanalysis` | §1 の `sigma_t`、CFA、`n/N`、`[DN]` と比率単位を満たす。A/B の各側は自分の数値を使い、隣側の値を付け替えない |
 | F3 | source の同一性と共有 | `srcmap`, `scan`, `fmtreg`, `verify` | 同じ `identity tuple` を持つ二つの `membership` は同じ `source` を指し、復号と常駐メモリの会計を二重に行わない。別の recipe / member / file-frame は共有しない |
 | F4 | Close の意味論 | `close`, `batch`, `verify` | stack / frame を閉じると、その `membership` だけが外れる。`source` は最後の参照がなくなるまで生存し、残った `membership` は画素と統計を読める |
 | F5 | 派生（derive）と CoW | `derive` | derive は `source` を参照し、常駐バイト数を増やさない。共有後に片側を crop すると新しい `source` へ分離し、他方の画素・identity・統計を変えない |
@@ -100,21 +100,19 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 | F11 | remote reader / container / measurement | `remote`, `rreader`, `rnpz`, `rmeasure`, `rtemporal`, `rtemporal-png` | 単独実行の peer とプロトコルの可否判定を通り、local と remote の画素・member row・測定値が契約どおり一致する。古いプロトコルや閉じた reader の可否判定は理由付きで拒否する |
 | F12 | 解析層と集合解析 | `aset`, `setanalysis`, `detrend`, `seriespanel`, `stackavg`, `lin`, `sweepfile`, `test_prnu` | AnalysisSet の束縛（binding）、層ごとの入力、DSNU / PRNU、detrend、リニアリティ、frame / stack 混合集合の拒否と計算を仕様どおり行う |
 | F13 | plugin ABI と由来情報 | `anaprov`, `stackana`, `bundled`, `rplugin`, `rset`, `test_abi_probe`, `test_display_falsecolor` | ABI v3 の frame / stack 登録 API、部分ロード、release、name+version、local / remote の同等性、builtin と plugin の由来情報（provenance）を区別する |
-| F14 | export と報告面 | `framestats`, `export`, `export-tsv`, `roi-export` | 画面の数値と export の数値・単位・由来情報が一致し、ROI、stack、series、比較側を取り違えない。現行fixtureの単位保証は整数入力で、floatは §4.1 |
+| F14 | export と報告面 | `framestats`, `export`, `export-tsv`, `roi-export` | 画面の数値と export の数値・単位・由来情報が一致し、ROI、stack、series、比較側を取り違えない |
 | F15 | UI を伴う機能 | [UI 検証仕様](ui.md) | 操作、レイアウト、表示文字列まで含む項目は UI 仕様の該当行を満たす |
 
 ### 4.1 phase④ の受け入れ条件（未実装）
 
-次は現行 selftest の合格条件ではなく、[tasks.csv](../tasks.csv) の #230 phase④ 行と
-表示・export phase④ 行を実装するときに追加する条件である。
+次は現行 selftest の合格条件ではなく、[tasks.csv](../tasks.csv) の #230 phase④ 行を
+実装するときに追加する条件である。
 
 - mixed Series の Move / Close は stack と standalone frame の全memberへ作用し、順序・identity・
   同一batch不変条件を保つ。Close後は全memberが消え、無関係controlとrole-refを壊さない
 - Reader由来のFrame+Stack mixed SeriesはNPZ/stream双方でkindと順序を保ち、sessionを往復する
 - typed ReaderはFrame→CHW、Stack→FCHW、`C=1..4`だけを受け、cross-layer・虚偽layout・
   `C>4`を layer / layout / shape 付きの理由で拒否する。Seriesのkindをshapeから推定しない
-- integer fixture は Inspector / Histogram / Projection / Temporal / ROIs / TSV / CSV の
-  `[DN]` を保ち、float fixture は同じ全surfaceで未宣言の `[DN]` を出さない
 
 ## 5. probe の契約
 

@@ -1,24 +1,57 @@
 # プラグイン ABI v3 — 現行契約と決定履歴
 
-> **状態: 中核を実装済み (2026-08-18)。** 公開契約の正典は
-> [`include/ps/ps_plugin.h`](../../include/ps/ps_plugin.h) である。本書はその契約を
-> 解説し、実装前に検討した案を履歴として残す。
+> **状態: 確定 (2026-08-09, #104)。** [analysis-layers.md](../analysis-layers.md)
+> §4 の骨格 (「方向であって寸法ではない」) に寸法を与える実装仕様。§10 が
+> ABI v3 に預けた4件 — 構造体の確定・stack の運搬・remote MEASURE の拡張
+> 方向・kind 3/4 の口 — と、判断record 6 が v3 と同時と決めた #46 の
+> version 欄をここで確定する。**開いていた選択8項は #104 で全部閉じた**
+> (「推奨で。」= 全項推奨どおり) ので、§13 は判断リストではなく
+> **判断record** であり、本文は全文が決定文である。コードはまだ無い —
+> この文書が先で、実装が後 (ヘッダ差分の全景は §12)。
 >
-> 現行 ABI v3 には `psAnalyzerV3`、`psAnalyzeSink3`、`psStack`、
-> `psStackAnalyzerV3`、`register_analyzer3`、`register_stack_analyzer3` がある。
-> `MOP_PLUGIN_ANALYZE` の name+version パリティと peer 側実行も実装済みで、
-> 現在の remote protocol 版は `core/remote_proto.h::VERSION` を正典とする。
+> **実装状況 (2026-08-10) — 段階3 が入った。** 本文は仕様のまま (実装が
+> 仕様に追いつく、逆ではない)。段階1 で **§2 (版交渉と互換)・§3
+> (`version` / `headline`)・§11 (ホスト帳簿との接続)** と、それを載せる
+> **§4 の `psAnalyzerV3` / `psAnalyzeSink3` / `psHostApi::register_analyzer3`**
+> が入り (#46 段階2 はこれで閉じた)、段階2 で **§5 (`psStack` /
+> `psStackAnalyzerV3` — pull 型アクセス)・§6 (`min_frames` の宣言と n/N の
+> 事実の両建て)** と、それを載せる `psHostApi::register_stack_analyzer3`
+> が入り、段階3 で **§10 (`MOP_PLUGIN_ANALYZE` — name+version パリティ、
+> 不一致は両版併記の拒否、provenance は peer の帳簿から)** が入った
+> (`rp::VERSION` 6→7)。ABI は段階3 で **1バイトも動いていない** —— §10 は
+> ワイヤの話であり、ヘッダの話ではない。
+> 運搬は **§9.1 (in-process、常駐フレームへの参照)** と **§9.3 (remote —
+> plugin が画素の側へ行く)** の2つが実物になった。§9.3 の peer 側 `get_frame`
+> は要求された時点でそのフレームを読み、`release_frame` は区画を本当に解放する
+> —— **§9.2 の窓を、共有メモリではなく peer のストリーミング読み出しで実装した
+> もの**であり、pull の口を先に固定しておいたことの2つめの配当である
+> (新しい運搬コードはゼロ)。
+> **まだ無い**のは §7 (series の形と席)・§8 (`emit_number_u` / `emit_map`)・
+> §9.2 (#45 の Python ワーカ区画)、および §5.2 末尾の住処 (Analysis パネル /
+> Measure メニューへの stack アナライザの掲示とグレーアウト) —— UI はまだ
+> 張っていない。§10 も**ホスト側の口とプロトコルまで**で、Analysis パネルから
+> peer 実行を選ぶ導線 (どちら側で走るかの提示と `--remote-policy` との接続) は
+> 未着手である。
+> 未実装分は §2.2 の探針規則どおり**予約席**に居る: `psHostApi` の
+> `register_stack_analyzer3` の後ろ、`psAnalyzeSink3` の `reserved[8]` の
+> 先頭2席。**ヘッダに名前を書くのは実装する段階** —— 名前が書かれた瞬間に
+> 形の約束が始まるので、席は番地だけ確保して名前は伏せてある (§7.2 が
+> kind 3/4 に対して採った線をそのまま全未実装席に適用した)。どれも
+> **版上げ無しに**埋まる。
 >
-> 一方、`psSeriesMember` / `psSeries` / `psSeriesAnalyzerV3` と
-> `register_series_analyzer3` は公開ヘッダに無い。`emit_number_u` もまだ名前の
-> 付いた callback ではなく、将来候補として `psAnalyzeSink3::reserved[0]` が
-> 意図されているだけである。`psMapOut` / `emit_map` は 2026-08-11 に撤回され、
-> **どの reserved field も map 用とは約束されていない** (#49)。§7 と §8.2 はこのため
-> 非規範の設計履歴、§8.3 は撤回記録として読む。
->
-> 未実装なのは Python 常駐ワーカの共有メモリ区画 (#45)、stack アナライザを
-> Analysis パネルへ掲示する UI、および peer 実行を UI から選ぶ導線である。
-> これらは現行 ABI の存在とは分けて扱う。
+> **現行追記 (2026-08-18/20):** 中核の公開契約は
+> [`include/ps/ps_plugin.h`](../../include/ps/ps_plugin.h) であり、ヘッダ自身が
+> 委譲する本書 §7 の凍結形と §12 の予約席も契約を成す。現行 ABI v3 には
+> `psAnalyzerV3`、`psAnalyzeSink3`、`psStack`、`psStackAnalyzerV3`、
+> `register_analyzer3`、`register_stack_analyzer3` がある。§7 の型と
+> `register_series_analyzer3`、§8.2 の `emit_number_u` はまだ名前付き field として
+> ヘッダへ着地していないため呼べないが、予約席から独自 cast してよいという意味ではない。
+> `psMapOut` / `emit_map` は 2026-08-11 に撤回され、**どの reserved field も map 用とは
+> 約束されていない** (#49)。`MOP_PLUGIN_ANALYZE` の name+version パリティと peer
+> 側実行は実装済みで、現在の remote protocol 版は
+> `core/remote_proto.h::VERSION` を正典とする。未実装なのは Python 常駐ワーカの
+> 共有メモリ区画 (#45)、stack アナライザを Analysis パネルへ掲示する UI、peer 実行を
+> UI から選ぶ導線である。
 >
 > **同梱アナライザの V3 移行は済んだ。** 5本すべてが
 > `register_analyzer3` に移り、`version` (いずれも `1.0.0` —— version を
@@ -45,8 +78,8 @@
 3. frame シグネチャの v3 形 `psAnalyzerV3` (§4)
 4. stack シグネチャ — `psStack` (pull 型) と `psStackAnalyzerV3` (§5)
 5. 部分ロードの契約 — `min_frames` (宣言) と n/N (事実) の両建て (§6)
-6. series シグネチャ — 当時の提案と、現行ヘッダに採用していない境界 (§7)
-7. 結果の語彙 — 現行 `psAnalyzeSink3`、単位 callback の候補、map 撤回 (§8)
+6. series シグネチャ — v3 で凍結した形と予約席、名前付き field 未着地の実装境界 (§7)
+7. 結果の語彙 — 現行 `psAnalyzeSink3`、`emit_number_u` の予約席、map 撤回 (§8)
 8. stack をプラグインに見せる運搬 — 3つの実装形態と却下案 (§9)
 9. remote MEASURE op の拡張方向 (§10)
 10. ホスト帳簿 (#46 段階1) との接続 — provenance の表示 (§11)
@@ -98,15 +131,22 @@ only extend」がヘッダ自身の約束)、
  *   2 - adds psAnalyzerV2 (emit_series curves + description) via
  *       psHostApi::register_analyzer2. V1 structs keep abi_version = 1
  *       and remain loadable forever.
- *   3 - psAnalyzerV3 (+version/+headline) over psAnalyzeSink3, and
- *       psStack + psStackAnalyzerV3 (pull access, min_frames).
- *       The remaining ideas use reserved seats only after a public name and
- *       contract are added. emit_map was withdrawn (#49). */
+ *   3 - layer-typed analyzers (docs/reference/abi-v3.md): psAnalyzerV3 - the frame
+ *       descriptor, +version/+headline - over psAnalyzeSink3, registered
+ *       through psHostApi::register_analyzer3; and psStack + psStackAnalyzerV3
+ *       (§5: frames PULLED one at a time, +min_frames) through
+ *       psHostApi::register_stack_analyzer3. V1/V2 structs and their two
+ *       register slots stay loadable forever; psHostApi does not change size.
+ *       The rest of v3 (psSeriesAnalyzerV3 §7, emit_number_u §8.2) arrives
+ *       in the reserved seats below and needs NO further version bump - see
+ *       the probe rule. (emit_map §8.3 was withdrawn, #49.) */
 ```
 
 これは現行ヘッダの要約である。`psAnalyzeSink3` に名前の付いた emit は
 `emit_number` / `emit_text` / `emit_series` の3つだけで、series 入力用の型や
-登録 slot もまだ宣言されていない。
+登録 slot もまだ名前付き field として宣言されていない。一方、ヘッダ自身が
+`psSeriesAnalyzerV3` の形を §7、`emit_number_u` の席を §8.2 へ委譲しているため、
+未実装・NULL であることは両節の規範性を取り消さない。
 
 互換の不変条件 (すべて現行ヘッダの約束の継続):
 
@@ -311,19 +351,18 @@ typedef struct psStackAnalyzerV3 {
   なら 1 と書く (それは「なぜ stack アナライザなのか」を作者に一度
   問う摩擦でもあり、意図的に残す)。→ 判断 3
 
-## 7. Series — 設計履歴 (非規範、現行 ABI には未採用)
+## 7. Series — 形は凍結、口は指定席
 
-### 7.1 当初提案した形
+### 7.1 凍結する形
 
-以下は #104 時点に、正典の series 定義 (「条件を1つ振った stack / frame の
-並び」) と判断record 7 (frame | stack 混在) を C に写した**設計案**である。
-**公開ヘッダにはこれらの型が存在せず、プラグインはこの形を契約として
-コンパイルしてはならない。** 提案では frame メンバを
-**`frames == 1` の psStack として渡す** — メンバ型の分岐が ABI から消え、
+正典の series 定義 (「条件を1つ振った stack / frame の並び」) と
+判断record 7 (frame | stack 混在) をそのまま C にする。**frame メンバは
+`frames == 1` の psStack として渡す** — メンバ型の分岐が ABI から消え、
 プラグインは1つの型だけ読む:
 
 ```c
-/* NON-NORMATIVE historical sketch; absent from the public header. */
+/* SHAPE-frozen in v3; the register slot may be NULL until the host opens
+ * the series mouth - probe it (§2.2, §7.2). */
 typedef struct psSeriesMember {
     double         value;       /* swept-parameter value for this member      */
     const psStack* stack;       /* frame member = psStack with frames == 1    */
@@ -360,73 +399,128 @@ typedef struct psSeriesAnalyzerV3 {
 
 - include を外されたメンバはそもそも渡らない (`count` は included のみ)。
   編集状態はホストの事実で、プラグインに flag を読ませない。
-- 「単位と値が無ければ fit しない」という条件は入力型に組み込み済みである: param_unit が
+- 「単位と値が無ければ fit しない」は入口で構造化済み: param_unit が
   宣言で、series 側に値の無い状態はこの型では表現できない。
 
-### 7.2 当初案と現在の適用結果
+### 7.2 口を開けない — 正典との張力をどう解いたか
 
 ここに正典間の張力が1つある。analysis-layers.md §4/§10 は「series
-シグネチャの公開プラグイン API は今回作らない (まず組み込み実装で §5–§6 を検証し、
+シグネチャのプラグイン口は今回作らない (組み込みが先に §5–§6 を張り、
 外に開くのは形が固まってから)」と確定済み。一方、判断record 6 の原理
 (版上げを2回にしない) は「v3 で開けてしまえ」を示唆する。
 
-当初案は、§7.1 の形を v3 ヘッダで凍結し、
-`register_series_analyzer3` を NULL 検査可能な名前付き field として出荷するものだった。
-**この部分は現行公開ヘッダには適用されていない。** 現在の `psHostApi` は
-`register_stack_analyzer3` の後ろが単なる `reserved[5]` で、series や kind 3/4
-に割り当てた番地は無い。組み込み Series Analysis が実装済みであることも、
-プラグイン ABI の型や登録関数が存在することを意味しない。
+**確定は両立**: 形 (§7.1) は v3 ヘッダで凍結し、`register_series_analyzer3`
+は**指定席のまま NULL** で出荷する。§2.2 の探針規則により、Series
+Analysis パネル (PR #102) の組み込み解析が形を検証し終えた時点で
+**版上げなしに**席を埋められる。正典の順序 (組み込みが先) と record 6
+(2回上げない) を NULL 探針が同時に満たす。→ 判断 4
 
-将来追加する場合は、§2.2 の探針規則に従い、公開ヘッダへ型・slot 名・NULL 時の
-縮退動作を同時に記載する。その時点までは §7.1 は比較材料に留まる。→ 判断 4 の
-**歴史的提案**
+kind 3/4 (役割スキーマの口) は形すら凍結しない (§1 非目標)。指定席の
+**予約番地だけ**確保する: psHostApi の残り予約 4 席のうち末尾 2 席を
+「set 系の口のために名前を付けずに取り置く」と本文で言明する (ヘッダには
+書かない — 名前を書いた瞬間に形の約束が始まるため)。
 
-## 8. 結果の語彙 — 現行 `psAnalyzeSink3` と撤回済み提案
+> **現行実装注 (2026-08-20):** 公開ヘッダはこの形と予約席を §7 / §12 への
+> 参照で凍結しているが、型宣言と `register_series_analyzer3` という field 名はまだ
+> ヘッダへ着地していない。したがって現行プラグインはこの口を呼べず、`reserved[0]` を
+> 独自に cast することも契約外である。これは形・席の決定を非規範化するものではなく、
+> NULL 席の実装段階が未到着という状態である。
 
-### 8.1 現行公開契約
+## 8. 結果の語彙 — psAnalyzeSink3
+
+### 8.1 継承と新設
 
 ```c
+typedef struct psMapOut {
+    const char*  key;           /* result name; same namespace as number keys */
+    uint32_t     x, y, w, h;    /* placement in INPUT pixel coordinates
+                                   (whole frame or the analyzed ROI)          */
+    const float* data;          /* row-major w*h floats; row i at
+                                   (char*)data + i*pitch_bytes.
+                                   NaN = "no value at this pixel"             */
+    size_t       pitch_bytes;   /* >= w * sizeof(float)                       */
+    const char*  unit;          /* REQUIRED, never NULL. "" = declared
+                                   unitless (mask). Declared, not inferred    */
+    uint64_t     reserved[4];
+} psMapOut;
+
 typedef struct psAnalyzeSink3 {
     void* ctx;
+    /* unchanged from sink2: */
     void (*emit_number)(void* ctx, const char* key, double value);
     void (*emit_text)  (void* ctx, const char* key, const char* value);
     void (*emit_series)(void* ctx, const char* name, const char* x_label,
                         const char* y_label, const float* x, const float* y,
                         uint32_t n);
-    void* reserved[8];
+    /* v3: scalar with a DECLARED unit. Where a declaration slot exists,
+     * declaration beats key-name inference (input-adapters house rule). */
+    void (*emit_number_u)(void* ctx, const char* key, double value,
+                          const char* unit);
+    /* v3: pixel-shaped result. Host copies during the call; returns 0 if
+     * accepted (nonzero: host cannot take maps in this context). */
+    int32_t (*emit_map)(void* ctx, const psMapOut* m);
+    void* reserved[6];
 } psAnalyzeSink3;
 ```
 
-名前の付いた3つの emit は、従来どおり**呼び出し中にホストがコピー**する。
-sink3 は v3 の analyze 関数にだけ渡り、V1/V2 の sink は永久に不変である。
-予約配列を独自に関数 pointer へ読み替えることは契約外である。
+すべての emit は従来どおり**呼び出し中にホストがコピー**する。sink3 は
+v3 の analyze 関数にだけ渡る — V1/V2 の sink は永久に不変。
 
-### 8.2 `emit_number_u` — 将来候補 (まだ公開 API ではない)
+### 8.2 emit_number_u — キー名規約を fallback に降ろす
 
-`emit_number` のキー名単位規約 (`snr_db` → dB 等) は「ABI に単位欄が無い」
-ための現行 fallback である ([analyzers.md](analyzers.md))。設計時には
-`emit_number_u(ctx, key, value, unit)` を `reserved[0]` に置き、宣言単位を
-キー名規約より優先する案を採った。現行ヘッダのコメントも最初の reserved field をこの候補に
-意図しているが、**field 名も関数型もまだ公開されていないため呼べない**。
+emit_number のキー名単位規約 (`snr_db` → dB 等) は「**ABI に単位の欄が
+無いから**」が文書化された成立理由 ([analyzers.md](analyzers.md))。
+新しい口には欄が作れるので、家訓 (宣言できるなら宣言が勝つ —
+[input-adapters.md](../features/adapters/input-adapters.md) §4.3.1) に従い宣言欄を設ける:
 
-実装する場合は、公開ヘッダへ名前・型・NULL 時の fallback を同時に追加する。
-その時の優先順位候補は「宣言単位 > `unitForAnalysisKey` > dtype 由来」、単位は
-文字列をそのまま扱い換算しない、という当初案である
-([input-adapters.md](../features/adapters/input-adapters.md) §4.3.1)。→ 判断 5 の
-**未適用部分**
+- 優先順位: `emit_number_u` の unit > キー名規約 (`unitForAnalysisKey`) >
+  画像値系の dtype 由来。v3 プラグイン内でも emit_number は合法のまま
+  (規約が fallback として働く) — 移行を強制しない。
+- unit も逐語。ホストは換算しない (dB を倍率に直したりしない)。
+- float の物理単位問題 (ファイルは反射率か e⁻ かを言わない) はこれで
+  **プラグインが知っている場合に限り**閉じる: 暗電流 [DN/s] のような
+  計算が単位を確定する量は、キー名を汚さず宣言できる。→ 判断 5
 
-### 8.3 `psMapOut` / `emit_map` — 撤回済み (#49)
+### 8.3 emit_map — 画素形の結果に口を開ける (#49 との境界)
 
-初期案では、`key`、入力座標 `x/y/w/h`、pitch 付き float32 `data`、`unit` を
-持つ `psMapOut` と `emit_map` を検討した。しかし map の語彙・型・表示・保存・
-set への帰属を決めないまま ABI の運搬だけを固定できないため、2026-08-11 に
-撤回した。
+#49 が名指しした欠落 — 「analyzer は emit_number/emit_series しか持たず
+画素を返せないので、stack から欠陥マップを作る解析の置き場所が無い」 —
+の ABI 側の半分がこれ。**入れないと v3 の主役 (stack アナライザ) が主産物
+(欠陥マップ・有効枚数マップ — §3.2 の Sum 申告要件) を出せず、次の版上げ
+が確定する** (record 6 の原理に反する)。
 
-現行公開ヘッダには `psMapOut` も `emit_map` callback も無い。さらにヘッダは
-`psAnalyzeSink3::reserved[8]` のどの field も map 用ではないと明記している。
-したがって現行プラグインは画素形の結果を返せず、remote 応答も map を
-直列化しない。再導入するなら #49 で意味論・所有権・寿命・失敗時の扱いまで
-決め、新たな明示契約としてレビューする。→ 判断 6 の**撤回記録**
+正典との線引き: analysis-layers.md §1.3 は「map の型の形そのものは #49 で
+決める」と言う。これは**データ層としての map** (Files での型・帰属・
+表示) の話で、v3 が決めるのは**運搬中の欄**だけ。欄は #49 のどの候補も
+塞がない最小集合に絞った:
+
+- `key` — 結果名。number キーと同じ名前空間 (`R.defect` のように
+  チャンネルはキーで分ける。map は常に 1ch — 量が違えば map を分ける)。
+- `x, y, w, h` — 入力画素座標での placement。ROI 解析は ROI 分だけの
+  map を出してよい (whole を強制すると ROI 解析が無意味に膨らむ)。
+- `data` — float32 固定 + `NaN = その画素に値なし`。NaN の画素毎除外の
+  規律と同じ語彙で「欠測」を運ぶ。
+- `unit` — **必須・NULL 不可**。`""` が「明示的に単位なし (マスク)」。
+  #49 の「自前の量と単位 (またはマスクとして明示的に単位無し)」の要件を
+  構造にしたもの — 無宣言という状態を型から消す。
+- 意味種別 (defect / mask / gain / confidence …) の欄は**置かない**:
+  それは #49 の語彙で、確定前に ABI へ写すと #49 の手を縛る。確定後に
+  必要なら psMapOut の reserved を名前に変える (探針不要 — 記述子でなく
+  値なので、NULL/0 のままなら「無宣言」と読める)。
+
+受け側の最小動作 (これも #49 を待たない範囲): ホストは map を受理して
+**結果と一緒に保持し、provenance に載せる**。表示・保存・set への帰属は
+#49 確定まで「結果グリッドに『map: key (w×h, unit)』の行が出る」以上を
+約束しない。emit_map の戻り値非0は「このホスト文脈では map を受け取れ
+ない」 (例: 将来の縮退ホスト) — プラグインは主結果が map しか無いなら
+err で失敗し、副産物なら黙って続行してよい。→ 判断 6
+
+> **後続裁定・現行実装 (2026-08-11〜20):** `emit_map` / `psMapOut` は #49 で
+> 取り下げられた。現行公開ヘッダは `psAnalyzeSink3::reserved[8]` のどの field も
+> map 用とは約束せず、remote 応答も map を直列化しない。再導入には意味論・所有権・
+> 寿命・失敗契約を含む新たな裁定が必要である。`emit_number_u` の指定席は残るが、
+> field 名と関数型はまだ公開ヘッダへ着地していないため呼べず、予約配列からの独自
+> cast も契約外である。
 
 ## 9. 運搬 — stack をプラグインに見せる3つの実装形態
 
@@ -511,40 +605,83 @@ stack を回線に流してプラグインに見せる経路は**作らない**�
   version + ファイル」) がこれで全欄埋まり、**#46 はこの仕様の実装を
   もって閉じられる**。
 
-## 12. 現行ヘッダの全景
+## 12. ヘッダ差分の全景
 
-実装者向け索引。規範は常に
-[ps_plugin.h](../../include/ps/ps_plugin.h) であり、この表は照合用である。
+実装者向けの一覧 (規範は各節、ここは索引):
 
-| 現行要素 | 契約 | 節 |
-|---|---|---|
-| `PS_ABI_VERSION` | `3u`。V1/V2 は互換維持 | §2.1 |
-| `psAnalyzerV3` | frame、`version` / `headline`、sink3 | §4 |
-| `psStack` | pull (`get_frame` / `release_frame`)、n/N | §5.1 |
-| `psStackAnalyzerV3` | `min_frames`、sink3 | §5.2 |
-| `psAnalyzeSink3` | number / text / series + `reserved[8]` | §8.1 |
-| `psHostApi` | `register_analyzer3` + `register_stack_analyzer3` + `reserved[5]` | §2 |
-| 現行ヘッダに無いもの | series 入力型/登録関数、`emit_number_u`、`psMapOut` / `emit_map` | §7、§8 |
+| 追加・指定席 | 節 |
+|---|---|
+| `PS_ABI_VERSION` 2u → 3u + 履歴コメント | §2.1 |
+| `psAnalyzerV3` (frame; +version/+headline, sink3) | §4 |
+| `psStack` (pull: get_frame / release_frame, n/N) | §5.1 |
+| `psStackAnalyzerV3` (min_frames) | §5.2 |
+| `psSeriesMember` / `psSeries` / `psSeriesAnalyzerV3` (形のみ凍結) | §7.1 |
+| `psAnalyzeSink3::reserved[0]` → `emit_number_u` (NULL 可・探針、field 名の着地待ち)。`emit_map` は撤回済み | §8.2、§8.3 |
+| `psHostApi`: 旧 `reserved[7]` → `register_analyzer3` + `register_stack_analyzer3` + `register_series_analyzer3` (NULL 可・探針) + `reserved[4]` (末尾2席は kind 3/4 取り置き — 本文言明のみ) | §2、§7.2 |
+
+現行ヘッダで名前が付いているのは `register_analyzer3` と
+`register_stack_analyzer3` までで、残りは `reserved[5]` / `reserved[8]` のままである。
+§7 / §8.2 の指定席は形と割当てを凍結するが、名前付き field がヘッダへ入るまでは
+呼び出せず、予約配列からの独自 cast も契約外である。
 
 変えないもの: psFrame / psRect / 全 V1/V2 構造体と sink / psDtype 等の
 enum / `psRegisterPlugins` の1シンボル規約 / frame_alloc・frame_free の
 唯一性 / struct_size。
 
-## 13. 判断 record と現在の適用結果
+## 13. 判断record (2026-08-09 確定 — もう「待ち」ではない)
 
-#104 では 2026-08-09 のユーザー回答「推奨で。」により8項目を推奨どおり採用した。その後、実装時の検証で
-一部を遅延・撤回したため、**過去の採用判断と現行公開契約を同一視しない**。
+#104 でユーザーが全8項に回答した:「推奨で。」— **全項、推奨どおりに確定**。
+番号は草案時の判断リスト (8項目版) のもの。各項が言うのは**何が決まって、
+それが今どの節に住んでいるか**だけである — 理由は当の節が持っているので
+ここでは繰り返さない。
 
-| # | 当時の判断 | 2026-08-18 時点の適用結果 |
-|---:|---|---|
-| 1 | version は記述子単位 | **適用済み**。frame / stack V3 と provenance に実装 (§3、§11) |
-| 2 | stack は pull 型 | **適用済み**。`get_frame` + `release_frame` (§5、§9) |
-| 3 | `min_frames` と n/N を併用 | **適用済み** (§5、§6) |
-| 4 | series の形と NULL 検査可能な登録 field を v3 に置く | **未適用**。公開ヘッダに型も名前付き field も無い (§7) |
-| 5 | `emit_number_u` を追加 | **保留**。`reserved[0]` は将来候補だが名前付き callback ではない (§8.2) |
-| 6 | `emit_map` を追加 | **2026-08-11 に撤回**。`psMapOut` も map 用 reserved field も無い (#49、§8.3) |
-| 7 | in-process / Python 窓 / remote peer の3態 | in-process と remote peer は**適用済み**、Python 窓は未実装 (§9) |
-| 8 | `MOP_PLUGIN_ANALYZE` と name+version parity | **プロトコル実装済み**。UI の peer 選択導線は未実装 (§10) |
+1. **version の粒度** — 推奨どおり確定 (2026-08-09, #104)。記述子ごとの
+   `const char* version` 欄で、dll 単位の第2エクスポートは採らない。
+   規範は §3.1、欄そのものは §4 / §5.2 / §7.1 の各構造体、帳簿との合流は
+   §11。
+2. **stack アクセスモデル** — 推奨どおり確定 (2026-08-09, #104)。pull
+   (`get_frame` + `release_frame`)。規範は §5.1、却下した2案 (全枚配列 /
+   push 型逐次) は §9.4 の表に理由つきで残る。
+3. **部分ロード契約** — 推奨どおり確定 (2026-08-09, #104)。`min_frames`
+   (宣言) と `frames`/`expected` (事実) の両建て。規範は §6、欄は §5.1 と
+   §5.2。
+4. **series の口** — 推奨どおり確定 (2026-08-09, #104)。形は v3 ヘッダで
+   凍結し、`register_series_analyzer3` は NULL 席のまま出荷する。形は §7.1、
+   席と探針規則は §7.2 と §2.2、ヘッダ差分は §12。正典 §10 (組み込みが先)
+   と判断record 6 (版上げを2回にしない) の張力はこの形で解けており、
+   **analysis-layers.md 側の修正は要らない**。
+5. **単位の宣言欄 emit_number_u** — 推奨どおり確定 (2026-08-09, #104)。
+   追加する。優先順位 (宣言 > キー名規約 > dtype) の規範は §8.2、欄は §8.1。
+6. **emit_map** — 推奨どおり確定 (2026-08-09, #104)。最小欄で v3 に入れる。
+   規範は §8.3、`psMapOut` は §8.1。意味種別の欄は置かない — map の語彙・
+   型・表示・帰属は #49 の手に残る (§1 非目標)。
+7. **運搬の3態** — 推奨どおり確定 (2026-08-09, #104)。in-process は常駐
+   参照、#45 ワーカは共有メモリ窓、remote は peer 側実行。ABI が固定するのは
+   pull の口だけ。規範は §9.1–§9.3。
+8. **remote 拡張** — 推奨どおり、**方向として**確定 (2026-08-09, #104)。
+   `MOP_PLUGIN_ANALYZE` を name+version 等値パリティで足す (不一致は両版
+   併記の理由つき拒否)。規範は §10。ワイヤ形式は remote.md の領分のまま
+   (§1) — この項が確定させたのは op の存在と成立条件だけである。
 
-新規プラグインは §7 の型案や撤回済み §8.3 を再現せず、§12 と公開ヘッダだけを
-現在のビルド指示として使う。
+これで本書は**実装可能**になった: §12 のヘッダ差分がそのまま
+[ps_plugin.h](../../include/ps/ps_plugin.h) への作業指示で、同梱アナライザの
+V3 移行は判断の外の機械的作業 (§1)。
+
+### 後続の適用結果 (2026-08-18/20)
+
+上の判断recordは書き換えない。実装時の進捗と後続裁定は次のとおりである。
+
+| # | 現在の適用結果 |
+|---:|---|
+| 1 | **適用済み**。frame / stack V3 と provenance に実装 (§3、§11) |
+| 2 | **適用済み**。`get_frame` + `release_frame` (§5、§9) |
+| 3 | **適用済み** (§5、§6) |
+| 4 | 形と予約席は契約済み。公開ヘッダの型宣言と名前付き field は未着地で、まだ呼べない (§7) |
+| 5 | 指定席と意味は契約済み。名前付き callback は未着地で、まだ呼べない (§8.2) |
+| 6 | **2026-08-11 に撤回**。`psMapOut` も map 用 reserved field も無い (#49、§8.3) |
+| 7 | in-process と remote peer は**適用済み**、Python 窓は未実装 (§9) |
+| 8 | **プロトコル実装済み**。UI の peer 選択導線は未実装 (§10) |
+
+現行プラグインをコンパイルする際は公開ヘッダに名前のある field だけを使用する。
+§7 / §8.2 / §12 は次に予約席へ名前を付ける時の規範であり、撤回済み §8.3 を
+再現してはならない。

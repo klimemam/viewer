@@ -213,7 +213,7 @@ raw (ヘッダ無し) は元々ユーザーが dtype・寸法・解釈を明示�
 **値の扱い — 宣言する、推測しない。**
 
 - **保存されたままの値**。8bit は 0..255、16bit は 0..65535。**0..1 に割らない。**
-  整数画素は `[DN]`、float 画素は単位を仮定しない。整数は値を保ったまま f32 に載る
+  画素の単位は [DN] 固定 (§8-9) で、整数は値を保ったまま f32 に載る
   (§4.8 — ただし 2^24 まで。u32/i32 はそこから先が別の整数になり、その事実は
   数えて申告される)。
   ここで正規化すると「**リンクされたライブラリによって同じファイルの測定値が
@@ -1280,17 +1280,22 @@ adapter を編集したら次に開いたときに効く。
 変換する**ことになり、この道具の設計思想 (見えているものと数値だけが流れる) に
 反する。したがって **adapter は peer 側で走る**。
 
-- **実装済み (2026-08-17、stage 0〜5 / protocol 12〜14)。** adapter 本体と
-  `viewer_import.py` / `run_adapter.py` はテキストとして client から peer へ渡り、
-  peer が `--serve-readers` の明示許可の下で実行する。peer 側の harness は
-  `--stream` 出力をキャッシュ materialisation に置く
-- `.vstream` キャッシュそのものを転送する op は無い。最初は間引き TILE、正式 open 後は
-  開いた frame の TILE、集計は MEASURE を返す。結果として全サンプルがリンクを通ることは
-  あるが、生ファイルを client へ戻して Reader を自動実行する fallback は無い
-- peer に Python / numpy が無ければ理由を返して拒否する。client 側 Reader への自動 fallback は
-  しない。選択は client 側に残り、peer が勝手に Reader を探すこともない
-- remote Reader が `AnalysisSet` を返す経路は role-ref registry が未実装なので、登録前に
-  返り値全体を名指しで拒否する。既存 remote stack の `MOP_SET_FOLD` とは別境界である
+- adapter は**テキストなので protocol で送れる**。peer は受け取った関数を
+  一時ディレクトリで実行し、**npz を peer 側に置く**
+- **変換結果は回線を渡らない。** peer は今 npy に対してやっているのと同じく、
+  TILE (見えている領域) と MEASURE (測定結果) だけを返す。
+  「見えているものと数値だけが流れる」は adapter 経由でも成立する
+- peer に Python / numpy が無ければ**そう言う** (推測して黙って失敗しない)。
+  そのときの逃げ道は「手元で走らせる (ファイルが流れます)」を明示的に選ばせる
+- 選択はローカルで行われたまま。**peer が勝手に adapter を探すことはない**
+
+> **後続実装 (2026-08-17、stage 0〜5 / protocol 12〜14):** adapter 本体と
+> `viewer_import.py` / `run_adapter.py` は client から peer へ渡り、peer が
+> `--serve-readers` の明示許可の下で実行する。変換 materialisation は peer 側の
+> `.vstream` cache に留まり、client へ返す wire 語彙は TILE / MEASURE である。
+> Python / numpy が無い場合は理由を返して拒否し、client 側 Reader への自動 fallback は
+> しない。remote Reader が `AnalysisSet` を返す経路は role-ref registry が未実装なので、
+> 登録前に返り値全体を名指しで拒否する。
 
 #### 4.13.2 リーダの置き場所は「登録する」(2026-08-10 裁定、issue #51)
 
@@ -1483,9 +1488,7 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
    設定ファイルごとに一度承認させ、path+内容ハッシュで覚える形になる
 8. ~~内蔵エディタ~~ **決定**: 内蔵は作らないが、**エディタ起動は v1 から入れる**
    (`$EDITOR` → `code -g` → OS 関連付け)
-9. ~~画素値の単位~~ **当初決定を訂正 (2026-08-18)**: 整数入力は `[DN]`。
-   float 入力は reflectance、電子数、正規化値などを表し得るため単位を固定せず、
-   Reader が量名・単位を明示した場合だけその宣言を使う
+9. ~~画素値の単位~~ **決定**: 不要。**[DN] 固定**
 10. ~~部分読み込み~~ **決定**: `only=` の契約は v1 で決め、実装は後。
     adapter が勝手に一部を返すのは「部分読み」ではない (§4.1 の理由)
 11. ~~ローカル先行か~~ **決定**: **remote 込み**。adapter は peer 側で走る (§4.13.1)

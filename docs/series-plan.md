@@ -5,8 +5,9 @@
 > 保存した履歴として読む。現行のデータモデルは §1 の mixed frame / stack member。
 
 正典は [terminology.md](terminology.md)。順序付きデータ層は
-`frame ≼ stack ≼ series` (`≼` は集合包含ではない)。中間層の省略は可、逆転は
-不可。**series と各メンバは同じ1つの batch に `managed-by` される**。
+`frame ≼ stack ≼ series` (`≼` は集合包含ではない)。各層は単独でも存在でき、
+中間層の省略は可、逆転は不可。**series と各メンバは同じ1つの batch に
+`managed-by` される**。
 各 phase は単独で出荷できる。
 
 ## 0. 設計を縛る現状

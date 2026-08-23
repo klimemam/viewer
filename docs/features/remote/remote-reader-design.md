@@ -1,12 +1,14 @@
 # リモート実行リーダ — 「reader は peer 側で走る」の設計 (G11 / issue #180 裁定 B)
 
-**状態: 実装済み (2026-08-17、stage 0〜5、protocol 12〜14)。** issue #180 の
-ユーザー裁定 B — `docs/features/adapters/input-adapters.md` §4.13.1
-(2026-08-03)「**adapter は peer 側で走る**」— を実装した記録である。
-§0、§7、§8〜§10 は確定した現行契約・境界・実装台帳 (当初案との差分を含む)、§1〜§6 は実装前に
-不足・選択肢・ワイヤ案を固定した**実装前設計記録**として読む。途中の `VERSION 12` /
-`MRF_READER` という案より、§8 の実装注記と `core/remote_proto.h` の protocol 14 が優先する。
-対象だった verify-matrix **G11** は解消済み。
+**状態: 設計 (2026-08-17, Fable)。** issue #180 のユーザー裁定 B —
+`docs/features/adapters/input-adapters.md` §4.13.1 (2026-08-03)「**adapter は peer 側で走る**」を
+そのとおり実装する — を受けた設計。対象は verify-matrix **G11**
+(「決定はあるが実装が無く、拒否文もそれを言わない」、`docs/verification/matrix.md:640`)。
+
+> **現行追記:** stage 0〜5 は 2026-08-17 に protocol 12〜14 として実装済み。
+> §0、§7、§8〜§10 は現行契約・境界・実装台帳、§1〜§6 は実装前設計記録として
+> 読む。途中の `VERSION 12` / `MRF_READER` 案より、§8 の実装注記と
+> `core/remote_proto.h` の現行版を優先する。G11 は解消済み。
 
 読んだもの: `docs/features/adapters/input-adapters.md` §4.12/§4.12.1/§4.13〜§4.13.2 /
 `core/remote_proto.h` (protocol 11 全注釈) / `core/serve.cpp` /
@@ -242,14 +244,17 @@ MSG_TILE は元から「復号済み画素を source dtype で返す。ファイ
 配列の dtype** である — harness が 9 種 (`u1 i1 b1 u2 i2 u4 i4 f4 f8`) に正規化
 済みで、wire の DType に全部載る (`b1 → DT_U8` は openNpy の既存表 serve.cpp :267
 の写しであり、新しい対応を発明しない。u4/i4/f8 の f32 損失は既存の census が
-そのまま数える)。materialisation (`.vstream`) は peer に置かれたままで、client は
-最初に全体の間引き TILE、正式 open 後に開いた frame の全解像度 TILE を受ける。
-したがって**キャッシュファイル自体は渡らないが、frame の全サンプルが TILE として
-渡ることはある**。MEASURE を使う処理は画素列ではなく集計結果だけを返す。
+そのまま数える)。§4.13.1 の 2 行目「**変換結果は回線を渡らない**」はこう実装
+される: materialisation (.vstream) は peer に置かれたまま、渡るのはヘッダの
+テキストと、画面が要る間引きタイルと、MEASURE の結果だけ。
+
+> **現行追記:** client は最初に全体の間引き TILE、正式 open 後に開いた frame の
+> 全解像度 TILE を受ける。キャッシュファイル自体は渡らないが、正式 open では
+> frame の全サンプルが TILE として渡ることがある。MEASURE は集計結果だけを返す。
 
 ---
 
-## 5. peer 側の実行 — #44 の枠付きストリームをそのまま転送に使う
+## 5. peer 側の実行 — #44 の枠付きストリームがそのまま配布面になる
 
 ### 5.1 実行
 

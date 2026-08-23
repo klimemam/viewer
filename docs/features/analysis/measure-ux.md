@@ -73,10 +73,8 @@ Series Analysis(旧 Linearity)機能・remote/ssh 系・README は対象外で�
 
 - **unit 列**: グリッドに metric 名の隣へ単位列を常設。単位はキー名が
   自己申告するもの(`snr_db`→dB、`*_pct`→%、`mtf50 (cy/px)`→cy/px)は
-  そこから、画像値系(mean/std/noise/percentile)はホストが dtype から
-  決める: 整数系 dtype は DN、float は単位を断定せず dtype 名を出す
-  (float の .npy が反射率か e- かはファイルには書かれていない。
-  Inspector と同じ規約)。相対指標(sharpness)は a.u.、無次元は ratio。
+  そこから、画像値系(mean/std/noise/percentile)は dtype にかかわらず `[DN]`。
+  相対指標(sharpness)は a.u.、無次元は ratio。
 - **主要指標の強調**: アナライザごとの見出し数値(mtf50、prnu_pct、noise、
   snr_db)の行をアクセント色で強調する。グリッドは全数値を保持しつつ、
   最初に確認すべき値を視覚的に示す。**ABI v3 記述子はこれを自分で申告する**

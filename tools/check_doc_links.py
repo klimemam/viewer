@@ -457,8 +457,15 @@ def run_checks(root: Path, files: list[Path] | None = None) -> list[Problem]:
     board_text = _text(board)
     if board_text:
         try:
-            rows = list(csv.reader(io.StringIO(board_text)))
-            for row_no, row in enumerate(rows[1:], 2):
+            rows = csv.reader(io.StringIO(board_text))
+            next(rows, None)
+            previous_end = rows.line_num
+            for row in rows:
+                # Report the physical start line. csv.reader.line_num is the
+                # physical end line of the record just consumed, including an
+                # embedded newline inside a quoted field.
+                row_no = previous_end + 1
+                previous_end = rows.line_num
                 if len(row) < 4 or row[0].strip() == "対応済み":
                     continue
                 live_text = "\n".join(row[1:])
@@ -586,7 +593,7 @@ def selftest() -> int:
         (root / "ARCHITECTURE.md").write_text(old_path + "\n", encoding="utf-8")
         (root / "docs" / "tasks.csv").write_text(
             "分類,項目,内容,参照,実装ブランチ,備考\n"
-            f"進行中,reference,case,{old_path},,\n"
+            f'進行中,"reference\ncontinued",case,{old_path},,\n'
             f"進行中,{PurePosixPath(old_path).name},case,{new_path},,\n"
             f"進行中,content,{old_path},{new_path},,\n"
             f"進行中,branch,case,{new_path},{PurePosixPath(old_path).name},\n"
@@ -601,8 +608,8 @@ def selftest() -> int:
         rejected = {p.path for p in problems if p.code in {"OLD_PATH", "BOARD_OLD_PATH"}}
         required_rejections = {
             current_source, "README.md", "ARCHITECTURE.md",
-            "docs/tasks.csv:2", "docs/tasks.csv:3", "docs/tasks.csv:4",
-            "docs/tasks.csv:5", "docs/tasks.csv:6",
+            "docs/tasks.csv:2", "docs/tasks.csv:4", "docs/tasks.csv:5",
+            "docs/tasks.csv:6", "docs/tasks.csv:7",
         }
         if not required_rejections.issubset(rejected):
             print("selftest case 2: current source escaped old-path gate", file=sys.stderr)

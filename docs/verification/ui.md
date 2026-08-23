@@ -54,6 +54,64 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 | `g_escProbe` | 1回の ESC を消費した層を `popup / textedit / roi / compare / nothing` のいずれかで、押下順に1件だけ記録する |
 | layout probe（配置観測） | item / plot / pane の矩形を ImGui から読み返し、親ウィンドウの範囲、重なり、必要なバッジが残っていることを数値で判定する |
 
+### `--browse-keys` action language
+
+UI を実フレーム経由で駆動できる入口は `--browse-keys-selftest <dir>` である。
+`--browse-keys "<act,act,…>"` は既定の action 列全体を置き換える。完全な語彙と
+意味の正典は [core/app/cli.inc](../../core/app/cli.inc) とし、ここには再実行時に必要な
+系統を列挙する。
+
+- キー: `down` `up` `left` `right` `enter` `home` `end` `back` `esc` `comma` `period`
+- マウス: `click` `ctrlclick` `dbl` `clickoff:N` `dbloff:N` `idle:N` `chevclick`
+  `mback` `mfwd` `altleft` `altright` `fmenu` `rctx` `rctxcur` `ctxclick:LABEL`
+- 状態: `viewreset` `w<px>` `h<px>` `focus` `blur` `flat` `tree` `disc`。
+  撤去済みの drawer と同じく `more` action も存在しない
+- instance: `target:N` `newpanel` `reconnect` `closep` `hidep` `showp` `filt:S` `sessrt`
+- 待機: `waitimg:N` `waitdir:LEAF`
+- 主な assert: `chkimg:N` `chkpv:N` `chkidx:K` `chkopen:S` `chkcur`
+  `chkcurn:NAME` `chknames:SPEC` `chkdir:LEAF` `chkcursor:N` `chkatrow:NAME`
+  `chkback:N` `chkfwd:N` `chkexp:N` `exparm` `chkexpn:0` `chkfocus:0|1`
+  `chkfilt:S` `chkpanels:N` `chkshown:N` `chksel:N` `chkctx:N`
+  `chkctx:+LABEL` `chkctx:-LABEL` `rdrshut` `chkrdr:NAME`
+
+### Script template and calibration
+
+自作スクリプトは次の定型を前後に置く。
+
+```text
+PROLOG  waitdir:<leaf>,viewreset,w400,home
+EPILOG  <6個以上のnavキー>,blur,down,up,end,home,rawopen,popupcheck,seqask,popupcheck
+```
+
+- **PROLOG が要る理由**: `viewreset` は grouped + list + folded + natural-name の
+  絶対ピンである。`w400` はパネルを固定幅で float させ、注入クリックが
+  利用者の保存レイアウト次第の座標に落ちるのを防ぐ。**重なり順も `w400` が固定する**
+  (#206): 矩形を決めても、そこに描かれているのが別の窓なら注入クリックはそちらに
+  落ちる —— layout.ini の無い config では Browse は docked で始まり、`w400` の
+  undock だけでは既定で開いている ROIs / Analysis の下のままだった。
+- **EPILOG が要る理由**: 終了判定は
+  `keysOk = routeOk && popOk && watchOff && keysCheckBad == 0`
+  ([core/main.cpp](../../core/main.cpp)) である。`routeOk` / `popOk` / `watchOff` を
+  観測する action を省くと、個々の assert が通っても run は非0で終わる。
+
+校正は、製品コードを変更・再ビルドせず、同じ20 actionの期待行名だけを変えて行う。
+
+```bash
+bash tools/verify/calibrate_browse_keys.sh <checkout>
+```
+
+```text
+### 1. DELIBERATELY WRONG expectation (chkatrow:expset) - must FAIL
+browsekeys: chkatrow:expset    -> … cur=-  cursor row=digitset: FAIL
+browsekeys: 20 action(s) through real frames, no crash, 1 panel check(s) failed: FAILED
+rc=1
+
+### 2. CORRECT expectation (chkatrow:digitset) - must PASS
+browsekeys: chkatrow:digitset  -> … cur=-  cursor row=digitset: ok
+browsekeys: 20 action(s) through real frames, no crash, 0 panel check(s) failed: ok
+rc=0
+```
+
 スクリプト実行（scripted run）は、CMake がテストごとの設定用・一時用ディレクトリに
 隔離する。さらに製品側も、scripted run では利用者の `layout.ini` と autosave を
 読み書きしない。この二重の隔離を外した直接実行は、標準の判定に使わない。
@@ -143,6 +201,10 @@ PASS にしない。製品が実際に描画または発行した値を保持す
 - 色、線幅、線種など、状態値だけでは見た目を保証できない属性
 
 probe がない場合は `要 probe`、見た目そのものを判定する場合は `実機確認` と記録する。
+
+> **C4 の現行注記:** [2026-08-03 の結果](results/20260803-ui.md) にある
+> `A = B` / `paused` との併存は、当時の未実施期待であり、2026-08-04 に撤去済みである。
+> 現行契約は A13 / B2。凍結した過去結果そのものは書き換えない。
 
 ## 8. 保存済みの実施記録
 

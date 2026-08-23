@@ -9,16 +9,16 @@ stack」という層モデルの読みと、依存候補の比較までで止ま
 問うていない。本書はそこから始め、実測して、結論を出す。
 
 このツールの正典は [docs/terminology.md](../../terminology.md) と
-[docs/features/analysis/stats-taxonomy.md](../analysis/stats-taxonomy.md) である。v1 が受理する
-整数 y4m の画素は記録された符号値 `[DN]` であり、**数値が製品**である。
+[docs/features/analysis/stats-taxonomy.md](../analysis/stats-taxonomy.md): **画素値は [DN]**
+であり、**数値が製品**。
 「デコードできた」は「その数値に意味がある」ではない。
 
 ---
 
 ## 結論(先に書く)
 
-1. **v1 は y4m (YUV4MPEG2) の輝度プレーンだけを読む。** 非圧縮・ビット完全なので、
-   値は記録された DN と一致する。1 ファイル = 1 stack、N フレーム、提示順。
+1. **v1 は y4m (YUV4MPEG2) の輝度プレーンだけを読む。** 非圧縮・ビット完全なので
+   値は正真正銘 DN。1 ファイル = 1 stack、N フレーム、提示順。
 2. **lossy な動画コンテナ(mp4/mov/mkv/avi/…)は名指しで拒否する。** 「開けません」
    ではなく、**形式名・拒否理由・正直に取り込む変換コマンド**を出す。
 3. **FFmpeg (libavcodec 等) は v1 では採用しない。** 実測 95.6 MB / LGPL 義務 /

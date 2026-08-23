@@ -16,7 +16,7 @@ peer は protocol 10 以降 PNG / JPEG / TIFF / 単一 document の OpenEXR / y4
 
 ---
 
-## 1. OpenEXR 対応 — 実装前比較と実装結果
+## 1. OpenEXR 対応
 
 > **状態: 実装済み (2026-08-09、#53)。以下の比較検討は当時のまま残す。**
 >
@@ -41,16 +41,15 @@ peer は protocol 10 以降 PNG / JPEG / TIFF / 単一 document の OpenEXR / y4
 > | `viewer.exe` | 9,141,893 B | 12,293,548 B | **+3,151,655 B (+3.01 MiB、+34.5%)** |
 > | `viewer-serve.exe` | 3,352,097 B | 3,352,097 B | **0 —— sha256 まで同一** |
 >
-> ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、クリーンなビルドでしか
+> ビルド時間の増分は**ほぼ全部が OpenEXR 自身のコンパイル**で、cold tree でしか
 > 起きない。バイナリの増分は実コード(使わなければリンカが落とすため)。
 >
-> **この2つの増分を 0 に戻す構成はもう無い** (#53 の裁定、2026-08-09 ——
+> **この2つの数字を 0 に戻す方法はもう無い** (#53 の裁定、2026-08-09 ——
 > 「既定ONで。OFFにするパスは不要です」)。上の表の「なし」列は、この節が
 > 書かれた時点の測定として残す —— 再現できる構成ではない。`VIEWER_WITH_EXR`
 > option は削除済み。**代償**は「オフラインの clean clone が、システムに
-> OpenEXR/Imath が無いとビルドできない」こと ([manual.md](../../guides/manual.md)
-> 付録「ビルドとネットワーク」、[CMakeLists.txt](../../../CMakeLists.txt) の
-> OpenEXR ブロック)。
+> OpenEXR/Imath が無いとビルドできない」こと (manual.md 付録「ビルドと
+> ネットワーク」、CMakeLists.txt の OpenEXR ブロック)。
 >
 > **peer は形式を増やさない** (下の「remote への波及」の案 (a))。`viewer-serve`
 > が `core/imagefile.cpp` をコンパイルしないという1つの事実がそれを保証していて、
@@ -58,9 +57,8 @@ peer は protocol 10 以降 PNG / JPEG / TIFF / 単一 document の OpenEXR / y4
 > (#148 判断 B、下の「remote への波及」の追記)。peer は `core/imagefile.cpp` を
 > コンパイルする。
 
-当初の最小要件は scanline RGB/Y の half/float を**画素値そのまま**
-(トーンマップなし)で読むことだった。実装後は1レベル tiled も読み、deep / multipart /
-mipmap / ripmap は名指しで断る。
+必要なのは scanline RGB/Y の half/float を**画素値そのまま**(トーンマップなし)で
+読むことだけ。deep / tiled / multipart は当面対象外。
 
 ### 候補比較
 
@@ -86,7 +84,7 @@ mipmap / ripmap は名指しで断る。
 TILE は dtype 付きで画素を運ぶ設計([remote_proto.h](../../../core/remote_proto.h))なので、
 サーバ側で EXR→f32 に落として `DT_F32` を返せば**プロトコル変更ゼロ**(案 b)。
 ただし loader が main.cpp 内にある現状では serve.cpp から呼べない。
-**推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` のような
+**推奨: まず (a) ローカル専用**で出し、npy/exr デコードを `core/loaders.cpp` 的な
 共有 TU へ切り出す整理(toFloatSamples と同じ共有パターン)ができた時点で (b) を足す。
 
 > **(b) に移行した (issue #148 判断 B, 2026-08-10)。** 共有 TU は

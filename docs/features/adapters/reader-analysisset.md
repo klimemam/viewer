@@ -431,12 +431,17 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
 2. terminology.md の操作マトリクスに AnalysisSet 列を足した (Close = 束縛の
    破棄・メンバ無傷、rename = 可・セッション保存、他は空欄)。§11 の適用
    パッケージと同じく、修正として明示的に。
-3. `tools/import/viewer_import.py` は `AnalysisSet` / `Ref` を実装・公開し、
-   `run_adapter.py` は `analysisset` / `__role_<i>` / `__refs_<i>` と
-   `__viewer 2` を出力する。viewer と selftest も同じ契約を読む。
-4. **後続改訂 (2026-08-19, #230):** 5語を、3つの順序付きデータ層
-   (`frame ≼ stack ≼ series`) と、`managed-by` / `role-ref` の2関係へ再整理した。
-   2026-08-07時点の適用記録は上記のまま保持する。
+3. `tools/import/viewer_import.py` の docstring に AnalysisSet / Ref の所在
+   (本書) と未実装である事実を足した。`__all__` への型追加と README の型一覧
+   は実装と同時 (存在しない型を輸出可能と言わない)。
+
+**後続実装 (2026-08-17/18):** `viewer_import.py` は `AnalysisSet` / `Ref` を
+実装・公開し、`run_adapter.py` は `analysisset` / `__role_<i>` / `__refs_<i>` と
+`__viewer 2` を出力する。viewer と selftest も同じ契約を読む。
+
+**後続改訂 (2026-08-19, #230):** 5語を、3つの順序付きデータ層
+(`frame ≼ stack ≼ series`) と、`managed-by` / `role-ref` の2関係へ再整理した。
+2026-08-07時点の適用記録は上記のまま保持する。
 
 ## 9. 判断record (2026-08-07 確定 — もう「待ち」ではない)
 

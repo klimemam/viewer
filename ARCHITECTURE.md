@@ -37,8 +37,9 @@ GUI 本体は `core/main.cpp` が `core/app/*.inc`、`core/ui/*.inc`、selftest 
 ## 2. 層モデルと、それを守っている場所
 
 データ層の順序は `frame ≼ stack ≼ series` です。これは集合包含ではなく、存在する
-中間層がこの順序を守るという意味です。stack を省略した standalone frame の series
-参加や、どの series にも属さない stack は合法ですが、順序の逆転はしません。
+中間層がこの順序を守るという意味です。各層は単独でも存在でき、stack を省略した
+standalone frame の series 参加や、どの series にも属さない stack は合法ですが、
+順序の逆転はしません。
 frame / stack / series は batch に `managed-by` され、AnalysisSet はそれらを
 `role-ref` します。batch は管理境界、AnalysisSet は役割参照で、どちらもこの順序の
 続きではありません。
@@ -443,7 +444,7 @@ GL の無い windows / macos ランナーでも走ります。どちらに属す
   `resident n of N frame(s)`、表には `n` と `N` の列。
 - **B-4 ラベルに乗った量は単位を連れる。** `sigma_t [DN]`、`sigma_frame [%]` —
   絶対量と相対量が同じ見た目で並ばないこと。
-- **B-5 整数の画素値は [DN]。float は単位を仮定せず保存値として扱う。**
+- **B-5 画素値は [DN]。**
 
 加えて:
 

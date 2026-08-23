@@ -52,8 +52,8 @@ Measure メニューは `description` をツールチップに出す
   キー名に単位を埋めず `{"value":…, "unit":…}` を使います
   ([input-adapters.md §4.3.1](../features/adapters/input-adapters.md))。**宣言できるなら宣言が勝つ。**
 - 画像値系のキー(`.mean` `.std` `.noise` `.min/.max/.p1/.p50/.p99` `.var`)は
-  **ファイルの単位**: ホストが dtype から決める(整数 → DN、float → dtype 名。
-  float ファイルの物理単位はファイルに書かれていないので断定しない)
+  ホスト共通の画素値単位 `[DN]`（`.var` は `DN^2`）。保存 dtype によって
+  単位名を変えない
 - 相対指標(`varlap` `tenengrad` `grad_mean`)は a.u.(絶対値に意味なし)
 - **見出し数値**(そのアナライザの主目的の数値)は**プラグインが申告する**:
   ABI v3 記述子の `headline` 欄(チャンネル接頭辞を剥いだキー名1つ、NULL 可)。

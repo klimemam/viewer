@@ -38,8 +38,9 @@ v2 で加わった認識 (ユーザー提案の核):
     frame / stack / series --managed-by--> batch
     AnalysisSet --role-ref--> frame / stack / series
 
-`≼` は集合包含ではない。途中の stack は省略でき、standalone frame と stack を
-同じ series のメンバにできるが、存在する層の順序は逆転できない。batch は管理境界で
+`≼` は集合包含ではない。各層は単独でも存在でき、途中の stack は省略できる。
+standalone frame と stack を同じ series のメンバにできるが、存在する層の順序は
+逆転できない。batch は管理境界で
 あって上位データ層ではない。series と全メンバは同じ batch に管理される。
 
 **AnalysisSet = 解析への入力を役割 (role) で参照する型。** 例:
@@ -489,7 +490,7 @@ SetAnalyzer の結果は自分の set を指せば provenance の大半が済む
 判断record 8 の承認後、関係モデルだけは #230 の A + 補足で改訂された。現行の
 適用パッケージは次のとおり:
 
-1. **関係の分離**: データ層は `frame ≼ stack ≼ series`（中間省略可・逆転不可）。
+1. **関係の分離**: データ層は `frame ≼ stack ≼ series`（各層単独可・中間省略可・逆転不可）。
    frame / stack / series は batch に managed-by され、AnalysisSet はそれらを
    role-ref する。set 自身は1つの batch に管理されるが、参照先は別 batch でもよい。
 2. **用語の追加**: AnalysisSet と解析の4種 (General Analyzer / Specific
