@@ -2705,6 +2705,50 @@ static bool g_watchSuppressed = false;
                             requestBrowseTemporal(app.previewHost, app.previewFiles,
                                                   "svtemp", app.previewPort);
                     }
+                    else if (a == "scanhere") {
+                        // what a folder row's "Open folder (all stacks below)"
+                        // does, aimed at the browsed directory
+                        remoteScanFolder(rbKeysT(), rbKeysT().b.dir);
+                    }
+                    else if (a == "pickok") {
+                        // the folder picker's "Load" button, pressed - the same
+                        // call --bench makes (see pickerAccept above)
+                        fprintf(stderr, "browsekeys: pickok - open=%d remote=%d groups=%d\n",
+                                app.folderPickOpen ? 1 : 0, app.folderPickRemote ? 1 : 0,
+                                (int)app.folderPick.size());
+                        if (app.folderPickOpen) pickerAccept();
+                    }
+                    else if (a == "stopload") {
+                        // The Files panel's "Stop", pressed. It is the button's
+                        // OWN code (stopLocalStackLoad / stopRemoteStackFetch,
+                        // core/app/sequence.inc) and not a copy, and it presses
+                        // whichever of the two is on screen - which loader is
+                        // running is what decides which button the user sees.
+                        fprintf(stderr, "browsekeys: stopload - seqRunning=%d rfPending=%d "
+                                        "backlog=%d, %d image(s)\n",
+                                app.seqRunning ? 1 : 0, app.rfPending.load(),
+                                (int)seqReadyCount(), (int)app.images.size());
+                        if (app.seqRunning || !app.seqQueue.empty()) stopLocalStackLoad();
+                        if (app.rfPending > 0) stopRemoteStackFetch();
+                        g_rbImgMark = (int)app.images.size();   // "since the Stop"
+                    }
+                    else if (a == "chkloadidle") {
+                        // The loader is back AT REST - every part of it. Not
+                        // "the frames stopped arriving": a Stop that leaves the
+                        // cancel flag raised, a queue behind it or a backlog of
+                        // decoded frames has not finished stopping, and each of
+                        // those is a way the next load starts from a state
+                        // nobody chose (#237).
+                        bool idle = !app.seqRunning && !seqReadyPending() &&
+                                    app.seqQueue.empty() && !app.seqCancel &&
+                                    app.rbOpenQueue.empty() && app.rfPending <= 0;
+                        chk(idle, "running=" + std::to_string(app.seqRunning ? 1 : 0) +
+                                  " backlog=" + std::to_string((int)seqReadyCount()) +
+                                  " queued=" + std::to_string((int)app.seqQueue.size()) +
+                                  " cancelling=" + std::to_string(app.seqCancel ? 1 : 0) +
+                                  " openq=" + std::to_string((int)app.rbOpenQueue.size()) +
+                                  " rfPending=" + std::to_string(app.rfPending.load()));
+                    }
                     else if (op == "chkfocus") {   // the TARGET instance owns the keys
                         ImGuiWindow* nw = ImGui::GetCurrentContext()->NavWindow;
                         bool f2 = nw && rbKeysT().wtitle == nw->Name;
@@ -2725,6 +2769,20 @@ static bool g_watchSuppressed = false;
                         if (idleLeft < 0) idleLeft = arg;
                         if (idleLeft > 0) { idleLeft--; hold = true; }
                         else idleLeft = -1;
+                    }
+                    else if (op == "waitload") {
+                        // Hold until a stack load is really IN FLIGHT. "Stop"
+                        // only exists while one is, so a scripted Stop fired a
+                        // frame too early presses nothing and the run that
+                        // follows asserts about nothing.
+                        static double waitL0 = 0;
+                        bool live = app.seqRunning || app.rfPending > 0;
+                        if (live) { chk(true, "rfPending=" + std::to_string(app.rfPending.load()) +
+                                              " seqRunning=" + std::to_string(app.seqRunning ? 1 : 0));
+                                    waitL0 = 0; }
+                        else if (waitL0 == 0) { waitL0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitL0 < 60.0) hold = true;
+                        else { chk(false, "no load ever started"); waitL0 = 0; }
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;

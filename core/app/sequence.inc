@@ -327,6 +327,34 @@ static void stopSequenceLoader() {
     app.seqReady.clear();
 }
 
+// ---- what the Files panel's two "Stop" buttons DO ---------------------------
+// Lifted out of core/ui/file_list.inc so the scripted Stop (--browse-keys'
+// "stopload") presses the button's own code rather than a second copy of it -
+// a copy is how "Stop leaves something behind" survives being tested.
+// Two functions and not one, because they are two buttons: which of them the
+// user sees is which loader is running, and a local Stop has never cancelled a
+// remote fetch.
+static void stopLocalStackLoad() {
+    app.seqCancel = true;
+    app.seqQueue.clear();
+}
+static void stopRemoteStackFetch() {
+    app.rfGen++;
+    app.rbOpenQueue.clear();   // or the queue would just start the next stack
+    std::lock_guard<std::mutex> lk(app.rfMtx);
+    app.rfQueue.clear();
+    app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0;
+    app.rfBytesInFlight = 0;
+}
+// How many decoded frames are waiting for the UI thread - the size of the
+// backlog a Stop has to refuse. For the line a scripted Stop prints and for the
+// selftest that asserts the loader came back to rest; the pump reads
+// app.seqReady itself, under this same lock.
+static size_t seqReadyCount() {
+    std::lock_guard<std::mutex> lk(app.seqMtx);
+    return app.seqReady.size();
+}
+
 // (frameShapeText / stackShapeRefusal moved to core/app/util.inc: the remote
 // fetcher refuses the same disagreement in the same words, and util.inc is
 // above both transports. The rule is one rule, so it has one definition.)
@@ -567,6 +595,26 @@ static void pumpSequence() {
     std::string err;
     {
         std::lock_guard<std::mutex> lk(app.seqMtx);
+        // STOP MEANS STOP, and it means it NOW (issue #237). The worker tests
+        // app.seqCancel once per FILE, so between the button being pressed and
+        // the thread noticing it keeps handing over frames it had already
+        // decoded - and this pump used to integrate every one of them, four
+        // textures at a time, long after the user had said to stop. Measured on
+        // the 1200-frame folder selftest.browse-stop opens: 253 frames already
+        // decoded and waiting at the press, and the pump went on opening them
+        // (30 and 61 documents after the Stop in two runs) while the window
+        // paid for every texture upload on the thread the Browse panel's clicks
+        // and listings also live on. That is what "the panel stopped answering
+        // after I pressed Stop" is made of.
+        //
+        // Dropped here and not in the button, because the button cannot reach
+        // what has not been pushed yet. This is the ONE place a decoded frame
+        // becomes a document, so it is the only place that can refuse one - and
+        // it has to refuse on every frame the cancel stands, not once, or the
+        // rest of the backlog simply lands on the frame after.
+        // (stopSequenceLoader empties the same vector for the same reason; the
+        // button's Stop had no way of saying it.)
+        if (app.seqCancel) app.seqReady.clear();
         // cap per UI frame: a fast decoder could otherwise hand us dozens of
         // 48 MB frames at once and stall the frame
         const size_t MAX_PER_FRAME = 4;
@@ -584,7 +632,16 @@ static void pumpSequence() {
     // wrong temporal statistics.
     if (!err.empty()) { toast(err, true); app.seqNote = err; }
     if (batch.empty()) {
-        if (!app.seqRunning && app.seqThread.joinable()) app.seqThread.join();
+        if (!app.seqRunning && app.seqThread.joinable()) {
+            app.seqThread.join();
+            // ...and the flag comes BACK. The button's Stop only ever raised
+            // it; stopSequenceLoader lowers it after its own join and nothing
+            // lowered it after this one, so a stopped load left the loader
+            // permanently marked "cancelling" - the #206 shape, a state that
+            // does not return. Here, after the join, is the only point at
+            // which lowering it cannot restart a worker that is still reading.
+            app.seqCancel = false;
+        }
         return;
     }
     // inherit display settings from the sequence reference frame so frames are

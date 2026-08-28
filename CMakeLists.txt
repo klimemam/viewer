@@ -885,7 +885,7 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Six of the tests below do; the other 37 take the --no-window startup path and
+# Eight of the tests below do; the other 45 take the --no-window startup path and
 # need neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1080,10 +1080,10 @@ set_tests_properties(test_abi_probe PROPERTIES LABELS "selftest;nogl" TIMEOUT 60
 # byte-identical to the same test with a window (the load-progress line
 # "stack: loaded N frames" excepted - it is a snapshot of a race between the
 # loader thread and the integrating pump, and it varies run to run in either
-# mode). The five without it - browse-keys, browse-dbl, abstats, verify, tile
-# - stop at needWindow() and say so; they drive real ImGui frames and
-# assert on the LAYOUT that comes back, which is exactly what the backends the
-# window carries are what produce.
+# mode). The six without it - browse-keys, browse-dbl, browse-stop, abstats,
+# verify, tile - stop at needWindow() and say so; they drive real ImGui frames
+# and assert on the LAYOUT that comes back, which is exactly what the backends
+# the window carries are what produce.
 #
 # `roistats` is the one that had to EARN its NOGL rather than merely take it,
 # because it is the only test here that draws ImGui frames without a backend
@@ -1138,6 +1138,32 @@ dbloff:1,chkimg:1,chknames:dark.npy,chkatrow:dark.npy,\
 clickoff:1,idle:80,click,chkatrow:flat.npy,chkimg:2,\
 chknames:dark.npy+flat.npy[pv],\
 home,imgmark,dbloff:1,waitdir:digitset,chkimgmark,chkimg:2")
+# ...and the same loop with the load STOPPED half way (issue #237). The user's
+# report is "open a stack of many files from Browse, press Stop, and the panel
+# will not change folder any more", so the run is that sentence and nothing
+# else: a real folder scan from the panel ("Open folder (all stacks below)"),
+# the picker's Load, a wait until the loader is genuinely running, the Files
+# panel's own Stop - stopload presses stopLocalStackLoad / stopRemoteStackFetch,
+# which ARE the button's code, not a copy of it - and then the two claims.
+#
+#   chkloadidle  the loader came back to rest: no thread, no backlog, no queue
+#                and NOT still marked cancelling. That last one is the state
+#                that did not return: the button raised app.seqCancel and
+#                nothing ever lowered it, so this line fails before the fix.
+#   chkimgmark   nothing was opened AFTER the Stop. stopload takes the mark, so
+#                this is "Stop means stop", not "Stop means stop shortly".
+#   the tail     the panel still navigates: into elsewhere/, back out, both
+#                asserted as the browsed directory rather than as a click that
+#                appeared to land.
+#
+# `focus` before the keys because a 1200-frame load ends with the canvas holding
+# the keyboard - true of a load with or without a Stop, and not what this test
+# is about.
+viewer_selftest(browse-stop --browse-keys-selftest tools/testdata/stopset
+                --browse-keys "waitdir:stopset,viewreset,w400,\
+scanhere,idle:20,pickok,waitload,stopload,idle:40,chkloadidle,chkimgmark,\
+focus,home,down,chkatrow:elsewhere,dbl,waitdir:elsewhere,chkdir:elsewhere,\
+home,dbl,waitdir:stopset,chkdir:stopset")
 # The T group lays out the Temporal panel in real ImGui frames (the chart that
 # was drawn past the panel's bottom edge is a layout fact, invisible to the
 # recompute functions).

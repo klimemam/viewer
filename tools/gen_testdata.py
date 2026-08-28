@@ -1229,6 +1229,33 @@ for _i in (1, 2, 3):
     write_png(openf / ("暗電流_%03d.png" % _i),   # 暗電流 = dark current
               ((ofyy * 5 + ofxx + _i * 29) % 256).astype(np.uint8), bit=8, ctype=0)
 
+# --------------------------------------------------------------- stopset/ ----
+# Issue #237: the Stop that has to be pressed WHILE a stack is loading, and the
+# Browse panel that has to survive it.
+#
+# The only thing this fixture needs is ENOUGH FILES. selftest.browse-stop (a
+# --browse-keys run, registered in CMakeLists.txt) holds on `waitload` until the
+# loader is genuinely running and presses Stop one
+# action (8 frames, ~70 ms) later; a folder of a dozen frames is finished before
+# the button exists, and the whole run then asserts about a load that was never
+# stopped. 1200 frames of 64x64 float32 is 20 MB on disk and takes the local
+# decoder a second or more - two orders of magnitude of margin - while staying
+# small enough that CI regenerates it in a blink.
+#
+# `elsewhere/` is the somewhere-else the panel has to be able to reach after the
+# Stop, and it holds ONE file on purpose: a single file is not a sibling group,
+# so the folder scan finds exactly one stack and the picker's contents are a
+# fact this test does not have to keep in step with.
+stopset = fresh(out / "stopset")
+_ss = fresh(stopset / "many")
+_sy, _sx = np.mgrid[0:64, 0:64]
+for _i in range(1200):
+    # each frame differs, so a loader that dropped one cannot hide in a stack
+    # of identical pictures
+    np.save(_ss / ("frame_%04d.npy" % _i), (_sx + _sy * 2 + _i).astype(np.float32))
+_se = fresh(stopset / "elsewhere")
+np.save(_se / "lone.npy", (_sy + _sx * 3).astype(np.float32))
+
 print("wrote test data to", out)
 for p in sorted(out.iterdir()):
     if p.is_dir():

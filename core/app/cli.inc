@@ -198,6 +198,14 @@ static bool g_bundledSelftest = false;
 // open on a path containing NAME);
 // viewreset (absolute grouped+list+folded+natural-name state - the toggles are
 // relative);
+// scanhere (what a folder row's "Open folder (all stacks below)" does, aimed at
+// the browsed directory) with pickok (the picker's "Load" button); waitload
+// (hold until a stack load is really in flight - "Stop" only exists while one
+// is, so a scripted Stop a frame early presses nothing) and stopload (the Files
+// panel's Stop, pressed - it calls stopLocalStackLoad / stopRemoteStackFetch,
+// which ARE the button's code, and takes the imgmark so "since the Stop" can be
+// said); chkloadidle (the loader is back at REST: no thread, no backlog, no
+// queue, and not still marked cancelling - issue #237);
 // waitimg:N / waitdir:LEAF (hold until N images are open / the browsed dir's
 // leaf is LEAF); and the assertions chkimg:N (count + NAMES), chkpv:N,
 // chkidx:K, chkopen:S, chkcur, chkcurn:NAME, chknames:SPEC, chkdir:LEAF,
