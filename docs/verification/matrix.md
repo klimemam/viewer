@@ -1,11 +1,20 @@
-# 形式 × 戸 × 操作 の検証マトリクス
+# 形式 × 入口 × 操作 の検証マトリクス
 
-このリポジトリは「どの形式が読めるか」を `core/imagefile.h` の表で、「どの戸から
+> **読み方:** §1〜§6 は 2026-08-11 の測定記録として凍結し、§7 が G1〜G11 の
+> 現況を示す。過去の `×落` は修正後も書き換えない。
+> 凍結測定と現況台帳は旧判断により本書へ同居している。別文書へ分けるかは
+> [tasks.csv](../tasks.csv) の Fable 行で再裁定し、ここでは先に書き換えない。
+
+本書でいう「入口」は、ファイルやデータを製品へ取り込む操作経路を指す。たとえば
+File > Open、Browse、フォルダ走査、リモート接続、リーダはそれぞれ別の入口である。
+
+このリポジトリは「どの形式が読めるか」を `core/imagefile.h` の表で、「どの入口から
 入れるか」を `openPath` / `openRemote` / `scanFolderGroups` / `serve.cpp` の述語で、
 「入ったあと何ができるか」を各パネルで決めている。**その3つを一度に見る場所が
 無かった。**
 
-無かったことの代償は 2026-08-11 に現れた——「remote で `.raw` が開けないね」。
+無かったことの代償は 2026-08-11 に現れた——「remoteで、.rawが開けないね」。
+対象はヘッダ無し RAW (`.raw`) だった。
 調べると、これは**判断ではなく落穂**だった。ベンダ RAW (`.nef` / `.cr2` / `.dng`) が
 リンクを渡らないのは `Backend::overLink = false` という**表の列**で、理由 (LibRaw が
 CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無し RAW (`.raw` / `.bin`) は
@@ -23,7 +32,7 @@ CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無
 
 ## 0. 読み方
 
-セルは必ず次の 4つのどれかで、**どれかを必ず名乗る**。
+セルは必ず次の4状態のいずれかを明示する。
 
 | 記号 | 意味 |
 |---|---|
@@ -63,7 +72,7 @@ CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無
 
 | # | 形式 | 拡張子 | 表の行 |
 |---|---|---|---|
-| F1 | `.npy` | `.npy` | 無 (`core/main.cpp` 自身の戸) |
+| F1 | `.npy` | `.npy` | 無 (`core/main.cpp` 自身の入口) |
 | F2 | `.npz` | `.npz` | 無 (同上) |
 | F3 | PNG | `.png` | 有 `overLink=1` |
 | F4 | JPEG | `.jpg .jpeg .jpe` | 有 `overLink=1` |
@@ -78,22 +87,22 @@ CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無
 | F13 | reader 出力 / viewer container | ディスク上は `.npz` (`__viewer` ツリー)、メンバ名 `__pixels_*` | 無 |
 
 F9 と F10 を分けたのは、**`.rggb` だけ `SEQ_EXTS` にあって File ▸ Open の
-フィルタに無い**からである (§7 G8)。同じ形式が戸によって違う答えを返すなら、
+フィルタに無い**からである (§7 G8)。同じ形式が入口によって違う答えを返すなら、
 それは別の行として数えるべきである。
 
-### 1.2 戸 (9)
+### 1.2 入口 (9)
 
-| # | 戸 | 入口 |
+| # | 入口 | 実装箇所 |
 |---|---|---|
-| D1 | CLI 引数 | `core/app/cli.inc:821-845` |
-| D2 | ファイルの D&D | `core/main.cpp:359` → `openPath` |
+| D1 | CLI 引数 | `parseCli` (`core/app/cli.inc`) |
+| D2 | ファイルの D&D | `dropCallback` (`core/main.cpp`) → `openPath` (`core/app/open_dispatch.inc`) |
 | D3 | フォルダの D&D | 同上 → `openPath` → `openFolder` |
-| D4 | File ▸ Open | `openFileDialog` `core/app/open_dispatch.inc:2359` |
+| D4 | File ▸ Open | `openFileDialog` (`core/app/open_dispatch.inc`) |
 | D5 | File ▸ Open Folder | `openFolderDialog` → `openFolder` → `scanFolderGroups` |
 | D6 | Browse (このマシン, `local://`) | `browseLocalFolder` → `openRemote` |
 | D7 | Browse (peer, `ssh://`) | `startRemote` → `openRemote` |
-| D8 | セッション復元 | `loadSession` `core/app/session.inc:2530` |
-| D9 | 登録済み reader | `readerFor` → `openWithReader` `core/app/session.inc:1504` |
+| D8 | セッション復元 | `loadSession` (`core/app/session.inc`) |
+| D9 | 登録済み reader | `readerFor` → `openWithReader` (`core/app/session.inc`) |
 
 ### 1.3 操作 (7)
 
@@ -108,15 +117,15 @@ F9 と F10 を分けたのは、**`.rggb` だけ `SEQ_EXTS` にあって File �
 | O7 | export | `exportDocRGBA` `core/app/export.inc:77` ほか |
 
 **由来で表を割る。** O4 は `serverComputes` (`core/app/open_dispatch.inc:408`) が
-「`remoteUrl` も `remoteFiles` も空なら false」と決めているので、直接の戸から入った
+「`remoteUrl` も `remoteFiles` も空なら false」と決めているので、直接の入口から入った
 doc には**構造上あり得ない**。したがって操作の表は 2枚になる:
 
-- **表B** = 直接の戸 (D1–D5, D8, D9) から入った doc = このディスクのファイル
+- **表B** = 直接の入口 (D1–D5, D8, D9) から入った doc = このディスクのファイル
 - **表C** = Browse 経由 (D6, D7) = `remoteUrl` を持つ doc
 
 ---
 
-## 2. 表A — 形式 × 戸 (117セル)
+## 2. 表A — 形式 × 入口 (117セル)
 
 | | D1 CLI | D2 D&D file | D3 D&D folder | D4 Open | D5 Open Folder | D6 Browse local | D7 Browse peer | D8 session | D9 reader |
 |---|---|---|---|---|---|---|---|---|---|
@@ -138,18 +147,18 @@ doc には**構造上あり得ない**。したがって操作の表は 2枚に�
 先頭 (`core/app/open_dispatch.inc:2289`) だけで、`openRemote` は
 `peerServesName` が false なら reader を提案せずに断る (`:1748`)。
 `docs/features/adapters/input-adapters.md §4.13.1` (2026-08-03) は「adapter は peer 側で走る」と
-**決めている**が、`core/serve.cpp` にその口は無い → **G11**。
+**決めている**が、`core/serve.cpp` にその API は無い → **G11**。
 
-**この表の読みどころ。** D1–D5 (直接の戸) はほぼ全部 ○ で、× は 動画の判断された
-拒否だけ。**落穂は D6 / D7 の列に固まっている**——つまり **Browse という戸が、
-他の戸が開けるファイルを開けない**。これは #111 と #148 が 2回続けて直した欠陥の
+**この表の読みどころ。** D1–D5 (直接の入口) はほぼ全部 ○ で、× は動画に対する意図的な
+拒否だけ。**未対応項目は D6 / D7 の列に集中している**——つまり **Browse という入口が、
+他の入口で開けるファイルを開けない**。これは #111 と #148 が2回続けて直した欠陥の
 **3回目**で、直っていないのは 形式表に**行を持たない**形式 (F9/F10/F12) である。
 述語 `viewerReadsName` / `peerServesName` はどちらも「表の行かどうか」で答えるので、
 表に行が無い形式は**述語の外側にいる**。
 
 ---
 
-## 3. 表B — 形式 × 操作 (直接の戸から入った doc, 91セル)
+## 3. 表B — 形式 × 操作 (直接の入口から入った doc, 91セル)
 
 | | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
 |---|---|---|---|---|---|---|---|
@@ -167,7 +176,7 @@ doc には**構造上あり得ない**。したがって操作の表は 2枚に�
 | **F12 `.vsession`** | — 画像ではない (セッションは状態であって doc ではない) | — | — | — | — | — | — |
 | **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ `stack` 層 → 2 doc `[T:fmtreg F6]` | ○ | — | ○ 起点ファイルを見る `[C:watch:32]` | ×決 `[T:fmtreg F6/F8]` `[C:od:610]` | ○ |
 
-`O4` の列が丸ごと「—」なのは欠落ではなく**設計**である: 直接の戸から入った doc は
+`O4` の列が丸ごと「—」なのは欠落ではなく**設計**である: 直接の入口から入った doc は
 `remoteUrl` も `remoteFiles` も持たないので `serverComputes` が false を返し、
 MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列に意味が
 生じるのは表C だけである。
@@ -186,13 +195,13 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 記号が 2つ入っているセルの読み方:
 
 - `A | B` — **由来で割れる**。左が `local://`、右が `ssh://`
-- `A / B` — **フレームの状態で割れる**。左が全解像度が着地したあと、右が
+- `A / B` — **フレームの状態で割れる**。左が全解像度の読込み完了後、右が
   間引かれた preview のあいだ (O7 の列だけ)
 
 | | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
 |---|---|---|---|---|---|---|---|
 | **F1 .npy** | ○ `[T:fmtgate P1/P2]` | ○ `[T:scan]` `[T:browse]` | ○ 常駐分のみ `[C:pt:429]` | ○ `[T:rtemporal]` | ○ `[T:rwatch]` | ○ `[T:rwatch R]` `[C:od:616]` | ○ / **×落 G4** preview |
-| **F2 .npz** | ○ ローカルの戸へ再ルート `[C:od:1734]` \| ○ SCAN の道 `[T:rnpz]` | — 再ルート後は表B \| メンバごとに表B | — \| — | — \| — | — \| — | — \| — | — \| **×決** preview 無し `[T:fmtgate F4g]` |
+| **F2 .npz** | ○ ローカルの入口へ再ルート `[C:od:1734]` \| ○ SCAN の経路 `[T:rnpz]` | — 再ルート後は表B \| メンバごとに表B | — \| — | — \| — | — \| — | — \| — | — \| **×決** preview 無し `[T:fmtgate F4g]` |
 | **F3 PNG** | ○ `[T:fmtgate P1/P2]` | ○ `[T:fmtgate P7]` | ○ | ○ `[T:rtemporal-png]` | ○ `[T:rwatch R12]` | ○ `[T:rwatch]` | ○ / **×落 G4** |
 | **F4 JPEG** | ○ `[T:fmtgate P1/P2]` | ○ `[C:serve:1129]` | ○ | ○ `[C:serve:558]` 無試験 | ○ `[C:watch:51]` | ○ | ○ / **×落 G4** |
 | **F5 TIFF** | ○ `[T:fmtgate P1/P2]` | ○ 複数ページ `[T:fmtgate P2]` | ○ | ○ `[C:serve:558]` 無試験 | ○ | ○ | ○ / **×落 G4** |
@@ -207,7 +216,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 
 ### 表C で気付いたこと
 
-**`local://` の非 peer 形式は「戸を通ってローカルに落ちる」。** `.npz` と ベンダ RAW は
+**`local://` の非 peer 形式は、入口でローカル処理へ再ルートされる。** `.npz` と ベンダ RAW は
 `openRemote` の #111 分岐 (`core/app/open_dispatch.inc:1733-1743`) で `openPath` に
 渡され、`remoteUrl` を持たない doc になる。したがって表C の行としては O1 だけが
 意味を持ち、以降は表B の行と同一になる。これは判断であって落穂ではない
@@ -278,7 +287,7 @@ MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |
 | G5 | リモートのファイル内フレーム軸が復元で 0 に戻る | **済** PR #177 — 試験 browse restore-wait |
-| G6 | reader で開いた doc の復元が memo 頼み | **一部** PR #181 — 黙らなくなった。試験 V25p。(a) session に spec を書くかは信頼の問い(#179)
+| G6 | reader で開いた doc の復元が memo 頼み | **一部** PR #181 — 黙らなくなった。試験 V25p。(a) session に spec を書くかは信頼の問い(#179) |
 | G7 | `.mp4` が peer 一覧で理由と逃げ道を失う | **済** PR #176 — 試験 F3b |
 | G8 | `.rggb` が File ▸ Open のフィルタに無い | **済** PR #175 — 試験 F4c |
 | G9 | generic な peer 拒否文に逃げ道が無い | **済** PR #176 — 試験 F3b |
@@ -351,7 +360,7 @@ not a name this viewer reads (*.npy *.npz *.png *.jpg ... *.y4m)
 ```
 
 **これは偽である。** 同じファイルを File ▸ Open で開けば RAW ダイアログが立ち、
-`.vsession` なら `loadSession` が走る。**同じディスクの 2つの戸が同じファイルに
+`.vsession` なら `loadSession` が走る。**同じディスクの2つの入口が同じファイルに
 ついて逆のことを言っている**——#148 が 1段上で言っていた欠陥そのもので、
 `docs/features/adapters/input-adapters.md:88` の「同じファイルがローカルとリモートで違う読まれ方を
 するのは欠陥」がここにも掛かる。
@@ -362,7 +371,7 @@ not a name this viewer reads (*.npy *.npz *.png *.jpg ... *.y4m)
 
 **正直な選択肢。**
 
-- **(a) 戸を開ける。** `viewerReadsName` に `SEQ_EXTS` と `.vsession` を足す。
+- **(a) 入口を対応させる。** `viewerReadsName` に `SEQ_EXTS` と `.vsession` を足す。
   `openRemote` の #111 分岐 (`:1734`) は既に「host が空で viewerReadsName なら
   `openPath` に渡す」と書いてあるので、**この 1語で `openPath` に届き、RAW
   ダイアログが立つ**。副作用: peer 一覧では `peerServesName` が別述語なので何も
@@ -411,8 +420,8 @@ File ▸ Open で 1本開けば正しく開き、フォルダごと開くと RAW
   になり、**黙って garbage を出すよりは正しい**が、`.npz` の連番フォルダを stack に
   したい人には道が無くなる。
 
-**どちらにせよ、`isRaw` の述語は「表に行があるか」ではなく「ファイルが自分で形を
-名乗るか」を訊くべきである**——それが真上のコメントの言っていることなので。
+**どちらにせよ、`isRaw` の述語は「表に行があるか」ではなく「ファイルが自身の形状を
+記述するか」を判定すべきである**——それが上の引用でいう「形を名乗る」の意味である。
 
 ---
 
@@ -441,14 +450,14 @@ static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int&
 `panel_projection.inc:871` は `"frame not resident"`、`annotations.inc:69` は
 `"preview: wait for full resolution before placing ROIs/pins"`、
 `loader_npy_raw.inc:374` は crop を拒否。**canvas は画面に "PREVIEW 1/N" と
-出している** (`core/ui/canvas.inc:1049`) ——つまり「preview は嘘をつく」は
+出している** (`core/ui/canvas.inc:1049`) ——つまり「preview を全解像度画像として扱わない」は
 このリポジトリの既知の規則で、**export だけがそれを守っていない。**
 
 **正直な選択肢。**
 
 - **(a) 断る。** 隣の 8箇所と同じ文で。`"still a preview - export after the full
   frame lands"`。
-- **(b) 出すが名乗る。** PNG の tEXt チャンクと toast に `1/N preview` と書く。
+- **(b) preview であることを明示して出す。** PNG の tEXt チャンクと toast に `1/N preview` と書く。
   ROI/統計の export は provenance 行に `step N` を足す。
   **「測っていない絵を測ったことにしない」という点ではどちらでもよく、
   今の「黙って出す」だけが選べない。**
@@ -497,9 +506,9 @@ drain する。**諦めることも出来事にした**: fetch が失敗した /
 **(b) を実装した (PR #181)。** 「開いたが名指しされたメンバは無かった」枝は
 コメントに「never worse than today」と書いてあったが、**worse である** ——
 以降の range / LUT / モザイク読み / crop はすべて `cur()` に当たるので、
-その行の設定が**別の document に着地する**。既に報告している隣の枝
+その行の設定が**別の document に適用される**。既に報告している隣の枝
 (already-here dedupe) と揃えた。メンバ名が `__pixels_` で始まるときは理由も
-名乗る —— 「そのメンバが無い」だけだと、問題ではないファイルの中を探させる
+明示する —— 「そのメンバが無い」だけだと、問題ではないファイルの中を探させる
 ことになるので。
 
 **(a) は実装していない。信頼の問いだから。** `docs/features/adapters/input-adapters.md §4.12`
@@ -519,7 +528,7 @@ memo が引ければ RUN を再依頼して開き直す。peer のキャッシ�
 名乗って失敗する —— **peer には要求すら出さない** (`bytesReceived()` 不変で観測)。
 「どの reader か」は client の
 memo/picker、「走ってよいか」は peer 起動者の `--serve-readers`、という
-`docs/features/remote/remote-reader-design.md` §2.2 の 2 段の門の、client 側の段である。
+`docs/features/remote/remote-reader-design.md` §2.2 の2段階の許可判定のうち、client 側の段である。
 
 ---
 
@@ -538,7 +547,7 @@ a.mp4  peerRefusal  = "the peer serves .npy, PNG, JPEG, TIFF, OpenEXR and y4m"
 (`core/browse/panel.cpp:121-123`) ので、**peer のフォルダに置いてある `.mp4` は
 測定に基づく理由も ffmpeg の逃げ道も失う。** `selftest.fmtgate` の F3 は
 「local: an unreadable row names ITS reason, not the peer's」を assert して
-いるが、**その鏡像 (remote 行が自分の理由を名乗る) は誰も見ていない。**
+いるが、**その逆向きの条件 (remote 行が自身の理由を表示する) は誰も検査していない。**
 
 **選択肢。** (a) `peerRefusal` の頭で `videoRefusal` を先に返す (3行)。
 (b) 「リンク越しの断りは link の限界だけを言う」と決めて記録する——ただしそれは
@@ -574,11 +583,11 @@ const std::string pat = "*.npy *.npz *.bin *.raw *.yuv *.dat " + media;
 
 **採ったのは (a) の一般形。** 数えたらリテラルは 2つではなく **4つ**あった
 (`SEQ_EXTS` / `HEADERLESS_EXTS`(関数内) / ダイアログのフィルタ / `viewerReadsName`)
-——さらに拒否文と RAW パネルの説明文が同じ 5つを日本語で名乗っていて **6箇所**。
+——さらに拒否文と RAW パネルの説明文が同じ5形式を日本語で列挙していて **6箇所**。
 `.rggb` が落ちていたのは 1箇所だけなので、足すだけでは「次に足す拡張子が
 どこかで落ちる」状態が残る。
 
-配置は**戸ごとに 2配列**、`core/app/sequence.inc` の頭:
+配置は**入口ごとに2配列**、`core/app/sequence.inc` の先頭:
 
 ```cpp
 static const char* SELFDESC_EXTS[]   = { ".npy", ".npz" };                        // 形を自分で述べる
@@ -598,7 +607,7 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 **試験 F4c** (`core/selftest/fmtgate.inc`): 2配列と表の全行を歩き、**各拡張子が
 `openImagesFilter()` に出ること**を主張する。この試験の中に拡張子のリストは無い
 (明日どちらかに足した拡張子は誰も試験を編集せずに検査される)。トークン一致で
-見る —— 部分一致だと短い拡張子が長い方の陰に隠れる。拒否文が同じ集合を名乗る
+見る —— 部分一致だと短い拡張子が長い方の陰に隠れる。拒否文が同じ集合を列挙する
 ことも同時に主張する。反空虚は「12個以上を検査し、フィルタが空でない」。
 
 赤: `missing [.rggb]` / 緑: `missing [-]`。
@@ -620,7 +629,7 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 「browse it locally」と言っていて、それは**この分岐に落ちてくる名前について真とは
 限らない**——ヘッダ無しの `.raw` はローカルなら開くが、正体不明の名前は開かない。
 そして `core/imagefile.cpp` は **peer 側のバイナリにもリンクされる**ので、
-`core/main.cpp` 自身の戸 (`SELFDESC_EXTS` / `HEADERLESS_EXTS`) を見て区別する
+`core/main.cpp` 自身の入口 (`SELFDESC_EXTS` / `HEADERLESS_EXTS`) を見て区別する
 ことができない。だから逃げ道は**リンクの限界**を述べる:「この link はその形式
 しか運ばない —— このマシンにコピーすれば、この viewer が読む残り全部で開ける」。
 どちらの名前についても真で、しかも実際にファイルを動かす事実である。
@@ -633,12 +642,12 @@ static bool isLoadableName(const std::string&);   // 拡張子ではなく名前
 
 **どこ。** `session.inc:2653` は `cropInPlace(...)` の**戻り値を見ていない**。
 `cropInPlace` は `remoteStep > 1` で false を返す (`loader_npy_raw.inc:374`、
-理由は同所のコメント: 全解像度の着地が crop の帳簿を知らずに上書きするから)。
+理由は同所のコメント: 全解像度の読込み完了時に crop 状態を参照せず上書きするから)。
 復元直後の remote doc はまさに間引かれた状態なので、**1600px を超える画像では
 crop が黙って消える。**
 
 **選択肢。** (a) 戻り値を見て、落ちたら失敗行として報告する。
-(b) 全解像度が着地してから適用する (G5 と同じ遅延キューに載る)。
+(b) 全解像度の読込み完了後に適用する (G5 と同じ遅延キューに載る)。
 
 **採ったのは (b)。** (a) は黙らなくなるだけで crop は失われたままで、しかも
 **対話側は既に (b) の答えを返している** (`cropCurrentToSelectedRoi` の
@@ -649,12 +658,12 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 
 ---
 
-### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **全段済 (戸が開き、測定も向こうで走る)**
+### G11. 「reader は peer 側で走る」という 2026-08-03 の決定が実装されていない —— **全段実装済み (reader 経路と peer 測定に対応)**
 
 **どこ。** `docs/features/adapters/input-adapters.md §4.13.1` は明確に決めている——
 「データが向こうにあるのに adapter を手元で走らせると生ファイルを転送してから
 変換することになり、この道具の設計思想に反する。**したがって adapter は peer 側で
-走る**」。`core/serve.cpp` に adapter/reader の口は無い (あるのは
+走る**」。`core/serve.cpp` に adapter/reader API は無い (あるのは
 `MOP_PLUGIN_ANALYZE` = ABI v3 の解析プラグインで別物)。`openRemote` は
 `peerServesName` が false なら reader を提案せずに断る (`:1748`)。
 
@@ -664,7 +673,7 @@ fetcher の暇を待つと混んだキューの中で「もう少しで着く do
 **選択肢。** (a) v1 の範囲を「ローカルで走らせる (ファイルが流れます)」に狭めると
 決め直して記録する——§4.13.1 自身がその逃げ道を「明示的に選ばせる」と書いている
 ので、**その半分だけ先に実装する**のが一番安い。
-(b) §4.13.1 のとおり protocol に adapter の口を足す。
+(b) §4.13.1 のとおり protocol に adapter API を追加する。
 
 **裁定 (#180) は B。** 設計は `docs/features/remote/remote-reader-design.md` (2026-08-17, Fable)——
 protocol 12・`MSG_READER_RUN`・起動引数 `--serve-readers`・reader は client から
@@ -672,10 +681,10 @@ protocol 12・`MSG_READER_RUN`・起動引数 `--serve-readers`・reader は cli
 
 **stage 0 済 (PR #211)。** 二文のうち後ろの半分——「拒否文もそれを言わない」——だけ
 先に消した。`imagefile::peerRefusal` の fall-through が、決定 (§4.13.1) を名指しし、
-**戸が未完成である**と言い、今日効く道 (手元に copy して reader) を出す。
+**reader 経路が未実装である**と示し、現時点で利用できる方法 (手元に copy して reader) を出す。
 無い機構は仄めかさない (同設計 §7: peer 上に reader を名前で探す道は無い)。
 試験は `fmtgate` **F4d2**——ヘッダレス拒否文を歩く F4d の隣。
-**この文は stage 2 で `choose a reader` に差し替わる**(戸が開いた日にこの検査が
+**この文は stage 2 で `choose a reader` に差し替わる**(reader 経路が実装された日にこの検査が
 落ちるように書いてある)。
 
 **stage 1-2 済 (2026-08-17)。** 前の半分「実装が無い」も消えた。protocol 12 /
@@ -692,13 +701,13 @@ META・TILE の末尾 `[u32 flags][str key][u32 node]` で materialisation の�
 stack を個別に指し、conditions・名前・単位がローカル実行と同値で立つ
 (`--rreader-selftest` R12)。範囲外のノードは名指しで断る (R13)。zoom による精細化
 も**この回で繋いだ**——`FrameSource::remoteKey/remoteNode` を `RFetchJob` まで
-通し、木が着地したあと `remoteTreeRefine` が node ごとに `requestFullRemote` を
+通し、tree の構築後に `remoteTreeRefine` が node ごとに `requestFullRemote` を
 呼ぶ。
 
 **同じ回に issue #217 (remote `.npz`) が乗った。** protocol **13** /
 `MSG_NPZ_SCAN` / peer は列挙と member 単位の遅延 materialise だけ / 分類・picker・
 木は client の既存 1 経路。`.npz` は `peerServesDeclared` に入り (行が生きる)、
-`peerServes` には入らない (1クリックプレビューの門は据え置き)。試験は
+`peerServes` には入らない (1クリックプレビューの可否判定は据え置き)。試験は
 `--rnpz-selftest` (R14〜R17) と `fmtgate` **F4g** (R18)。
 
 **stage 4 済 (2026-08-17)。** memo / session 復元の remote 版。memo (url 鍵) が
@@ -711,7 +720,7 @@ peer は環境同一性を確認する provenance probe だけを 1 回起動す
 **stage 5 済 (2026-08-17)。** protocol **14**。MEASURE がファイルしか名指せなかった
 最後の穴を塞ぐ——`MeasureReqHead::flags` の `MRF_KEYED` + rois の後ろの
 `[str key][u32 node]` で、**reader の node も .npz の member も**「データのある側」で
-集計される (`nPaths` は 0 = パスは一切送らない)。着地は
+集計される (`nPaths` は 0 = パスは一切送らない)。実装上の変更は
 `FrameSource::init` が `openKeyed` を通るだけで、σ_t/σ_fpn の算術は 1 文字も
 動いていない。σ_t は独立 f64 参照と一致し、同じ stack をローカルで開いて測った値と
 **ビット一致**する。v13 peer へは送信前に断る (`rp::measureKeyedTooOldText`)——
@@ -739,7 +748,7 @@ peer が古いという文ではない。試験は `--rmeasure-selftest`
 | Browse の stack 系の動詞は peer の問いのまま | `docs/features/adapters/input-adapters.md §3.6.4` |
 | Browse のローカル行にプレビューは付かない | 同上 (「1クリックは選択・ダブルクリックで開く」) |
 | peer が配れない行も一覧から落とさない | 同上 (#111 の裁定「見せて理由を言う」)。試験: `fmtgate` F2/F3 |
-| 直接の戸から入った doc は MEASURE を peer に投げない | `serverComputes` `core/app/open_dispatch.inc:408` |
+| 直接の入口から入った doc は MEASURE を peer に投げない | `serverComputes` `core/app/open_dispatch.inc:408` |
 | 単独フレームは Watch しない (手動 Reload) | `docs/features/watch/watch-design.md §9` + `core/app/watch.inc:66-68` |
 | 自動 reload は peer の stack に対して走らない | `watchAutoRefusal` `core/app/watch.inc:680-688` + `docs/features/watch/watch-design.md §16.6` |
 | `.raw` を LibRaw に渡さない | `core/imagefile.cpp:230-234` + `docs/features/adapters/input-adapters.md:577` |
@@ -748,7 +757,7 @@ peer が古いという文ではない。試験は `--rmeasure-selftest`
 
 ## 9. `[P]` — 手で確かめたもの
 
-**何を。** 形式の門 (`imagefile::forPath` / `peerServes` / `peerRefusal` /
+**何を。** 形式の可否判定 (`imagefile::forPath` / `peerServes` / `peerRefusal` /
 `videoRefusal` / `dialogPattern` / `backends`) が**実際に返す値**。ソースを読んだ
 結果ではなく、**出荷されるオブジェクトが答えたもの**。
 
@@ -786,7 +795,8 @@ decodableFormats: PNG, JPEG, TIFF, OpenEXR, y4m
 `a.vsession`) が **G1 と G2 の実測**である。`a.mp4` の 2つの列が **G7 の実測**——
 同じファイルについて 2つの関数が別のことを言っている。
 
-**この PR で走らせた試験。** `bash tools/run_selftests.sh build-vm` →
+**履歴（初出 2026-08-11、commit `5906542e`）— 当時走らせた試験。**
+`bash tools/run_selftests.sh build-vm` →
 `ran 50, skipped 0` / `100% tests passed, 0 tests failed out of 50` /
 `run_selftests: PASS`、exit 0。この文書は**製品の振る舞いを 1バイトも変えて
 いない**ので、この結果は base と同じである (この PR は文書のみ)。
@@ -795,7 +805,7 @@ decodableFormats: PNG, JPEG, TIFF, OpenEXR, y4m
 
 ## 10. この表の保ち方
 
-**この文書は手で保つものではない。** 上の表のうち、形式の門の列
+**この文書は手作業だけで保守するものではない。** 上の表のうち、形式の可否判定の列
 (`forPath` / `viewerReadsName` / `peerServes`) は `selftest.fmtgate` の F4 が
 **表の全行について不変条件として** assert している——「peer が配れるものは
 必ずこの viewer も読む」「`peerServesName(x) == b.overLink`」。だから

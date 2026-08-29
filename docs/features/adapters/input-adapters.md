@@ -1,12 +1,18 @@
 # 読めない形式をどう読むか — native の範囲とリーダ
 
+> **状態: 実装済み。** native の形、Reader の Python 契約、Reader パネル、
+> 検査・キャッシュ・登録場所・session、peer 上での Reader 実行まで main に実装されている。
+> リモート Reader は stage 0〜5 / protocol 12〜14。§7 は未着手計画ではなく、
+> 実装時の段階と受け入れ条件の記録である。typed layer / layout の端点照合だけは
+> #230 phase ④ の残課題として、本書内で明示する。
+
 **名前について (2026-08-03 決定)。** ユーザーが書く Python の関数を **リーダ
 (reader)** と呼ぶ。UI もこの語で統一されている (`Open With a Reader...`、
 Inspector の `reader native` / `reader <spec>`)。この文書は当初「入力アダプタ」
 と呼んでいたが、機構の名前と、ユーザーが実際に書くものの名前は同じでよい —
 **ユーザーが書くのは関数1つ**で、それ以外は viewer 側の都合だからである。
-ファイル名 `input-adapters.md` は未マージのブランチ5本が参照しているため、
-それらが着地してから `readers.md` に改める。
+ファイル名 `input-adapters.md` は既存の設計・コード参照を壊さない安定名として残す。
+UI の語は一貫して **Reader** であり、ファイル名を別の用語として扱わない。
 
 **この文書は 2026-08-03 に全面改訂した。** 初版は JSON manifest を契約にし、
 そこへ「関数にする」「層の宣言を足す」「型を付ける」と追記を重ねた結果、
@@ -42,13 +48,14 @@ Inspector の `reader native` / `reader <spec>`)。この文書は当初「入�
 形式が増えるたびにこの推測表が伸び、**推測が外れたときに黙って間違った絵を出す**。
 測定器としては最悪の失敗の仕方で、しかも増え続ける。
 
-**根本原因は「ファイルは自分が何であるかを言わない」こと。** 層 (frame ⊂ stack ⊂
-series ⊂ batch)・軸・単位・CFA はドメインの知識であって、バイト列からは復元できない。
+**根本原因は「ファイルは自分が何であるかを言わない」こと。** データ層の順序
+(`frame ≼ stack ≼ series`)・軸・単位・CFA はドメインの知識であって、
+バイト列からは復元できない。batch の管理や AnalysisSet の role-ref も shape からは決まらない。
 
 ## 2. その仕組みは既にこのリポジトリにある
 
 リモートは**別プロセスに stdio で喋る**構造で動いている (`core/remote.cpp` /
-`core/serve.cpp` / `remote_proto.h`、VERSION=5)。ローカルの Browse すら
+`core/serve.cpp` / `remote_proto.h`、現在は VERSION=14)。ローカルの Browse すら
 `local://` で同じ経路を通る。つまり:
 
 > **「外部プロセスが読んで、正典の形で返す」配線は、実装済みで実運用中。**
@@ -723,22 +730,25 @@ def load(path):            # path: str。この1引数だけが必須
   「10000 枚のうち今見る 20 枚」と言えるようにするためのもの。
   **adapter が自分の判断で一部だけ返すときは、その事実を `note` に残すこと。**
 
-### 4.2 返り値が層を名乗る
+### 4.2 返り値が正典の型を名乗る
 
 **返り値の型が、frame / stack / series / batch / AnalysisSet のどれかを
-名乗る。** 層モデルの5語以外の語を持ち込まない (`frames` のような新語を
-作らない)。5語目 (役割束縛の AnalysisSet — 正典の5層化に伴い 2026-08-07 追加)
-の返し方は [reader-analysisset.md](reader-analysisset.md) が仕様で、本節の
-以下は最初の4語のまま。
+名乗る。** 正典の5語以外の語を持ち込まない (`frames` のような新語を
+作らない)。順序付きデータ層は最初の3語、batch は managed-by の管理単位、
+AnalysisSet は role-ref の型である。AnalysisSet の返し方は
+[reader-analysisset.md](reader-analysisset.md) が仕様で、本節の以下は最初の4語のまま。
 
 ```python
 from viewer_import import Frame, Stack, Series, Batch
 
 return Frame(img)                       # 1枚
 return Stack(arr)                       # 複数フレーム、同一条件
-return Series(stacks, conditions=...)   # 条件を振ったもの
+return Series(members, conditions=...)  # Frame / Stack を条件順に並べたもの
 return Batch([dark, flat])              # 一緒に開くもの
 ```
+
+`Series` の先頭引数の正名は **members**。現行 Python 実装の `stacks` / `stack_count` は
+stack-only 時代の互換名で、phase④ で `members` を公開名にし、旧名は alias として扱う。
 
 **返し方は2通りだけ。** 素の配列か、上の型か。dict は用意しない —
 同じことを言う道が3つあれば3通りに食い違い、どれが正なのかを
@@ -752,24 +762,24 @@ def load(path):
 素の配列は §3.1 の native と同じ規則で読む (覚えることを増やさない)。
 **曖昧さを自分で潰したくなった時点で型を名乗る** — それが2つ目の道。
 
-### 4.3 層ごとのフィールド
+### 4.3 型ごとのフィールド
 
-| 層 | 位置引数 | 追加のフィールド |
+| 型 | 位置引数 | 追加のフィールド |
 |---|---|---|
 | `Frame` | 画素 | `cfa` `name` `note` `meta` `range` |
 | `Stack` | 画素 | `timestamps` `cfa` `name` `note` `meta` `range` |
-| `Series` | `Stack` の列 (または画素) | **`conditions` (必須)** `name` `note` `meta` `range` |
+| `Series` | `Stack` / `Frame` の列 (または画素) | **`conditions` (必須)** `name` `note` `meta` `range` |
 | `Batch` | 上記の列 | `name` |
 
 | フィールド | 型 | 意味 |
 |---|---|---|
 | `timestamps` | `Values` | 各フレームを**いつ撮ったか**。条件は同じまま。§4.3.3 |
-| `conditions` | `Values` | stack 間で**変えた条件** (露光・照度)。series の存在理由。§4.3.3 |
+| `conditions` | `Values` | メンバ間で**変えた条件** (露光・照度)。series の存在理由。§4.3.3 |
 | `cfa` | str | `"RGGB"` `"BGGR"` `"GRBG"` `"GBRG"`、quad は `"quad:RGGB"` |
 | `name` | str | 表示名。省略時はファイル名 |
 | `note` | str | **素性の一文**。画面に出る散文。§4.3.1 |
 | `meta` | dict | **撮影条件の事実**。key-value。provenance に載る。§4.3.1 |
-| `range` | (lo,hi) または配列 | 表示レンジ。**その層の形に合わせられる**。§4.3.3 |
+| `range` | (lo,hi) または配列 | 表示レンジ。**その型の形に合わせられる**。§4.3.3 |
 
 `timestamps` / `conditions` の値の型はどちらも `Values` 1つ (§4.3.2)。
 **値は全桁保持。単位は推測せず、必須** — 空のまま渡された軸は**適用されない**
@@ -824,7 +834,7 @@ Series(sts, conditions=Values(exposures, "exposure", "ms"))    # 名前は必須
 | フィールド | 付く層 | 長さ | `name` | `unit` |
 |---|---|---|---|---|
 | `timestamps` | `Stack` | **フレーム数** | **省略可** (既定 `"time"`)。`"elapsed"` 等で上書き可 | **必須** |
-| `conditions` | `Series` | **stack 数** | **必須** — 何を振ったかは viewer には分からない | **必須** |
+| `conditions` | `Series` | **メンバ数** | **必須** — 何を振ったかは viewer には分からない | **必須** |
 | `covariates` (将来) | `Stack` | フレーム数 | **キーが名前** | **必須** |
 
 - **型は `Values(values, name="", unit="")` の1つだけ。** 専用型 (`Times` / `Sweep`) は
@@ -851,17 +861,17 @@ Stack(arr, timestamps=Values(t, unit="s"),
 「いつ」と「何が観測されたか」が同じ場所に混ざる。狭く始めて、必要になったら
 別のフィールドで足すほうが、後から意味を分離するより安い。
 
-#### 4.3.3 `range` は、それが属する層の形に合わせられる
+#### 4.3.3 `range` は、それが属する型の形に合わせられる
 
 ユーザー提案 (2026-08-03):「stack でフレーム毎に変えたい場合、series で
 series 毎に変えたい場合は、画像側の shape と合わせて作ったらどうだろう?」
 
 | 書き方 | 形 | 意味 |
 |---|---|---|
-| `range=(lo, hi)` | 2 | その層の全部に同じレンジ |
+| `range=(lo, hi)` | 2 | その型の全部に同じレンジ |
 | `Stack` に `range=arr` | `(F,2)` | **フレームごと** |
-| `Series` に `range=arr` | `(S,2)` | **stack ごと** |
-| `Series` に `range=arr` | `(S,R,2)` | stack ごと × フレームごと |
+| `Series` に `range=arr` | `(S,2)` | **メンバごと** |
+| `Series` に `range=arr` | `(S,R,2)` | stack メンバごと × フレームごと |
 
 長さが合わなければ**拒否** (`conditions` と同じ規則)。
 
@@ -880,19 +890,29 @@ range は「values are NOT DN, view only」と明記している)、それと同
 
 | 層 | 受ける shape | 意味 |
 |---|---|---|
-| `Frame` | `(H,W)` `(H,W,C)` | 1枚 |
-| `Stack` | `(F,H,W)` `(F,H,W,C)` | F 枚。`(3,H,W)` は3枚 |
-| `Series` | `(S,R,H,W)` `(S,R,H,W,C)` | S 条件 × R 繰り返し |
+| `Frame` | `(H,W)` `(H,W,C)`、`1 ≤ C ≤ 4` | 1枚 |
+| `Stack` | `(F,H,W)` `(F,H,W,C)`、`1 ≤ C ≤ 4` | F 枚。`(3,H,W)` は3枚 |
+| `Series` | `(S,H,W)` | S 条件 × standalone frame 1枚 |
+| `Series` | `(S,R,H,W)` `(S,R,H,W,C)`、`1 ≤ C ≤ 4` | S 条件 × R 繰り返し |
 | `Series` | `Stack` / `Frame` の列 | そのまま |
 | どれでも | 合わない shape | **拒否**。層と shape を両方名指しして言う |
 
-- **`(S,H,W)` は受けない。** 「S 条件 × 各1枚」は `(S,1,H,W)` と **1 を明示**して書く。
-  これで4次元の Series に解釈の分岐が無くなる
-- 型を名乗っているので、**チャンネル軸の有無はランクで一意に決まる** —
-  native の「最後の軸 ≤ 4」のような判定すら要らない
-- **`layout` は無い。** 軸の順序を canonical に合わせるのは書いた人の仕事
-  (`t.permute(0,2,3,1)` の1行)。宣言フィールドにしてもコピーは1回のままで
-  「誰が転置を書くか」が動くだけなので、契約に置く価値がない
+- 型を名乗っているので、**チャンネル軸の位置は layer と layout で決める**。ただし
+  viewer が表示できるチャンネル数は typed 入力でも `1..4` であり、5以上は名指しで拒否する
+- v1 の転置宣言は `Frame → CHW`、`Stack → FCHW` だけ。`Series` の tensor 全体へ
+  layout は付けず、転置した入力は `Frame` / `Stack` member の列として各 member が宣言する。
+  layer と layout の組が交差した入力 (`Stack+CHW` など) は拒否する
+- 明示 layout は native の shape fallback より優先する。ただし下の実装状況のとおり、
+  この境界検査は #230 phase ④ で完成させる
+
+**実装状況 (2026-08-20、#230 phase ③)**: Python 型は layout の綴りと rank を検査し、
+harness は `__layer_<i>` と `__layout_<i>` を運ぶ。しかし現状は layer ごとの許可 layout、
+`C ≤ 4`、duck-typed 出力の宣言整合を端から端まで検査しない。viewer も
+`__pixels_<i>` を native 規則で先に decode し、宣言 layer / layout と materialize 結果を
+照合していない。また series の frame 子は木として受理されるが、membership 登録時に落ちる。
+これらは #230 phase ④ の実装修正と回帰試験の対象であり、現時点で「typed 宣言が端まで
+有効」とは主張しない。契約は、明示宣言を native fallback で上書きせず、整合しない入力を
+layer / layout / shape を名指しして拒否すること。bare tensor だけが §3.1 の互換 fallback を使う。
 
 ### 4.5 `timestamps` と `conditions` の違い — 「経っただけ」か「設定を変えた」か
 
@@ -902,7 +922,7 @@ range は「values are NOT DN, view only」と明記している)、それと同
 
 | | `timestamps` (Stack につく) | `conditions` (Series につく) |
 |---|---|---|
-| 何を表すか | 各フレームを**いつ撮ったか** | stack 間で**変えた条件** |
+| 何を表すか | 各フレームを**いつ撮ったか** | series メンバ間で**変えた条件** |
 | 例 | 時刻 [s]、開始からの経過 [s] | 露光 [ms]、照度 [lx]、ゲイン [dB] |
 | 撮影条件は | **同じ** | **各点で違う** |
 | σ_t | **意味を持つ** (繰り返しなので) | **条件をまたぐ計算は拒否** |
@@ -944,9 +964,10 @@ viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノ�
 - series メンバシップは正典どおり明示的に作られ、**後から自動で継がれない**
 - `conditions` の長さが合わなければ**拒否** (黙って辻褄を合わせない)
 
-素の配列を返したときは `Stack` (繰り返し) として扱われる。それが違えば σ_t は
-嘘になるので、note に `repeats (returned as a bare array)` を残す —
-数値の出所が後から辿れること。
+素の配列を返したときだけ §3.1 の native fallback を使う。2-D と last axis ≤ 4 の
+3-D は frame、それ以外の native 3-D / 4-D は Stack (繰り返し) になる。Stack になった
+bare 配列には `repeats (returned as a bare array)` を note に残し、数値の出所を辿れる
+ようにする。意味が違うなら `Frame` / `Stack` / `Series` を明示する。
 
 ### 4.7 よくある保存形の書き方
 
@@ -957,8 +978,8 @@ return Stack(arr)                                  # (24, H, W)
 # 2. 露光 8 通り x 各 16 枚
 return Series(arr, conditions=Values(exposures, "exposure", "ms"))   # (8, 16, H, W)
 
-# 3. 露光 8 通り x 各 1 枚 (繰り返し 1 を明示する)
-return Series(arr, conditions=Values(exposures, "exposure", "ms"))   # (8, 1, H, W)
+# 3. 露光 8 通り x 各 1 枚
+return Series(arr, conditions=Values(exposures, "exposure", "ms"))   # (8, H, W)
 
 # 4. 同一条件の 24 枚 + 撮影時刻 (σ_t は有効なまま)
 return Stack(arr, timestamps=Values(t, unit="s"))  # (24, H, W)
@@ -1010,8 +1031,8 @@ raise ValueError("header says 12 planes but the file holds 9")
 **素の配列** — 学ぶことがゼロ。native と同じ読み方なので、既に知っている規則しか
 使わない。1行で書ける。
 
-**dataclass** — 型名が層モデルそのもの (`Frame` / `Stack` / `Series` / `Batch`)
-なので、書きながら語彙が身につく。そして**構築した行で落ちる**:
+**dataclass** — 型名が正典の語彙そのもの (`Frame` / `Stack` / `Series` / `Batch`)
+なので、書きながらデータ層と管理の区別が身につく。そして**構築した行で落ちる**:
 
 ```python
 from viewer_import import Stack, Series, Frame, Batch, Values
@@ -1022,8 +1043,8 @@ def load(path):
                   conditions=Values(z["exp"], "exposure", "ms"))
 ```
 
-構築時に検査するもの: 名乗った層に対して shape が合っているか (§4.4) /
-`conditions` 長 == stack 数 / `timestamps` 長 == frame 数 / `range` の形 (§4.3.3) /
+構築時に検査するもの: 名乗った型に対して shape が合っているか (§4.4) /
+`conditions` 長 == series メンバ数 / `timestamps` 長 == frame 数 / `range` の形 (§4.3.3) /
 `cfa` が既知のパターンか / 非数値 dtype の拒否。
 
 **これが型の最大の利得**: 間違いが *harness が走ったあと* ではなく
@@ -1043,9 +1064,9 @@ ValueError: Series: conditions has 8 value(s) but there are 16 stack(s)
 - dataclass は `frozen=True`。返したあとに誰も書き換えない
 - **import できない環境でも素の配列は返せる** — これが2通りにしておく実利。
   型は表現力のために足すのであって、依存を増やすためではない
-- **素の配列と `Stack(arr)` は、画素も構造も同一**。違うのは `__note_0` だけで、
-  素の配列には「どう読んだか」の note が付く。harness の検査項目にする —
-  2通りが食い違うくらいなら1通りのほうがマシ
+- native fallback が stack を選ぶ shape では、素の配列と `Stack(arr)` の画素は同一。
+  ただし前者は互換 fallback、後者は明示宣言であり、意味上は同じ経路ではない。
+  素の配列には「どう読んだか」の note が付く
 
 ### 4.11 harness が引き受けること (ユーザーが書かなくてよいこと)
 
@@ -1055,14 +1076,14 @@ ValueError: Series: conditions has 8 value(s) but there are 16 stack(s)
 - **.npz への書き出し**。予約メンバ:
   - 木: `__n` (ノード数) / `__layer_<i>` (`frame` `stack` `series` `batch`
     `analysisset`) / `__parent_<i>` (親のノード番号、根は -1)。深さ優先で
-    並べ、ノード 0 が adapter の返り値。**series と stack を区別できる唯一の
-    手段なので必須**
+    並べ、ノード 0 が adapter の返り値。`__layer` は既存形式の判別子名で、5値を
+    5つの順序付きデータ層と呼ぶものではない。shape でなく宣言型を運ぶため必須
   - set の束縛 (2026-08-07 追加、[reader-analysisset.md](reader-analysisset.md)
     §4): `__role_<i>` (親が analysisset のメンバが演じる役割名) /
     `__refs_<i>` (set ノードに置く JSON の参照 —
     `{"dark": {"path": "...", "member": ""}}`)
   - 画素と付随物: `__pixels_<i>` / `__cfa_<i>` / `__name_<i>` / `__note_<i>` /
-    `__range_<i>`
+    `__range_<i>` / `__layout_<i>`
   - 軸: `__conditions_values_<i>` / `__conditions_name_<i>` / `__conditions_unit_<i>` /
     `__timestamps_values_<i>` / `__timestamps_name_<i>` / `__timestamps_unit_<i>`
   - metadata: 根は `__meta_<k>`、ノード i>0 は `__meta_<i>_<k>`。値は JSON で
@@ -1106,12 +1127,17 @@ __layer_2 'stack'    __parent_2  0   __pixels_2 ...
 (docs/features/adapters/npz-design.md: メンバを形で分類し、1次元は軸候補) がそのまま働く。
 両者が混ざることはない。
 
+`__viewer` のある typed container では `__layer_<i>` / `__layout_<i>` が native
+fallback より優先する。読む側は宣言と decode 結果を照合し、不一致を黙って別の層へ
+読み替えない。この読み側の照合と series frame 子の登録は #230 phase ④ で未実装
+(§4.4 の実装状況) であり、ここは形式の契約を先に固定している。
+
 **必要になるもの** (別タスク):
 
 | # | 内容 | 状態 |
 |---|---|---|
 | 1 | `__viewer <version>` を仕様に入れ、読む側が版で分岐できるようにする | **済** (2026-08-03) |
-| 2 | viewer 側の**読み手** (adapter 経由でなく直接開く) | **済** (stage 3) |
+| 2 | viewer 側の**読み手** (adapter 経由でなく直接開く) | 基本読取は**済** (stage 3)。宣言 layer / layout の最終照合と series frame 子の登録は #230 phase ④ |
 | 3 | viewer 側の**書き手** (`Save as viewer npz...`)。stack/series をそのまま保存 | 未 |
 | 4 | 往復の検査 — 書いて読んで、層・軸・単位・CFA・note が同一であること | 片道のみ (V25) |
 | 5 | 版を上げるときの規則 (追加は互換、意味の変更は版を上げる) | **済** |
@@ -1263,6 +1289,14 @@ adapter を編集したら次に開いたときに効く。
   そのときの逃げ道は「手元で走らせる (ファイルが流れます)」を明示的に選ばせる
 - 選択はローカルで行われたまま。**peer が勝手に adapter を探すことはない**
 
+> **後続実装 (2026-08-17、stage 0〜5 / protocol 12〜14):** adapter 本体と
+> `viewer_import.py` / `run_adapter.py` は client から peer へ渡り、peer が
+> `--serve-readers` の明示許可の下で実行する。変換 materialisation は peer 側の
+> `.vstream` cache に留まり、client へ返す wire 語彙は TILE / MEASURE である。
+> Python / numpy が無い場合は理由を返して拒否し、client 側 Reader への自動 fallback は
+> しない。remote Reader が `AnalysisSet` を返す経路は role-ref registry が未実装なので、
+> 登録前に返り値全体を名指しで拒否する。
+
 #### 4.13.2 リーダの置き場所は「登録する」(2026-08-10 裁定、issue #51)
 
 **裁定 (ユーザー、2026-08-10)**:
@@ -1374,12 +1408,13 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
 
 ##### Preferences パネル (#50) との関係
 
-ここで作った UI は **Reader パネルの中の一覧 + 追加/削除/並べ替えだけ**で、
-設定パネルは作っていない。#50 で JSONC の設定が着地したら、
-**`readerplace` の列と `pythonexe` はそちらへ移る**べき設定である
-(順序が意味を持つので、JSON の**配列**がそのまま正しい表現になる)。
+**Preferences パネルと JSONC 設定は実装済み。** Reader の場所は
+`readers.searchPath` (順序付きの JSON 配列)、Python は
+`readers.pythonExecutable`、エディタは `readers.editor` で読む。Preferences は
+同じキーを表示し、場所の列は `Open...` から Reader パネルの追加/削除/並べ替え UI へ移る。
+変更元は組み込み既定 / `prefs.txt` / `settings.jsonc` / CLI の badge で分かる。
 **`readerfor` (パス→リーダの記憶) は移さない** —— あれは設定ではなく
-**ユーザーが行った選択の記録**で、手で編集する設定ファイルの住人ではない。
+**ユーザーが行った選択の記録**であり、手で編集する設定ファイルの管理対象ではない。
 
 ---
 
@@ -1400,26 +1435,31 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
 - **Python 依存**: viewer 本体は C++ だけで動く。adapter を使う人だけが Python を要る
 - **読めるものが狭くなる**: §3.4 の移行。**これは意図した代償** —
   黙って間違えるより、読まずに理由を言うほうがよい
-- **嘘の宣言は検証できない**: adapter が「これは 8 条件だ」と言えば viewer は信じる。
-  検証できるのは形の整合だけ (長さ・次元・dtype)。それは harness が必ず行う
+- **意味上の嘘は検証できない**: adapter が「これは 8 条件だ」と言えば viewer は信じる。
+  検証できる形の整合 (長さ・次元・dtype・宣言 layer と decode 結果) は両端で行う。
+  harness 側は実装済み、viewer 側の最終照合は #230 phase ④
 
 ## 7. 段階
+
+**出荷段階はすべて実装済み。** 次の表は実装順と受け入れ条件の記録である。
+#230 phase ④ の typed 境界は、既存段階を未実装へ戻すものではなく追加 hardening である。
 
 | # | 内容 | 検証 |
 |---|---|---|
 | 0 | **native を §3.1 に絞る** + 読まないときの言い方 (§3.2) + HWC 猶予 | 既存 selftest が緑のまま / `(H,W,3)` が note つきで開くこと / 1次元と5次元が理由つきで拒否されること |
 | 1 | 返り値の契約 (§4.1-4.8) + `tools/import/viewer_import.py` (型3段) | Python 側だけで完結。3段が同じ結果を出すこと |
 | 2 | harness `run_adapter.py` + 同梱 adapter (key 付き npz / HWC) + テンプレート | 手で叩いて npz が出ること |
-| 3 | viewer 側: 起動・npz 受け取り・Inspector の reader 欄 | **済** V25a-h |
+| 3 | viewer 側: 起動・npz 受け取り・Inspector の reader 欄 | 基本経路は**済** V25a-h。typed 境界の最終照合は #230 phase ④ |
 | 4 | パス→関数の規則 (prefs 保存・一覧・LRU) | **済** V25k。v1 は**1ファイル1エントリのみ** (§8-7)、規則は未 |
 | 4b | リーダの置き場所の登録 (ファイル/フォルダ、順序、断り文) §4.13.2 | **済** V25n / V25o (#51) |
 | 5 | キャッシュ (元ファイル + adapter の mtime で無効化) | **済** V25i |
-| 6 | 返り値の検査と断り方 | **済** V25g / V25j |
-| 7 | peer 側での実行 (リモート) | 既存の remote selftest に1本足す |
+| 6 | 返り値の検査と断り方 | 基本検査は**済** V25g / V25j。layer別layout・C上限・viewer materialize の端点照合は #230 phase ④ |
+| 7 | peer 側での実行 (リモート) | **済**。`--rreader-selftest` / `--rmeasure-selftest`、stage 0〜5、protocol 12〜14 |
 
-## 8. 決めてほしいこと
+## 8. 判断 record
 
-1. **この方向で進めるか** (推奨: 進める。npz native 修正は独立で先行)
+1. ~~この方向で進めるか~~ **決定**: 進める。npz native 修正を独立で先行し、
+   Reader の出荷段階も実装済み
 2. ~~native を3形に絞るか~~ **決定 (2026-08-03)**: `(H,W)` / `(H,W,C≤4)` /
    `(F,H,W)` / `(F,H,W,C≤4)` の4形。カラーは残し、判定は**最後の軸だけ**を見る
    —— **最後の軸が 4 以下なら channel** (2026-08-05, issue #71 で確定。
@@ -1433,7 +1473,12 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
    `Series` に **`conditions`** (複数形 = メンバ1つにつき1つ = 長さの規則)。
    値の型は **`Values(values, name, unit)` の1つ**で、`timestamps` の名前は
    `"time"` が既定。共変量は v1 では受けず、将来 `covariates` を別に足す。
-   `layout` は廃止 (軸の順序を合わせるのは書いた人の仕事)
+   `layout` は廃止 (軸の順序を合わせるのは書いた人の仕事)。
+
+   **後続改訂 (2026-08-19, #230):** `layout` は transposed tensor の明示宣言
+   (`CHW` / `FCHW`) として復活。宣言を運ぶ配線は実装済みだが、layer別layout・
+   channel上限・duck-typed出力・viewer materialize の端点照合は phase④で行う。
+   当時の「誰が転置を書くか」という判断は上に保存する。
 6. ~~bfloat16~~ **決定**: f32 に変換し、変換したことを note に残す
 7. ~~記憶する規則~~ **決定 (暫定)**: v1 は**1ファイルごとのキャッシュ**だけ。
    規則 (フォルダ・glob) は作らない。locality が高い運用なので、将来は

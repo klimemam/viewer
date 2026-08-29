@@ -1,9 +1,14 @@
 # Stats Taxonomy — 「基本 stats」と「追加 measurement」の境界定義
 
+現行の分類と実装状態を先に示す。§6–§8 は 2026-08-10 の ddof 裁定に至る
+調査・判断記録で、裁定前の数値や「未実装」は履歴として読む。現在の実装状態は
+§9 に集約した。
+
 機能リクエスト(例:「フレーム毎の stats を Excel に貼りたい」)を即座に分類するための
 基準文書。判断基準はただ一つ: **その数値を出すのに何を入力する必要があるか**。
-実装の所在は [manual.md](../../guides/manual.md) / [analyzers.md](../../reference/analyzers.md) /
-[remote.md](../remote/remote.md)、コードは `core/main.cpp`・`core/serve.cpp`・`plugins/*.c`。
+実装の所在は [manual.md](../../guides/manual.md) /
+[analyzers.md](../../reference/analyzers.md) / [remote.md](../remote/remote.md)、コードは
+`core/main.cpp`・`core/serve.cpp`・`plugins/*.c`。
 
 ## 1. 軸の定義
 
@@ -12,7 +17,7 @@
 | クラス | 入力 | 例 |
 |---|---|---|
 | **S1** | **1フレームだけ**。追加情報ゼロ | mean/std、histogram、projection |
-| **TN** | **同一条件の N フレーム**(塊/stack) | σ_t、FPN 分離、blink/RTS |
+| **TN** | **同一条件の N フレーム**（stack） | σ_t、FPN 分離、blink/RTS |
 | **LM** | **条件を変えた M 個の stack**(レベルスイープ) | linearity、PTC gain K、SNR curve |
 | **+meta** | 上記+**外部メタデータ**(照度、露光時間、gain、単位…)。ファイルには書かれていない | linearity の level [lx]、dark current [DN/s] |
 | **+ref** | 上記+**参照データ**(dark/flat 基準画像、チャート形状・パッチ位置) | EMVA DSNU/PRNU、OECF、defect map 差分判定 |
@@ -26,9 +31,9 @@ S1 が「基本 stats」、TN 以降が「追加 measurement」。境界は S1/T
 - **出力形**: scalar(plane 毎の数値)/ curve(系列)/ map(画素マップ)。
   map は転送・表示コストがクラスと独立に跳ねる(remote では画素を返す話になる)
 - **ROI 依存**: ほぼ全 stats が「選択 ROI、なければ全体」規約に従う(host 共通)
-- **CFA plane 分離**: 本ツールの**鉄則 — plane は決して混ぜない**。R/Gr/Gb/B は
-  常に別系列・別 fit(`drawPanelLinearity` のコメント、serve.cpp の `planeKey` 参照)。
-  新規統計もこの規約に従うこと。plane 混合平均は「別の測定」であり既定にしない
+- **CFA plane 分離**: R/Gr/Gb/B は個別系列・個別 fit として保持する
+  (`drawPanelSeriesAnalysis` の実装、serve.cpp の `planeKey` 参照)。新規統計も
+  この規約に従うこと。明示的な `all` 集計は「別の測定」と名乗り、既定にしない
 
 ## 2. 分類表
 
@@ -37,10 +42,10 @@ class 列: S1 / TN / LM(+m = +meta、+r = +ref)。「実装」列は現在の所
 
 | 名称 | class | 最小入力 | 出力 | 実装 | 備考 |
 |---|---|---|---|---|---|
-| min / max / mean / std / var | S1 | 1フレーム(+ROI) | sc | ROIs パネル、Inspector Statistics | 常時表示。sampling 上限 200k/ROI。**σ の ddof は裁定待ち → §6** |
+| min / max / mean / std / var | S1 | 1フレーム(+ROI) | sc | ROIs パネル、Inspector Statistics | 常時表示。sampling 上限 200k/ROI。領域自身の σ は **ddof=0** (§8 裁定1) |
 | percentile / entropy / finite ratio | S1 | 同上 | sc | plugin `stats/moments` | NaN/Inf 検出込み |
 | histogram(CFA 4系列) | S1 | 同上 | cv | Histogram パネル | 表示レンジ 256bin、クリップ率付き |
-| H/V projection + profile 統計 | S1 | 同上 | cv+sc | Projection パネル | σ(列平均)= 列 FPN の S1 近似。**ddof は正典と不一致 → §6** |
+| H/V projection + profile 統計 | S1 | 同上 | cv+sc | Projection パネル | σ(列平均)= 列 FPN の S1 近似。行/列平均の σ は **ddof=1** (§8 裁定2) |
 | POI / 行・列バンド画素値 | S1 | 1フレーム+座標 | sc | Annotations、`X`/`Y` キー | |
 | noise floor(タイル中央値)/ SNR点 | S1 | 平坦め ROI | sc | plugin `noise/floor` | σ_t+FPN 混合。純時間ノイズではない |
 | PRNU proxy / 行・列 FPN % / shading | S1 | 明るい flat 1枚 | sc | plugin `uniformity/prnu-fpn` | **温度ノイズ混入**と明記済み。EMVA 値ではない |
@@ -51,16 +56,16 @@ class 列: S1 / TN / LM(+m = +meta、+r = +ref)。「実装」列は現在の所
 | **temporal noise σ_t** | **TN** | **1 つの stack**(同条件 ≥2 フレーム) | sc | Temporal パネル / `MOP_TEMPORAL_STATS` | 画素毎時間 var(**ddof=1**)の平均。stack の性質 |
 | **FPN(σ_fpn)** | TN | 同上 | sc | 同上 | `sqrt(max(0, var_spatial(時間平均, **ddof=1**) − C))`、C = `mean(s_t,i²/n_i)`。**補正量 `fpn_corr` とクランプを併記**(#57 判断2)。平坦でなければ絵柄込み |
 | frame mean ドリフト / フリッカ | TN | 同上 | cv | Temporal パネルのグラフ | 横軸 frame、縦軸 ROI mean |
-| **per-frame ROI 統計テーブル** | TN(中身は S1×N) | 同上 | cv/表 | server `MOP_FRAME_ROI_STATS`(plane 毎 mean/var 系列) | §3 参照。Excel 貼り付け要求の正体 |
-| 時間平均フレーム(ノイズ低減画像) | TN | 同上 | mp | —(serve 内部では計算済み、出力なし) | EMVA 系 +ref の素材になる |
+| **per-frame ROI 統計テーブル** | TN(中身は S1×N) | 同上 | cv/表 | Temporal `Copy (TSV)` / `Save (CSV)...`、server `MOP_FRAME_ROI_STATS` | §3 参照。sectioned rectangles の per-frame 節 |
+| 時間平均フレーム(ノイズ低減画像) | TN | 同上 | mp | **Open frame average** (Files / Browse / Temporal) | 計算由来と再計算レシピを記録する |
 | blink / RTS 画素検出 | TN | 多め(≥50〜)のフレーム | sc+mp | — | 画素毎の時系列が要る。map 出力 |
 | dark noise(EMVA) | TN+m | **dark stack** + 露光条件 | sc | Linearity の level-0 ルールが部分実装 | 「dark である」ことはメタ情報 |
-| DSNU(EMVA 1288) | TN+r | dark stack の時間平均 → 補正済み空間σ | sc+mp | — | **補正込み** σ_fpn の dark 限定版(同じ `−C`)。正式には基準条件指定 |
-| PRNU(EMVA 1288) | TN+r | **flat stack + dark stack** の各時間平均 | sc | —(`emva1288/*` 予定) | 現 plugin は proxy と明記 |
+| DSNU (直接) | TN+r | dark stack の時間平均 → 補正済み空間σ | sc | Set Analysis | **補正込み** σ_fpn の dark 限定版(同じ `−C`)。EMVA 1288 の名は原文照合まで付けない |
+| PRNU (直接 / 分離) | TN+r / LM+r | **flat stack + dark stack** / sweep + dark | sc | Set Analysis | 直接行と σ_fpn²–μ² 分離 fit を実装済み。現 plugin の `prnu_pct` は単一 frame proxy |
 | **linearity fit(感度・offset・LE max)** | **LM+m** | レベル別 stack / frame ×3+ + **level 値と単位** | sc+cv | Series Analysis パネル | level は folder 名から auto、編集可 |
 | conversion gain K(PTC) | LM | 同上(level 値自体は不要: σ_t² vs mean。σ_t を持つ stack メンバのみ) | sc | Series Analysis パネル(K [DN/e-]) | |
 | read noise | LM / TN+m | PTC 外挿、または **dark stack で実測**(dark frame メンバは黒レベルのみ) | sc | Series Analysis パネル(extrap. 明示) | dark 有無で信頼度が変わる設計済み |
-| SNR curve(mean vs SNR) | LM | レベル別 stack | cv | —(素材 = linearity rows) | |
+| SNR curve(mean vs SNR) | LM | レベル別 stack | cv | Series Analysis パネル | ratio / dB、TSV コピー対応 |
 | dynamic range | LM+m | 飽和までのスイープ+飽和定義 | sc | — | |
 | dark current | LM+m | 露光時間違いの dark stack 群+**時間** | sc | — | 横軸が時間になった linearity |
 | OECF(ISO 14524) | S1+r | チャート1枚+**パッチ位置・濃度** | cv | —(`iso14524/oecf` 予定) | チャート形状が参照データ |
@@ -90,7 +95,7 @@ frame 番号 / plane 毎 mean / var(std) / min / max / percentile / クリップ
 同じカテゴリエラーが**逆向き**にも起きる。フレーム行に stack の量を置くのが
 誤りであるのと同様に、**複数の stack を 1 本の時間軸として σ_t を取るのも
 誤り**である。露光・ゲインの違う 3 つの stack(各 8 枚)を選んで 24 枚の
-σ_t を出しても、それは何の測定値でもない。したがって **σ_t の入口は常に
+σ_t を出しても、それは何の測定値でもない。したがって **σ_t の入力は常に
 「1 つの stack」**: 開いた stack の Temporal パネル、または Browse の
 **連番(group)行**の `Temporal stats (server) for stack "…"`。複数選択から
 σ_t を計算する暫定経路は**ユーザー裁定 (2026-08-09, #107) で削除**した
@@ -102,7 +107,7 @@ frame 番号 / plane 毎 mean / var(std) / min / max / percentile / クリップ
 (#57 項目3, 2026-08-09 裁定)。local だけが ddof=0 だった期間があり、同じ
 stack の σ_t が測る場所によって √(N/(N−1)) 倍(N=8 で 6.9%、N=16 で 3.3%)
 食い違っていた。**local / server は転送路であって量ではない。**
-`docs/features/analysis/flat-field-stats.md` の `− ⟨σ_t²⟩/N` 補正もこの ddof=1 を前提に書かれている。
+[`flat-field-stats.md`](flat-field-stats.md) の `− ⟨σ_t²⟩/N` 補正もこの ddof=1 を前提に書かれている。
 
 ## 4. リクエスト判定フロー
 
@@ -111,9 +116,9 @@ stack の σ_t が測る場所によって √(N/(N−1)) 倍(N=8 で 6.9%、N=1
 | # | 質問 | Yes → クラス | 実装コスト帯 |
 |---|---|---|---|
 | 1 | 2枚目のフレームが要るか? | No → **S1** | 既存の数値の見せ方なら **UI-only**(TSV copy 等)。新統計なら **local compute**(plugin か host)。remote stack 全体に効かせるなら **MEASURE op**(`MOP_ANALYZER` 経由なら protocol 変更なし) |
-| 2 | 同一条件の N フレームか? | **TN** | 常駐フレームだけなら local compute(`computeStackStats` 系)。**全フレーム対象なら必ず protocol MEASURE op**(remote stack は手元に全画素がない。processing policy `auto/server/local-fetch` に従う) |
+| 2 | 同一条件の N フレームか? | **TN** | 常駐フレームだけなら local compute(`computeStackStats` 系)。**全フレーム対象なら必ず protocol MEASURE op**(remote stack の全画素は client 側にない。processing policy `auto/local-fetch` に従う) |
 | 3 | 条件(レベル)を変えた複数 stack か? | **LM** | Series Analysis パネルの拡張が第一候補。新パネルは最後の手段 |
-| 4 | ファイルに無い数値(照度・時間・gain)が要るか? | **+meta** | **新 user-input field**: stack 単位の編集可能フィールド+auto 抽出+session 保存(`SeqInfo::level` が先例) |
+| 4 | ファイルに無い数値(照度・時間・gain)が要るか? | **+meta** | series の `paramName` / `unit` と `Series::Member::value` を使う。folder 名からの自動抽出は提案として明示し、値は session に保存する |
 | 5 | 参照画像・チャート定義が要るか? | **+ref** | 参照の指定 UI+session 保存+検証(サイズ/dtype 一致)。コスト最大 |
 | 6 | 校正器材が要るか? | **+cal** | ツールの外。数値の**入力欄と単位表記**だけ提供する |
 
@@ -121,35 +126,29 @@ stack の σ_t が測る場所によって √(N/(N−1)) 倍(N=8 で 6.9%、N=1
 < user-input field(永続化と provenance 表記が付く)。複合する場合は加算。
 どのクラスでも **CFA plane 分離**と **provenance 行**(measure-ux.md)は必須要件。
 
-## 5. ギャップ(taxonomy が露呈させる欠落)
+## 5. taxonomy から確認できる未実装項目
 
-センサ評価ワークフローへの価値順。class タグ付き:
+per-frame の TSV/CSV、frame average、SNR curve、直接 DSNU / PRNU、分離フィットは
+実装済みであり、もうギャップに数えない。現行で残るもの:
 
-1. **per-frame テーブルの持ち出し**(TN、中身 S1×N) — `MOP_FRAME_ROI_STATS` は
-   実装済みだが、**ローカル stack 用の同型計算と「表としての TSV/CSV export」が無い**。
-   曲線ではなく行列で出すだけ。コスト帯: UI-only+小さな local compute。最安で最需要
-2. **SNR curve / dynamic range**(LM/+meta) — 素材(level 毎 mean と σ_t)は
-   Linearity が既に持っている。派生曲線1本と飽和定義の入力欄で済む
-3. **EMVA 準拠 DSNU / PRNU**(TN+ref) — 現 PRNU は単一フレーム proxy と自認済み。
-   dark/flat stack の指定 UI(「この stack を dark として使う」)が本体で、
-   計算は時間平均後の既存統計。`emva1288/*` 予定の中で最初に着手すべき項目
-4. **defect pixel カウント/マップ**(S1 簡易 / TN+ref 正式) — 現状ゼロ。
-   閾値法(S1)だけでも歩留まり確認に有用。map 出力の表示経路(オーバーレイ)が
-   新規要素
-5. **blink / RTS 検出**(TN、map) — 画素毎時系列が必要で、remote では
-   MEASURE op 必須。長い stack の主用途になり得るが実装コストは高い
-6. **dark current**(LM+meta) — 横軸を露光時間にした linearity。level 単位
-   フィールドが既に自由記述(`ms` 可)なので、実は「dark stack 群+単位 ms」で
-   近い数値は出る。正式化は fit の再解釈のみ
-7. **OECF / dead-leaves**(S1+ref) — チャート定義の入力という新カテゴリを開く。
-   analyzers.md の予定リストにあり、優先度は上記より下
+1. **dynamic range / full well** (LM+meta) — 飽和定義とその provenance が要る。
+2. **EMVA 1288 原文照合** (TN/LM+ref) — 実装済みの直接推定と分離 fit は
+   ツール固有名のまま。規格名は照合後にだけ付ける。
+3. **defect pixel カウント / map** (S1 簡易 / TN+ref 正式) — 検出に加え、
+   map の公開契約・表示・保存が必要。現行 ABI に `emit_map` はない。
+4. **blink / RTS 検出** (TN, map) — 画素毎時系列と remote 集計が必要。
+5. **dark current** (LM+meta) — 横軸を露光時間にした fit として正式化が必要。
+6. **OECF / dead-leaves** (S1+ref) — チャート定義と照合の入力経路が必要。
 
-逆に、taxonomy 上「安いのに未提供」なもの: S1 統計の**クリップ率・飽和画素率**の
+一方、taxonomy 上で実装コストが低い未提供項目は、S1 統計の**クリップ率・飽和画素率**の
 グリッド常設(histogram 内には表示済み)。UI-only で拾える。
 
 ## 6. 空間σの ddof — 全数調査と裁定材料 (board 193行、PR #123 の報告)
 
-> **本節は裁定待ちであり、実装は一切変えていない。** やったのは「どこがどう
+> **以下は裁定前のスナップショット。** 「今」「現状」は 2026-08-10 時点を指す。
+> 現行実装は §9 を正とする。
+
+> **調査時点では裁定待ちで、実装は一切変えていなかった。** やったのは「どこがどう
 > なっているか」を数えて測ることだけ。答えは §7 の判断リストに**番号で**返せる。
 
 PR #123 は σ_t の parity 破れ (local ddof=0 / peer ddof=1) を直したとき、
@@ -161,7 +160,7 @@ PR #123 は σ_t の parity 破れ (local ddof=0 / peer ddof=1) を直したと�
 これが問題になるのは、本プロジェクトが既に持つ規則のためである:
 **同じ名前の数が、表示される場所によって違ってはならない。** PR #127 は
 `sigma_s` / `sigma_fpn` の一量二名を潰すときにこの論を立て、PR #130 の
-有名名スキャナはその一般形を機械化した。
+定義済み指標名スキャナは、その規則を一般化して機械的に検査する。
 
 ### 6.1 結論を先に — これは「パネル間の対立」ではなく「量の取り違え」である
 
@@ -172,7 +171,7 @@ board 行は「panel_temporal は 1、rois/canvas/histogram は 0」と書くが
    同じ Temporal パネルの**グラフ** (`T.frameStd`) は ddof=0 である。つまり
    Temporal パネルは**自分自身と食い違っている** —— 同じフレームの同じσを、
    グラフでは 0、エクスポートでは 1 で出す。
-2. **ddof=0 側は一枚岩ではない**。Projection パネルの `sigma_row` / `sigma_col`
+2. **ddof=0 を使う計算は統一されていない**。Projection パネルの `sigma_row` / `sigma_col`
    は「行/列平均のσ」であり、これは正典 [flat-field-stats.md](flat-field-stats.md)
    が **ddof=1 と明示的に指定している A と B そのもの**である(「**ddof は全部
    ddof=1 で統一する** —— T も A も B も」「A, B は ddof=1 で不偏。T を ddof=0 で
@@ -239,14 +238,14 @@ canvas を、`detrend.inc:124` / `rtemporal.inc:69` / `setanalysis.inc:371` /
 
 #### local / peer の分裂は **無い** —— これが方向を決める
 
-#123 が直したのと同じ級の欠陥(local と peer が同じ量に別の ddof)が空間σにも
+#123 が直したものと同種の欠陥(local と peer が同じ量に別の ddof)が空間σにも
 あるかを個別に確認した。**無い。** peer が per-frame の空間統計を出すのは 2 箇所
 (`frame std` #6、`roi var` #7)で、**どちらも ddof=0**、local の相方(#5
 `T.frameStd`、および #1 の ROI σ)と一致する。peer は行/列プロファイル統計を
 **一切計算していない**(`MOP_*` 5 op すべて確認)。
 
 **つまり今のパリティは ddof=0 側で成立している。** これは裁定の方向を片側だけ
-高くする: I 群を ddof=1 に寄せると**今成立しているパリティを自分から壊し**、
+高くする: I 群を ddof=1 に寄せると**現在成立しているパリティを壊し**、
 `rp::VERSION` 上げが要る(枠は不変で既存キーの意味だけが変わる —— PR #127 が
 5→6 を上げたのと同じ条件)。ddof=0 に寄せると **local 1 箇所で済み、ワイヤは
 一切動かない。**
@@ -254,8 +253,8 @@ canvas を、`detrend.inc:124` / `rtemporal.inc:69` / `setanalysis.inc:371` /
 ### 6.3 実測 —— どちらに動かすと何がどれだけ動くか
 
 決定論的な 4096x3000 RGGB フレーム 1 枚(台座 ~2000 DN、PRNU 0.5%、列 FPN
-1.8 DN、ショット+リードノイズ)の上で、**各サイトの式を間引き・モザイクセル
-丸めまで含めて逐語的に写して**両 ddof を計算した。式が同じでも **n がサイト
+1.8 DN、ショット+リードノイズ)の上で、**各計算箇所の式を間引き・モザイクセル
+丸めまで含めてそのまま再現し**、両方の ddof で計算した。式が同じでも **n が計算箇所
 ごとに全く違う**ことが本節の要点である。
 
 #### 領域の σ (I 群) —— n は画素数**ではない**
@@ -295,7 +294,7 @@ peer の `roi var` は**分散**なので比は二乗で効く: 3x3 の R プレ
 
 #### 同じフレーム・同じ ROI を、いまの各面が答える値
 
-128x128 ROI、R プレーン、同一フレーム。**「同じ名前の数が場所で違う」の実物**:
+128x128 ROI、R プレーン、同一フレーム。**「同じ名前の値が場所によって異なる」実例**:
 
 | 面 / 列 | n | 値 [DN] | 今の ddof |
 |---|---|---|---|
@@ -348,12 +347,12 @@ peer の `roi var` は**分散**なので比は二乗で効く: 3x3 の R プレ
 
 1. **12 のうち 11 が既に 0。** 規約を変えるのではなく外れ値を直すのであって、
    #123 と同じ形の裁定になる(「挙動変更ではなく parity 違反の解消」)。
-2. **peer が 0 側にいる。** 0 に寄せれば local/peer は全サイトで一致し、ワイヤも
+2. **peer は ddof=0 を使っている。** 0 に寄せれば local/peer は全計算箇所で一致し、ワイヤも
    `rp::VERSION` も動かない。1 に寄せると**いま成立しているパリティを壊して**
    版上げが要る。
 3. **これらの面は間引いている。** 200k / 1M 上限のストライド標本は i.i.d. では
    なく(モザイクセル単位で、列 FPN と相関する)、ddof=1 が約束する不偏性を
-   そもそも供給できない。**払えない保証に systematic な代金を払うことになる。**
+   そもそも供給できない。**実現できない保証のために systematic bias を負うことになる。**
 4. **Temporal パネルの自己矛盾が同時に消える。** グラフ (`frameStd`、ddof=0) と
    第3節エクスポート (ddof=1) が、同じフレームの同じσで一致する。
 5. **プールされた `all` 行の恒等式が厳密なまま残る。** `verify.inc` V17 は
@@ -371,14 +370,14 @@ peer の `roi var` は**分散**なので比は二乗で効く: 3x3 の R プレ
 1. **正典が既に理由つきで答えている。**「A, B は ddof=1 で不偏。T を ddof=0 で
    取ると O(1/W) の不整合が戻ってくる」「ddof を混ぜない」。
 2. **これは記述統計ではなく推定量の部品である。** `T − A − B` で σ_p を出す分解
-   (判断record の (a)) が着地したとき、A と B が ddof=0 だと分解が合わない。今
+   (判断record の (a)) を実装したとき、A と B が ddof=0 だと分解が合わない。今
    0 のままにすると、(a) 実装時に**出荷済みの数が黙って動く**か、(a) が不整合な
    A を継ぐかの二択になる。
 3. **n がプロファイル長で小さい。** 実際に見える群である(n=8 で +6.9 %、n=2 で
    +41 %)。正典の警告「小さな ROI や Bayer プレーンでは効く」はこの群のこと。
 4. peer はこの量を計算していないので、**ワイヤは動かない**。
 
-#### 何を差し出すことになるか (推奨の代償)
+#### 推奨に伴うトレードオフ
 
 - **「ddof は全部 ddof=1」という一行が、プログラム全体については言えなくなる。**
   規則が二行になる:「推定量の中は ddof=1。1フレームの記述統計は ddof=0。ただし
@@ -388,22 +387,22 @@ peer の `roi var` は**分散**なので比は二乗で効く: 3x3 の R プレ
 - **同じ表の隣り合う列で ddof が違う。** Projection の TSV は `sigma_frame`
   (ddof=0) と `sigma_col` (ddof=1) を並べることになる。一見、今潰そうとしている
   不整合そのものに見える。差は「別の量だから」であり、**列の説明がそれを言わない
-  限り弁護できない**(判断4)。
+  限り説明できない**(判断4)。
 - **3x3 ROI の σ は、統計家が 6 % 低いと言う値のまま残る。** 受け入れる根拠は
   §6.3 の最終表 —— その n では数字自体が 25 % ばらついており、供給できない
-  不偏性のために systematic なずれを入れる取引は悪い。
+  不偏性のために systematic bias を導入する取引は妥当でない。
 
 #### 採らなかった案
 
 | 案 | 却下理由 |
 |---|---|
-| **全部 ddof=1** | 16 サイト中 14 が動く。peer 2 サイトが動くので `rp::VERSION` 上げが要り、**いま成立しているパリティを自分から壊す**。間引き標本に不偏補正を掛ける正当化も無い |
+| **全部 ddof=1** | 16 箇所中 14 箇所が変わる。peer の 2 箇所も変わるため `rp::VERSION` 上げが必要で、**現在成立しているパリティを壊す**。間引き標本に不偏補正を掛ける正当化も無い |
 | **全部 ddof=0** | 正典(「A, B は ddof=1 で不偏」)に正面から反し、(a) の分解が O(1/W) ずれる。#14 を「直す」ことで正典準拠の唯一のサイトを壊す |
 | **現状維持** | 規則違反が残るだけでなく、**1つのエクスポート文書の中に同名列が両 ddof で並ぶ**(§6.5)。放置は「読者に判別できない」を確定させる |
 
 ### 6.5 エクスポート —— 既に配られた数値をどうするか
 
-**まず、いま既に壊れている点を明示する。** `buildTemporalExport` の吐く TSV は
+**まず、裁定前に壊れていた点を明示する。** `buildTemporalExport` の当時の TSV は
 第2節(H/V profile statistics、`ProjState` 由来 = **ddof=0**)と第3節
 (per-frame statistics = **ddof=1**)を**一つのファイルに**持つ。1ch 非 CFA の
 stack では第3節の列名にプレーン接尾辞が付かないため、**同一ファイル内に
@@ -411,9 +410,9 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 `--export-tsv-selftest` の assert が `has(tsv, "sigma_col [%]")` で
 **どちらの節に当たったか区別できていない**のはその証拠である。
 
-σ を運ぶエクスポート面は次の通り:
+σ を含むエクスポートは次の通り:
 
-| 面 | 運ぶ量 | 今の ddof | 版・日時 |
+| 出力 | 含む量 | 今の ddof | 版・日時 |
 |---|---|---|---|
 | Temporal `Copy (TSV)` / CSV 第1節 | σ_t / σ_fpn / σ_tot | 1 (確定済み) | **持つ** (`app: viewer <ver>` + 生成日時) |
 | 同 第2節 | `sigma_frame` / `sigma_row` / `sigma_col` (+ %) | **0** | 同上 |
@@ -422,14 +421,14 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 | Analysis `Copy table (TSV)` | `<ch>.std` / `.var` / `prnu_pct` / `row_fpn_pct` / `col_fpn_pct` | **0** | 持つ (`ana.prov` + plugin 版) |
 | peer measure 応答 | `frame std` / `roi var` | **0** | 送信側の版で決まる |
 
-**ROIs パネルにはエクスポートが無い** —— 画面から手で写されている。そこの数は
-遡って照合できない。
+**裁定前の ROIs パネルにはエクスポートが無かった。** 現在は
+`Copy (TSV)` / `Save (CSV)...` と `--roi-export-selftest` がある (§9)。
 
-**announce すべきこと(裁定がどちらでも):**
+**裁定の内容にかかわらず周知すべきこと:**
 
-1. **各σ列は自分の ddof を名乗るべきである。これは移行注記ではなく、今欠けて
+1. **各σ列は自身の ddof を明示すべきである。これは移行注記ではなく、今欠けて
    いる申告である。** 現状、第2節と第3節のどちらを貼ったのかを読者が判別する
-   手段が無い。#123 が σ_t の method 行に推定量を名乗らせたのと同じ理由
+   手段が無い。#123 が σ_t の method 行に推定量を明示させたのと同じ理由
    (「local 行と server 行が並ぶ表なので」)が、ここでは**同じ文書の隣の節**に
    対して成立している。
 2. **Projection の TSV には版も日時も無い。** II 群を動かすなら、この面だけは
@@ -437,7 +436,7 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
    Temporal エクスポートが既に持っているので形はある。
 3. **遡って書き換えない。** 既に配られた表は ddof=0 の ROI 値と ddof=1 の
    Temporal 値で成立している。訂正すべきは**数値ではなく、その数値がどちらの
-   規約かを言えなかったこと**。announce は「この版から `sigma_col` は ddof=1
+   規約かを示せなかったこと**。周知内容は「この版から `sigma_col` は ddof=1
    (以前は ddof=0)、差は `sqrt(n/(n−1))`、n は列数」の形で、**再測定なしに
    換算できる**ように書けば足りる(#127 が uncorrected upper bound を
    `sqrt(sigma_fpn^2 + fpn_corr^2)` で復元可能にしたのと同じ流儀)。
@@ -445,10 +444,10 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
    どの報告書も書き換わらない。** 書き換わるのは小 ROI と CFA プレーンスライス、
    そして行/列σの全域である(§6.3)。
 
-### 6.6 ピン(テスト)を今回入れなかった理由
+### 6.6 回帰テストを裁定前の調査で追加しなかった理由
 
-裁定が出るまで不整合が**広がらない**ようにするピンを検討したが、**入れていない**。
-理由は「静かに落ちるピンなら無い方がまし」だからである。
+裁定が出るまで不整合が**広がらない**ようにする回帰テストを検討したが、**追加していない**。
+理由は、異常を検出できない回帰テストなら無い方がよいからである。
 
 まず、実測した事実を二つ:
 
@@ -456,12 +455,12 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
   assert していない。** ゆえに #4 / #14 (ddof=1 の2式) は**どのテストにも
   守られていない**。実験として #4 と #14 を ddof=0 に反転してスイートを回したところ
   **42 テスト全 PASS、失敗ゼロ**だった(実験は測定後に revert 済み)。
-  このサイトが隣と食い違ったまま残れたのは、これが理由である。
+  この計算箇所が隣の計算箇所と食い違ったまま残れたのは、これが理由である。
 - 逆に **ddof=0 側は守られている**: `--roistats-selftest` が解析フィクスチャの
   真値に対して **8 本**の exact assert を持つ(`sqrt(250004.0)`、`2.0`、`0.5`、
   `sqrt(1250009.0)`、`3.0` …)。`verify.inc` V17 のプール恒等式も効く。
 
-**守りが要るのは ddof=1 側であり、そこに loud なピンを今日は書けない。** 二節の
+**保護が必要なのは ddof=1 側であり、現時点では異常を確実に検出する回帰テストを書けない。** 二節の
 σを突き合わせる assert は書けない —— 第2節は間引き標本、第3節は全画素走査で、
 **同じ標本を測っていない**ので比が `sqrt(n/(n−1))` にならず、閾値は勘になる。
 残る手はテスト内に推定量を書き直すことだが、**自分が守る対象を再実装した
@@ -470,7 +469,7 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 
 したがって推奨は、判断1/2 の**実装 PR の中で**、per-frame エクスポートのσに
 **値の assert を1本**(フィクスチャから式で再導出したもの)足すこと。裁定と
-同じコミットで入れば、守る値が確定しているので loud に書ける。判断7 を参照。
+同じコミットで入れば、保護する値が確定するため、異常を確実に検出する形で書ける。判断7 を参照。
 
 ## 7. 判断リスト (空間σの ddof)
 
@@ -480,22 +479,22 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
    既に 0 で peer もそこにおり、動くのは `panel_temporal.inc:472` の1式・ワイヤ
    不動で済むから(§6.4 推奨A)。
 2. **II 群(行/列平均の σ)の統一先** —— 推奨: **ddof=1**。正典が A/B を理由つきで
-   ddof=1 に指定済みで、ここを 0 のままにすると σ 分解 (a) の着地時に出荷済みの
+   ddof=1 に指定済みで、ここを 0 のままにすると σ 分解 (a) の実装時に出荷済みの
    数が黙って動くから(§6.4 推奨B)。
 3. **同梱プラグインの扱い** —— 推奨: **判断1/2 にそのまま従う**
    (`prnu_pct`・`.std`・タイル std は 0 のまま、`row_fpn_pct`/`col_fpn_pct` は
    1 へ)。プラグインだけ別規約にする理由が無く、`varlap` は a.u. で σ ではない
    から。
-4. **σ 列の申告義務** —— 推奨: **各σ列が自分の ddof を名乗る。裁定がどちらでも
+4. **σ 列の申告義務** —— 推奨: **各σ列が自身の ddof を明示する。裁定がどちらでも
    実施する。** 今は同一 TSV 内に同名列が両 ddof で並び、読者に判別手段が無い ——
    これは移行注記ではなく欠けている申告だから(§6.5)。
 5. **Projection TSV の provenance** —— 推奨: **II 群を動かす前に
    `app: viewer <ver>` + 生成日時を足す**。この面だけ「いつの規約か」を後から
    言えず、Temporal 側に既に形があるから(§6.5-2)。
-6. **既配布の数値** —— 推奨: **遡及訂正しない。換算式だけ announce する。**
+6. **既配布の数値** —— 推奨: **遡及訂正しない。換算式だけ周知する。**
    全画面・通常 ROI では 0.05 % 未満で報告書は書き換わらず、変わる範囲は
    `sqrt(n/(n−1))` で再測定なしに戻せるから(§6.5-3)。
-7. **ピン(テスト)** —— 推奨: **本 PR では入れない。判断1/2 の実装 PR で
+7. **回帰テスト** —— 推奨: **本 PR では追加しない。判断1/2 の実装 PR で
    per-frame エクスポートのσに値 assert を1本足す。** 今日書ける形は
    閾値が勘になるか推定量の再実装になり、どちらも黙って通るから(§6.6)。
 8. **正典の書き換え** —— 推奨: **`flat-field-stats.md` の「ddof は全部 ddof=1 で
@@ -516,9 +515,9 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 | 1 | **I 群 (領域そのものの画素の σ) は ddof=0 に統一** |
 | 2 | **II 群 (行/列平均の σ) は ddof=1 に統一** |
 | 3 | 同梱プラグインは 1/2 に従う |
-| 4 | 各σ列が自分の ddof を名乗る |
+| 4 | 各σ列が自身の ddof を明示する |
 | 5 | Projection TSV の provenance を **II 群を動かす前に**足す |
-| 6 | 既配布の数値は遡及訂正しない。換算式 `sqrt(n/(n−1))` を announce |
+| 6 | 既配布の数値は遡及訂正しない。換算式 `sqrt(n/(n−1))` を周知 |
 | 7 | per-frame エクスポートのσに値 assert を1本 |
 | 8 | 正典 (`flat-field-stats.md`) に適用範囲の一文 |
 
@@ -545,7 +544,7 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 
 - **I 群 → 0**: `core/ui/panel_temporal.inc:472` の**1式のみ**。12箇所中11は既に
   0 で、peer も 0 側にいる。**ワイヤ不動・`rp::VERSION` 不動** (1 に寄せると
-  いま成立しているパリティを自分から壊して版上げが要る、が推奨Aの根拠)
+  現在成立しているパリティを壊して版上げが必要になることが、推奨Aの根拠)
 - **II 群 → 1**: `core/ui/panel_histogram.inc:679`、`plugins/analyzer_prnu.c:190`
   (`row_fpn_pct`)、`plugins/analyzer_prnu.c:198` (`col_fpn_pct`)。peer はこの量を
   計算していないので**ここもワイヤ不動**
@@ -591,3 +590,19 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 実装時はこの2件について、**n−1 にした上でその留保を PR に書く**。ここを黙って
 n−1 にすると、「不偏にした」という主張が実際より強くなる —— 本書がまさに
 潰そうとしている種類の齟齬である。
+
+## 9. 現行実装への適用状況 (2026-08-18)
+
+§8 の裁定は一式で実装された。現在の挙動は次のとおり:
+
+- **I 群は ddof=0、II 群は ddof=1。** `panel_temporal.inc` の per-frame
+  領域 σ は ddof=0、Projection と `analyzer_prnu.c` の行/列平均 σ は
+  ddof=1。各エクスポート列が自身の ddof を明示する。
+- **数値の回帰テストがある。** `--export-tsv-selftest` の E11 は、per-frame
+  σ が ddof=0 の閉じた式と最後の桁まで一致し、ddof=1 とは一致しないことを検査する。
+- **Temporal のエクスポートは統合済み。** `buildTemporalExport` が temporal summary / H/V
+  profile statistics / per-frame statistics を1文書に作り、`Copy (TSV)` /
+  `Save (CSV)...` が同じビルダーを使う。ROIs にも同じ形式のエクスポートがある。
+- **TN / LM の主要派生物は実装済み。** frame average、SNR curve、
+  直接 DSNU / PRNU、σ_fpn²–μ² 分離フィットがある。ただし EMVA 1288 の名は
+  原文照合後にだけ付け、画素 map 出力は現行の公開 ABI の外である。

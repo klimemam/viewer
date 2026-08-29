@@ -1,274 +1,147 @@
-# 機能検証マトリクス — frame 参照化 (ステージ1 の不変性と、以降の受入条件)
+# 機能検証仕様
 
-対象: `verify-func` @ `e3883f5` (merge `880d2ae` = ステージ1)
-比較基線: `viewer-wt-verify-base` @ `e290c77` (ステージ1 直前)
-仕様: `docs/reference-design.md` (§2 フィールド分割 / §8 表の1行目 = ステージ1 の合格基準)
+本書は、現在の `main` に対して繰り返し実行する機能検証の仕様である。特定のコミットに
+対する実施結果、PASS/FAIL の集計、実行環境の情報は置かない。それらは
+[results/](results/) の日付付き記録に保存する。
 
-ステージ1 の合格基準は仕様が一文で決めている — **「既存 suite 全部が無変更で緑」**
-(§8 表 1行目「検証」欄)。共有はまだ一つも起きないので、**出力は基線とビット同一で
-なければならない**。本書はそれを「suite が緑」より強く、**数値の A/B 差分ゼロ**まで
-落として測る。
+テストの登録名、引数、テストデータ（fixture）、OpenGL 不要の指定（`NOGL`）、
+タイムアウトの正典は
+[`CMakeLists.txt`](../../CMakeLists.txt) の `viewer_selftest(...)` 群である。本書は、
+そのテスト群が何を保証するかを項目別に定義する。
 
-## 結論 (2026-08-03 実施)
+## 1. 合格条件と不変条件
 
-- **suite**: `SUITE TOTAL c:/Users/hish/Desktop/viewer-wt-verify pass=21 fail=0`
-- **A/B 数値不変性**: `AB SUMMARY identical=24 differing=1 rc_differing=0 missing=0`。
-  唯一の相違 `browsekeys` は非同期待ちの進捗行のみで、**基線を自分自身と比べたときの
-  ゆらぎのほうが大きい** (A-8)。**ステージ1 に帰属する数値 drift はゼロ。**
-- **校正**: 捕捉ファイルへ 1 バイト (`4096`→`4097`) と有効数字5桁目 (`8.00031`→`8.00032`)
-  の偽差を注入し、harness が両方を検出することを確認 (A-11)。この検査は失敗し得る。
-- **測定不変条件**: 10件すべて実出力上で成立、基線と一致 (B 節)。
-- **新規の欠陥**: **無し**。落ちたものは既知2件 (E-4 の A2、E-5 の layout.ini) のみ。
+全機能に共通する合格条件は次のとおり。
 
-| 節 | 項目数 | 実施 | PASS | FAIL | 要probe | 既知 | 未実施 |
-|---|---|---|---|---|---|---|---|
-| A ステージ1 不変性 | 16 | 16 | 14 | 0 | 1 (A-12) | 1 (A-10) | 0 |
-| B 測定不変条件 | 10 | 10 | 10 | 0 | 0 | 0 | 0 |
-| C ステージ2/3/4/5 受入 | 17 | 0 | 0 | 0 | 0 | 0 | 17 |
-| D 穴 (probe 提案) | 7 | 0 | 0 | 0 | 7 | 0 | 0 |
-| **合計 (A-D)** | **50** | **26** | **24** | **0** | **8** | **1** | **17** |
+1. ビルドが成功し、CMake に登録されたテストが一覧に現れないまま欠落しない。
+2. 実行された各テストが終了コード 0 で、内部の全アサーション（表明）が PASS になる。
+3. skip、quarantine、未登録、実行不能を PASS に数えない。
+4. 次の測定不変条件をどの変更でも保つ。
 
-(E 節の既知6件は検証項目ではなく記録。A-10 は「既知の失敗が基線と同一に再現する」ことの
-確認なので、不変性としては合格・項目としては既知に数えた。)
-
-## 0. この機械で「できないこと」を先に書く
-
-- **OpenGL のスクリーンショットが撮れない** (クライアント領域が白く出る)。
-  よって本書に**視覚確認は一件も無い**。判定はすべて CLI フラグ・状態表明・
-  stderr・出力ファイルに依る。描画の見た目に関する項目は D 節で 要probe とする。
-- `srcId` / `use_count` / `rev` / `mtime` / `fsize` を**印字する経路がコードに無い**
-  (D-1 で詳述)。共有の有無を外から直接主張することは今日できない。
-
-## 1. 方法 — A/B 出力差分の作り方と、その決定性の担保
-
-`tools/verify/ab_capture.sh` が同一のコマンド列を1つのビルドに対して流し、
-`tools/verify/ab_diff.sh` が2つの捕捉ディレクトリを突き合わせる。
-
-**決定性の担保 (どれも「便利だから」ではなく、偽の差分を潰すために要る)**
-
-| 担保 | 理由 |
-|---|---|
-| cwd を共有の中立ルート (`scratchpad/verifyagent_ab/root`) に固定。worktree では走らせない | 相対 fixture パスが両ビルドで**同じ文字列**になる。worktree で走らせるとパスに `-base` が混じり、差分が出力ではなくパスから出る |
-| `APPDATA`・`HOME`・`USERPROFILE` を**パスごとに新規の空ディレクトリ**へ固定 | selftest は実ユーザの `%APPDATA%/viewer/{layout.ini,prefs.txt}` を読み、さらに **`io.IniFilename` が無防備なため実ユーザの `layout.ini` へ書き戻す** (E-5、main で修正中)。実測: 本検証中、**別エージェントの worktree `viewer-wt-verifyui` が同一の `--browse-keys-selftest` を同時実行していた**。固定しなければ隣の書き込みが偽の差分を作り、こちらの実行が操作者の状態を壊す |
-| cwd の `imgui.ini`/`layout.ini` をパス開始時に削除 | 共有の実行ルートに前のパスが置いた ini を次のパスが読むと、B は A と違う初期状態から始まる |
-| `TMP`/`TEMP` をパスごとに固定 | selftest が `temp_directory_path()` へ書く `.vsession` (`viewer_batchselftest.vsession` 他) がパスの中に落ちる。**同機の兄弟エージェントが同じ固定名を共有 temp に書く**ので、固定しなければ往復の対象が入れ替わり得る。※実体は selftest が終了時に自分で削除するため成果物としては残らず、往復の証跡は A-13 の表明行のほうで取る |
-| 基線→ステージ1 の順で**逐次**実行 | 兄弟エージェントが同機で走る。並列にすると selftest 内部の壁時計予算 (60s/300s) を踏んで偽 FAIL になる |
-
-**正規化 (適用した規則の全部。これ以外は本物の差分として扱う)**
-
-| # | 規則 | 根拠 |
+| 不変条件 | 正典 | 検証で見ること |
 |---|---|---|
-| N1 | `...viewer-serve.exe` の絶対パス → `<SERVE_EXE>` | `--remote-selftest` は各ビルド**自身**の serve を起動する。引数が構造上異なるだけで挙動差ではない |
-| N2 | パスごとの `APPDATA`/`TMP`/捕捉ディレクトリの絶対パス → `<CAPDIR>`/`<PASS>` | 上の担保で意図的に分けたディレクトリ名 |
-| N3 | `<数値> ms` / `<数値> MB/s` / `in <数値> s` → `<TIME>` | 壁時計。実測で `browse` が `in 0.07 s` / `in 0.09 s` と揺れた。**`%.2f MB on the wire` は正規化しない** — あれは通信量で決定的、比較対象に残す |
-| N4 | `%p` の生ヒープアドレス → `<PTR>`。ただし**全ゼロは `<NULLPTR>`** に分けて残す | ASLR で値は実行固有だが、**null か否かは挙動**。実測で `abstats` の `slot 1 held 0000019fbe321270` は毎回変わる一方、`hist[1].img=0000000000000000` は両ビルドで一致した — この区別を潰さない |
-| N5 | `generated: YYYY-MM-DD HH:MM:SS` → `<TIMESTAMP>` | `--export-tsv-selftest` の来歴ヘッダが実時刻を書く (`# app: viewer 0.1 \| generated: 2026-08-03 00:46:35`) |
+| `sigma_t` は frame ではなく stack の性質 | [用語](../terminology.md) | stack 集計にだけ現れ、per-frame 表には `sigma_t` 列がない |
+| CFA のプレーンを黙って混ぜない | [用語](../terminology.md) | R / Gr / Gb / B を独立して扱う。明示的な `all` 集計は別測定として表示・出力する |
+| 部分ロードを完全な stack と誤認させない | [用語](../terminology.md) | 常駐済み数（resident）と予定総数（expected）を `n/N` で示す |
+| ラベルに乗った量は単位を伴う | [用語](../terminology.md) | 画素値・ノイズは `[DN]`、相対量は `[%]` と明示する |
+| 数値は、その数値を作った画素と同時に無効化する | [参照設計](../reference-design.md) | reload / crop / source 共有後に古い cache、fit、平均を再利用しない |
 
-正規化は **N1–N5 だけ**。数値 (mean/sigma/fit/バイト数/枚数) には一切触れていない。
-N3–N5 は**先に無正規化で diff を取り、実行固有だと現物で確かめてから**足した規則で、
-「合わせるために」置いたものは一つも無い。
+## 2. 標準の実行方法
 
-## 2. 判定語
+リポジトリのルートで、構成済みのビルドディレクトリを指定して実行する。
 
-`PASS` = 期待どおり / `FAIL` = 期待と異なる (要修正) / `未実施` = このランでは走らせて
-いない / `要probe` = 観測手段がコードに無く、作らないと測れない / `既知` = ステージ1
-以前から在る欠陥で、仕様が「今は直さない」と決めているもの。
+```bash
+tools/run_selftests.sh build
+```
 
-## A. ステージ1 の挙動不変性 (このランの本体 — 全件実施)
+この入口は、ビルド、テストデータの再生成、OpenGL の利用可否確認、ctest、未実行項目の
+列挙、失敗ログの退避を一続きで行う。ビルドディレクトリを省略した場合の探索規則も、
+同スクリプトが正典である。
 
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| A-1 | 両 worktree がビルドできる | 環境節のレシピを両方で | どちらも成功 | 両方成功。`viewer.exe` 7,844,350 B (stage1) / 7,836,551 B (base)。`viewer-serve.exe` は**両方 3,354,273 B で同一サイズ** (serve.cpp 無変更と整合) | PASS |
-| A-2 | **§8 表1行目の合格基準そのもの**: 既存 suite 21件が無変更で緑 | `bash "$SP/integ_suite_orchestrator.sh" c:/Users/hish/Desktop/viewer-wt-verify` | pass=21 fail=0 | `SUITE TOTAL c:/Users/hish/Desktop/viewer-wt-verify pass=21 fail=0` (90秒。`APPDATA`/`TMP` を固定して実行 — 理由は A-16) | PASS |
-| A-3 | CLI 表面が基線と同一 | 両 `core/main.cpp` から `"--..."` 文字列を抽出して diff | 増減ゼロ | **52 フラグ / うち selftest 22件、diff 空**。フラグの追加も削除も無い | PASS |
-| A-4 | 利用者に見える文言が一つも変わっていない | 両ソースの4文字以上の文字列リテラルを出現数つきで diff | 変化はフィールド移動に伴う機械的なものだけ | 差分は**セッション書き出しのストリーム式が `d->rawLE`→`d->src->rawLE` 等に変わった4件**と、**コメント内の引用句2件** (`"reload"` 2440行, `"this frame as seen by this stack"` 190行) のみ。**表示文言の変更はゼロ**。ゆえに以降の出力差分は「文言の編集」ではなく**計算値のdrift**しか有り得ない | PASS |
-| A-5 | selftest 22件すべてを suite 経由でなく**直接**実行 | `ab_capture.sh` が中立ルートで25コマンドを実行 | 全件 rc=0 (既知失敗の A-10 を除く) | 全件 rc=0。終行例: `seriesselftest: ok` / `browsekeys: 241 action(s) through real frames, no crash, 0 panel check(s) failed: ok` / `verifyselftest: ok` / `deriveselftest: ok` / `texportselftest: ok` / `framelinselftest: ok` / `newwinselftest: ALL PASS` / `selftest: FRAME_ROI_STATS over 120 frames: ok` / `sweepfile: ok` / `linselftest: snr analytic check (linset): worst \|signal err\| 0.175%, worst \|SNR err\| 1.019% (tol 2% / 3%) ok` | PASS |
-| A-6 | 終了コードが基線と全件一致 | `ab_diff.sh` の rc 比較 | 25件すべて一致 | `rc_differing=0` (25件中0件相違)。既知失敗も**両方 rc=1** | PASS |
-| A-7 | **正規化ゼロ**での生バイト一致 | 正規化を一切かけずに全捕捉を diff | 実行固有ノイズを持つものを除き一致 | **25件中20件が正規化なしでバイト完全一致**。相違は `abstats` `abstatscfa` `browse` `browsekeys` `texport` の5件のみ | PASS |
-| A-8 | **ノイズ床の測定 (対照実験)** — 相違5件は本当に実行固有か | 基線ビルドを**同一環境でもう一度**流し、基線 vs 基線を diff | 同じ5件が自分自身とも食い違うはず | **同じ5件がすべて自己不一致**。しかも `browsekeys` は自己比較のほうが churn が大きい (自己10行 vs A/B 8行) — 自己比較では**表明行まで**揺れた (`expanded on 0/24` vs `0/26 watched frame(s)`)。すなわち**ステージ1 の差は基線自身の実行間ゆらぎより小さい** | PASS |
-| A-9 | **数値 A/B 不変性 (このステージ最強の検査)** | `ab_diff.sh capA capB` (正規化 N1-N5) | 数値差分ゼロ | `AB SUMMARY identical=24 differing=1 rc_differing=0 missing=0`。残る1件 `browsekeys` の相違は**`waitdir`/`waitimg` の進捗行4+4行のみ** (非同期条件の待ち中に毎フレーム出るスナップショット)。**表明行234行はバイト完全一致**。基線の自己比較(A-8)は同じ場所でより大きく揺れる。**判定: ステージ1 に帰属する数値 drift はゼロ** | PASS |
-| A-10 | 既知の A2 失敗が**同一に**再現する | `viewer.exe --abstats-selftest tools/testdata/multi --cfa bayer --bayer-pattern RGGB` | 基線と同じ行が同じように落ちる | 両ビルドとも rc=1、同一行: `abstatsselftest: A2 B sigma_t matches within 1e-6 relative              FAIL` (前後の `A2 B histogram bins match…PASS` / `A2 B mean/sd match…PASS` も一致)。**新規発見ではない (E-4)**。挙動不変という意味では合格 | 既知 / 挙動不変は PASS |
-| A-11 | **校正 — この検査は失敗し得るか** | 捕捉**出力ファイル**に偽の差を注入 (製品コードには一切触れない): `verify.out` の `resident 0 -> 4096 B`→`4097 B`、`sweepfile.out` の `sens=8.00031`→`8.00032` | harness が両方を検出する | 検出した。`AB SUMMARY identical=22 differing=3` (24/1 から悪化) し、両行を名指しで出力: `< …resident 0 -> 4096 B…` / `> …resident 0 -> 4097 B…`、`< …sens=8.00031…` / `> …sens=8.00032…`。**1バイトの会計差と有効数字5桁目の差の両方を捕まえる** | PASS |
-| A-12 | npz の Watch 基線 (ステージ1 の新規) | コード読み + 実行経路の探索 | `statSourceFile` が npy/raw/npz の3つのローカル復号経路を**過不足なく**覆う | `statSourceFile` は `core/main.cpp:173` に1つ。呼び出しは**ちょうど3箇所** — `3666` (npz, `loadNpz` 内)、`3936` (npy, `loadNpyFrame`)、`4091` (raw)。**漏れている復号経路は無い**。montage/processor/derive/remote は非ファイル源なので 0 のままが正しい。ただし **`mtime`/`fsize` を印字する経路がコードに存在せず、実行による確認はできない** → D-2 | 要probe (コード読みは充足) |
-| A-13 | セッション往復が基線と同一 | 既存 suite の機構 (`--batch-selftest`/`--verify-selftest`/`--series-selftest` が `temp_directory_path()` へ `.vsession` を書いて読み直す) を、パスごとに固定した `TMP` 上で実行 | 往復結果が基線と一致 | 3件とも A/B **バイト完全一致**。`batchselftest: reloaded session: 15 image(s), 3 stack(s), batch 'moved' restored, 0 stray frame(s)` / `verifyselftest: V15 renamed a folder stack '25C dark', saved and reloaded: 3 stack(s) [25C dark, 01/frame_000‥004.npy, 02/frame_000‥004.npy]` / `seriesselftest: session reloaded ok`・`a folder stack's user-given name survives the session ok`・`legacy (seqlevel) session loaded ok`。※ `.vsession` 実体は selftest が終了時に削除するため成果物としては残らない | PASS |
-| A-14 | §7 のバイト会計 (`residentImageBytes` を srcId 和へ書き換えた箇所) が不変 | `--verify-selftest` の V14 が実バイト数を印字する | 基線と同一の数値 | A/B 一致: `verifyselftest: V14 after one stack open with nothing pumped: resident 0 -> 4096 B, claimed 0 -> 32768 B, in flight 28672 B (7 job(s))`、および `V14 after draining: in flight 0 B, claimed == resident: 1`。**共有がまだ無いので srcId 和は従来の和と同値** — 仕様の「結果は不変」を実測で確認 | PASS |
-| A-15 | suite が**一度も走らせていない** 22番目の selftest | `viewer.exe --sweepfile-selftest levelfiles` (`levelfiles` は注入済み真値 sens 8.0 DN/lx, offs 64.0 DN, K 2.0, read 3.0 を持つ fixture) | fit が真値を復元し、基線と一致 | A/B **バイト完全一致**、`sweepfile: ok`。`sweepfile: fit: 7 point(s) sens=8.00031 offs=64.0674 r2=0.99999984 LEmax=0.1565 K=2.0209 read=3.0019 (dark stack)` — **注入した真値を復元**。suite の21件を超える新規カバレッジ | PASS |
-| A-16 | 最初の suite 実行が `--browse-keys-selftest` で9分以上停止した件の切り分け | 実ユーザ状態のまま実行 → 停止。`APPDATA` を使い捨てに固定して単独実行 | ステージ1 の欠陥か環境かを判定する | **ステージ1 の欠陥ではない**。固定後は **35秒 / rc=0** で完走 (`241 action(s) through real frames, no crash, 0 panel check(s) failed: ok`)。原因は E-5 (scripted selftest が実ユーザの `layout.ini` を書く既知欠陥) + 別エージェントの worktree `viewer-wt-verifyui` が**同一テストを同時実行**して同じ状態を奪い合ったこと。なお当該テストの待ち段階には**壁時計の上限が無い** (listing 段階のみ60秒。`core/main.cpp:28658`)、ゆえに停止は無限に続き得る | PASS (切り分け完了) / 原因は E-5 |
+実行時の制約:
 
-### A 節の証跡について
+- テストは逐次実行する。ローダと peer には実時間の制限があるため、並列実行を
+  標準の合否判定に使わない。
+- CMake がテストごとに `APPDATA` / `HOME` / `TMP` / `TEMP` / `TMPDIR` を分ける。
+  操作者のレイアウト、セッション、設定、別テストの固定名テストデータを共有しない。
+- OpenGL コンテキストがない環境では `nogl` のテストだけが走る。出力の
+  `ran / skipped / quarantined / in no run set`（実行済み／スキップ／隔離中／実行集合外）
+  を確認する。全項目の受入れには `skipped=0` が必要である。
+- リモート検証は CMake に登録された `--remote-exe` を使い、client 自身ではなく
+  単独実行の `viewer-serve` を相手にする。
+- 失敗を再現するときは、まず標準入口が保存した
+  `docs/diagnostics/auto/` のログを保全する。
 
-比較したコマンドは25件 — suite の21件 (中立ルートのパスに置換) + `--sweepfile-selftest`
-+ `--scan-selftest levelfiles` + `--abstats-selftest --cfa bayer` (既知失敗) + `--help`。
-両ビルドとも**同一の cwd・同一の fixture 実体**に対して実行しているので、パス文字列は
-比較対象にならない。
+単独項目の調査には、標準入口を一度通してビルドとテストデータを最新にした後で、
+次の形を使う。
 
-## B. 測定不変条件 (どのステージでも跨いではならない — 全件実施)
+```bash
+ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
+```
 
-いずれも「捕捉した実出力に、その不変条件を述べる文字列が実在するか」で判定する。
-`tools/verify/invariants.sh <capdir>` が実行する。**基線・ステージ1 の両方で pass=10 fail=0。**
+`tools/verify/ab_capture.sh`、`ab_diff.sh`、`invariants.sh` は
+2026-08-03 の二つのビルドを比較した記録用スクリプトであり、当時のコマンド列を
+固定して保持する。現在の全テスト入口としては使わない。
 
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| B-1a | σ_t は **stack** の性質であって frame の性質ではない | `invariants.sh` (対象: `--export-tsv-selftest` の出力) | 出力が σ_t を stack 統計として名乗る | 実出力に存在: `# == temporal summary (stack statistics; sigma_t is a property of the stack, never of a frame) ==` | PASS |
-| B-1b | ゆえに**毎フレーム表に σ_t 列があってはならない** | 同上 (対象: `--framestats-selftest`) | frame 表に σ_t 列が無い | 無い。ヘッダは `frame	file	mean [DN]	sigma [DN]	sigma_col [%]	sigma_row [%]` | PASS |
-| B-1c | 毎フレーム表のヘッダ形が期待どおり | 同上 | mean/sigma 形 | 上記ヘッダで一致 | PASS |
-| B-2a | CFA プレーンを混ぜない | 同上 (mosaic 有効の TSV) | 列がプレーンごとに分かれる | `frame	file	mean_R [DN]	sigma_R [DN]	…	mean_Gr [DN]	…	mean_Gb [DN]	…	mean_B [DN]	…` — **R/Gr/Gb/B が独立列**。プールされた列は無い | PASS |
-| B-2b | 片側の σ_t を他方に流用しない | 同上 | B 側は B 側の数 | `texportselftest: E9 B's sigma_t is temporal[1]'s number, not A's relabelled PASS` | PASS |
-| B-3a | 部分ロードは n/N で言う | 同上 | 素の枚数でなく n of N | `# -- side A: 00/frame_000‥004.npy  \|  region: whole frame (80x64)  \|  resident 5 of 5 frame(s) --` | PASS |
-| B-3b | 集計表自体が n と N の列を持つ | 同上 | n・N 列が在る | `side	ch	n	N	sigma_t [DN]	sigma_fpn [DN]	sigma_tot [DN]	source` | PASS |
-| B-4a | 軸ラベルは量と単位を運ぶ | 同上 | ノイズ量に [DN] | `sigma_t [DN]	sigma_fpn [DN]	sigma_tot [DN]` | PASS |
-| B-4b | 相対量は [%] で、[DN] と区別される | 同上 | [%] が別に在る | `sigma_frame [%]` / `sigma_col [%]` / `sigma_row [%]` が [DN] 列と併存 | PASS |
-| B-5 | 画素値は [DN] | 同上 | mean が [DN] | `mean [DN]` | PASS |
+## 3. 判定語
 
-**A/B 不変性**: これら10件の根拠となる `texport` / `framestats` の捕捉は
-**両ビルドでバイト完全一致** (A-7)。すなわち不変条件はステージ1 を跨いで動いていない。
+| 判定 | 意味 |
+|---|---|
+| PASS | 手順を実行し、期待する全表明と終了コードを確認した |
+| FAIL | 実行結果が期待と異なる。新しい検証結果に証拠を残す |
+| 未実施 | この検証実施（run）では実行していない。PASS には含めない |
+| 実行不能 | テストデータ、依存関係、OpenGL、peer などの実行条件を満たせない。理由を記録する |
+| 要 probe | 合否を決める状態が外から観測できない。観測点（probe）を追加するまで、コードを読んだだけで PASS にしない |
+| quarantine | 既知の失敗として合否判定（gate）の対象外に隔離している。解除条件とともに名指しし、PASS にしない |
 
-## C. ステージ2+3・ステージ5 の受入行 (未実施 — 未マージ)
+## 4. 現行の機能検証項目
 
-仕様 §8 の表が各ステージの「検証」欄に書いた内容を、**実際に叩けるコマンド**まで
-降ろしたもの。マージされたら本書のこの節をそのまま実行する。
+表の「絞り込み」は CTest 名の候補である。`viewer_selftest` で登録した項目は共通の
+`selftest.` 接頭辞を省き、`test_prnu` など `test_` で始まる項目は完全な CTest 名を
+記す。単独実行では、前者に `selftest.` を補って `ctest -R` で選ぶ。標準の受入れでは、
+絞り込みだけでなく §2 の全テストを実行する。
 
-### C-1 ステージ2 (共有が起き得るようにする — registry / Files の共有印 / close の生存 / compare の same-pixels 文)
+この表では、文書と `source` の所属関係を `membership`、同じ `source` かどうかを
+判定する識別情報の組を `identity tuple` と呼ぶ。コード上の名称を示す場合は、英語表記を
+そのまま残す。
 
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| C1-1 | 同じフォルダを2回開くと source が共有される | `viewer.exe --verify-selftest tools/testdata/multi` (拡張後) | 2回目の open 後、両 stack の frame が同一 `srcId` を指す旨を selftest が印字し ok | — | 未実施(未マージ) |
-| C1-2 | 共有時バイトは1倍 | 同上。`residentImageBytes()` は既に srcId 和 (`core/main.cpp:5423-5433`) | 2回開いても resident バイトが1回分のまま (2倍にならない) | — | 未実施(未マージ) |
-| C1-3 | 片方の batch を閉じても画素が残る | 同上 | 片側 close 後も残った membership が画素を読めて統計が出る | — | 未実施(未マージ) |
-| C1-4 | Ctrl+Alt+W が membership だけを消す | 同上 | 閉じた側の doc だけ消え、source は生存 (最後の参照で死ぬ = §4) | — | 未実施(未マージ) |
-| C1-5 | compare が「同じ画素を見ている」と言う | 同上 | A と B が同一 source のとき `A and B share the same pixels` 相当の一文 (§3.1) | — | 未実施(未マージ) |
-
-### C-2 ステージ3 (derive をコピーから参照へ)
-
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| C2-1 | 既存の derive 表明が無傷 | `viewer.exe --derive-selftest tools/testdata` | 既存の D0/D1/D3/D4/D7 (両方向の数・seqIndex 順・元 stack 無傷・follow 収束) が今日と同じ値で ok | — | 未実施(未マージ) |
-| C2-2 | 派生がバイトを増やさない | 同上 (新規表明) | derive 前後で resident バイトが不変 | — | 未実施(未マージ) |
-| C2-3 | 派生後に元を crop しても派生は変わらない (CoW) | 同上 (新規表明) | `cropInPlace` の `use_count() > 1` 分岐 (`core/main.cpp:4127`) が発火し、派生側の画素・統計が不変 | — | 未実施(未マージ) |
-
-### C-3 ステージ5 (reload の walk / 鍵の stackRev / temporalExtra / 手動 Reload)
-
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| C3-1 | 画素差し替えで uid が不変 | `viewer.exe --reload-selftest <dir>` (新設予定) | reload 後も membership の uid が同じ (compare のピンが外れない) | — | 未実施(未マージ) |
-| C3-2 | 全キャッシュが再計算される | 同上 | hist/proj/ROI/diff/autoRange が `dataRev` で鍵から外れる (§3.2) | — | 未実施(未マージ) |
-| C3-3 | σ_t が変わる (古い値を返さない) | 同上 | **D-3 の既知穴の回帰テスト**: 枚数も ROI も変えずに画素だけ差し替え、σ_t が新しい値になる | — | 未実施(未マージ) |
-| C3-4 | fit が落ちる | 同上 | `linFitStale()` + 係る series の fit 破棄 | — | 未実施(未マージ) |
-| C3-5 | 共有先 stack も同じ一歩で更新される | 同上 | source を持つ**全** membership が walk される | — | 未実施(未マージ) |
-| C3-6 | `temporalExtra` も忘れられる | 同上 | **D-4 の既知穴の回帰テスト**: スロット C/D/E の temporal も落ちる | — | 未実施(未マージ) |
-| C3-7 | 手動 Reload from disk | Files 右クリック → Reload | GUI 操作。この機械では**スクリーンショット不可**のため selftest 側に表明が要る | — | 未実施(未マージ) + 要probe |
-
-### C-4 ステージ4 (セッションの明示メンバー) — 参考
-
-| 項番 | 検証項目 | 手順(コマンド) | 期待結果 | 実施結果 | 判定 |
-|---|---|---|---|---|---|
-| C4-1 | 派生 stack の保存→全撤去→復元でメンバー一致 | `--derive-selftest` 拡張 | §5.1 の既存欠陥 (D-5) の回帰テスト。`stackmember`/`stackrule` が書かれ読まれる | — | 未実施(未マージ) |
-| C4-2 | 旧キーのみのセッションが今日と同じに開く | `--series-selftest` の legacy セッション経路 (`viewer_serieslegacy.vsession`) | 未知キー読み飛ばしで劣化なく開く | — | 未実施(未マージ) |
-
-## D. 穴 — 今日は観測手段が無い項目 (probe の提案。実装はしない)
-
-| 項番 | 観測したいこと | なぜ今日測れないか (コードの実測) | 提案する probe |
+| 項番 | 検証項目 | 手順 / 絞り込み | 期待結果 |
 |---|---|---|---|
-| D-1 | 2つの doc が1つの source を共有しているか | `use_count()` はファイル全体で**1箇所** (`core/main.cpp:4127`、crop の CoW 判定) でしか読まれず、印字されない。`srcId` の読み手も `residentImageBytes()` (`5431`) の重複排除のみで、値を外へ出さない。`%p` による source ポインタの印字もゼロ | `--srcmap-selftest <dir>`: 開いた全 doc について `uid seqId seqIndex srcId rev use_count` を1行ずつ stderr に出して exit。ステージ2 の共有・ステージ3 の derive 参照・ステージ5 の walk が**1つの probe で**測れるようになる |
-| D-2 | Watch 基線 (`mtime`/`fsize`) が実際に入っているか | `statSourceFile` (`core/main.cpp:173-180`) は `FrameSource::mtime/fsize` を書くだけで、**印字経路が無い**。stderr に出る `mtime` はリモート LIST 応答の別構造体 (`20112-20121`) で、`FrameSource` のものではない | D-1 の probe 行に `mtime fsize` を足す。これが無い限り「npz にも基線が入った」は**コード読みでしか**言えない (本ランはそうした — A-12) |
-| D-3 | σ_t の鍵に `dataRev`/`stackRev` が無い件 | `TemporalState` の鍵は `seqId/frames/ROI/cfa/cfaPattern/nPl` のみ (`core/main.cpp:1098-1113`)。今日は `forgetImage` が毎回リセットするので露出しない | ステージ5 の `--reload-selftest` (C3-3)。**既知**: 仕様 §3.2-1 が「ステージ5 で塞ぐ」と明記 |
-| D-4 | `forgetImage` が `temporalExtra` を忘れない件 | `forgetImage` (`core/main.cpp:2232-2243`) は `k<2` で `temporal[0..1]` だけを触り、`app.temporalExtra` (`1117`) に手を出さない | ステージ5 の `--reload-selftest` (C3-6)。**既知**: 仕様 §3.2-2 |
-| D-5 | derive stack のセッション往復 | `writeSessionTo` にメンバーシップを書く行が無い (仕様 §5.1)。保存時点で膜だけになる | ステージ4 (C4-1)。**既知**: 仕様 §5.1 が「新形式はこれを直すものでもある」と明記 |
-| D-6 | 描画・テクスチャ・VRAM・Files の共有印の見た目 | この機械は OpenGL のクライアント領域が白く出てスクリーンショットが撮れない | 表示文字列を stderr にも吐く selftest (既存 `--browse-keys-selftest` と同型のスクリプト化クリック)。**視覚確認は本書の範囲外** |
-| D-7 | `rev` が preview→full 差し替えで +1 されているか | `S.rev++` (`core/main.cpp:2440`) はステージ1 唯一の rev 書き手だが、印字経路が無い | D-1 の probe 行に `rev` を含める (提案済み) |
+| F1 | 合否判定（gate）の完全性 | `tools/run_selftests.sh <build-dir>` | ビルドとテストデータ生成が成功する。登録されたテストは実行、skip、quarantine、実行集合（run set）外のいずれかに必ず名指しされ、無言の欠落がない |
+| F2 | 測定不変条件 | `framestats`, `export-tsv`, `abstats`, `abstats-cfa-bayer`, `roistats`, `setanalysis` | §1 の `sigma_t`、CFA、`n/N`、`[DN]` と比率単位を満たす。A/B の各側は自分の数値を使い、隣側の値を付け替えない |
+| F3 | source の同一性と共有 | `srcmap`, `scan`, `fmtreg`, `verify` | 同じ `identity tuple` を持つ二つの `membership` は同じ `source` を指し、復号と常駐メモリの会計を二重に行わない。別の recipe / member / file-frame は共有しない |
+| F4 | Close の意味論 | `close`, `batch`, `verify` | stack / frame を閉じると、その `membership` だけが外れる。`source` は最後の参照がなくなるまで生存し、残った `membership` は画素と統計を読める |
+| F5 | 派生（derive）と CoW | `derive` | derive は `source` を参照し、常駐バイト数を増やさない。共有後に片側を crop すると新しい `source` へ分離し、他方の画素・identity・統計を変えない |
+| F6 | セッションの往復 | `series`, `seriespanel`, `batch`, `derive`, `verify`, `stackavg` | stack への明示的な `membership`、名前、順序、compare の参照、ファイル内 member、解析 recipe を保存・復元する。旧キーだけの session も定義済みの互換動作で開く |
+| F7 | reload 時の一括無効化 | `reload` | `membership` の `uid` を保ったまま `source` の内容と識別情報を更新し、全共有先の `dataRev` / `stackRev`、cache、texture、temporal、fit を一度の処理で更新する。次の open は更新後の `source` を共有する |
+| F8 | reload 失敗の可視状態 | `reload`, `stackavg` | 一部 member の reload 失敗を stack にラッチし、成功する stack 全体 reload まで黙って消さない。派生平均の stale と reload failure を混同しない |
+| F9 | local / remote の Watch | `watch`, `rwatch` | appeared / changed / vanished、mtime が古くても非等値なら変更、複数回の観測（reading）、remote group を検出する。reload は F7 と同じ入口を通る |
+| F10 | ファイル形式と adapter | `media`, `fmtgate`, `fmtreg`, `rawrecipe`, `rnpz`, `precision` | 形式の可否判定、bit depth、multi-frame / layer / member identity、RAW recipe、reload と二回目の open による共有が、バックエンド間で一貫する |
+| F11 | remote reader / container / measurement | `remote`, `rreader`, `rnpz`, `rmeasure`, `rtemporal`, `rtemporal-png` | 単独実行の peer とプロトコルの可否判定を通り、local と remote の画素・member row・測定値が契約どおり一致する。古いプロトコルや閉じた reader の可否判定は理由付きで拒否する |
+| F12 | 解析層と集合解析 | `aset`, `setanalysis`, `detrend`, `seriespanel`, `stackavg`, `lin`, `sweepfile`, `test_prnu` | AnalysisSet の束縛（binding）、層ごとの入力、DSNU / PRNU、detrend、リニアリティ、frame / stack 混合集合の拒否と計算を仕様どおり行う |
+| F13 | plugin ABI と由来情報 | `anaprov`, `stackana`, `bundled`, `rplugin`, `rset`, `test_abi_probe`, `test_display_falsecolor` | ABI v3 の frame / stack 登録 API、部分ロード、release、name+version、local / remote の同等性、builtin と plugin の由来情報（provenance）を区別する |
+| F14 | export と報告面 | `framestats`, `export`, `export-tsv`, `roi-export` | 画面の数値と export の数値・単位・由来情報が一致し、ROI、stack、series、比較側を取り違えない |
+| F15 | UI を伴う機能 | [UI 検証仕様](ui.md) | 操作、レイアウト、表示文字列まで含む項目は UI 仕様の該当行を満たす |
 
-### D節の更新 (2026-08-04) — probe を実装した (branch `verify-probes`)
+### 4.1 phase④ の受け入れ条件（未実装）
 
-`srcMapDump()` と、それを回す `--srcmap-selftest <dir>` を追加した。開いている
-membership 1件につき1行を stderr へ出す:
+次は現行 selftest の合格条件ではなく、[tasks.csv](../tasks.csv) の #230 phase④ 行を
+実装するときに追加する条件である。
 
-```
-srcmap: <tag> uid=… seq=… idx=… src=#K refs=N rev=… datarev=… WxHxC bytes=…
-        mtime=… fsize=… name='…' [member='…'] [path='…']
-srcmap: <tag> 15 doc(s), 15 source(s), 307200 resident byte(s)
-```
+- mixed Series の Move / Close は stack と standalone frame の全memberへ作用し、順序・identity・
+  同一batch不変条件を保つ。Close後は全memberが消え、無関係controlとrole-refを壊さない
+- Reader由来のFrame+Stack mixed SeriesはNPZ/stream双方でkindと順序を保ち、sessionを往復する
+- typed ReaderはFrame→CHW、Stack→FCHW、`C=1..4`だけを受け、cross-layer・虚偽layout・
+  `C>4`を layer / layout / shape 付きの理由で拒否する。Seriesのkindをshapeから推定しない
 
-`src=#K` は **srcId そのものではなく密な通し番号**。srcId は大域カウンタで、その値は
-「この frame の前に何枚復号したか」に依存して実行ごとに変わり、表明に使えない。
-**共有とは2つの doc が同じ #K を出すこと**で、これは実行間で安定する。
+## 5. probe の契約
 
-**D-1/D-2/D-7 の「観測手段が無い」は解消した。** ただし本行の提案文にあった
-「1本の probe で stage2/3/5 の受入行が**全部**解錠される」は、C節を1行ずつ読んだ
-結果**そのままでは正しくない** — C-1/C-2/C-3 の15行のうち、この probe が
-決め手になるのは**5行**である。
+probe（観測点）は、別実装で期待値を再計算するのではなく、製品が実際に使った
+identity、状態、文字列を観測する。値を出せるようになっただけでは PASS ではなく、
+独立した期待値との比較が必要である。
 
-| 受入行 | 解錠 | 理由 |
+| probe / 観測面 | 契約 | 主な検証先 |
 |---|---|---|
-| C1-1 同じフォルダ2回で source 共有 | **する** | 共有の有無は srcId でしか言えない。2行の `src=#K` が一致するかがそのまま判定になる |
-| C1-2 共有時バイトは1倍 | しない (既に観測可能) | `--verify-selftest` V14 が resident バイトを印字済み。probe は根拠を1行足すだけ |
-| C1-3 片方 close 後も画素が残る | 部分的 | 「残る」は統計が出るかで判る。probe は refs が 2→1 に落ちる証跡を足す |
-| C1-4 Ctrl+Alt+W が membership だけ消す | **する** | 「source は生きている」は use_count でしか見えない |
-| C1-5 compare の same-pixels 文 | しない | chip 文字列の probe が要る (verify-ui.md C4) |
-| C2-1 既存 derive 表明が無傷 | しない | 既存の表明そのもの |
-| C2-2 派生がバイトを増やさない | しない (既に観測可能) | resident バイト |
-| C2-3 crop CoW、派生側は不変 | **する。しかも今日実行した** | M4 が手で共有を作り (stage2 相当)、M5 が `cropInPlace` の `use_count()>1` 分岐を発火させて、他方の画素が1バイトも動かないことを表明する。stage1 では製品経路から到達不能な分岐で、規律だけが先に検査された |
-| C3-1 画素差し替えで uid 不変 | **する** | uid は probe 行が持つ |
-| C3-2 全キャッシュが再計算される | しない | 鍵の中身は出ない |
-| C3-3 σ_t が変わる | しない | |
-| C3-4 fit が落ちる | しない | |
-| C3-5 共有先 stack も同じ一歩で更新される | **する** | 全 membership の src と rev を並べれば walk の抜けがそのまま見える |
-| C3-6 temporalExtra も忘れる | しない | |
-| C3-7 手動 Reload (GUI) | しない | verify-ui.md 側の probe |
+| `srcMapDump()` / `--srcmap-selftest` | `membership` ごとに `uid / seq / idx / src=#K / refs / rev / datarev / shape / bytes / mtime / fsize / name / member / path` を出す。`#K` は同一 dump 内の連番であり、実行ごとに変わる生の `srcId` を期待値にしない | F3–F7 |
+| reload selftest の R 群 | 開いている実 stack の下で実ファイルを書き換え、identity、会計、cache、temporal、fit、共有先、失敗状態の保持（latch）をそれぞれ表明する | F7–F9 |
+| format registry の F 群 | backend ごとに「登録できる / reload が届く / 二回目 open が共有する」を同じ語彙で表明する | F3、F10 |
+| remote 系 selftest | `--remote-exe` の peer を使い、client 内の同一コードを peer の代用にしない。local との一致だけでなく、プロトコルや可否判定による拒否も表明する | F9–F11、F13 |
+| export / stats の文字列 | UI や export が実際に生成したヘッダーと由来情報を読む。ソースコード中に定数が存在するだけでは合格にしない | F2、F12、F14 |
 
-**D節の外で解錠したもの**
+## 6. 結果記録の作り方
 
-- **A-12 / D-2 は「コード読みでしか言えない」ではなくなった。** `--srcmap-selftest` の
-  M2 が npy 経路、M3 が raw 経路を、**ディスクの `last_write_time`/`file_size` と
-  突き合わせて**表明する (0 では通らない)。npz 経路は `--verify-selftest` V21 に
-  同じ形の1件を足した (container のサイズと全メンバーの `fsize` の一致)。
-  実測 15/15 frame・raw 1件・npz 5メンバー。
-  **未実行はコンテナ経路 (`.vnz`, `main.cpp:4929`) の1つだけ** — A-12 が数えた3経路は
-  すべて実行で確認済み。
-- **D-7**: `rev` は probe 行に出る。ただし +1 させるには remote の preview→full 差し替えが
-  要るので、**インクリメントの実行確認は未了**。M6 は `cloneSource` が rev を 0 に戻し
-  新しい srcId を取ることだけを表明する。
-- **A-3 (CLI 表面)**: フラグが 52 → 53 に増えた (`--srcmap-selftest`)。selftest フラグは
-  22 → 23、ctest の本数は 22 → 23。
+新しい検証実施（run）は `results/YYYYMMDD-<scope>.md` に分け、少なくとも次を記録する。
 
-**新しい表明 (すべて実測 PASS)**
+- 対象コミットと、比較する場合の基準コミット
+- OS / ツールチェーン。実行機の識別情報が未記録なら、その旨を明記する
+- 実行コマンドと環境上の制約
+- 実施した項番、実際の結果、判定、失敗時の証拠へのパス
+- skip / quarantine / 実行不能を含む未実施項目
 
-| 表明 | 何が今日まで言えなかったか |
-|---|---|
-| M1 「N docs, N sources, 各1 holder」 | stage1 の基線。stage2 が破る対象で、破れたら**目立つ**ように書いてある |
-| M1 mirror 一致 | §2.1 の per-doc ミラーが source とずれていないこと (印字経路が無かった) |
-| M2 npy の Watch 基線 = ディスクの実値 | A-12 は目視だった |
-| M3 raw の Watch 基線 = ディスクの実値 | 同上 |
-| M4 共有が **見える** (同じ #K・refs=2・resident が1枚分減る) | probe 自身の校正。refs=1 しか出せない probe は何も証明しない |
-| M5 crop CoW が分離し、他方の画素が不変 | **C2-3 そのもの**。stage1 では製品経路から起こせない |
-| M6 `cloneSource` は内容同じ・identity 別・rev=0 | D-7 の半分 |
-| V21 npz メンバーが container の Watch 基線を持つ | A-12 の3経路目 |
+過去の実施記録は後日の実装状態に合わせて書き換えない。現在の仕様を変えた場合は
+本書を更新し、過去結果から本書へのリンクだけを維持する。
 
-## E. 既知 — 本ランの発見ではないもの
+## 7. 保存済みの実施記録
 
-| 項番 | 内容 | 根拠 |
-|---|---|---|
-| E-1 | `TemporalState` の鍵に `dataRev` が無い | 仕様 §3.2-1。ステージ5 で塞ぐ。コードで再確認 (`core/main.cpp:1098-1113`) |
-| E-2 | `forgetImage` が `temporalExtra` を忘れる | 仕様 §3.2-2。ステージ5 で塞ぐ。コードで再確認 (`core/main.cpp:2232-2243`) |
-| E-3 | derive stack がセッションを正しく往復しない | 仕様 §5.1。ステージ4 で塞ぐ |
-| E-4 | `--abstats-selftest` の A2 が `--cfa bayer` で落ちる | 本ラン以前からの既知失敗。A-10 で**基線と同一に落ちる**ことを確認済み (挙動不変) |
-| E-5 | scripted selftest が `io.IniFilename` を塞がないまま走り、**操作者の実 `%APPDATA%/viewer/layout.ini` を書く** | 別の UI 検証エージェントが確認・記録済みで、**main で修正中** (既知(修正中))。本ランはこれを独立に踏んだ — A-16 の9分停止の原因。本書の harness は `APPDATA`/`HOME`/`USERPROFILE` を使い捨てへ向けて回避している |
-| E-6 | `--browse-keys-selftest` の待ち段階に壁時計の上限が無い | listing 段階のみ60秒の脱出があり (`core/main.cpp:28658`)、その後の action 段階は `reproIdle` の計数だけで進む。条件が成立しなければ停止は無限に続く。E-5 と組むと A-16 の形になる。**ステージ1 とは無関係**の既存性質 |
-
-### E-6 の訂正と修正 (2026-08-04, branch `verify-probes`)
-
-**訂正**: 「無限に続く」は言い過ぎだった。action 段階で `hold` を立てるのは
-`waitdir` / `waitimg` の2つだけで、どちらも**個別に60秒**で諦める
-(`main.cpp` の `waitD0` / `waitT0`)。実測: 不可能な待ちを3つ並べた列は
-**3分03秒**で終わる (60秒×3 + 実行)。したがって停止は無限ではなく、
-**行の長さに比例して伸びる** — 上限が run に無く、待ちの個数にしか無い。
-既定の列は待ちを15個持つので、A-16 の形 (レイアウトが古く、注入クリックが
-別の場所に落ち、待ちが全部空振りする) では**15分級**になり、そこで
-ctest の TIMEOUT 900 に殺される。ctest は "Timeout" としか言わないので、
-**どのアクションで止まったかはどこにも残らない**。
-
-**修正**: action 段階に run 全体の壁時計 (300秒) を入れた。listing 段階の60秒と
-同じ形で、時計は**listing が揃った時点から**回る。切れたときは
-`browsekeys: action phase gave up after 300 s at action 12/275 'waitimg:44'
-(phase 0), dir=…, imgs=…: FAILED` と**止まったアクションを名指しして** rc=1 で
-終わる。健康な run (約35秒) の8倍、ctest の 900 秒の内側。**待つスイートは
-誰も読まないスイートである。**
+- [2026-08-03 ステージ1 機能検証](results/20260803-functional.md)
+- [2026-08-04 機能 probe 検証](results/20260804-functional-probes.md)

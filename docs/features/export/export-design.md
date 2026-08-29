@@ -1,9 +1,15 @@
-# Temporal export 設計 — テンポラルデータ + H/V profile statistics を1回で持ち出す
+# Temporal export 設計 — テンポラルデータ + H/V profile statistics を1回でエクスポートする
+
+> **状態: 実装済み。** `buildTemporalExport` が temporal summary / H/V profile
+> statistics / per-frame statistics を1つの sectioned document に作り、Temporal の
+> `Copy (TSV)` / `Save (CSV)...` が同じビルダーを使う。ROIs のエクスポートも
+> `buildRoiExport` で同じ形式に実装された。テストは `--export-tsv-selftest` /
+> `--roi-export-selftest`。本文の「今」は設計前の症状を説明する箇所だけである。
 
 「Temporal で出力するときに、テンポラルのデータと H/V Profile の Statistic を
 両方出すようにして。今のやつは一回ないものとしてあるべき姿を考えて出す」への回答。
 本書が仕様で、実装はここに書いた形と理由に従う。現行の
-`copyPerFrameStats`(per-frame TSV)は**前提にしない** — 生き残る部分は §7 で
+`copyPerFrameStats`(per-frame TSV)は**前提にしない** — 引き続き使う部分は §7 で
 明示的に選び直す。
 
 ## 0. この出力は何のためにあるか
@@ -15,10 +21,10 @@ Temporal パネルが答える質問は「この stack のノイズはいくつ�
 2. **時間方向の変化**(frame 毎の mean/σ — ドリフト・フリッカの素材)— frame 軸の表
 3. **空間方向の構造**(H/V profile statistics — 行/列 FPN、シェーディング)— plane 毎のスカラ表
 
-今は 1 が画面写し(スクリーンショット)でしか出せず、2 が per-frame TSV、3 が
+設計前は 1 が画面写し(スクリーンショット)でしか出せず、2 が per-frame TSV、3 が
 Projection パネルの別ボタンで、**3回の操作と3つの断片**になる。同じ画像・同じ
-ROI の測定なのだから、1回の Export が3つとも運ぶべきである。これが「両方出す」の
-正体で、measure-ux.md の原則(出力はそれ単体で証拠になる)をここにも適用する。
+ROI の測定なのだから、1回の Export に3つとも含めるべきである。これが「両方出す」の
+意味であり、[measure-ux.md](../analysis/measure-ux.md) の原則(出力はそれ単体で証拠になる)をここにも適用する。
 
 ## 1. 誰が読むか — 主読者は Excel 貼り付け、副読者は pandas
 
@@ -31,22 +37,23 @@ ROI の測定なのだから、1回の Export が3つとも運ぶべきである
   pandas で `#` をコメントとして読み飛ばせば各セクションがそのまま読めること。
 - 報告書の付録(appendix)はこの2つの派生であり、独自形式は作らない。
 
-## 2. 中心決定 — 「ラベル付き矩形の積み重ね」(sectioned rectangles)
+## 2. 中心となる設計判断 — 「ラベル付き矩形の積み重ね」(sectioned rectangles)
 
 §0 の3つの表は**軸が違う**: 1 と 3 は行 = side×plane、2 は行 = side×frame。
 1つの矩形に畳む方法は2つしかなく、どちらも捨てる:
 
 - frame 行に σ_t を持たせる → **カテゴリエラー**(σ_t は stack の属性。
-  stats-taxonomy.md §3 と terminology.md の操作マトリクスが明文で禁止)。
+  [stats-taxonomy.md](../analysis/stats-taxonomy.md) §3 と
+  [terminology.md](../../terminology.md) の操作マトリクスが明文で禁止)。
 - 全列の直積 + 空セル埋め → Excel でも pandas でも「何が何の値か」が列名から
-  読めなくなる。空欄の海は矩形ではなくただの穴。
+  読めなくなる。空欄の多い表では、各データ領域の境界も分からない。
 
 よって出力は **`#` 行で見出しを付けたセクションの列**とし、**各セクションは
 それ自体が完全な矩形**(ヘッダ行1 + データ行 N、行によって列数が変わらない)
 とする。Excel は矩形を欲しがる — 各セクションが矩形である。人間はラベルを
 欲しがる — `#` 見出しがそれである。pandas はどちらでも読める —
 `comment='#'` で1セクション、または `#` 見出しで split。3読者全員が
-既存の家風(`#` provenance 行つき TSV/CSV)のまま満足する。これが中心決定。
+既存の規約(`#` provenance 行つき TSV/CSV)のまま要件を満たせる。これが中心となる設計判断である。
 
 セクションの順序は **summary → profile statistics → per-frame**。スカラ表
 2枚を先頭に置き、行数が伸びる per-frame を末尾に置く(貼った先で bulk が
@@ -54,9 +61,10 @@ summary を画面外へ押し出さない)。
 
 ## 3. セクション仕様
 
-すべての数値列はヘッダに単位を持つ(`sigma_t [DN]`、`sigma_col [%]`)。
-数値は `%.9g`、小数点は `.`、ASCII のみ(σ と書かず sigma と書く —
-serve.cpp の key と同じ)。表示側の decimals 設定は反映しない
+すべての数値列はヘッダに単位を持つ (`sigma_t [DN]`、`sigma_col [%]`)。
+数値は `%.9g`、小数点は `.`。生成するキーとヘッダは ASCII とし(σ と書かず
+sigma と書く — serve.cpp の key と同じ)、利用者が付けた名前・パス・ラベルは
+UTF-8 のまま保持する。表示側の decimals 設定は反映しない
 (Projection の Copy と同じ理由: 表示は走査のため、出力は再現のため)。
 
 ### 3.1 `# == temporal summary ==` — stack statistics
@@ -75,13 +83,13 @@ plane を持たない側は `all` 1行)。列:
   σ_t = per-pixel 時間分散の平均の平方根 (ddof=1)、
   **σ_fpn = 補正済みの固定パターン** — `sqrt(max(0, var_spatial(時間平均, ddof=1) − fpn_corr²))`、
   σ_tot = 両者の quadrature。ROI が平坦でなければ絵柄込み。
-  この注意はセクション直下の `#` 注記として出力自体が運ぶ。
+  この注意はセクション直下の `#` 注記として出力自体に含める。
 - **`fpn_corr [DN]` / `fpn_clamped` は σ_fpn の申告欄で、省略できない**
   ([flat-field-stats.md](../analysis/flat-field-stats.md) (b)、#57 判断2):
   - `fpn_corr` = `sqrt(mean(s_t,i²/n_i))` [DN]。σ_fpn から**二乗で引いた量**。
     N 枚平均しても時間ノイズは √N でしか落ちないので、引かなければその残差が
     固定パターンとして読まれる。**補正前の上界は行ごとに
-    `sqrt(σ_fpn² + fpn_corr²)` で戻せる** — この一文も `#` 注記が運ぶ。
+    `sqrt(σ_fpn² + fpn_corr²)` で戻せる** — この一文も `#` 注記に含める。
   - `fpn_clamped` = `yes` / `no`。減算が負に落ちたとき σ_fpn は 0 に
     クランプされるが、**その 0 は「平坦なセンサ」ではなく「この stack は
     自分の時間ノイズ床より下の固定パターンを分解できない」という測定の申告**
@@ -96,10 +104,12 @@ plane を持たない側は `all` 1行)。列:
 ### 3.2 `# == H/V profile statistics ==` — Projection パネルの数値
 
 行 = side × plane(+ `all` 行は **Projection パネルで有効なときだけ**、
-plane の後ろに置き `all` と名乗る — pooled は別測定であり5番目の plane では
+plane の後ろに置き `all` と表記する — pooled は別測定であり5番目の plane では
 ない)。列は Projection の Copy table (TSV) と同語彙:
 
-    side  ch  mean [DN]  sigma_frame [DN]  sigma_row [DN]  sigma_col [DN]  sigma_frame [%]  sigma_row [%]  sigma_col [%]  pp_frame [DN]  pp_row [DN]  pp_col [DN]
+```text
+side  ch  mean [DN]  sigma_frame [DN](ddof=0)  sigma_row [DN](ddof=1)  sigma_col [DN](ddof=1)  sigma_frame [%](ddof=0)  sigma_row [%](ddof=1)  sigma_col [%](ddof=1)  pp_frame [DN]  pp_row [DN]  pp_col [DN]
+```
 
 - 値は `App::ProjState`(A/B/slot 毎)の `fStat/vStat/hStat` を**そのまま**読む。
   reduce モード(mean/max/min)はセクション見出しに明記。
@@ -112,7 +122,9 @@ plane の後ろに置き `all` と名乗る — pooled は別測定であり5番
 列が plane 毎に立つので、A が 4-plane で B が 1-plane のとき1つの矩形に
 できない。side 内は完全な矩形。列(plane 毎に4列):
 
-    frame  file  mean_<p> [DN]  sigma_<p> [DN]  sigma_col_<p> [%]  sigma_row_<p> [%]
+```text
+frame  file  mean_<p> [DN]  sigma_<p> [DN](ddof=0)  sigma_col_<p> [%](ddof=1)  sigma_row_<p> [%](ddof=1)
+```
 
 - 中身は現行 `copyPerFrameStats` の計算(全画素走査、per-frame S1 のみ、
   σ_t 列は**持たない**)。列名だけ §3.2 と同語彙に揃える(旧
@@ -124,7 +136,8 @@ plane の後ろに置き `all` と名乗る — pooled は別測定であり5番
 
 ## 4. Provenance — 先頭の `#` ブロック
 
-数値は出所なしに報告書へ入れない(measure-ux.md)。先頭に:
+数値は出所なしに報告書へ入れない
+([measure-ux.md](../analysis/measure-ux.md))。先頭に:
 
     # temporal + H/V profile statistics
     # app: viewer 0.1  |  generated: <YYYY-MM-DD HH:MM:SS>
@@ -140,21 +153,22 @@ plane の後ろに置き `all` と名乗る — pooled は別測定であり5番
 
     # NOTE: side A: temporal and profile were measured over DIFFERENT regions (see above)
 
-を必ず添える。dark/level 等のメタは series が持つ(terminology.md)。stack が
+を必ず添える。dark/level 等のメタは series が持つ
+([terminology.md](../../terminology.md))。stack が
 series に属するときのみ `# A series: <name>, <param> = <value> <unit>` を1行
 添える(無ければ出さない — 空欄の約束はしない)。
 
 ## 5. Sides — A だけでなく画面にいる全員
 
 compare 中の Temporal パネルは A/B(+ C,D,… slot)を描く。出力が A だけを
-運ぶと画面と食い違う。**Projection の Copy と同じ規則**を採る: 見えている
+含めると画面と食い違う。**Projection の Copy と同じ規則**を採る: 見えている
 side 全部、`side` 列で区別、compare off なら A の1側(それでも `side` 列は
 置く — 列集合が状態で変わらないことが矩形の価値)。stack でない side は
 数値行を持たず、provenance に `A: not a stack (single frame)` と理由を言う。
 delta 列は**持たない**(delta は2項の画面上の演算。ファイルには両辺の生値が
 あり、引き算は読者の1セルで済む — 引けない条件の警告体系を出力に複製しない)。
 
-## 6. 2つの出口、1つのビルダー
+## 6. 2つの出力方法、1つのビルダー
 
 - ボタンは Temporal パネルに **`Copy (TSV)` / `Save (CSV)...`** の2つ。
   1つのビルダーがセル列を作り、区切り文字だけ差し替える。**内容は同一**。
@@ -163,20 +177,21 @@ delta 列は**持たない**(delta は2項の画面上の演算。ファイル�
 - CSV: RFC 4180 最小 — `,` `"` 改行を含むセルだけ `"` で括り `"` を二重化。
   `pfd::save_file`(Export curves と同じ pump)でファイルへ。既定名
   `temporal_stats.csv`。
-- 小数点は常に `.`、桁区切りなし、エンコーディングは ASCII。ロケールに
-  従わない(`snprintf` の C ロケール前提をそのまま契約にする)。
+- 小数点は常に `.`、桁区切りなし、エンコーディングは UTF-8。生成する識別子は
+  ASCII とし、数値書式はロケールに従わない(`snprintf` の C ロケール前提を
+  そのまま契約にする)。
 
-## 7. `copyPerFrameStats` から何が生き残るか
+## 7. `copyPerFrameStats` から何を引き継ぐか
 
-- **生き残る**: per-frame S1 行の計算そのもの(全画素走査、plane 分離、
+- **引き継ぐ**: per-frame S1 行の計算そのもの(全画素走査、plane 分離、
   NaN 除外、ROI 規約、per-frame の行/列プロファイル CV)。§3.3 の中身は
   この計算の移設であり、`--framestats-selftest` の「numpy で全数値再現可能」
   という約束も per-frame セクションがそのまま引き継ぐ。
-- **死ぬ**: 単独ボタンとしての存在(統合 Export に置換)、`path` 列、
+- **廃止する**: 単独ボタン(統合 Export に置換)、`path` 列、
   `Hproj/Vproj` という列名、provenance 無しで裸の表が出ること。
 - Projection パネルの Copy table (TSV) は**そのまま残す**。あれは「その表を
-  その形で」持ち出す表のコピーであり、こちらは「Temporal の測定一式」の
-  持ち出し。共有すべきは値の**出所**(同じ ProjState)と**語彙**(同じ列名)
+  その形で」コピーする機能であり、こちらは「Temporal の測定一式」の
+  エクスポートである。共有すべきは値の**出所**(同じ ProjState)と**語彙**(同じ列名)
   であり、実装の関数まで1本化して2つのボタンの寿命を縛り合わせる利益がない。
   (projForEachRow はパネル内 lambda であり、walk の規則 — side-major、
   all は最後 — を仕様として共有する。)
@@ -185,11 +200,11 @@ delta 列は**持たない**(delta は2項の画面上の演算。ファイル�
 
 stack のフレームは大抵、物理量(経過時間・露光・温度)に対応する。Temporal の
 per-frame チャートに **カンマ / 空白 / タブ区切りの数値リストを貼り付けて
-x 軸にできる**ようにする。設計は家風が決める:
+x 軸にできる**ようにする。設計には既存の規約を適用する:
 
 - **軸は「単位を持つ量」**。入力は NAME + UNIT + 値リストの3点セット
   (series が stack レベルのパラメータに持つものの per-frame 版、
-  docs/series-plan.md と同じ語彙)。**単位は決して既定しない** — name/unit の
+  [series-plan.md](../../series-plan.md) と同じ語彙)。**単位は決して既定しない** — name/unit の
   無い Apply は拒否する。
 - **パース**: `,`・空白・タブ・改行すべて区切り(Excel 列とスクリプト出力の
   両方が来る)。非数値トークンは**位置つきエラー**で列挙し、黙って飛ばさない。
@@ -203,11 +218,11 @@ x 軸にできる**ようにする。設計は家風が決める:
   読み飛ばす — 形式の常道)。A/B/slot はそれぞれ自分の軸を持つ。**重ねる
   チャートの x 軸は1本**: 曲線を持つ全 slot が同じ量(name+unit 一致。値は
   違ってよい — それが重ねる意味)を持つときだけ使い、そうでなければフレーム
-  番号に落として理由を言う。
+  番号にフォールバックし、その理由を表示する。
 - **解決は1関数** `frameAxisOf(seqId)`: チャートも export も selftest も
   ここから読む。設定済みでもフレーム数と合わなくなった軸は「なぜ使わないか」
-  つきでフレーム番号に落ちる。
-- **export が運ぶ**(§3.3 に追記): per-frame セクションの `frame` 列の隣に
+  を示したうえでフレーム番号にフォールバックする。
+- **export に含める**(§3.3 に追記): per-frame セクションの `frame` 列の隣に
   `<name> [<unit>]` 列として乗る(軸が有効なときだけ)。`frame` 列は残す —
   マッピングの主キーはフレーム番号である。
 - **UI**: チャート近くの `x axis...` ボタン → popup(name / unit / 値の
@@ -223,11 +238,11 @@ state struct と同じ文字列に整形されること**(再導出ではなく�
 temporal/profile の region 食い違いが NOTE になること、CSV の quoting。
 per-frame x 軸: 3種の区切りのパース、位置つきエラー、個数不一致の拒否文言
 (両方の数字)、単位必須、`frameAxisOf` が適用値を返すこと、export 列、
-セッション往復。壊した時に落ちることも証明する(region ラベル偽装、plane 欠落)。
+セッション往復。意図的に壊した場合にテストが失敗することも確認する(region ラベル偽装、plane 欠落)。
 
-## 10. ROIs パネルの持ち出し (issue #67)
+## 10. ROIs パネルのエクスポート (issue #67)
 
-本書は Temporal の設計として書かれたが、**§2 の中心決定(`#` 見出し付きの
+本書は Temporal の設計として書かれたが、**§2 の中心となる設計判断(`#` 見出し付きの
 セクション矩形)は形式そのものの決定**であり、ROIs もそれに乗る。ここに書くのは
 「2つ目の形式を作らない」ことの明示であり、ROIs 固有の点だけを足す。
 実装は `buildRoiExport`(`ExportDoc` / `expCell` / `expNum` は Temporal と同一)、
@@ -238,7 +253,7 @@ per-frame x 軸: 3種の区切りのパース、位置つきエラー、個数�
 
 ROIs は **測定領域(矩形そのもの)を値として持つ唯一の表**である。画面では行に
 ROI の名前と `WxH @X,Y` が出るが、名前は貼った先で何も意味しない。よって
-**`x` / `y` / `w` / `h` は統計と並ぶ第一級の列**とする。ヘッダの `#` ブロックでは
+**`x` / `y` / `w` / `h` は統計値と同様に通常の列**とする。ヘッダの `#` ブロックでは
 なく行に載るのは、「All (whole image)」行の領域が **side ごとに違う**からである
 (A が 64x48、C が 32x24 なら同じ行名で別の領域を測っている)。領域が行の値でなければ
 この事実は書けない。
@@ -256,7 +271,7 @@ ROI の名前と `WxH @X,Y` が出るが、名前は貼った先で何も意味�
 - `tileMap` が画像座標 `iy` を `+zoom` で画面 y に写す(画面 y は下向き)ので、
   `y=0` は**画面の最上行**。パネルの `%dx%d @%d,%d` と `x/y/w/h` エディタも同じ数。
 
-出力自身も先頭の `#` ブロックでこの1文を運ぶ(両方の綴り —— `x..x+w-1` と
+出力自身も先頭の `#` ブロックにこの1文を含める(両方の綴り —— `x..x+w-1` と
 `[x, x+w)` —— を書く。読む側がどちらかで読むため)。POI は1画素で `w`/`h` を
 持たないので、`x` / `y` だけを持つ別セクションに置く。
 
@@ -276,17 +291,18 @@ ROI の名前と `WxH @X,Y` が出るが、名前は貼った先で何も意味�
 
 - **列名は画面の確定名をそのまま使う** —— `std` / `std / mean [%]`
   ([flat-field-stats.md](../analysis/flat-field-stats.md) (a)、旧 `PRNU [σ %]` からの改名)。
-  σ は書かず ASCII のみ(§3)。
-- **`fold` 列**: パネルは畳み方を列名の修飾で名乗る (`std (mean_t)`) が、`side` 列を
+  列名には σ を書かず、生成する識別子は ASCII に限る(§3)。利用者が付けた名称は
+  UTF-8 のまま保持する。
+- **`fold` 列**: パネルは畳み方を列名の修飾で明示する (`std (mean_t)`) が、`side` 列を
   持つ文書のヘッダにはそれが書けない(畳み方は side ごとの性質)。よって**列**として
-  行ごとに名乗る。[analysis-layers.md](../../analysis-layers.md) §3.2 の規範は
-  「畳み方を名乗ること」であって綴りではない。
+  行ごとに明示する。[analysis-layers.md](../../analysis-layers.md) §3.2 の規範は
+  「畳み方を明示すること」であって綴りではない。
 - **`n` / `stride`**: 標本数の見えないσは測定ではない。大きな領域は間引かれ、
   モザイクでは step が CFA セル単位に切り上がる — 両方を行が申告する。
 - **plane 行**: A の plane を**名前で**引く(パネルの規約)。pooled は最後の1行で
-  `all` と名乗る —— 別の測定であって5番目の plane ではない(§3.2 と同じ)。
+  `all` と表記する —— 別の測定であって5番目の plane ではない(§3.2 と同じ)。
 - **チャンネルコンボは反映しない**。表示の走査幅を決める道具であり、
-  ファイルは常に全 plane を運ぶ(decimals を反映しないのと同じ理由、§3)。
+  ファイルには常に全 plane を含める(decimals を反映しないのと同じ理由、§3)。
   コンボの現在値は provenance が1行で述べる。
 
 ### 10.4 行の順序と、答えられない side
@@ -305,10 +321,12 @@ windowless・解析フィクスチャ(`--roistats-selftest` と同じ理由。�
 文字列比較できる根拠(蓄積器の部分和が 2^53 未満の整数なので `sum2/n - mean^2` が
 厳密)まで assert の隣に書く。押さえる点: セクションの順序と各矩形の列数、
 **座標規約の文が出ていること**、ROI を動かすと `x` と数値が両方動くこと、
-All 行が side 自身のフレームを名乗ること、収まらない side が `-` + 理由になること、
-plane 行 R/Gr/Gb/B と最後の `all`、モザイクの POI がその画素の plane を名乗ること、
+All 行に side 自身のフレームが記録されること、収まらない side が `-` + 理由になること、
+plane 行 R/Gr/Gb/B と最後の `all`、モザイクの POI にその画素の plane が記録されること、
 CSV/TSV の方言(**ROI 名はユーザーの自由入力なので、区切り文字と引用符が入る唯一の
-セル**)、コンボを変えても表が1バイトも変わらないこと、そして**全バイトが ASCII で
-あること**(最初の実装は `§` を出していて、この assert が落として捕まえた)。
-空振り防止として、文書が存在すること・フィクスチャの3水準が本当に違うこと・
+セル**)、UTF-8 の ROI 名を損なわないこと（実装契約。現行 selftest では未固定）、
+コンボを変えても表が1バイトも
+変わらないこと、そして**生成するキーとヘッダが ASCII であること**(最初の実装は
+ヘッダに `§` を出していて、この assert が落として捕まえた)。
+テストが実質的に何も検証しない状態を防ぐため、文書が存在すること・フィクスチャの3水準が本当に違うこと・
 assert が実際に何本走ったかを数える。

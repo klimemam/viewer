@@ -1,14 +1,18 @@
 # 参照設計 — frame の共有参照化 (単独所有 `seqId` の置き換え)
 
-対象: todo 週末項目「参照設計 (seqId→共有参照。項目0のコピーを置き換え) + 項目20
-Watch」の前半。本書が仕様で、実装はここに書いた形と理由に従う。Watch は
-docs/features/watch/watch-design.md が本書の上に組む。行番号はすべて `eb5609a` 時点の
+本書は設計仕様と実装判断の記録である。対象は
+[todo-open.md](background/project/todo-open.md) の週末項目「参照設計
+(seqId→共有参照。項目0のコピーを置き換え) + 項目20 Watch」の前半。
+Watch は [watch-design.md](features/watch/watch-design.md) が本書の上に組む。
+行番号はすべて `eb5609a` 時点の
 `core/main.cpp`(別ファイルはその都度言う)。数値は grep で数えた実測値。
 
-前提とする正典: docs/terminology.md (frame ⊂ stack ⊂ series ⊂ batch、厳密包含、
-操作マトリクスの Close 行、σ_t は stack の属性)、docs/background/project/todo-open.md 項目0
+前提とする正典: [terminology.md](terminology.md) (`frame ≼ stack ≼ series` の順序付きデータ層、
+batch の `managed-by`、AnalysisSet の `role-ref`、
+操作マトリクスの Close 行、σ_t は stack の属性)、[todo-open.md](background/project/todo-open.md) 項目0
 (derive はコピーが暫定で、`materializeDerivedFrame` が交換用の継ぎ目)、項目20
 (Watch の確定仕様)、項目28 (別プロセスが同じファイルを持ち得る)。
+現行の実装状態は [tasks.csv](tasks.csv) を参照する。
 
 ---
 
@@ -51,6 +55,10 @@ remote_proto.h は 0 行** — stack のメンバーシップは完全にクラ�
 | Temporal/Linearity/Export | `recomputeTemporalIfNeeded` (7011) / `drawTemporalAB` 11 行 / `lin.rows[].seqId` / `frameLinCollect` / `exportPerFrameBlock` / `buildTemporalExport` | 30 行超 |
 | selftest | main() 内 99 行 + `--derive-selftest` 等。**これが回帰網** | 99 行 |
 
+> **現行追記 (2026-08-07以降):** `Series::Member` は `frameUid` / `fold` を持ち、
+> `addFrameToSeries` / `removeFrameFromSeries` / `seriesOfFrame` が加わった。上表は
+> `eb5609a` 時点の実測なので改変しない。
+
 画素バッファ `data` へのメンバアクセスは **92 行** (`\(->\|\.\)data\b`、psFrame /
 RFetchDone 受けを含む)。data への**書き込み**は本体 8 箇所に閉じている:
 rfetch 新フレーム 2349 / rfetch 差し替え 2378 / montage 3374 / npz 3676 /
@@ -74,10 +82,11 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
 **B を選ぶ。** 理由:
 
 1. **正典との一致。** terminology.md の frame は「画面に見えている測定の最小
-   単位」で、木 (frame ⊂ stack ⊂ series ⊂ batch) の厳密包含は**見えるものの木**。
-   B は木をそのまま残し、画素をその**下**の共有プールにする。frame が 2 つの
-   stack に居るとき、木の上では 2 枚の frame (2 membership) であり、包含は
-   1 枚も壊れない。共有されているのは「中身」で、それは木の主張ではない。
+   単位」。見える membership の木は `frame ≼ stack ≼ series` の向きだけを
+   実現し、batch の `managed-by` はその木とは別の関係である。B は membership
+   を残し、画素をその**下**の共有プールにする。frame が 2 つの stack に居る
+   とき、木の上では 2 枚の frame (2 membership) であり、どちらの順序も壊れ
+   ない。共有されているのは「中身」で、それはデータ層の主張ではない。
 2. **seqIndex は定義から per-membership になる。** membership = doc なら、
    「同じ frame が stack ごとに別の位置を持つ」は doc が 2 つあるというだけの
    こと。448 行の消費者は 1 行も変わらない。
@@ -111,7 +120,7 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
 | フィールド | 理由 |
 |---|---|
 | `seqId`, `seqIndex` | メンバーシップそのもの。**共有 frame は stack ごとに別の位置を持つ** |
-| `batchId` | 正典の包含は membership の木。共有 frame が 2 つの batch に見えてよい (それぞれの membership が自分の batch を持つ) |
+| `batchId` | 各 membership を `managed-by` する batch。共有画素を参照する2つの frame membership が別々の batch に管理されてよい |
 | `uid` | membership identity (§3) |
 | `dataRev` | キャッシュキーの片割れ。**doc 単位の単調カウンタのまま** (§3.2) |
 | `name`, `note` | 表示名と素性文。derive は独自の note を書く (17762-17763) |
@@ -156,7 +165,7 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
 - **`srcId` が frame (画素) の identity。** 使い道は3つ: 会計の重複排除 (§7)、
   Files の共有表示 (§4)、compare の正直さ — A と B が同じ source を映して
   いるとき (`a->src == b->src`)、compare チップは一文「A and B share the same
-  pixels」を出す。差分が全ゼロなのは嘘ではないが、なぜかを画面が言うこと。
+  pixels」を出す。差分が全ゼロになる理由を画面で明示する。
   **これは「言う」だけで、何かを隠したり畳んだりはしない** — 隠す方は 2026-08-04
   に全廃された (下記)。
 - **A==B の禁則は無い** (2026-08-04 ユーザー裁定「こういうの全般不要です」、
@@ -218,7 +227,7 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
   「⧉ shared — also frame 7 of "10lx (same names as B)"」。stack ヘッダの
   枚数は今までどおり membership の数。**バイト数は Files には今日も出ていない**
   (`fmtBytesHuman` の呼び出しは Browse 列 17501/17577 とプロパティ/状態バー
-  だけ) — 会計の真実面は §7 の予算関数であり、Files への列追加はしない。
+  だけ) — メモリ使用量の正しい計数は §7 の予算関数で行い、Files への列追加はしない。
 
 ## 5. セッション形式
 
@@ -233,9 +242,9 @@ derive でコピーされた stack は、今日**セッションを正しく往�
 `findSequenceSiblings` (5429) で**フォルダ全体**を拾い直すので、派生 stack は
 「**全 siblings を持つ stack が派生の名前を名乗る**」形で戻る — 中身と名前が
 食い違う。stderr で数を言う対象 (4254-4262) は path の無い montage だけで、
-path を持つ派生コピーはこの防衛線の外。つまり「既存セッションに保存された
-コピー stack の移行」は**存在しない** — 保存された時点で膜だけになっている。
-新形式はこれを直すものでもある。
+path を持つ派生コピーはこの防衛線の外。つまり、既存セッションに保存された
+コピー stack 固有のメンバーシップは移行できない。保存時点で、その情報が
+失われているためである。新形式はこれを直すものでもある。
 
 ### 5.2 新キー
 
@@ -329,20 +338,20 @@ tuple** であり、決して共有しない (reload selftest R21b)。
   書き換わる。url は path ではない。
   - 正規化は**鍵の計算時**に行い `FrameSource::path` は書き換えない (出自は
     逐語、§2.1)。したがって `local://` の綴りで書かれた**既存のセッション行**も、
-    ローカルの戸から書かれた行も、復元すれば**同じ tuple** に着く —— 形式変更も
+    ローカルの通常入口から書かれた行も、復元後は**同じ tuple** に解決される —— 形式変更も
     移行も無く、復元が2つ目の identity を生むことも無い。
 - **「そのファイルの何フレーム目か」も1回だけ言う (同上)。** `fileFrame` は
   ローカルファイル内の、`remoteFrame` は peer のファイル内のフレーム番号で、
   **別のファイル**の話だから欄が2つある。画素がこのディスクに在る source
   (`local://`) では同じ話なので `(frame, 0)` に畳む。畳まないと multi-frame
-  .npy は frame 0 だけが2つの戸で共有され、1..N-1 は割れたままになる。
-- 上2点はどちらも「**このディスクの1ファイルは、どの戸から開いても1つの
+  .npy は frame 0 だけが2つの入口で共有され、1..N-1 は割れたままになる。
+- 上2点はどちらも「**このディスクの1ファイルは、どの入口から開いても1つの
   identity**」という本節の主張そのもの。証拠は `--scan-selftest` の
   S4d/S4e/S4f (鍵の文字列、peer の url は逐語のまま別鍵) と S5d-S5g
   (registry を数える: 2 doc / 1 source / refs=2、別ファイルは別 source のまま)。
 - registry は弱参照 (source が全 membership を失えば消える)。
 - **入らないものが1つあり、それは形式ではなく tuple の都合。** reader
-  (アダプタ) が作った画素は登録しない — tuple はファイルを名乗る欄しか持たず、
+  (アダプタ) が作った画素は登録しない — tuple はファイルを識別する欄しか持たず、
   **どの reader を走らせたか**を書く欄が無いので、1つの .dat に2つの reader を
   当てると同じ tuple になり、2つ目が1つ目の画素を黙って拾う。npy 側が2つの
   読みを分けられるのは npyRead が鍵に入っているからで、reader の spec が同じ
@@ -359,7 +368,7 @@ derive の規則が選んだが常駐していない frame (`notResident` 17663-
 「まだ来ていない」は今日 membership 層に既に答えがある (prefetch 隊列 +
 expectedFrames の n/N) — 空 source で二重に表現しない。
 **V2 (本書の範囲外、ユーザー判断待ち)**: SeqInfo に「pending membership」を
-持たせ、`pumpRemoteFetch` の graft (2331-2367) が着地時に複数 stack へ
+持たせ、`pumpRemoteFetch` の graft (2331-2367) が取得完了時に複数 stack へ
 membership を配る形。remote の derive がミスなく効くのはここから。
 
 ## 7. メモリ会計 — 積は数えない、和を数える

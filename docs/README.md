@@ -19,7 +19,7 @@
 |---|---|---|
 | docs/ 直下 | 複数機能にまたがる語彙、データモデル、全体方針、課題台帳 | 一つの機能だけで再検証できる仕様 |
 | features/機能名/ | 一つの機能だけを変更・再検証すれば完結する要求、設計仕様、実装反映記録 | 過去の検討だけを残す記録 |
-| verification/ | 検証仕様と、既存の実施記録（現在は同居） | 機能固有の実装台帳 |
+| verification/ | 再実行できる検証仕様。固定した実施記録は `verification/results/` | 機能固有の実装台帳 |
 | guides/ | 操作・起動など利用者向け手引き | 実装内部の契約 |
 | reference/ | リポジトリ外の利用者が消費する契約 | 内部だけで完結する設計 |
 | background/ | 採用しなかった案、完了した計画、過去のレビュー | 現行仕様、現在の未決事項 |
@@ -39,7 +39,7 @@
 | 文書 | 役割 | 状態 |
 |---|---|---|
 | [terminology.md](terminology.md) | frame / stack / series / AnalysisSet / batch の定義 | 現行の語彙正典 |
-| [analysis-layers.md](analysis-layers.md) | 3つの包含層、AnalysisSet の役割付き参照、4種類の analyzer | 現行のモデル正典 |
+| [analysis-layers.md](analysis-layers.md) | 3つの順序付きデータ層、batch の管理、AnalysisSet の役割付き参照、4種類の analyzer | 現行のモデル正典 |
 | [reference-design.md](reference-design.md) | frame の共有参照化 | 確定仕様 |
 | [series-plan.md](series-plan.md) | series 導入の全体計画と記録 | 実装済み部分を含む全体文書 |
 | [tasks.csv](tasks.csv) | 対応済み、進行中、残課題、暫定、要レビュー | 現在の課題の正典 |
@@ -67,10 +67,18 @@
 
 | 区分 | 索引 | 内容 |
 |---|---|---|
-| 検証 | [verification/README.md](verification/README.md) | 検証仕様と、既存の実施記録（現在は同居） |
+| 検証 | [verification/README.md](verification/README.md) | 再実行できる検証仕様と、固定した実施記録 |
 | 手引き | [guides/README.md](guides/README.md) | 起動と操作 |
 | 外部契約 | [reference/README.md](reference/README.md) | plugin ABI と analyzer |
 | 背景 | [background/README.md](background/README.md) | 完了した計画、比較、レビュー |
+
+保存済みの検証結果は、次の5回の検証実施（run）です。
+
+- [verification/results/20260803-functional.md](verification/results/20260803-functional.md)
+- [verification/results/20260803-ui.md](verification/results/20260803-ui.md)
+- [verification/results/20260804-functional-probes.md](verification/results/20260804-functional-probes.md)
+- [verification/results/20260804-ui-probes.md](verification/results/20260804-ui-probes.md)
+- [verification/results/20260817-open-with-reader-ui.md](verification/results/20260817-open-with-reader-ui.md)
 
 
 再構成より前から存在する背景文書のうち、文書全体の移動（whole-file move）の
@@ -83,8 +91,10 @@
 
 1. 現行仕様は一か所だけに置きます。背景へ移した記述を現在形で複製しません。
 2. 機能文書にはフェーズを示し、未決事項は [tasks.csv](tasks.csv) の行を参照します。
-3. 検証仕様には、再実行できる手順と期待結果を記します。検証結果は、1つのコミット、
-   1台の実行機、1回のマトリクス実施を単位として固定し、後日の状態で書き換えません。
+3. 検証仕様には、再実行できる手順と期待結果を記します。新規の検証結果は、1つの
+   コミット、識別できる1台の実行機、1回の実施を単位として固定します。移送元に
+   実行機の識別子が残っていない過去記録は `unknown` と明記して凍結し、推測で補わず、
+   後日の状態でも書き換えません。
 4. 文書全体を移動した場合（`whole-file`）、下の恒久対応表に登録します。`stub` が
    `required` の間だけ旧パスに3行の転送案内を残し、本文は現在パスにだけ置きます。
    現行参照をすべて移行したら転送案内を削除し、対応表を `none` にします。

@@ -1,29 +1,34 @@
-# 用語と操作の定義 (frame / stack / series / batch)
+# 用語と操作の定義 (frame / stack / series / AnalysisSet / batch)
 
 機能を継ぎ足すうちに「Close は何を閉じるのか」「rename はどれに効くのか」が
 場所ごとにバラバラになった。ここが正典。実装がこの表と違っていたらバグ。
 
-## 4つの層
+## 3つの順序付きデータ層と2つの関係
 
-| 層 | 定義 | 実体 | 名前 |
+| 語 | 定義 | 実体 | 名前 |
 |---|---|---|---|
 | **frame** | 画素の入った1枚。測定の最小単位 | `ImageDoc` | ファイル名（変更不可） |
 | **stack** | 同一条件で撮られた frame の並び。**時間軸**を持つので σ_t/FPN 分離・per-frame 表が意味を持つ | `SeqInfo` (`ImageDoc::seqId`) | 初期値=フォルダ/パターン、**リネーム可** |
 | **series (系列)** | **条件を1つ振った** stack / frame の並び。**パラメータ軸**を持つのでフィット・カーブが意味を持つ | `App::Series` (`Series::members` が唯一の真実) | 人間が付ける（例「25℃ 照度掃引」）、**リネーム可** |
-| **AnalysisSet** | 解析の**入力の役割**を束ねたもの（例 `{"dark": stack, "image": stack}`）。データが「dark である」のではなく、set の中で dark を**演じる** | 設計: [analysis-layers.md](analysis-layers.md) | 人間が付ける、**リネーム可** |
+| **AnalysisSet** | 解析の**入力の役割**を束ねたもの（例 `{"dark": stack, "image": stack}`）。データが「dark である」のではなく、set の中で dark を**演じる** | `App::ASet` / `App::ASetRole`（設計: [analysis-layers.md](analysis-layers.md)） | 人間が付ける、**リネーム可** |
 | **batch (塊)** | 開いたものを人間が管理するための入れ物。**構造の主張を一切しない** | `App::Batch` (`ImageDoc::batchId`) | 初期値=フォルダ名、**リネーム可** |
 
-包含関係は frame ⊂ stack ⊂ series ⊂ **AnalysisSet** ⊂ batch。**厳密**で、
-例外は1つだけ: **AnalysisSet のメンバ関係は包含ではなく束縛（参照）**である。
-dark は1回撮って複数の解析で使うのが通常運用なので、同じ stack を複数の set が
-参照してよい。set 自身は1つの batch に属する。それ以外に例外を作らない
-（series が batch をまたぐ、のような抜け道は置かない）。ただし途中の層は
-**省略**できる: 単発 frame は stack を経由せず batch に直接ぶら下がってよいし、
-どの series にも属さない stack があってよい（＝掃引の一部ではない、ただ開いた
-だけの stack）。省略はしても、**順序を飛び越えることはしない**。
+構造の順序は `frame ≼ stack ≼ series`。ここで `x ≼ y` は「x は y 以下の
+データ層で、存在する中間層はこの順序を守る」を表し、集合の包含ではない。
+したがって frame → stack → series、frame → series（stack の省略）、各層単独を
+許し、series → stack のような逆転は許さない。series のメンバは standalone frame
+または stack で、どちらかは明示された identity で決まり、shape から推測しない。
+
+frame / stack / series は batch に **managed-by（管理）**される。batch は仮想的な
+管理の柵であり、データ構造の上位層ではない。series と全メンバは同じ batch に
+管理される、という現行の不変条件は維持する。
+
+AnalysisSet は frame / stack / series を **role-ref（役割付き参照）**する。参照は
+所有でも移動でもなく、同じ dark stack を複数の set が参照してよい。参照先は
+set 自身とは別の batch にあってもよい。set 自身は1つの batch に管理される。
 
 別々に開いた stack を1本の掃引にしたい時は、**先に同じ batch へ移す**（Move to
-batch）。batch は仮想的な柵にすぎず、移動しても画素のコピーは起きない — 移すのが
+batch）。batch の管理先を替えても画素のコピーは起きない — 移すのが
 正しい帳簿でもある（1つの測定を成すなら、それらは同じ入れ物に属する）。
 これで「series はどこに表示されるか」「batch を閉じたら series はどうなるか」が
 すべて自明になる。
@@ -94,19 +99,19 @@ Yes なら series、No なら batch。
 
 ### series が持つもの（stack には持たせない）
 
-- **パラメータ軸の名前と単位**（`lx` / `ms` / `photons/px` / `℃`）。
-  今 `App::lin.unit` がアプリ全体で1つしかないのは、この層が無いことの症状。
-- **メンバごとのパラメータ値**（既存の `SeqInfo::level` が実質これ）。
+- **パラメータ軸の名前と単位**（`Series::paramName` / `Series::unit`。例 `lx` / `ms` /
+  `photons/px` / `℃`）。`App::lin.unit` は新規 series の入力既定・互換設定に限る。
+- **メンバごとのパラメータ値**（`Series::Member::value`）。
 - **測定の種類**（linearity / PTC / temperature …）。fit の式と出す量が決まる。
 
 ## 操作マトリクス
 
-「その操作をその層に対して行ったとき何が起きるか」。空欄はその層に対して
+「その操作をその対象に対して行ったとき何が起きるか」。空欄はその対象に対して
 提供しない（＝UI に出さない）。
 
 | 操作 | frame | stack | series | AnalysisSet | batch |
 |---|---|---|---|---|---|
-| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](features/adapters/reader-analysisset.md) §6） | 含む stack / frame をすべて破棄 |
+| **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](features/adapters/reader-analysisset.md) §6） | 管理する frame / stack / series / AnalysisSet を破棄。別 batch に管理された role-ref 参照先は無傷 |
 | **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
 | **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — |  | 同 = everything（全体で共有） |
 | **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） |  | — （条件混在は平均に意味がない） |
@@ -140,7 +145,8 @@ Yes なら series、No なら batch。
 
 ## 実装上の不変条件
 
-- CFA プレーンは統計で決して混ぜない（R/Gr/Gb/B は常に別系列）。
+- R/Gr/Gb/B の個別系列を黙って混ぜない。明示的な `all` 集計は別測定と名乗り、
+  plane 水準差が std に入ることを表示する。
 - **解析結果は自分の層と（set 解析なら）set を名乗る。** provenance が層・対象・
   役割を運ぶ。運ばない数値は報告書に引用できない。
 - **前処理・参照を含意する有名名（PRNU / DSNU …）は SetAnalyzer だけが名乗る。**
@@ -161,8 +167,9 @@ Yes なら series、No なら batch。
 - **series は自動で作らない**（フォルダ構造から推測すると外れたときに黙って嘘の
   掃引ができる）。picker の「照度掃引として開く」か、Files で stack を選んで
   「Group as series」か、Series Analysis パネル(旧リニアリティパネル)で作る。
-- 1つの stack は**高々1つ**の series に属する。
-- メンバの stack を単独で別 batch へ移すと、その stack は series から**外れる**
+- 1つの stack / standalone frame は**高々1つ**の series のメンバになる。
+- メンバの stack / standalone frame を単独で別 batch へ移すと、そのメンバは
+  series から**外れる**
   （禁止はしない。外れたことを画面で告げる）。
 - **単位の既定は未設定（空）**。単位を仮定しない — 空のままでは fit できない、
   が正しい振る舞い。既定 `lx` は新規作成ダイアログのプリフィルに格下げ。
@@ -179,6 +186,7 @@ Yes なら series、No なら batch。
 - 同じフォルダを 2 回開いた場合、セッション復元のメンバ探索は**その series の
   batch にある stack**を選ぶ（同じ path が 2 つの stack に居るのは正常）。
 - series の既定名は「<batch名> 掃引」（人が付けるまでの初期値）。
-- **series は1つの batch の中に収まる。** またぐ必要が出たら、メンバを同じ
-  batch へ移してから series を作る（柵の付け替えであって、複製ではない）。
+- **series と全メンバは同じ1つの batch に managed-by される。** 別々の batch に
+  あるメンバから series を作る場合は、先に同じ batch へ移す（管理先の付け替えで
+  あって、複製ではない）。
 - **batch 名は一意**。セッションは batch を名前で復元するため、衝突には ` (2)` を付す。

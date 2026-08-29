@@ -116,10 +116,18 @@ cmake --build build-mingw
 
 ### 2-1. 準備
 
-**サーバ側の準備は不要です。** 初回接続時に、サーバが自分で `binaries` ブランチから
-`viewer-serve` とプラグインを取得し `~/.viewer/` に配置します(サーバに git と
-ネットワークが必要)。手元のバイナリを送りつけるわけではないので、Windows 版の
-配布物が重くなることもありません。
+**通常はサーバ側の手作業は不要です。** 初回接続時は次の順で
+`~/.viewer/viewer-serve` を準備します。
+
+1. 既に動く protocol 14 以上の peer があればそのまま使う
+2. 手元の配布物／ビルドツリーにサーバ OS 用 `viewer-serve` があれば、ssh の標準入力で
+   `.new` へ送り、実行権を付けて置き換える。**サーバ側の git / network は不要**
+3. 手元に対象バイナリが無い場合だけ、サーバ側の git + network で `binaries`
+   ブランチを取得する
+
+クライアントから自動導入できる対象は Linux x86_64 と macOS arm64 です。必要なのは公開鍵認証と
+POSIX shell。手元にも対象 peer が無く、サーバ側 fallback も使えない場合や、別の
+OS / architecture では、対応する `viewer-serve` をビルドして `~/.viewer/` に置きます。
 
 必要なのは**公開鍵認証が通ること**だけです:
 
@@ -170,7 +178,7 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | フォルダをその場で開く | **`tree`** に切り替える。フォルダのクリック(`→` / `←` でも)がその場で展開/畳みになります。1 ノード 1 回だけリストして覚えるので、畳み直しは無料 |
 | 連番を送って見る | 連番は 1 行(`frame_000‥023.npy   [24 frames]`)にまとまる。クリックでプレビュー、下端の `< >` / スライダー / `,` `.` で**開かずにフレーム送り** |
 | 1 枚ずつ見たい | **`flat`** に切り替えると連番が 1 フレーム 1 行に展開されます(サーバへの問い合わせは発生しません。ただし size / modified 列は空になります —— 一覧の応答が持っていない値だからです) |
-| 正式に開く | **ダブルクリック**か `Enter`(連番行なら塊ごと)。測定・比較に使った瞬間にも自動で昇格します |
+| 正式に開く | **ダブルクリック**か `Enter`(連番行なら stack ごと)。測定・比較に使った瞬間にも自動で昇格します |
 | 任意の組み合わせ | `Ctrl` / `Shift` + クリックで選んで「**Open N selected as stack**」。形が揃わない選択はボタンが押せず、理由が出ます(転送する前に分かります) |
 | **いま居るフォルダ**を丸ごと | 2 段目の **`open folder`**。行を選ぶのではなく、**いま中に居るフォルダ**を走査します(以前はフォルダ行の右クリックしか無く、ホームやルートに居ると自分の名前を探しに 1 階層戻る必要がありました) |
 | 別のフォルダを丸ごと | フォルダ行の右クリック「Open folder (all stacks below)」(パンくずの右クリックでも同じ) |
@@ -184,7 +192,7 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 | 行 | 選ぶもの |
 |---|---|
 | 絞り込み | **1 本の入力欄**に語を並べます。打鍵ごとに反映。`dark` = `フォルダ/ファイル名` のどこかに含む、`!ng` = 除外、`*_A.npy` = ワイルドカード。**全語 AND** |
-| 塊 | **「N 個の別スタック」**か**「まとめて 1 スタック」** |
+| stack | **「N 個の別スタック」**か**「まとめて 1 スタック」** |
 | batch | **「1 batch」**か**「トップフォルダ毎に batch」** |
 | 掃引 | **「open as a sweep (creates a series)」** —— 別スタックが 2 つ以上選ばれているときだけ出ます([series の節](#series-系列--掃引を-1-本の測定として扱う)) |
 
@@ -263,24 +271,26 @@ peer がこのマシンで動くだけで、操作も見え方も一切変わり
 層とその操作の定義は **terminology.md が正典**です —— 実装があの表と食い違っていたらバグ扱い。
 ここには起動して触るのに要る分だけ書きます。
 
-| 層 | 何か |
+| 語 | 何か |
 |---|---|
 | **frame** | 画素の入った 1 枚。測定の最小単位。名前はファイル名で、変えられません |
 | **stack** | 同一条件で撮られた frame の並び。**時間軸**を持つので σ_t / FPN 分離が意味を持つ |
 | **series (系列)** | **条件を 1 つ振った** stack / frame の並び。**パラメータ軸**を持つのでフィット・カーブが意味を持つ |
+| **AnalysisSet** | frame / stack / series を解析上の役割で参照します。参照先を所有・移動しません |
 | **batch (塊)** | 開いたものを人間が管理するための入れ物。**構造の主張を一切しません**。1 回の Open = 1 batch が既定 |
 
-包含は `frame ⊂ stack ⊂ series ⊂ batch` で、**厳密**です(series が batch をまたぐ、のような
-抜け道はありません)。途中の層は**省略**できます —— 単発 frame は stack を経ずに batch へ
-直接ぶら下がってよいし、どの series にも属さない stack があってよい。
+データ層の順序は `frame ≼ stack ≼ series` です。集合包含ではなく、途中の stack を
+省略でき、各層は単独でも存在できるが、逆転はできないという順序です。batch はそれらを管理 (`managed-by`) し、
+AnalysisSet は役割付きで参照 (`role-ref`) します。series とメンバは同じ batch に
+管理されますが、AnalysisSet の参照先は別 batch でも構いません。
 
 stack / series / batch はどれも**右クリックでリネーム**でき(stack は選択中に `F2` でも)、
 名前はセッションに残ります。`Move to batch` で入れ替えもできます。同名ファイルだらけの測定でも、
-人間に分かる名前を付けて区別するための層です。
+人間に分かる名前を付けて区別するための語です。
 
 ## series (系列) —— 掃引を 1 本の測定として扱う
 
-「10lx / 20lx / 40lx …」のように**条件を 1 つ振った** stack の並びが series です。
+「10lx / 20lx / 40lx …」のように**条件を 1 つ振った** stack / frame の並びが series です。
 リニアリティ / PTC は **series 単位**で測ります(stack 単位でも batch 単位でもありません)。
 series が持つのは**パラメータ名**・**単位**・**種類**(linearity / PTC / temperature / other)と、
 **メンバごとの値**です。単位もパラメータ名も series の持ち物で、アプリ全体に 1 つではありません。
@@ -290,7 +300,7 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 
 | どこ | やり方 |
 |---|---|
-| フォルダを開くとき | Select stacks の **「open as a sweep (creates a series)」**。別スタックが 2 つ以上選ばれているときだけ出ます。チェックするとパラメータ名と単位の欄が現れ、各行に**名前から読めた値のプレビュー**(`-> 100 lx`)が付きます。読めない行は琥珀色で `-> no value in the name`。**「トップフォルダ毎に batch」とは排他**です(series は 1 つの batch に収まるため) |
+| フォルダを開くとき | Select stacks の **「open as a sweep (creates a series)」**。別スタックが 2 つ以上選ばれているときだけ出ます。チェックするとパラメータ名と単位の欄が現れ、各行に**名前から読めた値のプレビュー**(`-> 100 lx`)が付きます。読めない行は琥珀色で `-> no value in the name`。**「トップフォルダ毎に batch」とは排他**です(series とメンバを同じ batch が管理するため) |
 | 開いた後 | Files で stack を**右クリック > Series ▸**。同じ batch の series 一覧(参加したときに付く値も出ます)、`New series...`、`Remove from this series`。別 batch の series は選べず、「先に Move to batch」と理由が出ます |
 | Series Analysis パネル(旧 Linearity) | series が 0 個のときの空状態にある「Create a series from this batch's stacks...」、あるいは `New...` / `Edit...`。**このパネルは既定で出ていません** —— `View > Panels > Series Analysis` で出します |
 
@@ -301,9 +311,11 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 入るのは mean 統計だけで、sum 立ちのメンバが含まれているとフィットは実行せずに
 理由を言います。
 
-- **単位の既定は空**です。空のままでも series は作れ、メンバごとの平均も出ますが、
-  **フィットは出ません** —— 「DN / 何」が決まらないものに感度は書けないからです。
-  あとから `Edit...` で入れられます
+- **新規作成画面の単位欄は、Preferences の `series.defaultUnit` で事前入力されます。**
+  組み込み既定は `lx` ですが、消して空のまま series を作ることもできます。series
+  自体では空が「単位未設定」を表し、メンバごとの平均は出ても**フィットは出ません**
+  —— 「DN / 何」が決まらないものに感度は書けないからです。あとから `Edit...` で
+  入れられます
 - **値は「読めなければ未設定」**です。空欄・`-`・`1e` のような書きかけは**未設定**であって
   **0 ではありません**。リニアリティの 0 は暗電流 stack(offset と読み出しノイズの基準)という
   最も効く点なので、読めない文字列がそこへ落ちてはいけません。未設定のメンバは画面で
@@ -315,10 +327,14 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 
 | 操作(series 行の右クリック) | 何が起きるか |
 |---|---|
-| **Ungroup (keep the stacks)** | くくりだけ外します。stack は全部開いたまま、その場に残ります |
-| **Close series (discard its stacks)** | 正典どおりの Close。メンバの stack が全フレームごと閉じます |
+| **Ungroup (keep the members)** | くくりだけ外します。frame / stack メンバは全部開いたまま、その場に残ります |
+| **Close series (discard its members)** | 正典どおりの Close。frame / stack メンバを閉じます |
 | **Move to batch** | **全メンバが一緒に**動きます |
-| (メンバ 1 本だけを Move to batch) | その stack は series から**外れます**。禁止はせず、画面で告げます |
+| (メンバ 1 本だけを Move to batch) | そのメンバは series から**外れます**。禁止はせず、画面で告げます |
+
+> **現行実装差分。** standalone frame メンバを含む series では、Move / Close が
+> stack だけを処理して frame を取り残す。上表が正典であり、phase④ で
+> `moveSeriesToBatch` / `closeSeries` と回帰試験を修正する。
 
 Files パネルでは batch 見出しの下に series が先に並び、メンバ行は**値が先頭**に出ます
 (`100 lx · 10lx/frame_000‥023.npy`、未設定なら `value unset · …`)。series に属さない stack は
@@ -328,7 +344,7 @@ Files パネルでは batch 見出しの下に series が先に並び、メン�
 
 - B の指定は **Files で対象行を右クリック > Set as compare B**(名前ではなく実体を指すので、
   同名スタックだらけでも取り違えません)。選ばれている行には青い **B** が付きます。
-  `View > Compare A/B > B image` からも選べます(1 stack = 1 行なので、120 フレームの塊が
+  `View > Compare A/B > B image` からも選べます(1 stack = 1 行なので、120 フレームの stack が
   120 行になることはありません)
 - モードは `\`(または `C`)を押すたびに **オフ → ワイプ → 並べて → 差分 → ブリンク → オフ**。
   ブリンクは `B` / `Space` の**タップで切り替え**(他のモードのように押しっぱなしではありません)、
@@ -370,8 +386,14 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 
 嘘を書くくらいなら書かない方がまし、という節です。ここに無いものは動くはず。
 
-- **リモートで開けるのは `.npy` だけ**です(C order / Fortran order 両対応)。RAW はレシピの
-  受け渡しが未実装、`.npz` も未対応 —— どちらもローカルなら開けます
+- **リモートで開ける形式**は `.npy`、PNG、JPEG、TIFF、単一 document の OpenEXR、y4m、
+  レシピ付きヘッダ無し RAW、`.npz` の member です。Reader も peer 上で実行できます。
+  ただし **AnalysisSet を返す remote Reader** は、Ref の peer path を client の登記へ
+  安全に束縛する契約が無いため、返り値全体を名指しで拒否します。
+  **複数 named layer の OpenEXR**は現行 wire が layer を指せないため peer では拒否します。
+  **ベンダ RAW**は peer が LibRaw を含まないため native 非対応です。どちらも Reader を
+  選ぶか、ローカルで開く／コピーする必要があります。mp4/mov/mkv 等の圧縮動画も、
+  測定値の意味を保てないため native では開きません(y4m への変換方法を表示します)
 - **1 枚のフレームはタイル単位ではなく全部来ます。** 間引きプレビューが先に出て、その裏で
   全画素を取りに行きます。**プレビューの間は ROI / ピンを置けません**
 - **Files に複数選択がありません。** 「stack を複数選んで Group as series」という経路が
@@ -379,14 +401,15 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 - **Series Analysis パネルが式を持っているのは linearity と PTC の 2 種類だけ**です。
   temperature / other の series はメンバごとの平均までは出しますが、フィットは出しません
   (画面でそう言います)。式の無い量は印字しません
-- **1 つの stack は高々 1 つの series にしか属せません**(当面の制限。表示と操作が一意に決まるように)
-- 自動導入はサーバに **git とネットワーク**がある前提。無い場合は `~/.viewer/viewer-serve` に
-  手で置けば動きます
+- **1 つの frame / stack は高々 1 つの series にしか属せません**(当面の制限。表示と操作が一意に決まるように)
+- 自動導入は**手元に対象 OS 用 peer があればサーバの git / network 不要**です。
+  手元に無い場合だけ server-side git fallback を使い、どちらも無ければ
+  `~/.viewer/viewer-serve` に手で置きます
 - Process で作った画像(ファイル実体の無いもの)は**セッションに保存されません**
 
-なお **サーバ側の `MEASURE` は実装済み**です —— 塊を開くと転送を待たずにサーバ側で時間統計を
+なお **サーバ側の `MEASURE` は実装済み**です —— stack を開くと転送を待たずにサーバ側で時間統計を
 計算し、`[server <ホスト>, N frames]` タグ付きで表示します
-(`File > Stack loading > Remote processing` で auto / server / local fetch を切替)。
+(`File > Stack loading > Remote processing` で auto / local fetch を切替)。
 開いていない連番も、Browse パネルの**連番行**の
 「Temporal stats (server) for stack "…"」でそのまま測れます(1 回 = 1 stack)。
 local で測っても server で測っても**同じ数**です —— 画素毎の時間分散は

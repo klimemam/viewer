@@ -1,11 +1,16 @@
 # 動画対応 — フレームの画素は何なのか、そして依存の代価
 
+> **状態: y4m v1 実装済み。** ローカルと peer の両方で、progressive y4m の
+> 8〜16 bit 輝度プレーンを 1 ファイル = 1 stack として読む。他の動画コンテナは、
+> 画素値が測定値でなくなる理由と y4m への変換コマンドを示して拒否する。
+
 [docs/features/media/media-support.md](media-support.md) §2 の続き。§2 は「動画 = 遅延デコードされる
 stack」という層モデルの読みと、依存候補の比較までで止まっていた。**画素の意味**を
 問うていない。本書はそこから始め、実測して、結論を出す。
 
 このツールの正典は [docs/terminology.md](../../terminology.md) と
-[docs/features/analysis/stats-taxonomy.md](../analysis/stats-taxonomy.md): **画素値は [DN]** であり、**数値が製品**。
+[docs/features/analysis/stats-taxonomy.md](../analysis/stats-taxonomy.md): **画素値は [DN]**
+であり、**数値が製品**。
 「デコードできた」は「その数値に意味がある」ではない。
 
 ---
@@ -139,7 +144,9 @@ v1 が採る形は、選択肢でいうと「**真に可逆な形式だけ読む
 ## 3. 問い 2 — 層モデルにおける動画
 
 **1 ファイル = 1 stack、N フレーム、提示順。** これは §2 の読みのままで正しく、
-[terminology.md](../../terminology.md) の frame ⊂ stack ⊂ series ⊂ batch にそのまま乗る。
+[terminology.md](../../terminology.md) の順序付きデータ層
+`frame ≼ stack ≼ series` にそのまま乗る。`≼` は集合包含ではなく、この場合は
+frame が stack のメンバになるという許された向きだけを使う。
 `.npy` の frame 軸 (F,H,W[,C]) が既に「1 ファイル = 1 stack」を実装しており
 (`loadNpy`)、y4m はその 2 例目にすぎない。実装上も同じ経路を通す。
 
@@ -152,7 +159,8 @@ v1 が採る形は、選択肢でいうと「**真に可逆な形式だけ読む
   → v1 はそういう stack を作らせない(拒否する)ことで解決している。
 - series には**しない**。1 本の動画は「条件を 1 つ振った並び」ではなく
   「同一条件の並び」。terminology.md の「series は自動で作らない」に従う。
-- batch は 1 ファイル = 1 batch(npz の前例と同じ)。
+- batch は 1 ファイル = 1 batch(npz の前例と同じ)。stack と各 frame はその
+  batch に `managed-by` される。
 
 ### index → frame の対応と seek
 
@@ -356,9 +364,10 @@ v1 はこう書いていた: 「Browse パネルには y4m は出ない。一覧
   無かった。この repo の流儀は**名指しで断る**ことなので、正しい形は隠すのでも
   黙って出すのでもなく、**出して理由を言う**(#111 の裁定)。
 
-現在: **ローカルの Browse からは y4m がダブルクリックで開く**。ssh 先では
-淡色のまま、hover で「peer は npy のみ」と理由が出る。リモート動画配信は
-引き続き §6 の再評価対象で、そこは何も変わっていない。
+現在: **ローカル／ssh どちらの Browse からも y4m が開く**。protocol 10 で
+`viewer-serve` が同じ `core/imagefile.cpp` / y4m backend を使うため、単クリック preview、
+正式 open、stack のフレーム送りは同じ経路で動く。FFmpeg を要する圧縮動画は
+§6 の採用条件が満たされるまで対象外のまま。
 
 **`abValueUnit()` は変更していない。** 読み込むのはビット完全な値だけなので、
 **[DN] は正しい**。ラベルを剥がす必要が出るのは非可逆を読むようになったときで、
@@ -418,31 +427,29 @@ main に **Python 入力アダプタ**([input-adapters.md](../adapters/input-ada
 再評価条件 1(可逆形式の実ファイルが来たら)は**さらに満たされにくくなった**。
 FFV1 ですらアダプタ経由で読める。
 
-### ただし、アダプタは本ブランチが閉じた穴を開け直せる
+### ただし、Reader では native 経路の制約を回避できる
 
-アダプタの返り値は **native な numpy 配列として入ってくる**。つまり
-8-bit H.264 をデコードして `uint8` を返すアダプタを書けば、その値は
+Reader の返り値は **native な numpy 配列として入ってくる**。つまり
+8-bit H.264 をデコードして `uint8` を返す Reader を書けば、その値は
 **[DN] を名乗ったまま統計に流れる** — §1-A で σ_t が 0.00 になる、まさにその
-経路である。本ブランチが `openPath` で塞いだのは**拡張子の入口だけ**であって、
-アダプタの入口ではない。
+経路である。本ブランチが `openPath` で無効にしたのは**拡張子から開く経路だけ**であり、
+Reader 経由の読み込みは対象外である。
 
-**これは現時点では将来のリスクである(正確に言う):** 合流時点の main には
-仕様([input-adapters.md](../adapters/input-adapters.md))と Python 側のライブラリ・ハーネス
-(`tools/import/`)が入っただけで、**アダプタ host は core/main.cpp にまだ
-配線されていない**(`runAdapter` 等の呼び出しは main.cpp に無い)。
-穴が開くのはその配線が入るときなので、**配線と同時に**下記を入れるのが安い。
+**これは現在の Reader 経路に存在する境界である。** Reader host はローカルと peer の
+両方に配線済みで、viewer は返された numpy 配列を Reader の宣言どおりに受け取る。
+任意の Python が内部でどの codec / pix_fmt を使ったかを viewer が推測することは
+できないし、推測してはならない。
 
 緩和策は既に契約の中にある: `note`(素性の一文)と `meta`(機械可読な事実)。
 input-adapters.md §4.3.1 は「viewer 自身が note を書く場面が既にある
 (dtype を変換した、n/N しか読めなかった)」と書いており、**非可逆コーデックを
 通した旨はまさにその種類の事実**である。
 
-**提案(この branch では実装しない — adapter 仕様は main の領分):**
-アダプタが動画を復号したなら `note` に必須で記録する、を契約に足す。
-`meta` に `codec` / `pix_fmt` / `lossless: false` を持たせれば、
-将来 `abValueUnit()` が「この doc は DN と名乗ってよいか」を機械的に
-判定できる — §2 の二軸(ビット完全性・伝達特性)が、そのまま
-アダプタの meta キーになる。
+したがって、動画を復号する Reader は `note` に変換を明記し、`meta` に
+`codec` / `pix_fmt` / `lossless` 等の provenance を返す責任を持つ。ただし現行契約は
+任意の metadata を運ぶだけで、これらのキーを必須検査したり、`abValueUnit()` が
+`[DN]` 表示を自動で外したりはしない。Reader が誤った内容を宣言しても viewer は検証
+できない、という [input-adapters.md](../adapters/input-adapters.md) §6 の境界に含まれる。
 
 ## 7. 再現方法
 

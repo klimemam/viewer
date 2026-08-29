@@ -1,8 +1,13 @@
 # リモートのデータを手元から見る (`ssh://`)
 
-計算機に置いた大量の RAW/npy を、手元のマシンの viewer から開いて測るための仕組み。
-稼働中の機能です(プロトコル `VERSION = 9`、[core/remote_proto.h](../../../core/remote_proto.h) /
+計算機に置いた大量の画像・配列を、手元のマシンの viewer から開いて測るための仕組みです。
+稼働中の機能です(プロトコル `VERSION = 14`、
+[core/remote_proto.h](../../../core/remote_proto.h) /
 [core/serve.cpp](../../../core/serve.cpp) / [core/remote.cpp](../../../core/remote.cpp))。
+現在の対応範囲は `.npy`、PNG、JPEG、TIFF、単一 document の OpenEXR、y4m、
+レシピ付きのヘッダ無し RAW、`.npz` のメンバ、および peer 上で実行する Reader です。
+複数の named layer を持つ OpenEXR は、現行 wire がファイル内の layer を指せないため
+リモートでは名指しで拒否します。
 残っている制限は §8。
 
 ---
@@ -36,7 +41,7 @@ X11 に出るのはその矩形の描画コマンドだけ、**約 20 KB**。
 矩形か」の違いです。ローカルでは即時モードのほうが速い(状態同期のコストがない)。
 X11 という「ピクセルを転送する経路」に載せた瞬間だけ、単位の大きさが効いてくる。
 
-6.4 MB を 500 ms ということは、実効スループット 約 13 MB/s ≒ 100 Mbps 級の回線を
+6.4 MB を 500 ms ということは、実効スループットは約 13 MB/s ≒ 100 Mbps 級の回線を
 使い切っている計算です(概算)。回線を太くしても、単位が 6.4 MB のままなら
 1 Gbps でも 50 ms/frame = 20 fps 相当にしかなりません。**単位を変えないと直らない。**
 
@@ -54,24 +59,29 @@ flowchart LR
     X -.->|"キー / マウス"| V
 ```
 
-> 参考: [ARCHITECTURE.md 「性能の建付け」](../../../ARCHITECTURE.md#性能の建付け-計測してから議論する)
+> 参考: [ARCHITECTURE.md 「フレームループと描画」](../../../ARCHITECTURE.md#4-フレームループと描画)
 > の不変条件 4「アイドル時は描画しない」と「再描画ポリシー」節は、まさにこの
 > 「1 フレーム = 画面全体の転送」を前提にした縛りです。`wakeUi()` を毎フレーム呼ぶ経路を
 > 作ると、X11 越しでは 6.4 MB/frame を延々と流し続けることになります。
 
 ---
 
-## 2. 新しい設計 — GUI を転送するのをやめる
+## 2. 現行設計 — GUI を転送せず、最初の表示と完全な画素を分ける
 
 **転送するのは画素と数値だけ。GUI は転送しない。**
 
 - **UI は手元のマシンで動く。** ネイティブ実行(Windows / Linux / macOS)は本ツールの
   必須要件で、そこは変えません。ローカルの 0.4 ms/frame をそのまま維持します。
-- **リモートには同じバイナリを `--serve` で起動したものが待つ。**
+- **リモートでは headless の `viewer-serve --serve` が動く。**
   ウィンドウを作らず、OpenGL を初期化せず、ソケットも開かない。stdin から要求を読んで
-  stdout に返事を書くだけのプロセスです。
-- 手元の viewer は「ファイルを読む」代わりに「見えている領域を要求する」。
-  画面に出る画素の分だけが線を通ります。
+  stdout に返事を書くだけのプロセスです。GUI 本体の `viewer --serve` も検証用に同じ
+  protocol を話しますが、自動導入されるのは standalone の `viewer-serve` です。
+- 最初はフレーム全体を `max(w,h) <= 1600` になる `step` で間引いて取り、先に表示します。
+  正式 open なら、その後に**フレーム全体の全解像度 TILE**を別の ssh session で取得し、
+  到着時に間引き像と置き換えます。Browse の使い捨て preview も、元のフレームが
+  48 MiB 以下なら低優先度で全解像度を先読みします。
+- stack の残りの frame はメモリ予算に収まる分をバックグラウンド取得します。
+  全画素が要らない時間統計・ROI 統計は `MSG_MEASURE` で peer 側に計算させ、数値だけ返せます。
 
 ```mermaid
 flowchart LR
@@ -79,18 +89,21 @@ flowchart LR
         U["viewer 本体<br/>ImGui + OpenGL<br/>0.4 ms/frame のまま"]
     end
     subgraph R["リモート(データのある側)"]
-        S["viewer --serve<br/>ウィンドウなし / GL なし<br/>待ち受けソケットなし"]
+        S["viewer-serve --serve<br/>ウィンドウなし / GL なし<br/>待ち受けソケットなし"]
         D[("RAW / npy")]
         D -->|"必要な行だけ seek して読む"| S
     end
     U -->|"LIST / META / TILE / MEASURE<br/>数十バイトの要求"| S
-    S ==>|"見えている領域の間引き画素<br/>+ 測定結果の数値だけ<br/><b>視野が変わったときだけ</b>"| U
+    S ==>|"全体の間引き像 → 正式 open 後は全解像度<br/>+ peer で集計した数値"| U
     U -.->|"ssh の stdin/stdout パイプ 1 本"| S
 ```
 
-肝は 2 つ。**(1) 送るのは画面に映る分だけ**(12 Mpx ではなく 1.3 Mpx)、
-**(2) 送るのは視野が変わったときだけ**(毎フレームではない)。
-文字入力・ROI のドラッグ・メニュー操作では、**画素は 1 バイトも流れません**。
+要点は 2 つ。**(1) 最初の表示は間引いて待ち時間を短くする**、
+**(2) 解析は可能ならデータのある側で行い、画素列ではなく数値を返す**。
+現在の client は viewport ごとの部分 TILE をパンのたびに要求する方式ではありません。
+正式 open した 1 frame は最終的に全画素を手元へ置きます。文字入力・ROI のドラッグ・
+メニュー操作そのものは追加要求を出しませんが、先に open した全解像度 fetch が
+バックグラウンドで続いていることはあります。
 
 ---
 
@@ -99,7 +112,7 @@ flowchart LR
 手元の viewer が
 
 ```
-ssh -o BatchMode=yes user@host viewer --serve
+ssh -o BatchMode=yes user@host ~/.viewer/viewer-serve --serve --serve-readers
 ```
 
 を起動し、**その子プロセスの stdin/stdout と会話する**だけです
@@ -112,8 +125,8 @@ rsync も git も同じ方式で動いています(`rsync --server`, `git-upload
 | **デーモン常駐が要らない** | プロセスは接続中だけ生きる。viewer を閉じればパイプが閉じ、`readExact` が 0 を返して自然終了 |
 | **待ち受けソケットが存在しない** | サーバは `bind`/`listen` を一切しない。**攻撃面がない** — ssh を通っていない人はそもそも到達経路を持たない |
 | **認証は ssh が済ませている** | 独自の資格情報・トークン・TLS 証明書を持たない。鍵の運用は既存のまま |
-| **設定ファイルもトンネルも不要** | `~/.ssh/config` の Host エイリアスがそのまま使える。ProxyJump も踏み台もタダで乗る |
-| **バイナリ 1 個** | リモートに置くのは同じ `viewer` 実行ファイル。Python 環境もライブラリも要らない |
+| **設定ファイルもトンネルも不要** | `~/.ssh/config` の Host エイリアスがそのまま使える。ProxyJump や踏み台も追加実装なしで利用できる |
+| **peer は 1 実行ファイル** | リモートに置くアプリは headless の `viewer-serve`。native 形式を読むだけなら Python は不要で、Reader を使う場合は peer 側に Python + numpy が要る |
 
 `-o BatchMode=yes` を付けているので、**公開鍵認証(または ssh-agent / ControlMaster)が
 前提**です。パスワード入力を求められる接続は、GUI 側に打ち込む端末がないため
@@ -123,17 +136,20 @@ rsync も git も同じ方式で動いています(`rsync --server`, `git-upload
 
 ## 4. 何がネットワークを流れるのか
 
-プロトコルは [core/remote_proto.h](../../../core/remote_proto.h)。フレーミングは
-`[magic][type][len][payload]` の 12 バイトヘッダのみ。要求は 6 種類です。
+プロトコルは [core/remote_proto.h](../../../core/remote_proto.h) で定義しています。フレーミングは
+`[magic][type][len][payload]` の 12 バイトヘッダのみ。HELLO の後に使う要求は
+8 種類です。
 
 | メッセージ | 要求 | 返答 | 典型サイズ |
 |---|---|---|---|
 | `MSG_LIST` | パス | ディレクトリ項目(名前 / dir / サイズ / mtime / npy ヘッダの形状・dtype、連番は 1 グループ行に集約) | 数百 B 〜 数十 KB |
-| `MSG_META` | パス | `w, h, ch, dtype, frames` | **24 バイト** |
+| `MSG_META` | パス | `w, h, ch, dtype, frames` | **基本 24 バイト** + 宣言 shape 等の optional trailer |
 | `MSG_TILE` | パス + frame + 矩形 + `step` | 間引き済み画素(**元の dtype のまま**) | 下記 |
 | `MSG_MEASURE` | パス + ROI + アナライザ名 | 測定結果の数値 | 数十バイト〜数十 KB |
 | `MSG_GLOB` | ルート + パターン + 深さ/件数上限 | 一致した相対パス(打ち切りフラグ付き) | 数 KB |
 | `MSG_SCAN` | ルート + 深さ/件数上限 | サブフォルダごとのスタック一覧(リモート版 Open Folder) | 数 KB |
+| `MSG_READER_RUN` | 元パス + Reader/harness のテキスト | 実行結果、provenance、materialisation の鍵と木 | ヘッダと結果に依存 |
+| `MSG_NPZ_SCAN` | `.npz` のパス | メンバ名、npy ヘッダ、小さい補助配列、materialisation の鍵 | メンバ数に依存 |
 
 LIST の拡張・GLOB・SCAN はプロトコル 3。相手が 2 のときはサーバが v2 形式で
 LIST を返し、クライアントは形状・日時列を「-」表示にしてブラウズ自体は続く。
@@ -147,51 +163,54 @@ Browse パネルの表示モードと通信量の関係:
 | tree でノードを畳む | 0。子はキャッシュに残り、開き直しても 0 |
 | refresh / 別ホストへ接続 | キャッシュ破棄(次の展開で再取得) |
 
-### TILE の `step` が肝
+### TILE の `step` — 先に間引き像、後から完全な frame
 
-`TileReq` の `step` はサンプル間引きの刻みです。**「画面で見えている解像度以上は送らない」**
-という一点だけで、転送量が桁で変わります。
+`TileReq` の `step` はサンプル間引きの刻みです。現行 client の初回要求は viewport の
+矩形ではなく**フレーム全体**で、`step = ceil(max(w,h) / 1600)`。正式 open では同じ
+フレーム全体を `step = 1` でバックグラウンド取得し、最初の間引き像と置き換えます。
 
-**ケース A: 4000x3000 の f32 画像を 1000 px のペインにフィット表示**
+**ケース A: 4000x3000 の f32 画像を初めて表示**
 
 | | 値 |
 |---|---|
 | 元データ | 4000x3000 = 12 Mpx、f32 → ファイル上 48 MB |
-| ペイン高さ | 1000 px → `step = 3` |
-| 実際に送るサンプル数 | 1333 x 1000 = **1.33 Mpx**(12 Mpx ではない) |
-| 生バイト数 | 1.33 Mpx x 4 B = **5.3 MB** |
+| 初回の規則 | `ceil(max(4000,3000) / 1600)` → `step = 3` |
+| 最初に送るサンプル数 | 1334 x 1000 = **1.334 Mpx**(12 Mpx ではない) |
+| 最初の生バイト数 | 1.334 Mpx x 4 B = **約 5.3 MB** |
 | deflate 後 | **概算 2〜4 MB**(センサデータの圧縮率次第。クライアントは常に圧縮を要求) |
-| リモート側がディスクから読む量 | **概算 16 MB**(1000 行 x 4000 px x 4 B。48 MB 全部は読まない) |
-| 送るタイミング | **この 1 回だけ**。以後どれだけ操作しても再送なし |
+| 最初のリモート側ディスク読み | **概算 16 MB**(1000 行 x 4000 px x 4 B。`.npy` 等の場合) |
+| 正式 open 後 | 全体を `step = 1` で取得。生 48 MB (deflate 後はデータ依存) |
 
-**ケース B: 等倍(1:1)で一部を拡大**
+**ケース B: Browse の使い捨て preview**
 
 | | 値 |
 |---|---|
-| 見えている矩形 | 例 1000 x 700 px、`step = 1` |
-| 送るサンプル数 | 0.7 Mpx → 生 **2.8 MB**、deflate 後 概算 1〜2 MB |
-| ディスク読み | 700 行 x 1000 px x 4 B = **2.8 MB** |
+| 最初の表示 | ケース A と同じ、全体を `step = 3` で取得 |
+| 元フレームが 48 MiB 以下 | 低優先度で全体の `step = 1` fetch も開始 |
+| 48 MiB を超える | preview の間は間引き像のまま。正式 open への昇格時に全解像度 fetch |
 
-`step` は「そもそも見えない情報を送らない」ための仕掛けなので、
-**画像が大きくなっても転送量はペインの大きさで頭打ち**になります。
-12 Mpx でも 50 Mpx でも、1000 px のペインに映る限りコストはほぼ同じ。
+したがって `step` が抑えるのは**最初の表示までの転送量**です。正式 open した frame の
+総転送量は画像サイズに比例し、最終的には全解像度が手元に来ます。プロトコル自体は矩形を
+指定できますが、現行 client はパン／ズームごとの viewport TILE には使っていません。
 
 ### 送らないとき
 
 | 操作 | 流れるもの |
 |---|---|
-| 文字入力(ファイル名フィルタ、数値入力) | **0 バイト** |
-| ROI のドラッグ・リサイズ | **0 バイト**(統計は手元にあるタイルから計算) |
+| 文字入力(ファイル名フィルタ、数値入力) | 追加要求 0 |
+| ROI のドラッグ・リサイズ | 追加要求 0。peer 集計を実行したときだけ `MSG_MEASURE` |
 | メニュー・パネル配置・テーマ変更 | **0 バイト** |
 | 黒点/白点・ガンマ・カラーマップ変更 | **0 バイト**(表示変換は手元の画素に対して行う) |
-| パン / ズーム(視野が変わった) | TILE 1 回 |
-| フレーム送り(`←→`) | TILE 1 回 |
+| パン / ズーム(視野が変わった) | 追加要求 0。現在の frame 全体を resident にする設計 |
+| フレーム送り(`←→`) | resident なら 0。未取得 frame は全体の TILE をバックグラウンド取得 |
 
-X11 転送ではこの表の**全行が 6.4 MB** でした。そこが 300 倍の正体です。
+ここでの 0 は**その操作が新しい要求を作らない**という意味です。open によって既に始まった
+全解像度 fetch は並行して流れ続けます。X11 転送では UI の再描画自体が毎回ネットワークへ
+出るため、この違いは残ります。
 
-### ディスクからも必要分しか読まない
+### `.npy` / ヘッダ無し RAW はディスクからも必要分だけ読む
 
-[core/serve.cpp](../../../core/serve.cpp) の `readRegion()` は、フレームをメモリに載せません。
+[core/serve.cpp](../../../core/serve.cpp) の `readNpyRegion()` は、フレームをメモリに載せません。
 要求された行だけを `seekg` で拾い、**読みながら間引きます**。
 
 ```cpp
@@ -202,33 +221,39 @@ for (uint32_t y = y0, oy = 0; oy < outH; y += step, oy++) {
 }
 ```
 
-`y += step` なので、`step = 3` なら**行を 3 本に 1 本しか読まない**。48 MB のファイルに
+`y += step` なので、`step = 3` なら**3 行につき 1 行だけを読む**。48 MB の配列に
 対するディスク I/O は概算 16 MB で済み、ページキャッシュも汚しません
 (`NpyFile` の設計方針コメント: 「A reader, not a loader」)。
 `n.bigEndian` のバイトスワップもサーバ側で済ませるので、手元は素直に読めます。
+
+この部分読みの性質は、最初の `step > 1` 要求では `.npy`、レシピ付きヘッダ無し RAW、
+peer cache に materialise された `.npz` member / Reader 出力に適用されます。
+正式 open 後の `step = 1` fetch は frame 全体を読みます。PNG / JPEG / TIFF / OpenEXR / y4m は
+各 decoder が peer 側でファイルを復号してから、要求された矩形と step だけを TILE として
+返します。最初にリンクを流れる量は間引かれますが、codec のディスク I/O は部分読みとは
+限らず、正式 open の完了時には全解像度 frame がリンクを渡ります。
 
 ### MEASURE — 解析はデータのある側で
 
 `MSG_MEASURE` は「ROI とアナライザ名を送り、**数値だけ**返す」ための予約枠です。
 PRNU も e-SFR もノイズフロアも、入力は数 Mpx あっても出力は
 `mean=512.3, std=4.71, MTF50=0.31` のような**数十バイト**。
-画素をこちら側に引いてから測るのは、答えを得るために原料を輸送しているようなものです。
-解析プラグインはリモート側で走らせ、結果だけ持ってくるのが正しい。
+全画素を手元へ転送してから測るのは非効率です。
+解析プラグインをリモート側で実行し、結果だけを返す方式が適しています。
 
-set 解析(DSNU / PRNU / 分離フィット)も同じ線に乗りました。ただし set の入力は
+set 解析(DSNU / PRNU / 分離フィット)も同じ方式で実装済みです。ただし set の入力は
 **役割の付いた N 本の stack** なので、`MeasureReqHead` の平坦なパス列では
 「どこで1本が終わるか」を書けません。`MOP_SET_FOLD` は rois の後ろに
 **役割ブロック**を足してそれを言い、返すのは平面ごとの和だけ — 名前のある量は
-どれも手元で合成されます。480 枚の dark は計算機で畳まれ、リンクを渡るのは
+どれも手元で合成されます。480 枚の dark は peer 側で集計され、リンクを渡るのは
 スカラです。
 
 ---
 
 ## 5. 当初の「WebSocket ブリッジ」との関係
 
-[README のロードマップ項目 5](../../../README.md#ロードマップ)にある
-「WebSocket ブリッジ(ブラウザをリモートフロントエンドに)」は、
-**この設計と別物ではありません。同じ設計の transport 違い**です。
+初期ロードマップにあった「WebSocket ブリッジ(ブラウザをリモートフロントエンドに)」は、
+**この設計と別物ではありません。転送方式だけが異なります。**
 
 [core/serve.cpp](../../../core/serve.cpp) は最初からそう作ってあります。
 ハンドラ(`handleList` / `handleMeta` / `handleTile`)は、要求がどこから来て返事がどこへ
@@ -253,9 +278,10 @@ WebSocket 版は `g_sink` に別の関数を差して `handleRequest` を呼ぶ�
 | **フレーミング** | 12 B ヘッダ + payload | WebSocket バイナリフレームに同じ payload |
 | **認証** | ssh(既存の鍵運用のまま) | 別途必要(TLS + トークン等) |
 | **待ち受けソケット** | **なし** | 必要(= 守る対象が増える) |
-| **導入の手間** | リモートに同じバイナリを置くだけ | サーバ常駐・証明書・ポート開放 |
+| **導入の手間** | リモートに headless の `viewer-serve` を置くだけ | サーバ常駐・証明書・ポート開放 |
 
-ssh 版を先に作るのは、**同じ内部設計で攻撃面ゼロ・準備ゼロの経路が先に手に入る**からです。
+ssh 版を先に作るのは、**同じ内部設計で、新しい待ち受けポートや常駐プロセスを
+必要としない経路を先に実現できる**からです。
 WebSocket は「ブラウザから見たい」という要求が実際に出たときに、この上に足します。
 
 ---
@@ -263,25 +289,28 @@ WebSocket は「ブラウザから見たい」という要求が実際に出た�
 ## 6. 他の選択肢との比較
 
 前提: 12 Mpx f32(48 MB/枚)の連番 300 枚 = 14 GB がリモートにある。
-ウィンドウは 1600x1000、ペインは 1000 px。
+ウィンドウは 1600x1000。
 
 | 方式 | ネットワークを流れるもの | 速度 | 準備の手間 |
 |---|---|---|---|
 | **(a) `ssh -X` のまま** | **ウィンドウ全体のピクセル 6.4 MB を再描画のたびに** | **500 ms/frame、入力遅延 300 ms**(実測) | 不要。ただし遅さは構造的で、設定で直らない |
 | **(b) xpra** | ウィンドウ全体を**符号化 + 差分**して送る。単位は (a) と同じ「ウィンドウ全体」だが、H.264/VP8 と差分矩形で **1〜2 桁減**(概算 数十〜数百 KB/frame) | 操作は実用域に入る。ただし**非可逆符号化で画素値が変わりうる**——画質評価では致命的 | 両側に xpra を導入、セッション管理(`xpra start/attach`)、常駐プロセスあり |
-| **(c) sshfs でマウントしてローカル実行** | **ファイル丸ごと**。1 枚開くたび **48 MB**、連番 300 枚を舐めれば **14 GB** | 1 枚目の表示までに 48 MB 待ち。連番の一括ロード・フォルダ走査で全読みが走る | FUSE / sshfs の導入(macOS は特に面倒)、マウント権限、切断時のハング対策 |
-| **(d) 本方式 (`ssh://`)** | **見えている領域の間引き画素**(ケース A: deflate 後 概算 2〜4 MB)**と数値だけ**。しかも**視野が変わったときだけ** | UI は手元で 0.4 ms/frame。視野変更時だけ 1 往復待つ | **リモートに同じバイナリを置くだけ**。ポート・デーモン・設定ファイルなし |
+| **(c) sshfs でマウントしてローカル実行** | **ファイル丸ごと**。1 枚開くたび **48 MB**、連番 300 枚を走査すると **14 GB** | 1 枚目の表示までに 48 MB 待ち。連番の一括ロード・フォルダ走査で全読みが走る | FUSE / sshfs の導入(macOS は特に面倒)、マウント権限、切断時のハング対策 |
+| **(d) 本方式 (`ssh://`)** | 最初は**フレーム全体の間引き像**(ケース A: deflate 後 概算 2〜4 MB)。正式 open 後は全解像度 frame、peer 集計では数値だけ | UI は手元で 0.4 ms/frame。最初の間引き像を先に表示し、完全な frame は背景取得 | リモートに headless の `viewer-serve` を置くだけ。ポート・デーモン・設定ファイルなし |
 
 補足:
 
-- **(c) sshfs の本質的な問題**は「viewer が読みたいのは 1.3 Mpx なのに、ファイルシステムは
-  ファイル単位でしか話せない」こと。連番を「塊」として扱う viewer の設計(1 枚開くと同フォルダの
-  連番を裏で一括ロード)と最悪に噛み合います。**14 GB を引く前提の道具ではない。**
+- **(c) sshfs の本質的な問題**は、最初の間引き像や peer 集計だけが欲しい場面でも、
+  ファイルシステム層は画像の geometry や測定 op を知らないこと。正式 open 後の全解像度
+  frame 転送は本方式にもありますが、初期表示と server-side MEASURE を分けられる点が違います。
 - **(b) xpra は「送る単位」を変えていない**。ウィンドウ全体を送るのは同じで、符号化と差分で
-  絞っているだけ。だから絞るほど画素が信用できなくなる、という取引になります。
-  画素値をそのまま読みたい道具では選びにくい。
-- **(d) だけが送る単位そのものを変えています**。しかも `TileRep.dtype` は元の dtype なので、
-  **画素値は間引かれこそすれ、値としては厳密**です(u16 は u16 のまま、f32 は f32 のまま)。
+  絞っているだけです。そのため、転送量と画素値の信頼性がトレードオフになります。
+  画素値をそのまま読みたい viewer には適さない。
+- **(d) は UI の再描画ではなく、データ要求を送ります。** 最初の表示は `step` で間引き、
+  正式 open 後は全解像度 frame を resident にするので、「総転送量が常に画面サイズで
+  頭打ち」という方式ではありません。一方、`MSG_MEASURE` は画素全体ではなく集計値だけを
+  返します。`TileRep.dtype` は元の dtype なので、**届いたサンプル値は厳密**です
+  (u16 は u16 のまま、f32 は f32 のまま)。
 
 ---
 
@@ -292,42 +321,47 @@ viewer ssh://user@host/data/run42
 ```
 
 これだけ。内部では
-`ssh -o BatchMode=yes -o ConnectTimeout=10 user@host ~/.viewer/viewer-serve --serve`
+`ssh -o BatchMode=yes -o ConnectTimeout=10 user@host ~/.viewer/viewer-serve --serve --serve-readers`
 が起動し、`/data/run42` を LIST します(`remote.cpp` `Session::start`)。
 
 - リモート側の準備は**`~/.viewer/viewer-serve` があること**だけ。無ければ初回接続時に
-  自動導入します(サーバに git があれば binaries ブランチから、無ければ手元の
-  `viewer-serve` を ssh 越しに送り込む)。`--remote-exe <path>` で明示指定もできます。
+  自動導入します。まず手元の配布物またはビルドツリーにある対象 OS 用
+  `viewer-serve` を ssh 越しに送り、見つからない／送れない場合だけサーバ側の
+  git + network で `binaries` ブランチを取得します。`--remote-exe <path>` で
+  明示指定もできます。
 - `~/.ssh/config` の Host エイリアスがそのまま使えます(`ssh://dev-box/data/run42`)。
 - 既存のローカル起動は一切変わりません。パスがローカルなら従来通りローカルで読みます。
 
-デバッグ用に、ホストを空にするとローカルで `viewer --serve` を起動して同じ経路を通します
+デバッグ用に、ホストを空にするとローカルで `viewer --serve --serve-readers` を起動して同じ経路を通します
 (`Session::start` の `host.empty()` 分岐)。プロトコルの検証はネットワークなしでできます。
 
 ---
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 9`、[core/remote_proto.h](../../../core/remote_proto.h))の状態。
-**残っている制限だけ**を書く節です。済んだものを「これから」の顔で残さないこと —
-この節は一度それで嘘をつきました。
+現時点(プロトコル `VERSION = 14`、
+[core/remote_proto.h](../../../core/remote_proto.h))の状態。
+**残っている制限だけ**を書く節です。実装済みの項目を、未実装であるかのように
+残さないでください。この節には過去にその誤記がありました。
 
 | 項目 | 状態 |
 |---|---|
-| **対応フォーマット** | **`.npy` のみ**。`parseNpyHeader` が u8/i8/u16/i16/u32/i32/f32/f64 と 2〜4 次元の shape を扱う。`.npz` はサーバ側に無い(ローカルなら開ける) |
-| **`read as` / `re-read as…`** | **実装済み**([docs/features/adapters/input-adapters.md](../adapters/input-adapters.md) §3.3、`VERSION = 9`、issue #124)。META が**ファイルが宣言した shape** を運び(`MR_SHAPE` で本体の後ろに `[u32 ndim][u32 dims[4]]`)、META と TILE が**宣言された読み方**(`rp::NpyRead`)を受ける。peer 側は `serveLayout` が軸割り当てとストライドをやり直すので、`(48,40,1)` を `(F,H,W)` として読み直した TILE が**ローカルの読み直しと1画素も違わない**。古い peer はこの要求を**拒否しない** —— 末尾の4バイトを読まないまま自分の読み方で成功を返すので、client が **HELLO の数から送る前に断る**(`rp::npyReReadTooOldText`)。Inspector は行を出したうえで menu の代わりに理由を出す(押せない menu を出さない)|
-| **ベタ RAW** | 未対応。RAW はヘッダを持たないので、**手元で指定したレシピ(画素フォーマット x 解釈 x 寸法)をサーバに送る**必要がある。プロトコルに枠がまだない |
-| **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む。ローカルの loader は元から Fortran を読めたので、リンク越しだけ拒否するのは不整合だった([docs/guides/startup.md](../../guides/startup.md) の「まだ出来ないこと」もそう言っている) |
+| **対応フォーマット** | `.npy`、PNG、JPEG、TIFF、単一 document の OpenEXR、y4m。複数 named layer の OpenEXR は現行 wire が layer を指せず、誤って先頭だけを返さないため拒否する。ヘッダ無し RAW (`.bin .raw .yuv .dat .rggb`) は宣言したレシピを protocol 11 のトレーラで運ぶ。`.npz` は protocol 13 の `MSG_NPZ_SCAN` でメンバを列挙し、選んだメンバを既存の META/TILE 経路で読む。ベンダ RAW だけは LibRaw の配布条件により native peer では読まず、理由とローカル／Reader という代替手段を表示する |
+| **`read as` / `re-read as…`** | **実装済み**([input-adapters.md](../adapters/input-adapters.md) §3.3、protocol 9、issue #124)。META が**ファイルが宣言した shape** を運び(`MR_SHAPE` で本体の後ろに `[u32 ndim][u32 dims[4]]`)、META と TILE が**宣言された読み方**(`rp::NpyRead`)を受ける。peer 側は `serveLayout` が軸割り当てとストライドをやり直すので、`(48,40,1)` を `(F,H,W)` として読み直した TILE が**ローカルの読み直しと1画素も違わない**。古い peer は末尾を読まないため、client が HELLO の数から**送る前に断る** |
+| **ヘッダ無し RAW** | **実装済み**(protocol 11)。手元で指定したレシピ(画素フォーマット × 解釈 × 寸法)を META/TILE/MEASURE の各要求に載せ、peer が宣言どおりに読む。1クリック preview は幾何が未宣言なので行わず、正式に開くときにレシピを選ぶ |
+| **`.npz`** | **実装済み**(protocol 13)。peer はメンバの事実を列挙し、分類と picker は client のローカル経路と同じものを使う。単一 image member は picker 無しで開く。コンテナ自体には単一 geometry がないため、Browse の1クリック preview は行わない |
+| **Reader** | **stage 0〜5 実装済み**(protocol 12〜14)。Reader はファイルのある peer で走り、META/TILE と鍵付き MEASURE は materialisation の同じ生成物を参照する。鍵付き subject で現在走るのは temporal / frame ROI stats の2 op。人が読む source 名を欠く plugin analyzer / set fold と、Ref の名前空間を束縛できない set-bearing Reader の返り値は名指しで拒否する。実行には peer の `--serve-readers` が必要で、通常の viewer の ssh/local session はこのフラグを付けて起動する。standalone peer 自体の既定は閉 |
+| **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
-| **`MOP_PLUGIN_ANALYZE`** | **実装済み**([docs/reference/abi-v3.md](../../reference/abi-v3.md) §10、`VERSION = 7`)。プラグインの **name + version が等値** のときだけ peer で走る。不一致は**両方の版を並べて拒否**し、黙って手元実行に振り替えない。frame / stack の両方に届き、stack は peer が1枚ずつ読んで `release_frame` で区画を返す(§9.2 の窓)。返答は peer 自身の帳簿(name / version / dll / フルパス)を provenance として運ぶ。version を宣言しない V1/V2 記述子は**照合できないので拒否**され、名前だけで一致する従来の `MOP_ANALYZER` に残る。`VIEWER_SERVE_PLUGINS` で peer のプラグイン探索先を足せる |
-| **`MOP_SET_FOLD`** | **実装済み**([docs/analysis-layers.md](../../analysis-layers.md) §3.5 / §6、`VERSION = 8`)。set 解析の**畳み込みだけ**が peer で走り、DSNU / PRNU / 分離フィットという**名前のある量は全部こちらで合成する**。要求は rois の後ろに**役割ブロック**(役割名 + そのパス数 + frame 範囲)を足したもの — set は「役割 → stack」で、平坦なパス列だけでは区切りを書けないため。返るのは役割ごと平面ごとの (ΣM, ΣM², ΣC, n) と遮蔽量、つまり数値だけ。**画素ごとの差**を要する直接 PRNU は peer 側で差画像を作って落とす(モーメントから組み直すと局所と別の binary64 になる)。パリティは組み込みなので name+version ではなく**畳み込みが宣言する form の等値**で、不一致は両方の form を並べて拒否する。古い peer は op 番号で拒否するので、client は送る前に数から拒否して「古い」と「不一致」を言い分ける。`VIEWER_SERVE_PROTOCOL` で peer を古い版として喋らせられる(試験用) |
-| **先読み(prefetch)** | 実装済み(`rfWorker`)。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
+| **`MOP_PLUGIN_ANALYZE`** | **実装済み**([abi-v3.md](../../reference/abi-v3.md) §10、protocol 7)。プラグインの **name + version が等値** のときだけ peer で走る。不一致は**両方の版を並べて拒否**し、黙って手元実行に振り替えない。frame / stack の両方に届き、返答は peer 自身の記録を provenance として運ぶ |
+| **`MOP_SET_FOLD`** | **実装済み**([analysis-layers.md](../../analysis-layers.md) §3.5 / §6、protocol 8)。set 解析の畳み込みは peer で走り、DSNU / PRNU / 分離フィットという名前のある量は client で合成する。返るのは役割ごと平面ごとの集約値で、画素列そのものは渡さない |
+| **先読み(prefetch)** | 実装済み(`rfWorker`)。最初の全体間引き像の後、正式 open した frame を `step = 1` で全体取得する。frame 軸／連番の残りもメモリ予算内で取得する。`Session` は**スレッドセーフではない**ので、**1 つの `Session` には所有スレッドが 1 つだけ**という規律で回す(下の所有表)。共有して mutex で守るのは誤り — 片側しか取らない mutex は何も守らないし、両側が取れば片方のネットワーク I/O の間じゅう他方が止まる |
 | **`ssh://` の CLI 配線** | **配線済み**。`openPath` が `ssh://` と `local://` を受け、`viewer ssh://host/path.npy`(ファイル)と `viewer ssh://host/~/dir`(接続してそこを Browse)の両方が起動パス。`--help` にも出る |
 | **LIST のファイルサイズ** | 64 bit。u32 の lo/hi 2 本で送る(`serve.cpp`、`remote_proto.h` の mtime と同じ形) |
 | **圧縮** | deflate(miniz)固定、level 6。クライアントは常に要求し、縮まなかったときだけ生で返る |
-| **並列・キャンセル** | なし。1 要求 1 返答の同期往復。`rp::Header` に要求 ID が無いので、パン中に古い要求を捨てる仕組みも入れられない(下の所有表がその帰結) |
+| **並列・キャンセル** | 1 session 内ではなし。1 要求 1 返答の同期往復。用途ごとに session を分けて並行させるが、`rp::Header` に要求 ID が無いため、送信済みの古い full-fetch 等を応答単位で捨てる protocol cancellation は無い(下の所有表がその帰結) |
 
-### `Session` の所有(鉄則)
+### `Session` の所有規則
 
 `rp::Header` には**要求 ID が無い**。`Session::recv` は「次に届いたヘッダ」を
 そのまま消費するので、2 スレッドが 1 本の ssh の stdin にフレームを書けば
@@ -350,17 +384,16 @@ viewer ssh://user@host/data/run42
 **次にやること**(優先順)。上の表で「実装済み」のものはここに書かない:
 
 1. 古い要求のキャンセル。まず `rp::Header` に要求 ID を足す(VERSION を上げる)ところから。
-   これが無いうちは並列化もできない
-2. RAW レシピの転送(META 要求にレシピを添える形が有力)
-3. WebSocket transport(`ReplySink` を差し替えるだけ。§5 参照)
+   これが無いうちは 1 session 内の多重化もできない
+2. WebSocket transport(`ReplySink` を差し替えるだけ。§5 参照)
 
 ---
 
 ## 関連
 
 - [core/remote_proto.h](../../../core/remote_proto.h) — ワイヤフォーマットの定義
-- [core/serve.cpp](../../../core/serve.cpp) — `viewer --serve`。`readRegion()` が間引き読みの本体
+- [core/serve.cpp](../../../core/serve.cpp) — `viewer-serve`。要求処理と間引き読みの本体
 - [core/remote.cpp](../../../core/remote.cpp) — 手元側の `Session`
-- [ARCHITECTURE.md 「性能の建付け」](../../../ARCHITECTURE.md#性能の建付け-計測してから議論する) —
+- [ARCHITECTURE.md 「フレームループと描画」](../../../ARCHITECTURE.md#4-フレームループと描画) —
   毎フレーム処理の不変条件と再描画ポリシー。`View > Low bandwidth` もここ
-- [README ロードマップ](../../../README.md#ロードマップ) — 項目 5 の WebSocket ブリッジ
+- [README リモート](../../../README.md#リモート-ssh) — 利用者向けの案内

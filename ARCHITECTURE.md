@@ -24,7 +24,8 @@
 
 ### アプリケーションが1ファイルであること
 
-GUI のほぼ全体 (`core/main.cpp`、約 29,000 行) は1つの翻訳単位です。
+GUI 本体は `core/main.cpp` が `core/app/*.inc`、`core/ui/*.inc`、selftest 断片などを
+取り込む1つの翻訳単位です。
 これは事実として受け入れてください。ここでの結合は「パネルが `App` という1つの
 状態を共有し、1フレームの中で順に描かれる」というもので、ヘッダに切り出しても
 その結合は減らず、`static` な内部関数が公開シンボルに変わるだけです。
@@ -35,28 +36,34 @@ GUI のほぼ全体 (`core/main.cpp`、約 29,000 行) は1つの翻訳単位で
 
 ## 2. 層モデルと、それを守っている場所
 
-`frame ⊂ stack ⊂ series ⊂ batch` は厳密な包含です。層の**省略**はできますが
-(単発 frame が batch に直接ぶら下がる、どの series にも属さない stack がある)、
-**順序を飛び越えることはしません**。
+データ層の順序は `frame ≼ stack ≼ series` です。これは集合包含ではなく、存在する
+中間層がこの順序を守るという意味です。各層は単独でも存在でき、stack を省略した
+standalone frame の series 参加や、どの series にも属さない stack は合法ですが、
+順序の逆転はしません。
+frame / stack / series は batch に `managed-by` され、AnalysisSet はそれらを
+`role-ref` します。batch は管理境界、AnalysisSet は役割参照で、どちらもこの順序の
+続きではありません。
 
-| 層 | 実体 | 同一性 |
+| 語 | 実体 | 同一性 / 関係 |
 |---|---|---|
 | frame | `ImageDoc` | `ImageDoc::uid` (`uint64_t`) |
 | stack | `App::SeqInfo` | `SeqInfo::id`、frame 側は `ImageDoc::seqId` |
 | series | `App::Series` | `Series::id`。所属は **`Series::members` が唯一の真実** |
-| batch | `App::Batch` | `Batch::id`、frame 側は `ImageDoc::batchId` |
+| AnalysisSet | `App::ASet` / `App::ASetRole` | set は1つの batch に管理され、role は frame / stack / series を参照 |
+| batch | `App::Batch` | `Batch::id`、データ側は `batchId` |
 
 守られている場所:
 
 - **Close の粒度** — `closeCurrent()` は frame が stack の一員なら **stack ごと**
   閉じます。1枚だけ閉じる逃げ道は `Ctrl+Alt+W` です。
-- **series の所属** — `SeqInfo` に `seriesId` は**ありません**。2箇所が同じ事実を
-  持つと必ずずれるので、逆引きは `seriesOfStack` が数個の series を走査します。
+- **series の所属** — `SeqInfo` / `ImageDoc` に `seriesId` は**ありません**。2箇所が
+  同じ事実を持つと必ずずれるので、逆引きは `seriesOfStack` / `seriesOfFrame` が
+  数個の series を走査します。
 - **series は自動で作らない** — フォルダ構造からの推測は、外れたときに黙って嘘の
-  掃引を作ります。作る経路は picker / Files の「Group as series」/ Linearity パネルの
+  掃引を作ります。作る経路は picker / Files の「Group as series」/ Series Analysis パネルの
   3つだけで、自動生成は `--lin-selftest` の `selftestMakeSeries` にしかありません。
-- **series は1つの batch に収まる** — またぐ必要が出たら、先にメンバを同じ batch へ
-  移してから作ります。
+- **series とメンバは同じ batch に管理される** — またぐ必要が出たら、先にメンバを
+  同じ batch へ移してから作ります。これは包含ではなく管理関係の不変条件です。
 - **単位と値は「未設定」を持つ** — `Series::unit` の空文字は「未設定」であって
   既定値ではなく、`Member::value` の NaN は 0 ではありません。0 は測定値
   (linearity では暗電流 stack) なので、読めない文字列が 0 に落ちてはいけません。
@@ -159,8 +166,8 @@ CLI から analyzer を指定できます)。
 | Inspector | `drawInspector` |
 | Histogram | `drawPanelHistogram` |
 | Projection (H/V) | `drawPanelProjection` |
-| Temporal | `drawPanelTemporal` (+ `drawTemporalAB`、`drawFrameLinSection`、`drawBrowseTemporal`) |
-| Linearity | `drawPanelLinearity` (+ `drawSeriesModal`) |
+| Temporal | `drawPanelTemporal` (+ `drawTemporalAB`、`drawBrowseTemporal`) |
+| Series Analysis | `drawPanelSeriesAnalysis` (+ `drawSeriesModal`) |
 | ROIs | `drawPanelRois` |
 | Analysis | `drawPanelAnalysis` (+ `drawAnalysisPlots`) |
 | Messages | `drawMessagesPanel` |
@@ -244,18 +251,14 @@ rp:: (core/remote_proto.h, core/serve.cpp)
 スカラはリトルエンディアンのパック、文字列は `[u32 len][bytes]`、64bit 値は
 lo/hi の u32 対。クライアントは 512MB 超の返信を、サーバは 64MB 超の要求を拒みます。
 
-**バージョン** — `rp::VERSION = 9`。HELLO で双方向に交換し、サーバはクライアントの
+**バージョン** — `rp::VERSION = 14`。HELLO で双方向に交換し、サーバはクライアントの
 版に合わせて LIST の形を選び、クライアントは機能を版で gate します。
-番号が動く理由は2種類あり、**どちらもワイヤ形式とは限りません**。v4/v5/v6 は
-形式を一切変えず**意味**だけを縛りました (連番のグループ化規則、表示パターンの
-範囲表記、`sigma_fpn` が補正済みの量になったこと) — 古い peer が黙って違う答えを
-返すのを防ぐためです。v7/v8/v9 は枠が増えた側で、それでも番号を上げる理由は
-**拒否が読めること**: 古い peer の「unknown measure op」は打ち間違いの拒否と
-区別がつかないので、client が**送る前に**数から断って「古い」と「不一致」を
-言い分けます。v9 だけは逆向きで、古い peer は**拒否しません** — TILE 末尾の
-宣言された読み方を読まないまま自分の読み方で成功を返すので、番号が無ければ
-「間違った絵が正しいラベルで出る」ことになります (issue #124)。
-理由は `core/remote_proto.h` の `VERSION` の上に版ごとに書いてあります。
+番号が動く理由は**枠の変更だけではありません**。v4〜v6 は応答の意味、v7〜v9 は
+測定 op と宣言された配列の読み方、v10 は画像形式、v11 は宣言付き headerless RAW、
+v12 は peer 上の reader、v13 は `.npz` member、v14 は materialise された配列の
+keyed measure を境界にします。古い peer が黙って別の画素や測定を返し得る機能は、
+client が**送る前に**版から拒否します。版ごとの理由と wire 上の差分の正典は
+`core/remote_proto.h` の `VERSION` 直前です。
 
 | opcode | 何をするか |
 |---|---|
@@ -266,11 +269,15 @@ lo/hi の u32 対。クライアントは 512MB 超の返信を、サーバは 6
 | `MSG_MEASURE` | サーバ側の測定。analyzer / temporal stats / frame ROI stats |
 | `MSG_GLOB` | 再帰検索 |
 | `MSG_SCAN` | サブツリーの stack 発見 (リモートの Open Folder) |
+| `MSG_READER_RUN` | reader の3テキストを peer へ運び、許可された peer 上で実行 |
+| `MSG_NPZ_SCAN` | `.npz` の member 一覧と materialisation key を返す |
 | `MSG_OK` / `MSG_ERR` | 成功 / エラー文字列 |
 
-**peer は「読み手」であって「ローダ」ではありません。** `.npy` のヘッダを解析して
-seek し、要求された行だけを読みます。フレーム全体をメモリに置く箇所はありません。
-ビッグエンディアンはサーバ側で byteswap します。
+peer は `.npy` だけでなく、viewer と共有する形式表に従って PNG / JPEG / TIFF /
+OpenEXR / y4m を読み、宣言付き headerless RAW、`.npz` member、reader 出力も扱います
+(vendor RAW は配布ライセンス上 peer 対象外)。回線を渡るのはファイル全体ではなく、
+`MSG_TILE` が要求した領域と測定結果です。`.npy` はヘッダを解析して必要な行を seek し、
+ビッグエンディアンなら peer 側で byteswap します。
 
 **サーバ側で走るもの:** 一覧、メタ、領域読み出し、検索、そして**測定**
 (per-pixel の temporal stats、per-frame ROI stats、および `dlopen` した
@@ -369,17 +376,16 @@ autosave」を選びます。
 
 ## 10. セルフテスト
 
-GUI を出さず、stderr に `<name>selftest: ...` を出して 0/1 で終了します。
-**22個**あり、`--help` に載っているのは8個です。
-`--browse-keys-selftest` だけが実際に ImGui のフレームを回します
-(隠しウィンドウ)。
+多くは GUI を出さず、stderr に `<name>selftest: ...` を出して 0/1 で終了します。
+登録一覧・本数・GL 要否の正典は `CMakeLists.txt` の `viewer_selftest(...)` と
+`add_test(...)` です。以下は代表的な検査です。
 
 | フラグ | 何を守っているか |
 |---|---|
-| `--verify-selftest <dir>` | 他が取りこぼす角: 非連続 stack、compare-B の dangling、prune と `closeBatch`、batch 名の衝突、preview をセッションに書かないこと、4面モザイク統計、DN 表記、n=N/N の正直さ、NaN の除外、メモリ予算の勘定、CFA プレーン別のヒストグラム/ROI 抽出 (V1-V18) |
+| `--verify-selftest <dir>` | 他が取りこぼす角: 非連続 stack、compare-B の dangling、prune と `closeBatch`、batch 名の衝突、preview をセッションに書かないこと、4面モザイク統計、画素値の単位表記、n=N/N の正直さ、NaN の除外、メモリ予算の勘定、CFA プレーン別のヒストグラム/ROI 抽出。V群の番号と範囲の正典は `core/selftest/verify.inc` |
 | `--lin-selftest` | series のリニアリティ/PTC が、仕込んだ感度・ゲインを取り戻せること |
-| `--frame-lin-selftest` | フレーム毎リニアリティ。厳密な平均を持つ合成 stack で R²=1、+2% の折れの検出、両方のフィット手法、n-of-N とエクスポート、軸未設定の空状態 |
 | `--series-selftest <dir>` | series モデルの不変条件を、変更のたびに `seriesAudit` で全数検査 |
+| `--seriespanel-selftest <dir>` | Series Analysis の frame / stack 混在メンバ、fold、fit 範囲と手法、session 往復を検査 |
 | `--sweepfile-selftest <dir>` | 1レベル1ファイル (フレーム軸つき `.npy`) の掃引。名前がローカルとリモートで一致すること、1 series になること、フィットが仕込み値を返すこと |
 | `--abstats-selftest <dir>` | 5つの統計パネルの2スロット化。B の数値を第2実装と 1e-6 で照合、A が compare-off と**バイト一致**すること、stack 属性の temporal が frame 送りで再計算されないこと |
 | `--tile-selftest <dir>` | side-by-side のペイン幾何を算術として (この機械では GL が白を返すため)。スロット順、重なり無し、全ペインで1つのズーム |
@@ -387,7 +393,7 @@ GUI を出さず、stderr に `<name>selftest: ...` を出して 0/1 で終了�
 | `--newwin-selftest <dir>` | autosave の枠取り、stale lock の回収、復旧の提示、secondary が prefs を書かないこと、`newWindowArgv` が組む argv の完全一致 |
 | `--export-selftest <dir>` | 画を外に出す経路をバイト列で。PNG の IHDR、montage の寸法と CFA 位相、タイル0が frame0 の ROI と画素一致 |
 | `--export-tsv-selftest <dir>` | Temporal 統一エクスポートの文字列 — 見出し、素性行、単位、n-of-N、領域の申告、CSV 方言、フレーム軸の往復 |
-| `--roi-export-selftest` | ROIs の表を文書として (#67)。座標規約の申告、`x/y/w/h` が列であること、All 行が side 自身のフレーム、収まらない side の `-` と理由、plane 行と pooled `all`、ASCII、コンボ非反映 |
+| `--roi-export-selftest` | ROIs の表を文書として (#67)。座標規約の申告、`x/y/w/h` が列であること、All 行が side 自身のフレーム、収まらない side の `-` と理由、plane 行と pooled `all`、生成構文の ASCII と利用者文字列の UTF-8、コンボ非反映 |
 | `--framestats-selftest` | per-frame TSV を stdout に出す (numpy で再現するための golden 出力。内部アサート無し) |
 | `--range-selftest <dir>` | A/B の表示レンジの全組み合わせ、軸の命名、追従、auto の再フィット |
 | `--picker-selftest <dir>` | picker の5ユースケース (merge、フィルタ、トップフォルダ毎の batch、単一フレーム) |
@@ -413,13 +419,12 @@ CI (`.github/workflows/build.yml`) は **windows / ubuntu / macos の3面マト�
 自分の名乗るより小さい仕事の数字になり得ます (ba40ba8 から 815173c までが実際にそれ)。
 同じ表明は `selftest.benchcov` として3面マトリクスの中にもあります。
 
-**セルフテストは3面すべてで走ります** (`tools/run_selftests.sh` が CI と手元の
-共通入口)。22本のうち実 ImGui フレームを描く5本 (`browse-keys` / `abstats` /
-`verify` / `tile` / `frame-lin`) だけが GL コンテキストを要り、Linux では
-xvfb + ソフトウェア GL で走ります。残り17本は `--no-window` 起動経路
-(ウィンドウも GL も作らない) を通るので、GL の無い windows / macos ランナーでも
-走ります。どちらに属するかは `CMakeLists.txt` の `viewer_selftest(...)` 行の
-`NOGL` の一語が唯一の宣言で、この語がラベルと `--no-window` の両方を出します。
+**同じセルフテスト入口を3面すべてで使います** (`tools/run_selftests.sh` が CI と手元の
+共通入口)。ImGui フレームを描く検査は Linux で xvfb + ソフトウェア GL を使い、
+`NOGL` の検査は `--no-window` 起動経路 (ウィンドウも GL も作らない) を通るので、
+GL の無い windows / macos ランナーでも走ります。どちらに属するかは
+`CMakeLists.txt` の `viewer_selftest(...)` 行の `NOGL` が唯一の宣言で、この語が
+ラベルと `--no-window` の両方を出します。
 走れなかったものは**名指しで** skip と報告され、pass には決してなりません。
 
 ---
@@ -432,8 +437,9 @@ xvfb + ソフトウェア GL で走ります。残り17本は `--no-window` 起�
 - **B-1 σ_t は stack の属性であって frame の属性ではない。**
   per-frame の表に `sigma_t` 列を作らない。エクスポートの temporal 要約は
   「stack statistics」と名乗る。
-- **B-2 CFA プレーンを統計で混ぜない。** モザイクなら R/Gr/Gb/B は常に別系列で、
-  プールした列を出さない。ヒストグラムも ROI 統計もアナライザも同じです。
+- **B-2 CFA プレーンを黙って混ぜない。** モザイクの R/Gr/Gb/B は個別系列として
+  保持する。明示的な `all` 集計は別測定と名乗り、plane 水準差が std に入ることを
+  表示する。ヒストグラム、ROI 統計、アナライザで同じ規則を使います。
 - **B-3 部分ロードは「何枚中何枚か」を必ず併記する。** 裸の件数は不足を隠します。
   `resident n of N frame(s)`、表には `n` と `N` の列。
 - **B-4 ラベルに乗った量は単位を連れる。** `sigma_t [DN]`、`sigma_frame [%]` —

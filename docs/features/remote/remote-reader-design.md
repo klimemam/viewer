@@ -5,6 +5,11 @@
 そのとおり実装する — を受けた設計。対象は verify-matrix **G11**
 (「決定はあるが実装が無く、拒否文もそれを言わない」、`docs/verification/matrix.md:640`)。
 
+> **現行追記:** stage 0〜5 は 2026-08-17 に protocol 12〜14 として実装済み。
+> §0、§7、§8〜§10 は現行契約・境界・実装台帳、§1〜§6 は実装前設計記録として
+> 読む。途中の `VERSION 12` / `MRF_READER` 案より、§8 の実装注記と
+> `core/remote_proto.h` の現行版を優先する。G11 は解消済み。
+
 読んだもの: `docs/features/adapters/input-adapters.md` §4.12/§4.12.1/§4.13〜§4.13.2 /
 `core/remote_proto.h` (protocol 11 全注釈) / `core/serve.cpp` /
 `core/app/open_dispatch.inc` (`openRemote` :1819〜) / `core/app/session.inc`
@@ -19,24 +24,24 @@
 
 | # | 問い | 決定 |
 |---|---|---|
-| 1 | 許可の形 | **peer プロセスの起動引数 `--serve-readers`(既定 閉)**。環境変数でも同梱ディレクトリでもない。#179 裁定 C はリンクを越えても成立する: client 側は memo/picker だけが起動でき (変更なし)、peer 側の同意は「その旗を立ててプロセスを起動した者」に付く。ssh では起動者 = client のユーザー自身 = 既に shell 権限を持つ者なので、旗は ssh に対しては新権限を与えない。旗が守るのは **ssh でない起動者** (将来の WebSocket front、serve.cpp :641 の注釈が名指しする転送) である |
-| 2 | adapter ファイルの所在 | **クライアントから運ぶ** (reader 1 ファイル + `viewer_import.py` + `run_adapter.py` の 3 テキスト)。peer 側常設 (名前で解決) は採らない — §4.13.1 自身の文言・#148 の「同名別バイトの静かな分岐」・配備コスト・provenance の 4 点で負ける (§3) |
+| 1 | 許可の形 | **peer プロセスの起動引数 `--serve-readers`**。実行ファイル自身の既定は閉だが、現行 `remote::Session` は通常の ssh/local peer をこのフラグ付きで起動する。環境変数でも同梱ディレクトリでもない。#179 裁定 C はリンクを越えても成立する: client 側は memo/picker だけが起動でき (変更なし)、peer 側の同意は「そのフラグを指定してプロセスを起動した者」に付く。ssh では起動者 = client のユーザー自身 = 既に shell 権限を持つ者なので、フラグは ssh に対しては新権限を与えない。フラグが保護するのは **ssh でない起動者** (将来の WebSocket front、serve.cpp :641 の注釈が名指しする転送) である |
+| 2 | adapter ファイルの所在 | **クライアントから運ぶ** (reader 1 ファイル + `viewer_import.py` + `run_adapter.py` の 3 テキスト)。peer 側常設 (名前で解決) は採らない — §4.13.1 自身の文言・#148 の「同名別バイトの静かな分岐」・配備コスト・provenance の 4 点で不利になる (§3) |
 | 3 | プロトコル | **FRAMING の版上げ** (7/8/11 と同種)。新 op `MSG_READER_RUN = 8`。META/TILE/MEASURE は**末尾追記のトレーラ** (`[str key][u32 node]`)。client は **送る前に** HELLO の数で断る (`readerTooOldText` / `measureKeyedTooOldText`) — 古い peer はトレーラを黙って読まないので、#124 型の「正しいラベルの下の違う画素」が起きうるため (§4.2)。**出荷は 1 版ではなく 3 版**: 12 = RUN と META/TILE のトレーラ (PR #218)、13 = `MSG_NPZ_SCAN` (PR #221)、**14 = MEASURE の鍵トレーラ**。MEASURE のビットの綴りは **`MRF_KEYED`** (値 2) —— 鍵は materialisation を指し、reader はその出自の 1 つに過ぎない。以下 §4 が現在形で書く「VERSION 12 / `MRF_READER`」は**当初案の綴り**で、確定は §8 stage 3 注 ② と stage 5 注 ①、台帳は §9 |
-| 4 | MSG_TILE の原則 | **そのまま成り立つ**。reader が peer で materialise した画素の「source dtype」は **reader が宣言した dtype** (harness の 9 種、`b1` は serve.cpp :267 の既存表どおり `DT_U8`)。ファイルバイトも変換結果全体も回線を渡らない — 渡るのはヘッダ (テキスト) と間引きタイルと測定結果だけ (§4.3) |
-| 5 | #44 との接続 | peer 上で `run_adapter.py --stream → ファイル` (凍結済みの枠付き v1、0.268 s/151 MB)。**キャッシュファイルがそのまま配布面**: `.vstream` の blob は C-order 連続なので、`openRaw` (serve.cpp :568) と同じ「offset + stride の ServedFile」で `readNpyRegion` が無改造で読む。キャッシュ鍵の mtime/size は **peer の stat** (§5) |
+| 4 | MSG_TILE の原則 | **そのまま成り立つ**。reader が peer で materialise した画素の「source dtype」は **reader が宣言した dtype** (harness の 9 種、`b1` は serve.cpp :267 の既存表どおり `DT_U8`)。元ファイルと `.vstream` キャッシュをファイルとして転送せず、最初の全体間引き像と、正式 open 後の全解像度 frame を既存 TILE で返す。MEASURE は集計値だけ (§4.3) |
+| 5 | #44 との接続 | peer 上で `run_adapter.py --stream → ファイル` (凍結済みの枠付き v1、0.268 s/151 MB)。**キャッシュファイルをそのまま転送元に使う**: `.vstream` の blob は C-order 連続なので、`openRaw` (serve.cpp :568) と同じ「offset + stride の ServedFile」で `readNpyRegion` が無改造で読む。キャッシュ鍵の mtime/size は **peer の stat** (§5) |
 | 6 | 失敗の報告 | RUN 応答は `adapter::Run` が分けている 4 事実 (started / timedOut / exit / stderr) を**そのまま**運ぶ。文面は `readerFinish` (session.inc :1631) の文を関数に括って両経路で共有し、**機械名を足す** — 「どの python が無いのか」は machine を言わなければ直せない (§6) |
 
-段階は 0〜5 (§8)。**stage 0 (拒否文が事実を言う) は設計から独立した Opus 仕事**で、
-即日切り出せる。
+段階は 0〜5 (§8) で、すべて実装済み。stage 0 は本体のワイヤ変更に先行できる
+独立作業として設計され、実装時にもその境界を保った。
 
 ---
 
-## 1. 何が欠けているか — G11 の現状
+## 1. 実装前に何が欠けていたか — G11 の当時の状態
 
 - `docs/features/adapters/input-adapters.md` §4.13.1 (:1241) は 2026-08-03 に決めている:
   「データが向こうにあるのに adapter を手元で走らせると、生ファイルを転送してから
   変換することになる … **したがって adapter は peer 側で走る**」。
-- `core/serve.cpp` にその口は無い。あるのは `MOP_PLUGIN_ANALYZE` (ABI v3 の
+- `core/serve.cpp` に該当する処理経路はない。あるのは `MOP_PLUGIN_ANALYZE` (ABI v3 の
   解析プラグイン、serve.cpp :2491) で別物。
 - `openRemote` (open_dispatch.inc :1847) は `peerServesName` が false のとき
   reader を提案せず断り、拒否文 (`imagefile::peerRefusal` の fall-through、
@@ -56,7 +61,7 @@
 
 ---
 
-## 2. 許可の形 — 門は「起動した者」に付く
+## 2. 許可の形 — 起動者が同意を示す
 
 ### 2.1 決定
 
@@ -66,10 +71,10 @@
   固有の一文で断る:
   `"this peer was started without --serve-readers: whoever starts viewer-serve
   decides whether readers sent by a client may run here"`。
-- client (v12) は ssh / local:// の peer を起動するとき**常にこの旗を付ける**
+- client (v12) は ssh / local:// の peer を起動するとき**常にこのフラグを付ける**
   (`core/remote.cpp` :342/:352 の argv に 1 語)。
 - `VIEWER_SERVE_PROTOCOL` (serve.cpp :669) で v11 を演じる peer は op 自体を
-  `unknown request` で断る — 「旗が閉じている v12」と「op を知らない v11」が
+  `unknown request` で断る — 「フラグが指定されていない v12」と「op を知らない v11」が
   試験で区別できること。
 
 ### 2.2 なぜこの形か — #179 裁定 C がリンクを越えても成り立つ読み方
@@ -86,30 +91,30 @@
 2. **この機械で他人のコードが走ってよいか** — peer 側の同意。その実体は
    「`--serve-readers` を付けてプロセスを起動した」という行為である。
    **peer は memo も session も hint も一切読まない** — peer にコードを
-   走らせうる唯一のものは、v12 client が明示に送った RUN 要求 × 開いた旗、
+   走らせうる唯一のものは、v12 client が明示に送った RUN 要求と有効なフラグの組み合わせ、
    の積である。文書がコードを走らせる経路は両側に存在しない。
 
-**ssh ではこの旗は新しい権限を与えない**ことを正直に書いておく: この転送の
+**ssh ではこのフラグは新しい権限を与えない**: この転送の
 認証モデルは「ssh already did the authentication」(remote_proto.h 冒頭) で、
-`viewer-serve` を起動できる者は同じ手で `python` を起動できる。旗を立てるのが
-client なのは矛盾ではなく、**既に持っている権限の行使**である。旗が実質を持つのは
+`viewer-serve` を起動できる者は同じ権限で `python` を起動できる。フラグを指定するのが
+client なのは矛盾ではなく、**既に持っている権限の行使**である。フラグが実質的な制限になるのは
 handler が意図的に転送非依存 (serve.cpp :641「same requests, same replies」) で
 ある点にある — WebSocket front が来た日、argv は**運用者**のもので client は
-触れない。そのとき何もしなくても既定で閉じているのが、この設計の防御線である。
+触れない。その場合も既定で閉じていることが、この設計のセキュリティ特性である。
 
 ### 2.3 なぜ他の形でないか
 
 - **VIEWER_SERVE_PLUGINS 型 (同梱ディレクトリ既定 ON) ではない**: plugin の同意は
   「機械の持ち主が dll をその場所に置いた」という**ファイルの存在**が担う。運ばれて
-  くる reader には peer 側の同意の器がファイルとして存在しないので、同意は起動
+  くる reader では peer 側のファイルによって同意を示せないので、同意は起動
   行為に付けるしかない。
 - **環境変数ではない**: ssh は任意の環境変数を運ばない (AcceptEnv 制限)。argv は
-  client が既に組んでいる (remote.cpp :342-352) ので、旗は追加配線ゼロで届く。
+  client が既に組んでいる (remote.cpp :342-352) ので、フラグの追加に新たな伝達機構は要らない。
   peer 側の**補助設定** (interpreter の指定・キャッシュ置き場) は環境変数でよい
   (§5.3) — あれは同意ではなく設定だから。
 
 **再訪条件**: 認証はあるが shell 同等でない転送 (WebSocket) が実装されたら、
-旗 1 本で足りるか (接続ごとの許可・reader の allowlist が要るか) を再設計する。
+このフラグだけで足りるか (接続ごとの許可・reader の allowlist が要るか) を再設計する。
 それまでは無い転送のための機構を作らない。
 
 ---
@@ -151,7 +156,7 @@ handler が意図的に転送非依存 (serve.cpp :641「same requests, same rep
 - **サイズ上限**: 運ぶ 3 ファイル合計 4 MB (reader はテキストである。超えたら
   名指しで断る)。メッセージ全体は既存の 64 MB 枠 (serve.cpp :2623) に収まる。
 - **peer 上の実行権限**: 運ばれた reader は peer アカウントの権限で走る。これは
-  仕様であって漏れではない — §2 の門がその同意である。
+  仕様であって権限漏れではない — §2 の起動フラグがその同意を表す。
 
 ---
 
@@ -184,8 +189,8 @@ handler が意図的に転送非依存 (serve.cpp :641「same requests, same rep
   client-version ゲートは**不要**。これが FRAMING と断言できる根拠である。
 - **接続時の自己更新**: 番号が、入っている peer を更新させる (毎版の理由)。
 
-「旗が閉じた v12」の拒否 (§2.1) は too-old と**別の文**である — 版は送る前に
-client が書き、旗は peer が書く。3 状態 (古い / 閉じている / 開いている) が
+「フラグが指定されていない v12」の拒否 (§2.1) は too-old と**別の文**である — 版の拒否文は送信前に
+client が生成し、フラグの拒否文は peer が生成する。3 状態 (古い / 無効 / 有効) が
 すべて別の文で読める。
 
 ### 4.2 ワイヤの形
@@ -205,7 +210,7 @@ MSG_READER_RUN = 8
                                  5 reader exited non-zero / 6 output unreadable
      [str err]                   outcome != 0 のときの一文 (§6 の文面)
      [str stderrText]            harness の stderr 丸ごと (summary・traceback・
-                                 reader 自身の print)。成功時も运ぶ (§4.13.0 の
+                                 reader 自身の print)。成功時も運ぶ (§4.13.0 の
                                  パネルが出すものはこれ)
      [str pyProvenance]          "Python 3.11.4 (/usr/bin/python3), numpy 1.26.4"
      [str key]                   peer が発行した不透明なキャッシュ鍵 (16 進)。
@@ -243,6 +248,10 @@ MSG_TILE は元から「復号済み画素を source dtype で返す。ファイ
 される: materialisation (.vstream) は peer に置かれたまま、渡るのはヘッダの
 テキストと、画面が要る間引きタイルと、MEASURE の結果だけ。
 
+> **現行追記:** client は最初に全体の間引き TILE、正式 open 後に開いた frame の
+> 全解像度 TILE を受ける。キャッシュファイル自体は渡らないが、正式 open では
+> frame の全サンプルが TILE として渡ることがある。MEASURE は集計結果だけを返す。
+
 ---
 
 ## 5. peer 側の実行 — #44 の枠付きストリームがそのまま配布面になる
@@ -271,7 +280,7 @@ harness の出力は凍結済みの枠付きストリーム v1 (`VIEWERSTREAM 1`
 これをキャッシュファイルとして受け、
 
 1. **木の検査**: A3 の `vnzCheckTree` 相当を**共有 TU に括って両バイナリから呼ぶ**
-   (`parent` 上限・layer 語彙・conditions 長)。断り文がローカルの門と一字一句
+   (`parent` 上限・layer 語彙・conditions 長)。断り文がローカル側の検査と一字一句
    同じであること — #71 の規律。`VIEWERSTREAM 2` (set 入り) は v1 では名指しで
    断る (§7)。
 2. **ヘッダを RUN 応答で逐語返す**。client は**既にある 1 つの木ビルダ**
@@ -285,7 +294,7 @@ harness の出力は凍結済みの枠付きストリーム v1 (`VIEWERSTREAM 1`
    立てれば `readNpyRegion` :301 が**無改造で** step 間引き・部分矩形を返す。
    headerless RAW (protocol 11) が敷いた道と同じで、reader 専用の画素ループは
    1 本も書かない。
-4. **client の doc はリモート doc として着地する**: 最初の 1 枚は間引きタイル
+4. **client にはリモート doc として登録する**: 最初の 1 枚は間引きタイル
    (openRemote :1902 の step 計算のまま)、zoom/pan で精細化、stack は n / N。
    フォルダ由来の巨大 stack を全解像度で引き寄せる経路は最初から無い。
 
@@ -342,11 +351,11 @@ stat は peer が取る。client の stat では NAS の二重マウントで同
 
 ### 5.4 常駐ワーカ・共有メモリはここに入れない
 
-#44 の決着どおり運び屋は**ファイル渡しで確定** (0.268 s / 151 MB 実測、パイプ段は
+#44 の決着どおり転送方式は**ファイル渡しで確定** (0.268 s / 151 MB 実測、パイプ段は
 削除済み)。peer 側でも同じ理由がそのまま立つ (キャッシュがファイルを要求する、が
 特に)。常駐ワーカ (起動 0.12-0.19 s / torch import 1.2-1.4 s の節約) は #45 の
 W1/W2 が main に入った時点の再訪条件 (`adapter-transport-review.md` §3.1) に
-peer 側も**同乗する** — この設計はそれを妨げる配線を作らない (RUN handler と
+peer 側も**同じ条件で再検討する** — この設計はそれを妨げる配線を作らない (RUN handler と
 実行器の間は `adapter::run` 1 呼び出しで、差し替え点が既に 1 箇所)。
 
 ---
@@ -362,7 +371,7 @@ RUN 応答の `outcome`/`err`/`stderrText` を `readerFinish` の文面**その�
 |---|---|---|
 | **Python が無い** | outcome 2 + findPython の `why` | `no Python to run the reader with on <host>: <why> (install numpy for it, or set VIEWER_SERVE_PYTHON where viewer-serve runs)` — ローカルの文 (:1548) + 機械名 + peer 側の直し方。**client の Settings を触らせない**: 直る場所は向こうである |
 | **adapter が例外** | outcome 5 + stderr = traceback 丸ごと | パネルに**逐語** (§4.9「メッセージがそのままユーザーに出る」・§4.13.0「traceback を丸ごと出す」)。toast は最終行。行番号は運ばれた reader の本文と一致する — 運搬型 (§3) だから、client の手元のファイルのその行がまさに失敗した行である |
-| **形が宣言と合わない** | outcome 6 + 共有 `vnzCheckTree` の文 | `the reader ran on <host> and returned, but the viewer could not read what it produced:` + ローカル門と同一の検査文 (:1674 の形)。両門同文は A3 の検査を共有 TU にすることで構造保証 |
+| **形が宣言と合わない** | outcome 6 + 共有 `vnzCheckTree` の文 | `the reader ran on <host> and returned, but the viewer could not read what it produced:` + ローカル側と同一の検査文 (:1674 の形)。両経路で文面が一致することは、A3 の検査を共有 TU にすることで構造的に保証する |
 
 付随 (同じ表の続きとして実装する): outcome 3 = `could not start the reader on
 <host>: <fail>` + 実コマンド、outcome 4 = `the reader did not finish on <host>
@@ -382,9 +391,9 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 
 | 断るもの | 文と理由 | 再訪条件 |
 |---|---|---|
-| **set 入りの返り値** (`VIEWERSTREAM 2`) | RUN 完了時に名指しで拒否: set の Ref は peer のパスを指し、役割の解決と着地は client の登記と絡む。「新しい版は読まずに断る」の既存規則がそのまま器になる | series/batch が実運用で通った後、`.npz` over link の「zip の中身一覧を返す動詞」(docs/features/adapters/npz-design.md) と**同じ回**で設計する — 同じ「ファイルの中の部分を指す」問いだから |
-| **ssh:// での「手元で走らせる」逃げ道** | §4.13.1 は「手元で走らせる (ファイルが流れます) を明示的に選ばせる」と書いたが、**送・受どちら向きにも file 転送 op は存在せず** (remote_proto.h :129「there has never been a send-a-file op」)、作ることは「見えているものと数値だけが流れる」への原則級の変更。v1 の逃げ道は文で言う: `copy the file here (scp) and use the reader locally` | Python の無い peer に実地で繰り返し当たったら、そのとき初めて fetch op を独立の裁定に掛ける。**local:// では逃げ道は既に在る** (openRemote :1848 が openPath へ回すので、ローカル読みも Reader パネルもそのまま効く) — 失われているのは ssh だけ、と記録する |
-| **remote reader doc の自動 reload / watch** | 既存裁定の合流: 自動 reload は peer stack に対して走らない (`watchAutoRefusal`)。手動 Reload は stat 変化 → 鍵不一致 → 明示の再 RUN を促す文 | rwatch の器 (remote finding) に reader 鍵の失効を載せる別件 |
+| **set 入りの返り値** (`VIEWERSTREAM 2`) | RUN 完了時に名指しで拒否: set の Ref は peer のパスを指し、役割の解決と client への登録が関係する。「新しい版は読まずに断る」という既存規則をそのまま使える | peer path の Ref を client の identity / registry に写す契約を、部分束縛・session 復元まで含めて設計するとき。`.npz` と同じ回に束ねるという実装前案は §10.7 で解消済み |
+| **ssh:// での「手元で走らせる」代替手段** | §4.13.1 は「手元で走らせる (ファイルが流れます) を明示的に選ばせる」と書いたが、**元ファイルを送・受する file transfer op は存在しない** (remote_proto.h :129「there has never been a send-a-file op」)。TILE で開いた frame のサンプルを受けることとは別の機能である。v1 では次の代替手段を案内する: `copy the file here (scp) and use the reader locally` | Python の無い peer に実地で繰り返し当たったら、そのとき初めて fetch op を独立の裁定に掛ける。**local:// には既に代替手段がある** (openRemote :1848 が openPath へ回すので、ローカル読みも Reader パネルもそのまま効く) — 不足しているのは ssh だけ、と記録する |
+| **remote reader doc の自動 reload / watch** | 既存裁定の合流: 自動 reload は peer stack に対して走らない (`watchAutoRefusal`)。手動 Reload は stat 変化 → 鍵不一致 → 明示の再 RUN を促す文 | rwatch の機構 (remote finding) に reader 鍵の失効を載せる別件 |
 | **peer 上の reader 常設・名前解決** | §3.2 の 4 理由。淡色行の hover/toast はその旨を言わない (存在しない機構を仄めかさない) | ssh でない転送の設計時 (§2 の再訪) に、allowlist 型と一緒に再考 |
 
 ---
@@ -396,7 +405,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 プロセスの python で**走った」ことは、client が自分自身に喋る構成では証明でき
 ない (rwatch.inc :5-8 と同じ理由)。
 
-### stage 0 — 拒否文が事実を言う (**設計から独立。即日の Opus 仕事**)
+### stage 0 — 拒否文が事実を言う — **済**
 
 - `imagefile::peerRefusal` の fall-through (:485-487) に一文を足す:
   `"a reader could read it, but readers do not yet run on the peer - the
@@ -419,7 +428,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 >    reader の**本文そのもの**を混ぜているので `moduleVersion` は不要。現在の全項目と
 >    順序は §5.3 の式を正典とする。
 > ② `VIEWER_SERVE_PYTHON` は peer では**厳格**(指定が失敗したら PATH に
->    落ちない)。peer 側には設定窓が無く、黙って別の python で走った結果は
+>    フォールバックしない)。peer 側には設定画面がなく、黙って別の python で走った結果は
 >    再現できないため。
 > ③ 木の検査を共有 TU に括る件は `core/vstream.h` の `vns::checkTree` +
 >    `vns::scanHeader`。ヘッダの**残り**(note/cfa/range/…) は client だけが
@@ -438,10 +447,10 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   動かない** (= reader/harness 不再実行の観測)。Python は provenance probe のため
   1 回だけ起動する。
   R3 `VIEWER_SERVE_PROTOCOL=11` → client が**送信前に** readerTooOldText。
-  R4 旗なし起動 → gate の一文 (R3 と別文であること)。
+  R4 フラグなし起動 → gate の一文 (R3 と別文であること)。
   R5 `VIEWER_SERVE_PYTHON=/nonexistent` → §6 の一文が host 名を含む。
   R6 raise する reader → traceback が応答に丸ごと居る。
-  R7 (S,H,W) を Stack と名乗る reader → 両門同文 (ローカル `loadViewerStream` の
+  R7 (S,H,W) を Stack と名乗る reader → 両経路で同じ拒否文 (ローカル `loadViewerStream` の
   文と strcmp 一致)。
 
 ### stage 2 — 開く: 単根の frame / stack が link 越しに doc になる — **済**
@@ -450,13 +459,13 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 > **フラグ語 1 つを前置**した (`rp::ReqTrailer`): v11 の「残りバイトがあれば
 > recipe」規則は任意ブロックが 2 つになると成立せず、鍵が geometry として
 > 読まれる事故が起きうる。v12↔v12 のときだけ書き、両端とも
-> `servedVersion()` で門を張るので `VIEWER_SERVE_PROTOCOL` の継ぎ目は生きている。
+> `servedVersion()` で版を確認するので `VIEWER_SERVE_PROTOCOL` の互換性境界は保たれる。
 >
 > 設計との差分 2 点:
 > ① doc は `vnzBuild` が作る**ローカル doc** (間引き済み画素を保持) であり、
 >    `openRemote` が作る remote doc ではない。よって zoom での精細化
->    (`pumpRemoteFetch`) は**繋いでいない** —— 着地は §5.2.4 どおり間引き
->    (`step = ceil(max(w,h)/1600)`) で、そこから先の要求は出ない。
+>    (`pumpRemoteFetch`) は**繋いでいない** —— §5.2.4 どおり、表示は間引き済み画像
+>    (`step = ceil(max(w,h)/1600)`) に限られ、そこから先の要求は出ない。
 >    木ビルダを 1 本に保つ (§5.2.2) 方を採った結果で、精細化を足すなら
 >    stage 3 の木配線と同じ回に `S.remoteUrl` を立てるのが素直。
 > ② R10 (1600px 超) は書いていない。間引きの経路は R8 と同じ 1 本で、
@@ -469,7 +478,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 
 
 - META/TILE トレーラ・`openReaderCache` (openRaw 形)・RUN 応答ヘッダ →
-  `vnzBuild`(VnzFetch = remote tile)・間引き着地・Inspector の
+  `vnzBuild`(VnzFetch = remote tile)・間引き画像の登録・Inspector の
   `reader <spec> (ran on <host>)` 行・`rememberReader(url, spec)` (memo の鍵は
   **url 全体**。`readerFor(d->src->path)` :172 は remote doc の path = url なので
   既存コードがそのまま正しい)・stage 0 の文を `choose a reader` に差し替え、
@@ -478,7 +487,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   **画素バイト一致** (fmtgate の bit-identical 規律。同一機・同一 python なので
   張れる assert であり、異機の ULP 一致は約束しない —
   adapter-transport-review §5.1 の線のまま)。R9 dtype 表示一致 (`u2` は両側 `u2`)。
-  R10 1600px 超の materialisation が step > 1 で着地し n / N が出る。
+  R10 1600px 超の materialisation が step > 1 で登録され、n / N が出る。
   R11 set 入り reader → §7 の一文。
 
 ### stage 3 — 木: series / batch が通る — **済**
@@ -492,7 +501,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 > 設計との差分:
 > ① stage 2 の注記①(精細化未配線)を**この回で解消した**。`FrameSource` に
 >    `remoteKey` / `remoteNode` / `remoteKeyKind` を足し、`RFetchJob` /
->    `RFetchDone` にも同じ 3 つを載せた上で、木が着地したあと
+>    `RFetchDone` にも同じ 3 つを載せた上で、木の構築後に
 >    `remoteTreeRefine` が node ごとに `S.remoteUrl` / `remoteFrame` /
 >    `remoteStep` を立てて `requestFullRemote` を呼ぶ。精細化の TILE は
 >    step 1 の同じ要求なので新しい経路は 1 本も無い。
@@ -522,7 +531,7 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 >    `readerhint` の既存条件 (`member` が `__pixels_` で始まる → `readerFor(path)`)
 >    が remote doc にもそのまま当たる。V25p-r1a/r1b はその assert。
 > ② memo 枝は memo **だけ**でなく行の `member` (`__pixels_`) も見る。ローカル
->    の門は memo 単独で判断するが、link の向こうでは同じ url を native で開く方
+>    のローカル側判定は memo 単独で判断するが、link の向こうでは同じ url を native で開く方
 >    (Browse) が常態で、「その doc が reader 産か」を知っているのは行の方だから。
 > ③ V25p-r1 の「実行回数が増えない」は client 側 `g_adapterRuns` では自明に 0
 >    (client は Python を起動しない)。実質の観測は **peer の materialisation の
@@ -577,8 +586,8 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
   同 stack をローカル reader 経由で開いて測った値と**ビット一致** (M1)。
   npz member でも同じで、しかも**両者が互いにビット一致**する (M2 — 同じ画素を
   2 つの鍵発行者から測っているので、ワイヤがどちらが発行したかを知らないことの
-  証明になる)。旗を閉じた peer では reader 産 doc が存在しないので測るものが無く、
-  member の測定だけが通る (M3 — 旗はコードを守る、データではない)。v13 peer は
+  証明になる)。フラグが無効な peer では reader 産 doc が存在しないので測るものがなく、
+  member の測定だけが通る (M3 — フラグが制限するのはコード実行であり、データ処理ではない)。v13 peer は
   送信前に断られる (M4)。文法の縁 — 第 2 の集計 op・set fold の拒否・recipe との
   同居拒否・未発行の鍵 (M5)。
 
@@ -588,12 +597,12 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 
 | 決定 | 再訪条件 |
 |---|---|
-| 門は `--serve-readers` (起動者の同意、既定 閉) | shell 同等でない転送の実装時 |
+| 許可は `--serve-readers` で示す (起動者の同意、既定は無効) | shell 同等でない転送の実装時 |
 | reader は client から運ぶ (3 テキスト、peer に常設しない) | 複数ファイル reader の実需要 → manifest 型 |
 | VERSION 12 は FRAMING、client は送る前に数字で断る | — (この header の恒常規律) |
-| 運び屋はファイル渡しの枠付き v1、peer でも同じ | #45 W1/W2 着地で常駐ワーカ再測 (§5.4) |
-| キャッシュ鍵の stat は peer、鍵は peer 発行の不透明トークン | キャッシュ肥大の実地報告 → 両側同方針の掃除 |
-| set は断る、ssh の「手元で走らす」は文で逃がす、進捗 tail は無し | それぞれ §7 / §6 に個別に記載 |
+| 転送方式はファイル渡しの枠付き v1、peer でも同じ | #45 W1/W2 の実装時に常駐ワーカを再測定 (§5.4) |
+| キャッシュ鍵の stat は peer、鍵は peer 発行の不透明トークン | キャッシュ肥大の実地報告 → 両側で同じ削除方針を適用 |
+| set は断る、ssh の「手元で走らす」は代替手段を案内する、進捗 tail は実装しない | それぞれ §7 / §6 に個別に記載 |
 | stage 0 は独立に先行 (拒否文の 1 文 + fmtgate assert) | stage 2 で文を差し替え |
 | MEASURE の鍵は **版 14**、鍵付き要求はパスを送らない (`nPaths = 0`) | — (§10.7 の規則の帰結。この header の恒常規律) |
 | 鍵を運ぶ MEASURE op は集計 2 つだけ、plugin/set は名指しで断る | peer が鍵に人間可読な名前を持てるようになったら plugin 系へ (stage 5 注 ③) |
@@ -618,13 +627,13 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 | # | 問い | 決定 |
 |---|---|---|
 | a | peer 側で npz の木を作るのは誰か | **誰も作らない。** peer は列挙と materialise だけ。木・分類・picker は client の既存 1 経路 (§10.2) |
-| b | member 選択 UI | **同じ picker、同じ入口** — drawNpzPickModal と loadNpz の規則すべてを共有 (§10.3) |
+| b | member 選択 UI | **同じ picker、同じ操作経路** — drawNpzPickModal と loadNpz の規則すべてを共有 (§10.3) |
 | c | :438 の拒否文 | .npz は **peerServesDeclared に入り、peerServes には入らない** (protocol 11 が headerless で割った線)。:438 の文は「member 一覧から開く」事実に書き換わり、旧 peer には presend の `npzTooOldText` (定型 5 本目) が断る (§10.4) |
 | d | MRF_READER トレーラとの区別 | **しない。** [str key][u32 node] の意味を「peer 上の materialisation の中の 1 配列」に固定する。reader は key の出自の一つに過ぎない (§10.5) |
 | e | キャッシュ鍵 | `H("npz", peerPath, peer の stat)` — **SCAN 時に peer が発行**、member は node で選ぶ。reader 鍵とは kind 語で族が分かれる (§10.6) |
 
-`--serve-readers` は **npz に関与しない**: §2 の門が守るのは「他人のコードがこの
-機械で走る」ことで、npz で peer に走るのは viewer 自身のコードだけである。旗の
+`--serve-readers` は **npz に関与しない**: §2 の制限対象は「他人のコードがこの
+機械で走る」ことで、npz で peer 上を走るのは viewer 自身のコードだけである。フラグが
 閉じた v12 peer でも SCAN は答える。
 
 ### 10.1 #217 の言い方への訂正 — 「木」は半分だけ正しい
@@ -635,11 +644,11 @@ ordinary npz に木は無い: `npzScan` (loader_npz.inc :617) が member を**�
 開く。`vnzBuild` を通るのは `__viewer` 判別子を持つ viewer container だけ
 (:2136-2150)。したがって「stage 3 に乗る」の正確な中身は:
 
-- **両方の顔が共有する**のはワイヤの継ぎ目 — SCAN 動詞 + [key][node] トレーラ +
+- **両方の形式が共有する**のはワイヤの境界 — SCAN 動詞 + [key][node] トレーラ +
   peer 側 materialisation キャッシュ + openRaw 形の TILE (§5.2 の 3 と同じ道)。
-- **vnzBuild に触るのは container の顔だけ**で、その形は stage 3 の reader 木と
+- **vnzBuild を使うのは container 形式だけ**で、その形は stage 3 の reader 木と
   同一 (「宣言は逐語で渡り、木のビルダは client の 1 つ」§5.2 の 2)。
-- ordinary npz の顔が共有するのは npzScan → picker → 1 member 開き、という
+- ordinary npz が共有するのは npzScan → picker → 1 member 開き、という
   **client の既存 1 経路**。これも「コードは 1 つ」だが、木のコードではなく
   分類と picker のコードである。
 
@@ -687,7 +696,7 @@ MSG_NPZ_SCAN
   応答全体には下記の 256 MiB 枠を別に適用する。`__pixels_<i>` は乗らない —
   それが渡らないための本設計である。
   版の拒否 (`VIEWER_NPZ_VERSION` :851、3 は名指しで断る) は client の既存文のまま
-  — 検査の門は 1 つ、が §5.2 の規律。
+  — 検査処理は 1 つに保つ、という §5.2 の規律に従う。
 
 #### 10.2.1 一通の SCAN 応答の天井 — 出荷時の値 (#221 review、#180 codex review で訂正)
 
@@ -756,13 +765,13 @@ directory 完走、local header 照合、長い error の実寸)・**R25**(lower
 - **loadNpz の規則が全部ついて来る**: 画像 member 1 つなら dialog 無し (:2190)、
   dialog は 1 度に 1 枚で残りは queue (:2213)、軸候補は「長さ == frames」の同じ
   判定、軸の名前と単位はユーザー確定。remote 用の第 2 の規則集は作らない。
-- **入口**: openRemote (open_dispatch.inc :1847) の門が .npz を SCAN の道へ回す —
+- **処理経路**: openRemote (open_dispatch.inc :1847) の判定が .npz を SCAN へ回す —
   META より前 (コンテナに 1 つの geometry は無いので、META では答えられない)。
   local:// は今日と同じく :1848 が openPath へ回す (§7 の記録どおり、ローカルの
-  picker がそのまま出る) — この道は ssh:// の道である。
-- **開く**: 選ばれた member ごとに stage 2 の着地 (間引きの最初の 1 枚 :1902 の
+  picker がそのまま出る)。SCAN を使うのは ssh:// 経路である。
+- **開く**: 選ばれた member ごとに stage 2 の実装を使う (間引きの最初の 1 枚 :1902 の
   step 計算、stack は n / N、zoom/pan で精細化)。TILE は [key][member index] で引く。
-- **復元**: src->path = url、src->member = 配列名 (npzOpenMember :769 と同じ器が
+- **復元**: src->path = url、src->member = 配列名 (npzOpenMember :769 と同じフィールドが
   remote doc にもある)。session 復元は onlyMember の規則 (:2115-2117) ごと共有 —
   SCAN して名指しの member だけを picker 無しで開く。memo / readerhint は無関係
   (native であり、走るものが無い)。
@@ -773,7 +782,7 @@ directory 完走、local header 照合、長い error の実寸)・**R25**(lower
   (browse/panel.cpp :123) が点き、double-click が SCAN 経由で開く。**peerServes
   (:379) には入れない**: one-click preview は「1 つの geometry を持つファイル」の
   約束で、コンテナはそれを持たない。protocol 11 が headerless で割った線 (行は
-  生きる / preview の門は広げない、fmtgate F4d が**対で** assert する形) をそのまま
+  利用できる / preview の対象は広げない、fmtgate F4d が**対で** assert する形) をそのまま
   踏む。
 - **imagefile.cpp :438 の文は stage 3 で書き換わる**。「the peer serves one array
   per file, not a container」は door が開いた日に**偽になる文**なので残せない —
@@ -781,7 +790,7 @@ directory 完走、local header 照合、長い error の実寸)・**R25**(lower
   `".npz is a container and opens from its member list - this request addressed
   the whole file as one array\n  open it from Browse (the peer lists the
   members), or copy it here"` (最終文言は実装時、R18 が事実を assert する)。
-  このブランチに残る客は、丸ごとの .npz を 1 枚として指した要求への peer 側の
+  このブランチに残る対象は、丸ごとの .npz を 1 枚として指した要求への peer 側の
   断り (serve.cpp :459 経由) だけになる。
 - **旧 peer は client が送る前に数字で断る**: `formatServable` (remote.cpp
   :583-596) が pictureTooOldText でやっている形の 5 本目、`npzTooOldText`。
@@ -801,13 +810,13 @@ reader 鍵を持たないことは問題にならない — 鍵は reader の鍵
 materialisation の鍵だからである。reader である事実は provenance (Inspector の
 reader 行、stage 2) に居り、番地付けには居ない。
 
-矛盾の名指し 2 件 (どちらも未実装の本文なので、実装はこの追記の読みで行う):
+**実装前案で特定した矛盾 2 件** (現行仕様は、後続する各実装注記を正とする):
 
 - §4.2 の注「key 空 = reader 無し」は狭い。正しくは「**key 空 = path そのものが
   origin**」— reader 無しでも npz の TILE は key を持つ。
-- **`MRF_READER` という綴りは stage 5 で嘘になる** (native npz の stack を測る
+- **`MRF_READER` という綴りは stage 5 では不正確になる** (native npz の stack を測る
   MEASURE に reader はどこにも居ない)。値 2 は §4.2 のまま、綴りは実装時に
-  **`MRF_KEYED`** とする。まだ 1 バイトも出荷されていないから、この改名は無料。
+  **`MRF_KEYED`** とする。まだ 1 バイトも出荷されていないため、この改名に互換性コストはない。
 
 node の意味は**コンテナ自身の番地**: .vstream = 木の pixel ノード番号 (§4.2 の
 まま)、npz = SCAN 応答の member index。member **名**は META/TILE に乗らない —
@@ -837,17 +846,18 @@ key = H( "npz",                        ← kind 語。reader 鍵 (§5.3) と族�
   黙って新バイトへ再束縛するより、断って再 SCAN させる方が強い。
 - **stored member を zip offset から直に serve する形は退けた**: 展開コストは
   ゼロだが、zip の in-place 上書きが「開いている doc の画素」を identity の下で
-  差し替える — :2121 が名指しするまさにその窓である。stored も copy して鍵付き
+  差し替える — :2121 が名指しする競合期間である。stored も copy して鍵付き
   ファイルにする (1 回の read+write、ローカルの zip 丸読みと同じコスト級)。
   再訪条件: 実運用の multi-GB stored member で copy が痛んだ実報告 — その時は
-  fd 保持か読み口検証の別設計を、identity を割らずに立てる。
+  fd 保持か読み取り時検証の別設計を、identity を変えずに立てる。
 
 ### 10.7 版とワイヤの置き場 — §7 の「同じ回」束は解く
 
-`MSG_NPZ_SCAN = 9` は **VERSION 12 の定義に同居**する — v12 は未出荷なので番号は
-無料である。規律の名指し: stage 1 が npz より先に main へ入って**出荷された後**に
-この動詞を足すなら、それは 13 である (「送る前に数字で断る」を成立させる数が
-それだから)。
+**実装前案:** `MSG_NPZ_SCAN = 9` を **VERSION 12 の定義に同居**させる。設計時点では
+v12 が未出荷だったため、番号変更に互換性コストはなかった。ただし、stage 1 が npz より先に
+main へ入り**出荷された後**にこの動詞を追加したため、**stage 3 着地時は VERSION 13**
+だった (「送る前に数字で断る」を成立させるため)。stage 5 で VERSION 14 となったため、
+現行番号は `core/remote_proto.h::VERSION` と冒頭の実装帳簿を正とする。
 
 矛盾の名指し: §7 の表 1 行目は「.npz over link の zip の中身一覧を返す動詞」を
 set (VIEWERSTREAM 2) の設計と**同じ回**に束ねた。その束は解く — 動詞の設計は
@@ -872,13 +882,13 @@ set (VIEWERSTREAM 2) の設計と**同じ回**に束ねた。その束は解く 
 >    でないと行の文言が割れるので、そこまでを共有側に置いた。
 > ② **member の事実は npy ヘッダ**を**逐語**で運ぶ (フィールド分解ではない)。
 >    §10.2 の素描 `[str descr][u32 ndim][i64 dims...]` には `fortran_order` が
->    無く、それが落ちると fortran 順の member の role が両側で割れる。client は
+>    無く、その情報が欠けると fortran 順の member の role が両側で異なる。client は
 >    peer が覗いたのと同じバイトに `nz::peekHeader` を掛ける。
 > ③ **鍵 → origin の対応は peer のキャッシュに小さな控え (`<key>.npzsrc`)** を
 >    書く。プロセス内 map では足りない —— 精細化の TILE を投げるのは
 >    `rfWorker` の**別プロセスの peer** であり、SCAN を見ていない。
-> ④ **`local://` の .npz は今日どおりローカルの戸へ落ちる** (§10.3 の記録どおり)。
->    SCAN の道は ssh:// の道で、試験は `openRemoteNpz` を直接叩いて両側を
+> ④ **`local://` の .npz は今日どおりローカル経路へ進む** (§10.3 の記録どおり)。
+>    SCAN は ssh:// 経路で使い、試験は `openRemoteNpz` を直接叩いて両側を
 >    比較する (fmtgate bothWays と同じ型)。
 
 
@@ -892,7 +902,7 @@ native コンテナとして、SCAN + [key][node] で**。
 | R15 | 画像 member 1 つの npz → dialog 無しで開く (:2190 の規則が remote でも同文で成立) |
 | R16 | `__viewer` container を peer 越しに開き、ローカル open と doc 数・conditions 値・単位が一致 (R12 の npz 版 — R12 は reader 産、R16 は npz 産、**通る木のコードが同じ 1 つ**であることの証明) |
 | R17 | `VIEWER_SERVE_PROTOCOL=11` → client が**送信前に** npzTooOldText / SCAN 後に peer 側で zip を上書き → 次の inflate が再 stat で名指し拒否 (§10.6 の文) |
-| R18 | fmtgate: .npz の行が peer で生きる + preview の門は広がらない (F4d の対 assert の npz 版) + :438 の新文が「member 一覧」を言い、旧文「one array per file」を言わない |
+| R18 | fmtgate: .npz の行を peer で利用できる + preview の対象は広がらない (F4d の対 assert の npz 版) + :438 の新文が「member 一覧」を言い、旧文「one array per file」を言わない |
 
 ### 10.9 台帳 (追加分)
 
