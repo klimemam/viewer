@@ -234,21 +234,44 @@ struct SegmentedName {
     std::string name;              // the basename, exactly as the caller holds it
     std::string ext;               // ".npy" - the case as written, never folded
     std::vector<NameSeg> segs;     // the stem's runs
+    // The candidacy test below, written out as a KEY. Two names can be
+    // siblings only if they agree on the extension, on the number and kind of
+    // runs, and on every TEXT run - none of which mentions the head, so it is
+    // a property of one name and can be computed once. Digit runs become a
+    // single '#': their VALUES are what the rule is about to compare.
+    // The separators are bytes no path component can hold, so "a_1" + "b" and
+    // "a" + "_1b" cannot collide into one key.
+    std::string candKey;
 };
 static SegmentedName segmentFileName(const std::string& name) {
     const std::filesystem::path np = pathFromUtf8(name);
-    return { name, np.extension().u8string(), segmentName(np.stem().u8string()) };
+    SegmentedName s{ name, np.extension().u8string(),
+                     segmentName(np.stem().u8string()), {} };
+    s.candKey = s.ext;
+    for (const NameSeg& g : s.segs) {
+        s.candKey += '\x01';
+        if (g.digit) s.candKey += '#';
+        else s.candKey += g.s;
+    }
+    return s;
 }
 
+// `pool` need only CONTAIN the head's candidates - the test is applied here
+// regardless, so handing in the whole listing and handing in one candKey
+// bucket give the same answer. The order of the pool cannot matter either: the
+// frame axis is chosen by "does this run take two values" and the members come
+// back through a sort on (numeric value, name), which is total because names
+// in one directory are unique.
 static std::vector<std::string> siblingNamesAmong(const SegmentedName& head,
-                                                  const std::vector<SegmentedName>& names,
+                                                  const std::vector<const SegmentedName*>& pool,
                                                   std::string& patternOut) {
     std::vector<std::string> out;
     const std::vector<NameSeg>& segs = head.segs;
 
     // candidate files: same extension, same segment structure, all text segments equal
     std::vector<const SegmentedName*> cands;
-    for (const SegmentedName& n : names) {
+    for (const SegmentedName* np : pool) {
+        const SegmentedName& n = *np;
         if (n.ext != head.ext) continue;
         if (n.segs.size() != segs.size()) continue;
         bool ok = true;
@@ -319,7 +342,41 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
     std::vector<SegmentedName> parsed;
     parsed.reserve(names.size());
     for (const std::string& n : names) parsed.push_back(segmentFileName(n));
-    return siblingNamesAmong(segmentFileName(headName), parsed, patternOut);
+    std::vector<const SegmentedName*> pool;
+    pool.reserve(parsed.size());
+    for (const SegmentedName& p : parsed) pool.push_back(&p);
+    return siblingNamesAmong(segmentFileName(headName), pool, patternOut);
+}
+
+// ---- one directory's listing, filed by candidacy ----------------------------
+// Every head asks "which of these could be my siblings", and the answer is a
+// property of the NAMES and not of the head (see SegmentedName::candKey), so
+// the whole listing is filed once and each head is handed its own bucket.
+//
+// This is the LAST quadratic term in the scan. With the listing handed in and
+// the splits hoisted, a head still walked all N names to find its candidates,
+// so a folder whose names do not group - the honest worst case, and the one
+// #236 measured at 16.4 MINUTES for 10000 files and projected at 27 HOURS for
+// 100000 - paid N per head over N heads. Filed by key, a head touches only
+// names it could actually be a sibling of, and that folder's N buckets hold
+// one name each.
+struct NameBuckets {
+    std::vector<SegmentedName> parsed;                         // by file index
+    std::unordered_map<std::string, std::vector<const SegmentedName*>> byKey;
+    const std::vector<const SegmentedName*>& poolFor(size_t i) const {
+        static const std::vector<const SegmentedName*> none;
+        auto it = byKey.find(parsed[i].candKey);
+        return it == byKey.end() ? none : it->second;
+    }
+};
+static NameBuckets bucketNames(const std::vector<std::string>& baseNames) {
+    NameBuckets b;
+    b.parsed.reserve(baseNames.size());
+    for (const std::string& n : baseNames) b.parsed.push_back(segmentFileName(n));
+    // filled in a SECOND pass: parsed must have stopped reallocating before a
+    // single pointer into it is taken
+    for (const SegmentedName& p : b.parsed) b.byKey[p.candKey].push_back(&p);
+    return b;
 }
 
 // ...and the same rule with the listing taken here. The paths it returns are
@@ -1598,16 +1655,16 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         std::vector<std::string> files = d.second;
         std::sort(files.begin(), files.end());
         std::vector<bool> used(files.size(), false);
-        // ONE split of this directory's listing, and one name -> index map over
-        // it, both reused by every stack found below. See SegmentedName.
-        std::vector<SegmentedName> parsed;
+        // ONE split of this directory's listing, filed by candidacy, plus one
+        // name -> index map over it; all three reused by every stack found
+        // below. See SegmentedName and NameBuckets.
+        std::vector<std::string> bases;
+        bases.reserve(files.size());
+        for (const std::string& f : files) bases.push_back(baseName(f));
+        const NameBuckets nb = bucketNames(bases);
         std::unordered_map<std::string, size_t> idxOfName;
-        parsed.reserve(files.size());
         idxOfName.reserve(files.size() * 2);
-        for (size_t i = 0; i < files.size(); i++) {
-            parsed.push_back(segmentFileName(baseName(files[i])));
-            idxOfName.emplace(parsed.back().name, i);
-        }
+        for (size_t i = 0; i < bases.size(); i++) idxOfName.emplace(bases[i], i);
         // name the stack by its folder relative to the opened root
         std::string rel = d.first.u8string();
         if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
@@ -1656,7 +1713,12 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             // the same one: findSequenceSiblings IS this call plus that listing,
             // and the extension test inside it means a non-loadable file in the
             // folder could never have been a candidate anyway.
-            std::vector<std::string> sibs = siblingNamesAmong(parsed[i], parsed, pattern);
+            //
+            // ...and it is asked over this head's BUCKET rather than over the
+            // whole listing, which is the same set of candidates reached
+            // without walking the names that could never have been any.
+            std::vector<std::string> sibs =
+                siblingNamesAmong(nb.parsed[i], nb.poolFor(i), pattern);
             if (sibs.size() >= 2) {
                 // ...and the members come back as names, so the members' rows
                 // are found by lookup instead of by comparing every name in the
