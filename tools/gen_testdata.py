@@ -1233,19 +1233,27 @@ for _i in (1, 2, 3):
 # Issue #237: the Stop that has to be pressed WHILE a stack is loading, and the
 # Browse panel that has to survive it.
 #
-# The only thing this fixture needs is ENOUGH FILES. selftest.browse-stop (a
-# --browse-keys run, registered in CMakeLists.txt) holds on `waitload` until the
-# loader is genuinely running and presses Stop one
-# action (8 frames, ~70 ms) later; a folder of a dozen frames is finished before
-# the button exists, and the whole run then asserts about a load that was never
-# stopped. 1200 frames of 64x64 float32 is 20 MB on disk and takes the local
-# decoder a second or more - two orders of magnitude of margin - while staying
-# small enough that CI regenerates it in a blink.
+# selftest.browse-stop (a --browse-keys run, registered in CMakeLists.txt) has
+# to press Stop WHILE the Files panel is offering one, and it can only act once
+# every 8 frames. So the fixture's job is to keep that button on screen for
+# longer than one action, ON ANY MACHINE - which is a stronger requirement than
+# "lots of files", and the first version of this fixture failed it.
+#
+# Measured, ubuntu-latest: 1200 frames of 64x64 float32 were DECODED in under
+# the ~70 ms between two actions (open() is microseconds there, against ~1.7 ms
+# on Windows), so `app.seqRunning` was already false while 1170 of those frames
+# still sat in the UI's integration backlog. The load was plainly still going -
+# documents kept appearing for another 300 frames - and every "is a load
+# running" flag said no.
+#
+# What stays true across all of that is the QUEUE, so the folder holds a stack
+# BEHIND the big one. `zz_more` sorts last, so the scan queues it after `many`
+# and it waits there - and the panel therefore shows "queued" with its Stop -
+# for as long as `many` is still landing. The 1200 frames are what makes that
+# window hundreds of frames wide; `zz_more` is what makes it exist at all.
 #
 # `elsewhere/` is the somewhere-else the panel has to be able to reach after the
-# Stop, and it holds ONE file on purpose: a single file is not a sibling group,
-# so the folder scan finds exactly one stack and the picker's contents are a
-# fact this test does not have to keep in step with.
+# Stop. One file, so it is not a sibling group and costs the picker nothing.
 stopset = fresh(out / "stopset")
 _ss = fresh(stopset / "many")
 _sy, _sx = np.mgrid[0:64, 0:64]
@@ -1253,6 +1261,9 @@ for _i in range(1200):
     # each frame differs, so a loader that dropped one cannot hide in a stack
     # of identical pictures
     np.save(_ss / ("frame_%04d.npy" % _i), (_sx + _sy * 2 + _i).astype(np.float32))
+_sm = fresh(stopset / "zz_more")
+for _i in range(8):
+    np.save(_sm / ("frame_%03d.npy" % _i), (_sx * 2 + _sy + _i).astype(np.float32))
 _se = fresh(stopset / "elsewhere")
 np.save(_se / "lone.npy", (_sy + _sx * 3).astype(np.float32))
 

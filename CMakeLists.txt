@@ -1156,6 +1156,12 @@ home,imgmark,dbloff:1,waitdir:digitset,chkimgmark,chkimg:2")
 #                asserted as the browsed directory rather than as a click that
 #                appeared to land.
 #
+# waitload asks the FILES PANEL's question - is a Stop being offered - and not
+# "is a decoder thread alive", because on a fast disk it is not: ubuntu-latest
+# decoded the whole 1200-frame stack between two actions while 1170 of its
+# frames were still queued for the UI. The fixture keeps a stack behind the big
+# one so the answer stays yes across that (tools/gen_testdata.py, stopset/).
+#
 # `focus` before the keys because a 1200-frame load ends with the canvas holding
 # the keyboard - true of a load with or without a Stop, and not what this test
 # is about.

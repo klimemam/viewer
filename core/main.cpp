@@ -2771,18 +2771,32 @@ static bool g_watchSuppressed = false;
                         else idleLeft = -1;
                     }
                     else if (op == "waitload") {
-                        // Hold until a stack load is really IN FLIGHT. "Stop"
-                        // only exists while one is, so a scripted Stop fired a
-                        // frame too early presses nothing and the run that
-                        // follows asserts about nothing.
+                        // Hold until the Files panel is OFFERING a Stop, which
+                        // is the only moment the button can be pressed - and
+                        // the predicate is that panel's, verbatim
+                        // (core/ui/file_list.inc): a decoder thread running, a
+                        // queue behind it, or a remote fetch in flight.
+                        //
+                        // "app.seqRunning alone" was the first form and it is a
+                        // race on a fast disk: on the ubuntu runner the 1200
+                        // frames were DECODED inside the ~70 ms between this
+                        // action and the one before it, so the thread was gone
+                        // while 1170 of them were still queued for the UI - and
+                        // this waited out its whole 60 s watching frames
+                        // arrive. The queue is what stays true across that,
+                        // which is also why the fixture has a stack behind the
+                        // big one.
                         static double waitL0 = 0;
-                        bool live = app.seqRunning || app.rfPending > 0;
-                        if (live) { chk(true, "rfPending=" + std::to_string(app.rfPending.load()) +
-                                              " seqRunning=" + std::to_string(app.seqRunning ? 1 : 0));
-                                    waitL0 = 0; }
+                        bool live = app.seqRunning || !app.seqQueue.empty() ||
+                                    app.rfPending > 0;
+                        std::string how = "seqRunning=" + std::to_string(app.seqRunning ? 1 : 0) +
+                                          " queued=" + std::to_string((int)app.seqQueue.size()) +
+                                          " rfPending=" + std::to_string(app.rfPending.load()) +
+                                          " backlog=" + std::to_string((int)seqReadyCount());
+                        if (live) { chk(true, how); waitL0 = 0; }
                         else if (waitL0 == 0) { waitL0 = nowSec(); hold = true; }
                         else if (nowSec() - waitL0 < 60.0) hold = true;
-                        else { chk(false, "no load ever started"); waitL0 = 0; }
+                        else { chk(false, "no load ever started: " + how); waitL0 = 0; }
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
