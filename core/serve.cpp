@@ -28,6 +28,8 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_map>             // groupNumbered's buckets, by key and not by scan
+#include <unordered_set>             // ...and "does this digit run vary at all"
 #include <vector>
 
 #include "imagefile.h"           // #148 B: the peer decodes what the viewer decodes
@@ -1265,14 +1267,25 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
                              std::vector<SeqGroup>& groups, std::vector<size_t>& singles) {
     struct Bucket { std::string key, pattern; std::vector<size_t> m; };
     std::vector<Bucket> buckets;
+    // The bucket a name belongs to is found BY KEY. Scanning the bucket list
+    // for it cost one string compare per bucket per file, and a folder whose
+    // files mostly do not share a key has as many buckets as files: 100000
+    // loose names took the peer 11 seconds in that loop alone (#236). The
+    // buckets stay a vector - the emit order below is their creation order,
+    // and a hash map has no order to give back.
+    std::unordered_map<std::string, size_t> bucketIdx;
     std::vector<char> used(files.size(), 0);
     for (size_t i = 0; i < files.size(); i++) {
         std::string key, pat;
         if (!seqSegKey(files[i].first, key, pat)) continue;
-        Bucket* b = nullptr;
-        for (auto& q : buckets) if (q.key == key) { b = &q; break; }
-        if (!b) { buckets.push_back({ key, pat, {} }); b = &buckets.back(); }
-        b->m.push_back(i);
+        auto it = bucketIdx.find(key);
+        if (it == bucketIdx.end()) {
+            bucketIdx.emplace(key, buckets.size());
+            buckets.push_back({ key, pat, {} });
+            buckets.back().m.push_back(i);
+        } else {
+            buckets[it->second].m.push_back(i);
+        }
     }
     // emit one group from members that are already in natural order; pattern
     // from the FIRST member: '?' over the frame-axis run only. Zero-padding
@@ -1342,11 +1355,15 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
             // illuminance, producing three "stacks" each spanning 10 levels,
             // which is exactly the condition-mixed stack the canon forbids.
             for (size_t r = 0; r < nRuns; r++) {
-                std::vector<std::string> distinct;
+                // "Does this run take two different values" - never how many,
+                // so the values go in a set and the walk stops at the second.
+                // Collecting them in a list and re-comparing the list for every
+                // member made this quadratic in the bucket size, which on a
+                // single 100000-file group is the whole answer time (#236).
+                std::unordered_set<std::string> distinct;
                 for (const auto& v : vals) {
-                    bool dup = false;
-                    for (const auto& d : distinct) if (d == v[r]) { dup = true; break; }
-                    if (!dup) distinct.push_back(v[r]);
+                    distinct.insert(v[r]);
+                    if (distinct.size() >= 2) break;
                 }
                 if (distinct.size() < 2) continue;
                 varying++;
@@ -1363,14 +1380,21 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
         }
         // >= 2 varying runs: sub-bucket by every run EXCEPT the frame axis
         std::vector<std::pair<std::string, std::vector<size_t>>> subs;
+        // ...found by key, for the bucket loop's reason. The vector stays: the
+        // emit order below is creation order, and that is what the client sees.
+        std::unordered_map<std::string, size_t> subIdx;
         for (size_t i = 0; i < b.m.size(); i++) {
             std::string ck;
             for (size_t r = 0; r < nRuns; r++)
                 if ((int)r != frameAxis) { ck += vals[i][r]; ck += '\x01'; }
-            std::vector<size_t>* sv = nullptr;
-            for (auto& sp : subs) if (sp.first == ck) { sv = &sp.second; break; }
-            if (!sv) { subs.push_back({ ck, {} }); sv = &subs.back().second; }
-            sv->push_back(b.m[i]);
+            auto it = subIdx.find(ck);
+            if (it == subIdx.end()) {
+                subIdx.emplace(ck, subs.size());
+                subs.push_back({ ck, {} });
+                subs.back().second.push_back(b.m[i]);
+            } else {
+                subs[it->second].second.push_back(b.m[i]);
+            }
         }
         for (const auto& sp : subs)
             if (sp.second.size() >= 2) emit(sp.second, frameAxis, b.pattern);

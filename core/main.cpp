@@ -1178,6 +1178,12 @@ int main(int argc, char** argv) {
 
     #include "selftest/scan.inc"
 
+    // ...and the LOCAL half of the same door, pinned as an ANSWER rather than
+    // as a count: #236 rewrote how scanFolderGroups computes it and claims the
+    // answer is untouched. Beside scan.inc because the two are one question
+    // asked over two transports.
+    #include "selftest/folderscan.inc"
+
     #include "selftest/range.inc"
 
     #include "selftest/export-tsv.inc"

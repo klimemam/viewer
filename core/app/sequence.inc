@@ -222,28 +222,41 @@ std::string stackNameFor(const std::string& dir, const std::string& pattern) {
 //
 // `headName` and `names` are BASENAMES; the result is the subset of `names`
 // that belongs to the head's stack, ordered by the numeric field.
-static std::vector<std::string> siblingNamesAmong(const std::string& headName,
-                                                  const std::vector<std::string>& names,
+//
+// ONE name, split the way the rule below splits it: the extension, and the
+// stem's digit / text runs. Splitting is the expensive half of the rule - a
+// path construction plus a vector<NameSeg> of substrings per name - and a
+// folder scan asks the rule once per STACK over the SAME listing, so a caller
+// holding that listing splits each name once and hands the splits in. A folder
+// of 100000 files in 1000 stacks used to re-split all 100000 names 1000 times
+// (#236: that folder took 17.9 minutes and the tool did not draw during it).
+struct SegmentedName {
+    std::string name;              // the basename, exactly as the caller holds it
+    std::string ext;               // ".npy" - the case as written, never folded
+    std::vector<NameSeg> segs;     // the stem's runs
+};
+static SegmentedName segmentFileName(const std::string& name) {
+    const std::filesystem::path np = pathFromUtf8(name);
+    return { name, np.extension().u8string(), segmentName(np.stem().u8string()) };
+}
+
+static std::vector<std::string> siblingNamesAmong(const SegmentedName& head,
+                                                  const std::vector<SegmentedName>& names,
                                                   std::string& patternOut) {
     std::vector<std::string> out;
-    const std::filesystem::path hp = pathFromUtf8(headName);
-    const std::string stem = hp.stem().u8string(), ext = hp.extension().u8string();
-    std::vector<NameSeg> segs = segmentName(stem);
+    const std::vector<NameSeg>& segs = head.segs;
 
     // candidate files: same extension, same segment structure, all text segments equal
-    struct Cand { std::vector<NameSeg> segs; std::string name; };
-    std::vector<Cand> cands;
-    for (const std::string& n : names) {
-        const std::filesystem::path np = pathFromUtf8(n);
-        if (np.extension().u8string() != ext) continue;
-        std::vector<NameSeg> s2 = segmentName(np.stem().u8string());
-        if (s2.size() != segs.size()) continue;
+    std::vector<const SegmentedName*> cands;
+    for (const SegmentedName& n : names) {
+        if (n.ext != head.ext) continue;
+        if (n.segs.size() != segs.size()) continue;
         bool ok = true;
         for (size_t k = 0; k < segs.size() && ok; k++) {
-            if (segs[k].digit != s2[k].digit) ok = false;
-            else if (!segs[k].digit && segs[k].s != s2[k].s) ok = false;
+            if (segs[k].digit != n.segs[k].digit) ok = false;
+            else if (!segs[k].digit && segs[k].s != n.segs[k].s) ok = false;
         }
-        if (ok) cands.push_back({ std::move(s2), n });
+        if (ok) cands.push_back(&n);
     }
     if (cands.size() < 2) return out;
 
@@ -255,29 +268,30 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
     int best = -1;
     for (size_t k = 0; k < segs.size(); k++) {
         if (!segs[k].digit) continue;
-        std::vector<std::string> vals;
-        bool othersMatch = true;
-        for (const auto& c : cands) {
+        // Only "are there TWO different values here" is ever asked of this, so
+        // the values are counted in a set and the walk stops at the second one.
+        // The list-and-scan version it replaces compared every earlier value
+        // again for every candidate - the second quadratic term in the scan.
+        std::unordered_set<std::string> vals;
+        for (const SegmentedName* c : cands) {
             bool same = true;
             for (size_t m = 0; m < segs.size(); m++)
-                if (m != k && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+                if (m != k && segs[m].digit && c->segs[m].s != segs[m].s) { same = false; break; }
             if (!same) continue;
-            bool dup = false;
-            for (const auto& v : vals) if (v == c.segs[k].s) { dup = true; break; }
-            if (!dup) vals.push_back(c.segs[k].s);
+            vals.insert(c->segs[k].s);
+            if (vals.size() >= 2) break;
         }
-        (void)othersMatch;
         if (vals.size() >= 2) best = (int)k;     // keep overwriting: the last wins
     }
     if (best < 0) return out;
 
     std::vector<std::pair<long long, std::string>> found;
-    for (const auto& c : cands) {
+    for (const SegmentedName* c : cands) {
         bool same = true;
         for (size_t m = 0; m < segs.size(); m++)
-            if ((int)m != best && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+            if ((int)m != best && segs[m].digit && c->segs[m].s != segs[m].s) { same = false; break; }
         if (!same) continue;
-        found.emplace_back(atoll(c.segs[best].s.c_str()), c.name);
+        found.emplace_back(atoll(c->segs[best].s.c_str()), c->name);
     }
     if (found.size() < 2) return out;
     std::sort(found.begin(), found.end());
@@ -286,7 +300,7 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
         // '?' and not '#': ImGui truncates any label at "##", which blanked
         // every all-digit sequence name in the picker ('?' also reads as glob)
         patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
-    patternOut += ext;
+    patternOut += head.ext;
     out.reserve(found.size());
     for (auto& f : found) out.push_back(f.second);
     // ...then say what the '?' run actually spans. Same function the peer runs
@@ -294,6 +308,18 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
     // listed over ssh must produce the identical stack name.
     patternOut = rp::patternWithExtent(patternOut, out);
     return out;
+}
+
+// The same rule asked of raw names - one stack's worth of question, so the
+// split is taken here and thrown away. Every caller that asks it repeatedly
+// over ONE listing (scanFolderGroups) should hold the splits instead.
+static std::vector<std::string> siblingNamesAmong(const std::string& headName,
+                                                  const std::vector<std::string>& names,
+                                                  std::string& patternOut) {
+    std::vector<SegmentedName> parsed;
+    parsed.reserve(names.size());
+    for (const std::string& n : names) parsed.push_back(segmentFileName(n));
+    return siblingNamesAmong(segmentFileName(headName), parsed, patternOut);
 }
 
 // ...and the same rule with the listing taken here. The paths it returns are
@@ -1511,14 +1537,20 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
     const size_t MAX_GROUPS = 256;    // a truncated scan is reported, never silent
     // collect loadable files per directory (depth-limited walk)
     std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> perDir;
+    // ...found by name, not by walking what is already collected. The scan
+    // ends in a sort by directory anyway, so the order files arrive in does
+    // not survive; what the linear search cost was one comparison per file per
+    // directory ALREADY seen, which a deep tree pays on every one of its files.
+    std::unordered_map<std::string, size_t> perDirIdx;
     auto addFile = [&](const std::filesystem::path& p) {
         std::string ext = p.extension().u8string();
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
         if (!isLoadableExt(ext)) return;
         std::filesystem::path dir = p.parent_path();
-        for (auto& d : perDir)
-            if (d.first == dir) { d.second.push_back(p.u8string()); return; }
+        auto it = perDirIdx.find(dir.u8string());
+        if (it != perDirIdx.end()) { perDir[it->second].second.push_back(p.u8string()); return; }
+        perDirIdx.emplace(dir.u8string(), perDir.size());
         perDir.push_back({ dir, { p.u8string() } });
     };
     // Manual breadth-first walk: recursive_directory_iterator aborts the whole
@@ -1556,9 +1588,26 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
 
     std::string rootStr = rootPath.u8string();
     for (auto& d : perDir) {
+        // The cap is a STOP, not a filter. push() below has always dropped
+        // groups past 256, but the walk went on finding them: a folder of 500
+        // stacks paid the full grouping cost for 244 answers that were thrown
+        // away on arrival, and at 1.07 s per stack (#236, grp_100000) that was
+        // most of the wait. What is reported is unchanged - 256 groups still
+        // means "truncated" to openFolder.
+        if (groups.size() >= MAX_GROUPS) break;
         std::vector<std::string> files = d.second;
         std::sort(files.begin(), files.end());
         std::vector<bool> used(files.size(), false);
+        // ONE split of this directory's listing, and one name -> index map over
+        // it, both reused by every stack found below. See SegmentedName.
+        std::vector<SegmentedName> parsed;
+        std::unordered_map<std::string, size_t> idxOfName;
+        parsed.reserve(files.size());
+        idxOfName.reserve(files.size() * 2);
+        for (size_t i = 0; i < files.size(); i++) {
+            parsed.push_back(segmentFileName(baseName(files[i])));
+            idxOfName.emplace(parsed.back().name, i);
+        }
         // name the stack by its folder relative to the opened root
         std::string rel = d.first.u8string();
         if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
@@ -1599,17 +1648,35 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         for (size_t i = 0; i < files.size(); i++) {
             if (used[i]) continue;
             std::string pattern;
-            std::vector<std::string> sibs = findSequenceSiblings(files[i], pattern);
+            // The listing is IN HAND. This used to call findSequenceSiblings,
+            // which re-opens the directory and reads it again - once per stack,
+            // over a folder this walk had just finished enumerating. On a
+            // 100000-file folder holding 1000 stacks that was 1000 extra full
+            // listings and 99.8% of a 17.9-minute wait (#236). The answer is
+            // the same one: findSequenceSiblings IS this call plus that listing,
+            // and the extension test inside it means a non-loadable file in the
+            // folder could never have been a candidate anyway.
+            std::vector<std::string> sibs = siblingNamesAmong(parsed[i], parsed, pattern);
             if (sibs.size() >= 2) {
-                for (const auto& s : sibs)
-                    for (size_t k = 0; k < files.size(); k++)
-                        if (files[k] == s) used[k] = true;
-                push(std::move(sibs), pattern);
+                // ...and the members come back as names, so the members' rows
+                // are found by lookup instead of by comparing every name in the
+                // folder against every member (the scan's second quadratic).
+                std::vector<std::string> full;
+                full.reserve(sibs.size());
+                for (const auto& s : sibs) {
+                    auto it = idxOfName.find(s);
+                    if (it == idxOfName.end()) continue;
+                    used[it->second] = true;
+                    full.push_back(files[it->second]);
+                }
+                push(std::move(full), pattern);
+                if (groups.size() >= MAX_GROUPS) break;
             } else {
                 used[i] = true;
                 leftover.push_back(files[i]);
             }
         }
+        if (groups.size() >= MAX_GROUPS) break;
         // Two or more unnumbered leftovers = ONE stack in natural order, same
         // fold the remote SCAN does: capture sets are not always numbered, and
         // N single-frame stacks from one folder is never what Open Folder

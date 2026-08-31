@@ -43,6 +43,8 @@ static bool g_linSelftest = false;      // --lin-selftest: fit, print, exit
 static bool g_fstatSelftest = false;    // --framestats-selftest: TSV to stdout, exit
 static std::string g_rangeSelftest;      // --range-selftest <dir with 2 stacks>
 static std::string g_scanSelftest;      // --scan-selftest <dir>: remote Open Folder, print, exit
+static bool g_folderScanSelftest = false; // --folderscan-selftest: the LOCAL scan's answer,
+                                        // pinned group by group (#236). Builds its own fixtures.
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
@@ -620,6 +622,7 @@ static void printUsage() {
         "  --export-tsv-selftest <dir> the Temporal export document\n"
         "  --picker-selftest <dir>     stack picker: filter cut + merge\n"
         "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
+        "  --folderscan-selftest       the local folder scan's answer, group by group\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
@@ -816,6 +819,8 @@ static void parseCli(int argc, char** argv) {
             g_bundledSelftest = true;              // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
+        } else if (a == "--folderscan-selftest") {
+            g_folderScanSelftest = true;           // handled in main()
         } else if (a == "--picker-selftest") {
             g_pickerSelftest = next();             // handled in main()
         } else if (a == "--close-selftest") {
