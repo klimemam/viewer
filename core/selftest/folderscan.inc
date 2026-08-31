@@ -180,6 +180,149 @@
             }
         }
 
+        // ---- S7: an abandoned scan answers NOTHING ----------------------------
+        // The worker's cancel is a token comparison, not a flag (App::FolderScan):
+        // two Opens can overlap and a bare "stop" cannot say which scan it meant.
+        // Asked here at the bottom, where the walk itself reads it: a watch whose
+        // generation has already moved must come back empty rather than come back
+        // with the folder's real answer, because the caller's guard is the same
+        // comparison and an answer that survives it would raise a picker over
+        // whatever the user did instead.
+        {
+            std::filesystem::path d = root / "one";        // S1's folder, still there
+            std::atomic<int> gen{ 7 };
+            std::atomic<long long> seen{ 0 };
+            ScanWatch w;
+            w.gen = &gen; w.mine = 6; w.seen = &seen;      // 6 != 7: already stale
+            const size_t n = scanFolderGroups(d.u8string(), &w).size();
+            // ...and the control: the SAME folder, the same watch, current token.
+            w.mine = 7;
+            const size_t live = scanFolderGroups(d.u8string(), &w).size();
+            const bool pass = n == 0 && live == 1 && seen.load() == 5;
+            fprintf(stderr, "folderscanselftest: %-46s %s\n",
+                    "S7 a stale token scans nothing", pass ? "PASS" : "FAIL");
+            if (!pass) {
+                fprintf(stderr, "  stale=%d live=%d seen=%lld (want 0 / 1 / 5)\n",
+                        (int)n, (int)live, (long long)seen.load());
+                ok = false;
+            }
+        }
+
+        // ---- S8: the WORKER's answer is the synchronous answer ----------------
+        // #236 moved the scan off the UI thread, and the whole claim of that move
+        // is that only the waiting changed. So the same folder is asked twice -
+        // once on this thread, once through folderScanWorker and pumpFolderScan,
+        // which is the path a real Open Folder takes - and the picker the pump
+        // raises must hold exactly what the direct call returned.
+        //
+        // Driven past openFolder() on purpose: openFolder scans SYNCHRONOUSLY
+        // under g_scriptedRun (see g_scriptedRun), which is what keeps the other
+        // 103 call sites working and is therefore exactly what would stop this
+        // test from exercising the thread at all.
+        {
+            std::filesystem::path d = root / "tree";       // S4's two subdirectories
+            const std::string want = shape(scanFolderGroups(d.u8string()));
+            app.folderPick.clear();
+            app.folderPickOpen = false;
+            app.folderScan.root = d.u8string();
+            app.folderScan.seen = 0;
+            app.folderScan.running = true;
+            const int myGen = app.folderScan.gen.load();
+            app.folderScan.thread = std::thread(folderScanWorker, d.u8string(), myGen);
+            for (int i = 0; i < 2000 && app.folderScan.running.load(); i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            pumpFolderScan();
+            std::string got;
+            for (const auto& e : app.folderPick) {
+                if (!got.empty()) got += " ";
+                got += e.g.name + "{";
+                for (size_t i = 0; i < e.g.files.size(); i++)
+                    got += (i ? "," : "") + baseName(e.g.files[i]);
+                got += "}";
+            }
+            const bool pass = app.folderPickOpen && got == want;
+            fprintf(stderr, "folderscanselftest: %-46s %s\n",
+                    "S8 the worker answers what the caller does", pass ? "PASS" : "FAIL");
+            if (!pass) {
+                fprintf(stderr, "  want: %s\n  got : %s (picker=%d)\n",
+                        want.c_str(), got.c_str(), app.folderPickOpen ? 1 : 0);
+                ok = false;
+            }
+            app.folderPickOpen = false;
+            app.folderPick.clear();
+        }
+
+        // ---- S9: Cancel, and the answer that arrives after it ------------------
+        // The failure this pins is not "Cancel is slow", it is "Cancel is
+        // ignored": openPickerWith CLEARS app.folderPick and resets the filter,
+        // merge and sweep fields, so a cancelled scan whose result still reached
+        // the pump would not merely appear late - it would destroy a picker the
+        // user had moved on to and raise a modal over it. RbScan carries the same
+        // token for the same reason (core/browse/nav.cpp).
+        //
+        // So: start a worker, cancel it, pump - and assert that NOTHING opened.
+        // A picker here is the defect.
+        {
+            std::filesystem::path d = root / "cap";        // S5's 600 files
+            app.folderPick.clear();
+            app.folderPickOpen = false;
+            app.folderScan.root = d.u8string();
+            app.folderScan.seen = 0;
+            app.folderScan.running = true;
+            const int myGen = app.folderScan.gen.load();
+            app.folderScan.thread = std::thread(folderScanWorker, d.u8string(), myGen);
+            stopFolderScan();          // moves the token, then joins
+            pumpFolderScan();          // ...and the pump must find nothing to do
+            const bool pass = !app.folderPickOpen && app.folderPick.empty() &&
+                              !app.folderScan.thread.joinable();
+            fprintf(stderr, "folderscanselftest: %-46s %s\n",
+                    "S9a Cancel leaves no picker behind", pass ? "PASS" : "FAIL");
+            if (!pass) {
+                fprintf(stderr, "  picker=%d groups=%d thread=%d (want 0 / 0 / 0)\n",
+                        app.folderPickOpen ? 1 : 0, (int)app.folderPick.size(),
+                        app.folderScan.thread.joinable() ? 1 : 0);
+                ok = false;
+            }
+            app.folderPickOpen = false;
+            app.folderPick.clear();
+        }
+
+        // ---- S9b: the pump's own guard, asked on its own ----------------------
+        // S9a cancels a scan that is still walking, and stopFolderScan empties
+        // the box on its way out - so S9a passes whether or not pumpFolderScan
+        // checks the token, and a test that passes either way is not testing the
+        // check. Here the box is loaded BY HAND with a finished answer stamped
+        // with a token that has since moved: the exact state a scan reaches when
+        // it publishes a moment before the user cancels it. Delete the
+        // comparison in pumpFolderScan and this line goes red on its own.
+        {
+            app.folderPick.clear();
+            app.folderPickOpen = false;
+            app.folderScan.root = (root / "one").u8string();
+            App::PendingGroup stale;
+            stale.name = "stale";
+            stale.files.push_back((root / "one" / "frame_000.npy").u8string());
+            {
+                std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+                app.folderScan.groups.assign(1, stale);
+                app.folderScan.doneGen = app.folderScan.gen.load() - 1;   // superseded
+                app.folderScan.done = true;
+            }
+            pumpFolderScan();
+            const bool pass = !app.folderPickOpen && app.folderPick.empty();
+            fprintf(stderr, "folderscanselftest: %-46s %s\n",
+                    "S9b a superseded answer never reaches the picker",
+                    pass ? "PASS" : "FAIL");
+            if (!pass) {
+                fprintf(stderr, "  picker=%d groups=%d (want 0 / 0)\n",
+                        app.folderPickOpen ? 1 : 0, (int)app.folderPick.size());
+                ok = false;
+            }
+            app.folderPickOpen = false;
+            app.folderPick.clear();
+        }
+
+        stopFolderScan();                             // nothing of ours left running
         std::filesystem::remove_all(root, ec);        // ours: ours to remove
         fprintf(stderr, "folderscanselftest: %s\n", ok ? "ok" : "FAILED");
         return ok ? 0 : 1;

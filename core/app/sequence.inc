@@ -1585,8 +1585,27 @@ static bool isLoadableName(const std::string& name) {
 
 // ---- open a whole folder tree: every numbered group becomes its own stack ----
 
+// What a scan running on a WORKER hands back while it runs, and what tells it
+// to stop (#236). Null for the synchronous callers, who are neither watched nor
+// cancellable.
+//
+// Cancelling is a comparison and not a flag, for the reason RbScan's token
+// exists: two Opens can overlap, and a bare "stop" cannot say WHICH scan it
+// meant. The worker holds the gen it started with; anything that supersedes or
+// cancels it bumps app.folderScan.gen, and the worker notices at the next
+// directory and at the next group.
+struct ScanWatch {
+    const std::atomic<int>* gen = nullptr;
+    int mine = 0;
+    std::atomic<long long>* seen = nullptr;   // files enumerated, published as it goes
+    bool abandoned() const { return gen && gen->load(std::memory_order_relaxed) != mine; }
+};
+
 // Walk root recursively; each directory yields one group per numeric pattern.
-static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) {
+// A watched scan returns EMPTY when abandoned - the caller compares the token
+// again before using anything, so an abandoned result is never read.
+static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root,
+                                                       const ScanWatch* watch = nullptr) {
     std::vector<App::PendingGroup> groups;
     std::error_code ec;
     std::filesystem::path rootPath = pathFromUtf8(root);
@@ -1599,7 +1618,9 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
     // not survive; what the linear search cost was one comparison per file per
     // directory ALREADY seen, which a deep tree pays on every one of its files.
     std::unordered_map<std::string, size_t> perDirIdx;
+    size_t seenFiles = 0;                 // every regular file the walk touched
     auto addFile = [&](const std::filesystem::path& p) {
+        seenFiles++;
         std::string ext = p.extension().u8string();
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
@@ -1629,6 +1650,11 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             std::error_code dec;
             std::filesystem::directory_iterator dit(dir, dec), dend;
             if (dec) continue;                       // unreadable dir: skip just this one
+            // Tested per DIRECTORY and not per entry: the load is an atomic
+            // read either way, but a folder is the unit this walk can leave
+            // cleanly, and a Cancel that waits out one directory is a Cancel
+            // nobody notices waiting.
+            if (watch && watch->abandoned()) return {};
             for (; dit != dend; dit.increment(dec)) {
                 if (dec) { dec.clear(); break; }
                 std::error_code fec;
@@ -1638,8 +1664,15 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
                     addFile(dit->path());
                 }
             }
+            // The number the waiting window prints. Published per directory for
+            // the reason above, and it is the ENUMERATED count, not the
+            // loadable one: "scanning... 40000 files" describes the work being
+            // done, and a folder of 100000 .txt would otherwise sit on 0.
+            if (watch && watch->seen)
+                watch->seen->store((long long)seenFiles, std::memory_order_relaxed);
         }
     }
+    if (watch && watch->abandoned()) return {};
     std::sort(perDir.begin(), perDir.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
@@ -1652,6 +1685,7 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         // most of the wait. What is reported is unchanged - 256 groups still
         // means "truncated" to openFolder.
         if (groups.size() >= MAX_GROUPS) break;
+        if (watch && watch->abandoned()) return {};
         std::vector<std::string> files = d.second;
         std::sort(files.begin(), files.end());
         std::vector<bool> used(files.size(), false);
@@ -1973,17 +2007,36 @@ static void applyPickFilter() {
             else t.push_back(*c);
         }
     }
-    auto hit = [](const std::string& term, const std::string& subj) {
-        std::string p = "*" + term + "*";      // match anywhere: "frame_0??" must
-        return globMatch(p.c_str(), subj.c_str());   // not need to cover ".npy"
-    };
+    // AN EMPTY FILTER IS NOT A MATCH, IT IS EVERY MATCH - and saying so here
+    // costs nothing while asking it per file costs a walk. This is the common
+    // case and not a corner: openPickerWith() clears pickFilter and calls this
+    // for EVERY scan, so a 100000-file folder ran 100000 glob calls against no
+    // terms before its picker could be drawn (#236).
+    if (inc.empty() && exc.empty()) {
+        for (auto& e : app.folderPick) {
+            e.match.assign(e.g.files.size(), 1);
+            e.nMatch = (int)e.g.files.size();
+        }
+        return;
+    }
+    // "match anywhere" is a property of the TERM, so the stars go on once here
+    // rather than per file. Built per keystroke, this string was built per file
+    // per term - two heap allocations each, over every file in the scan, for
+    // every character typed.
+    std::vector<std::string> incP, excP;
+    incP.reserve(inc.size());
+    excP.reserve(exc.size());
+    for (const auto& t : inc) incP.push_back("*" + t + "*");   // "frame_0??" must
+    for (const auto& t : exc) excP.push_back("*" + t + "*");   // not cover ".npy"
     for (auto& e : app.folderPick) {
         e.match.assign(e.g.files.size(), 1);
         e.nMatch = 0;
         for (size_t i = 0; i < e.rel.size() && i < e.match.size(); i++) {
             bool ok = true;
-            for (const auto& t : inc) if (!hit(t, e.rel[i])) { ok = false; break; }
-            if (ok) for (const auto& t : exc) if (hit(t, e.rel[i])) { ok = false; break; }
+            for (const auto& p : incP)
+                if (!globMatch(p.c_str(), e.rel[i].c_str())) { ok = false; break; }
+            if (ok) for (const auto& p : excP)
+                if (globMatch(p.c_str(), e.rel[i].c_str())) { ok = false; break; }
             e.match[i] = ok ? 1 : 0;
             if (ok) e.nMatch++;
         }
@@ -2050,21 +2103,97 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.folderPickOpen = true;
 }
 
-static void openFolder(const std::string& path) {
-    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
+// What a finished LOCAL scan does with its answer. One function so the
+// synchronous door and the worker's pump cannot come to differ about what an
+// empty scan says or when the truncation warning is raised.
+//
+// ALWAYS ask, one group included - same rule the remote scan follows. The
+// picker is where the file filter lives (UC3: "open only the *_dark* frames of
+// this folder" needs the dialog even when the folder groups into a single
+// sequence), and "Always load folder" no longer mutes it: that setting keeps
+// its original job - loading a single FILE's numbered siblings without asking.
+// Headless callers auto-accept via pickerAccept(). Batches are created at
+// ACCEPT time (pickerAccept), not here: creating one per scan left an empty
+// batch behind on Cancel, and the picker's batch mode (one / per top folder) is
+// only known once the user answers.
+static void finishFolderScan(std::vector<App::PendingGroup> groups,
+                             const std::string& path) {
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
         toast("scan stopped at 256 stacks - narrow the folder or use the filter", true);
-    // ALWAYS ask, one group included - same rule the remote scan follows. The
-    // picker is where the file filter lives (UC3: "open only the *_dark*
-    // frames of this folder" needs the dialog even when the folder groups into
-    // a single sequence), and "Always load folder" no longer mutes it: that
-    // setting keeps its original job - loading a single FILE's numbered
-    // siblings without asking. Headless callers auto-accept via pickerAccept().
-    // Batches are created at ACCEPT time (pickerAccept), not here: creating one
-    // per scan left an empty batch behind on Cancel, and the picker's batch
-    // mode (one / per top folder) is only known once the user answers.
     openPickerWith(std::move(groups), path, path, false, "");
+}
+
+// ---- Open Folder, which no longer holds the window while it walks (#236) -----
+// The worker owns nothing but the root string it was handed and the token it
+// started with; it publishes under the mutex and the UI thread does every
+// touch of app state. Same division as rbWorker, one instance rather than one
+// per panel, because there is one local disk and one picker to raise.
+static void folderScanWorker(std::string root, int myGen) {
+    ScanWatch w;
+    w.gen = &app.folderScan.gen;
+    w.mine = myGen;
+    w.seen = &app.folderScan.seen;
+    std::vector<App::PendingGroup> got = scanFolderGroups(root, &w);
+    {
+        std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+        app.folderScan.groups = std::move(got);
+        app.folderScan.doneGen = myGen;
+        app.folderScan.done = true;
+    }
+    app.folderScan.running = false;
+    g_browseHost.wakeUi();     // the pumps live inside the frame; see pumpFolderScan
+}
+
+// Stop whatever is walking and forget its answer. The token moves FIRST, so a
+// worker still inside the walk abandons at its next directory rather than
+// running to completion; the join then costs one directory, not one folder.
+// Called by the Cancel button, by the next Open, and at shutdown.
+static void stopFolderScan() {
+    app.folderScan.gen++;
+    if (app.folderScan.thread.joinable()) app.folderScan.thread.join();
+    std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+    app.folderScan.done = false;
+    app.folderScan.groups.clear();
+}
+
+static void openFolder(const std::string& path) {
+    // A run with nobody at the keyboard scans HERE, on this thread, and returns
+    // with the picker already up: 103 call sites in the selftests read
+    // app.folderPick on the line after this one. See g_scriptedRun.
+    if (g_scriptedRun) { finishFolderScan(scanFolderGroups(path), path); return; }
+    stopFolderScan();                  // a second Open supersedes the first
+    app.folderScan.root = path;
+    app.folderScan.seen = 0;
+    const int myGen = app.folderScan.gen.load();
+    app.folderScan.running = true;
+    app.folderScan.thread = std::thread(folderScanWorker, path, myGen);
+}
+
+// UI thread: raise the picker for a scan that finished and is still the one
+// being waited for. A result whose token has moved is DROPPED - openPickerWith
+// clears app.folderPick and resets the filter, merge and sweep fields, so a
+// late answer from a cancelled scan would not merely arrive, it would destroy
+// the picker the user is working in. RbScan guards itself the same way.
+static void pumpFolderScan() {
+    std::vector<App::PendingGroup> groups;
+    bool have = false;
+    int gen = 0;
+    {
+        std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+        if (app.folderScan.done) {
+            have = true;
+            gen = app.folderScan.doneGen;
+            groups.swap(app.folderScan.groups);
+            app.folderScan.done = false;
+        }
+    }
+    if (!have) return;
+    if (app.folderScan.thread.joinable()) app.folderScan.thread.join();
+    if (gen != app.folderScan.gen.load()) return;       // cancelled or superseded
+    const std::string root = app.folderScan.root;
+    app.folderScan.root.clear();
+    finishFolderScan(std::move(groups), root);
 }
 
 // Stack name for a merged load: the common prefix of the merged group names,
@@ -2382,6 +2511,49 @@ static void npzPickAccept() {
     fprintf(stderr, "npz: %s\n", say.c_str());
     toast(say, stacks == 0 && loneFrames == 0);
     npzPickNext();                 // whatever was dropped alongside this file
+}
+
+// ---- what the window shows WHILE the local scan walks (#236) ----------------
+// A count and a Cancel, and deliberately nothing else. The obvious richer
+// dialog - stacks appearing in the tree as they are found - is not available
+// here and the reason is in App::FolderScan: a group taken from half a
+// directory can have the wrong frame axis, so rows would appear and then have
+// to be rewritten. The honest thing to show while the answer is not yet an
+// answer is how much has been looked at.
+//
+// No percentage, for the same kind of reason: nothing knows how many files are
+// under a root until the walk has found them, and a bar that reaches 90% and
+// stays there is worse than a number that keeps climbing.
+static void drawFolderScanModal() {
+    const bool running = app.folderScan.running.load();
+    if (running && !ImGui::IsPopupOpen("Scanning folder") &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        ImGui::OpenPopup("Scanning folder");
+    if (!ImGui::IsPopupOpen("Scanning folder")) return;
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Scanning folder", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) return;
+    // The scan ANSWERED (or was cancelled) - so this dialog goes, and it has to
+    // go from INSIDE the Begin/End pair. Dropping the BeginPopupModal call
+    // instead does not close a popup: ImGui keeps it on the open stack, the
+    // picker's "no popup is open" test below stays false, and the dialog the
+    // whole scan was for never appears.
+    if (!running) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+    ImGui::TextDisabled("%s", dispPath(app.folderScan.root).c_str());
+    ImGui::Text("scanning... %lld files",
+                (long long)app.folderScan.seen.load(std::memory_order_relaxed));
+    ImGui::Spacing();
+    // Cancel means the scan AND the dialog: stopFolderScan moves the token
+    // first, so the answer that is still being computed can no longer raise a
+    // picker over whatever the user does next.
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        stopFolderScan();
+        app.folderScan.running = false;
+        app.folderScan.root.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 // Tree of what the scan found. One live filter narrows FILES as you type;
