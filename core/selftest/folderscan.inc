@@ -100,14 +100,16 @@
         // ---- S3: the leftover fold, per extension -----------------------------
         // Nothing numbered here, so every file falls through the sibling rule
         // and the per-extension fold answers: two or more of one extension are
-        // ONE stack in natural order, a lone one keeps its own name.
+        // ONE stack named "*<ext>" in natural order, while a lone one is not a
+        // pattern at all and keeps its own FILE name ("solo.png", not "*.png").
+        // The groups come back in the fold's map order, which is by extension.
         {
             std::filesystem::path d = root / "loose";
             for (const char* n : { "alpha.npy", "beta.npy", "gamma.raw", "delta.raw",
                                    "solo.png" })
                 put(d, n);
             expect("S3 leftovers fold per extension", d.u8string(),
-                   "*.npy{alpha.npy,beta.npy} *.png{solo.png} *.raw{delta.raw,gamma.raw}");
+                   "*.npy{alpha.npy,beta.npy} solo.png{solo.png} *.raw{delta.raw,gamma.raw}");
         }
 
         // ---- S4: subdirectories -----------------------------------------------
