@@ -1650,11 +1650,15 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root,
             std::error_code dec;
             std::filesystem::directory_iterator dit(dir, dec), dend;
             if (dec) continue;                       // unreadable dir: skip just this one
-            // Tested per DIRECTORY and not per entry: the load is an atomic
-            // read either way, but a folder is the unit this walk can leave
-            // cleanly, and a Cancel that waits out one directory is a Cancel
-            // nobody notices waiting.
             if (watch && watch->abandoned()) return {};
+            // INSIDE the entry loop, not merely per directory - because the
+            // folder this issue is about is ONE directory holding 100000 files.
+            // Per-directory was the obvious placing and it is wrong for exactly
+            // the reported case: the count would sit at 0 for the whole wait and
+            // then jump to the total, and Cancel would not be looked at until
+            // the whole enumeration had run. Every 512 entries, so the atomic
+            // store and the token load are noise next to the readdir.
+            size_t tick = 0;
             for (; dit != dend; dit.increment(dec)) {
                 if (dec) { dec.clear(); break; }
                 std::error_code fec;
@@ -1663,11 +1667,17 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root,
                 } else if (dit->is_regular_file(fec)) {
                     addFile(dit->path());
                 }
+                if ((++tick & 511) == 0) {
+                    if (watch && watch->abandoned()) return {};
+                    // The number the waiting window prints, and it is the
+                    // ENUMERATED count and not the loadable one: "scanning...
+                    // 40000 files" describes the work being done, and a folder
+                    // of 100000 .txt would otherwise sit on 0.
+                    if (watch && watch->seen)
+                        watch->seen->store((long long)seenFiles,
+                                           std::memory_order_relaxed);
+                }
             }
-            // The number the waiting window prints. Published per directory for
-            // the reason above, and it is the ENUMERATED count, not the
-            // loadable one: "scanning... 40000 files" describes the work being
-            // done, and a folder of 100000 .txt would otherwise sit on 0.
             if (watch && watch->seen)
                 watch->seen->store((long long)seenFiles, std::memory_order_relaxed);
         }
@@ -1737,6 +1747,10 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root,
         };
         std::vector<std::string> leftover;
         for (size_t i = 0; i < files.size(); i++) {
+            // ...and here too, for the reason written at the walk: one directory
+            // can be the whole scan, so "per directory" would mean "never" on
+            // the folder that prompted all this.
+            if ((i & 511) == 0 && watch && watch->abandoned()) return {};
             if (used[i]) continue;
             std::string pattern;
             // The listing is IN HAND. This used to call findSequenceSiblings,
