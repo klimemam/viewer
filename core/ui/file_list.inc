@@ -252,19 +252,12 @@ static void drawFileList() {
                          ImGui::GetCursorStartPos().x;
             if (ImGui::GetContentRegionAvail().x - used - st.ItemSpacing.x >= stopW) ImGui::SameLine();
         }
-        if (ImGui::SmallButton("Stop")) { app.seqCancel = true; app.seqQueue.clear(); }
+        if (ImGui::SmallButton("Stop")) stopLocalStackLoad();
     }
     if (app.rfPending > 0) {
         ImGui::SameLine();
         // the ONLY way to cancel a remote fetch used to be quitting the app
-        if (ImGui::SmallButton("Stop##rf")) {
-            app.rfGen++;
-            app.rbOpenQueue.clear();   // or the queue would just start the next stack
-            std::lock_guard<std::mutex> lk(app.rfMtx);
-            app.rfQueue.clear();
-            app.rfPending = 0; app.rfTotal = 0; app.rfFetched = 0;
-            app.rfBytesInFlight = 0;
-        }
+        if (ImGui::SmallButton("Stop##rf")) stopRemoteStackFetch();
     }
     if (app.rfPending > 0)
         ImGui::TextDisabled("remote: fetching %d/%d", app.rfFetched.load(), app.rfTotal.load());

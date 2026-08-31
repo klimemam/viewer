@@ -2705,6 +2705,50 @@ static bool g_watchSuppressed = false;
                             requestBrowseTemporal(app.previewHost, app.previewFiles,
                                                   "svtemp", app.previewPort);
                     }
+                    else if (a == "scanhere") {
+                        // what a folder row's "Open folder (all stacks below)"
+                        // does, aimed at the browsed directory
+                        remoteScanFolder(rbKeysT(), rbKeysT().b.dir);
+                    }
+                    else if (a == "pickok") {
+                        // the folder picker's "Load" button, pressed - the same
+                        // call --bench makes (see pickerAccept above)
+                        fprintf(stderr, "browsekeys: pickok - open=%d remote=%d groups=%d\n",
+                                app.folderPickOpen ? 1 : 0, app.folderPickRemote ? 1 : 0,
+                                (int)app.folderPick.size());
+                        if (app.folderPickOpen) pickerAccept();
+                    }
+                    else if (a == "stopload") {
+                        // The Files panel's "Stop", pressed. It is the button's
+                        // OWN code (stopLocalStackLoad / stopRemoteStackFetch,
+                        // core/app/sequence.inc) and not a copy, and it presses
+                        // whichever of the two is on screen - which loader is
+                        // running is what decides which button the user sees.
+                        fprintf(stderr, "browsekeys: stopload - seqRunning=%d rfPending=%d "
+                                        "backlog=%d, %d image(s)\n",
+                                app.seqRunning ? 1 : 0, app.rfPending.load(),
+                                (int)seqReadyCount(), (int)app.images.size());
+                        if (app.seqRunning || !app.seqQueue.empty()) stopLocalStackLoad();
+                        if (app.rfPending > 0) stopRemoteStackFetch();
+                        g_rbImgMark = (int)app.images.size();   // "since the Stop"
+                    }
+                    else if (a == "chkloadidle") {
+                        // The loader is back AT REST - every part of it. Not
+                        // "the frames stopped arriving": a Stop that leaves the
+                        // cancel flag raised, a queue behind it or a backlog of
+                        // decoded frames has not finished stopping, and each of
+                        // those is a way the next load starts from a state
+                        // nobody chose (#237).
+                        bool idle = !app.seqRunning && !seqReadyPending() &&
+                                    app.seqQueue.empty() && !app.seqCancel &&
+                                    app.rbOpenQueue.empty() && app.rfPending <= 0;
+                        chk(idle, "running=" + std::to_string(app.seqRunning ? 1 : 0) +
+                                  " backlog=" + std::to_string((int)seqReadyCount()) +
+                                  " queued=" + std::to_string((int)app.seqQueue.size()) +
+                                  " cancelling=" + std::to_string(app.seqCancel ? 1 : 0) +
+                                  " openq=" + std::to_string((int)app.rbOpenQueue.size()) +
+                                  " rfPending=" + std::to_string(app.rfPending.load()));
+                    }
                     else if (op == "chkfocus") {   // the TARGET instance owns the keys
                         ImGuiWindow* nw = ImGui::GetCurrentContext()->NavWindow;
                         bool f2 = nw && rbKeysT().wtitle == nw->Name;
@@ -2725,6 +2769,34 @@ static bool g_watchSuppressed = false;
                         if (idleLeft < 0) idleLeft = arg;
                         if (idleLeft > 0) { idleLeft--; hold = true; }
                         else idleLeft = -1;
+                    }
+                    else if (op == "waitload") {
+                        // Hold until the Files panel is OFFERING a Stop, which
+                        // is the only moment the button can be pressed - and
+                        // the predicate is that panel's, verbatim
+                        // (core/ui/file_list.inc): a decoder thread running, a
+                        // queue behind it, or a remote fetch in flight.
+                        //
+                        // "app.seqRunning alone" was the first form and it is a
+                        // race on a fast disk: on the ubuntu runner the 1200
+                        // frames were DECODED inside the ~70 ms between this
+                        // action and the one before it, so the thread was gone
+                        // while 1170 of them were still queued for the UI - and
+                        // this waited out its whole 60 s watching frames
+                        // arrive. The queue is what stays true across that,
+                        // which is also why the fixture has a stack behind the
+                        // big one.
+                        static double waitL0 = 0;
+                        bool live = app.seqRunning || !app.seqQueue.empty() ||
+                                    app.rfPending > 0;
+                        std::string how = "seqRunning=" + std::to_string(app.seqRunning ? 1 : 0) +
+                                          " queued=" + std::to_string((int)app.seqQueue.size()) +
+                                          " rfPending=" + std::to_string(app.rfPending.load()) +
+                                          " backlog=" + std::to_string((int)seqReadyCount());
+                        if (live) { chk(true, how); waitL0 = 0; }
+                        else if (waitL0 == 0) { waitL0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitL0 < 60.0) hold = true;
+                        else { chk(false, "no load ever started: " + how); waitL0 = 0; }
                     }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
