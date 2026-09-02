@@ -85,7 +85,7 @@ struct KeyedRef {
     // Local-only named metadata. Non-empty CHW/FCHW is the protocol-15 gate;
     // the wire already carries `read` for .npz, while a reader peer gets this
     // same declaration from its cached stream header.
-    std::string layout;
+    std::string layout{};
     // Empty layout can still require v15: a typed Stack (F,H,W) whose W<=4
     // would be guessed as one HWC Frame by an older reader-cache peer. This is
     // local-only gate evidence, carried independently of the wire reading.

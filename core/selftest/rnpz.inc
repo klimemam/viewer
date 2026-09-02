@@ -137,6 +137,26 @@
             { "__layout_2", str1("FCHW") },
             { "__pixels_2", selftestNpyBytes("<u2", { 2, 2, 2, 3 }, ts.data(), ts.size() * 2) },
         });
+        // The same typed keyed path, large enough to make remoteTreeRefine
+        // enqueue a real step-1 fetch after its decimated first view.  Two
+        // frames are deliberate: while the worker owns frame 0, frame 1 stays
+        // in the queue for Stop to sweep.  Axis-coded values distinguish an
+        // FCHW fetch from native/FHWC bytes wearing the right dimensions.
+        const int STOP_H = 2002, STOP_W = 4, STOP_C = 2, STOP_F = 2;
+        std::vector<uint16_t> stopPx((size_t)STOP_F * STOP_C * STOP_H * STOP_W);
+        for (size_t i = 0; i < stopPx.size(); i++) stopPx[i] = (uint16_t)(1000 + i);
+        const std::string typedStop = root + "/typed-stop.npz";
+        selftestWriteNpz(typedStop, {
+            { "__viewer",   i32(3) },
+            { "__n",        i32(1) },
+            { "__layer_0",  str1("stack") },
+            { "__parent_0", i32(-1) },
+            { "__name_0",   str1("stoppable FCHW") },
+            { "__layout_0", str1("FCHW") },
+            { "__pixels_0", selftestNpyBytes("<u2",
+                                { STOP_F, STOP_C, STOP_H, STOP_W },
+                                stopPx.data(), stopPx.size() * 2) },
+        });
         // Two malformed typed declarations. rawSeries proves a Series cannot
         // smuggle in a tensor beside an otherwise valid Frame child. lateBad
         // puts a valid Frame first and a cross-layer layout second: validation
@@ -517,6 +537,145 @@
             app.uiSession.stop();
             setEnv("VIEWER_SERVE_PROTOCOL", "");
             if (!connect()) return 1;
+        }
+
+        // ---- R27: Stop crosses the typed keyed full-refine path -------------
+        // #238 put the Files button's exact remote Stop body behind this seam.
+        // Phase 4 subsequently put Reader and Viewer-NPZ typed nodes through
+        // the same keyed background refiner.  Exercise the NPZ issuer here: it
+        // is the stronger representative because both its declared identity
+        // AND its wire request are FCHW (a Reader's keyed wire read is native).
+        //
+        // Restart just the fetch worker so its peer observes the lag seam.  The
+        // UI Session stays live and unlagged, hence the initial preview is still
+        // cheap; only the background TILE remains in flight long enough for the
+        // test to press Stop deterministically.
+        {
+            closeAll();
+            stopRemoteFetcher();
+            closeAll();                 // discard any answer the joined worker returned
+            app.rfStop = false;
+            setEnv("VIEWER_SERVE_LAG_MS", "400");
+
+            const bool opened = openRemoteNpz(urlOf(typedStop), std::string());
+            const uint32_t oldGen = app.rfGen.load();
+            std::vector<uint64_t> previewUids;
+            std::vector<std::vector<float>> previewPixels;
+            std::vector<int> previewSteps;
+            for (const auto& d : app.images) {
+                previewUids.push_back(d->uid);
+                previewPixels.push_back(d->src->data);
+                previewSteps.push_back(d->src->remoteStep);
+            }
+            const bool preview = opened && app.images.size() == STOP_F;
+            bool previewTyped = preview;
+            for (const auto& d : app.images) {
+                const int step = d->src->remoteStep;
+                previewTyped = previewTyped && step > 1 &&
+                               d->w == (STOP_W + step - 1) / step &&
+                               d->h == (STOP_H + step - 1) / step && d->ch == STOP_C &&
+                               d->src->npyRead == NR_FCHW &&
+                               d->src->remoteKeyRead == NR_FCHW &&
+                               d->src->remoteKeyLayout == "FCHW" &&
+                               d->src->remoteKeyRequires15;
+            }
+            check(previewTyped,
+                  "R27a a large Viewer-NPZ FCHW node starts as a typed keyed preview");
+
+            // V8 uses this same distinction: pending counts queued + in-flight,
+            // while rfQueue contains only the jobs the worker has not taken.
+            // With two frames, catching one busy also leaves a real queued job
+            // for the button to sweep.
+            bool caught = false;
+            int queuedBefore = -1, pendingBefore = -1;
+            const double catchAt = nowSec();
+            while (nowSec() - catchAt < 10.0) {
+                bool targetBusy = false;
+                {
+                    std::lock_guard<std::mutex> lk(app.rfMtx);
+                    const uint64_t busy = app.rfBusyUid.load();
+                    for (uint64_t uid : previewUids)
+                        if (busy == uid) targetBusy = true;
+                    if (targetBusy) {
+                        queuedBefore = (int)app.rfQueue.size();
+                        pendingBefore = app.rfPending.load();
+                    }
+                }
+                if (targetBusy && pendingBefore > queuedBefore && queuedBefore > 0) {
+                    caught = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            stopRemoteStackFetch();             // the Files panel's actual seam
+            check(caught && pendingBefore == STOP_F && queuedBefore == STOP_F - 1,
+                  "R27b Stop is pressed with one typed fetch held and one queued");
+
+            bool swept = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                swept = app.rfQueue.empty();
+            }
+            check(app.rfGen.load() == oldGen + 1 && swept && app.rbOpenQueue.empty() &&
+                      app.rfPending == 0 && app.rfTotal == 0 && app.rfFetched == 0 &&
+                      app.rfBytesInFlight == 0,
+                  "R27c the real Stop advances generation and zeros queue/counters");
+
+            // Let the one answer already beyond the queue arrive, then pump it.
+            // Its old generation must be ignored before it can change pixels or
+            // decrement the counters Stop already returned to zero.
+            const double staleAt = nowSec();
+            while (app.rfBusyUid != 0 && nowSec() - staleAt < 10.0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            pumpRemoteFetch();
+            bool oldDidNotLand = app.rfBusyUid == 0 && app.images.size() == previewPixels.size();
+            for (size_t i = 0; i < app.images.size() && oldDidNotLand; i++)
+                oldDidNotLand = app.images[i]->src->remoteStep == previewSteps[i] &&
+                                app.images[i]->src->data == previewPixels[i];
+            bool stoppedClean = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                stoppedClean = app.rfQueue.empty() && app.rfDone.empty();
+            }
+            stoppedClean = stoppedClean && app.rfPending == 0 && app.rfTotal == 0 &&
+                           app.rfFetched == 0 && app.rfBytesInFlight == 0;
+            check(oldDidNotLand && stoppedClean,
+                  "R27d the old-generation TILE cannot land or revive stopped counters");
+
+            // The worker itself remains usable after the button: enqueue the
+            // same two typed sources under the new generation and require their
+            // complete step-1 pixels, axes and keyed wire declaration.
+            for (const auto& d : app.images) requestFullRemote(d.get());
+            const bool restarted = app.rfPending > 0;
+            drainRemote(30.0);
+            bool full = restarted && app.images.size() == STOP_F;
+            const size_t plane = (size_t)STOP_H * STOP_W;
+            for (int f = 0; f < (int)app.images.size() && full; f++) {
+                const ImageDoc& d = *app.images[(size_t)f];
+                const size_t base = (size_t)f * STOP_C * plane;
+                full = d.w == STOP_W && d.h == STOP_H && d.ch == STOP_C &&
+                       d.src->remoteStep == 1 && d.src->npyRead == NR_FCHW &&
+                       d.src->remoteKeyRead == NR_FCHW &&
+                       d.src->remoteKeyLayout == "FCHW" &&
+                       d.src->remoteKeyRequires15 && d.src->data.size() == plane * STOP_C &&
+                       d.src->data[0] == stopPx[base] &&
+                       d.src->data[1] == stopPx[base + plane] &&
+                       d.src->data[2] == stopPx[base + 1];
+            }
+            bool restartedClean = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                restartedClean = app.rfQueue.empty() && app.rfDone.empty();
+            }
+            restartedClean = restartedClean && app.rfPending == 0 && app.rfTotal == 0 &&
+                             app.rfFetched == 0 && app.rfBytesInFlight == 0;
+            check(full && restartedClean,
+                  "R27e the next typed fetch finishes with FCHW axes and clean counters");
+
+            stopRemoteFetcher();
+            setEnv("VIEWER_SERVE_LAG_MS", "");
+            app.rfStop = false;
+            closeAll();
         }
 
         // ---- R17: the two ways a container can be unreachable ------------------
