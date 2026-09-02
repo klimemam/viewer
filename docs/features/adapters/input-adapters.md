@@ -1194,15 +1194,21 @@ adapter を編集したら次に開いたときに効く。
 実行できてはならない。裁定は4案 (A 書かない / B 書いて走らせる / C 書くが
 走らせない / D memo と一致した時だけ走らせる) から **C**。
 
-- 保存時: member が `__pixels_*`(reader 産)の image 行の前に、そのとき memo が
-  知っていれば `readerhint <spec>` を書く。**加算的**な鍵 —— 古いビルドは
-  読み飛ばし、鍵が無いときと同じに振る舞う
-- 復元時: memo が引ければ従来どおり(それが走るのは memo であって hint ではない)。
-  引けなければ **hint の名前を失敗報告に入れる** ——「この session は reader X で
-  保存された。信頼するならその reader で開き直せ」。hint が何を名指ししていても
-  **viewer はそれを実行しない**
-- 検証: selftest V25p(記録が無いときの名指し失敗)/ V25p2(hint の書き出し・
-  名指し・**実行回数が動かないこと**)
+- 保存時: materialisationのimage行の前に、local/remote共通の加算key
+  `materializedissuer reader|npz` と `materializedrun <id>` を書く。前者は戸、後者は
+  同じpathを同じ戸で複数回開いたときの1回ごとのbuild境界である。run idは
+  ImageDocのmembershipに属し、共有FrameSourceや後のbatch移動には左右されない。
+  Reader産なら、そのときmemoが知っている場合だけ `readerhint <spec>` も書く。
+  古いビルドは未知keyを読み飛ばす
+- 復元時: issuer keyがReader/NPZの戸を選ぶ。Readerを実際に走らせる権限は従来どおり
+  **memoだけ**にあり、hintではない。memoが引けなければ **hintの名前を失敗報告に
+  入れる** ——「このsessionはreader Xで保存された。信頼するならそのreaderで
+  開き直せ」。hintが何を名指ししていても **viewerはそれを実行しない**。
+  issuer/run keyの無い（またはrun 0の）旧sessionだけは従来の保守的な
+  member/memoと未使用slotによる判定を維持する
+- 検証: selftest V25p(記録が無いときの名指し失敗)/ V25p2(hintの書き出し・名指し・
+  **実行回数が動かないこと**)に加え、R21h2〜h4 / R26d4〜e4で同一path/memberの
+  Reader/NPZ発行元と複数groupを混同しないこと
 
 ### 4.13 どこで指定するか / どこで書くか / 信頼
 

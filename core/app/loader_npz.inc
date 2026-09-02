@@ -582,8 +582,11 @@ static std::string npzOpenMember(const std::string& path, const std::vector<uint
     size_t before = app.images.size();
     std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead);
     if (!lErr.empty()) return lErr;
+    const uint64_t materializedRunId = app.nextMaterializedRunId++;
     for (size_t k = before; k < app.images.size(); k++) {
         app.images[k]->src->member = arrayName;   // identity for session restore
+        app.images[k]->src->materializedIssuer = remote::KeyedRef::FromNpz;
+        app.images[k]->materializedRunId = materializedRunId;
         // Watch baseline (§2.1): the npz FILE is the local file these pixels
         // came from - src->path already names it; member keeps members
         // distinct in the registry tuple (§6.2). Identity is complete only
@@ -686,9 +689,12 @@ static int seqIdOfFirstFramePath(const std::string& path, int preferBatch = 0,
                                  const std::string& member = std::string());  // fwd (sequence.inc)
 static std::vector<std::string> findSequenceSiblings(const std::string& path,
                                                      std::string& patternOut);  // fwd
-static std::string loadNpz(const std::string& path, const std::string& onlyMember,
-                           int npyRead, const std::string& readerSpec,
-                           const std::string& origin);       // fwd (below)
+static std::string loadNpz(const std::string& path,
+                           const std::string& onlyMember = "",
+                           int npyRead = 0 /*NR_NATIVE*/,
+                           const std::string& readerSpec = std::string(),
+                           const std::string& origin = std::string(),
+                           bool reuseExisting = true);       // fwd (below)
 static std::string loadNpy(const std::string& path, int npyRead);  // fwd (below)
 static std::string loadImageFile(const std::string& path,
                                  const std::string& onlyMember = "");   // fwd (below)
@@ -1848,6 +1854,7 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                                 ? nodes[0].name : baseName(origin);
     app.loadBatchId = newBatch(uniqueBatchName(batchName));
     int batchId = app.loadBatchId;
+    const uint64_t materializedRunId = app.nextMaterializedRunId++;
     int frames = 0, stacks = 0, seriesN = 0;
     std::string firstErr;
 
@@ -1926,6 +1933,9 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
             // looking member name.  Ordinary NPZ is allowed to contain an
             // array literally named "__pixels_0" (§4.11.1).
             d->src->viewerMaterialized = true;
+            d->src->materializedIssuer = readerSpec.empty()
+                ? remote::KeyedRef::FromNpz : remote::KeyedRef::FromReader;
+            d->materializedRunId = materializedRunId;
             // the CALLER's stat, taken before the origin's bytes were read
             // (identity before bytes, §6.2): a stat taken here, after the
             // multi-second container decode, could bind NEW disk state to OLD
@@ -2100,10 +2110,9 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
 //
 // onlyMember != "" restores a single array (sessions record which one): no
 // picker and no batch of its own, because the session owns both.
-static std::string loadNpz(const std::string& path, const std::string& onlyMember = "",
-                           int npyRead = 0 /*NR_NATIVE*/,
-                           const std::string& readerSpec = std::string(),
-                           const std::string& origin = std::string()) {
+static std::string loadNpz(const std::string& path, const std::string& onlyMember,
+                           int npyRead, const std::string& readerSpec,
+                           const std::string& origin, bool reuseExisting) {
     // identity BEFORE the bytes: see decodeNpyFrame - the multi-second member
     // decode below is exactly the window an overwrite would exploit. Every
     // member opened from THIS zip binds to this stat (npzOpenMember).
@@ -2123,13 +2132,14 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
         // The file the user opened, which is this one unless a cache artifact
         // is standing in for it.
         const std::string& src = origin.empty() ? path : origin;
-        if (!onlyMember.empty()) {
+        if (!onlyMember.empty() && reuseExisting) {
             // A session records one line per doc, but a container is ONE unit and
             // rebuilds every doc at once: the second line onward would duplicate
             // the whole tree. Already-here is the signal, so no state is carried
             // between the calls.
             for (const auto& d : app.images)
                 if (d->src->path == src &&
+                    d->src->materializedIssuer == remote::KeyedRef::FromNpz &&
                     d->src->member.compare(0, 9, "__pixels_") == 0)
                     return {};
         }

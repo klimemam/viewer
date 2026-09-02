@@ -738,6 +738,216 @@
             check(parity, "R21h local stream and remote stream are dimension/pixel identical");
             closeAll();
 
+            // One URL can legitimately have BOTH issuers: a Reader may ignore
+            // the origin bytes and a Viewer-NPZ may materialise those same bytes.
+            // Give both the same reserved member names, then order the groups
+            // Reader -> NPZ -> Reader.  Without issuer-scoped, bounded restore
+            // runs the final Reader line can borrow the intervening NPZ's
+            // __pixels_1/__pixels_2 slots and its group never comes back.
+            const std::string issuerPath = root + "/issuer-cross.npz";
+            const std::string issuerUrl = "local://" + issuerPath;
+            auto issuerI32 = [](int32_t v) {
+                return selftestNpyBytes("<i4", {}, &v, sizeof(v));
+            };
+            auto issuerStr = [](const std::string& s) {
+                const size_t n = s.empty() ? 1 : s.size();
+                std::vector<uint32_t> cps(n, 0);
+                for (size_t i = 0; i < s.size(); i++)
+                    cps[i] = (uint32_t)(unsigned char)s[i];
+                return selftestNpyBytes(("<U" + std::to_string(n)).c_str(), {},
+                                        cps.data(), cps.size() * sizeof(uint32_t));
+            };
+            std::vector<uint16_t> issuerFrame(3 * 2 * 4);
+            std::vector<uint16_t> issuerStack(2 * 2 * 2 * 3);
+            for (size_t i = 0; i < issuerFrame.size(); i++)
+                issuerFrame[i] = (uint16_t)(3000 + i);
+            for (size_t i = 0; i < issuerStack.size(); i++)
+                issuerStack[i] = (uint16_t)(4000 + i);
+            const double issuerConditions[2] = { 2.0, 8.0 };
+            selftestWriteNpz(issuerPath, {
+                { "__viewer", issuerI32(3) },
+                { "__n", issuerI32(3) },
+                { "__layer_0", issuerStr("series") },
+                { "__parent_0", issuerI32(-1) },
+                { "__name_0", issuerStr("NPZ between Readers") },
+                { "__conditions_values_0", selftestNpyBytes(
+                    "<f8", { 2 }, issuerConditions, sizeof(issuerConditions)) },
+                { "__conditions_name_0", issuerStr("exposure") },
+                { "__conditions_unit_0", issuerStr("ms") },
+                { "__layer_1", issuerStr("frame") },
+                { "__parent_1", issuerI32(0) },
+                { "__layout_1", issuerStr("CHW") },
+                { "__pixels_1", selftestNpyBytes(
+                    "<u2", { 3, 2, 4 }, issuerFrame.data(), issuerFrame.size() * 2) },
+                { "__layer_2", issuerStr("stack") },
+                { "__parent_2", issuerI32(0) },
+                { "__layout_2", issuerStr("FCHW") },
+                { "__pixels_2", selftestNpyBytes(
+                    "<u2", { 2, 2, 2, 3 }, issuerStack.data(), issuerStack.size() * 2) },
+            });
+            const std::string crossReader1 = openRemoteWithReader(issuerUrl, spec);
+            const size_t crossNpzAt = app.images.size();
+            const bool crossNpz = crossReader1.empty() &&
+                                  openRemoteNpz(issuerUrl, "__pixels_1");
+            const size_t crossReader2At = app.images.size();
+            const std::string crossReader2 = crossNpz
+                ? openRemoteWithReader(issuerUrl, spec) : std::string("NPZ did not open");
+            check(crossReader1.empty() && crossNpz && crossReader2.empty() &&
+                      crossNpzAt == 4 && crossReader2At == 7 &&
+                      app.images.size() == 11 && app.series.size() == 3 &&
+                      app.images[4]->src->member == "__pixels_1" &&
+                      app.images[7]->src->member == "__pixels_1",
+                  "R21h2 one URL opens as Reader, NPZ, then Reader without dedupe");
+            for (size_t i = 0; i < app.images.size(); i++) {
+                const bool firstReader = i < crossNpzAt;
+                const bool npzGroup = i >= crossNpzAt && i < crossReader2At;
+                app.images[i]->black = firstReader ? 10.0f : npzGroup ? 20.0f : 30.0f;
+                app.images[i]->white = firstReader ? 110.0f : npzGroup ? 120.0f : 130.0f;
+                app.images[i]->displayLut = firstReader ? 1 : npzGroup ? 2 : 3;
+            }
+            // Leave NPZ __pixels_1 UNSAVED while keeping __pixels_2. Its restore
+            // still rebuilds the whole container and therefore creates a free
+            // __pixels_1 slot between Reader 1 and Reader 2. An issuer-blind or
+            // unbounded Reader run will steal precisely that slot for Reader 2.
+            if (app.images.size() == 11) closeImages({ (int)crossNpzAt });
+            check(app.images.size() == 10 && app.series.size() == 3,
+                  "R21h2b the NPZ run deliberately leaves an unsaved member slot");
+            const std::string crossSession = root + "/issuer-cross.vsession";
+            { std::ofstream f(pathFromUtf8(crossSession), std::ios::binary); writeSessionTo(f); }
+            std::ifstream crossIn(pathFromUtf8(crossSession), std::ios::binary);
+            const std::string crossBody((std::istreambuf_iterator<char>(crossIn)),
+                                        std::istreambuf_iterator<char>());
+            int crossReaderLines = 0, crossNpzLines = 0, crossRunLines = 0;
+            for (size_t at = 0; (at = crossBody.find("materializedissuer reader", at)) !=
+                 std::string::npos; at += strlen("materializedissuer reader"))
+                crossReaderLines++;
+            for (size_t at = 0; (at = crossBody.find("materializedissuer npz", at)) !=
+                 std::string::npos; at += strlen("materializedissuer npz"))
+                crossNpzLines++;
+            std::vector<unsigned long long> crossRuns;
+            std::istringstream crossLines(crossBody);
+            std::string crossLine;
+            while (std::getline(crossLines, crossLine)) {
+                std::istringstream one(crossLine);
+                std::string key;
+                unsigned long long run = 0;
+                one >> key >> run;
+                if (key != "materializedrun" || run == 0) continue;
+                crossRunLines++;
+                if (std::find(crossRuns.begin(), crossRuns.end(), run) == crossRuns.end())
+                    crossRuns.push_back(run);
+            }
+            check(crossReaderLines == 6 && crossNpzLines == 1 &&
+                      crossRunLines == 7 && crossRuns.size() == 3,
+                  "R21h3 the session distinguishes every issuer line and materialisation run");
+
+            closeAll();
+            const std::string crossRestore = loadSession(crossSession);
+            const double crossSeriesStart = nowSec();
+            while (nowSec() - crossSeriesStart < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int readerDocs = 0, npzDocs = 0;
+            int state10 = 0, state20 = 0, state30 = 0;
+            bool npzFreeSlotSafe = true;
+            bool crossFacts = crossRestore.empty() && app.images.size() == 11 &&
+                              app.series.size() == 4;
+            for (const auto& d : app.images) {
+                const bool fromReader =
+                    d->src->materializedIssuer == remote::KeyedRef::FromReader &&
+                    d->src->remoteKeyKind == remote::KeyedRef::FromReader;
+                const bool fromNpz =
+                    d->src->materializedIssuer == remote::KeyedRef::FromNpz &&
+                    d->src->remoteKeyKind == remote::KeyedRef::FromNpz;
+                readerDocs += fromReader ? 1 : 0;
+                npzDocs += fromNpz ? 1 : 0;
+                state10 += d->black == 10.0f && d->white == 110.0f &&
+                           d->displayLut == 1 ? 1 : 0;
+                state20 += d->black == 20.0f && d->white == 120.0f &&
+                           d->displayLut == 2 ? 1 : 0;
+                state30 += d->black == 30.0f && d->white == 130.0f &&
+                           d->displayLut == 3 ? 1 : 0;
+                if (fromNpz && d->src->member == "__pixels_1")
+                    npzFreeSlotSafe = npzFreeSlotSafe &&
+                        !(d->black == 30.0f && d->white == 130.0f &&
+                          d->displayLut == 3);
+                crossFacts = crossFacts && (fromReader || fromNpz);
+            }
+            int readerSeries = 0, npzSeries = 0;
+            int readerState10 = 0, readerState30 = 0;
+            int npzState20 = 0, npzFreeFrame = 0;
+            for (const auto& s : app.series) {
+                int issuer = -1;
+                bool oneIssuer = !s.members.empty();
+                bool all10 = !s.members.empty(), all30 = !s.members.empty();
+                bool npzM1Seen = false, npzM1Safe = true;
+                bool npzM2Seen = false, npzM2State20 = true;
+                for (const auto& m : s.members) {
+                    const ImageDoc* memberDoc = nullptr;
+                    bool memberAny = false, member10 = true, member20 = true, member30 = true;
+                    for (const auto& d : app.images) {
+                        if ((m.frameUid != 0 && d->uid == m.frameUid) ||
+                            (m.seqId != 0 && d->seqId == m.seqId)) {
+                            if (!memberDoc) memberDoc = d.get();
+                            memberAny = true;
+                            member10 = member10 && d->black == 10.0f &&
+                                d->white == 110.0f && d->displayLut == 1;
+                            member20 = member20 && d->black == 20.0f &&
+                                d->white == 120.0f && d->displayLut == 2;
+                            member30 = member30 && d->black == 30.0f &&
+                                d->white == 130.0f && d->displayLut == 3;
+                        }
+                    }
+                    if (!memberDoc || !memberAny) { oneIssuer = false; continue; }
+                    if (issuer < 0) issuer = memberDoc->src->materializedIssuer;
+                    else if (issuer != memberDoc->src->materializedIssuer) oneIssuer = false;
+                    all10 = all10 && member10 && !member20 && !member30;
+                    all30 = all30 && member30 && !member10 && !member20;
+                    if (memberDoc->src->materializedIssuer == remote::KeyedRef::FromNpz &&
+                        memberDoc->src->member == "__pixels_1") {
+                        npzM1Seen = true;
+                        npzM1Safe = npzM1Safe && !member10 && !member20 && !member30;
+                    }
+                    if (memberDoc->src->materializedIssuer == remote::KeyedRef::FromNpz &&
+                        memberDoc->src->member == "__pixels_2") {
+                        npzM2Seen = true;
+                        npzM2State20 = npzM2State20 && member20 &&
+                            !member10 && !member30;
+                    }
+                }
+                crossFacts = crossFacts && oneIssuer;
+                if (oneIssuer && issuer == remote::KeyedRef::FromReader) {
+                    readerSeries++;
+                    readerState10 += all10 ? 1 : 0;
+                    readerState30 += all30 ? 1 : 0;
+                    crossFacts = crossFacts && (all10 || all30);
+                }
+                if (oneIssuer && issuer == remote::KeyedRef::FromNpz) {
+                    npzSeries++;
+                    const bool npzStackBound = !npzM1Seen && npzM2Seen && npzM2State20;
+                    const bool npzFreeBound = npzM1Seen && npzM1Safe && !npzM2Seen;
+                    npzState20 += npzStackBound ? 1 : 0;
+                    npzFreeFrame += npzFreeBound ? 1 : 0;
+                    crossFacts = crossFacts && (npzStackBound || npzFreeBound);
+                }
+            }
+            fprintf(stderr, "rreaderselftest:   R21h4 err=\"%s\" docs=%zu series=%zu "
+                            "issuer=%d/%d state=%d/%d/%d readerSeries=%d(%d/%d) "
+                            "npzSeries=%d(stack=%d free=%d) facts=%d\n",
+                    crossRestore.c_str(), app.images.size(), app.series.size(),
+                    readerDocs, npzDocs, state10, state20, state30,
+                    readerSeries, readerState10, readerState30,
+                    npzSeries, npzState20, npzFreeFrame, crossFacts ? 1 : 0);
+            check(crossFacts && readerDocs == 8 && npzDocs == 3 &&
+                      state10 == 4 && state20 == 2 && state30 == 4 &&
+                      npzFreeSlotSafe && readerSeries == 2 && npzSeries == 2 &&
+                      readerState10 == 1 && readerState30 == 1 && npzState20 == 1 &&
+                      npzFreeFrame == 1,
+                  "R21h4 session restores three issuer-scoped runs plus the free-frame Series");
+            forgetReader(issuerUrl);
+            closeAll();
+
             std::string tf[3] = { std::string(), files[1], files[2] };
             check(slurp(rdTyped, tf[0]), "R21i (setup) the typed reader is readable");
             std::string oldFiles[3] = { tf[0], tf[1], tf[2] };

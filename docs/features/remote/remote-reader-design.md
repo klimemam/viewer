@@ -545,10 +545,19 @@ tail する :1603)。RUN は一往復なので、進捗はパネルに「running
 >    V25p-r2 の「hint は依頼もしない」は `bytesReceived()` が 1 バイトも動かない
 >    こと + peer のキャッシュ不変 —— 拒否は `ensureUiSession` より手前なので、
 >    接続すら起きない。
+>
+> **後続追記 (#230 phase④):** 上の①②はstage 4着地時の履歴である。その後
+> Viewer-NPZも同じ `__pixels_N` を使うため、member名だけをReaderの証拠には
+> できなくなった。現行sessionはlocal/remote共通の加算key
+> `materializedissuer reader|npz` で戸を、`materializedrun <id>` で同じpath・戸を
+> 複数回開いた各build範囲を区別する。run idはImageDocのmembershipに属する。
+> Readerを走らせる権限がmemoだけにある裁定は不変で、keyの無い（またはrun 0の）
+> 旧sessionだけが未使用slotによる旧判定へfallbackする。
 
-- 復元: memo (url 鍵) が引ければ RUN → 開き直し (ローカル復元 :2691-2701 と同じ
-  「memo が走らせる」)。引けなければ readerhint を**名指しだけ**して失敗報告
-  (§4.12.1 裁定 C — hint は remote でも走らない)。
+- 復元: `materializedissuer reader` がReaderの戸を選び、memo (url鍵) が引ければ
+  RUN → 開き直し (ローカル復元と同じ「memoが走らせる」)。引けなければ
+  readerhintを**名指しだけ**して失敗報告 (§4.12.1 裁定C — hintはremoteでも
+  走らない)。keyの無い旧sessionはmemberによる旧判定を維持する。
 - **赤→緑**: V25p-r1 memo ありで復元 → doc が戻る・**adapter 実行回数が RUN
   キャッシュにより増えない**。V25p-r2 memo を消して復元 → hint 名入りの失敗行、
   実行回数 0。
@@ -778,8 +787,14 @@ directory 完走、local header 照合、長い error の実寸)・**R25**(lower
 - **開く**: 選ばれた member ごとに stage 2 の実装を使う (間引きの最初の 1 枚 :1902 の
   step 計算、stack は n / N、zoom/pan で精細化)。TILE は [key][member index] で引く。
 - **復元**: src->path = url、src->member = 配列名 (npzOpenMember :769 と同じフィールドが
-  remote doc にもある)。session 復元は onlyMember の規則 (:2115-2117) ごと共有 —
-  SCAN して名指しの member だけを picker 無しで開く。memo / readerhint は無関係
+  remote doc にもある)。session はmaterialisationの発行元をlocal/remote共通の加算key
+  `materializedissuer npz` として記録し、Readerも使う `__pixels_N` という名前から
+  発行元を推定しない。同じpath/memberを複数回開いたgroupも、加算key
+  `materializedrun <id>` で1回ごとのbuild範囲に分離する。run idはImageDocの
+  membershipに属し、keyの無い（またはrun 0の）旧sessionだけは従来の保守的な
+  未使用slot判定を維持する。
+  復元は onlyMember の規則 (:2115-2117) ごと共有 — SCAN して名指しの member だけを
+  picker 無しで開く。memo / readerhint は無関係
   (native であり、走るものが無い)。
 
 ### 10.4 (c) 拒否文と灰色の解け方

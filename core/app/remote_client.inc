@@ -46,7 +46,8 @@ static bool openRemote(const std::string& url, bool asPreview = false, int frame
 // compiled before the door itself and both halves of "choose arrays" - the one
 // that offers the rows and the one that opens what was ticked - have to reach
 // the same function whichever end listed the file.
-static bool openRemoteNpz(const std::string& url, const std::string& onlyMember);
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember,
+                          bool reuseExisting = true);
 static bool openRemoteNpzMember(const std::string& url, const std::string& key,
                                 const NpzMember& m, bool asPreview);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
@@ -113,6 +114,7 @@ static void rfWorker() {
         d.key = job.key; d.node = job.node; d.keyKind = job.keyKind;
         d.keyedRead = job.keyedRead; d.keyLayout = job.keyLayout;
         d.keyRequires15 = job.keyRequires15;
+        d.materializedRunId = job.materializedRunId;
         d.member = job.member;
         std::string host, rpath, err;
         int port = 0;
@@ -215,6 +217,7 @@ static void rfInheritRead(App::RFetchJob& j, const ImageDoc* head) {
     j.keyedRead = head->src->remoteKeyRead;
     j.keyLayout = head->src->remoteKeyLayout;
     j.keyRequires15 = head->src->remoteKeyRequires15;
+    j.materializedRunId = head->materializedRunId;
     j.member = head->src->member;
 }
 
@@ -252,6 +255,7 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     j.keyedRead = d->src->remoteKeyRead;
     j.keyLayout = d->src->remoteKeyLayout;
     j.keyRequires15 = d->src->remoteKeyRequires15;
+    j.materializedRunId = d->materializedRunId;
     j.member = d->src->member;
     // the full frame REPLACES the decimated one, so only the growth is new
     {
@@ -355,6 +359,8 @@ static void pumpRemoteFetch() {
             S.remoteKey = d.key;
             S.remoteNode = d.node;
             S.remoteKeyKind = d.keyKind;
+            S.materializedIssuer = d.key.empty() ? -1 : d.keyKind;
+            doc->materializedRunId = d.materializedRunId;
             S.remoteKeyRead = d.keyedRead;
             S.remoteKeyLayout = d.keyLayout;
             S.remoteKeyRequires15 = d.keyRequires15;

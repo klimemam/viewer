@@ -1873,7 +1873,8 @@ static void openRemoteRawRow(const std::string& url, uint64_t sizeBytes) {
 }
 
 // The 4-argument shape core/browse/host.h binds. See the note at that binding.
-static bool openRemoteNpz(const std::string& url, const std::string& onlyMember);  // fwd
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember,
+                          bool reuseExisting);  // fwd; default is declared in remote_client.inc
 
 // §4.12 OVER A LINK, at the door rather than after it (#218 review).
 //
@@ -2067,6 +2068,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
                 (frame > 0 ? " #" + std::to_string(frame) : "") +
                 (step > 1 ? "  (1/" + std::to_string(step) + ")" : "");
     FrameSource& S = *doc->src;
+    if (kd) doc->materializedRunId = app.nextMaterializedRunId++;
     S.mtime = urlStat.mtime;                 // the PRE-read stat: 0/0 for ssh://,
     S.fsize = urlStat.fsize;                 // the disk baseline for local://
     S.path = url;
@@ -2099,6 +2101,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         S.remoteKey = kd->key;
         S.remoteNode = kd->node;
         S.remoteKeyKind = kd->kind;
+        S.materializedIssuer = kd->kind;
         S.remoteKeyRead = npyRead;
         S.remoteKeyLayout = kd->layout;
         S.remoteKeyRequires15 = kd->requires15;
@@ -2725,6 +2728,7 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
             S.remoteKey = key;
             S.remoteNode = node;
             S.remoteKeyKind = kind;
+            S.materializedIssuer = kind;
             S.remoteProto = app.uiSession.peerVersion();
             // Preserve vnzBuild's logical npyRead: it is identity, session and
             // UI truth. Later peer requests use a separate wire reading. A
@@ -2925,7 +2929,8 @@ static std::string openRemoteViewerNpz(const std::string& url, const remote::Npz
 // The door. `onlyMember` restores a single array (sessions record which one):
 // no picker and no batch of its own, because the session owns both - the same
 // rule loadNpz follows, shared rather than restated.
-static bool openRemoteNpz(const std::string& url, const std::string& onlyMember) {
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember,
+                          bool reuseExisting) {
     std::string host, rpath;
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) {
@@ -2940,9 +2945,12 @@ static bool openRemoteNpz(const std::string& url, const std::string& onlyMember)
         // A container is ONE unit and rebuilds every doc at once, so a session's
         // second line for the same file adds nothing (loadNpz makes the same
         // call, with the same reason).
-        if (!onlyMember.empty())
+        if (!onlyMember.empty() && reuseExisting)
             for (const auto& d : app.images)
-                if (d->src->path == url && d->src->member.compare(0, 9, "__pixels_") == 0)
+                if (d->src->path == url &&
+                    !d->src->remoteKey.empty() &&
+                    d->src->remoteKeyKind == remote::KeyedRef::FromNpz &&
+                    d->src->member.compare(0, 9, "__pixels_") == 0)
                     return true;
         const size_t before = app.images.size();
         const std::string cerr = openRemoteViewerNpz(url, sc);

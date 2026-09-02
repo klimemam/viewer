@@ -492,6 +492,241 @@
                 rpx.push_back(d->src->data);
                 rdims.emplace_back(d->w, d->h, d->ch);
             }
+            // Runtime materialisation ids are the anti-vacuous witness for the
+            // additive session token.  Series restore may deliberately move a
+            // member between auto-created Series, so Series membership alone
+            // cannot prove that a later saved occurrence did not borrow the
+            // first occurrence's unsaved Frame slot.
+            auto occurrencePairs = [&](float stackABlack, float stackAWhite, int stackALut,
+                                       float frameBBlack, float frameBWhite, int frameBLut,
+                                       float stackBBlack, float stackBWhite, int stackBLut) {
+                struct RunFacts {
+                    uint64_t id = 0;
+                    int docs = 0, frames = 0, stacks = 0;
+                    int frameB = 0, frameOther = 0;
+                    int stackA = 0, stackB = 0, stackOther = 0;
+                };
+                std::vector<RunFacts> runs;
+                bool valid = true;
+                for (const auto& d : app.images) {
+                    if (d->materializedRunId == 0) { valid = false; continue; }
+                    auto it = std::find_if(runs.begin(), runs.end(), [&](const RunFacts& r) {
+                        return r.id == d->materializedRunId;
+                    });
+                    if (it == runs.end()) {
+                        runs.push_back(RunFacts{});
+                        runs.back().id = d->materializedRunId;
+                        it = runs.end() - 1;
+                    }
+                    it->docs++;
+                    if (d->src->member == "__pixels_1") {
+                        it->frames++;
+                        const bool b = d->black == frameBBlack && d->white == frameBWhite &&
+                                       d->displayLut == frameBLut;
+                        if (b) it->frameB++; else it->frameOther++;
+                    } else if (d->src->member == "__pixels_2") {
+                        it->stacks++;
+                        const bool a = d->black == stackABlack && d->white == stackAWhite &&
+                                       d->displayLut == stackALut;
+                        const bool b = d->black == stackBBlack && d->white == stackBWhite &&
+                                       d->displayLut == stackBLut;
+                        if (a) it->stackA++;
+                        else if (b) it->stackB++;
+                        else it->stackOther++;
+                    } else valid = false;
+                }
+                int runA = 0, runB = 0;
+                for (const RunFacts& r : runs) {
+                    const bool a = r.docs == 3 && r.frames == 1 && r.stacks == 2 &&
+                        r.frameB == 0 && r.frameOther == 1 && r.stackA == 2 &&
+                        r.stackB == 0 && r.stackOther == 0;
+                    const bool b = r.docs == 3 && r.frames == 1 && r.stacks == 2 &&
+                        r.frameB == 1 && r.frameOther == 0 && r.stackA == 0 &&
+                        r.stackB == 2 && r.stackOther == 0;
+                    runA += a ? 1 : 0;
+                    runB += b ? 1 : 0;
+                    valid = valid && (a || b);
+                }
+                return valid && runs.size() == 2 && runA == 1 && runB == 1;
+            };
+
+            // A Reader and a Viewer-NPZ both use reserved __pixels_N members.
+            // Put a deliberately stale Reader memo on this NPZ URL: the member
+            // heuristic alone would run that Reader (or fail before SCAN), while
+            // the persisted keyed issuer must keep this on the NPZ door.  The
+            // Frame and the selected Stack frame carry distinct display state,
+            // so treating the container's second saved line as a failed dedupe
+            // cannot pass merely because all three pixel docs came back.
+            const std::string typedUrl = urlOf(typed);
+            const auto memoBefore = app.readerMemo;
+            const bool secondGroup = openRemoteNpz(typedUrl, std::string());
+            check(secondGroup && app.images.size() == 6 && app.series.size() == 2,
+                  "R26d4 the same remote Viewer-NPZ can be opened as two groups");
+            if (app.images.size() >= 6) {
+                app.images[0]->black = 17.0f;
+                app.images[0]->white = 170.0f;
+                app.images[0]->displayLut = 2;
+                selectImage(1);
+                for (size_t i = 1; i <= 2; i++) {
+                    app.images[i]->black = 23.0f;
+                    app.images[i]->white = 230.0f;
+                    app.images[i]->displayLut = 4;
+                }
+                app.images[3]->black = 31.0f;
+                app.images[3]->white = 131.0f;
+                app.images[3]->displayLut = 1;
+                selectImage(4);
+                for (size_t i = 4; i <= 5; i++) {
+                    app.images[i]->black = 47.0f;
+                    app.images[i]->white = 147.0f;
+                    app.images[i]->displayLut = 3;
+                }
+            }
+            // Make the first remote occurrence partial as well.  Its Stack line
+            // rebuilds a free Frame slot; the second occurrence's Frame line
+            // must be bound by materializedrun rather than borrowing that slot.
+            if (app.images.size() == 6) closeImages({ 0 });
+            check(app.images.size() == 5 && app.series.size() == 2,
+                  "R26d4b first remote NPZ group leaves one member unsaved");
+            rememberReader(typedUrl, root + "/not-a-reader.py:load");
+            const std::string sess = root + "/typed-npz.vsession";
+            { std::ofstream f(pathFromUtf8(sess), std::ios::binary); writeSessionTo(f); }
+            std::ifstream sf(pathFromUtf8(sess), std::ios::binary);
+            const std::string sessionBody((std::istreambuf_iterator<char>(sf)),
+                                          std::istreambuf_iterator<char>());
+            int remoteIssuerLines = 0, remoteRunLines = 0;
+            for (size_t at = 0; (at = sessionBody.find(
+                     "materializedissuer npz", at)) != std::string::npos;
+                 at += strlen("materializedissuer npz"))
+                remoteIssuerLines++;
+            std::vector<unsigned long long> remoteRuns;
+            std::istringstream remoteLines(sessionBody);
+            std::string remoteLine;
+            while (std::getline(remoteLines, remoteLine)) {
+                std::istringstream one(remoteLine);
+                std::string key;
+                unsigned long long run = 0;
+                one >> key >> run;
+                if (key == "materializedrun" && run != 0) {
+                    remoteRunLines++;
+                    if (std::find(remoteRuns.begin(), remoteRuns.end(), run) ==
+                        remoteRuns.end())
+                        remoteRuns.push_back(run);
+                }
+            }
+            check(remoteIssuerLines == 3 && remoteRunLines == 3 &&
+                      remoteRuns.size() == 2 &&
+                      sessionBody.find("readerhint ") == std::string::npos,
+                  "R26d5 session records remote NPZ issuer and two occurrence ids");
+
+            closeAll();
+            const std::string sessErr = loadSession(sess);
+            const double remoteSeriesStart = nowSec();
+            while (nowSec() - remoteSeriesStart < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int frameDocs = 0, stackDocs = 0;
+            bool frameStateB = false;
+            bool stackStateA = false, stackStateB = false;
+            int frameStateBCount = 0;
+            bool sessionAxes = true;
+            for (const auto& d : app.images) {
+                if (d->src->member == "__pixels_1") {
+                    frameDocs++;
+                    const bool isFrameB = d->black == 31.0f && d->white == 131.0f &&
+                                          d->displayLut == 1;
+                    frameStateB = frameStateB || isFrameB;
+                    frameStateBCount += isFrameB ? 1 : 0;
+                    sessionAxes = sessionAxes && d->src->npyRead == NR_CHW &&
+                        d->src->remoteKeyRead == NR_CHW &&
+                        d->src->remoteKeyLayout == "CHW" &&
+                        d->src->remoteKeyKind == remote::KeyedRef::FromNpz &&
+                        d->src->remoteKeyRequires15 &&
+                        d->src->materializedIssuer == remote::KeyedRef::FromNpz;
+                }
+                if (d->src->member == "__pixels_2") {
+                    stackDocs++;
+                    stackStateA = stackStateA ||
+                        (d->black == 23.0f && d->white == 230.0f && d->displayLut == 4);
+                    stackStateB = stackStateB ||
+                        (d->black == 47.0f && d->white == 147.0f && d->displayLut == 3);
+                    sessionAxes = sessionAxes && d->src->npyRead == NR_FCHW &&
+                        d->src->remoteKeyRead == NR_FCHW &&
+                        d->src->remoteKeyLayout == "FCHW" &&
+                        d->src->remoteKeyKind == remote::KeyedRef::FromNpz &&
+                        d->src->remoteKeyRequires15 &&
+                        d->src->materializedIssuer == remote::KeyedRef::FromNpz;
+                }
+            }
+            bool sessionMembers = app.series.size() == 3;
+            int statePairA = 0, statePairB = 0, freeFrameSeries = 0;
+            for (const auto& s : app.series) {
+                bool hasFrameB = false, hasOtherFrame = false;
+                bool stackA = false, stackB = false;
+                for (const auto& d : app.images) {
+                    bool inSeries = false;
+                    for (const auto& m : s.members)
+                        if ((m.frameUid != 0 && d->uid == m.frameUid) ||
+                            (m.seqId != 0 && d->seqId == m.seqId)) {
+                            inSeries = true;
+                            break;
+                        }
+                    if (!inSeries) continue;
+                    if (d->src->member == "__pixels_1") {
+                        const bool fb = d->black == 31.0f && d->white == 131.0f &&
+                                        d->displayLut == 1;
+                        hasFrameB = hasFrameB || fb;
+                        hasOtherFrame = hasOtherFrame || !fb;
+                    }
+                    if (d->src->member == "__pixels_2") {
+                        stackA = stackA || (d->black == 23.0f && d->white == 230.0f &&
+                                            d->displayLut == 4);
+                        stackB = stackB || (d->black == 47.0f && d->white == 147.0f &&
+                                            d->displayLut == 3);
+                    }
+                }
+                if (stackA && !stackB && !hasFrameB && !hasOtherFrame) statePairA++;
+                else if (stackB && !stackA && hasFrameB && !hasOtherFrame) statePairB++;
+                else if (!stackA && !stackB && !hasFrameB && hasOtherFrame)
+                    freeFrameSeries++;
+                else sessionMembers = false;       // catches A/B cross-wiring
+            }
+            const bool remoteRunsBound = occurrencePairs(
+                23.0f, 230.0f, 4, 31.0f, 131.0f, 1, 47.0f, 147.0f, 3);
+            fprintf(stderr, "rnpzselftest:   R26d6 err=\"%s\" docs=%zu series=%zu "
+                            "frameB=%d stackA=%d stackB=%d pairs=%d/%d free=%d "
+                            "members=%d axes=%d runs=%d\n",
+                    sessErr.c_str(), app.images.size(), app.series.size(),
+                    frameStateBCount, stackStateA ? 1 : 0, stackStateB ? 1 : 0,
+                    statePairA, statePairB, freeFrameSeries,
+                    sessionMembers ? 1 : 0, sessionAxes ? 1 : 0,
+                    remoteRunsBound ? 1 : 0);
+            check(sessErr.empty() && app.images.size() == 6 && frameDocs == 2 &&
+                      stackDocs == 4 && sessionMembers && sessionAxes &&
+                      frameStateB && frameStateBCount == 1 &&
+                      stackStateA && stackStateB &&
+                      statePairA == 1 && statePairB == 1 && freeFrameSeries == 1 &&
+                      remoteRunsBound,
+                  "R26d6 remote NPZ session restores two occurrence-scoped groups and axes");
+
+            // Same URL and reserved member are still not enough: a Reader may
+            // have materialised those names too.  Turn the two restored groups
+            // into that exact colliding identity and make the NPZ door prove it
+            // checks issuer before claiming an already-open unit.
+            for (auto& d : app.images) {
+                d->src->remoteKeyKind = remote::KeyedRef::FromReader;
+                d->src->materializedIssuer = remote::KeyedRef::FromReader;
+            }
+            const size_t beforeIssuerOpen = app.images.size();
+            const bool issuerOpen = openRemoteNpz(typedUrl, "__pixels_1");
+            bool issuerSeparated = issuerOpen && app.images.size() == beforeIssuerOpen + 3;
+            for (size_t i = beforeIssuerOpen; i < app.images.size() && issuerSeparated; i++)
+                issuerSeparated = app.images[i]->src->remoteKeyKind ==
+                                  remote::KeyedRef::FromNpz;
+            check(issuerSeparated,
+                  "R26d7 Reader-kind docs with the same URL/member cannot dedupe an NPZ");
+            app.readerMemo = memoBefore;
             closeAll();
             const std::string le = loadNpz(typed);
             bool parity = le.empty() && app.images.size() == rpx.size();
@@ -501,6 +736,144 @@
                          !npyReReadAvailable(*app.images[i]->src) &&
                          !app.images[i]->src->npyShape.empty();
             check(parity, "R26e local and remote NPZ are dimension/pixel identical");
+
+            // The same issuer fact is not a remote-only convenience. A stale
+            // local Reader memo used to divert this Viewer-NPZ through the
+            // adapter door, and path/member-only dedupe collapsed the second
+            // occurrence. Save two local groups with cross-wire-sensitive state
+            // and require both to survive a session as NPZ materialisations.
+            const std::string leSecond = loadNpz(typed);
+            check(leSecond.empty() && app.images.size() == 6 && app.series.size() == 2,
+                  "R26e2 the same local Viewer-NPZ can be opened as two groups");
+            if (app.images.size() >= 6) {
+                app.images[0]->black = 61.0f;
+                app.images[0]->white = 161.0f;
+                app.images[0]->displayLut = 1;
+                selectImage(1);
+                for (size_t i = 1; i <= 2; i++) {
+                    app.images[i]->black = 71.0f;
+                    app.images[i]->white = 171.0f;
+                    app.images[i]->displayLut = 2;
+                }
+                app.images[3]->black = 81.0f;
+                app.images[3]->white = 181.0f;
+                app.images[3]->displayLut = 3;
+                selectImage(4);
+                for (size_t i = 4; i <= 5; i++) {
+                    app.images[i]->black = 91.0f;
+                    app.images[i]->white = 191.0f;
+                    app.images[i]->displayLut = 4;
+                }
+            }
+            // Group A deliberately omits its Frame line. Restoring its Stack
+            // still rebuilds the whole Viewer-NPZ and leaves a free Frame slot;
+            // group B must not claim that slot merely because path/issuer/member
+            // match. The additive materializedrun is the occurrence boundary.
+            if (app.images.size() == 6) closeImages({ 0 });
+            check(app.images.size() == 5 && app.series.size() == 2,
+                  "R26e2b first local NPZ group leaves one member unsaved");
+            rememberReader(typed, root + "/not-a-local-reader.py:load");
+            const std::string localSess = root + "/typed-local-npz.vsession";
+            { std::ofstream f(pathFromUtf8(localSess), std::ios::binary); writeSessionTo(f); }
+            std::ifstream lsf(pathFromUtf8(localSess), std::ios::binary);
+            const std::string localSessionBody((std::istreambuf_iterator<char>(lsf)),
+                                               std::istreambuf_iterator<char>());
+            int localIssuerLines = 0;
+            for (size_t at = 0; (at = localSessionBody.find(
+                     "materializedissuer npz", at)) != std::string::npos;
+                 at += strlen("materializedissuer npz"))
+                localIssuerLines++;
+            std::vector<unsigned long long> localRuns;
+            std::istringstream localLines(localSessionBody);
+            std::string localLine;
+            int localRunLines = 0;
+            while (std::getline(localLines, localLine)) {
+                std::istringstream one(localLine);
+                std::string key;
+                unsigned long long run = 0;
+                one >> key >> run;
+                if (key == "materializedrun" && run != 0) {
+                    localRunLines++;
+                    if (std::find(localRuns.begin(), localRuns.end(), run) ==
+                        localRuns.end())
+                        localRuns.push_back(run);
+                }
+            }
+            check(localIssuerLines == 3 && localRunLines == 3 && localRuns.size() == 2 &&
+                      localSessionBody.find("readerhint ") == std::string::npos,
+                  "R26e3 local session records NPZ issuer and two occurrence ids");
+
+            closeAll();
+            const std::string localSessErr = loadSession(localSess);
+            const double localSeriesStart = nowSec();
+            while (nowSec() - localSeriesStart < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            bool localSession = localSessErr.empty() && app.images.size() == 6 &&
+                                 app.series.size() == 3;
+            int localPairA = 0, localPairB = 0, localFreeFrame = 0;
+            int frameBCount = 0, stackACount = 0, stackBCount = 0;
+            for (const auto& d : app.images) {
+                localSession = localSession &&
+                    d->src->materializedIssuer == remote::KeyedRef::FromNpz &&
+                    d->src->remoteKey.empty();
+                const bool frameB = d->src->member == "__pixels_1" &&
+                    d->black == 81.0f && d->white == 181.0f && d->displayLut == 3;
+                const bool stackA = d->src->member == "__pixels_2" &&
+                    d->black == 71.0f && d->white == 171.0f && d->displayLut == 2;
+                const bool stackB = d->src->member == "__pixels_2" &&
+                    d->black == 91.0f && d->white == 191.0f && d->displayLut == 4;
+                frameBCount += frameB ? 1 : 0;
+                stackACount += stackA ? 1 : 0;
+                stackBCount += stackB ? 1 : 0;
+            }
+            for (const auto& s : app.series) {
+                bool hasFrameB = false, hasOtherFrame = false;
+                bool hasStackA = false, hasStackB = false;
+                for (const auto& d : app.images) {
+                    bool inSeries = false;
+                    for (const auto& m : s.members)
+                        if ((m.frameUid != 0 && d->uid == m.frameUid) ||
+                            (m.seqId != 0 && d->seqId == m.seqId)) {
+                            inSeries = true;
+                            break;
+                        }
+                    if (!inSeries) continue;
+                    if (d->src->member == "__pixels_1") {
+                        const bool fb = d->black == 81.0f && d->white == 181.0f &&
+                                        d->displayLut == 3;
+                        hasFrameB = hasFrameB || fb;
+                        hasOtherFrame = hasOtherFrame || !fb;
+                    }
+                    if (d->src->member == "__pixels_2") {
+                        hasStackA = hasStackA || (d->black == 71.0f &&
+                            d->white == 171.0f && d->displayLut == 2);
+                        hasStackB = hasStackB || (d->black == 91.0f &&
+                            d->white == 191.0f && d->displayLut == 4);
+                    }
+                }
+                if (hasStackA && !hasStackB && !hasFrameB && !hasOtherFrame) localPairA++;
+                else if (hasStackB && !hasStackA && hasFrameB && !hasOtherFrame)
+                    localPairB++;
+                else if (!hasStackA && !hasStackB && !hasFrameB && hasOtherFrame)
+                    localFreeFrame++;
+                else localSession = false;
+            }
+            const bool localRunsBound = occurrencePairs(
+                71.0f, 171.0f, 2, 81.0f, 181.0f, 3, 91.0f, 191.0f, 4);
+            fprintf(stderr, "rnpzselftest:   R26e4 err=\"%s\" docs=%zu series=%zu "
+                            "frameB=%d stackA=%d stackB=%d pairs=%d/%d free=%d "
+                            "ok=%d runs=%d\n",
+                    localSessErr.c_str(), app.images.size(), app.series.size(),
+                    frameBCount, stackACount, stackBCount, localPairA, localPairB,
+                    localFreeFrame, localSession ? 1 : 0, localRunsBound ? 1 : 0);
+            check(localSession && frameBCount == 1 &&
+                      stackACount == 2 && stackBCount == 2 &&
+                      localPairA == 1 && localPairB == 1 && localFreeFrame == 1 &&
+                      localRunsBound,
+                  "R26e4 local NPZ session restores two occurrence-scoped groups and state");
+            app.readerMemo = memoBefore;
             closeAll();
 
             auto bothRefuseBeforeDocs = [&](const std::string& path,

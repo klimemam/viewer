@@ -209,6 +209,12 @@ struct FrameSource {
     // Inspector keeps the authoritative read-as line but does not offer a
     // loose-.npy re-read that would lose the carrier node identity.
     bool viewerMaterialized = false;
+    // Which declared mechanism produced the named member for session restore.
+    // Uses remote::KeyedRef::Kind values but is client-side/session provenance:
+    // Reader and NPZ may both call their arrays `__pixels_N`, locally or
+    // remotely, and a stale Reader memo must not choose between them. -1 means
+    // an ordinary non-materialised file.
+    int materializedIssuer = -1;
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -622,6 +628,11 @@ struct ImageDoc {
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
+    // One invocation of a Reader/Viewer-NPZ materialiser. Unlike FrameSource
+    // provenance this is per membership: the source registry may share pixels
+    // across repeated local opens, while a session must still restore each open
+    // as a distinct occurrence. Non-materialised documents keep zero.
+    uint64_t materializedRunId = 0;
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
     float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
@@ -1437,6 +1448,7 @@ struct App {
     int previewPort = 0;
     int nextSeqId = 1;
     uint64_t nextUid = 1;
+    uint64_t nextMaterializedRunId = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
     // "all stacks below": how many levels UNDER the opened folder the scan
@@ -1880,6 +1892,7 @@ struct App {
         std::string key, member, keyLayout;
         int node = 0, keyKind = 0, keyedRead = 0;
         bool keyRequires15 = false;
+        uint64_t materializedRunId = 0;
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -1900,6 +1913,7 @@ struct App {
         std::string key, member, keyLayout; // ...and which array/materialisation
         int node = 0, keyKind = 0, keyedRead = 0; // + its wire axes (see RFetchJob)
         bool keyRequires15 = false;
+        uint64_t materializedRunId = 0;
         // ...and what float32 cost THESE samples, measured on the worker where
         // the peer's exact bytes still existed. It cannot be recomputed on the
         // UI thread - by then the only copy is the float one.
