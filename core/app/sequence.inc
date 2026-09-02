@@ -222,28 +222,64 @@ std::string stackNameFor(const std::string& dir, const std::string& pattern) {
 //
 // `headName` and `names` are BASENAMES; the result is the subset of `names`
 // that belongs to the head's stack, ordered by the numeric field.
-static std::vector<std::string> siblingNamesAmong(const std::string& headName,
-                                                  const std::vector<std::string>& names,
+//
+// ONE name, split the way the rule below splits it: the extension, and the
+// stem's digit / text runs. Splitting is the expensive half of the rule - a
+// path construction plus a vector<NameSeg> of substrings per name - and a
+// folder scan asks the rule once per STACK over the SAME listing, so a caller
+// holding that listing splits each name once and hands the splits in. A folder
+// of 100000 files in 1000 stacks used to re-split all 100000 names 1000 times
+// (#236: that folder took 17.9 minutes and the tool did not draw during it).
+struct SegmentedName {
+    std::string name;              // the basename, exactly as the caller holds it
+    std::string ext;               // ".npy" - the case as written, never folded
+    std::vector<NameSeg> segs;     // the stem's runs
+    // The candidacy test below, written out as a KEY. Two names can be
+    // siblings only if they agree on the extension, on the number and kind of
+    // runs, and on every TEXT run - none of which mentions the head, so it is
+    // a property of one name and can be computed once. Digit runs become a
+    // single '#': their VALUES are what the rule is about to compare.
+    // The separators are bytes no path component can hold, so "a_1" + "b" and
+    // "a" + "_1b" cannot collide into one key.
+    std::string candKey;
+};
+static SegmentedName segmentFileName(const std::string& name) {
+    const std::filesystem::path np = pathFromUtf8(name);
+    SegmentedName s{ name, np.extension().u8string(),
+                     segmentName(np.stem().u8string()), {} };
+    s.candKey = s.ext;
+    for (const NameSeg& g : s.segs) {
+        s.candKey += '\x01';
+        if (g.digit) s.candKey += '#';
+        else s.candKey += g.s;
+    }
+    return s;
+}
+
+// `pool` need only CONTAIN the head's candidates - the test is applied here
+// regardless, so handing in the whole listing and handing in one candKey
+// bucket give the same answer. The order of the pool cannot matter either: the
+// frame axis is chosen by "does this run take two values" and the members come
+// back through a sort on (numeric value, name), which is total because names
+// in one directory are unique.
+static std::vector<std::string> siblingNamesAmong(const SegmentedName& head,
+                                                  const std::vector<const SegmentedName*>& pool,
                                                   std::string& patternOut) {
     std::vector<std::string> out;
-    const std::filesystem::path hp = pathFromUtf8(headName);
-    const std::string stem = hp.stem().u8string(), ext = hp.extension().u8string();
-    std::vector<NameSeg> segs = segmentName(stem);
+    const std::vector<NameSeg>& segs = head.segs;
 
     // candidate files: same extension, same segment structure, all text segments equal
-    struct Cand { std::vector<NameSeg> segs; std::string name; };
-    std::vector<Cand> cands;
-    for (const std::string& n : names) {
-        const std::filesystem::path np = pathFromUtf8(n);
-        if (np.extension().u8string() != ext) continue;
-        std::vector<NameSeg> s2 = segmentName(np.stem().u8string());
-        if (s2.size() != segs.size()) continue;
+    std::vector<const SegmentedName*> cands;
+    for (const SegmentedName* np : pool) {
+        const SegmentedName& n = *np;
+        if (n.ext != head.ext) continue;
+        if (n.segs.size() != segs.size()) continue;
         bool ok = true;
         for (size_t k = 0; k < segs.size() && ok; k++) {
-            if (segs[k].digit != s2[k].digit) ok = false;
-            else if (!segs[k].digit && segs[k].s != s2[k].s) ok = false;
+            if (segs[k].digit != n.segs[k].digit) ok = false;
+            else if (!segs[k].digit && segs[k].s != n.segs[k].s) ok = false;
         }
-        if (ok) cands.push_back({ std::move(s2), n });
+        if (ok) cands.push_back(&n);
     }
     if (cands.size() < 2) return out;
 
@@ -255,29 +291,30 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
     int best = -1;
     for (size_t k = 0; k < segs.size(); k++) {
         if (!segs[k].digit) continue;
-        std::vector<std::string> vals;
-        bool othersMatch = true;
-        for (const auto& c : cands) {
+        // Only "are there TWO different values here" is ever asked of this, so
+        // the values are counted in a set and the walk stops at the second one.
+        // The list-and-scan version it replaces compared every earlier value
+        // again for every candidate - the second quadratic term in the scan.
+        std::unordered_set<std::string> vals;
+        for (const SegmentedName* c : cands) {
             bool same = true;
             for (size_t m = 0; m < segs.size(); m++)
-                if (m != k && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+                if (m != k && segs[m].digit && c->segs[m].s != segs[m].s) { same = false; break; }
             if (!same) continue;
-            bool dup = false;
-            for (const auto& v : vals) if (v == c.segs[k].s) { dup = true; break; }
-            if (!dup) vals.push_back(c.segs[k].s);
+            vals.insert(c->segs[k].s);
+            if (vals.size() >= 2) break;
         }
-        (void)othersMatch;
         if (vals.size() >= 2) best = (int)k;     // keep overwriting: the last wins
     }
     if (best < 0) return out;
 
     std::vector<std::pair<long long, std::string>> found;
-    for (const auto& c : cands) {
+    for (const SegmentedName* c : cands) {
         bool same = true;
         for (size_t m = 0; m < segs.size(); m++)
-            if ((int)m != best && segs[m].digit && c.segs[m].s != segs[m].s) { same = false; break; }
+            if ((int)m != best && segs[m].digit && c->segs[m].s != segs[m].s) { same = false; break; }
         if (!same) continue;
-        found.emplace_back(atoll(c.segs[best].s.c_str()), c.name);
+        found.emplace_back(atoll(c->segs[best].s.c_str()), c->name);
     }
     if (found.size() < 2) return out;
     std::sort(found.begin(), found.end());
@@ -286,7 +323,7 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
         // '?' and not '#': ImGui truncates any label at "##", which blanked
         // every all-digit sequence name in the picker ('?' also reads as glob)
         patternOut += ((int)k == best) ? std::string(segs[k].s.size(), '?') : segs[k].s;
-    patternOut += ext;
+    patternOut += head.ext;
     out.reserve(found.size());
     for (auto& f : found) out.push_back(f.second);
     // ...then say what the '?' run actually spans. Same function the peer runs
@@ -294,6 +331,52 @@ static std::vector<std::string> siblingNamesAmong(const std::string& headName,
     // listed over ssh must produce the identical stack name.
     patternOut = rp::patternWithExtent(patternOut, out);
     return out;
+}
+
+// The same rule asked of raw names - one stack's worth of question, so the
+// split is taken here and thrown away. Every caller that asks it repeatedly
+// over ONE listing (scanFolderGroups) should hold the splits instead.
+static std::vector<std::string> siblingNamesAmong(const std::string& headName,
+                                                  const std::vector<std::string>& names,
+                                                  std::string& patternOut) {
+    std::vector<SegmentedName> parsed;
+    parsed.reserve(names.size());
+    for (const std::string& n : names) parsed.push_back(segmentFileName(n));
+    std::vector<const SegmentedName*> pool;
+    pool.reserve(parsed.size());
+    for (const SegmentedName& p : parsed) pool.push_back(&p);
+    return siblingNamesAmong(segmentFileName(headName), pool, patternOut);
+}
+
+// ---- one directory's listing, filed by candidacy ----------------------------
+// Every head asks "which of these could be my siblings", and the answer is a
+// property of the NAMES and not of the head (see SegmentedName::candKey), so
+// the whole listing is filed once and each head is handed its own bucket.
+//
+// This is the LAST quadratic term in the scan. With the listing handed in and
+// the splits hoisted, a head still walked all N names to find its candidates,
+// so a folder whose names do not group - the honest worst case, and the one
+// #236 measured at 16.4 MINUTES for 10000 files and projected at 27 HOURS for
+// 100000 - paid N per head over N heads. Filed by key, a head touches only
+// names it could actually be a sibling of, and that folder's N buckets hold
+// one name each.
+struct NameBuckets {
+    std::vector<SegmentedName> parsed;                         // by file index
+    std::unordered_map<std::string, std::vector<const SegmentedName*>> byKey;
+    const std::vector<const SegmentedName*>& poolFor(size_t i) const {
+        static const std::vector<const SegmentedName*> none;
+        auto it = byKey.find(parsed[i].candKey);
+        return it == byKey.end() ? none : it->second;
+    }
+};
+static NameBuckets bucketNames(const std::vector<std::string>& baseNames) {
+    NameBuckets b;
+    b.parsed.reserve(baseNames.size());
+    for (const std::string& n : baseNames) b.parsed.push_back(segmentFileName(n));
+    // filled in a SECOND pass: parsed must have stopped reallocating before a
+    // single pointer into it is taken
+    for (const SegmentedName& p : b.parsed) b.byKey[p.candKey].push_back(&p);
+    return b;
 }
 
 // ...and the same rule with the listing taken here. The paths it returns are
@@ -1502,8 +1585,27 @@ static bool isLoadableName(const std::string& name) {
 
 // ---- open a whole folder tree: every numbered group becomes its own stack ----
 
+// What a scan running on a WORKER hands back while it runs, and what tells it
+// to stop (#236). Null for the synchronous callers, who are neither watched nor
+// cancellable.
+//
+// Cancelling is a comparison and not a flag, for the reason RbScan's token
+// exists: two Opens can overlap, and a bare "stop" cannot say WHICH scan it
+// meant. The worker holds the gen it started with; anything that supersedes or
+// cancels it bumps app.folderScan.gen, and the worker notices at the next
+// directory and at the next group.
+struct ScanWatch {
+    const std::atomic<int>* gen = nullptr;
+    int mine = 0;
+    std::atomic<long long>* seen = nullptr;   // files enumerated, published as it goes
+    bool abandoned() const { return gen && gen->load(std::memory_order_relaxed) != mine; }
+};
+
 // Walk root recursively; each directory yields one group per numeric pattern.
-static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) {
+// A watched scan returns EMPTY when abandoned - the caller compares the token
+// again before using anything, so an abandoned result is never read.
+static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root,
+                                                       const ScanWatch* watch = nullptr) {
     std::vector<App::PendingGroup> groups;
     std::error_code ec;
     std::filesystem::path rootPath = pathFromUtf8(root);
@@ -1511,14 +1613,22 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
     const size_t MAX_GROUPS = 256;    // a truncated scan is reported, never silent
     // collect loadable files per directory (depth-limited walk)
     std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> perDir;
+    // ...found by name, not by walking what is already collected. The scan
+    // ends in a sort by directory anyway, so the order files arrive in does
+    // not survive; what the linear search cost was one comparison per file per
+    // directory ALREADY seen, which a deep tree pays on every one of its files.
+    std::unordered_map<std::string, size_t> perDirIdx;
+    size_t seenFiles = 0;                 // every regular file the walk touched
     auto addFile = [&](const std::filesystem::path& p) {
+        seenFiles++;
         std::string ext = p.extension().u8string();
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
         if (!isLoadableExt(ext)) return;
         std::filesystem::path dir = p.parent_path();
-        for (auto& d : perDir)
-            if (d.first == dir) { d.second.push_back(p.u8string()); return; }
+        auto it = perDirIdx.find(dir.u8string());
+        if (it != perDirIdx.end()) { perDir[it->second].second.push_back(p.u8string()); return; }
+        perDirIdx.emplace(dir.u8string(), perDir.size());
         perDir.push_back({ dir, { p.u8string() } });
     };
     // Manual breadth-first walk: recursive_directory_iterator aborts the whole
@@ -1540,6 +1650,15 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
             std::error_code dec;
             std::filesystem::directory_iterator dit(dir, dec), dend;
             if (dec) continue;                       // unreadable dir: skip just this one
+            if (watch && watch->abandoned()) return {};
+            // INSIDE the entry loop, not merely per directory - because the
+            // folder this issue is about is ONE directory holding 100000 files.
+            // Per-directory was the obvious placing and it is wrong for exactly
+            // the reported case: the count would sit at 0 for the whole wait and
+            // then jump to the total, and Cancel would not be looked at until
+            // the whole enumeration had run. Every 512 entries, so the atomic
+            // store and the token load are noise next to the readdir.
+            size_t tick = 0;
             for (; dit != dend; dit.increment(dec)) {
                 if (dec) { dec.clear(); break; }
                 std::error_code fec;
@@ -1548,17 +1667,48 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
                 } else if (dit->is_regular_file(fec)) {
                     addFile(dit->path());
                 }
+                if ((++tick & 511) == 0) {
+                    if (watch && watch->abandoned()) return {};
+                    // The number the waiting window prints, and it is the
+                    // ENUMERATED count and not the loadable one: "scanning...
+                    // 40000 files" describes the work being done, and a folder
+                    // of 100000 .txt would otherwise sit on 0.
+                    if (watch && watch->seen)
+                        watch->seen->store((long long)seenFiles,
+                                           std::memory_order_relaxed);
+                }
             }
+            if (watch && watch->seen)
+                watch->seen->store((long long)seenFiles, std::memory_order_relaxed);
         }
     }
+    if (watch && watch->abandoned()) return {};
     std::sort(perDir.begin(), perDir.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
     std::string rootStr = rootPath.u8string();
     for (auto& d : perDir) {
+        // The cap is a STOP, not a filter. push() below has always dropped
+        // groups past 256, but the walk went on finding them: a folder of 500
+        // stacks paid the full grouping cost for 244 answers that were thrown
+        // away on arrival, and at 1.07 s per stack (#236, grp_100000) that was
+        // most of the wait. What is reported is unchanged - 256 groups still
+        // means "truncated" to openFolder.
+        if (groups.size() >= MAX_GROUPS) break;
+        if (watch && watch->abandoned()) return {};
         std::vector<std::string> files = d.second;
         std::sort(files.begin(), files.end());
         std::vector<bool> used(files.size(), false);
+        // ONE split of this directory's listing, filed by candidacy, plus one
+        // name -> index map over it; all three reused by every stack found
+        // below. See SegmentedName and NameBuckets.
+        std::vector<std::string> bases;
+        bases.reserve(files.size());
+        for (const std::string& f : files) bases.push_back(baseName(f));
+        const NameBuckets nb = bucketNames(bases);
+        std::unordered_map<std::string, size_t> idxOfName;
+        idxOfName.reserve(files.size() * 2);
+        for (size_t i = 0; i < bases.size(); i++) idxOfName.emplace(bases[i], i);
         // name the stack by its folder relative to the opened root
         std::string rel = d.first.u8string();
         if (rel.size() > rootStr.size()) rel = rel.substr(rootStr.size() + 1);
@@ -1597,19 +1747,46 @@ static std::vector<App::PendingGroup> scanFolderGroups(const std::string& root) 
         };
         std::vector<std::string> leftover;
         for (size_t i = 0; i < files.size(); i++) {
+            // ...and here too, for the reason written at the walk: one directory
+            // can be the whole scan, so "per directory" would mean "never" on
+            // the folder that prompted all this.
+            if ((i & 511) == 0 && watch && watch->abandoned()) return {};
             if (used[i]) continue;
             std::string pattern;
-            std::vector<std::string> sibs = findSequenceSiblings(files[i], pattern);
+            // The listing is IN HAND. This used to call findSequenceSiblings,
+            // which re-opens the directory and reads it again - once per stack,
+            // over a folder this walk had just finished enumerating. On a
+            // 100000-file folder holding 1000 stacks that was 1000 extra full
+            // listings and 99.8% of a 17.9-minute wait (#236). The answer is
+            // the same one: findSequenceSiblings IS this call plus that listing,
+            // and the extension test inside it means a non-loadable file in the
+            // folder could never have been a candidate anyway.
+            //
+            // ...and it is asked over this head's BUCKET rather than over the
+            // whole listing, which is the same set of candidates reached
+            // without walking the names that could never have been any.
+            std::vector<std::string> sibs =
+                siblingNamesAmong(nb.parsed[i], nb.poolFor(i), pattern);
             if (sibs.size() >= 2) {
-                for (const auto& s : sibs)
-                    for (size_t k = 0; k < files.size(); k++)
-                        if (files[k] == s) used[k] = true;
-                push(std::move(sibs), pattern);
+                // ...and the members come back as names, so the members' rows
+                // are found by lookup instead of by comparing every name in the
+                // folder against every member (the scan's second quadratic).
+                std::vector<std::string> full;
+                full.reserve(sibs.size());
+                for (const auto& s : sibs) {
+                    auto it = idxOfName.find(s);
+                    if (it == idxOfName.end()) continue;
+                    used[it->second] = true;
+                    full.push_back(files[it->second]);
+                }
+                push(std::move(full), pattern);
+                if (groups.size() >= MAX_GROUPS) break;
             } else {
                 used[i] = true;
                 leftover.push_back(files[i]);
             }
         }
+        if (groups.size() >= MAX_GROUPS) break;
         // Two or more unnumbered leftovers = ONE stack in natural order, same
         // fold the remote SCAN does: capture sets are not always numbered, and
         // N single-frame stacks from one folder is never what Open Folder
@@ -1844,17 +2021,36 @@ static void applyPickFilter() {
             else t.push_back(*c);
         }
     }
-    auto hit = [](const std::string& term, const std::string& subj) {
-        std::string p = "*" + term + "*";      // match anywhere: "frame_0??" must
-        return globMatch(p.c_str(), subj.c_str());   // not need to cover ".npy"
-    };
+    // AN EMPTY FILTER IS NOT A MATCH, IT IS EVERY MATCH - and saying so here
+    // costs nothing while asking it per file costs a walk. This is the common
+    // case and not a corner: openPickerWith() clears pickFilter and calls this
+    // for EVERY scan, so a 100000-file folder ran 100000 glob calls against no
+    // terms before its picker could be drawn (#236).
+    if (inc.empty() && exc.empty()) {
+        for (auto& e : app.folderPick) {
+            e.match.assign(e.g.files.size(), 1);
+            e.nMatch = (int)e.g.files.size();
+        }
+        return;
+    }
+    // "match anywhere" is a property of the TERM, so the stars go on once here
+    // rather than per file. Built per keystroke, this string was built per file
+    // per term - two heap allocations each, over every file in the scan, for
+    // every character typed.
+    std::vector<std::string> incP, excP;
+    incP.reserve(inc.size());
+    excP.reserve(exc.size());
+    for (const auto& t : inc) incP.push_back("*" + t + "*");   // "frame_0??" must
+    for (const auto& t : exc) excP.push_back("*" + t + "*");   // not cover ".npy"
     for (auto& e : app.folderPick) {
         e.match.assign(e.g.files.size(), 1);
         e.nMatch = 0;
         for (size_t i = 0; i < e.rel.size() && i < e.match.size(); i++) {
             bool ok = true;
-            for (const auto& t : inc) if (!hit(t, e.rel[i])) { ok = false; break; }
-            if (ok) for (const auto& t : exc) if (hit(t, e.rel[i])) { ok = false; break; }
+            for (const auto& p : incP)
+                if (!globMatch(p.c_str(), e.rel[i].c_str())) { ok = false; break; }
+            if (ok) for (const auto& p : excP)
+                if (globMatch(p.c_str(), e.rel[i].c_str())) { ok = false; break; }
             e.match[i] = ok ? 1 : 0;
             if (ok) e.nMatch++;
         }
@@ -1921,21 +2117,97 @@ static void openPickerWith(std::vector<App::PendingGroup> groups,
     app.folderPickOpen = true;
 }
 
-static void openFolder(const std::string& path) {
-    std::vector<App::PendingGroup> groups = scanFolderGroups(path);
+// What a finished LOCAL scan does with its answer. One function so the
+// synchronous door and the worker's pump cannot come to differ about what an
+// empty scan says or when the truncation warning is raised.
+//
+// ALWAYS ask, one group included - same rule the remote scan follows. The
+// picker is where the file filter lives (UC3: "open only the *_dark* frames of
+// this folder" needs the dialog even when the folder groups into a single
+// sequence), and "Always load folder" no longer mutes it: that setting keeps
+// its original job - loading a single FILE's numbered siblings without asking.
+// Headless callers auto-accept via pickerAccept(). Batches are created at
+// ACCEPT time (pickerAccept), not here: creating one per scan left an empty
+// batch behind on Cancel, and the picker's batch mode (one / per top folder) is
+// only known once the user answers.
+static void finishFolderScan(std::vector<App::PendingGroup> groups,
+                             const std::string& path) {
     if (groups.empty()) { toast("no loadable files under " + baseName(path), true); return; }
     if (groups.size() >= 256)
         toast("scan stopped at 256 stacks - narrow the folder or use the filter", true);
-    // ALWAYS ask, one group included - same rule the remote scan follows. The
-    // picker is where the file filter lives (UC3: "open only the *_dark*
-    // frames of this folder" needs the dialog even when the folder groups into
-    // a single sequence), and "Always load folder" no longer mutes it: that
-    // setting keeps its original job - loading a single FILE's numbered
-    // siblings without asking. Headless callers auto-accept via pickerAccept().
-    // Batches are created at ACCEPT time (pickerAccept), not here: creating one
-    // per scan left an empty batch behind on Cancel, and the picker's batch
-    // mode (one / per top folder) is only known once the user answers.
     openPickerWith(std::move(groups), path, path, false, "");
+}
+
+// ---- Open Folder, which no longer holds the window while it walks (#236) -----
+// The worker owns nothing but the root string it was handed and the token it
+// started with; it publishes under the mutex and the UI thread does every
+// touch of app state. Same division as rbWorker, one instance rather than one
+// per panel, because there is one local disk and one picker to raise.
+static void folderScanWorker(std::string root, int myGen) {
+    ScanWatch w;
+    w.gen = &app.folderScan.gen;
+    w.mine = myGen;
+    w.seen = &app.folderScan.seen;
+    std::vector<App::PendingGroup> got = scanFolderGroups(root, &w);
+    {
+        std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+        app.folderScan.groups = std::move(got);
+        app.folderScan.doneGen = myGen;
+        app.folderScan.done = true;
+    }
+    app.folderScan.running = false;
+    g_browseHost.wakeUi();     // the pumps live inside the frame; see pumpFolderScan
+}
+
+// Stop whatever is walking and forget its answer. The token moves FIRST, so a
+// worker still inside the walk abandons at its next directory rather than
+// running to completion; the join then costs one directory, not one folder.
+// Called by the Cancel button, by the next Open, and at shutdown.
+static void stopFolderScan() {
+    app.folderScan.gen++;
+    if (app.folderScan.thread.joinable()) app.folderScan.thread.join();
+    std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+    app.folderScan.done = false;
+    app.folderScan.groups.clear();
+}
+
+static void openFolder(const std::string& path) {
+    // A run with nobody at the keyboard scans HERE, on this thread, and returns
+    // with the picker already up: 103 call sites in the selftests read
+    // app.folderPick on the line after this one. See g_scriptedRun.
+    if (g_scriptedRun) { finishFolderScan(scanFolderGroups(path), path); return; }
+    stopFolderScan();                  // a second Open supersedes the first
+    app.folderScan.root = path;
+    app.folderScan.seen = 0;
+    const int myGen = app.folderScan.gen.load();
+    app.folderScan.running = true;
+    app.folderScan.thread = std::thread(folderScanWorker, path, myGen);
+}
+
+// UI thread: raise the picker for a scan that finished and is still the one
+// being waited for. A result whose token has moved is DROPPED - openPickerWith
+// clears app.folderPick and resets the filter, merge and sweep fields, so a
+// late answer from a cancelled scan would not merely arrive, it would destroy
+// the picker the user is working in. RbScan guards itself the same way.
+static void pumpFolderScan() {
+    std::vector<App::PendingGroup> groups;
+    bool have = false;
+    int gen = 0;
+    {
+        std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+        if (app.folderScan.done) {
+            have = true;
+            gen = app.folderScan.doneGen;
+            groups.swap(app.folderScan.groups);
+            app.folderScan.done = false;
+        }
+    }
+    if (!have) return;
+    if (app.folderScan.thread.joinable()) app.folderScan.thread.join();
+    if (gen != app.folderScan.gen.load()) return;       // cancelled or superseded
+    const std::string root = app.folderScan.root;
+    app.folderScan.root.clear();
+    finishFolderScan(std::move(groups), root);
 }
 
 // Stack name for a merged load: the common prefix of the merged group names,
@@ -2253,6 +2525,49 @@ static void npzPickAccept() {
     fprintf(stderr, "npz: %s\n", say.c_str());
     toast(say, stacks == 0 && loneFrames == 0);
     npzPickNext();                 // whatever was dropped alongside this file
+}
+
+// ---- what the window shows WHILE the local scan walks (#236) ----------------
+// A count and a Cancel, and deliberately nothing else. The obvious richer
+// dialog - stacks appearing in the tree as they are found - is not available
+// here and the reason is in App::FolderScan: a group taken from half a
+// directory can have the wrong frame axis, so rows would appear and then have
+// to be rewritten. The honest thing to show while the answer is not yet an
+// answer is how much has been looked at.
+//
+// No percentage, for the same kind of reason: nothing knows how many files are
+// under a root until the walk has found them, and a bar that reaches 90% and
+// stays there is worse than a number that keeps climbing.
+static void drawFolderScanModal() {
+    const bool running = app.folderScan.running.load();
+    if (running && !ImGui::IsPopupOpen("Scanning folder") &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        ImGui::OpenPopup("Scanning folder");
+    if (!ImGui::IsPopupOpen("Scanning folder")) return;
+    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Scanning folder", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) return;
+    // The scan ANSWERED (or was cancelled) - so this dialog goes, and it has to
+    // go from INSIDE the Begin/End pair. Dropping the BeginPopupModal call
+    // instead does not close a popup: ImGui keeps it on the open stack, the
+    // picker's "no popup is open" test below stays false, and the dialog the
+    // whole scan was for never appears.
+    if (!running) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+    ImGui::TextDisabled("%s", dispPath(app.folderScan.root).c_str());
+    ImGui::Text("scanning... %lld files",
+                (long long)app.folderScan.seen.load(std::memory_order_relaxed));
+    ImGui::Spacing();
+    // Cancel means the scan AND the dialog: stopFolderScan moves the token
+    // first, so the answer that is still being computed can no longer raise a
+    // picker over whatever the user does next.
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        stopFolderScan();
+        app.folderScan.running = false;
+        app.folderScan.root.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 // Tree of what the scan found. One live filter narrows FILES as you type;

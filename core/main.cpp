@@ -732,6 +732,11 @@ int main(int argc, char** argv) {
         if (n >= 9 && !strcmp(argv[i] + n - 9, "-selftest")) scriptedRun = true;
         if (!strncmp(argv[i], "--bench", 7)) scriptedRun = true;
     }
+    // ...and published, because openFolder asks it and openFolder is reached
+    // from parseCli below (a folder named on the command line) as well as from
+    // the window. Set HERE, at the one place the answer is worked out, rather
+    // than recomputed anywhere else. See g_scriptedRun in core/app/state.h.
+    g_scriptedRun = scriptedRun;
     // --bench N: render N frames in a hidden window and report frame times, so
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
@@ -1177,6 +1182,12 @@ int main(int argc, char** argv) {
     #include "selftest/tile.inc"
 
     #include "selftest/scan.inc"
+
+    // ...and the LOCAL half of the same door, pinned as an ANSWER rather than
+    // as a count: #236 rewrote how scanFolderGroups computes it and claims the
+    // answer is untouched. Beside scan.inc because the two are one question
+    // asked over two transports.
+    #include "selftest/folderscan.inc"
 
     #include "selftest/range.inc"
 
@@ -1872,6 +1883,7 @@ static bool g_watchSuppressed = false;
         drawSequenceModal();
         drawSeriesModal();
         drawDeriveModal();
+        drawFolderScanModal();        // ...and the count while that scan walks
         drawFolderPickModal();
         drawNpzPickModal();
         drawReaderPanel();
@@ -2096,6 +2108,14 @@ static bool g_watchSuppressed = false;
                 { std::lock_guard<std::mutex> lk(app.mMtx);  working |= !app.mDone.empty(); }
                 working |= seqReadyPending();
                 working |= app.folderPickOpen || app.seqAskImage >= 0 || app.remoteDlgOpen;
+                // A local folder scan is a worker with a dialog over it: the
+                // count has to keep climbing and the answer arrives in a pump,
+                // which lives inside the frame. Without this the scan runs but
+                // the window that is supposed to be showing it goes to sleep -
+                // the shape the remote scan's row two lines up already names.
+                working |= app.folderScan.running.load();
+                { std::lock_guard<std::mutex> lk(app.folderScan.mtx);
+                  working |= app.folderScan.done; }
                 working |= app.anyFileDialog();   // pollFileDialog lives in the frame
                 working |= app.rdJob != nullptr;  // and so does pollReader
                 // ...including the queue behind it: pollReader takes the next
@@ -2177,6 +2197,7 @@ static bool g_watchSuppressed = false;
         pumpRemoteBrowse();           // connect/list results from the browse worker
         pumpBrowseWatch(nowSec());    // ...and re-list a DRAWN panel's own dir (§2)
         pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
+        pumpFolderScan();             // ...and the LOCAL walk, when it has finished
         pumpWatch();                  // source files that moved on disk (項目20)
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
@@ -3388,6 +3409,7 @@ static bool g_watchSuppressed = false;
         if (app.prefsDirty) savePrefs();
     }
     stopSequenceLoader();             // join the workers before tearing anything down
+    stopFolderScan();                 // ...including the one walking a folder tree
     stopRemoteFetcher();
     stopMeasureWorker();
     stopRbWorker();

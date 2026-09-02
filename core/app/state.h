@@ -2084,6 +2084,37 @@ struct App {
     std::vector<FolderPick> folderPick;
     bool folderPickOpen = false;
     std::string folderPickRoot;
+    // ---- the LOCAL folder scan, off the UI thread (#236) --------------------
+    // Open Folder used to walk and group the tree ON the UI thread, inside
+    // parseCli or inside the click, so the window did not pump until the
+    // picker was ready: measured at 17.9 minutes of a dead window on one
+    // folder. The walk is the browse worker's shape now - one thread, a
+    // generation token, results published under a lock and read by a pump.
+    //
+    // Why the picker is NOT filled in as groups arrive. The frame axis is "the
+    // LAST digit run that varies among the candidates", so a group derived
+    // from HALF a directory can have the wrong axis, the wrong name and the
+    // wrong members - #236 measured exactly that (a01_b1/a02_b1 alone group
+    // one way, and the four names group another). A partial answer here is not
+    // an early answer, it is a wrong one that would have to be unsaid. So the
+    // scan publishes a COUNT while it runs and the whole group list once.
+    struct FolderScan {
+        std::thread thread;
+        std::mutex mtx;
+        // gen is the cancel/supersede token, bumped by Cancel and by the next
+        // Open. A worker whose gen has moved drops what it has and returns:
+        // openPickerWith would otherwise destroy a picker the user is already
+        // filtering, the same hazard RbScan's token guards remotely.
+        std::atomic<int> gen{ 0 };
+        std::atomic<bool> running{ false };
+        std::atomic<long long> seen{ 0 };     // files enumerated so far, for the line
+        std::string root;                     // UI thread only: what is being scanned
+        // handover, under mtx
+        bool done = false;
+        int doneGen = 0;
+        std::vector<PendingGroup> groups;
+    };
+    FolderScan folderScan;
     // remote variant: the same picker, but accepted groups go through
     // rbOpenQueue / openRemoteStack instead of the local sequence loader
     bool folderPickRemote = false;
@@ -2398,6 +2429,22 @@ struct App {
 // THE app. Declared here so every TU that includes this header sees the same
 // object; DEFINED in core/main.cpp — §6 keeps the definition in the spine.
 extern App app;
+
+// ---- "is anybody going to press anything?" -----------------------------------
+// True for --no-window, for every *-selftest and for --bench: a run with no
+// hand on it. Set once in main() before parseCli, so the folder argument's own
+// openFolder already sees it.
+//
+// The ONE thing it changes is that a local folder scan stays SYNCHRONOUS
+// (#236). Moving the scan onto a worker means openFolder returns before the
+// picker exists, and 103 call sites across 26 selftest files assert the picker
+// - or accept it - on the line after openFolder(). Making the scan
+// asynchronous for them would be 103 waits to write and 103 chances to write a
+// wait that passes for the wrong reason; making it synchronous for them is one
+// branch, and it costs the selftests nothing they had (no window is pumping
+// there to keep alive). Declared here rather than in cli.inc because
+// sequence.inc is included first and is what asks.
+inline bool g_scriptedRun = false;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)

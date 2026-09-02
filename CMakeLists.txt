@@ -1278,6 +1278,11 @@ viewer_selftest(stackana    NOGL --stackana-selftest)
 # failure of the first claim should not silence that output.
 viewer_selftest(bundled     NOGL --bundled-selftest)
 viewer_selftest(scan        NOGL --scan-selftest tools/testdata/linset)
+# The local scan's ANSWER, pinned group by group (#236). Takes no fixture
+# directory: every case it makes is a folder full of empty files whose NAMES are
+# the whole question, so tools/testdata has nothing to offer it and a fixture
+# that drifted there could not weaken it.
+viewer_selftest(folderscan  NOGL --folderscan-selftest)
 viewer_selftest(localbrowse NOGL --localbrowse-selftest tools/testdata/rb)
 # #111. Pointed at media/ and not at rb/ on purpose: rb/ is where the picture
 # formats are absent, and it is also where --browse-keys addresses rows BY INDEX
