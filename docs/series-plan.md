@@ -115,10 +115,10 @@ seriesend
 - `seqctx` に「Series ▸」: **同じ batch の** series 一覧（他 batch のものは無効化＋tooltip「別 batch の series。先に Move to
   batch」）、区切り、「新しい series を作る…」。メンバの Move to batch は不変条件 4 の警告付き。
 
-> **現行実装 gap / phase④。** `moveSeriesToBatch()` / `closeSeries()` は現在
-> `seqId` だけを収集し、standalone frame (`frameUid`) を移動・破棄しない。
-> 上の「全メンバ」が正典であり、mixed series の Move / Close 回帰と
-> Files / toast の `member(s)` 語彙を同じ修正で固定する。
+> **実装済み (2026-09-02)。** `moveSeriesToBatch()` / `closeSeries()` は
+> `seqId` のある stack と `frameUid` のある standalone frame の全メンバを扱う。
+> mixed series の Move / Close 回帰と Files / toast の `member(s)` 語彙も
+> 同じ修正で固定した。
 
 ## 5. picker の「掃引として開く」（phase 5）と Files 複数選択（phase 6・任意）
 

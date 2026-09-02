@@ -336,9 +336,9 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 | **Move to batch** | **全メンバが一緒に**動きます |
 | (メンバ 1 本だけを Move to batch) | そのメンバは series から**外れます**。禁止はせず、画面で告げます |
 
-> **現行実装差分。** standalone frame メンバを含む series では、Move / Close が
-> stack だけを処理して frame を取り残す。上表が正典であり、phase④ で
-> `moveSeriesToBatch` / `closeSeries` と回帰試験を修正する。
+> **実装済み (2026-09-02)。** standalone frame メンバを含む series でも、
+> `moveSeriesToBatch` / `closeSeries` は上表どおり全メンバを扱う。
+> stack だけを処理して frame を取り残さないことを回帰試験で固定した。
 
 Files パネルでは batch 見出しの下に series が先に並び、メンバ行は**値が先頭**に出ます
 (`100 lx · 10lx/frame_000‥023.npy`、未設定なら `value unset · …`)。series に属さない stack は
