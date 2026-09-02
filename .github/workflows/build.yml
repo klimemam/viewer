@@ -235,14 +235,33 @@ jobs:
             test -d "build/_deps/$d-src" \
               || { echo "build/_deps/$d-src is missing: the cmake build above did not fetch $d (a system copy satisfied find_package?), so this step cannot build what the runner build used"; exit 1; }
           done
+          # BEFORE, measured rather than remembered: what the runner's own build
+          # would have shipped if this step did not exist. It is the number in
+          # the user's report (#241), and it is printed HERE so that the log of
+          # one run carries both halves of the comparison instead of asking a
+          # reader to find an older run for the other one.
+          for f in build/viewer build/viewer-serve; do
+            echo "runner build (24.04, would NOT ship): $f needs $(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1), links $(objdump -p "$f" | sed -n 's/^ *NEEDED *//p' | grep -c 'libstdc++\|libgcc_s') of the two compiler runtimes"
+          done
           docker run --rm -i -v "$PWD:/src" -w /src ubuntu:20.04 bash -s <<'COMPAT'
           set -euo pipefail
           # archive.ubuntu.com is flaky from Actions runners (two runs in a
           # row died on "Connection failed" here); the Azure mirror is what
-          # the runner images themselves use, and retries cover the rest
+          # the runner images themselves use, and retries cover the rest.
+          #
+          # ForceIPv4 and --no-install-recommends below are not tuning: the
+          # first run of this step spent THIRTY MINUTES in apt, against the one
+          # minute the same container took for `g++ cmake make` before the GUI
+          # headers joined the list. A docker bridge network offers a AAAA
+          # record it cannot route, so every connection apt opens waits out a
+          # v6 timeout first, and the cost is per connection - which is why it
+          # only became visible when the package count went up. Nothing is
+          # -qq'd or sent to /dev/null any more for the same reason: a step
+          # this expensive has to say where its time goes.
           sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|;s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|" /etc/apt/sources.list
-          echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d/80-retries
-          apt-get update -qq >/dev/null
+          printf 'Acquire::Retries "5";\nAcquire::ForceIPv4 "true";\nAcquire::http::Timeout "30";\n' \
+            > /etc/apt/apt.conf.d/80-retries
+          apt-get update
           # The GUI half is the whole difference from the peer-only step this
           # replaced. GLFW opens libX11, libwayland-client and libxkbcommon
           # with dlopen at RUN time, so what it needs here is their HEADERS and
@@ -254,10 +273,10 @@ jobs:
           # 20.04's own wayland-protocols version does not enter into it.
           # git is for cmake/gitversion.cmake: without it in here, every
           # shipped Linux binary would name its commit "unknown".
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               g++ make git curl ca-certificates \
               xorg-dev libgl1-mesa-dev libwayland-dev libwayland-bin \
-              libxkbcommon-dev >/dev/null
+              libxkbcommon-dev
           # 20.04 ships cmake 3.16.3 and this project's cmake_minimum_required
           # is 3.21, so the container brings its own. Kitware's linux-x86_64
           # tarball is built against glibc 2.17, which is the only reason it can
@@ -353,8 +372,18 @@ jobs:
                 fail=1 ;;
             esac
             if [ -z "$ceil" ]; then
-              echo "  ^ no versioned glibc symbols at all: objdump found nothing to check"
-              fail=1
+              # An EXECUTABLE with no versioned glibc symbols did not link the
+              # way this step thinks it did - it cannot start a process without
+              # libc - so nothing to check is a failure there. A PLUGIN can
+              # honestly need nothing: display_falsecolor.so is a lookup table
+              # in a loop, it names no shared library at all, and it therefore
+              # runs anywhere. Measured, on the first run of this step, which
+              # failed on exactly that (and on nothing else).
+              case "$f" in
+                *.so) echo "  ^ needs no shared library at all: nothing to be incompatible with" ;;
+                *)    echo "  ^ no versioned glibc symbols at all: objdump found nothing to check"
+                      fail=1 ;;
+              esac
             elif [ "$(printf '%s\n%s\n' "$ceil" "$max" | sort -V | tail -1)" != "$max" ]; then
               echo "  ^ needs $ceil, above the $max this step promises"
               fail=1
