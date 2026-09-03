@@ -655,12 +655,123 @@ static void computeMinMax(ImageDoc& im) {
 static float effBlack(const ImageDoc& im);
 static float effWhite(const ImageDoc& im);
 
+// The LOAD-TIME default, and only that. Its two magnets - integer types to
+// their type fullscale, near-[0,1] floats to 0..1 - are conventions about what
+// a file that was just opened probably means, not a fit to what it contains.
+// Nothing that re-fits an image ALREADY on screen may go through here: see
+// autoRange below, and issue #245.
 static void defaultRange(ImageDoc& im) {
     if (im.dtype == "u8" || im.dtype == "i8")       { im.black = 0; im.white = 255; }
     else if (im.dtype == "u16")                     { im.black = 0; im.white = 65535; }
     else if (im.dtype == "i16")                     { im.black = 0; im.white = 32767; }
     else if (im.vmin >= -0.001f && im.vmax <= 1.2f && im.vmax > 0.005f) { im.black = 0; im.white = 1; }
     else                                            { im.black = im.vmin; im.white = im.vmax; }
+}
+
+// "Auto per frame" means what its own tooltip says: this frame's min..max.
+// It used to call defaultRange, so the magnets above re-applied on every step
+// - a stack of arbitrary-unit floats running 0.3..0.6 snapped back to 0..1 on
+// each frame, and the mode looked like it did nothing at all (issue #245).
+// computeMinMax guarantees vmin < vmax, so this always leaves a usable range.
+static void autoRange(ImageDoc& im) {
+    im.black = im.vmin; im.white = im.vmax;
+}
+
+// ---- the percentile fit ("Auto %") -----------------------------------------
+// "Auto" answers with the true min..max, and one hot pixel or one dead column
+// is enough to stretch that to uselessness. "Auto %" answers with the
+// 0.1..99.9 percentile of the FINITE pixels, so tails that are defects rather
+// than signal fall outside the display range instead of deciding it. Both are
+// offered because both are right: min..max is the only answer that shows you
+// every pixel you have, and the user asked for exactly these two
+// (2026-09-03,「Auto Min~Maxと,Auto 0.1~99.9%の二通り」).
+//
+// A 65536-bin histogram over [vmin, vmax], not a sort: an exact quantile of a
+// 12 Mpx frame costs a 48 MB copy and an O(N log N) pass, and the answer is a
+// display range whose bin edge is already finer than the black/white spinner
+// prints. One pass, fixed memory - and the same bins can be shared by several
+// images, which is what the linked fit below needs.
+static const int kPctBins = 65536;
+
+// Add one image's finite pixels to a histogram spanning [rlo, rhi]; returns
+// how many were added, so a caller can pool several images onto one grid.
+// A wrongly sized (or empty) vector is sized and zeroed here, so the pooling
+// caller can just declare `std::vector<uint32_t> bins;` and loop.
+static uint64_t accumulatePercentileBins(const ImageDoc& im, float rlo, float rhi,
+                                         std::vector<uint32_t>& bins) {
+    if (!(rhi > rlo) || !std::isfinite(rlo) || !std::isfinite(rhi)) return 0;
+    if (bins.size() != (size_t)kPctBins) bins.assign((size_t)kPctBins, 0u);
+    const double scale = (double)kPctBins / ((double)rhi - (double)rlo);
+    uint64_t n = 0;
+    for (float v : im.px()) {
+        if (!std::isfinite(v)) continue;
+        long long b = (long long)(((double)v - (double)rlo) * scale);
+        if (b < 0) b = 0;
+        if (b >= kPctBins) b = kPctBins - 1;     // vmax itself lands one past the end
+        bins[(size_t)b]++;
+        n++;
+    }
+    return n;
+}
+
+// Pooled bins -> the two cuts. lo is the LOWER edge of the bin where the
+// cumulative count first reaches loFrac, hi the UPPER edge of the bin where it
+// first reaches hiFrac: the range has to contain the pixels it was measured
+// from, so each cut opens outward to its own bin boundary. False when the
+// counts cannot answer (nothing finite, or the cuts collapse into one edge) -
+// every caller then falls back to plain min..max.
+static bool percentileFromBins(const std::vector<uint32_t>& bins, uint64_t n,
+                               float rlo, float rhi, float loFrac, float hiFrac,
+                               float& lo, float& hi) {
+    if (n == 0 || bins.size() != (size_t)kPctBins || !(rhi > rlo)) return false;
+    const double binW = ((double)rhi - (double)rlo) / (double)kPctBins;
+    const double loTarget = (double)n * (double)loFrac;
+    const double hiTarget = (double)n * (double)hiFrac;
+    int bLo = 0, bHi = kPctBins - 1;
+    bool gotLo = false, gotHi = false;
+    uint64_t cum = 0;
+    for (int b = 0; b < kPctBins; b++) {
+        cum += bins[(size_t)b];
+        if (!gotLo && (double)cum >= loTarget) { bLo = b; gotLo = true; }
+        if ((double)cum >= hiTarget) { bHi = b; gotHi = true; break; }
+    }
+    if (!gotLo || !gotHi) return false;
+    double l = (double)rlo + (double)bLo * binW;
+    double h = (double)rlo + (double)(bHi + 1) * binW;
+    if (h > (double)rhi) h = (double)rhi;        // never claim more than the data
+    lo = (float)l; hi = (float)h;
+    return std::isfinite(lo) && std::isfinite(hi) && hi > lo;
+}
+
+// One image's own percentile range. lo/hi are ALWAYS left usable: on any
+// degenerate input they hold the min..max this would otherwise refine.
+static bool percentileRange(const ImageDoc& im, float loFrac, float hiFrac,
+                            float& lo, float& hi) {
+    lo = im.vmin; hi = im.vmax;
+    std::vector<uint32_t> bins;
+    uint64_t n = accumulatePercentileBins(im, im.vmin, im.vmax, bins);
+    float a = 0, b = 0;
+    if (!percentileFromBins(bins, n, im.vmin, im.vmax, loFrac, hiFrac, a, b)) return false;
+    lo = a; hi = b;
+    return true;
+}
+
+// What the "Auto %" button fits to. Unlinked: this image. Linked: every open
+// image pooled onto ONE histogram spanning the shared min..max - the
+// percentile counterpart of what plain "Auto" does in the same mode (fit the
+// min/max over all of them), and the reason the bins are accumulated rather
+// than averaged: a quantile of a union is not the union of quantiles.
+static void autoPercentileFit(const ImageDoc& im, float& lo, float& hi) {
+    if (!app.linkRange) { percentileRange(im, 0.001f, 0.999f, lo, hi); return; }
+    float rlo = im.vmin, rhi = im.vmax;
+    for (const auto& d : app.images) { rlo = std::min(rlo, d->vmin); rhi = std::max(rhi, d->vmax); }
+    lo = rlo; hi = rhi;                          // the fallback IS Auto's answer
+    std::vector<uint32_t> bins;
+    uint64_t n = 0;
+    if (app.images.empty()) n = accumulatePercentileBins(im, rlo, rhi, bins);
+    else for (const auto& d : app.images) n += accumulatePercentileBins(*d, rlo, rhi, bins);
+    float a = 0, b = 0;
+    if (percentileFromBins(bins, n, rlo, rhi, 0.001f, 0.999f, a, b)) { lo = a; hi = b; }
 }
 
 // Keep only the most recent textures resident: a 200-frame sequence would

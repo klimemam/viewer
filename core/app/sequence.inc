@@ -1471,7 +1471,11 @@ static void selectImage(int idx) {
     if (prev && d != prev) {
         // linked mode overlays one range non-destructively (effBlack/effWhite),
         // so only auto-per-frame touches the image's own numbers here
-        if (app.rangeScope == 0 && !app.linkRange) { defaultRange(*d); d->texDirty = true; }
+        // ...and it re-fits to the frame's OWN min..max, which is what the
+        // mode is called and what its tooltip promises. This used to be
+        // defaultRange, whose load-time magnets snapped every step back to
+        // 0..1 / type fullscale (issue #245).
+        if (app.rangeScope == 0 && !app.linkRange) { autoRange(*d); d->texDirty = true; }
     }
     if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
         app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
