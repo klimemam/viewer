@@ -705,9 +705,17 @@ static uint64_t accumulatePercentileBins(const ImageDoc& im, float rlo, float rh
     uint64_t n = 0;
     for (float v : im.px()) {
         if (!std::isfinite(v)) continue;
-        long long b = (long long)(((double)v - (double)rlo) * scale);
-        if (b < 0) b = 0;
-        if (b >= kPctBins) b = kPctBins - 1;     // vmax itself lands one past the end
+        // Clamped in DOUBLE, before the narrowing. Every caller passes the
+        // measured min/max of the very pixels being binned, so t is in
+        // [0, kPctBins] and only vmax itself lands one past the end - but a
+        // float is 38 orders of magnitude wide and this is a general helper,
+        // and a double that does not fit a long long converts to nothing
+        // defined. Clamping after the cast would be clamping a value the
+        // conversion was already free to invent.
+        const double t = ((double)v - (double)rlo) * scale;
+        const int b = t <= 0.0 ? 0
+                    : t >= (double)kPctBins ? kPctBins - 1
+                    : (int)t;
         bins[(size_t)b]++;
         n++;
     }
