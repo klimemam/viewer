@@ -5,6 +5,24 @@
             fprintf(stderr, "scanselftest: %-74s %s\n", what, cond ? "PASS" : "FAIL");
             if (!cond) ok = false;
         };
+        // "every open stack holds all the frames it promised", as a reusable
+        // claim: it is asked once after the .npy scan and again after the
+        // picture scan, and the two must not be able to drift into different
+        // questions.
+        auto checkStacksWhole = [&](auto&& chk, const char* what) {
+            std::string say;
+            int shortfall = 0;
+            for (const auto& si : app.seqs) {
+                const int have = (int)framesOfSeq(si.id).size();
+                if (have >= si.expectedFrames) continue;
+                shortfall++;
+                say += (say.empty() ? "" : ", ") + si.name + " " +
+                       std::to_string(have) + "/" + std::to_string(si.expectedFrames);
+            }
+            if (shortfall)
+                fprintf(stderr, "scanselftest: short stack(s): %s\n", say.c_str());
+            chk(shortfall == 0, what);
+        };
         std::string dir = g_scanSelftest;
         std::replace(dir.begin(), dir.end(), '\\', '/');
         startRemote(rbMain(), "local://" + dir);
@@ -70,6 +88,19 @@
                     opened ? "ok" : ("FAILED " + rbMain().b.err).c_str());
             if (!opened) ok = false;
         }
+        // ...and the FRAMES, which this test did not look at. A stack whose head
+        // opened and whose siblings were never fetched - a memory budget that
+        // computed fit == 0, a fetch generation that dropped every arrival -
+        // still leaves app.seqs non-empty and rbOpenQueue empty and rfPending
+        // 0, so every condition above is satisfied by a stack that is one frame
+        // of forty. That is issue #244's exact shape ("remote stacks stopped
+        // being read out"), and it is why this test could not have caught it.
+        //
+        // Asked as "does every stack hold the frames it says it expects", not
+        // as a fixture count: expectedFrames is what the SCAN promised, so the
+        // claim stays true if the fixture grows and false the moment a promise
+        // is not kept.
+        checkStacksWhole(check, "S-frames the remote scan's stacks hold every frame they promise");
 
         // ================= issue #148 ==========================================
         // The same folder used to return two answers depending on which door
@@ -222,6 +253,8 @@
                   "S2a ...under the same two patterns the local door produces (S3d)");
             check(!timedOut,
                   "S2b ...and REPORTS it: zero groups is an answer, not a wait");
+            checkStacksWhole(check,
+                  "S2c ...and both stacks hold every frame they promised");
         }
 
         // ---- S3: the local door groups them ----------------------------------

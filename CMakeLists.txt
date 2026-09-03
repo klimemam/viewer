@@ -1170,6 +1170,26 @@ viewer_selftest(browse-stop --browse-keys-selftest tools/testdata/stopset
 scanhere,idle:20,pickok,waitload,stopload,idle:40,chkloadidle,chkimgmark,\
 focus,home,down,chkatrow:elsewhere,dbl,waitdir:elsewhere,chkdir:elsewhere,\
 home,dbl,waitdir:stopset,chkdir:stopset")
+# ...and the same door with the scan ON THE WORKER, which is the one the user
+# gets and the one NOTHING in this suite ran until now.
+#
+# #236 moved the local folder scan onto a thread and kept a synchronous branch
+# for scripted runs, because 103 call sites across 26 selftest files read
+# app.folderPick on the line after openFolder(). That branch is a convenience
+# and a HOLE: g_scriptedRun is true for every selftest, so all 57 of them walk
+# the folder on the UI thread and the worker handoff - scan finishes, "Scanning
+# folder" modal closes, picker opens, Load queues the stacks - had no test at
+# all. Issue #244 ("remote stacks stopped loading") could not be confirmed or
+# refuted against this suite for exactly that reason.
+#
+# --async-scan takes the branch back for this one run; `waitpick` is the wait a
+# person performs and its timeout is a FAILURE, so "the picker never appeared"
+# fails here rather than turning `pickok` into a no-op that passes. scanroot is
+# three folders of eight frames, so chkimg:24 is arithmetic, not a threshold.
+viewer_selftest(browse-scan-async --async-scan
+                --browse-keys-selftest tools/testdata/rb/scanroot
+                --browse-keys "waitdir:scanroot,viewreset,w400,\
+scanhere,waitpick,pickok,waitimg:24,chkimg:24")
 # The T group lays out the Temporal panel in real ImGui frames (the chart that
 # was drawn past the panel's bottom edge is a layout fact, invisible to the
 # recompute functions).

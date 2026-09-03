@@ -2175,7 +2175,10 @@ static void openFolder(const std::string& path) {
     // A run with nobody at the keyboard scans HERE, on this thread, and returns
     // with the picker already up: 103 call sites in the selftests read
     // app.folderPick on the line after this one. See g_scriptedRun.
-    if (g_scriptedRun) { finishFolderScan(scanFolderGroups(path), path); return; }
+    if (g_scriptedRun && !g_forceAsyncScan) {
+        finishFolderScan(scanFolderGroups(path), path);
+        return;
+    }
     stopFolderScan();                  // a second Open supersedes the first
     app.folderScan.root = path;
     app.folderScan.seen = 0;

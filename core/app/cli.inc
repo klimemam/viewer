@@ -623,6 +623,7 @@ static void printUsage() {
         "  --picker-selftest <dir>     stack picker: filter cut + merge\n"
         "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
         "  --folderscan-selftest       the local folder scan's answer, group by group\n"
+        "  --async-scan                scan folders on the worker even in a scripted run\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
@@ -819,6 +820,10 @@ static void parseCli(int argc, char** argv) {
             g_bundledSelftest = true;              // handled in main()
         } else if (a == "--scan-selftest") {
             g_scanSelftest = next();               // handled in main()
+        } else if (a == "--async-scan") {
+            // take back g_scriptedRun's synchronous-scan branch: this run walks
+            // the folder on the WORKER, exactly as a windowed run does
+            g_forceAsyncScan = true;
         } else if (a == "--folderscan-selftest") {
             g_folderScanSelftest = true;           // handled in main()
         } else if (a == "--picker-selftest") {
