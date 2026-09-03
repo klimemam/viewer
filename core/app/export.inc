@@ -199,7 +199,8 @@ static void applyRangeMode(int mode, ImageDoc* on) {
         if (app.linkRange && !wasLinked) {     // seed from what is on screen
             app.linkBlack = on->black; app.linkWhite = on->white;
         }
-        if (mode == 0 && !app.linkRange) { defaultRange(*on); on->texDirty = true; }
+        // min..max, not defaultRange: same reason as in selectImage (#245).
+        if (mode == 0 && !app.linkRange) { autoRange(*on); on->texDirty = true; }
     }
     if (app.linkRange != wasLinked) markAllTexDirty();
 }

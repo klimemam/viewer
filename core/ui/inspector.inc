@@ -846,8 +846,8 @@ static void drawInspector() {
         bwEditing = ImGui::IsItemActive();
         if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0])
             setRange(*im, bwEdit[0], bwEdit[1]);
-        {   // four equal buttons measured from the panel, never wider than it
-            float bw = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+        {   // five equal buttons measured from the panel, never wider than it
+            float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5.0f;
             bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
             if (ImGui::Button("Auto", ImVec2(bw, 0))) {
                 float lo = im->vmin, hi = im->vmax;
@@ -857,6 +857,19 @@ static void drawInspector() {
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(app.linkRange ? "min/max over all open images" : "min/max of this image");
+            ImGui::SameLine();
+            // ...and the same fit with the tails cut off. One hot pixel is
+            // enough to make "Auto" useless, and cutting it is a DIFFERENT
+            // answer rather than a better one - min/max is the only fit that
+            // shows every pixel you have - so both stay on the row (#245).
+            if (ImGui::Button("Auto %", ImVec2(bw, 0))) {
+                float lo = im->vmin, hi = im->vmax;
+                autoPercentileFit(*im, lo, hi);
+                setRange(*im, lo, hi);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(app.linkRange ? "0.1-99.9%% over all open images"
+                                                : "0.1-99.9%% of this image");
             ImGui::SameLine();
             if (ImGui::Button("0-1", ImVec2(bw, 0))) setRange(*im, 0, 1);
             ImGui::SameLine();
