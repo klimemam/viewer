@@ -761,6 +761,14 @@ static bool percentileRange(const ImageDoc& im, float loFrac, float hiFrac,
 // percentile counterpart of what plain "Auto" does in the same mode (fit the
 // min/max over all of them), and the reason the bins are accumulated rather
 // than averaged: a quantile of a union is not the union of quantiles.
+//
+// The linked branch therefore READS EVERY OPEN PIXEL, where linked "Auto" only
+// reads the cached vmin/vmax - a 200-frame sequence costs seconds, not
+// milliseconds. Exact and once per press, deliberately: this is a button the
+// user asked for by name, not a per-frame path, and a sampled quantile would
+// have to answer for its stride (see ensureDiffTexture, where an even one
+// silently sampled two of four CFA planes). Bound it if it ever moves onto a
+// path that runs while stepping.
 static void autoPercentileFit(const ImageDoc& im, float& lo, float& hi) {
     if (!app.linkRange) { percentileRange(im, 0.001f, 0.999f, lo, hi); return; }
     float rlo = im.vmin, rhi = im.vmax;
