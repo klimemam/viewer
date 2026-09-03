@@ -650,6 +650,13 @@ Ubuntu 20.04 コンテナの手書き `g++` 1行も無傷である。
 > **明示の指定**で、その理由は CDDL-1.0 という**ライセンス**である
 > (THIRD-PARTY-NOTICES.md)。上のサイズ測定はその時点の記録として残す。
 
+> **手書きの `g++` そのものが 2026-09-02 に消えた (#241)。結論はやはり変わらない。**
+> 20.04 コンテナは viewer 本体と plugins も作るようになった —— viewer の
+> ソース一覧を手で並べる方式では届かないので、コンテナはプロジェクト自身の
+> cmake を走らせる。`VIEWER_NO_LIBRAW` は CMakeLists.txt の
+> `target_compile_definitions(viewer-serve ...)` 1箇所に戻り、「peer は LibRaw を
+> 載せない」は CI の workflow に書かれた指定ではなくビルド定義そのものになった。
+
 #### fixture — 合成 DNG。そして合成できないもの
 
 `tools/gen_testdata.py` が `media/sensor_*.dng` を書く。**DNG はカメラ無しで

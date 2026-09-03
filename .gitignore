@@ -16,6 +16,15 @@ build-dbg/
 build-hard/
 *.egg-info/
 build-board/
+# The headless bench gate's log (.github/workflows/build.yml, "Headless render +
+# frame-time check" tees it here and greps it for the frame-time verdict). It is
+# ignored rather than merely untracked because the compat build that runs after
+# it asks cmake/gitversion.cmake whether the tree is clean, and an untracked file
+# at the root is a modification as far as `git status --porcelain` is concerned -
+# which would stamp every shipped Linux binary "<hash>+local" and stop it naming
+# the commit it was built from.
+bench.log
+
 # tools/run_selftests.sh files a failing test's output here, one file per test.
 # Untracked on purpose: it is written automatically and unreviewed, and a 200 kB
 # ctest log must never arrive in a commit by accident. What gets COMMITTED to
