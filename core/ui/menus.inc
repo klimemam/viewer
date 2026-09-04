@@ -228,6 +228,26 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem(label.c_str(), nullptr, false, has)) openPath(ap);
             if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
+        {   // A whole STACK out of the tool, at the levels on screen (#253).
+            // Here rather than only in the canvas export block because its
+            // subject is the stack, not the picture under the cursor, and File
+            // is where the verbs about a whole thing live (Save Session, Close
+            // Batch). Enabled only for a frame of a stack: a standalone image
+            // is one picture, and "Save image as PNG..." is already its verb.
+            ImageDoc* vi = cur();
+            const bool canVideo = canExportStackVideo(vi);
+            if (ImGui::MenuItem("Export stack as video (displayed levels)...", nullptr,
+                                false, canVideo))
+                askStackVideoExport(vi->seqId);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(canVideo
+                    ? "every frame of this stack, in order, through the SAME\n"
+                      "mapping the screen and the PNG export use - range, gamma,\n"
+                      "colormap, CFA colorize - at the frame's own pixel size.\n"
+                      "Lossless: FFV1/MKV where ffmpeg is on PATH, uncompressed\n"
+                      "AVI otherwise."
+                    : "the current image is not a frame of a stack");
+        }
         ImGui::Separator();
         {   // Close follows the layer canon (docs/terminology.md): Ctrl+W closes
             // the STACK when the current frame is in one, the image otherwise.

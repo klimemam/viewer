@@ -127,6 +127,14 @@ static void settingsOriginSessionPath(const char* path);
 
 #include "app/sequence.inc"
 
+// A whole STACK out as a lossless video (issue #253), at the levels on screen.
+// Here rather than beside saveViewPng in export.inc because the subject is a
+// STACK: it needs framesOfSeq and seqInfo, and export.inc is included from
+// remote_client.inc, long before sequence.inc defines either. Everything it
+// exports THROUGH - exportRefusalFor, exportHighlightNote, renderDocRGBA - is
+// already in scope from there, which is the point: one mapping, one refusal.
+#include "app/export_video.inc"
+
 #include "app/temporal_model.inc"
 
 // The detrend STAGE (docs/features/analysis/flat-field-stats.md 判断6/7): pure, no app state,
@@ -228,6 +236,9 @@ static std::string fmtVal(float v, const std::string& dtype) {
 #include "app/preprocess.inc"
 
 #include "ui/modal_derive.inc"
+// The fps/format question a stack-to-video export has to settle before the OS
+// save dialog can be given a default extension (#253).
+#include "ui/modal_video.inc"
 #include "ui/file_list.inc"
 // after file_list: the Files selection (g_aSetSelId) is what picks this panel's
 // subject, exactly as the selection picks the layer for every General panel
@@ -651,6 +662,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // is a function like histHlSelftest() and needs nothing more than selectImage
 // and app.view - both of which exist by now.
 #include "selftest/framesize.inc"
+
+// A stack out as a lossless video (#253). Here beside framesize for its reason:
+// it is a function like frameSizeSelftest(), its documents are built in memory,
+// and everything it drives - startStackVideoExport, pumpVideoExport,
+// saveViewPng, selectImage - exists by now.
+#include "selftest/video.inc"
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
@@ -1141,6 +1158,7 @@ int main(int argc, char** argv) {
     // for the histhl reasons - the fixtures are sizes and every assertion is a
     // product of two numbers.
     if (g_frameSizeSelftest) return frameSizeSelftest();
+    if (g_videoSelftest) return videoSelftest();
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
     // through the real panel. Windowless because every assertion is a string.
@@ -1894,6 +1912,7 @@ static bool g_watchSuppressed = false;
         drawSequenceModal();
         drawSeriesModal();
         drawDeriveModal();
+        drawVideoExportModal();       // fps and format, before the save dialog (#253)
         drawFolderScanModal();        // ...and the count while that scan walks
         drawFolderPickModal();
         drawNpzPickModal();
@@ -2128,6 +2147,13 @@ static bool g_watchSuppressed = false;
                 { std::lock_guard<std::mutex> lk(app.folderScan.mtx);
                   working |= app.folderScan.done; }
                 working |= app.anyFileDialog();   // pollFileDialog lives in the frame
+                // ...and the same argument for the stack-to-video job (#253):
+                // it renders ONE frame per UI frame, on this thread, so at 0
+                // fps the frames it is waiting for simply never happen and the
+                // export stalls at "1 / 300" until the mouse moves. The modal
+                // in front of it needs a frame to open on, for drawSequenceModal's
+                // reason two rows up.
+                working |= app.videoExport.active || app.videoAskOpen;
                 working |= app.rdJob != nullptr;  // and so does pollReader
                 // ...including the queue behind it: pollReader takes the next
                 // one, so a frame that is never drawn is a drop of five files
@@ -2210,6 +2236,7 @@ static bool g_watchSuppressed = false;
         pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
         pumpFolderScan();             // ...and the LOCAL walk, when it has finished
         pumpWatch();                  // source files that moved on disk (項目20)
+        pumpVideoExport();            // ONE frame of the stack-to-video job (#253)
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.

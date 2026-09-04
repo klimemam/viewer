@@ -808,6 +808,22 @@ static void drawCanvas(ImVec2 avail) {
                             baseName(ci->name) + ".png",
                             std::vector<std::string>{ "PNG (*.png)", "*.png" });
                 }
+                {   // ...and the whole STACK, in one file, at the same levels
+                    // (#253). Beside the PNG on purpose: it is the same verb
+                    // one layer up (docs/terminology.md's frame / stack), and
+                    // it goes through the same renderDocRGBA - so what the two
+                    // items produce for one frame is the same picture.
+                    const bool canVideo = canExportStackVideo(ci);
+                    if (ImGui::MenuItem("Export stack as video (displayed levels)...",
+                                        nullptr, false, canVideo))
+                        askStackVideoExport(ci->seqId);
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(canVideo
+                            ? "every frame of this stack, in order, lossless:\n"
+                              "FFV1/MKV where ffmpeg is on PATH, uncompressed\n"
+                              "AVI otherwise."
+                            : "this image is not a frame of a stack");
+                }
                 const bool inStack = ci && ci->seqId != 0;
                 App::Ann* ra = findAnn(app.selectedAnn);
                 const bool roiOk = ra && ra->type == 0;

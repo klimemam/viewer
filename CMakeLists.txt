@@ -440,6 +440,14 @@ add_executable(viewer core/main.cpp core/plugin_host.cpp core/ui_theme.cpp
                       core/imagefile.cpp core/tiffread.cpp core/exrread.cpp
                       core/rawread.cpp
                       core/y4mread.cpp
+                      # ...and the one that writes video (#253). A real TU, not
+                      # a fragment of the spine: it takes bytes and a path, it
+                      # knows nothing about App or ImGui, and the RIFF
+                      # arithmetic and the process spawning are exactly the kind
+                      # of thing that should be compilable - and reviewable -
+                      # on its own. Not on viewer-serve's list: a peer answers
+                      # pixel requests and writes no files.
+                      core/videowrite.cpp
                       core/browse/nav.cpp core/browse/panel.cpp
                       ${miniz_SOURCE_DIR}/miniz.c)
 # The commit this binary was built from, refreshed on every build (a
@@ -1259,6 +1267,21 @@ viewer_selftest(histhl      NOGL --histhl-selftest)
 # test rather than a section of range.inc so that a failure names the invariant
 # it is about - and because range.inc's fixtures are a folder on disk.
 viewer_selftest(framesize   NOGL --framesize-selftest)
+# A stack written out as a LOSSLESS VIDEO (#253): the AVI container read back by
+# a RIFF parser the test writes itself, the three refusals (a preview frame, a
+# stack over AVI 1.0's 4 GB, a .mkv where no ffmpeg exists), and the claim the
+# feature rests on - frame n of the video is byte-for-byte the PNG export of
+# frame n, on an "Auto per frame" stack where the export has to re-fit as
+# selectImage does. NOGL and fixture-free for framesize's reasons: the frames
+# are built in memory and every expected number is a byte derived by hand.
+#
+# The ffmpeg half runs on every runner, with or without ffmpeg installed: the
+# absent case is FORCED (PATH pointed at a directory with no ffmpeg) so the
+# refusal is asserted rather than skipped, and where ffmpeg IS present the FFV1
+# file is additionally read back by ffprobe. So this test's pass does not mean
+# the same thing on every machine - it means MORE where ffmpeg is installed -
+# and it can never mean less.
+viewer_selftest(video       NOGL --video-selftest)
 # settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
 # (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of
