@@ -654,6 +654,7 @@ static void computeMinMax(ImageDoc& im) {
     // cleared here; a sibling membership on the same source clears its own
     // through syncMirrors, which is how it learns the new vmin/vmax at all.
     im.pctValid = false;
+    im.medValid = false;                    // ...and so does the cached median (#252)
 }
 // Effective display range: the shared value when linking is on, the image's own
 // otherwise. Linking never overwrites an image's range (defined below with App).
@@ -793,6 +794,143 @@ static void autoPercentileFit(const ImageDoc& im, float& lo, float& hi) {
     else for (const auto& d : app.images) n += accumulatePercentileBins(*d, rlo, rhi, bins);
     float a = 0, b = 0;
     if (percentileFromBins(bins, n, rlo, rhi, 0.001f, 0.999f, a, b)) { lo = a; hi = b; }
+}
+
+// This image's own "Auto %" answer, computed once and kept (#248's cache).
+// The two readers - the row that lights the button and the per-frame re-fit
+// that steps through a stack in the pct flavour - both ask on every UI frame
+// or every step, and the answer costs a 65536-bin pass. One definition of
+// "the cached percentile answer", so the cache cannot be filled two ways.
+static void percentileRangeCached(ImageDoc& im, float& lo, float& hi) {
+    if (!im.pctValid) {
+        // percentileRange leaves lo/hi usable (min..max) even when it returns
+        // false, and that fallback is exactly what the button would have set -
+        // so the return value is not consulted here any more than
+        // autoPercentileFit consults it.
+        percentileRange(im, 0.001f, 0.999f, im.pctLo, im.pctHi);
+        im.pctValid = true;
+    }
+    lo = im.pctLo; hi = im.pctHi;
+}
+
+// ---- the median fit ("Med": put the median at `target`) --------------------
+// The third answer (#252, user 2026-09-04「median 値を target に合わせるモード」).
+// Auto and Auto % both answer "what is in this picture"; this one answers
+// "where do I want the BULK of it to sit" - the level a photographer sets an
+// exposure to, or a reviewer sets so two captures at different light levels
+// can be looked at side by side.
+//
+//   white = black + (median - black) / target
+//
+// so that the median maps to exactly `target` on the 0..1 display bar. The
+// black point is the user's, from three choices (MedBlackMode); the median
+// comes from the SAME 65536-bin histogram Auto % already builds, at fraction
+// 0.5, because a real median of a 12 Mpx frame is a 48 MB copy and a sort.
+
+// The median from pooled bins: the lower edge of the bin the cumulative count
+// reaches half in. percentileFromBins already answers exactly that question -
+// asked for the 0.5 cut at BOTH ends it returns that bin's two edges - so the
+// median is its `lo`, and the "open outward, never claim more than the data"
+// convention is stated once, there.
+static bool medianFromBins(const std::vector<uint32_t>& bins, uint64_t n,
+                           float rlo, float rhi, float& med) {
+    float lo = 0, hi = 0;
+    if (!percentileFromBins(bins, n, rlo, rhi, 0.5f, 0.5f, lo, hi)) return false;
+    med = lo;
+    return std::isfinite(med);
+}
+
+// One image's own median, cached on the doc like the percentile answer above
+// and dropped in exactly the same two places (computeMinMax / syncMirrors).
+// False = the pixels cannot answer (nothing finite, min == max); `med` is then
+// untouched and every caller falls back to min..max.
+static bool medianValue(ImageDoc& im, float& med) {
+    if (im.medValid) { med = im.medVal; return true; }
+    std::vector<uint32_t> bins;
+    uint64_t n = accumulatePercentileBins(im, im.vmin, im.vmax, bins);
+    float m = 0;
+    if (!medianFromBins(bins, n, im.vmin, im.vmax, m)) return false;
+    im.medVal = m; im.medValid = true;
+    med = m;
+    return true;
+}
+
+// The arithmetic itself, and every way it can refuse. Pulled out because TWO
+// places must agree to the last bit: the button that sets the range, and the
+// row that decides whether the range in force IS that answer.
+//   - target outside the open interval (0, 1): 0 divides, 1 says "white =
+//     median" and throws away the brighter half of the picture.
+//   - median <= black: the black point is at or above the middle of the data,
+//     so there is no positive white to derive - the fit has nothing to say.
+static bool medianWhite(float black, float med, float target, float& white) {
+    if (!(target > 0.0f) || !(target < 1.0f)) return false;
+    if (!std::isfinite(black) || !std::isfinite(med) || !(med > black)) return false;
+    const float w = black + (med - black) / target;
+    if (!std::isfinite(w) || !(w > black)) return false;
+    white = w;
+    return true;
+}
+
+// Which black point the Med fit uses, for pixels whose min and 0.1% cut are
+// `mn` and `p1`. Stated once so the fit and the lighting rule cannot drift.
+static float medBlackOf(float mn, float p1) {
+    switch (app.medBlackMode) {
+        case MB_Min:    return mn;
+        case MB_MinPct: return p1;
+        default:        return app.medBlackValue;
+    }
+}
+
+// What the "Med" button fits to. Unlinked: this image (median and 0.1% cut
+// both cached on the doc). Linked: every open image pooled onto ONE histogram
+// spanning the shared min..max, from which the median, the union min and the
+// pooled 0.1% cut all come - the same semantics linked "Auto %" has, and the
+// same cost warning applies (it READS EVERY OPEN PIXEL; once per press).
+// lo/hi are ALWAYS left usable: on any degenerate input they hold the min..max
+// this would otherwise refine, which is the Auto % convention.
+static void medianFit(ImageDoc& im, float& lo, float& hi) {
+    float rlo = im.vmin, rhi = im.vmax;
+    if (app.linkRange)
+        for (const auto& d : app.images) { rlo = std::min(rlo, d->vmin); rhi = std::max(rhi, d->vmax); }
+    lo = rlo; hi = rhi;                          // the fallback IS Auto's answer
+
+    float med = 0, p1 = rlo;
+    if (!app.linkRange) {
+        if (!medianValue(im, med)) return;
+        // Only paid for when the black point is the one that needs it.
+        if (app.medBlackMode == MB_MinPct) { float b = 0; percentileRangeCached(im, p1, b); }
+    } else {
+        std::vector<uint32_t> bins;
+        uint64_t n = 0;
+        if (app.images.empty()) n = accumulatePercentileBins(im, rlo, rhi, bins);
+        else for (const auto& d : app.images) n += accumulatePercentileBins(*d, rlo, rhi, bins);
+        if (!medianFromBins(bins, n, rlo, rhi, med)) return;
+        if (app.medBlackMode == MB_MinPct) {
+            float a = 0, b = 0;
+            if (!percentileFromBins(bins, n, rlo, rhi, 0.001f, 0.999f, a, b)) return;
+            p1 = a;
+        }
+    }
+    const float black = medBlackOf(rlo, p1);
+    float white = 0;
+    if (!medianWhite(black, med, app.medTarget, white)) return;
+    lo = black; hi = white;
+}
+
+// ONE answer to "what does re-fitting this frame mean right now" (#252), for
+// the two places that re-fit in "Auto per frame": selectImage, when a frame
+// arrives on screen, and applyRangeMode, when the mode itself is chosen. They
+// used to both call autoRange, so the mode had exactly one meaning; now it has
+// three and they must not be able to disagree about which.
+//
+// Only ever reached with linkRange OFF (both callers guard on it), so the
+// pooled linked branches inside the fits below never run per frame - which
+// matters: linked Auto % / Med read every open pixel.
+static void refitByFlavor(ImageDoc& im) {
+    float lo = im.vmin, hi = im.vmax;            // AF_MinMax, i.e. autoRange
+    if (app.autoFlavor == AF_Pct)         percentileRangeCached(im, lo, hi);
+    else if (app.autoFlavor == AF_Median) medianFit(im, lo, hi);
+    im.black = lo; im.white = hi;
 }
 
 // Keep only the most recent textures resident: a 200-frame sequence would
