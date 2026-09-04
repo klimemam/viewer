@@ -177,8 +177,11 @@ static bool pumpVideoExport() {
         const std::string name = baseName(J.path), kind = J.sinkName;
         const int w = J.w, h = J.h;
         const double fps = J.fps;
+        // A finish that failed leaves a file with no index and a header still
+        // claiming 0 frames - unplayable, and saying nothing about why. It goes
+        // the same way a Stop goes, for the same reason: nothing left behind.
+        if (!ok) { abandonVideoExport("video export failed: " + err); return false; }
         J = App::VideoExport();
-        if (!ok) { toast("video export failed: " + err, true); return false; }
         char tail[96];
         snprintf(tail, sizeof tail, "  %d frames  %dx%d  @%.6g fps", n, w, h, fps);
         // The highlight note goes where the export is ANNOUNCED, exactly as it
