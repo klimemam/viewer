@@ -649,6 +649,11 @@ static void computeMinMax(ImageDoc& im) {
     if (mn == mx) mx = mn + 1;
     im.src->vmin = mn; im.src->vmax = mx;   // the source's truth...
     im.vmin = mn; im.vmax = mx;             // ...and the doc's mirror of it
+    // The cached "Auto %" answer was measured from the pixels this just
+    // re-measured, so it no longer describes them (#248). Only THIS doc is
+    // cleared here; a sibling membership on the same source clears its own
+    // through syncMirrors, which is how it learns the new vmin/vmax at all.
+    im.pctValid = false;
 }
 // Effective display range: the shared value when linking is on, the image's own
 // otherwise. Linking never overwrites an image's range (defined below with App).

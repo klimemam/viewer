@@ -338,6 +338,275 @@
             app.linkRange = saveLink;
             app.rangeScope = saveScope;
         }
+        // ==================================================================
+        // #248 - "Per stack" as a policy that is HELD, not a load-time
+        // accident, and the Range row saying which preset is in force.
+        // Same discipline as #245 above: in-memory fixtures, hand-derived
+        // numbers, every borrowed mode returned to the shared home.
+        // ==================================================================
+        {   // ---- P7: in "Per stack", setRange writes the whole stack -------
+            // Every write of a display range - the number field and all five
+            // preset buttons - arrives at setRange, and setRange did not read
+            // the scope. Pressing Auto in per-stack mode therefore fitted the
+            // frame on screen and left its siblings on their old numbers
+            // (#248 (b)); the mode only ever looked right because frames
+            // INHERIT at landing and nothing had disturbed them yet.
+            const bool saveLink = app.linkRange;
+            const int  saveScope = app.rangeScope;
+            const size_t imgWas = app.images.size();
+            auto A3 = mkRamp("ps_A", 0.3f, 0.6f, 0, 0.0f);   // data 0.3..0.6
+            auto B3 = mkRamp("ps_B", 2.0f, 3.0f, 0, 0.0f);   // data 2..3
+            A3->seqId = 4242; A3->seqIndex = 0;
+            B3->seqId = 4242; B3->seqIndex = 1;
+            B3->black = -1; B3->white = 7;                   // plainly not A's
+            B3->texDirty = false;                            // so "was redrawn" means something
+            ImageDoc* pA = A3.get(); ImageDoc* pB = B3.get();
+            // app.images is SWAPPED, not appended to (the P4 discipline): the
+            // loaded frames must not be caught by a stack-wide write, and the
+            // swap back restores every one of them.
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(A3));
+            pool.push_back(std::move(B3));
+            std::swap(app.images, pool);
+            app.linkRange = false;
+            app.rangeScope = 1;                              // per stack
+            setRange(*pA, 0.3f, 0.6f);                       // what "Auto" on A presses
+            bool shared = pB->black == 0.3f && pB->white == 0.6f && pB->texDirty;
+            fprintf(stderr, "rangeselftest: P7 per-stack setRange | A %.6g..%.6g -> "
+                            "sibling %.6g..%.6g (expect 0.3..0.6, redrawn) %s\n",
+                    pA->black, pA->white, pB->black, pB->white, shared ? "ok" : "WRONG");
+            if (!shared) bad++;
+
+            // ...and "auto per frame" must NOT spread: the sibling keeps what
+            // it had, and is not even marked for redraw.
+            app.rangeScope = 0;
+            pB->texDirty = false;
+            setRange(*pA, 0.0f, 255.0f);
+            bool alone = pB->black == 0.3f && pB->white == 0.6f && !pB->texDirty &&
+                         pA->black == 0.0f && pA->white == 255.0f;
+            fprintf(stderr, "rangeselftest: P7 scope 0 touches A only | A %.6g..%.6g "
+                            "sibling %.6g..%.6g (expect 0.3..0.6, untouched) %s\n",
+                    pA->black, pA->white, pB->black, pB->white, alone ? "ok" : "WRONG");
+            if (!alone) bad++;
+
+            // ...and a standalone image is not a stack. Only a POSITIVE seqId
+            // names one ("0 = standalone, >0 = frame of that sequence"), and
+            // seqId 0 is the whole rest of the program: two unrelated singles
+            // must not fuse just because the scope says "per stack". The
+            // negative pass is the same claim for an id that should never
+            // exist - a doc carrying one must not be treated as a stack of all
+            // the others.
+            app.rangeScope = 1;
+            bool single = true;
+            for (int id : { 0, -1 }) {
+                pA->seqId = id; pB->seqId = id;
+                pB->texDirty = false;
+                setRange(*pA, 1.0f, 2.0f);
+                bool ok = pB->black == 0.3f && pB->white == 0.6f && !pB->texDirty;
+                fprintf(stderr, "rangeselftest: P7 seqId %d shares with nobody | other single "
+                                "%.6g..%.6g (expect 0.3..0.6) %s\n",
+                        id, pB->black, pB->white, ok ? "ok" : "WRONG");
+                single = single && ok;
+            }
+            if (!single) bad++;
+
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas) {
+                fprintf(stderr, "rangeselftest: P7 app.images %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size());
+                bad++;
+            }
+            app.linkRange = saveLink;
+            app.rangeScope = saveScope;
+        }
+
+        {   // ---- P8: switching TO "Per stack" re-shares --------------------
+            // This is the reported bug itself (#248 (a)). "Auto per frame"
+            // REWRITES each frame's stored black/white as you step - main.cpp
+            // 1393 records that as known and deliberate - so a stack that has
+            // been stepped in mode 0 holds per-frame values. applyRangeMode
+            // used to only raise the scope flag, and those stored per-frame
+            // values then reappeared on every step: 「Per stack にしても一枚毎
+            // に Auto されてしまう」. The frame on screen is the reference.
+            const bool saveLink = app.linkRange;
+            const int  saveScope = app.rangeScope;
+            const size_t imgWas = app.images.size();
+            auto A4 = mkRamp("ms_A", 0.3f, 0.6f, 0, 0.0f);
+            auto B4 = mkRamp("ms_B", 2.0f, 3.0f, 0, 0.0f);
+            A4->seqId = 4243; B4->seqId = 4243;
+            // exactly what stepping in mode 0 leaves behind: each frame on its
+            // own min..max (autoRange), which is what these fixtures measure to
+            A4->black = 0.3f; A4->white = 0.6f;
+            B4->black = 2.0f; B4->white = 3.0f;
+            B4->texDirty = false;
+            ImageDoc* pA = A4.get(); ImageDoc* pB = B4.get();
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(A4));
+            pool.push_back(std::move(B4));
+            std::swap(app.images, pool);
+            app.linkRange = false;
+            app.rangeScope = 0;                        // coming FROM auto-per-frame
+            applyRangeMode(1, pA);                     // exactly what the combo calls
+            bool reshared = app.rangeScope == 1 && !app.linkRange &&
+                            pB->black == 0.3f && pB->white == 0.6f && pB->texDirty &&
+                            pA->black == 0.3f && pA->white == 0.6f;
+            fprintf(stderr, "rangeselftest: P8 mode 0 -> 1 re-shares | A %.6g..%.6g "
+                            "sibling %.6g..%.6g (expect A's 0.3..0.6, was 2..3) %s\n",
+                    pA->black, pA->white, pB->black, pB->white, reshared ? "ok" : "WRONG");
+            if (!reshared) bad++;
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas) {
+                fprintf(stderr, "rangeselftest: P8 app.images %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size());
+                bad++;
+            }
+            app.linkRange = saveLink;
+            app.rangeScope = saveScope;
+        }
+
+        {   // ---- P9: the first batch of a new stack has no seam ------------
+            // This runs the REAL landing path: pumpSequence is the one place a
+            // decoded frame becomes a document, and it is driven here by
+            // filling app.seqReady exactly as the decode worker does, with no
+            // worker and no files. `ref` (the first landed frame of the stack
+            // being loaded) is looked up once before the loop, so in the FIRST
+            // batch there is nothing to find and up to MAX_PER_FRAME = 4
+            // frames each took their own defaultRange (#248 (c)).
+            //   Fixtures are arbitrary-unit floats - 100..200, 300..400,
+            //   500..600 - chosen so defaultRange has no magnet to apply and
+            //   answers each frame's own min..max. Frame 1 therefore lands on
+            //   100..200, and frames 2 and 3 must hold 100..200 too, not
+            //   300..400 and 500..600.
+            const size_t imgWas = app.images.size();
+            const int saveLoadingId = app.seqLoadingId;
+            const bool saveCancel = app.seqCancel;
+            app.seqCancel = false;    // a standing cancel empties seqReady, and
+                                      // an empty batch is not a passing test
+            auto mkBand = [&](const char* nm, float lo, float hi) {
+                auto d = mkRamp(nm, lo, hi, 0, 0.0f);
+                d->black = -12345; d->white = 12345;   // no answer smuggled in
+                return d;
+            };
+            auto f1 = mkBand("seam_1", 100.0f, 200.0f);
+            auto f2 = mkBand("seam_2", 300.0f, 400.0f);
+            auto f3 = mkBand("seam_3", 500.0f, 600.0f);
+            f1->batchId = 77; f1->displayLut = 3;      // the block that rides along
+            f2->batchId = 0;  f2->displayLut = -1;
+            f3->batchId = 0;  f3->displayLut = -1;
+            // app.images is emptied for the duration: that is what makes this
+            // the FIRST batch (ref == nullptr), and it keeps the landed frames
+            // out of the loaded stacks - the swap back drops them.
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            std::swap(app.images, pool);
+            app.seqLoadingId = 4244;
+            {
+                std::lock_guard<std::mutex> lk(app.seqMtx);
+                app.seqReady.emplace_back(0, std::move(f1));
+                app.seqReady.emplace_back(1, std::move(f2));
+                app.seqReady.emplace_back(2, std::move(f3));
+            }
+            pumpSequence();                            // the real integration
+            bool landed = app.images.size() == 3;
+            bool seam = landed &&
+                        app.images[0]->black == 100.0f && app.images[0]->white == 200.0f &&
+                        app.images[1]->black == 100.0f && app.images[1]->white == 200.0f &&
+                        app.images[2]->black == 100.0f && app.images[2]->white == 200.0f;
+            bool block = landed &&
+                         app.images[1]->batchId == 77 && app.images[2]->batchId == 77 &&
+                         app.images[1]->displayLut == 3 && app.images[2]->displayLut == 3;
+            fprintf(stderr, "rangeselftest: P9 first batch | %zu landed | "
+                            "%.6g..%.6g / %.6g..%.6g / %.6g..%.6g (expect 100..200 three times) %s"
+                            " | batch+colormap carried %s\n",
+                    app.images.size(),
+                    landed ? app.images[0]->black : 0.f, landed ? app.images[0]->white : 0.f,
+                    landed ? app.images[1]->black : 0.f, landed ? app.images[1]->white : 0.f,
+                    landed ? app.images[2]->black : 0.f, landed ? app.images[2]->white : 0.f,
+                    seam ? "ok" : "WRONG", block ? "ok" : "WRONG");
+            if (!seam || !block) bad++;
+            // anti-vacuity: the fixtures really do measure to three different
+            // bands, so "100..200 three times" is the fix and not an artifact
+            bool distinct = landed && app.images[1]->vmin == 300.0f && app.images[2]->vmin == 500.0f;
+            if (!distinct) {
+                fprintf(stderr, "rangeselftest: P9 fixtures are not three distinct bands"
+                                "  ANTI-VACUITY LOST\n");
+                bad++;
+            }
+            std::swap(app.images, pool);
+            app.seqLoadingId = saveLoadingId;
+            app.seqCancel = saveCancel;
+            if (app.images.size() != imgWas) {
+                fprintf(stderr, "rangeselftest: P9 app.images %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size());
+                bad++;
+            }
+        }
+
+        {   // ---- P10: which Range button is the range in force -------------
+            // The row's whole claim, asserted on the predicate itself rather
+            // than through a draw: rangeButtonMatches is where the rule lives
+            // and the five buttons are a thin wrapper over it (#248 (2)).
+            // Fixture: the clean ramp of P2 - data exactly 0.3..0.6, whose
+            // 0.1/99.9 percentiles are the hand-derived 0.3003 / 0.5997.
+            const bool saveLink = app.linkRange;
+            app.linkRange = false;
+            auto d = mkRamp("btn", 0.3f, 0.6f, 0, 0.0f);
+            struct Case { const char* what; float b, w; int expect; };
+            // expect is a bitmask over RB_Auto..RB_0_65535
+            const int mAuto = 1 << RB_Auto, mPct = 1 << RB_AutoPct,
+                      m01 = 1 << RB_0_1, m0255 = 1 << RB_0_255, m0655 = 1 << RB_0_65535;
+            // the percentile answer has to be asked for once to be quoted here
+            float plo = 0, phi = 0;
+            percentileRange(*d, 0.001f, 0.999f, plo, phi);
+            const Case cases[] = {
+                { "min..max",      d->vmin, d->vmax, mAuto },
+                { "0.1-99.9%",     plo,     phi,     mPct  },
+                { "0-1",           0.0f,    1.0f,    m01   },
+                { "0-255",         0.0f,    255.0f,  m0255 },
+                { "0-65535",       0.0f,    65535.0f,m0655 },
+                { "hand-typed",    0.31f,   0.59f,   0     },
+            };
+            for (const Case& c : cases) {
+                int got = 0;
+                for (int b = RB_Auto; b <= RB_0_65535; b++)
+                    if (rangeButtonMatches(*d, b, c.b, c.w)) got |= 1 << b;
+                fprintf(stderr, "rangeselftest: P10 %-10s %.6g..%.6g | lit 0x%02x "
+                                "(expect 0x%02x) %s\n",
+                        c.what, c.b, c.w, got, c.expect, got == c.expect ? "ok" : "WRONG");
+                if (got != c.expect) bad++;
+            }
+            // The row is NOT a radio group: data running exactly 0..1 makes
+            // Auto and 0-1 the same answer and BOTH light. Hiding one of two
+            // true facts to keep the look of a selector would misdescribe the
+            // range that is actually in force.
+            auto u = mkRamp("btn01", 0.0f, 1.0f, 0, 0.0f);
+            int both = 0;
+            for (int b = RB_Auto; b <= RB_0_65535; b++)
+                if (rangeButtonMatches(*u, b, 0.0f, 1.0f)) both |= 1 << b;
+            fprintf(stderr, "rangeselftest: P10 data 0..1 | lit 0x%02x (expect Auto+0-1 = 0x%02x) %s\n",
+                    both, mAuto | m01, both == (mAuto | m01) ? "ok" : "WRONG");
+            if (both != (mAuto | m01)) bad++;
+            // ...and the percentile answer is cached, and the cache is dropped
+            // when the pixels are re-measured. Never a 65536-bin pass per UI
+            // frame; never a stale answer after a reload/crop/detrend.
+            bool cached = d->pctValid && d->pctLo == plo && d->pctHi == phi;
+            computeMinMax(*d);
+            bool dropped = !d->pctValid;
+            fprintf(stderr, "rangeselftest: P10 pct cache | held after use %s | "
+                            "dropped by computeMinMax %s\n",
+                    cached ? "ok" : "WRONG", dropped ? "ok" : "WRONG");
+            if (!cached || !dropped) bad++;
+            // Linked mode: the fixed presets and Auto still answer, Auto %
+            // deliberately does not (its linked answer reads every open pixel;
+            // see rangeButtonMatches).
+            app.linkRange = true;
+            bool quiet = !rangeButtonMatches(*d, RB_AutoPct, plo, phi) &&
+                         rangeButtonMatches(*d, RB_0_255, 0.0f, 255.0f);
+            fprintf(stderr, "rangeselftest: P10 linked | Auto %% stays dark, presets answer %s\n",
+                    quiet ? "ok" : "WRONG");
+            if (!quiet) bad++;
+            app.linkRange = saveLink;
+        }
+
         // the shared home gets the modes it was lent, back
         app.rangeScope = 1;
         app.linkRange = false;

@@ -757,6 +757,16 @@ static void pumpSequence() {
         doc->uid = app.nextUid++;
         app.imagesRev++;
         app.images.push_back(std::move(doc));
+        // The seam at the very start of a stack (#248 (c)): ref is looked up
+        // ONCE, above, and in the FIRST batch of a new stack there is nothing
+        // to find - so up to MAX_PER_FRAME frames each took their own
+        // defaultRange and the head of the stack came up in four different
+        // stretches. (Invisible for integer types and near-[0,1] floats, whose
+        // load-time magnets hand every frame the same answer; plainly visible
+        // for arbitrary-unit floats, where defaultRange IS each frame's own
+        // min..max.) The frame just landed becomes the reference, so the rest
+        // of its own batch inherits from frame 1 exactly as later batches do.
+        if (!ref) ref = app.images.back().get();
     }
     // invalidating per pump made this O(frames^2) over a load; refresh at ~2 Hz
     static double lastTemporalInvalidate = 0;
