@@ -2819,6 +2819,26 @@ static bool g_watchSuppressed = false;
                         else if (nowSec() - waitL0 < 60.0) hold = true;
                         else { chk(false, "no load ever started: " + how); waitL0 = 0; }
                     }
+                    else if (op == "waitpick") {
+                        // Hold until the stack picker is UP. With --async-scan
+                        // the scan is on a worker, so `scanhere` returns before
+                        // there is anything to press - `pickok` on the next
+                        // action would find no picker and quietly do nothing,
+                        // which is a test that passes by not testing. This is
+                        // the wait a person performs, and its timeout is a
+                        // FAILURE: "the picker never appeared" is precisely the
+                        // shape a broken worker handoff has.
+                        static double waitP0 = 0;
+                        std::string how = "scanning=" +
+                                std::to_string(app.folderScan.running.load() ? 1 : 0) +
+                                " seen=" + std::to_string(app.folderScan.seen.load()) +
+                                " picker=" + std::to_string(app.folderPickOpen ? 1 : 0) +
+                                " groups=" + std::to_string((int)app.folderPick.size());
+                        if (app.folderPickOpen) { chk(true, how); waitP0 = 0; }
+                        else if (waitP0 == 0) { waitP0 = nowSec(); hold = true; }
+                        else if (nowSec() - waitP0 < 60.0) hold = true;
+                        else { chk(false, "no picker ever appeared: " + how); waitP0 = 0; }
+                    }
                     else if (op == "waitimg") {    // fetches land between frames
                         static double waitT0 = 0;
                         if ((int)app.images.size() >= arg) { chk(true); waitT0 = 0; }

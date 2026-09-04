@@ -2446,6 +2446,15 @@ extern App app;
 // sequence.inc is included first and is what asks.
 inline bool g_scriptedRun = false;
 
+// ...and the one way to take that branch BACK, because the branch above is a
+// hole as well as a convenience: every selftest sets g_scriptedRun, so all 57
+// of them run the synchronous scan and NOTHING in the suite ever runs the one
+// the user actually gets. --async-scan is that hole's lid - a scripted run that
+// asks for the worker and then waits for the picker the way a person does
+// (browse-keys' `waitpick`). Only openFolder reads it; everything else about a
+// scripted run is unchanged.
+inline bool g_forceAsyncScan = false;
+
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)
 // and its default is 6. Before that ruling the number was a literal at each
