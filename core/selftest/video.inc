@@ -545,6 +545,52 @@ static int videoSelftest() {
         closeAll();
     }
 
+    {   // ---- V6b: ...and the re-fit is the FLAVOUR's, not min..max ---------
+        // "Auto per frame" has three answers since #252 (min..max, the
+        // 0.1-99.9% cut, median->target) and selectImage applies whichever
+        // app.autoFlavor names. The export must apply the SAME one, or a video
+        // of a stack browsed in another flavour shows frames the user never
+        // saw. Asserted on the MEDIAN flavour, black = min, target 0.25: for a
+        // ramp the median sits at the middle, so white = min + (med - min)/0.25
+        // lands about a full span ABOVE max - unmistakably not min..max, on a
+        // fixture of any size. (The pct flavour would not do here: on 48
+        // pixels the 0.1% cut is 0.048 px and falls in bin 0, so its answer IS
+        // min..max and the anti-vacuity half could not be told from a no-op.)
+        const int saveFlav = app.autoFlavor, saveBM = app.medBlackMode;
+        const float saveTgt = app.medTarget;
+        app.rangeScope = 0;
+        app.linkRange = false;
+        app.autoFlavor = AF_Median;
+        app.medBlackMode = MB_Min;
+        app.medTarget = 0.25f;
+        const int seq = mkSeq("v253_flavour");
+        const int i0 = mk("v6b_0.npy", seq, 0, 1.0f, 0.0f);
+        mk("v6b_1.npy", seq, 1, 2.0f, 10.0f);
+        mk("v6b_2.npy", seq, 2, 3.0f, 40.0f);
+        app.current = i0;
+        const std::string path = tmpFile("viewer_video_v6b.avi");
+        check(startStackVideoExport(seq, path, 30.0).empty(), "V6b the median-flavour export starts");
+        check(runToEnd(), "V6b ...and finishes");
+        std::vector<int> fr = framesOfSeq(seq);
+        bool same = fr.size() == 3, notMinMax = fr.size() == 3;
+        for (size_t k = 0; k < fr.size(); k++) {
+            ImageDoc& d = *app.images[fr[k]];
+            float lo = 0, hi = 0;
+            medianFit(d, lo, hi);
+            fprintf(stderr, "videoselftest: V6b frame %zu holds %.6g..%.6g | median fit %.6g..%.6g | "
+                            "min..max %.6g..%.6g\n", k + 1, d.black, d.white, lo, hi, d.vmin, d.vmax);
+            if (d.black != lo || d.white != hi) same = false;
+            if (d.black == d.vmin && d.white == d.vmax) notMinMax = false;
+        }
+        check(same, "V6b every frame was re-fitted by the flavour in force (median->target)");
+        check(notMinMax, "V6b ...which is not its min..max (anti-vacuity)");
+        std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+        closeAll();
+        app.autoFlavor = saveFlav;
+        app.medBlackMode = saveBM;
+        app.medTarget = saveTgt;
+    }
+
     // The home is shared: give back every mode this test borrowed.
     app.rangeScope       = saveScope;
     app.linkRange        = saveLink;

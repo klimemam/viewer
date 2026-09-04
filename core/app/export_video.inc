@@ -214,11 +214,14 @@ static bool pumpVideoExport() {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
         return false;
     }
-    // "Auto per frame" re-fits the frame to its OWN min..max on the way in -
-    // the same line selectImage runs on a step, in the same condition, so the
-    // video shows what stepping through the stack would have shown. Linked and
-    // per-stack need nothing: effBlack/effWhite already answer for the stack.
-    if (app.rangeScope == 0 && !app.linkRange) { autoRange(*d); d->texDirty = true; }
+    // "Auto per frame" re-fits the frame to its OWN numbers on the way in -
+    // the same call selectImage makes on a step, in the same condition, so the
+    // video shows what stepping through the stack would have shown. WHICH fit
+    // (min..max, the 0.1-99.9% cut, median->target) is app.autoFlavor's
+    // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
+    // be a second answer to the one question. Linked and per-stack need
+    // nothing: effBlack/effWhite already answer for the stack.
+    if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
     renderDocRGBA(*d, rgba);
