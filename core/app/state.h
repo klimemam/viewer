@@ -609,7 +609,10 @@ struct ImageDoc {
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
-    float pendingViewScale = 1;       // full-res swap while NOT current: applied on select
+    // (No pendingViewScale here any more. A preview->full swap on an off-screen
+    // frame used to leave the view correction on the FRAME for the next select
+    // to apply, but the view it corrects is shared by the whole stack, so the
+    // flags compounded - #250. selectImage derives the correction from w.)
     // A COMPUTED frame - today only a stack's frame average - has no file behind
     // it, so the session cannot round-trip it the way it round-trips an open.
     // What it CAN round-trip is the RECIPE: this holds the first-frame path of

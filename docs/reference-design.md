@@ -133,7 +133,7 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
 | フィールド | 理由 |
 |---|---|
 | `tex`, `texDirty`, `texBlack/texWhite`, `texNearest` | テクスチャは (source の画素 × membership のレンジ) の関数。membership 側に置く。共有 frame をタイルで 2 回映すと VRAM は 2 枚分だが、`texLru` の TEX_KEEP=12 (1789) が上限を握っている。レンジが等しいときの共有は**やらない** (最適化は必要が示されてから) |
-| `pendingViewScale` | ビューの都合 (2378 の差し替え時) |
+| ~~`pendingViewScale`~~ | **廃止 (#250)**。preview→full の差し替え (2378) が画面外で起きたとき、ビュー補正を frame 側に覚えて次の選択で適用していた。ところが `app.view` は stack 全体で1つの共有ビューなので、覚えたフラグは補正済みのビューに二重に効く (1/n, 1/n² …)。`selectImage` が同 stack の前フレームとの**幅の比**から補正するようになり、覚える状態は無くなった |
 
 `w/h/ch/dtype/vmin/vmax` は読みが 240+ 行あるためアクセサ化しない。**ImageDoc に
 鏡 (mirror) として残し、書き手を source 変異の walk (§3.2) と CoW (§2.2) の
