@@ -317,6 +317,30 @@ static int videoSelftest() {
         std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
     }
 
+    {   // ---- V2c: the stack closing under a running export ----------------
+        // The frames are held by UID, not by pointer and not by index, exactly
+        // so that this is NOTICEABLE rather than undefined: a uid that no
+        // longer resolves is a frame that went away, and the job stops and
+        // deletes instead of writing whatever moved into that slot.
+        app.rangeScope = 1;
+        const int seq = mkSeq("v253_closed");
+        const int i0 = mk("v2c_0.npy", seq, 0, 1.0f, 0.0f);
+        mk("v2c_1.npy", seq, 1, 1.0f, 8.0f);
+        mk("v2c_2.npy", seq, 2, 1.0f, 16.0f);
+        app.current = i0;
+        const std::string path = tmpFile("viewer_video_v2c.avi");
+        check(startStackVideoExport(seq, path, 30.0).empty(), "V2c the export starts");
+        check(pumpVideoExport(), "V2c one frame is written");
+        closeAll();                                   // ...and the stack is gone
+        check(!pumpVideoExport(), "V2c the next pump stops the job");
+        check(!app.videoExport.active, "V2c ...and nothing is left running");
+        fprintf(stderr, "videoselftest: V2c said: %s\n", app.toast.c_str());
+        check(has(app.toast, "closed") && has(app.toast, "deleted"),
+              "V2c ...and it says a frame was closed, and that the file is gone");
+        check(!std::filesystem::exists(pathFromUtf8(path)),
+              "V2c ...which it is");
+    }
+
     {   // ---- V3: a decimated preview is not an export --------------------
         // The stack-level statement of export.inc's E5: `remoteStep > 1` means
         // "still the preview", and a video whose frame 2 is a sixteenth of the
