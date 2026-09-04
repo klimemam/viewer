@@ -3433,6 +3433,22 @@ static void pollFileDialog() {           // called once per frame from the main 
         app.pngDlg.reset();
         app.pngDlgUid = 0;
     }
+    // ...and the same rule one layer up (#253): the dialog was opened on a
+    // STACK, so the frames written are that stack's, named by seqId - not
+    // whatever became current while the OS dialog was up. The extension is
+    // completed rather than corrected: the user may have typed .mkv into an
+    // AVI dialog, and export_video.inc reads the extension as the intent.
+    if (app.videoDlg && app.videoDlg->ready(0)) {
+        std::string p = app.videoDlg->result();
+        const int seqId = app.videoDlgSeqId;
+        app.videoDlg.reset();
+        app.videoDlgSeqId = 0;
+        if (!p.empty()) {
+            if (videoExtOf(p).empty()) p += videoExtFor(app.videoFormat);
+            std::string why = startStackVideoExport(seqId, p, app.videoFps);
+            if (!why.empty()) toast(why, true);
+        }
+    }
     if (app.folderDlg && app.folderDlg->ready(0)) {
         std::string p = app.folderDlg->result();
         app.folderDlg.reset();

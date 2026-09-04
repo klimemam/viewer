@@ -288,6 +288,19 @@ static void drawFileList() {
             toast("stopping the reader...");
         }
     }
+    if (app.videoExport.active) {
+        // The stack-to-video job reports where stack LOADING reports (#253):
+        // one place on screen for "this stack is busy with something long", and
+        // the same Stop beside it. Stop deletes the partial file - said here,
+        // because a Stop that silently leaves a two-frame video behind is the
+        // one outcome nobody could afterwards explain from the file.
+        ImGui::TextDisabled("writing video: %s", videoExportProgress().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##video")) app.videoExport.stop = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("stop, and delete the partial %s",
+                              baseName(app.videoExport.path).c_str());
+    }
     if (!app.seqNote.empty()) {          // why the stack is short, kept in view
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.76f, 0.35f, 1));
         ImGui::PushTextWrapPos(0.0f);
@@ -1158,6 +1171,20 @@ static void drawFileList() {
                                   "stacks with mismatched membership can be compared\n"
                                   "frame by frame. Frames are SHARED by reference (no\n"
                                   "pixel copy); this stack keeps every frame it has.");
+            // ...and the stack OUT of the tool, in one file (#253). The same
+            // verb the File menu and the canvas carry, aimed at the stack this
+            // row names rather than at whichever one is current - which is the
+            // reason it is worth repeating here at all.
+            if (ImGui::MenuItem("Export as video (displayed levels)...")) {
+                askStackVideoExport(si->id);
+                ImGui::CloseCurrentPopup();   // the fps/format modal opens at
+                                              // root level and would evict this
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Every frame of this stack, in order, through the SAME\n"
+                                  "mapping the screen and the PNG export use. Lossless:\n"
+                                  "FFV1/MKV where ffmpeg is on PATH, uncompressed AVI\n"
+                                  "otherwise.");
             ImGui::Separator();
             {   // the STACK moves, whole - per the canon's frame ⊂ stack ⊂ batch
                 if (const App::Series* mine = seriesOfStack(si->id))

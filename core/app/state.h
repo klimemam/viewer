@@ -38,6 +38,8 @@
 #include "../adapter.h"              // adapter::Run (App::ReaderJob)
 #include "../watch.h"                // watch::Finding - what Watch has CONFIRMED
                                      // about a stack's files (watch-design §4)
+#include "../videowrite.h"           // videowrite::VideoSink - the open file a
+                                     // stack-to-video export is writing into (#253)
 #include "../browse/browse_state.h"  // browse::Instance and the rb types (P7 §3);
                                      // App aliases them below, so every existing
                                      // App::BrowseInstance reference is unchanged
@@ -789,6 +791,39 @@ struct App {
     // dialog is open"); this is the same rule for pixels, kept by identity
     // rather than by copying a frame.
     uint64_t pngDlgUid = 0;
+    // ---- a STACK on its way out as a lossless video (issue #253) -----------
+    // The neighbour of pngDlg above and its rule is pngDlgUid's, one layer up:
+    // the dialog is opened ON A STACK, and the frames written when it closes
+    // must be that stack's. A seqId, not an index - indices move as documents
+    // open and close, and this one survives an OS dialog.
+    std::unique_ptr<pfd::save_file> videoDlg;
+    int videoDlgSeqId = 0;
+    // The little modal in front of the save dialog: frame rate and format have
+    // to be settled BEFORE the file name, because the format decides the
+    // extension the dialog defaults to.
+    bool videoAskOpen = false;
+    int  videoAskSeqId = 0;
+    float videoFps = 30.0f;           // positive finite; travels in the session
+    int   videoFormat = 0;            // 0 = uncompressed AVI, 1 = FFV1/MKV (ffmpeg)
+    // The job itself. renderDocRGBA is CPU-only but NOT thread-safe (it holds a
+    // static gamma LUT), so this runs on the UI thread - ONE frame per UI
+    // frame, the slicing pumpSequence uses, so a 300-frame stack does not
+    // freeze the window for the length of the write (#232's lesson).
+    struct VideoExport {
+        bool active = false;
+        int seqId = 0;
+        std::vector<uint64_t> uids;   // the frames, by uid, in seqIndex order,
+                                      // snapshotted at start: a document that
+                                      // closes mid-write must be NOTICED, and a
+                                      // uid that no longer resolves says so
+        size_t at = 0;
+        int w = 0, h = 0;
+        double fps = 30;
+        std::string path;
+        std::string sinkName;         // "uncompressed AVI" / "FFV1/MKV"
+        std::unique_ptr<videowrite::VideoSink> sink;
+        bool stop = false;            // Stop: close the file and DELETE it
+    } videoExport;
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
     // set is polled only when some unrelated event happens to wake the loop -
@@ -2343,7 +2378,7 @@ struct App {
     std::vector<ReaderWait> rdQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
-               folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
+               videoDlg || folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
     }
                                       // Folder (local peer in the Browse panel)
     // temporal analysis cache (built-in, follows the selected ROI)

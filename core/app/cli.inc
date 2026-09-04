@@ -147,6 +147,15 @@ static bool g_histHlSelftest = false;
 // memory and every assertion is a float derived by hand. See frameSizeSelftest().
 static bool g_frameSizeSelftest = false;
 
+// --video-selftest: a whole stack out as a lossless video (#253) - the AVI
+// container read back by a RIFF parser the test writes itself, the three
+// refusals (preview frame / over 4 GB / .mkv with no ffmpeg), and the claim the
+// feature rests on: frame n of the video IS the PNG export of frame n. Takes no
+// directory and no window for the --framesize-selftest reasons: the frames are
+// built in memory and every expected number is a byte derived by hand. See
+// videoSelftest().
+static bool g_videoSelftest = false;
+
 // --anaprov-selftest: analyzer results name the dll they came from (#46 stage
 // 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
 // directory and no window for the --roistats-selftest reasons: the fixture is
@@ -645,6 +654,9 @@ static void printUsage() {
         "                              mapping, the paint, the count, the sentences\n"
         "  --framesize-selftest        frame stepping inside a stack keeps the picture\n"
         "                              the size it had on screen (#250)\n"
+        "  --video-selftest            a stack written as a lossless video (#253): the\n"
+        "                              AVI container, the refusals, and that a video\n"
+        "                              frame IS the PNG export of that frame\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
         "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
@@ -823,6 +835,8 @@ static void parseCli(int argc, char** argv) {
             g_histHlSelftest = true;               // handled in main()
         } else if (a == "--framesize-selftest") {
             g_frameSizeSelftest = true;            // handled in main()
+        } else if (a == "--video-selftest") {
+            g_videoSelftest = true;                // handled in main()
         } else if (a == "--anaprov-selftest") {
             g_anaProvSelftest = true;              // handled in main()
         } else if (a == "--stackana-selftest") {

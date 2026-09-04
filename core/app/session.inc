@@ -109,6 +109,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "analysis " << app.anaSel << " " << (app.anaAuto ? 1 : 0) << " "
       << (app.anaRefOn ? 1 : 0) << " " << app.anaRef << "\n";
     f << "histlog " << (app.histLog ? 1 : 0) << "\n";
+    // Stack-to-video: frame rate and format (#253). In the SESSION and not in
+    // prefs.txt because the answer belongs to the material - 30 fps suits a
+    // 900-frame capture and 2 fps suits a 12-frame exposure sweep - and the
+    // session is what remembers this set of stacks.
+    f << "video " << app.videoFps << " " << app.videoFormat << "\n";
     // Series Analysis panel settings (docs/analysis-layers.md §3.3 migration;
     // board row 104's 「設定のセッション未保存」): the fit method and window are
     // part of what a printed number MEANT, so they travel with the session
@@ -2535,6 +2540,12 @@ static std::string loadSession(const std::string& path) {
             if (ls >> r >> rv) { app.anaRefOn = r != 0; app.anaRef = rv; }   // >= this rev
         }
         else if (key == "histlog") { int on = 1; ls >> on; app.histLog = on != 0; }
+        // #253. The fps is validated on the way IN, not only in the modal: a
+        // hand-edited 0 or a NaN would otherwise reach the writer, which can
+        // only refuse it - after the user has picked a file name.
+        else if (key == "video") { float f2 = 0; int fmt = 0;
+                                   if ((ls >> f2) && f2 > 0 && std::isfinite(f2)) app.videoFps = f2;
+                                   if (ls >> fmt) app.videoFormat = std::clamp(fmt, 0, 1); }
         else if (key == "seriespanel") {   // Series Analysis panel settings (§3.3)
             int tp = 0, db = 0, fm = 0, wm = 0;
             double lo = 0, hi = 0;
