@@ -849,12 +849,31 @@ static void drawInspector() {
         {   // five equal buttons measured from the panel, never wider than it
             float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5.0f;
             bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
+            // ...each lit while its own answer IS the range in force, so the
+            // row says where the numbers above came from (「Auto が選択されて
+            // いるかを UI 上で示した方が良い」, #248). The rule lives in
+            // rangeButtonMatches; see there for why this is not a radio group.
+            // ButtonHovered is pushed to the same colour as Button: without it
+            // a lit button reverts to the ordinary hover tint under the cursor
+            // and reads as having just gone OFF.
+            const float eb = effBlack(*im), ew = effWhite(*im);
+            auto lit = [&](int btn) {
+                bool on = rangeButtonMatches(*im, btn, eb, ew);
+                if (on) {
+                    const ImVec4 a = ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive);
+                    ImGui::PushStyleColor(ImGuiCol_Button, a);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, a);
+                }
+                return on;
+            };
+            bool on = lit(RB_Auto);
             if (ImGui::Button("Auto", ImVec2(bw, 0))) {
                 float lo = im->vmin, hi = im->vmax;
                 if (app.linkRange)                       // fit every image, not just this one
                     for (const auto& d : app.images) { lo = std::min(lo, d->vmin); hi = std::max(hi, d->vmax); }
                 setRange(*im, lo, hi);
             }
+            if (on) ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(app.linkRange ? "min/max over all open images" : "min/max of this image");
             ImGui::SameLine();
@@ -862,20 +881,28 @@ static void drawInspector() {
             // enough to make "Auto" useless, and cutting it is a DIFFERENT
             // answer rather than a better one - min/max is the only fit that
             // shows every pixel you have - so both stay on the row (#245).
+            on = lit(RB_AutoPct);
             if (ImGui::Button("Auto %", ImVec2(bw, 0))) {
                 float lo = im->vmin, hi = im->vmax;
                 autoPercentileFit(*im, lo, hi);
                 setRange(*im, lo, hi);
             }
+            if (on) ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(app.linkRange ? "0.1-99.9%% over all open images"
                                                 : "0.1-99.9%% of this image");
             ImGui::SameLine();
+            on = lit(RB_0_1);
             if (ImGui::Button("0-1", ImVec2(bw, 0))) setRange(*im, 0, 1);
+            if (on) ImGui::PopStyleColor(2);
             ImGui::SameLine();
+            on = lit(RB_0_255);
             if (ImGui::Button("0-255", ImVec2(bw, 0))) setRange(*im, 0, 255);
+            if (on) ImGui::PopStyleColor(2);
             ImGui::SameLine();
+            on = lit(RB_0_65535);
             if (ImGui::Button("0-65535", ImVec2(bw, 0))) setRange(*im, 0, 65535);
+            if (on) ImGui::PopStyleColor(2);
         }
 
         const int g = displayGammaPreset(app.dispGamma);

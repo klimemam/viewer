@@ -578,6 +578,14 @@ struct ImageDoc {
     int w = 0, h = 0, ch = 1;
     float vmin = 0, vmax = 1;         // data min/max
     float black = 0, white = 255;     // display range
+    // What "Auto %" would answer for THESE pixels, cached lazily (issue #248).
+    // The Range row lights the button whose result is the range currently in
+    // force, and that question is asked on every UI frame while the percentile
+    // answer costs a full 65536-bin pass over the image - so it is computed on
+    // first need and kept. computeMinMax invalidates it: reload, crop and
+    // detrend all move the pixels through there.
+    float pctLo = 0, pctHi = 0;
+    bool pctValid = false;
     GLuint tex = 0;
     bool texDirty = true;
     float texBlack = 0, texWhite = 0;   // the range this texture was built with
@@ -651,6 +659,7 @@ struct ImageDoc {
     void syncMirrors() {
         w = src->w; h = src->h; ch = src->ch;
         dtype = src->dtype; vmin = src->vmin; vmax = src->vmax;
+        pctValid = false;             // different pixels, different quantiles
     }
     std::vector<float>&       px()       { return src->data; }
     const std::vector<float>& px() const { return src->data; }

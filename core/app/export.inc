@@ -186,6 +186,22 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
+// "Per stack" is a promise that has to be KEPT, not merely made once (#248).
+// The frames of one stack sharing a reference range was implemented only where
+// frames LAND (sequence.inc copies the reference frame's range onto each
+// arriving frame); nothing afterwards held them together, so every later write
+// - and "Auto per frame" stepping, which rewrites each frame's stored
+// black/white as you go - broke the sharing silently. This is the one move
+// that restores it: whatever `from` shows now, the rest of its stack shows.
+// A standalone image (seqId == 0) is not a stack and shares with nobody.
+static void shareStackRange(const ImageDoc& from) {
+    if (from.seqId == 0) return;
+    for (auto& d : app.images)
+        if (d.get() != &from && d->seqId == from.seqId) {
+            d->black = from.black; d->white = from.white;
+            d->texDirty = true;
+        }
+}
 // The Range panel's one mode control (0 auto per frame / 1 per stack /
 // 2 linked). It lives here, not inside the combo, because choosing a mode has
 // to act on the frame ALREADY on screen: the per-frame policy is otherwise
@@ -201,6 +217,16 @@ static void applyRangeMode(int mode, ImageDoc* on) {
         }
         // min..max, not defaultRange: same reason as in selectImage (#245).
         if (mode == 0 && !app.linkRange) { autoRange(*on); on->texDirty = true; }
+        // ...and switching TO "per stack" has to RE-share, for the same reason
+        // the mode has to act on the frame already on screen. Stepping in mode
+        // 0 rewrote every frame's stored range to its own min..max (main.cpp
+        // 1393 records that as known), so the stack arrives here holding
+        // per-frame values and merely raising the scope flag changes nothing
+        // you can see: the stored per-frame values simply reappear on the next
+        // step, which is the report's 「Per stack にしても一枚毎に Auto」
+        // (#248). The frame ON SCREEN is the reference - least surprise: the
+        // picture in front of you is the one you meant to spread.
+        if (mode == 1) shareStackRange(*on);
     }
     if (app.linkRange != wasLinked) markAllTexDirty();
 }
@@ -269,7 +295,67 @@ static void setRange(ImageDoc& im, float black, float white) {
         markAllTexDirty();            // shared value changed: every image re-renders
     } else {
         im.black = black; im.white = white; im.texDirty = true;
+        // ONE path for the number field and all five buttons - they all arrive
+        // here - so "Per stack" holds for every one of them (#248). Without
+        // this, pressing Auto in per-stack mode fitted the frame on screen and
+        // left its siblings on their old numbers, i.e. the mode read as a
+        // load-time accident rather than a policy.
+        if (app.rangeScope == 1) shareStackRange(im);
     }
+}
+
+// ---- which Range button is the range currently in force? (#248) ------------
+// The row of five presets used to give no sign of which one you are looking at.
+// It is answered by COMPARISON and carries no state of its own: nothing has to
+// remember that Auto was pressed, and a range restored from a session or typed
+// by hand is judged by exactly the same rule as one that came from a click.
+//
+// It is therefore not a radio group. Two rules can be true of the same numbers
+// - data that happens to run exactly 0..1 makes Auto and 0-1 the same answer -
+// and both buttons light: the row states facts about the range, and hiding one
+// of two true facts to keep the look of a selector would be a lie about the
+// data. Nothing matching lights nothing, which is what a hand-typed range is.
+enum RangeButton { RB_Auto = 0, RB_AutoPct, RB_0_1, RB_0_255, RB_0_65535 };
+
+static bool rangeButtonMatches(ImageDoc& im, int btn, float eb, float ew) {
+    switch (btn) {
+        case RB_0_1:     return eb == 0.0f && ew == 1.0f;
+        case RB_0_255:   return eb == 0.0f && ew == 255.0f;
+        case RB_0_65535: return eb == 0.0f && ew == 65535.0f;
+        case RB_Auto: {
+            // the button's own arithmetic, repeated: linked Auto fits the
+            // min/max over every open image, and those are cached numbers -
+            // no pixel is read here.
+            float lo = im.vmin, hi = im.vmax;
+            if (app.linkRange)
+                for (const auto& d : app.images) { lo = std::min(lo, d->vmin); hi = std::max(hi, d->vmax); }
+            return eb == lo && ew == hi;
+        }
+        case RB_AutoPct: {
+            // Linked "Auto %" pools EVERY open pixel onto one histogram
+            // (autoPercentileFit says so in as many words). That is a second's
+            // work on a 200-frame stack and this question is asked once per UI
+            // frame, so the linked row simply does not light this button: the
+            // fixed presets and Auto still answer, and no answer is a smaller
+            // wrong than a stall. Unlinked, the answer is per-image and cached.
+            if (app.linkRange) return false;
+            // A quantile of these pixels cannot fall outside their own
+            // min..max, so a range wider than the image - which is the normal
+            // case in per-stack mode, where the shared range comes from a
+            // sibling - is refused before the first pass is ever paid for.
+            if (eb < im.vmin || ew > im.vmax) return false;
+            if (!im.pctValid) {
+                // percentileRange leaves lo/hi usable (min..max) even when it
+                // returns false, and that fallback is exactly what the button
+                // would have set - so the return value is not consulted here
+                // any more than autoPercentileFit consults it.
+                percentileRange(im, 0.001f, 0.999f, im.pctLo, im.pctHi);
+                im.pctValid = true;
+            }
+            return eb == im.pctLo && ew == im.pctHi;
+        }
+    }
+    return false;
 }
 static void forgetTexture(ImageDoc* im) {
     app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), im), app.texLru.end());
