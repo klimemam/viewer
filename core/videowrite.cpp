@@ -81,7 +81,12 @@ class AviWriter final : public VideoSink {
 public:
     AviWriter(const std::string& path, int w, int h, double fps)
         : path_(path), w_(w), h_(h), fps_(fps) {}
-    ~AviWriter() override { if (f_.is_open()) f_.close(); }
+    // A writer that goes away without a finish() leaves NOTHING. The explicit
+    // Stop already deletes, and so does every mid-write failure; this is the
+    // remaining way out of the job - the process ends while it is running - and
+    // what it would otherwise leave is a file with no index whose header still
+    // says 0 frames. Unplayable, and silent about why.
+    ~AviWriter() override { if (!finished_) abort(); }
 
     bool start(std::string& why) {
         f_.open(fsPath(path_), std::ios::binary | std::ios::trunc);
@@ -215,6 +220,7 @@ public:
         f_.flush();
         if (!f_) return fail("closing " + path_ + " failed", why);
         f_.close();
+        finished_ = true;
         return true;
     }
 
@@ -232,7 +238,7 @@ private:
     int w_ = 0, h_ = 0;
     double fps_ = 30;
     int frames_ = 0;
-    bool failed_ = false;
+    bool failed_ = false, finished_ = false;
     std::ofstream f_;
     std::vector<uint8_t> row_;
     std::vector<uint32_t> idx_;
@@ -250,7 +256,7 @@ class FfmpegPipe final : public VideoSink {
 public:
     FfmpegPipe(const std::string& path, int w, int h, double fps)
         : path_(path), w_(w), h_(h), fps_(fps) {}
-    ~FfmpegPipe() override { closePipe(); }
+    ~FfmpegPipe() override { if (!finished_) abort(); else closePipe(); }
 
     bool start(const std::string& exe, std::string& why) {
         char fps[64];
@@ -290,6 +296,7 @@ public:
         if (code != 0)
             return fail("ffmpeg exited with status " + std::to_string(code) +
                         " - see the console for what it printed", why);
+        finished_ = true;
         return true;
     }
 
@@ -418,7 +425,7 @@ private:
     int w_ = 0, h_ = 0;
     double fps_ = 30;
     int frames_ = 0;
-    bool failed_ = false;
+    bool failed_ = false, finished_ = false;
 };
 
 }  // namespace

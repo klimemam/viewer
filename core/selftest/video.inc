@@ -287,6 +287,36 @@ static int videoSelftest() {
         closeAll();
     }
 
+    {   // ---- V2b: ...and so does simply GOING AWAY ------------------------
+        // Stop is one way out of a running export; the process ending is the
+        // other, and no pump gets to run on that path. The invariant is put on
+        // the writer itself - a sink destroyed without a finish() deletes what
+        // it wrote - so quitting mid-export cannot leave a file with no index
+        // whose header still says 0 frames.
+        const std::string path = tmpFile("viewer_video_v2b.avi");
+        std::string why;
+        std::vector<uint8_t> frame((size_t)W * H * 3, 0x40);
+        {
+            std::unique_ptr<videowrite::VideoSink> s =
+                videowrite::openAvi(path, W, H, 30.0, why);
+            check(s != nullptr, "V2b a writer opens");
+            if (s) {
+                check(s->writeFrame(frame.data(), why), "V2b ...and takes a frame");
+                check(std::filesystem::exists(pathFromUtf8(path)), "V2b ...leaving a file on disk");
+            }
+        }                                  // destroyed WITHOUT finish()
+        check(!std::filesystem::exists(pathFromUtf8(path)),
+              "V2b a writer that never finished leaves nothing behind");
+        {   // anti-vacuity: a writer that DID finish keeps its file
+            std::unique_ptr<videowrite::VideoSink> s =
+                videowrite::openAvi(path, W, H, 30.0, why);
+            if (s) { s->writeFrame(frame.data(), why); s->finish(why); }
+        }
+        check(std::filesystem::exists(pathFromUtf8(path)),
+              "V2b ...while a finished one keeps its file (anti-vacuity)");
+        std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+    }
+
     {   // ---- V3: a decimated preview is not an export --------------------
         // The stack-level statement of export.inc's E5: `remoteStep > 1` means
         // "still the preview", and a video whose frame 2 is a sixteenth of the
