@@ -140,6 +140,13 @@ static bool g_abEqSelftest = false;
 // histHlSelftest().
 static bool g_histHlSelftest = false;
 
+// --framesize-selftest: stepping frames inside one stack never changes the
+// picture's size on screen (#250) - app.view is shared by the whole stack while
+// its frames can sit at two resolution levels at once. Takes no directory and
+// no window for the --histhl-selftest reasons: the fixtures are sizes built in
+// memory and every assertion is a float derived by hand. See frameSizeSelftest().
+static bool g_frameSizeSelftest = false;
+
 // --anaprov-selftest: analyzer results name the dll they came from (#46 stage
 // 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
 // directory and no window for the --roistats-selftest reasons: the fixture is
@@ -636,6 +643,8 @@ static void printUsage() {
         "                              coinciding, through the real panel\n"
         "  --histhl-selftest           the value highlight (#68): the drag -> interval\n"
         "                              mapping, the paint, the count, the sentences\n"
+        "  --framesize-selftest        frame stepping inside a stack keeps the picture\n"
+        "                              the size it had on screen (#250)\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
         "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
@@ -812,6 +821,8 @@ static void parseCli(int argc, char** argv) {
             g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--histhl-selftest") {
             g_histHlSelftest = true;               // handled in main()
+        } else if (a == "--framesize-selftest") {
+            g_frameSizeSelftest = true;            // handled in main()
         } else if (a == "--anaprov-selftest") {
             g_anaProvSelftest = true;              // handled in main()
         } else if (a == "--stackana-selftest") {

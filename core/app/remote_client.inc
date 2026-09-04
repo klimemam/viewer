@@ -421,17 +421,18 @@ static void pumpRemoteFetch() {
         im->dataRev++;
         im->texDirty = true;
         forgetImage(im);                         // caches hold the preview's numbers
-        if (stepBefore > 1) {
-            if (im == cur()) {
-                // same pixels on screen, now through finer data: rescale the
-                // shared view so nothing appears to move at the swap
-                app.view.zoom = std::max(app.view.zoom / stepBefore, 1.0f / 512);
-                app.view.center.x *= stepBefore;
-                app.view.center.y *= stepBefore;
-            } else {
-                // not on screen: remember, and rescale when it is selected
-                im->pendingViewScale = (float)stepBefore;
-            }
+        if (stepBefore > 1 && im == cur()) {
+            // same pixels on screen, now through finer data: rescale the
+            // shared view so nothing appears to move at the swap. This is "the
+            // document changed under the view", and it is the only case that
+            // belongs here. A swap on a frame that is NOT on screen used to
+            // leave a pendingViewScale for the next select to apply - which
+            // double-corrected a view that is shared by the whole stack (#250).
+            // Nothing is remembered now: selectImage reads the correction off
+            // the two frames' own widths at the moment the step happens.
+            app.view.zoom = std::max(app.view.zoom / stepBefore, 1.0f / 512);
+            app.view.center.x *= stepBefore;
+            app.view.center.y *= stepBefore;
         }
         app.imagesRev++;
         fprintf(stderr, "remote: full resolution %dx%d %dch for %s\n",

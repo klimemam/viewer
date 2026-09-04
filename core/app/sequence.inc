@@ -1477,11 +1477,37 @@ static void selectImage(int idx) {
         // 0..1 / type fullscale (issue #245).
         if (app.rangeScope == 0 && !app.linkRange) { autoRange(*d); d->texDirty = true; }
     }
-    if (d->pendingViewScale != 1.0f) {   // its preview->full swap happened off screen
-        app.view.zoom = std::max(app.view.zoom / d->pendingViewScale, 1.0f / 512);
-        app.view.center.x *= d->pendingViewScale;
-        app.view.center.y *= d->pendingViewScale;
-        d->pendingViewScale = 1;
+    // Within a stack, stepping frames never changes the picture's ON-SCREEN
+    // size (#250). app.view is ONE view shared by the whole stack, while the
+    // stack's frames can sit at two resolution LEVELS at once: a remote frame
+    // arrives DECIMATED (remoteStep n, so w/n) and is replaced by its full
+    // -resolution bytes whenever they land, frame by frame. Stepping across a
+    // level boundary changes what "one image pixel" means underneath a zoom
+    // that did not change, and the picture jumps.
+    //
+    // The correction is read off the DIMENSIONS, never off a remembered flag.
+    // Frames of one stack are the same size by contract (the loader refuses a
+    // numbered sibling of another shape), so a width difference between two
+    // frames of ONE stack can only be a difference of resolution level.
+    //
+    // What was here before was a per-doc pendingViewScale, set by the
+    // preview->full swap when the frame was off screen and applied on the next
+    // select. That was wrong twice over, because the flag belonged to the FRAME
+    // while the view it corrected is SHARED: once the on-screen swap had
+    // calibrated the view to full dimensions, every later frame still carrying
+    // a flag divided the zoom AGAIN - 1/n, 1/n², 1/n³, "一段毎小さく" - and the
+    // reverse direction (a full frame stepped onto one still at preview) set no
+    // flag at swap time and so got no correction at all. A ratio of the two
+    // widths says both, and needs nothing remembered.
+    //
+    // Moving between different stacks, or to a standalone image, is out of
+    // scope: that is another picture, and its size is decided elsewhere.
+    if (prev && d != prev && prev->seqId > 0 && d->seqId == prev->seqId &&
+        d->w != prev->w && prev->w > 0 && d->w > 0) {     // a shape of 0 is no level
+        const float r = (float)d->w / (float)prev->w;
+        app.view.zoom = std::max(app.view.zoom / r, 1.0f / 512);
+        app.view.center.x *= r;
+        app.view.center.y *= r;
     }
     if (App::SeqInfo* si = seqInfo(d->seqId)) si->lastImageIdx = idx;
 }

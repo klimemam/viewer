@@ -647,6 +647,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // panel through real frames.
 #include "selftest/histhl.inc"
 
+// Frame stepping keeps the picture's size (#250). Here beside histhl because it
+// is a function like histHlSelftest() and needs nothing more than selectImage
+// and app.view - both of which exist by now.
+#include "selftest/framesize.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -1130,6 +1135,12 @@ int main(int argc, char** argv) {
     // the badge SAY. Windowless for the abeq reasons - fixtures in memory, and
     // every assertion is a byte, a count or a string.
     if (g_histHlSelftest) return histHlSelftest();
+
+    // Frame stepping never changes the picture's size on screen (#250): the
+    // shared view against frames sitting at two resolution levels. Windowless
+    // for the histhl reasons - the fixtures are sizes and every assertion is a
+    // product of two numbers.
+    if (g_frameSizeSelftest) return frameSizeSelftest();
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
     // through the real panel. Windowless because every assertion is a string.

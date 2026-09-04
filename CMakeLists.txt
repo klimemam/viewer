@@ -1250,6 +1250,15 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # count == sum of the selected bins, inside the grid and at the folded end bin)
 # are the reason it is a test at all rather than a demo.
 viewer_selftest(histhl      NOGL --histhl-selftest)
+# Frame stepping keeps the picture's size (#250): app.view is ONE view shared by
+# a stack whose frames can sit at two resolution levels at once (a remote frame
+# arrives decimated and is replaced by its full-resolution bytes later), so a
+# step across a level boundary used to rescale the shared zoom - once per step.
+# NOGL and fixture-free for histhl's reasons: the fixtures are SIZES built in
+# memory and every assertion is zoom x width, a number derived by hand. Its own
+# test rather than a section of range.inc so that a failure names the invariant
+# it is about - and because range.inc's fixtures are a folder on disk.
+viewer_selftest(framesize   NOGL --framesize-selftest)
 # settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
 # (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of
