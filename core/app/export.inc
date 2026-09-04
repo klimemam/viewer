@@ -199,8 +199,15 @@ static void markAllTexDirty() {
 // decides who gets written to - a doc that somehow carried a negative id would
 // otherwise be fused with every other one, and that is not a mistake worth
 // leaving room for.
+static App::SeqInfo* seqInfo(int id);   // fwd (defined with the stacks, in
+                                        // sequence.inc): never held, only asked
 static void shareStackRange(const ImageDoc& from) {
     if (from.seqId <= 0) return;
+    // ...and the stack REMEMBERS whose fit it is wearing (#254). The Range row
+    // answers by comparison, so on every frame but this one the shared numbers
+    // no longer match that frame's own min/max and the lit button went dark on
+    // the first step - the range was still shared, the display was not.
+    if (App::SeqInfo* si = seqInfo(from.seqId)) si->rangeRefUid = from.uid;
     for (auto& d : app.images)
         if (d.get() != &from && d->seqId == from.seqId) {
             d->black = from.black; d->white = from.white;
@@ -212,16 +219,24 @@ static void shareStackRange(const ImageDoc& from) {
 // to act on the frame ALREADY on screen: the per-frame policy is otherwise
 // applied only by selectImage, on a frame change, and the mode read as dead
 // until the first step (report 2026-08-03).
-static void applyRangeMode(int mode, ImageDoc* on) {
+// `flavor` is what "Auto per frame" means from now on (AutoFlavor, #252), or
+// -1 for "leave it as it is" - which is what the two modes that are not per
+// frame pass, and what every caller that predates the flavours means. The
+// combo's five entries are (mode, flavor) pairs; nothing else about the
+// contract moved.
+static void applyRangeMode(int mode, ImageDoc* on, int flavor = -1) {
     bool wasLinked = app.linkRange;
+    if (flavor >= AF_MinMax && flavor <= AF_Median) app.autoFlavor = flavor;
     app.linkRange = mode == 2;
     app.rangeScope = mode == 0 ? 0 : 1;
     if (on) {
         if (app.linkRange && !wasLinked) {     // seed from what is on screen
             app.linkBlack = on->black; app.linkWhite = on->white;
         }
-        // min..max, not defaultRange: same reason as in selectImage (#245).
-        if (mode == 0 && !app.linkRange) { autoRange(*on); on->texDirty = true; }
+        // the frame's OWN fit, not defaultRange: same reason as in selectImage
+        // (#245). WHICH fit is app.autoFlavor's answer, and refitByFlavor is
+        // the one place that answers it (#252).
+        if (mode == 0 && !app.linkRange) { refitByFlavor(*on); on->texDirty = true; }
         // ...and switching TO "per stack" has to RE-share, for the same reason
         // the mode has to act on the frame already on screen. Stepping in mode
         // 0 rewrote every frame's stored range to its own min..max (main.cpp
@@ -320,7 +335,28 @@ static void setRange(ImageDoc& im, float black, float white) {
 // and both buttons light: the row states facts about the range, and hiding one
 // of two true facts to keep the look of a selector would be a lie about the
 // data. Nothing matching lights nothing, which is what a hand-typed range is.
-enum RangeButton { RB_Auto = 0, RB_AutoPct, RB_0_1, RB_0_255, RB_0_65535 };
+//
+// The row is TWO rows on the panel - the three fits, then the three fixed
+// conventions - but one rule and one enum: which row a button is drawn on is
+// a reading-order decision, not a difference in what lighting means.
+enum RangeButton { RB_Auto = 0, RB_AutoPct, RB_Median, RB_0_1, RB_0_255, RB_0_65535 };
+
+// WHOSE pixels the three fits are compared against (#254). Normally the frame
+// on screen. In "Per stack" it is the frame whose fit was SPREAD over the
+// stack: the shared range is that frame's answer, so asking any other frame
+// "is this your min..max?" gets a truthful no, and the button went dark on the
+// first step - 「Stack で Auto の設定が外れる」. Null = there is nothing to
+// compare against (nothing ever spread this stack's range, or the frame that
+// did has been closed), and the row then says nothing at all.
+// Not consulted by the fixed presets: 0-255 is 0-255 whoever is looking.
+static ImageDoc* rangeRefDoc(ImageDoc& im) {
+    if (app.linkRange || app.rangeScope != 1 || im.seqId <= 0) return &im;
+    App::SeqInfo* si = seqInfo(im.seqId);
+    if (!si || si->rangeRefUid == 0) return nullptr;
+    if (si->rangeRefUid == im.uid) return &im;
+    for (auto& d : app.images) if (d->uid == si->rangeRefUid) return d.get();
+    return nullptr;
+}
 
 static bool rangeButtonMatches(ImageDoc& im, int btn, float eb, float ew) {
     switch (btn) {
@@ -331,10 +367,13 @@ static bool rangeButtonMatches(ImageDoc& im, int btn, float eb, float ew) {
             // the button's own arithmetic, repeated: linked Auto fits the
             // min/max over every open image, and those are cached numbers -
             // no pixel is read here.
-            float lo = im.vmin, hi = im.vmax;
-            if (app.linkRange)
+            if (app.linkRange) {
+                float lo = im.vmin, hi = im.vmax;
                 for (const auto& d : app.images) { lo = std::min(lo, d->vmin); hi = std::max(hi, d->vmax); }
-            return eb == lo && ew == hi;
+                return eb == lo && ew == hi;
+            }
+            ImageDoc* ref = rangeRefDoc(im);
+            return ref && eb == ref->vmin && ew == ref->vmax;
         }
         case RB_AutoPct: {
             // Linked "Auto %" pools EVERY open pixel onto one histogram
@@ -344,20 +383,33 @@ static bool rangeButtonMatches(ImageDoc& im, int btn, float eb, float ew) {
             // fixed presets and Auto still answer, and no answer is a smaller
             // wrong than a stall. Unlinked, the answer is per-image and cached.
             if (app.linkRange) return false;
-            // A quantile of these pixels cannot fall outside their own
-            // min..max, so a range wider than the image - which is the normal
-            // case in per-stack mode, where the shared range comes from a
-            // sibling - is refused before the first pass is ever paid for.
-            if (eb < im.vmin || ew > im.vmax) return false;
-            if (!im.pctValid) {
-                // percentileRange leaves lo/hi usable (min..max) even when it
-                // returns false, and that fallback is exactly what the button
-                // would have set - so the return value is not consulted here
-                // any more than autoPercentileFit consults it.
-                percentileRange(im, 0.001f, 0.999f, im.pctLo, im.pctHi);
-                im.pctValid = true;
-            }
-            return eb == im.pctLo && ew == im.pctHi;
+            ImageDoc* ref = rangeRefDoc(im);
+            if (!ref) return false;
+            // A quantile of the reference frame's pixels cannot fall outside
+            // their own min..max, so a wider range is refused before the first
+            // 65536-bin pass is ever paid for.
+            if (eb < ref->vmin || ew > ref->vmax) return false;
+            float lo = 0, hi = 0;
+            percentileRangeCached(*ref, lo, hi);
+            return eb == lo && ew == hi;
+        }
+        case RB_Median: {
+            // Linked "Med" pools every open pixel exactly as linked "Auto %"
+            // does, and is dark here for exactly that reason.
+            if (app.linkRange) return false;
+            ImageDoc* ref = rangeRefDoc(im);
+            if (!ref) return false;
+            // The black point is known without reading a pixel unless it is
+            // the 0.1% cut (cached), so a range whose black is not the chosen
+            // one is refused before the median pass is paid for.
+            float p1 = ref->vmin;
+            if (app.medBlackMode == MB_MinPct) { float b = 0; percentileRangeCached(*ref, p1, b); }
+            const float black = medBlackOf(ref->vmin, p1);
+            if (eb != black) return false;
+            float med = 0, white = 0;
+            if (!medianValue(*ref, med)) return false;
+            if (!medianWhite(black, med, app.medTarget, white)) return false;
+            return ew == white;
         }
     }
     return false;

@@ -607,9 +607,376 @@
             app.linkRange = saveLink;
         }
 
+        // ==================================================================
+        // #252 - the third fit, "Med": put the median at `target`. Same
+        // discipline again: in-memory fixtures, every number below derived by
+        // hand from them, and every borrowed mode handed back to the home the
+        // whole selftest suite shares.
+        //
+        // The closed form all of P11-P14 lean on: a uniform ramp over
+        // [0.3, 0.6] with 128x128 = 16384 pixels has median 0.45, so
+        //     white = black + (0.45 - black) / target
+        // The histogram answers 0.449991 rather than 0.45 exactly - 65536 bins
+        // over a 0.3-wide span, and the cut opens outward to the bin's LOWER
+        // edge - i.e. it is short by less than one bin (4.6e-6), which is far
+        // finer than the 1e-3 these check to and finer than the black/white
+        // field ever prints. The white points inherit that shortfall divided
+        // by the target: 0.599982 for 0.5, 0.899963 for 0.25.
+        // ==================================================================
+        {   // ---- P11: median -> target, in closed form ---------------------
+            const bool saveLink = app.linkRange;
+            const int  saveFlav = app.autoFlavor, saveBM = app.medBlackMode;
+            const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
+            app.linkRange = false;
+            auto d = mkRamp("med", 0.3f, 0.6f, 0, 0.0f);
+            float med = 0;
+            bool gotMed = medianValue(*d, med);
+            bool medOk = gotMed && fabsf(med - 0.45f) < 1e-3f;
+            fprintf(stderr, "rangeselftest: P11 median of the 0.3..0.6 ramp = %.6g "
+                            "(closed form 0.45) %s\n", med, medOk ? "ok" : "WRONG");
+            if (!medOk) bad++;
+
+            struct MCase { const char* what; int bmode; float bval, target, wantLo, wantHi; };
+            const MCase mcases[] = {
+                // black = min = 0.3, target 0.5 -> 0.3 + 0.15/0.5  = 0.6
+                { "min, t=0.5",   MB_Min,   0.0f, 0.50f, 0.3f, 0.6f },
+                // black = min = 0.3, target 0.25 -> 0.3 + 0.15/0.25 = 0.9
+                { "min, t=0.25",  MB_Min,   0.0f, 0.25f, 0.3f, 0.9f },
+                // black = 0 (typed), target 0.5 -> 0 + 0.45/0.5    = 0.9
+                { "value 0, t=0.5", MB_Value, 0.0f, 0.50f, 0.0f, 0.9f },
+            };
+            for (const MCase& c : mcases) {
+                app.medBlackMode = c.bmode;
+                app.medBlackValue = c.bval;
+                app.medTarget = c.target;
+                float lo = 0, hi = 0;
+                medianFit(*d, lo, hi);
+                bool ok = fabsf(lo - c.wantLo) < 1e-3f && fabsf(hi - c.wantHi) < 1e-3f;
+                fprintf(stderr, "rangeselftest: P11 %-15s -> %.6g..%.6g "
+                                "(expect %.6g..%.6g) %s\n",
+                        c.what, lo, hi, c.wantLo, c.wantHi, ok ? "ok" : "WRONG");
+                if (!ok) bad++;
+            }
+            // ...and the degenerate case takes the Auto % convention: a black
+            // point at or above the median leaves no positive white to derive,
+            // so the fit hands back min..max rather than an inverted range.
+            app.medBlackMode = MB_Value;
+            app.medBlackValue = 0.9f;              // above the median, and above vmax
+            app.medTarget = 0.5f;
+            float dlo = -7, dhi = -7;
+            medianFit(*d, dlo, dhi);
+            bool fell = dlo == d->vmin && dhi == d->vmax && dhi > dlo;
+            fprintf(stderr, "rangeselftest: P11 black 0.9 >= median | %.6g..%.6g | %s\n",
+                    dlo, dhi, fell ? "falls back to min..max" : "WRONG");
+            if (!fell) bad++;
+            // ...and so does a target outside the open interval (0, 1).
+            app.medBlackValue = 0.0f;
+            bool badTarget = true;
+            for (float t : { 0.0f, 1.0f, -0.5f, 2.0f }) {
+                app.medTarget = t;
+                float a = -7, b = -7;
+                medianFit(*d, a, b);
+                if (!(a == d->vmin && b == d->vmax)) badTarget = false;
+            }
+            fprintf(stderr, "rangeselftest: P11 target outside (0,1) falls back: %s\n",
+                    badTarget ? "ok" : "WRONG");
+            if (!badTarget) bad++;
+            app.linkRange = saveLink; app.autoFlavor = saveFlav;
+            app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
+        }
+
+        {   // ---- P12: black = "min 0.1%" IS the Auto % lower cut -----------
+            // The reason the third black mode exists: one cold pixel or one
+            // dead column owns vmin, and a fit measured up from THAT starts
+            // 500 DN below anything real. The claim is an identity - the black
+            // point the Med fit uses is the very number Auto % puts at its
+            // lower end - so it is asserted as one, exactly.
+            //   Fixture: the 0.3..0.6 ramp with its top 4 pixels replaced by
+            //   -500, so vmin = -500 and vmax = 0.599927 (the 5th value down).
+            const bool saveLink = app.linkRange;
+            const int  saveBM = app.medBlackMode;
+            const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
+            app.linkRange = false;
+            app.medTarget = 0.5f;
+            auto d = mkRamp("medcold", 0.3f, 0.6f, 4, -500.0f);
+            float plo = 0, phi = 0;
+            percentileRange(*d, 0.001f, 0.999f, plo, phi);
+            app.medBlackMode = MB_MinPct;
+            float clo = 0, chi = 0;
+            medianFit(*d, clo, chi);
+            app.medBlackMode = MB_Min;
+            float mlo = 0, mhi = 0;
+            medianFit(*d, mlo, mhi);
+            bool isPct = clo == plo;
+            bool isMin = mlo == d->vmin && d->vmin == -500.0f;
+            // anti-vacuity: the outlier really does own vmin, so the two black
+            // modes are genuinely different answers here
+            bool differ = clo != mlo && plo > d->vmin;
+            fprintf(stderr, "rangeselftest: P12 black min-0.1%% %.6g (Auto %% lo %.6g) %s | "
+                            "black min %.6g (vmin %.6g) %s | different answers %s\n",
+                    clo, plo, isPct ? "ok" : "WRONG", mlo, d->vmin, isMin ? "ok" : "WRONG",
+                    differ ? "ok" : "ANTI-VACUITY LOST");
+            if (!isPct || !isMin || !differ) bad++;
+            // ...and the white point is derived from THAT black, not from vmin
+            float med = 0;
+            medianValue(*d, med);
+            float want = clo + (med - clo) / 0.5f;
+            bool derived = fabsf(chi - want) < 1e-3f;
+            fprintf(stderr, "rangeselftest: P12 white %.6g = black + (median %.6g - black)/0.5 "
+                            "= %.6g %s\n", chi, med, want, derived ? "ok" : "WRONG");
+            if (!derived) bad++;
+            app.linkRange = saveLink; app.medBlackMode = saveBM;
+            app.medTarget = saveTgt; app.medBlackValue = saveBV;
+        }
+
+        {   // ---- P13: "Auto per frame" now has a flavor, and obeys it ------
+            // P5's shape, one level up: mode 0 used to mean min..max and only
+            // min..max. The claim is that both re-fit sites read app.autoFlavor
+            // - and the anti-vacuity half is that the flavors give DIFFERENT
+            // answers on this fixture, so P13 would fail outright if the
+            // flavour were ignored and minmax applied.
+            const bool saveLink = app.linkRange;
+            const int  saveScope = app.rangeScope, saveFlav = app.autoFlavor;
+            const int  saveBM = app.medBlackMode;
+            const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
+            app.linkRange = false;
+            app.medBlackMode = MB_Value; app.medBlackValue = 0.0f; app.medTarget = 0.5f;
+            auto d = mkRamp("flav", 0.3f, 0.6f, 0, 0.0f);
+            // black = 0 typed, median 0.45, target 0.5 -> 0 .. 0.9
+            d->black = -5; d->white = 5;                   // clearly not any fit
+            applyRangeMode(0, d.get(), AF_Median);         // what the combo calls
+            bool medFit = app.autoFlavor == AF_Median &&
+                          d->black == 0.0f && fabsf(d->white - 0.9f) < 1e-3f;
+            fprintf(stderr, "rangeselftest: P13 flavor median %.6g..%.6g (expect 0..0.9) %s\n",
+                    d->black, d->white, medFit ? "ok" : "WRONG");
+            if (!medFit) bad++;
+            // ...and the same call with the minmax flavor is the old behaviour,
+            // unchanged. These two must not be the same numbers, or the test
+            // above proves nothing.
+            d->black = -5; d->white = 5;
+            applyRangeMode(0, d.get(), AF_MinMax);
+            bool mmFit = app.autoFlavor == AF_MinMax &&
+                         d->black == d->vmin && d->white == d->vmax;
+            bool distinct = !(d->vmin == 0.0f && fabsf(d->vmax - 0.9f) < 1e-3f);
+            fprintf(stderr, "rangeselftest: P13 flavor minmax %.6g..%.6g (expect %.6g..%.6g) %s"
+                            " | the two flavors differ %s\n",
+                    d->black, d->white, d->vmin, d->vmax, mmFit ? "ok" : "WRONG",
+                    distinct ? "ok" : "ANTI-VACUITY LOST");
+            if (!mmFit || !distinct) bad++;
+            // ...and the pct flavor is wired too, to its own cached answer
+            d->black = -5; d->white = 5;
+            applyRangeMode(0, d.get(), AF_Pct);
+            float qlo = 0, qhi = 0;
+            percentileRange(*d, 0.001f, 0.999f, qlo, qhi);
+            bool pctFit = d->black == qlo && d->white == qhi && qlo > d->vmin;
+            fprintf(stderr, "rangeselftest: P13 flavor pct %.6g..%.6g (expect %.6g..%.6g) %s\n",
+                    d->black, d->white, qlo, qhi, pctFit ? "ok" : "WRONG");
+            if (!pctFit) bad++;
+
+            // ...and the OTHER re-fit site: stepping a frame (P6's shape).
+            // selectImage is where the mode is applied while you work, and it
+            // has to read the same flavor the combo just set.
+            app.rangeScope = 0;
+            app.autoFlavor = AF_Median;
+            selectImage(fa[0]);
+            selectImage(fa[1]);
+            ImageDoc* f = cur();
+            float wlo = 0, whi = 0;
+            if (f) medianFit(*f, wlo, whi);
+            bool stepped = f && f->black == wlo && f->white == whi;
+            bool notMinMax = f && !(wlo == f->vmin && whi == f->vmax);
+            fprintf(stderr, "rangeselftest: P13 stepped frame holds %.6g..%.6g "
+                            "(its own median fit %.6g..%.6g, data %.6g..%.6g) %s | "
+                            "not its min..max %s\n",
+                    f ? f->black : 0.f, f ? f->white : 0.f, wlo, whi,
+                    f ? f->vmin : 0.f, f ? f->vmax : 0.f,
+                    stepped ? "ok" : "WRONG", notMinMax ? "ok" : "ANTI-VACUITY LOST");
+            if (!stepped || !notMinMax) bad++;
+            app.linkRange = saveLink; app.rangeScope = saveScope; app.autoFlavor = saveFlav;
+            app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
+        }
+
+        {   // ---- P14: the Med lamp, and the session round trip -------------
+            const bool saveLink = app.linkRange;
+            const int  saveScope = app.rangeScope, saveFlav = app.autoFlavor;
+            const int  saveBM = app.medBlackMode;
+            const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
+            app.linkRange = false;
+            app.rangeScope = 0;                    // a lone fixture is not a stack
+            app.medBlackMode = MB_Min; app.medTarget = 0.5f; app.medBlackValue = 0.0f;
+            auto d = mkRamp("medbtn", 0.3f, 0.6f, 0, 0.0f);
+            float lo = 0, hi = 0;
+            medianFit(*d, lo, hi);                 // 0.3 .. 0.6 (see P11)
+            bool onExact = rangeButtonMatches(*d, RB_Median, lo, hi);
+            bool offTyped = !rangeButtonMatches(*d, RB_Median, 0.3f, 0.55f);
+            fprintf(stderr, "rangeselftest: P14 Med lamp | fit %.6g..%.6g lights %s | "
+                            "hand-typed 0.3..0.55 dark %s\n",
+                    lo, hi, onExact ? "ok" : "WRONG", offTyped ? "ok" : "WRONG");
+            if (!onExact || !offTyped) bad++;
+            // The lamp answers by COMPARISON, so moving the target moves the
+            // answer and the old range stops being it - no state to stale.
+            app.medTarget = 0.25f;
+            bool wentOut = !rangeButtonMatches(*d, RB_Median, lo, hi);
+            float lo2 = 0, hi2 = 0;
+            medianFit(*d, lo2, hi2);               // 0.3 .. 0.9
+            bool newOne = rangeButtonMatches(*d, RB_Median, lo2, hi2) &&
+                          fabsf(hi2 - 0.9f) < 1e-3f;
+            fprintf(stderr, "rangeselftest: P14 target 0.5 -> 0.25 | old range dark %s | "
+                            "new fit %.6g..%.6g lights %s\n",
+                    wentOut ? "ok" : "WRONG", lo2, hi2, newOne ? "ok" : "WRONG");
+            if (!wentOut || !newOne) bad++;
+            // Linked pools every open pixel to answer, exactly as Auto % does,
+            // so Med is dark there for exactly the same reason.
+            app.linkRange = true;
+            bool quiet = !rangeButtonMatches(*d, RB_Median, lo2, hi2);
+            app.linkRange = false;
+            fprintf(stderr, "rangeselftest: P14 linked | Med stays dark %s\n",
+                    quiet ? "ok" : "WRONG");
+            if (!quiet) bad++;
+            // ...and the median is cached and dropped where the pct answer is
+            app.medTarget = 0.5f;
+            bool cached = d->medValid && fabsf(d->medVal - 0.45f) < 1e-3f;
+            computeMinMax(*d);
+            bool dropped = !d->medValid;
+            fprintf(stderr, "rangeselftest: P14 median cache | held after use %s | "
+                            "dropped by computeMinMax %s\n",
+                    cached ? "ok" : "WRONG", dropped ? "ok" : "WRONG");
+            if (!cached || !dropped) bad++;
+
+            // ---- the session round trip -------------------------------------
+            // app.images is SWAPPED OUT for this (the P4 discipline, and then
+            // some): loadSession closes every open, and the frames this test
+            // still needs must not be in the list when it does.
+            const size_t imgWas = app.images.size();
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            std::swap(app.images, pool);
+            std::error_code tec;
+            std::string sess = (std::filesystem::temp_directory_path(tec) /
+                                "viewer_rangeselftest_flavor.vsession").u8string();
+            app.autoFlavor = AF_Median;
+            app.medTarget = 0.25f;                 // exact in the stream's 9 digits
+            app.medBlackMode = MB_MinPct;
+            app.medBlackValue = 0.125f;            // ...and so is this
+            saveSession(sess, true);
+            app.autoFlavor = AF_MinMax;            // scrambled, so a no-op load shows
+            app.medTarget = 0.5f;
+            app.medBlackMode = MB_Value;
+            app.medBlackValue = 0.0f;
+            std::string serr = loadSession(sess);
+            bool trip = serr.empty() && app.autoFlavor == AF_Median &&
+                        app.medTarget == 0.25f && app.medBlackMode == MB_MinPct &&
+                        app.medBlackValue == 0.125f;
+            fprintf(stderr, "rangeselftest: P14 session round trip err=\"%s\" | "
+                            "flavor %d target %.6g black %d value %.6g "
+                            "(expect 2 / 0.25 / 2 / 0.125) %s\n",
+                    serr.c_str(), app.autoFlavor, app.medTarget, app.medBlackMode,
+                    app.medBlackValue, trip ? "ok" : "WRONG");
+            if (!trip) bad++;
+            // ...and a value the program must never take: a target of 0 divides.
+            {
+                std::ofstream bf(pathFromUtf8(sess), std::ios::binary | std::ios::app);
+                bf << "autoflavor 9 0 7 1\n";
+            }
+            std::string berr = loadSession(sess);
+            bool refused = berr.empty() && app.autoFlavor == AF_Median &&
+                           app.medTarget == 0.25f && app.medBlackMode == MB_MinPct &&
+                           app.medBlackValue == 1.0f;   // the only field in range
+            fprintf(stderr, "rangeselftest: P14 out-of-range line refused | "
+                            "flavor %d target %.6g black %d value %.6g %s\n",
+                    app.autoFlavor, app.medTarget, app.medBlackMode, app.medBlackValue,
+                    refused ? "ok" : "WRONG");
+            if (!refused) bad++;
+            std::error_code rec;
+            std::filesystem::remove(pathFromUtf8(sess), rec);
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas) {
+                fprintf(stderr, "rangeselftest: P14 app.images %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size());
+                bad++;
+            }
+            app.linkRange = saveLink; app.rangeScope = saveScope; app.autoFlavor = saveFlav;
+            app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
+        }
+
+        // ==================================================================
+        // #254 - in "Per stack", the lamp answers for the REFERENCE frame.
+        // ==================================================================
+        {   // ---- P15: the shared range keeps its lamp on every frame -------
+            // The report: 「Stack で Auto の設定が外れる」. Press Auto in
+            // per-stack mode and the fit is spread over the whole stack
+            // (#248) - but the row compared the shared numbers against the
+            // frame ON SCREEN, so on the next frame they were nobody's fit and
+            // the lamp went out. The range was never lost; the display was.
+            const bool saveLink = app.linkRange;
+            const int  saveScope = app.rangeScope;
+            const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
+            auto A5 = mkRamp("ref_A", 0.3f, 0.6f, 0, 0.0f);   // data 0.3..0.6
+            auto B5 = mkRamp("ref_B", 2.0f, 3.0f, 0, 0.0f);   // data 2..3
+            A5->seqId = 4245; A5->seqIndex = 0;
+            B5->seqId = 4245; B5->seqIndex = 1;
+            ImageDoc* pA = A5.get(); ImageDoc* pB = B5.get();
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(A5));
+            pool.push_back(std::move(B5));
+            std::swap(app.images, pool);
+            App::SeqInfo si;                  // the stack these two are frames of:
+            si.id = 4245; si.name = "ref";    // seqInfo is where the reference is kept
+            app.seqs.push_back(si);
+            app.linkRange = false;
+            app.rangeScope = 1;                        // per stack
+            setRange(*pA, pA->vmin, pA->vmax);         // what "Auto" on A presses
+            bool spread = pB->black == 0.3f && pB->white == 0.6f;
+            bool litA = rangeButtonMatches(*pA, RB_Auto, pA->black, pA->white);
+            bool litB = rangeButtonMatches(*pB, RB_Auto, pB->black, pB->white);
+            // anti-vacuity: B's own min..max is 2..3, so the shared 0.3..0.6 is
+            // emphatically NOT B's own fit - which is why it used to go dark
+            bool notBs = !(pB->black == pB->vmin && pB->white == pB->vmax);
+            fprintf(stderr, "rangeselftest: P15 per-stack Auto | spread %s | lamp on A %s, "
+                            "on sibling %s (sibling data %.6g..%.6g, range %.6g..%.6g) %s\n",
+                    spread ? "ok" : "WRONG", litA ? "ok" : "WRONG", litB ? "ok" : "WRONG",
+                    pB->vmin, pB->vmax, pB->black, pB->white,
+                    notBs ? "ok" : "ANTI-VACUITY LOST");
+            if (!spread || !litA || !litB || !notBs) bad++;
+            // "Auto per frame" is unchanged: there the frame on screen IS the
+            // subject, and the sibling's inherited range is not its own fit.
+            app.rangeScope = 0;
+            bool perFrame = !rangeButtonMatches(*pB, RB_Auto, pB->black, pB->white) &&
+                            rangeButtonMatches(*pB, RB_Auto, pB->vmin, pB->vmax);
+            fprintf(stderr, "rangeselftest: P15 auto-per-frame asks the frame itself: %s\n",
+                    perFrame ? "ok" : "WRONG");
+            if (!perFrame) bad++;
+            // ...and a reference that is gone is not silently replaced by the
+            // frame on screen: no comparison to make, no claim to publish.
+            app.rangeScope = 1;
+            if (App::SeqInfo* s = seqInfo(4245)) s->rangeRefUid = app.nextUid + 999;
+            bool darkGone = !rangeButtonMatches(*pB, RB_Auto, pB->black, pB->white) &&
+                            !rangeButtonMatches(*pB, RB_Median, pB->black, pB->white);
+            // the fixed presets are nobody's measurement and still answer
+            bool presets = rangeButtonMatches(*pB, RB_0_255, 0.0f, 255.0f);
+            fprintf(stderr, "rangeselftest: P15 reference frame gone | fits dark %s | "
+                            "fixed presets still answer %s\n",
+                    darkGone ? "ok" : "WRONG", presets ? "ok" : "WRONG");
+            if (!darkGone || !presets) bad++;
+            for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+                if (it->id == 4245) { app.seqs.erase(it); break; }
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas || app.seqs.size() != seqWas) {
+                fprintf(stderr, "rangeselftest: P15 app.images %zu -> %zu, seqs %zu -> %zu"
+                                "  NOT RESTORED\n",
+                        imgWas, app.images.size(), seqWas, app.seqs.size());
+                bad++;
+            }
+            app.linkRange = saveLink;
+            app.rangeScope = saveScope;
+        }
+
         // the shared home gets the modes it was lent, back
         app.rangeScope = 1;
         app.linkRange = false;
+        app.autoFlavor = AF_MinMax;
+        app.medTarget = 0.5f;
+        app.medBlackMode = MB_Value;
+        app.medBlackValue = 0;
 
         fprintf(stderr, "rangeselftest: %s\n", bad ? "FAILED" : "ok");
         if (app.seqThread.joinable()) app.seqThread.join();

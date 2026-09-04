@@ -81,6 +81,12 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeScope << "\n";
+    // What "Auto per frame" re-fits to, and the Med fit's three parameters
+    // (#252) - one line, because they are one setting: the flavour is useless
+    // without the target it aims at. No settings.jsonc key: this is where you
+    // left the panel, not how the program should start.
+    f << "autoflavor " << app.autoFlavor << " " << app.medTarget << " "
+      << app.medBlackMode << " " << app.medBlackValue << "\n";
     f << "cmpfollow " << (app.compareFollowFrame ? 1 : 0) << "\n";
     f << "cmprange " << app.compareRangeMode << "\n";
     // slots travel by the same NAME+frame pair B uses: uids do not survive a
@@ -2465,6 +2471,21 @@ static std::string loadSession(const std::string& path) {
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
         else if (key == "rangescope") { ls >> app.rangeScope; }
+        // Each half checked on its own, and each left alone when the file
+        // cannot answer for it: a session written by a newer build (or hand
+        // -edited) must not be able to set a target of 0, which divides, or a
+        // flavour index that names nothing. The locals start at what the
+        // program already holds, so a short line is a no-op rather than a
+        // reset (#252).
+        else if (key == "autoflavor") {
+            int fl = app.autoFlavor, bm = app.medBlackMode;
+            float tg = app.medTarget, bv = app.medBlackValue;
+            ls >> fl >> tg >> bm >> bv;
+            if (fl >= AF_MinMax && fl <= AF_Median)  app.autoFlavor = fl;
+            if (tg > 0.0f && tg < 1.0f)              app.medTarget = tg;
+            if (bm >= MB_Value && bm <= MB_MinPct)   app.medBlackMode = bm;
+            if (std::isfinite(bv))                   app.medBlackValue = bv;
+        }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
         else if (key == "cmprange") { ls >> app.compareRangeMode; }
         else if (key == "cmpslot")  { int fi = -1; ls >> fi;
