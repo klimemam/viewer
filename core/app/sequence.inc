@@ -768,6 +768,19 @@ static void pumpSequence() {
         // of its own batch inherits from frame 1 exactly as later batches do.
         if (!ref) ref = app.images.back().get();
     }
+    // The landing is the OTHER place a stack's frames come to wear one frame's
+    // range, so it is the other place that has to record whose (#254) - the
+    // Range row compares against the reference frame, and a stack that had its
+    // range only from inheriting at landing would otherwise have nobody to
+    // compare against and light nothing.
+    // Only while nobody has claimed it: a user who pressed Auto on frame 5
+    // half way through a load spread FRAME 5's fit, and later batches inherit
+    // those same numbers from the head - so the head's pixels are not what the
+    // range describes and re-seeding here would darken the button it just lit.
+    if (ref) {
+        App::SeqInfo* si = seqInfo(app.seqLoadingId);
+        if (si && si->rangeRefUid == 0) si->rangeRefUid = ref->uid;
+    }
     // invalidating per pump made this O(frames^2) over a load; refresh at ~2 Hz
     static double lastTemporalInvalidate = 0;
     double nowT = nowSec();
@@ -1481,11 +1494,13 @@ static void selectImage(int idx) {
     if (prev && d != prev) {
         // linked mode overlays one range non-destructively (effBlack/effWhite),
         // so only auto-per-frame touches the image's own numbers here
-        // ...and it re-fits to the frame's OWN min..max, which is what the
+        // ...and it re-fits to the frame's OWN numbers, which is what the
         // mode is called and what its tooltip promises. This used to be
         // defaultRange, whose load-time magnets snapped every step back to
-        // 0..1 / type fullscale (issue #245).
-        if (app.rangeScope == 0 && !app.linkRange) { autoRange(*d); d->texDirty = true; }
+        // 0..1 / type fullscale (issue #245). WHICH fit - min..max, the
+        // 0.1-99.9% cut or the median->target one - is app.autoFlavor's
+        // answer, and refitByFlavor is the one place that answers it (#252).
+        if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
     }
     // Within a stack, stepping frames never changes the picture's ON-SCREEN
     // size (#250). app.view is ONE view shared by the whole stack, while the

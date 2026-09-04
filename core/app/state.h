@@ -588,6 +588,12 @@ struct ImageDoc {
     // detrend all move the pixels through there.
     float pctLo = 0, pctHi = 0;
     bool pctValid = false;
+    // ...and what the MEDIAN of these pixels is (issue #252), cached beside it
+    // for exactly the same reason and dropped in exactly the same two places.
+    // One number rather than two: the "Med" fit derives its white point from
+    // the median and a black point that costs nothing to recompute.
+    float medVal = 0;
+    bool medValid = false;
     GLuint tex = 0;
     bool texDirty = true;
     float texBlack = 0, texWhite = 0;   // the range this texture was built with
@@ -665,6 +671,7 @@ struct ImageDoc {
         w = src->w; h = src->h; ch = src->ch;
         dtype = src->dtype; vmin = src->vmin; vmax = src->vmax;
         pctValid = false;             // different pixels, different quantiles
+        medValid = false;             // ...and a different median
     }
     std::vector<float>&       px()       { return src->data; }
     const std::vector<float>& px() const { return src->data; }
@@ -743,6 +750,20 @@ struct NpzMember {
     bool selected = false;
     size_t entry = 0;         // index into the zip listing
 };
+
+// What a re-fit MEANS (issue #252). "Auto per frame" used to be one thing -
+// this frame's min..max - and the Range row grew two more answers to the same
+// question, so the per-frame mode has to be able to say WHICH of them it
+// re-applies on every step. The three are not better and worse: min..max is
+// the only answer that shows every pixel you have, the percentile is the only
+// one a hot pixel cannot decide, and the median fit is the only one that puts
+// the BULK of the picture at a stated display level.
+enum AutoFlavor { AF_MinMax = 0, AF_Pct = 1, AF_Median = 2 };
+// ...and where the median fit takes its black point from. `value` is a number
+// the user types (0 for data that is already offset-corrected), `min` the
+// measured vmin, `min 0.1%` the same 0.1 percentile "Auto %" cuts at - which
+// is the one to pick when a dead column or a cold pixel owns vmin.
+enum MedBlackMode { MB_Value = 0, MB_Min = 1, MB_MinPct = 2 };
 
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
@@ -1110,6 +1131,18 @@ struct App {
         // temporal cache key - (seqId, frames, ROI, CFA) alone cannot see a
         // reload that changes no shape (docs/reference-design.md §3.2).
         int stackRev = 0;
+        // WHICH frame's fit the shared per-stack range came from (#254).
+        // "Per stack" spreads one frame's black/white over the whole stack
+        // (#248), and the Range row answers by COMPARISON - so on any OTHER
+        // frame the shared numbers stopped matching that frame's own min/max
+        // and the lit button went dark on the first step: 「Stack で Auto の
+        // 設定が外れる」. The range was still shared; what was wrong was the
+        // display. Recorded by shareStackRange and by the landing that copies
+        // the reference frame's range, read only by rangeButtonMatches. A uid
+        // and not a pointer: frames are closed, and a stale pointer answers.
+        // 0 = nothing spread this stack's range, so there is nothing to
+        // compare against and the row says nothing.
+        uint64_t rangeRefUid = 0;
         // ---- the rule this stack's MEMBERSHIP came from (watch-design §6) ----
         // Set at the moment the stack is minted, and only when the file list it
         // was minted from IS its folder's whole sibling group - i.e. when
@@ -1469,6 +1502,21 @@ struct App {
     // below, which is where the range is enforced and which is the only reader.
     int folderScanDepth = 6;
     int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
+    // What "Auto per frame" (rangeScope 0) re-fits each frame TO (#252).
+    // MinMax is what the mode has always done, and stays the default: a new
+    // flavour must not change what an existing session shows.
+    int autoFlavor = AF_MinMax;
+    // ---- the "Med" fit: put the median at this display level ---------------
+    // target is the NORMALISED display value (0..1, before gamma) the median
+    // is to land on, so white = black + (median - black) / target. 0.5 by
+    // default - "the middle of the bar" is the thing people mean by
+    // "expose it properly", and 0.18 (18% grey) is a photographic convention
+    // this tool has no other trace of. The open interval (0, 1) is enforced
+    // where it is typed and where a session restores it: 0 divides, and 1 is
+    // "white = median", which throws away half the picture.
+    float medTarget = 0.5f;
+    int medBlackMode = MB_Value;      // MedBlackMode
+    float medBlackValue = 0;          // used by MB_Value
     float memBudgetGB = 0;            // 0 = auto (60% of physical RAM)
     // remote viewing: one peer process per host, reached over ssh.
     // OWNERSHIP - remote::Session is documented not-thread-safe (remote.h), so

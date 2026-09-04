@@ -820,17 +820,31 @@ static void drawInspector() {
             // linking destructively (copying the range into each image instead
             // of overlaying one) - two mechanisms for the same intent, spotted
             // as such immediately. Modes:
-            //   0 auto per frame - every frame re-fits to its own min..max
-            //   1 per stack      - frames of a stack share the reference range
-            //   2 linked         - one display range overlays every open image
-            int mode = app.linkRange ? 2 : (app.rangeScope == 0 ? 0 : 1);
+            //   0..2 auto per frame - every frame re-fits, in one of the three
+            //                         flavours the Range row offers (#252)
+            //   3    per stack      - frames of a stack share the reference range
+            //   4    linked         - one display range overlays every open image
+            // The per-frame mode is spelled out three times rather than paired
+            // with a second "flavour" control: "Auto per frame" without saying
+            // auto WHAT is the question the user has to answer anyway, and a
+            // combo that names the answer needs no second widget to explain it.
+            int mode = app.linkRange ? 4
+                     : app.rangeScope == 0 ? std::min(std::max(app.autoFlavor, 0), 2)
+                                           : 3;
             ImGui::SetNextItemWidth(-1);
             if (ImGui::Combo("##rangemode", &mode,
-                             "Auto per frame\0Per stack (default)\0Linked across all images\0")) {
-                applyRangeMode(mode, im);
+                             "Auto per frame (min-max)\0"
+                             "Auto per frame (0.1-99.9%)\0"
+                             "Auto per frame (median->target)\0"
+                             "Per stack (default)\0"
+                             "Linked across all images\0")) {
+                if (mode <= 2) applyRangeMode(0, im, mode);
+                else           applyRangeMode(mode - 2, im);   // 3 -> 1, 4 -> 2
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Auto per frame: every frame re-fits to its own min..max\n"
+                ImGui::SetTooltip("Auto per frame: every frame re-fits as you step -\n"
+                                  "  to its own min..max, its own 0.1-99.9%% cut, or the\n"
+                                  "  range that puts its own median at 'target' below\n"
                                   "Per stack: frames of one stack share the reference\n"
                                   "  frame's range, so they compare directly\n"
                                   "Linked: one display range for every open image - display\n"
@@ -846,8 +860,13 @@ static void drawInspector() {
         bwEditing = ImGui::IsItemActive();
         if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0])
             setRange(*im, bwEdit[0], bwEdit[1]);
-        {   // five equal buttons measured from the panel, never wider than it
-            float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5.0f;
+        {   // SIX buttons in TWO rows of three, measured from the panel and
+            // never wider than it. The split is by what the button ANSWERS,
+            // which is what the eye is looking for: the top row are the three
+            // FITS (they read the pixels), the bottom row the three fixed
+            // conventions (they do not). One row of six put "Med" between
+            // "Auto %" and "0-1" and read as a list of unrelated presets.
+            float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
             bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
             // ...each lit while its own answer IS the range in force, so the
             // row says where the numbers above came from (「Auto が選択されて
@@ -892,6 +911,20 @@ static void drawInspector() {
                 ImGui::SetTooltip(app.linkRange ? "0.1-99.9%% over all open images"
                                                 : "0.1-99.9%% of this image");
             ImGui::SameLine();
+            // ...and the third question neither of them asks: not "what is in
+            // the picture" but "where do I want the bulk of it to sit" (#252).
+            on = lit(RB_Median);
+            if (ImGui::Button("Med", ImVec2(bw, 0))) {
+                float lo = im->vmin, hi = im->vmax;
+                medianFit(*im, lo, hi);
+                setRange(*im, lo, hi);
+            }
+            if (on) ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(app.linkRange
+                    ? "median of ALL open images -> target (one pooled histogram)"
+                    : "this image's median -> target, from the black point below");
+
             on = lit(RB_0_1);
             if (ImGui::Button("0-1", ImVec2(bw, 0))) setRange(*im, 0, 1);
             if (on) ImGui::PopStyleColor(2);
@@ -903,6 +936,64 @@ static void drawInspector() {
             on = lit(RB_0_65535);
             if (ImGui::Button("0-65535", ImVec2(bw, 0))) setRange(*im, 0, 65535);
             if (on) ImGui::PopStyleColor(2);
+        }
+        {   // The Med fit's parameters, directly UNDER the button that uses
+            // them and in the order the sentence is read: "put the median at
+            // <target>, measuring up from <black>". Editing them re-fits
+            // nothing on its own - Med is the button, these are its numbers -
+            // but the row above answers by comparison, so a changed parameter
+            // shows immediately as the lamp going out.
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const float numW = ImGui::GetFontSize() * 3.6f;
+            float comboW = ImGui::GetContentRegionAvail().x - 2 * numW
+                         - ImGui::CalcTextSize("target").x - ImGui::CalcTextSize("black").x
+                         - 2 * st.ItemInnerSpacing.x - 3 * st.ItemSpacing.x;
+            comboW = std::max(comboW, ImGui::GetFontSize() * 5.0f);
+            // EnterReturnsTrue is not allowed on InputScalar-family widgets
+            // (asserts in debug builds), so these edit shadow buffers and
+            // commit on deactivate-after-edit - the bwEdit pattern above.
+            static float tgtEdit = 0.5f;
+            static bool tgtEditing = false;
+            if (!tgtEditing) tgtEdit = app.medTarget;
+            ImGui::TextUnformatted("target");
+            ImGui::SameLine(0, st.ItemInnerSpacing.x);
+            ImGui::SetNextItemWidth(numW);
+            ImGui::InputFloat("##medtarget", &tgtEdit, 0.0f, 0.0f, "%.3g");
+            tgtEditing = ImGui::IsItemActive();
+            // The open interval (0, 1): 0 divides, and 1 means "white = the
+            // median", i.e. half the picture clipped. A value outside it is
+            // simply not taken, and the line above puts the one in force back
+            // in the field the moment it is let go.
+            if (ImGui::IsItemDeactivatedAfterEdit() && tgtEdit > 0.0f && tgtEdit < 1.0f)
+                app.medTarget = tgtEdit;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("where the median lands on the 0..1 display bar,\n"
+                                  "before gamma. Must be inside (0, 1)");
+
+            ImGui::SameLine();
+            ImGui::TextUnformatted("black");
+            ImGui::SameLine(0, st.ItemInnerSpacing.x);
+            int bm = app.medBlackMode;
+            ImGui::SetNextItemWidth(comboW);
+            if (ImGui::Combo("##medblack", &bm, "value\0min\0min 0.1%\0"))
+                app.medBlackMode = bm;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("value: the number beside this box\n"
+                                  "min: the measured minimum of the pixels\n"
+                                  "min 0.1%%: the 0.1 percentile - the one to use when a\n"
+                                  "  cold pixel or a dead column owns the minimum");
+
+            ImGui::SameLine();
+            static float bvEdit = 0.0f;
+            static bool bvEditing = false;
+            if (!bvEditing) bvEdit = app.medBlackValue;
+            ImGui::BeginDisabled(app.medBlackMode != MB_Value);
+            ImGui::SetNextItemWidth(numW);
+            ImGui::InputFloat("##medblackval", &bvEdit, 0.0f, 0.0f, "%.5g");
+            bvEditing = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit() && std::isfinite(bvEdit))
+                app.medBlackValue = bvEdit;
+            ImGui::EndDisabled();
         }
 
         const int g = displayGammaPreset(app.dispGamma);
