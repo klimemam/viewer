@@ -186,6 +186,8 @@ static void setFilter(ImageDoc& im, bool nearest) {
 static void markAllTexDirty() {
     for (auto& d : app.images) d->texDirty = true;
 }
+static App::SeqInfo* seqInfo(int id);   // fwd (defined with the stacks, in
+                                        // sequence.inc): never held, only asked
 // "Per stack" is a promise that has to be KEPT, not merely made once (#248).
 // The frames of one stack sharing a reference range was implemented only where
 // frames LAND (sequence.inc copies the reference frame's range onto each
@@ -199,8 +201,6 @@ static void markAllTexDirty() {
 // decides who gets written to - a doc that somehow carried a negative id would
 // otherwise be fused with every other one, and that is not a mistake worth
 // leaving room for.
-static App::SeqInfo* seqInfo(int id);   // fwd (defined with the stacks, in
-                                        // sequence.inc): never held, only asked
 static void shareStackRange(const ImageDoc& from) {
     if (from.seqId <= 0) return;
     // ...and the stack REMEMBERS whose fit it is wearing (#254). The Range row
