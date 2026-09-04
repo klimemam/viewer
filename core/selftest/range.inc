@@ -389,17 +389,25 @@
                     pA->black, pA->white, pB->black, pB->white, alone ? "ok" : "WRONG");
             if (!alone) bad++;
 
-            // ...and a standalone image is not a stack. seqId 0 is the whole
-            // rest of the program: two unrelated singles must not fuse just
-            // because the scope says "per stack".
+            // ...and a standalone image is not a stack. Only a POSITIVE seqId
+            // names one ("0 = standalone, >0 = frame of that sequence"), and
+            // seqId 0 is the whole rest of the program: two unrelated singles
+            // must not fuse just because the scope says "per stack". The
+            // negative pass is the same claim for an id that should never
+            // exist - a doc carrying one must not be treated as a stack of all
+            // the others.
             app.rangeScope = 1;
-            pA->seqId = 0; pB->seqId = 0;
-            pB->texDirty = false;
-            setRange(*pA, 1.0f, 2.0f);
-            bool single = pB->black == 0.3f && pB->white == 0.6f && !pB->texDirty;
-            fprintf(stderr, "rangeselftest: P7 seqId 0 shares with nobody | other single "
-                            "%.6g..%.6g (expect 0.3..0.6) %s\n",
-                    pB->black, pB->white, single ? "ok" : "WRONG");
+            bool single = true;
+            for (int id : { 0, -1 }) {
+                pA->seqId = id; pB->seqId = id;
+                pB->texDirty = false;
+                setRange(*pA, 1.0f, 2.0f);
+                bool ok = pB->black == 0.3f && pB->white == 0.6f && !pB->texDirty;
+                fprintf(stderr, "rangeselftest: P7 seqId %d shares with nobody | other single "
+                                "%.6g..%.6g (expect 0.3..0.6) %s\n",
+                        id, pB->black, pB->white, ok ? "ok" : "WRONG");
+                single = single && ok;
+            }
             if (!single) bad++;
 
             std::swap(app.images, pool);

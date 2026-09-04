@@ -193,9 +193,14 @@ static void markAllTexDirty() {
 // - and "Auto per frame" stepping, which rewrites each frame's stored
 // black/white as you go - broke the sharing silently. This is the one move
 // that restores it: whatever `from` shows now, the rest of its stack shows.
-// A standalone image (seqId == 0) is not a stack and shares with nobody.
+// A standalone image is not a stack and shares with nobody: state.h spells the
+// convention "0 = standalone, >0 = frame of that sequence", so ONLY a positive
+// seqId names a stack. Written as `<= 0` rather than `== 0` because this
+// decides who gets written to - a doc that somehow carried a negative id would
+// otherwise be fused with every other one, and that is not a mistake worth
+// leaving room for.
 static void shareStackRange(const ImageDoc& from) {
-    if (from.seqId == 0) return;
+    if (from.seqId <= 0) return;
     for (auto& d : app.images)
         if (d.get() != &from && d->seqId == from.seqId) {
             d->black = from.black; d->white = from.white;
