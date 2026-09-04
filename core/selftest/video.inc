@@ -353,13 +353,16 @@ static int videoSelftest() {
         // player. Discovering that at frame 900 costs the whole write, so the
         // arithmetic is done on the numbers up front. The way out is the
         // repo's usual shape - the OTHER format, named, with what to install.
+        // `fits`, not `small`: <rpcndr.h> - which arrives with windows.h -
+        // carries `#define small char`, so a local of that name compiles here
+        // and is a syntax error on MSVC. (It cost this branch one CI round.)
         const std::string big = videowrite::aviSizeRefusal(4096, 4096, 100);
-        const std::string small = videowrite::aviSizeRefusal(4096, 4096, 10);
+        const std::string fits = videowrite::aviSizeRefusal(4096, 4096, 10);
         fprintf(stderr, "videoselftest: V4 4096x4096x100 -> \"%s\"\n", big.c_str());
         check(!big.empty(), "V4 a 5 GB stack is refused as AVI");
         check(has(big, "4 GB") && has(big, "ffmpeg"),
               "V4 ...naming the limit and the way out");
-        check(small.empty(), "V4 a 0.5 GB stack is not (anti-vacuity)");
+        check(fits.empty(), "V4 a 0.5 GB stack is not (anti-vacuity)");
     }
 
     {   // ---- V5: the ffmpeg branch, on BOTH sides --------------------------
