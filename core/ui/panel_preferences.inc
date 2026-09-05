@@ -167,6 +167,23 @@ static void prefWidget(const PrefRow& r) {
             }
             break;
         }
+        case SW_Float: {
+            // The multiplier keys (#257 is the only one today). Committed on
+            // Enter or on leaving the box rather than per keystroke: typing
+            // "1.25" passes through 1 and 1.2, and each of those would be a
+            // toast and a prefs.txt write for a value nobody asked for.
+            float* v = prefFloatField(r.id);
+            if (v && ImGui::InputFloat("##v", v, 0.0f, 0.0f, "%.2f",
+                                       ImGuiInputTextFlags_EnterReturnsTrue)) {
+                prefAfterChange(r.id);
+                settingsWarnIfSticky(r.id, r.path);
+            }
+            if (r.id == SK_uiScale && ImGui::IsItemHovered())
+                ImGui::SetTooltip("0 = work it out from the display.\n"
+                                  "Otherwise 0.5 .. 4, applied at the next start.\n"
+                                  "The startup line on stderr says what was decided.");
+            break;
+        }
         case SW_Text: {
             // series.defaultUnit lives in a fixed buffer (app.lin.unit) rather
             // than a std::string, so it gets the one branch of its own instead

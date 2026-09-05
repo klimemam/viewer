@@ -1267,6 +1267,17 @@ viewer_selftest(histhl      NOGL --histhl-selftest)
 # test rather than a section of range.inc so that a failure names the invariant
 # it is about - and because range.inc's fixtures are a folder on disk.
 viewer_selftest(framesize   NOGL --framesize-selftest)
+# How big to draw the UI (#257): the double scaling a Wayland laptop got, where
+# the platform has ALREADY multiplied and the app multiplied again. NOGL and
+# fixture-free for framesize's reasons, and for one this test alone has: the
+# platform it is about cannot be run on any runner this project uses. Windows
+# reports GLFW_PLATFORM_WIN32 and the Linux job runs under xvfb, i.e. X11 -
+# both the PHYSICAL branch that was already right. So the decision was made a
+# pure function of (coordinate system, content scale, override) and this is its
+# table; a pass here is the arithmetic, never a claim that Wayland was tried.
+# It also covers the restore half - a 4000x3000 saved window clamped into a
+# 1920x1080 work area, with and without the window positions Wayland has none of.
+viewer_selftest(uiscale     NOGL --uiscale-selftest)
 # A stack written out as a LOSSLESS VIDEO (#253): the AVI container read back by
 # a RIFF parser the test writes itself, the three refusals (a preview frame, a
 # stack over AVI 1.0's 4 GB, a .mkv where no ffmpeg exists), and the claim the

@@ -147,6 +147,14 @@ static bool g_histHlSelftest = false;
 // memory and every assertion is a float derived by hand. See frameSizeSelftest().
 static bool g_frameSizeSelftest = false;
 
+// --uiscale-selftest: how big to draw the UI (#257) - the decision table over
+// (coordinate system, content scale, override), and the restored window clamped
+// into a work area. Takes no directory and no window for the
+// --framesize-selftest reasons, and one more: the platform this issue is ABOUT
+// cannot be run on any machine this project builds on, so the decision is a
+// pure function and this is its table. See uiScaleSelftest().
+static bool g_uiScaleSelftest = false;
+
 // --video-selftest: a whole stack out as a lossless video (#253) - the AVI
 // container read back by a RIFF parser the test writes itself, the three
 // refusals (preview frame / over 4 GB / .mkv with no ffmpeg), and the claim the
@@ -602,6 +610,10 @@ static void printUsage() {
         "                              selftests that never draw (nothing else runs)\n"
         "  --frame <system|integrated> title bar: the desktop's, or the one drawn\n"
         "                              in the menu bar (default: last used)\n"
+        "  --ui-scale <f>              how big to draw the UI: 0 = work it out from\n"
+        "                              the display (the default), otherwise 0.5 .. 4.\n"
+        "                              Beats appearance.uiScale for this run; the\n"
+        "                              startup line on stderr says what was decided\n"
         "  --window-offset <dx,dy>     shift the window off its default position (how\n"
         "                              \"Open in new window\" cascades the child ~40 px)\n"
         "  --secondary                 a spawned extra window: prefs are read-only\n"
@@ -654,6 +666,9 @@ static void printUsage() {
         "                              mapping, the paint, the count, the sentences\n"
         "  --framesize-selftest        frame stepping inside a stack keeps the picture\n"
         "                              the size it had on screen (#250)\n"
+        "  --uiscale-selftest          how big to draw the UI (#257): logical vs\n"
+        "                              physical window coordinates, the override,\n"
+        "                              and the restored window clamped to the screen\n"
         "  --video-selftest            a stack written as a lossless video (#253): the\n"
         "                              AVI container, the refusals, and that a video\n"
         "                              frame IS the PNG export of that frame\n"
@@ -800,8 +815,11 @@ static void parseCli(int argc, char** argv) {
             if (v == "always" || v == "never" || v == "ask")
                 settingsOriginCli(SK_stackPrompt, "--stack");
         } else if (a == "--bench" || a == "--crash-test" || a == "--frame" ||
-                   a == "--window-offset") {
-            next();                                // consumed in main(), not an error
+                   a == "--window-offset" || a == "--ui-scale") {
+            // consumed in main(), not an error. --ui-scale is up there with
+            // --frame because the font atlas is baked before parseCli runs
+            // (#257); the origin ledger is claimed there too.
+            next();
         } else if (a == "--bench-step" || a == "--bench-tiles" || a == "--bench-panels" ||
                    a == "--secondary" || a == "--no-window") {
             /* consumed in main(): no value */
@@ -835,6 +853,8 @@ static void parseCli(int argc, char** argv) {
             g_histHlSelftest = true;               // handled in main()
         } else if (a == "--framesize-selftest") {
             g_frameSizeSelftest = true;            // handled in main()
+        } else if (a == "--uiscale-selftest") {
+            g_uiScaleSelftest = true;              // handled in main()
         } else if (a == "--video-selftest") {
             g_videoSelftest = true;                // handled in main()
         } else if (a == "--anaprov-selftest") {

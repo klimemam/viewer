@@ -112,6 +112,12 @@ App app;
 
 #include "app/loader_npy_raw.inc"
 
+// How big to draw the UI (#257). Pure arithmetic over a coordinate system, a
+// content scale and an override - it touches neither GLFW nor App - so it goes
+// in before session.inc, which is the first file that needs the answer
+// (fitSavedWindow's caller) and long before startup bakes the font with it.
+#include "app/uiscale.inc"
+
 // session.inc restores two settings before settings.inc defines the origin
 // ledger.  Resolve them by canonical path once that ledger is available.
 static void settingsOriginSessionPath(const char* path);
@@ -453,6 +459,11 @@ static const char* applyGlContextHints() {
 // which is exactly what the Windows and macOS runners printed, once per test,
 // with no way to tell a dead runner from a broken viewer.
 static std::string g_glfwLastError;
+// ...and whether glfwInit() has actually succeeded. glfwGetPlatform() is a
+// GLFW_NOT_INITIALIZED error before that, and the two callers below - the UI
+// scale decision and the window restore - both run on the --no-window path
+// too, where GLFW is never started at all.
+static bool g_glfwUp = false;
 static void glfwErrorSink(int code, const char* desc) {
     g_glfwLastError = "GLFW error " + std::to_string(code) + ": " +
                       (desc && *desc ? desc : "(no description)");
@@ -528,15 +539,51 @@ static std::vector<WinRect> monitorWorkAreas() {
     return out;
 }
 
+// Which platform GLFW picked, as the number the uiscale helpers switch on.
+// GLFW_PLATFORM_NULL stands in for "there is no platform to ask" - a
+// --no-window run, or any moment before glfwInit().
+static int uiGlfwPlatform() {
+    return g_glfwUp ? glfwGetPlatform() : GLFW_PLATFORM_NULL;
+}
+
+// Are this platform's WINDOW COORDINATES logical rather than device pixels?
+// The whole of #257 turns on this one question; see core/app/uiscale.inc for
+// what each answer costs. Cocoa is compile-time (it has no other backend);
+// everywhere else it is Wayland or it is not, and only the running session can
+// say which - the same binary takes the X11 backend under an X session.
+static bool uiLogicalCoords() {
+#if defined(__APPLE__)
+    return true;
+#else
+    return uiGlfwPlatform() == GLFW_PLATFORM_WAYLAND;
+#endif
+}
+
+// ...and can a client know or choose WHERE it is? Not the same question: macOS
+// has logical coordinates and perfectly ordinary window positions, while
+// Wayland has neither a get nor a set (glfwGetWindowPos leaves the ints alone
+// and raises GLFW_FEATURE_UNAVAILABLE). fitSavedWindow is told, so that a
+// platform with no positions clamps the size and places nothing.
+static bool uiWindowPosKnown() {
+    return uiGlfwPlatform() != GLFW_PLATFORM_WAYLAND;
+}
+
 // The scale to turn the SAVED logical size back into screen coordinates: the
 // content scale of the monitor the saved position falls on, expressed the way
 // startup expresses uiScale so the two can never drift apart. Asked before the
 // window exists, which is the whole reason it goes by position rather than by
 // glfwGetWindowContentScale.
+//
+// 1.0 wherever window coordinates are already LOGICAL (#257): prefs.txt stores
+// the size in logical units, so on Cocoa and on Wayland the saved number IS the
+// number to create the window with, and multiplying it by the content scale is
+// how a 1600x1000 window came back at 3200x2000 on a 200% Wayland laptop - twice
+// the width of the screen it was restored onto. Asking the monitor is right only
+// where a window unit is a device pixel.
 static float scaleAtPos(int x, int y) {
+    if (uiLogicalCoords()) { (void)x; (void)y; return 1.0f; }
 #if defined(__APPLE__)
-    (void)x; (void)y;
-    return 1.0f;                     // Cocoa coordinates are points; the backend does the rest
+    return 1.0f;                     // unreachable: uiLogicalCoords() is true here
 #else
     int n = 0;
     GLFWmonitor** m = glfwGetMonitors(&n);
@@ -663,6 +710,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // and app.view - both of which exist by now.
 #include "selftest/framesize.inc"
 
+// How big to draw the UI (#257). Here beside framesize because it is the same
+// kind of test - a function over numbers derived by hand - and because it needs
+// nothing at all from startup: uiScaleDecision() and fitSavedWindow() are both
+// pure, and both have existed since the include block above.
+#include "selftest/uiscale.inc"
+
 // A stack out as a lossless video (#253). Here beside framesize for its reason:
 // it is a function like frameSizeSelftest(), its documents are built in memory,
 // and everything it drives - startStackVideoExport, pumpVideoExport,
@@ -763,12 +816,20 @@ int main(int argc, char** argv) {
     // performance can be measured (and regressions caught) instead of guessed.
     int benchFrames = 0, crashAfter = 0, cliFrame = -1;
     int winOffX = 0, winOffY = 0;
+    // --ui-scale (#257), read here for --frame's reason and one more of its own:
+    // the style is scaled and the font atlas is baked while the window is being
+    // created, which is a hundred lines ABOVE parseCli. -1 = not given, so that
+    // "--ui-scale 0" can still mean "ignore settings.jsonc, work it out from the
+    // display" - a flag has to be able to say the default out loud.
+    float cliUiScale = -1.0f;
     for (int i = 1; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--bench")) benchFrames = std::max(1, atoi(argv[i + 1]));
         // developer flag: verify the crash safety net actually writes a session
         if (!strcmp(argv[i], "--crash-test")) crashAfter = std::max(1, atoi(argv[i + 1]));
         // the window frame has to be decided before the window exists
         if (!strcmp(argv[i], "--frame")) cliFrame = !strcmp(argv[i + 1], "system") ? 0 : 1;
+        // ...and so does how big to draw, for the same reason
+        if (!strcmp(argv[i], "--ui-scale")) cliUiScale = (float)atof(argv[i + 1]);
         // "Open in new window" cascade: applied right after the window exists
         if (!strcmp(argv[i], "--window-offset"))
             sscanf(argv[i + 1], "%d,%d", &winOffX, &winOffY);
@@ -850,6 +911,21 @@ int main(int argc, char** argv) {
     // set a preference, or that order stops being true.
     loadSettings();
     if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
+    // ...and --ui-scale, applied HERE so it beats settings.jsonc (判断13: the
+    // command line is the temporary override, and there must not be two truths).
+    // A value this program cannot draw at is refused BY NAME and the run carries
+    // on with what the display said - the settings file's own rule, so that the
+    // flag and the key cannot mean different things for the same number.
+    if (cliUiScale >= 0.0f) {
+        if (cliUiScale == 0.0f || uiScaleOverrideValid(cliUiScale)) {
+            app.uiScaleOverride = cliUiScale;
+            g_uiScaleOverrideHow = cliUiScale > 0 ? "--ui-scale" : nullptr;
+            settingsOriginCli(SK_uiScale, "--ui-scale");
+        } else {
+            fprintf(stderr, "--ui-scale expects 0 (work it out from the display) "
+                            "or 0.5 .. 4; ignoring %g\n", (double)cliUiScale);
+        }
+    }
     // --settings-template: print a settings.jsonc carrying THIS user's current
     // non-default values, and exit. It is the migration path off prefs.txt and
     // it writes nothing - 判断3 is that the app never writes this file, and a
@@ -871,6 +947,10 @@ int main(int argc, char** argv) {
                     glfwReasonOr("no GLFW error reported").c_str());
             return 1;
         }
+        // From here glfwGetPlatform() may be asked - which is what decides
+        // whether window coordinates are logical or physical (#257), and
+        // therefore what the restore below multiplies by.
+        g_glfwUp = true;
         glslVersion = applyGlContextHints();   // the same context --gl-probe asks for
         if (benchFrames || !g_browseKeys.empty()) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
         // How a Linux desktop matches a window to its launcher: without these the
@@ -900,7 +980,7 @@ int main(int argc, char** argv) {
             want.y = app.winY;
             want.w = (int)lround(app.winW * s);
             want.h = (int)lround(app.winH * s);
-            wantPos = fitSavedWindow(want, monitorWorkAreas());
+            wantPos = fitSavedWindow(want, monitorWorkAreas(), uiWindowPosKnown());
             startW = want.w;
             startH = want.h;
             wantMax = app.winMax;
@@ -998,13 +1078,26 @@ int main(int argc, char** argv) {
     // landed on, and there is neither. Everything downstream (uiScale, the font
     // size, ui_theme) then reads exactly what a 100% display would give.
     if (win) glfwGetWindowContentScale(win, &xs, &ys);
-#if defined(__APPLE__)
-    float uiScale = 1.0f;                    // Cocoa coords are points; backend handles px
-    float fontScale = std::max(xs, 1.0f);    // rasterize glyphs at retina resolution
-#else
-    float uiScale = std::max(xs, 1.0f);
-    float fontScale = uiScale;
-#endif
+    (void)ys;
+    // #257. The OS name decided nothing here any more: what decides it is
+    // whether a window unit is a device pixel or a logical one, and on the
+    // platforms where it is logical the platform has ALREADY multiplied. See
+    // core/app/uiscale.inc - this is the one call site the whole issue is about,
+    // and scaleAtPos() above answers the same question for the window size.
+    // "prefs.txt" is the fourth answer and it is not a fallback: the Preferences
+    // row writes there, and a value nothing NAMED (no flag, no settings.jsonc
+    // line) but that is nevertheless set came from this machine's own prefs.
+    const UiScaleDecision uis =
+        uiScaleDecision(uiLogicalCoords(), xs, app.uiScaleOverride,
+                        g_uiScaleOverrideHow ? g_uiScaleOverrideHow : "prefs.txt");
+    const float uiScale = uis.ui;
+    const float fontScale = uis.font;
+    // ONE line, on stderr, every start. The next report of this shape is
+    // answered by asking for it instead of by guessing which backend a laptop
+    // took: it names the platform GLFW actually chose, what the monitor said,
+    // both numbers that came out, and who decided them.
+    fprintf(stderr, "ui scale: platform=%s content=%.2f -> ui %.2f font %.2f (%s)\n",
+            uiScalePlatformName(uiGlfwPlatform()), xs, uiScale, fontScale, uis.how);
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
     std::string fontPath = jpFontPath();
@@ -1042,9 +1135,15 @@ int main(int argc, char** argv) {
     // After the font toast, so that "your settings file would not parse" is the
     // one left on screen if both happened.
     settingsToastIfAny();
-#if defined(__APPLE__)
-    io.FontGlobalScale = 1.0f / fontScale;
-#endif
+    // The glyphs were baked at fontScale but the UI is laid out at uiScale, so
+    // wherever the two differ the atlas has to be shrunk back to the size the
+    // layout expects. That is the whole trick of a LOGICAL-coordinate platform
+    // (#257): text is rasterized at the display's real resolution and then
+    // drawn one point per point. It used to be spelled `#if __APPLE__`, which
+    // was the same condition by accident - Cocoa was the only logical platform
+    // the code knew about - and Wayland fell through it into a 4x UI.
+    if (fontScale > 0.0f && fontScale != uiScale)
+        io.FontGlobalScale = uiScale / fontScale;
 
     // The two BACKENDS - platform and renderer - are the only part of ImGui that
     // needs the window and the GL context. The context itself, the style, the
@@ -1158,6 +1257,13 @@ int main(int argc, char** argv) {
     // for the histhl reasons - the fixtures are sizes and every assertion is a
     // product of two numbers.
     if (g_frameSizeSelftest) return frameSizeSelftest();
+
+    // How big to draw the UI (#257): the decision table over logical vs
+    // physical window coordinates, and the restored window clamped into a work
+    // area. Windowless for the framesize reasons and one that is stronger here -
+    // the platform under test is one no machine in this project can run, so the
+    // decision is a pure function and this asserts it as one.
+    if (g_uiScaleSelftest) return uiScaleSelftest();
     if (g_videoSelftest) return videoSelftest();
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,

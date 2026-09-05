@@ -65,6 +65,13 @@ static int settingsSelftest() {
         app.showFps = false;
         app.showGrid = false;
         app.dispGamma = 1.0f;
+        // #257. 0 = "work it out from the display" is the built-in default, and
+        // it belongs in the state every group starts from for the reason the
+        // three below carry: group S feeds this key its sample (1.5), and a 1.5
+        // that survived into T would put an extra key in the template and make
+        // T3's count measure the previous group.
+        app.uiScaleOverride = 0.0f;
+        g_uiScaleOverrideHow = nullptr;
         app.dragPans = false;
         // 段2d/2e: three fields the file can now set, so they belong in the
         // state every block starts from. Without them R8's `memoryBudgetGB: 8`
@@ -954,6 +961,61 @@ static int settingsSelftest() {
               "O4 a reload forgets what the previous file said");
     }
 
+    // ---- O6: appearance.uiScale, the escape hatch of #257 -------------------
+    // The key exists BECAUSE detection can be wrong (XWayland with an Xft.dpi
+    // the compositor disagrees with, fractional scaling, a remote desktop), so
+    // the two things it has to get right are: a value this program can draw at
+    // lands and claims the file; a value it cannot is refused BY NAME and leaves
+    // both the field and the ledger exactly as they were. Then the flag on top,
+    // which is 判断13 with a number that is visible on screen the moment it is
+    // wrong. The same shape as the gamma cases below, one key over.
+    {
+        baseline();
+        const std::string up = writeFix("// a comment, so the line number is not 1\n"
+                                        "{ \"appearance\": { \"uiScale\": 1.25 } }\n");
+        const SettingsReport ur = loadSettingsFrom(up);
+        const OriginEntry& oUi = settingsOriginOf(SK_uiScale);
+        fprintf(stderr, "settingsselftest: O6 file uiScale=%g origin=%d line=%d "
+                        "value=\"%s\"\n",
+                (double)app.uiScaleOverride, (int)oUi.who, oUi.line,
+                settingsCurrentValue(SK_uiScale).c_str());
+        check(ur.rejected == 0 && app.uiScaleOverride == 1.25f &&
+              oUi.who == SetOrigin::File && oUi.line == 2 &&
+              settingsCurrentValue(SK_uiScale) == "1.25",
+              "O6 appearance.uiScale 1.25 lands and names the file and the line");
+        // Out of the window, and 0 is not: 0 is how the key says "work it out
+        // from the display", which is the way BACK and must stay writable.
+        const char* badScale[] = { "12", "0.1", "-1", "1e39" };
+        bool refused = true;
+        for (const char* b : badScale) {
+            baseline();
+            app.uiScaleOverride = 1.5f;              // a value that must SURVIVE the refusal
+            const SettingsReport br2 = loadSettingsFrom(writeFix(
+                std::string("{ \"appearance\": { \"uiScale\": ") + b + " } }\n"));
+            refused = refused && br2.rejected == 1 && app.uiScaleOverride == 1.5f &&
+                      settingsOriginOf(SK_uiScale).who == SetOrigin::None;
+        }
+        check(refused, "O6 a scale this program cannot draw at is refused, changing nothing");
+        baseline();
+        const SettingsReport zr = loadSettingsFrom(
+            writeFix("{ \"appearance\": { \"uiScale\": 0 } }\n"));
+        check(zr.rejected == 0 && app.uiScaleOverride == 0.0f &&
+              settingsCurrentValue(SK_uiScale).empty(),
+              "O6 ...while 0 is accepted and is the default, so it writes nothing");
+        // ...and the flag beats the file, in the value and in the badge.
+        baseline();
+        loadSettingsFrom(up);
+        app.uiScaleOverride = 2.0f;                  // what main() does for --ui-scale 2
+        g_uiScaleOverrideHow = "--ui-scale";
+        settingsOriginCli(SK_uiScale, "--ui-scale");
+        const OriginEntry& oUi2 = settingsOriginOf(SK_uiScale);
+        check(app.uiScaleOverride == 2.0f && oUi2.who == SetOrigin::Cli &&
+              oUi2.cliFlag && std::string(oUi2.cliFlag) == "--ui-scale" &&
+              settingsBadgeFor(SK_uiScale) == "command line (--ui-scale)",
+              "O6 --ui-scale beats the file and the row says so");
+        baseline();
+    }
+
     // O5: a loaded document is a fifth, later authority for the two display
     // values .vsession actually carries. Gamma starts under a CLI claim and
     // grid under a File claim, so this pins precedence rather than merely the
@@ -1158,8 +1220,11 @@ static int settingsSelftest() {
         // was never a prefs.txt line before it was a setting (the ruling made
         // it one; it is written to prefs.txt now because the panel edits it):
         // 27 readable over 34 rows.
-        check(readable == 27, "W1 ...and 27 of them are editable today");
-        check(rows.size() == 34, "W1 ...over 34 rows, which is the whole table");
+        // #257 adds appearance.uiScale, the second key here that was never a
+        // prefs.txt line first (it is one now, for scanDepth's reason - the
+        // panel edits it): 28 readable over 35 rows.
+        check(readable == 28, "W1 ...and 28 of them are editable today");
+        check(rows.size() == 35, "W1 ...over 35 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1190,6 +1255,10 @@ static int settingsSelftest() {
               "W3 displayGamma has two presets and a Custom numeric input");
         check(rr && rr->widget == SW_Link, "W3 rawRecipes is a link, not an editor");
         check(rb && rb->widget == SW_Bool, "W3 a boolean key gets a checkbox");
+        // #257: a MULTIPLIER, so a float box and not the accent's InputInt -
+        // 1.25 is an ordinary answer here and an integer control cannot hold it.
+        const PrefRow* ru = rowOf(SK_uiScale);
+        check(ru && ru->widget == SW_Float, "W3 uiScale is a float, not an int");
         // ...and the badge, which is the whole reason this panel exists: the
         // four layers have to be distinguishable ON THE ROW.
         const std::string bDefault = rb ? rb->badge : std::string();
