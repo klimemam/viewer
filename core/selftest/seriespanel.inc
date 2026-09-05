@@ -126,7 +126,7 @@
             check(addToSeries(sid, s10, 10), "A1 a stack joins");
             check(addFrameToSeries(sid, f40, 40), "A1 a standalone frame joins as a member");
             check(!addFrameToSeries(sid, fx, 99),
-                  "A1 strict containment: a frame from another batch is refused");
+                  "A1 same-batch invariant: a frame from another batch is refused");
             check(seriesOfFrame(f40) == seriesById(sid),
                   "A1 seriesOfFrame finds the membership");
             check(seriesFitPoints(*S) == 2, "A1 fit points count frame members too");
@@ -142,6 +142,147 @@
             check(moved && inNew && outOld,
                   "A1 a frame belongs to AT MOST one series (joining moves it)");
             check(audit(), "A1 audit after the move");
+        }
+
+        // ==== A1b: mixed Move / Close act on MEMBERS, never just seqIds =====
+        // The loose control is created FIRST on purpose. The old Files lookup
+        // asked for seqId 0 for every frame member, so it resolved every one of
+        // them to this first loose row, repeated it inside the series, and then
+        // drew the real member (and the control) again below the series.
+        closeAll();
+        {
+            int b1 = mkBatch("actions source"), b2 = mkBatch("actions target");
+            uint64_t control = lineFrame(b1, "control.npy", 1);
+            int stack = lineStack(b1, "action-stack", 10);
+            uint64_t frame = lineFrame(b1, "action-frame.npy", 20);
+            int sid = newSeries(b1, "mixed actions");
+            App::Series* S = seriesById(sid);
+            snprintf(S->unit, sizeof S->unit, "lx");
+            S->paramName = "level";
+            check(addFrameToSeries(sid, frame, 20),
+                  "A1b fixture: standalone frame joins first");
+            check(addToSeries(sid, stack, 10), "A1b fixture: stack joins second");
+            S = seriesById(sid);
+            if (S && S->members.size() == 2) {
+                S->members[0].include = false;       // metadata Move must not rewrite
+                S->members[1].fold = FOLD_SUM;
+            }
+
+            // Four bindings distinguish preservation from dangling ids: three
+            // targets this Close removes, and one unrelated control it must not.
+            App::ASet refs;
+            refs.id = app.nextASetId++;
+            refs.batchId = b1;
+            refs.name = "action refs";
+            App::ASetRole rr;
+            rr.role = "series"; rr.seriesId = sid; refs.roles.push_back(rr);
+            rr = App::ASetRole{};
+            rr.role = "stack"; rr.seqId = stack; refs.roles.push_back(rr);
+            rr = App::ASetRole{};
+            rr.role = "frame"; rr.frameUid = frame; refs.roles.push_back(rr);
+            rr = App::ASetRole{};
+            rr.role = "control"; rr.frameUid = control; refs.roles.push_back(rr);
+            const int refsId = refs.id;
+            app.analysisSets.push_back(std::move(refs));
+            app.imagesRev++;
+
+            // The pure identity lookup used by the actual Files walk: the frame
+            // row must be action-frame, not the earlier control with seqId 0.
+            {
+                const auto& rows = stacksCached();
+                std::vector<FileGroup> groups = buildFileGroups(rows);
+                const FileGroup* g = nullptr;
+                for (const auto& x : groups) if (x.batch == b1) g = &x;
+                const std::vector<int>* rf =
+                    g && S ? filesRowOfSeriesMember(*g, S->members[0]) : nullptr;
+                const std::vector<int>* rs =
+                    g && S ? filesRowOfSeriesMember(*g, S->members[1]) : nullptr;
+                check(rf && rs && app.images[rf->front()]->uid == frame &&
+                      app.images[rs->front()]->seqId == stack,
+                      "A1b Files resolves frame/stack members by their own identity");
+                check(S && filesSeriesMemberLead(*S, S->members[0], 0,
+                                                  "action-frame.npy") ==
+                               "[0]  20 lx  action-frame.npy" &&
+                      filesSeriesMemberLead(*S, S->members[1], 1,
+                                            "action-stack") ==
+                               "[1]  10 lx  action-stack",
+                      "A1b Files gives both physical layers one member vocabulary");
+                const int seriesJump = S ? filesImageIndexOfSeries(*S) : -1;
+                check(seriesJump >= 0 && app.images[seriesJump]->uid == frame,
+                      "A1b series-role navigation selects its first frame member");
+                ImageDoc* memberDoc = frameMemberDoc(frame);
+                ImageDoc* controlDoc = frameMemberDoc(control);
+                check(memberDoc && controlDoc && filesRowBelongsToSeries(*memberDoc) &&
+                      !filesRowBelongsToSeries(*controlDoc),
+                      "A1b Files suppresses only the member's duplicate loose row");
+            }
+
+            const std::vector<App::Series::Member> before = S ? S->members
+                                                               : std::vector<App::Series::Member>{};
+            moveSeriesToBatch(sid, b2);
+            S = seriesById(sid);
+            bool sameMembers = S && S->members.size() == before.size();
+            for (size_t i = 0; sameMembers && i < before.size(); i++) {
+                const auto& a = before[i];
+                const auto& z = S->members[i];
+                sameMembers = a.seqId == z.seqId && a.frameUid == z.frameUid &&
+                              a.value == z.value && a.include == z.include &&
+                              a.fold == z.fold;
+            }
+            bool allMoved = S && S->batchId == b2;
+            if (ImageDoc* d = frameMemberDoc(frame)) allMoved &= d->batchId == b2;
+            else allMoved = false;
+            std::vector<int> movedStackFrames = framesOfSeq(stack);
+            allMoved &= seqInfo(stack) && movedStackFrames.size() == 3;
+            for (int i : movedStackFrames) allMoved &= app.images[i]->batchId == b2;
+            ImageDoc* controlDoc = frameMemberDoc(control);
+            check(allMoved, "A1b Move sends stack + standalone frame to one target batch");
+            check(sameMembers, "A1b Move preserves member order, identity, value/include/fold");
+            check(controlDoc && controlDoc->batchId == b1,
+                  "A1b Move leaves the unrelated control in the source batch");
+            App::ASet* R = aSetById(refsId);
+            check(R && R->roles.size() == 4 && R->roles[0].seriesId == sid &&
+                  R->roles[1].seqId == stack && R->roles[2].frameUid == frame &&
+                  R->roles[3].frameUid == control,
+                  "A1b Move preserves series/member/control role references");
+            check(audit(), "A1b audit after mixed Move");
+
+            closeSeries(sid);
+            bool stackGone = !seqInfo(stack);
+            for (const auto& d : app.images) if (d->seqId == stack) stackGone = false;
+            controlDoc = frameMemberDoc(control);
+            check(!seriesById(sid) && !frameMemberDoc(frame) && stackGone,
+                  "A1b Close removes every stack/frame member and the series");
+            check(controlDoc && controlDoc->batchId == b1 && app.images.size() == 1,
+                  "A1b Close leaves the unrelated control open");
+            R = aSetById(refsId);
+            check(R && R->roles.size() == 4 && !R->roles[0].bound() &&
+                  R->roles[0].reason.find("series") != std::string::npos &&
+                  !R->roles[1].bound() &&
+                  R->roles[1].reason.find("stack") != std::string::npos &&
+                  !R->roles[2].bound() &&
+                  R->roles[2].reason.find("frame") != std::string::npos &&
+                  R->roles[3].frameUid == control && R->roles[3].bound(),
+                  "A1b Close unbinds removed roles and keeps the control binding");
+            check(app.toast == "closed series \"mixed actions\": 2 member(s)",
+                  "A1b Close toast counts mixed members in member vocabulary");
+            check(audit(), "A1b audit after mixed Close");
+
+            // Ungroup is the other series action whose old toast/UI claimed all
+            // members were stacks. It keeps both physical layers intact.
+            int us = lineStack(b1, "ungroup-stack", 30);
+            uint64_t uf = lineFrame(b1, "ungroup-frame.npy", 40);
+            int uid = newSeries(b1, "mixed ungroup");
+            addToSeries(uid, us, 30);
+            addFrameToSeries(uid, uf, 40);
+            const size_t openBefore = app.images.size();
+            ungroupSeries(uid);
+            check(!seriesById(uid) && seqInfo(us) && frameMemberDoc(uf) &&
+                  app.images.size() == openBefore,
+                  "A1b Ungroup keeps every mixed member open");
+            check(app.toast == "ungrouped \"mixed ungroup\": 2 member(s) stay open",
+                  "A1b Ungroup toast uses member vocabulary");
+            check(audit(), "A1b audit after mixed Ungroup");
         }
 
         // ==== A2/A3: mixed measurement + fit over mean statistics =============
@@ -586,7 +727,7 @@
         check(app.seqs.size() == 3 && uBright && uDim && bSweep,
               "B1 fixture: 3 stacks + 2 loose frames are open");
         {
-            // strict containment refuses ACROSS batches, then the move fixes it
+            // the same-batch invariant refuses ACROSS batches, then Move fixes it
             int sid = newSeries(bSweep, "file sweep");
             App::Series* S = seriesById(sid);
             snprintf(S->unit, sizeof S->unit, "lx");

@@ -2,9 +2,9 @@
 
 > **状態: 実装済み。** native の形、Reader の Python 契約、Reader パネル、
 > 検査・キャッシュ・登録場所・session、peer 上での Reader 実行まで main に実装されている。
-> リモート Reader は stage 0〜5 / protocol 12〜14。§7 は未着手計画ではなく、
-> 実装時の段階と受け入れ条件の記録である。typed layer / layout の端点照合だけは
-> #230 phase ④ の残課題として、本書内で明示する。
+> リモート Reader は stage 0〜5 / protocol 12〜14、typed layer / layout は
+> protocol 15 (#230 phase ④)。§7 は未着手計画ではなく、実装時の段階と
+> 受け入れ条件の記録である。
 
 **名前について (2026-08-03 決定)。** ユーザーが書く Python の関数を **リーダ
 (reader)** と呼ぶ。UI もこの語で統一されている (`Open With a Reader...`、
@@ -55,7 +55,7 @@ UI の語は一貫して **Reader** であり、ファイル名を別の用語�
 ## 2. その仕組みは既にこのリポジトリにある
 
 リモートは**別プロセスに stdio で喋る**構造で動いている (`core/remote.cpp` /
-`core/serve.cpp` / `remote_proto.h`、現在は VERSION=14)。ローカルの Browse すら
+`core/serve.cpp` / `remote_proto.h`、現在は VERSION=15)。ローカルの Browse すら
 `local://` で同じ経路を通る。つまり:
 
 > **「外部プロセスが読んで、正典の形で返す」配線は、実装済みで実運用中。**
@@ -495,7 +495,7 @@ dtype (u8/u16/f16/f32) は**すべて float32 に厳密に載る**ので往復�
 同じ `.exr` が local で `f16`、リンク越しで `f32` と表示され、それこそ #148 の
 「1つのフォルダが 2つの答え」を 1段下で作ることになる。
 
-`rp::VERSION` は **10**。形は動かないので 4/5/6 と同じ**意味**の版上げで、
+この追加時の `rp::VERSION` は **10** (現行は 15)。形は動かないので 4/5/6 と同じ**意味**の版上げで、
 入っている peer を接続時に更新させるのもこの番号である。
 
 ### 3.6.5 ベンダ RAW — ファイルが数値の意味を名乗る唯一の形式 (2026-08-10)
@@ -754,8 +754,10 @@ return Series(members, conditions=...)  # Frame / Stack を条件順に並べた
 return Batch([dark, flat])              # 一緒に開くもの
 ```
 
-`Series` の先頭引数の正名は **members**。現行 Python 実装の `stacks` / `stack_count` は
-stack-only 時代の互換名で、phase④ で `members` を公開名にし、旧名は alias として扱う。
+`Series` の先頭引数の正名は **members**。`stacks` / `stack_count` /
+`frames_per_stack` は stack-only 時代の互換 alias として残るが、エラー・count・repr の
+語彙と新規コードは member に統一する。`members` と `stacks` が別の列を同時に名乗れば
+どちらかを推測せず拒否する。
 
 **返し方は2通りだけ。** 素の配列か、上の型か。dict は用意しない —
 同じことを言う道が3つあれば3通りに食い違い、どれが正なのかを
@@ -773,9 +775,9 @@ def load(path):
 
 | 型 | 位置引数 | 追加のフィールド |
 |---|---|---|
-| `Frame` | 画素 | `cfa` `name` `note` `meta` `range` |
-| `Stack` | 画素 | `timestamps` `cfa` `name` `note` `meta` `range` |
-| `Series` | `Stack` / `Frame` の列 (または画素) | **`conditions` (必須)** `name` `note` `meta` `range` |
+| `Frame` | 画素 | `layout="CHW"` `cfa` `name` `note` `meta` `range` |
+| `Stack` | 画素 | `layout="FCHW"` `timestamps` `cfa` `name` `note` `meta` `range` |
+| `Series` | `Stack` / `Frame` の列、または canonical tensor shorthand | **`conditions` (必須)** `name` `note` `meta` `range` |
 | `Batch` | 上記の列 | `name` |
 
 | フィールド | 型 | 意味 |
@@ -787,6 +789,16 @@ def load(path):
 | `note` | str | **素性の一文**。画面に出る散文。§4.3.1 |
 | `meta` | dict | **撮影条件の事実**。key-value。provenance に載る。§4.3.1 |
 | `range` | (lo,hi) または配列 | 表示レンジ。**その型の形に合わせられる**。§4.3.3 |
+
+型付き画素の canonical は `Frame -> (H,W[,C])`、`Stack -> (F,H,W[,C])`。
+転置を宣言できるのは `Frame(layout="CHW") -> (C,H,W)` と
+`Stack(layout="FCHW") -> (F,C,H,W)` だけで、いずれも **C=1..4**。
+cross-layer (`Frame/FCHW`, `Stack/CHW`)、未知 layout、宣言と実 shape が違う
+duck-typed 出力は、別のもっともらしい画像へ読み替えず理由付きで拒否する。
+Python の convenience API は `(S,H,W)` / `(S,R,H,W[,C])` の canonical tensor
+shorthand も互換入口として受け、harness が `Frame` / `Stack` の child member 列へ
+展開する。**materialize 後・wire 上の `Series` node 自体**は `__pixels_i` も `layout` も
+持たず、画素と layout は各 child member だけが宣言する。
 
 `timestamps` / `conditions` の値の型はどちらも `Values` 1つ (§4.3.2)。
 **値は全桁保持。単位は推測せず、必須** — 空のまま渡された軸は**適用されない**
@@ -906,20 +918,18 @@ range は「values are NOT DN, view only」と明記している)、それと同
 
 - 型を名乗っているので、**チャンネル軸の位置は layer と layout で決める**。ただし
   viewer が表示できるチャンネル数は typed 入力でも `1..4` であり、5以上は名指しで拒否する
-- v1 の転置宣言は `Frame → CHW`、`Stack → FCHW` だけ。`Series` の tensor 全体へ
-  layout は付けず、転置した入力は `Frame` / `Stack` member の列として各 member が宣言する。
+- v1 の転置宣言は `Frame → CHW`、`Stack → FCHW` だけ。Python API が受ける
+  canonical Series tensor shorthand は harness が native child member 列へ展開する。
+  materialized / wire の `Series` node へ layout は付けず、転置した入力は
+  `Frame` / `Stack` member の列として各 member が宣言する。
   layer と layout の組が交差した入力 (`Stack+CHW` など) は拒否する
-- 明示 layout は native の shape fallback より優先する。ただし下の実装状況のとおり、
-  この境界検査は #230 phase ④ で完成させる
+- 明示 layout は native の shape fallback より優先する。
 
-**実装状況 (2026-08-20、#230 phase ③)**: Python 型は layout の綴りと rank を検査し、
-harness は `__layer_<i>` と `__layout_<i>` を運ぶ。しかし現状は layer ごとの許可 layout、
-`C ≤ 4`、duck-typed 出力の宣言整合を端から端まで検査しない。viewer も
-`__pixels_<i>` を native 規則で先に decode し、宣言 layer / layout と materialize 結果を
-照合していない。また series の frame 子は木として受理されるが、membership 登録時に落ちる。
-これらは #230 phase ④ の実装修正と回帰試験の対象であり、現時点で「typed 宣言が端まで
-有効」とは主張しない。契約は、明示宣言を native fallback で上書きせず、整合しない入力を
-layer / layout / shape を名指しして拒否すること。bare tensor だけが §3.1 の互換 fallback を使う。
+**実装状況 (2026-08-20、#230 phase ④)**: Python 型、harness、Viewer-NPZ、
+枠付き stream、remote Reader / container は同じ layer / layout / shape 境界を検査する。
+Frame child を含む mixed Series は member 順と identity を保持して登録する。明示宣言を
+native fallback で上書きせず、不整合は materialize 前に layer / layout / shape を
+名指しして拒否する。bare tensor だけが §3.1 の互換 fallback を使う。
 
 ### 4.5 `timestamps` と `conditions` の違い — 「経っただけ」か「設定を変えた」か
 
@@ -1113,7 +1123,7 @@ harness の予約メンバを決めた時点で、**副産物として1つの容
 これは転送の都合ではなく、**この道具にとって意味のある形式**になる:
 
 ```
-__viewer 1                     ← これがあれば viewer 容器、無ければただの npz
+__viewer 3                     ← これがあれば viewer 容器、無ければただの npz
 __n 3
 __layer_0 'series'   __parent_0 -1   __conditions_values_0 ...
 __layer_1 'stack'    __parent_1  0   __pixels_1 ...
@@ -1135,28 +1145,30 @@ __layer_2 'stack'    __parent_2  0   __pixels_2 ...
 両者が混ざることはない。
 
 `__viewer` のある typed container では `__layer_<i>` / `__layout_<i>` が native
-fallback より優先する。読む側は宣言と decode 結果を照合し、不一致を黙って別の層へ
-読み替えない。この読み側の照合と series frame 子の登録は #230 phase ④ で未実装
-(§4.4 の実装状況) であり、ここは形式の契約を先に固定している。
+fallback より優先する。読む側は全 pixel node を document 作成前に照合し、不一致を
+黙って別の層へ読み替えない。NPZ / stream と local / remote は同じ軸規則を使い、
+series の Frame 子は `frameUid`、Stack 子は `seqId` として宣言順に登録する。
 
 **必要になるもの** (別タスク):
 
 | # | 内容 | 状態 |
 |---|---|---|
 | 1 | `__viewer <version>` を仕様に入れ、読む側が版で分岐できるようにする | **済** (2026-08-03) |
-| 2 | viewer 側の**読み手** (adapter 経由でなく直接開く) | 基本読取は**済** (stage 3)。宣言 layer / layout の最終照合と series frame 子の登録は #230 phase ④ |
+| 2 | viewer 側の**読み手** (adapter 経由でなく直接開く) | **済**。#230 phase ④ で宣言 layer / layout の照合と series Frame 子を追加 |
 | 3 | viewer 側の**書き手** (`Save as viewer npz...`)。stack/series をそのまま保存 | 未 |
 | 4 | 往復の検査 — 書いて読んで、層・軸・単位・CFA・note が同一であること | 片道のみ (V25) |
 | 5 | 版を上げるときの規則 (追加は互換、意味の変更は版を上げる) | **済** |
 
-**1 と 5 について (2026-08-03、stage 3 の実装時に確定)**: harness は
-`__viewer 1` を**必ず最初に書く**。読む側は `__viewer` の**有無だけ**で分岐し、
-**自分より新しい版は読まずに断る** (意味が変わっているかもしれないため)。
-メンバの**追加は互換**、意味の変更は版を上げる。
-(2026-08-07 追記) **AnalysisSet を含むコンテナだけが `__viewer 2` を名乗る**
-— 版はファイル単位で、set の無いファイルは 1 のまま。旧 viewer が set を
-黙って落とす代わりに断るための版上げである
-([reader-analysisset.md](reader-analysisset.md) §4)。
+**1 と 5 について:** 読む側は `__viewer` の**有無だけ**で container / plain NPZ を
+分け、**自分より新しい版は読まずに断る** (意味が変わっているかもしれないため)。
+v1 から layer / layout 宣言は存在し、v2 は AnalysisSet を追加した。**v3 はその既存
+typed semantics を materialize 境界まで正しく適用できる reader を要求する安全世代**
+である。現行 harness は、結果がたまたま native axes / set-free でも
+`__viewer 3` / `VIEWERSTREAM 3` を常に先頭へ書く。版は個々の feature bit ではなく
+writer generation であり、旧 viewer が一見理解できる node だけを読んで後の typed
+node を誤解釈しないためである。現行 reader は既存 v1 / v2 / v3 を同じ修正版の
+境界規則で読み、v4 以上は全体を拒否する。v2 導入時に「set を含む生成物だけ2」とした
+歴史的規則は [reader-analysisset.md](reader-analysisset.md) §4 に記録する。
 
 **注意**: これを「汎用の交換形式」だと名乗らないこと。npz は zip + npy であって、
 `__layer_<i>` の意味を知っているのはこの道具だけ。**この道具のための容器**であり、
@@ -1189,15 +1201,21 @@ adapter を編集したら次に開いたときに効く。
 実行できてはならない。裁定は4案 (A 書かない / B 書いて走らせる / C 書くが
 走らせない / D memo と一致した時だけ走らせる) から **C**。
 
-- 保存時: member が `__pixels_*`(reader 産)の image 行の前に、そのとき memo が
-  知っていれば `readerhint <spec>` を書く。**加算的**な鍵 —— 古いビルドは
-  読み飛ばし、鍵が無いときと同じに振る舞う
-- 復元時: memo が引ければ従来どおり(それが走るのは memo であって hint ではない)。
-  引けなければ **hint の名前を失敗報告に入れる** ——「この session は reader X で
-  保存された。信頼するならその reader で開き直せ」。hint が何を名指ししていても
-  **viewer はそれを実行しない**
-- 検証: selftest V25p(記録が無いときの名指し失敗)/ V25p2(hint の書き出し・
-  名指し・**実行回数が動かないこと**)
+- 保存時: materialisationのimage行の前に、local/remote共通の加算key
+  `materializedissuer reader|npz` と `materializedrun <id>` を書く。前者は戸、後者は
+  同じpathを同じ戸で複数回開いたときの1回ごとのbuild境界である。run idは
+  ImageDocのmembershipに属し、共有FrameSourceや後のbatch移動には左右されない。
+  Reader産なら、そのときmemoが知っている場合だけ `readerhint <spec>` も書く。
+  古いビルドは未知keyを読み飛ばす
+- 復元時: issuer keyがReader/NPZの戸を選ぶ。Readerを実際に走らせる権限は従来どおり
+  **memoだけ**にあり、hintではない。memoが引けなければ **hintの名前を失敗報告に
+  入れる** ——「このsessionはreader Xで保存された。信頼するならそのreaderで
+  開き直せ」。hintが何を名指ししていても **viewerはそれを実行しない**。
+  issuer/run keyの無い（またはrun 0の）旧sessionだけは従来の保守的な
+  member/memoと未使用slotによる判定を維持する
+- 検証: selftest V25p(記録が無いときの名指し失敗)/ V25p2(hintの書き出し・名指し・
+  **実行回数が動かないこと**)に加え、R21h2〜h4 / R26d4〜e4で同一path/memberの
+  Reader/NPZ発行元と複数groupを混同しないこと
 
 ### 4.13 どこで指定するか / どこで書くか / 信頼
 
@@ -1444,24 +1462,24 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
   黙って間違えるより、読まずに理由を言うほうがよい
 - **意味上の嘘は検証できない**: adapter が「これは 8 条件だ」と言えば viewer は信じる。
   検証できる形の整合 (長さ・次元・dtype・宣言 layer と decode 結果) は両端で行う。
-  harness 側は実装済み、viewer 側の最終照合は #230 phase ④
+  harness 側と viewer 側の最終照合は #230 phase ④ で実装済み
 
 ## 7. 段階
 
 **出荷段階はすべて実装済み。** 次の表は実装順と受け入れ条件の記録である。
-#230 phase ④ の typed 境界は、既存段階を未実装へ戻すものではなく追加 hardening である。
+#230 phase ④ の typed 境界は、既存段階を未実装へ戻さず protocol 15 として追加した。
 
 | # | 内容 | 検証 |
 |---|---|---|
 | 0 | **native を §3.1 に絞る** + 読まないときの言い方 (§3.2) + HWC 猶予 | 既存 selftest が緑のまま / `(H,W,3)` が note つきで開くこと / 1次元と5次元が理由つきで拒否されること |
 | 1 | 返り値の契約 (§4.1-4.8) + `tools/import/viewer_import.py` (型3段) | Python 側だけで完結。3段が同じ結果を出すこと |
 | 2 | harness `run_adapter.py` + 同梱 adapter (key 付き npz / HWC) + テンプレート | 手で叩いて npz が出ること |
-| 3 | viewer 側: 起動・npz 受け取り・Inspector の reader 欄 | 基本経路は**済** V25a-h。typed 境界の最終照合は #230 phase ④ |
+| 3 | viewer 側: 起動・npz 受け取り・Inspector の reader 欄 | **済** V25a-h + #230 phase ④ typed 境界 |
 | 4 | パス→関数の規則 (prefs 保存・一覧・LRU) | **済** V25k。v1 は**1ファイル1エントリのみ** (§8-7)、規則は未 |
 | 4b | リーダの置き場所の登録 (ファイル/フォルダ、順序、断り文) §4.13.2 | **済** V25n / V25o (#51) |
 | 5 | キャッシュ (元ファイル + adapter の mtime で無効化) | **済** V25i |
-| 6 | 返り値の検査と断り方 | 基本検査は**済** V25g / V25j。layer別layout・C上限・viewer materialize の端点照合は #230 phase ④ |
-| 7 | peer 側での実行 (リモート) | **済**。`--rreader-selftest` / `--rmeasure-selftest`、stage 0〜5、protocol 12〜14 |
+| 6 | 返り値の検査と断り方 | **済** V25g / V25j + #230 phase ④ (layer別 layout、C上限、duck-typed、materialize 前検査) |
+| 7 | peer 側での実行 (リモート) | **済**。`--rreader-selftest` / `--rmeasure-selftest`、stage 0〜5 は protocol 12〜14、typed axes は protocol 15 |
 
 ## 8. 判断 record
 
@@ -1482,9 +1500,9 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
    `"time"` が既定。共変量は v1 では受けず、将来 `covariates` を別に足す。
    `layout` は廃止 (軸の順序を合わせるのは書いた人の仕事)。
 
-   **後続改訂 (2026-08-19, #230):** `layout` は transposed tensor の明示宣言
-   (`CHW` / `FCHW`) として復活。宣言を運ぶ配線は実装済みだが、layer別layout・
-   channel上限・duck-typed出力・viewer materialize の端点照合は phase④で行う。
+   **後続改訂 (2026-08-19〜20, #230):** `layout` は transposed tensor の明示宣言
+   (`CHW` / `FCHW`) として復活。phase④ で layer別 layout・channel上限・
+   duck-typed 出力・viewer materialize の端点照合まで実装した。
    当時の「誰が転置を書くか」という判断は上に保存する。
 6. ~~bfloat16~~ **決定**: f32 に変換し、変換したことを note に残す
 7. ~~記憶する規則~~ **決定 (暫定)**: v1 は**1ファイルごとのキャッシュ**だけ。

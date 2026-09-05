@@ -123,13 +123,13 @@ def scalar(m, key):
 
 @case
 def frame_shapes():
-    """4.4: Frame takes (H,W) or (H,W,C); C is unconstrained (a frame has no frame axis)."""
+    """4.4: Frame takes (H,W) or (H,W,C), with the viewer's C=1..4 boundary."""
     need_lib(); need_numpy()
     vi.Frame(np.zeros((8, 9)))
     vi.Frame(np.zeros((8, 9, 3)))
-    vi.Frame(np.zeros((8, 9, 5)))                       # C is not restricted to 3|4
     assert vi.Frame(np.zeros((8, 9, 3))).channel_count == 3
     assert vi.Frame(np.zeros((8, 9))).channel_count == 1
+    fails(lambda: vi.Frame(np.zeros((8, 9, 5))), 'layout "HWC" reads C=5')
     fails(lambda: vi.Frame(np.zeros((8,))), "Frame: shape (8,)")
     fails(lambda: vi.Frame(np.zeros((2, 3, 4, 5))), "Frame: shape (2, 3, 4, 5)")
 
@@ -152,7 +152,8 @@ def series_forms():
     exp = vi.Values([1, 2, 5, 10], "exposure", "ms")
 
     s = vi.Series([vi.Stack(np.zeros((16, 8, 9))) for _ in range(4)], conditions=exp)
-    assert s.stack_count == 4
+    assert s.member_count == 4 and s.stack_count == 4
+    assert s.members is s.stacks
 
     s = vi.Series(np.zeros((4, 8, 9)), conditions=exp)          # 4 conditions x 1 frame
     assert s.stack_count == 4 and s.frames_per_stack == 1
@@ -162,9 +163,15 @@ def series_forms():
 
     s = vi.Series(np.zeros((4, 16, 8, 9, 3)), conditions=exp)   # ... x 3 ch
     assert s.stack_count == 4 and s.frames_per_stack == 16
+    fails(lambda: vi.Series(np.zeros((4, 16, 8, 9, 5)), conditions=exp),
+          "C=5")
 
     s = vi.Series([vi.Frame(np.zeros((8, 9))) for _ in range(4)], conditions=exp)
-    assert s.stack_count == 4
+    assert s.member_count == 4
+
+    # The old keyword remains source-compatible, but is only an alias.
+    old = vi.Series(stacks=[vi.Frame(np.zeros((8, 9))) for _ in range(4)], conditions=exp)
+    assert old.member_count == 4 and old.members is old.stacks
 
     fails(lambda: vi.Series(np.zeros((8, 9)), conditions=exp), "Series: shape (8, 9)")
     fails(lambda: vi.Series(np.zeros((4, 2, 2, 8, 9, 3)), conditions=exp),
@@ -198,10 +205,10 @@ def series_conditions_length():
     need_lib(); need_numpy()
     stacks = [vi.Stack(np.zeros((2, 4, 4))) for _ in range(16)]
     fails(lambda: vi.Series(stacks, conditions=vi.Values(list(range(8)), "exposure", "ms")),
-          "=Series: conditions has 8 value(s) but there are 16 stack(s)")
+          "=Series: conditions has 8 value(s) but there are 16 member(s)")
     fails(lambda: vi.Series(np.zeros((16, 2, 4, 4)),
                             conditions=vi.Values(list(range(8)), "exposure", "ms")),
-          "=Series: conditions has 8 value(s) but there are 16 stack(s)")
+          "=Series: conditions has 8 value(s) but there are 16 member(s)")
 
 
 @case
@@ -271,7 +278,7 @@ def range_shapes():
     fails(lambda: vi.Stack(np.zeros((6, 4, 4)), range=np.zeros((3, 2))),
           "Stack: range has shape (3, 2) but the stack has 6 frame(s)")
     fails(lambda: vi.Series(np.zeros((3, 5, 4, 4)), conditions=exp, range=np.zeros((4, 2))),
-          "Series: range has shape (4, 2) but there are 3 stack(s)")
+          "Series: range has shape (4, 2) but there are 3 member(s)")
     fails(lambda: vi.Stack(np.zeros((6, 4, 4)), range=(0, 1, 2)), "Stack: range has shape (3,)")
 
 
@@ -377,13 +384,25 @@ def batch_rules():
 
 @case
 def layout_field():
-    """4.4: layout survives only as the escape hatch for transposed arrays."""
+    """4.4: v1 permits Frame/CHW and Stack/FCHW only, always with C=1..4."""
     need_lib(); need_numpy()
     vi.Frame(np.zeros((3, 8, 9)), layout="CHW")
     vi.Stack(np.zeros((4, 3, 8, 9)), layout="FCHW")
     fails(lambda: vi.Frame(np.zeros((3, 8, 9)), layout="HWC"), 'Frame: layout "HWC"')
     fails(lambda: vi.Frame(np.zeros((8, 9)), layout="CHW"), 'Frame: layout "CHW" needs a 3-D array')
     fails(lambda: vi.Stack(np.zeros((3, 8, 9)), layout="FCHW"), 'Stack: layout "FCHW" needs a 4-D array')
+    fails(lambda: vi.Stack(np.zeros((3, 8, 9)), layout="CHW"),
+          'Stack: layout "CHW" belongs to Frame')
+    fails(lambda: vi.Frame(np.zeros((3, 8, 9, 4)), layout="FCHW"),
+          'Frame: layout "FCHW" belongs to Stack')
+    fails(lambda: vi.Series(np.zeros((2, 8, 9)),
+                            conditions=vi.Values([1, 2], "exposure", "ms"), layout="CHW"),
+          'Series: layout "CHW" is not allowed')
+    fails(lambda: vi.Frame(np.zeros((5, 8, 9)), layout="CHW"),
+          'Frame: layout "CHW" reads C=5')
+    fails(lambda: vi.Stack(np.zeros((2, 5, 8, 9)), layout="FCHW"),
+          'Stack: layout "FCHW" reads C=5')
+    fails(lambda: vi.Stack(np.zeros((2, 8, 9, 5))), 'Stack: layout "FHWC" reads C=5')
 
 
 @case
@@ -936,6 +955,71 @@ def load(path):
 
 
 @case
+def harness_rechecks_duck_typed_layout_and_shape():
+    """4.10/4.11: copied/duck types cannot lie about layer, layout or unwrapped C."""
+    need_numpy(); need_runner()
+    path, _ = sample_npz((2, 8, 9))
+    src = """
+import numpy as np
+class Pixels(object):
+    shape = (3, 8, 9)                 # what the duck type advertises
+    dtype = np.dtype("float32")
+    def numpy(self): return np.zeros((5, 8, 9), dtype="float32")
+class Frame(object):
+    LAYER = "frame"
+    layout = "CHW"
+    name = note = cfa = ""
+    meta = None
+    range = None
+    pixels = Pixels()
+def load(path): return Frame()
+"""
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode == 2, proc.stderr
+    assert 'Frame: layout "CHW" reads C=5 from shape (5, 8, 9)' in proc.stderr, proc.stderr
+
+    src = """
+import numpy as np
+class Stack(object):
+    LAYER = "stack"
+    layout = "CHW"                    # an older/copied class failed to reject it
+    name = note = cfa = ""
+    meta = None
+    range = None
+    timestamps = None
+    pixels = np.zeros((3, 8, 9), dtype="uint16")
+def load(path): return Stack()
+"""
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode == 2, proc.stderr
+    assert 'Stack: layout "CHW" belongs to Frame' in proc.stderr, proc.stderr
+
+    # Canonical members works without the legacy attribute on a copied type;
+    # when both exist they must name one sequence, not two contradictory trees.
+    src = """
+import numpy as np
+from viewer_import import Frame, Values
+class Series(object):
+    LAYER = "series"
+    name = note = layout = ""
+    meta = None
+    range = None
+    conditions = Values([1], "exposure", "ms")
+    members = [Frame(np.zeros((8, 9), dtype="uint16"))]
+def load(path): return Series()
+"""
+    _, out = run_adapter(src, "load", path)
+    assert scalar(members(out), "__layer_1") == "frame"
+
+    src = src.replace("def load(path): return Series()",
+                      "Series.stacks = [Frame(np.ones((8, 9), dtype='uint16'))]\n"
+                      "def load(path): return Series()")
+    proc, _ = run_adapter(src, "load", path, expect_ok=False)
+    assert proc.returncode == 2, proc.stderr
+    assert "members and legacy stacks disagree" in proc.stderr, proc.stderr
+
+
+@case
 def shipped_adapters_run():
     """The adapters under tools/import/adapters are documentation that runs."""
     need_numpy(); need_runner()
@@ -1036,7 +1120,7 @@ def analysisset_in_batch_and_name_collision():
 def analysisset_transport():
     """ras 4: __layer analysisset; inline role members are CHILDREN carrying
     __role_<i>; Refs are __refs_<i> JSON in declaration order; and the
-    set-bearing container names __viewer 2."""
+    current writer names carrier generation __viewer 3."""
     need_numpy(); need_runner()
     path, _ = sample_npz((3, 4, 5))
     src = """
@@ -1052,7 +1136,7 @@ def load(path):
 """
     _, out = run_adapter(src, "load", path)
     m = members(out)
-    assert int(scalar(m, "__viewer")) == 2, "a set-bearing container is version 2"
+    assert int(scalar(m, "__viewer")) == 3, "new containers always name generation 3"
     layers = dict((k, scalar(m, k)) for k in m if k.startswith("__layer_"))
     setIdx = [k for k, v in layers.items() if v == "analysisset"]
     assert len(setIdx) == 1, layers
@@ -1073,13 +1157,13 @@ def load(path):
 
 @case
 def analysisset_version_moves_only_for_sets():
-    """ras 4: a set-free container stays __viewer 1 - compatibility does not
-    move one millimetre for files without a set."""
+    """phase 4: a set-free result still names v3.  Generation is a writer
+    contract, not a claim that this one result happened to exercise a feature."""
     need_numpy(); need_runner()
     path, _ = sample_npz((3, 4, 5))
     _, out = run_adapter(BARE, "load", path)
     m = members(out)
-    assert int(scalar(m, "__viewer")) == 1, "no set, version 1"
+    assert int(scalar(m, "__viewer")) == 3, "set-free output is also generation 3"
 
 
 @case
@@ -1133,7 +1217,7 @@ def load(path):
 
 @case
 def analysisset_stream_carries_roles():
-    """ras 4: the streamed carrier says the same things - VIEWERSTREAM 2, role
+    """ras 4/phase 4: the streamed carrier says the same things - VIEWERSTREAM 3, role
     and refs lines."""
     need_numpy(); need_runner()
     path, _ = sample_npz((3, 4, 5))
@@ -1151,16 +1235,19 @@ def load(path):
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     head = proc.stdout.split(b"\nend\n", 1)[0].decode("utf-8")
     lines = head.splitlines()
-    assert lines[0] == "VIEWERSTREAM 2", lines[0]
+    assert lines[0] == "VIEWERSTREAM 3", lines[0]
     assert any(l.startswith("layer 0 analysisset") for l in lines), lines
     assert any(l.startswith("role 1 image") for l in lines), lines
     refline = [l for l in lines if l.startswith("refs 0 ")]
     assert refline and '"dark"' in refline[0], lines
-    # ...and a set-free stream stays version 1
-    proc2 = subprocess.run([sys.executable, RUNNER, apath + ":load", path],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           universal_newlines=True)
-    assert proc2.returncode == 0
+    # ...and a set-free stream names the same writer generation.
+    bare = write(os.path.join(d, "bare.py"),
+                 "import numpy as np\n"
+                 "def load(path): return np.load(path)['data']\n")
+    proc2 = subprocess.run([sys.executable, RUNNER, bare + ":load", path, "--stream"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc2.returncode == 0, proc2.stderr.decode("utf-8", "replace")
+    assert proc2.stdout.startswith(b"VIEWERSTREAM 3\n"), proc2.stdout[:40]
 
 
 @case

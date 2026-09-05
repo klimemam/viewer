@@ -82,6 +82,14 @@ struct KeyedRef {
     std::string key;
     int node = 0;              // the peer's own address for one array in it
     int kind = FromReader;
+    // Local-only named metadata. Non-empty CHW/FCHW is the protocol-15 gate;
+    // the wire already carries `read` for .npz, while a reader peer gets this
+    // same declaration from its cached stream header.
+    std::string layout{};
+    // Empty layout can still require v15: a typed Stack (F,H,W) whose W<=4
+    // would be guessed as one HWC Frame by an older reader-cache peer. This is
+    // local-only gate evidence, carried independently of the wire reading.
+    bool requires15 = false;
 };
 
 // MEASURE: what came back is exactly what the analyzer emitted, so the caller
@@ -160,6 +168,9 @@ struct MeasureReq {
     // (rp::measureKeyedTooOldText).
     bool hasKeyed = false;
     KeyedRef keyed;
+    // Protocol 15: how a keyed .npz member is read. Reader keys keep native;
+    // their cached typed header is the source of truth.
+    int keyedRead = 0;
 };
 
 // What MSG_READER_RUN answered. Every field is a FACT the peer observed; the
@@ -309,6 +320,9 @@ public:
     // client writing it is not a contradiction - over ssh it is the exercise of
     // a permission the user already has.
     void setServeReaders(bool on) { serveReaders_ = on; }
+    // Compatibility seam for selftests: production leaves this at VERSION.
+    // It makes a current peer see the HELLO an older client really sent.
+    void setHelloVersionForTest(int v) { helloVersion_ = v; }
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }
@@ -335,7 +349,7 @@ private:
     // .npz member, in one place for the reason the three above are, and refused
     // here rather than at the peer because an older peer answers the request it
     // thinks it was sent instead of refusing the one it was.
-    bool keyedServable(const KeyedRef& rd, const std::string& name,
+    bool keyedServable(const KeyedRef& rd, const std::string& name, int read,
                        std::string& err) const;
     // ...and "can this peer list a container at all" - the same gate asked of
     // the SCAN itself, before a byte of it is written.
@@ -347,6 +361,7 @@ private:
     bool alive_ = false;
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
+    int helloVersion_ = (int)rp::VERSION;
     int port_ = 0;
     bool serveReaders_ = true;
     const std::atomic<bool>* abort_ = nullptr;

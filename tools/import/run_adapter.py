@@ -23,8 +23,9 @@ condition themselves (4.5).
 
     __viewer                   container format version; its PRESENCE is what
                                distinguishes a viewer container from a plain npz.
-                               1, or 2 when an analysisset is aboard (ONLY then:
-                               set-free files stay 1, docs/features/adapters/reader-analysisset.md 4)
+                               New output is always 3: typed layer/layout semantics
+                               are part of the carrier generation, even when this
+                               particular tree uses only native axes.
     __n                        number of nodes
     __layer_<i>                "frame" | "stack" | "series" | "batch" | "analysisset"
     __parent_<i>               parent node index, -1 for the root
@@ -97,6 +98,62 @@ def layer_of(obj):
                            or hasattr(obj, "members") or hasattr(obj, "roles")):
         return name
     return None
+
+
+def declared_layout(where, layer, obj, shape=None):
+    """Return and validate the v1 layout declaration for a typed node.
+
+    This deliberately repeats viewer_import's check after tensor unwrapping:
+    adapters may ship a copied/older viewer_import, or a duck-typed object may
+    advertise a shape that differs from what .numpy() actually returns.
+    """
+    raw = getattr(obj, "layout", "")
+    if not isinstance(raw, str):
+        raise AdapterError("%s: layout must be a string" % where)
+    layout = raw
+    title = layer.title()
+    allowed = {"frame": "CHW", "stack": "FCHW", "series": ""}
+    want = allowed[layer]
+    if layout not in ("", "CHW", "FCHW"):
+        raise AdapterError('%s: layout "%s" is not known -- layout is CHW or FCHW'
+                           % (title, layout))
+    if layout and layout != want:
+        if layer == "series":
+            raise AdapterError('%s: layout "%s" is not allowed -- a Series tensor '
+                               'has no layout in v1; pass Frame / Stack members '
+                               'that declare their own layout' % (title, layout))
+        owner = "Stack" if layout == "FCHW" else "Frame"
+        raise AdapterError('%s: layout "%s" belongs to %s, not %s -- %s accepts '
+                           'layout="%s" only'
+                           % (title, layout, owner, title, title, want))
+    if shape is None or layer == "series":
+        return layout
+
+    rank = len(shape)
+    if layer == "frame" and rank not in (2, 3):
+        raise AdapterError("Frame: shape %s is not a frame -- Frame takes (H,W) "
+                           "or (H,W,C), or (C,H,W) with layout=\"CHW\""
+                           % (shape,))
+    if layer == "stack" and rank not in (3, 4):
+        raise AdapterError("Stack: shape %s is not a stack -- Stack takes (F,H,W) "
+                           "or (F,H,W,C), or (F,C,H,W) with layout=\"FCHW\""
+                           % (shape,))
+    if layout == "CHW" and rank != 3:
+        raise AdapterError('Frame: layout "CHW" needs a 3-D array but shape is %s'
+                           % (shape,))
+    if layout == "FCHW" and rank != 4:
+        raise AdapterError('Stack: layout "FCHW" needs a 4-D array but shape is %s'
+                           % (shape,))
+    if layer == "frame":
+        c = 1 if rank == 2 else shape[0] if layout == "CHW" else shape[2]
+        order = layout or "HWC"
+    else:
+        c = 1 if rank == 3 else shape[1] if layout == "FCHW" else shape[3]
+        order = layout or "FHWC"
+    if c < 1 or c > 4:
+        raise AdapterError('%s: layout "%s" reads C=%d from shape %s -- the viewer '
+                           'accepts C=1..4' % (title, order, c, shape))
+    return layout
 
 
 def ref_of(obj):
@@ -234,7 +291,10 @@ class Build(object):
     def common(self, node, obj, where):
         node.name = str(getattr(obj, "name", "") or "")
         node.note = str(getattr(obj, "note", "") or "")
-        node.layout = str(getattr(obj, "layout", "") or "")
+        raw_layout = getattr(obj, "layout", "")
+        if not isinstance(raw_layout, str):
+            raise AdapterError("%s: layout must be a string" % where)
+        node.layout = raw_layout
         node.cfa = str(getattr(obj, "cfa", "") or "")
         meta = getattr(obj, "meta", None)
         if meta:
@@ -311,14 +371,11 @@ class Build(object):
 
     def leaf(self, obj, layer, parent, where):
         idx, node = self.add(layer, parent)
-        node.pixels = to_numpy(where, "pixels", getattr(obj, "pixels"), node.notes)
-        rank = node.pixels.ndim
-        if layer == "frame" and rank not in (2, 3):
-            raise AdapterError("Frame: shape %s is not a frame -- Frame takes (H,W) "
-                               "or (H,W,C)" % (node.pixels.shape,))
-        if layer == "stack" and rank not in (3, 4):
-            raise AdapterError("Stack: shape %s is not a stack -- Stack takes (F,H,W) "
-                               "or (F,H,W,C)" % (node.pixels.shape,))
+        if not hasattr(obj, "pixels"):
+            raise AdapterError("%s declares layer %s but has no pixels"
+                               % (where, layer))
+        node.pixels = to_numpy(where, "pixels", obj.pixels, node.notes)
+        node.layout = declared_layout(where, layer, obj, node.pixels.shape)
         self.common(node, obj, where)
         if layer == "stack":
             self.axis(node, obj, "timestamps", "Stack", node.pixels.shape[0], "frame")
@@ -326,28 +383,42 @@ class Build(object):
 
     def series(self, obj, parent, where):
         idx, node = self.add("series", parent)
+        declared_layout("Series", "series", obj)
         self.common(node, obj, where)
-        stacks = getattr(obj, "stacks", None)
-        if stacks is None:
-            raise AdapterError("%s: a Series must carry stacks" % where)
+        missing = object()
+        members = getattr(obj, "members", missing)
+        stacks = getattr(obj, "stacks", missing)
+        if members is missing:
+            members = stacks
+        elif stacks is not missing and stacks is not members:
+            raise AdapterError("Series: members and legacy stacks disagree -- "
+                               "there must be one member sequence")
+        if members is missing or members is None:
+            raise AdapterError("%s: a Series must carry members" % where)
 
-        if isinstance(stacks, (list, tuple)):
-            members = list(stacks)
+        if isinstance(members, (list, tuple)):
+            members = list(members)
+            if not members:
+                raise AdapterError("Series: no members -- a series holds Frame / Stack")
             for i, m in enumerate(members):
                 if layer_of(m) not in ("frame", "stack"):
                     raise AdapterError("Series: member %d is a %s -- a series holds "
                                        "Stack or Frame" % (i, type(m).__name__))
             count = len(members)
         else:
-            arr = to_numpy("Series", "stacks", stacks, node.notes)
+            arr = to_numpy("Series", "members", members, node.notes)
             if arr.ndim not in (3, 4, 5):
                 raise AdapterError("Series: shape %s is not a series -- Series takes "
                                    "(S,H,W), (S,R,H,W), (S,R,H,W,C), or a sequence of "
                                    "Stack / Frame" % (arr.shape,))
+            if arr.ndim == 5 and (arr.shape[4] < 1 or arr.shape[4] > 4):
+                raise AdapterError('Series: layout "SRHWC" reads C=%d from shape %s -- '
+                                   'the viewer accepts C=1..4'
+                                   % (arr.shape[4], arr.shape))
             count = arr.shape[0]
             members = None
 
-        self.axis(node, obj, "conditions", "Series", count, "stack")
+        self.axis(node, obj, "conditions", "Series", count, "member")
 
         if members is not None:
             for m in members:
@@ -491,24 +562,19 @@ def meta_key(prefix, key):
     return prefix + key
 
 
-#: bumped when the MEANING of a reserved member changes; additions are compatible
-CONTAINER_VERSION = 1
+#: Carrier generation. v1 already had layer/layout declarations and v2 added
+#: AnalysisSet. v3 is the safety generation saying that the reader must enforce
+#: those existing typed semantics at the materialisation boundary. A new writer
+#: always names v3, even for a set-free/native-axis result: an old viewer must
+#: refuse the generation as a whole instead of accepting a declaration it would
+#: silently decode with its native-axis heuristic.
+CONTAINER_VERSION = 3
+STREAM_VERSION = 3
 
-#: ras 4: ONLY a set-bearing container names version 2 - an old viewer then
-#: refuses it whole instead of silently dropping the set; a set-free file
-#: stays 1 and its compatibility does not move at all.
-CONTAINER_VERSION_SET = 2
-
-
-STREAM_VERSION = 1
-STREAM_VERSION_SET = 2                  # same rule, same reason (ras 4)
-
-
-def carries_set(nodes):
-    for nd in nodes:
-        if nd.layer == "analysisset":
-            return True
-    return False
+# Kept as import-compatible internal names for out-of-tree harness tests; the
+# generation no longer varies with tree contents.
+CONTAINER_VERSION_SET = CONTAINER_VERSION
+STREAM_VERSION_SET = STREAM_VERSION
 
 
 BACKSLASH = chr(92)
@@ -556,8 +622,7 @@ def stream_out(fh, nodes):
     frame or per member, which is nothing beside the pixels, and text is what the
     session already writes axis values as.
     """
-    _stream_line(fh, "VIEWERSTREAM %d"
-                 % (STREAM_VERSION_SET if carries_set(nodes) else STREAM_VERSION))
+    _stream_line(fh, "VIEWERSTREAM %d" % STREAM_VERSION)
     _stream_line(fh, "n %d" % len(nodes))
     blobs = []
     for i, nd in enumerate(nodes):
@@ -623,8 +688,7 @@ def write_npz(path, nodes):
     # an ordinary npz and the viewer classifies its members by shape
     # (docs/features/adapters/npz-design.md).  It is written FIRST and always, because "is this a
     # container?" must be answerable without understanding anything else here.
-    out = {"__viewer": np.array(CONTAINER_VERSION_SET if carries_set(nodes)
-                                else CONTAINER_VERSION, dtype="int32"),
+    out = {"__viewer": np.array(CONTAINER_VERSION, dtype="int32"),
            "__n": np.array(len(nodes), dtype="int32")}
     for i, nd in enumerate(nodes):
         out["__layer_%d" % i] = np.array(nd.layer)

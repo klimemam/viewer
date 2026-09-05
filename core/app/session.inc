@@ -2,6 +2,8 @@
 static bool openRemote(const std::string& url, bool asPreview, int frame, int npyRead,
                        const rp::RawWire* rw, const remote::KeyedRef* kd,
                        const std::string& member);   // fwd (defaults: first decl)
+static bool openRemoteNpz(const std::string& url, const std::string& onlyMember,
+                          bool reuseExisting);
 static void openRemoteStack(const std::string& host, const std::vector<std::string>& files,
                             const std::string& name, int port, int token);   // defaults: first decl
 // Run a reader ON THE PEER and open what it made (#180 stage 2). Declared here
@@ -179,12 +181,30 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
         if (!d->src->member.empty()) f << "member " << d->src->member << "\n";
+        // A Reader and a Viewer-NPZ both materialise reserved `__pixels_N`
+        // members, locally and remotely.  The member name therefore cannot tell
+        // restore which issuer to reopen.  FrameSource keeps that stable
+        // client-side provenance (the opaque remote key itself is deliberately
+        // not persisted).
+        // ADDITIVE: an older viewer skips these lines; a new viewer keeps the
+        // conservative legacy member/memo rules when they are absent.  The run
+        // id is per materialiser invocation, so two partial opens from the same
+        // issuer/path cannot borrow one another's unsaved member slots.
+        const int materializedIssuer = d->src->materializedIssuer;
+        const bool hasMaterializedIssuer =
+            materializedIssuer == remote::KeyedRef::FromReader ||
+            materializedIssuer == remote::KeyedRef::FromNpz;
+        const bool npzIssuer = materializedIssuer == remote::KeyedRef::FromNpz;
+        if (hasMaterializedIssuer)
+            f << "materializedissuer " << (npzIssuer ? "npz" : "reader") << "\n";
+        if (hasMaterializedIssuer && d->materializedRunId != 0)
+            f << "materializedrun " << d->materializedRunId << "\n";
         // #179 ruling C: a session NAMES the reader that produced these pixels
         // and never runs one. Written only when this machine still remembers
         // (the memo is the bounded LRU below) - the hint exists so that a
         // restore WITHOUT the memo can say "reader X" instead of "some reader,
         // no record". ADDITIVE like npyread: an older viewer skips the key.
-        if (d->src->member.rfind("__pixels_", 0) == 0) {
+        if (d->src->member.rfind("__pixels_", 0) == 0 && !npzIssuer) {
             const std::string rh = readerFor(d->src->path);
             if (!rh.empty()) f << "readerhint " << rh << "\n";
         }
@@ -2344,6 +2364,8 @@ static std::string loadSession(const std::string& path) {
     int pendingLut = -1;
     std::string pendingMember;         // .npz array name for the next image line
     std::string pendingReaderHint;     // #179 C: names a reader, NEVER runs one
+    int pendingMaterializedIssuer = -1; // -1 legacy/unknown, otherwise KeyedRef::Kind
+    uint64_t pendingMaterializedRun = 0;// 0 legacy/unknown; otherwise file-scoped occurrence
     int pendingRead = NR_NATIVE;       // §3.3 reading for the next image line
     bool lastImageOk = false;         // seqload applies to the image just loaded
     bool haveView = false;
@@ -2381,7 +2403,7 @@ static std::string loadSession(const std::string& path) {
         while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) p.pop_back();
         return p;
     };
-    // ---- WHICH RUN of a reader a line belongs to (#219 review) --------------
+    // ---- WHICH MATERIALISATION RUN a line belongs to (#219 review) ----------
     //
     // One reader run rebuilds every document that file produced and the session
     // carries one line per document, so a line whose doc is already here must
@@ -2412,39 +2434,48 @@ static std::string loadSession(const std::string& path) {
     // Both doors, deliberately: codex's補足2 - the local branch had the same
     // path-only test as the remote one, so the two would have disagreed about
     // what a repeated Load restores to.
-    struct ReaderRestoreRun {
+    struct MaterializedRestoreRun {
         std::string path;
+        int issuer = remote::KeyedRef::FromReader;
+        uint64_t savedRun = 0;        // additive session occurrence; zero = legacy heuristic
         size_t from = 0;             // where in app.images this run's documents start
+        size_t to = 0;               // one run never borrows a later issuer/group's docs
         std::vector<int> takenSeq;   // ...which of its STACKS a line already holds
         std::vector<int> takenDoc;   // ...and which of its lone docs, by index
     };
-    std::vector<ReaderRestoreRun> readerRuns;
+    std::vector<MaterializedRestoreRun> materializedRuns;
     // The first document of the unclaimed line for (path, member) in the NEWEST
-    // run of that path, or -1 when that run is used up (which is what "a new
-    // group starts here" looks like from a line). The FIRST, because that is
+    // matching run, or -1 when no slot remains. For a legacy savedRun==0 line
+    // that means "start a new group"; for a named run it means the occurrence
+    // is missing/exhausted and the caller deliberately does NOT rebuild it.
+    // The FIRST, because that is
     // where a line's display state goes and loadSession spreads it over the
     // stack from there - the same rule sessionDocAt states for the plain case.
-    auto readerSlot = [&](const std::string& path, const std::string& member,
-                          ReaderRestoreRun** runOut) -> int {
-        for (size_t i = readerRuns.size(); i-- > 0;) {
-            ReaderRestoreRun& r = readerRuns[i];
-            if (r.path != path) continue;
-            for (int k = (int)r.from; k < (int)app.images.size(); k++) {
+    auto materializedSlot = [&](const std::string& path, const std::string& member,
+                                int issuer, uint64_t savedRun,
+                                MaterializedRestoreRun** runOut) -> int {
+        for (size_t i = materializedRuns.size(); i-- > 0;) {
+            MaterializedRestoreRun& r = materializedRuns[i];
+            if (r.path != path || r.issuer != issuer) continue;
+            if (savedRun != 0 && r.savedRun != savedRun) continue;
+            if (runOut) *runOut = &r;
+            for (int k = (int)r.from; k < (int)r.to; k++) {
                 const ImageDoc* d = app.images[k].get();
-                if (d->preview || d->src->path != path || d->src->member != member) continue;
+                if (d->preview || d->src->path != path || d->src->member != member ||
+                    d->src->materializedIssuer != issuer) continue;
                 const std::vector<int>& t = d->seqId != 0 ? r.takenSeq : r.takenDoc;
                 const int id = d->seqId != 0 ? d->seqId : k;
                 if (std::find(t.begin(), t.end(), id) != t.end()) continue;
-                if (runOut) *runOut = &r;
                 return k;
             }
-            return -1;               // the newest run has no room: a NEW group
+            return -1;               // legacy: new group; named run: exhausted/error
         }
         return -1;
     };
-    auto readerSlotTake = [&](const std::string& path, const std::string& member) {
-        ReaderRestoreRun* run = nullptr;
-        const int at = readerSlot(path, member, &run);
+    auto materializedSlotTake = [&](const std::string& path, const std::string& member,
+                                    int issuer, uint64_t savedRun) {
+        MaterializedRestoreRun* run = nullptr;
+        const int at = materializedSlot(path, member, issuer, savedRun, &run);
         if (at >= 0 && run) {
             const ImageDoc* d = app.images[at].get();
             if (d->seqId != 0) run->takenSeq.push_back(d->seqId);
@@ -2621,18 +2652,34 @@ static std::string loadSession(const std::string& path) {
         else if (key == "lut") ls >> pendingLut;   // applies to the next image line
         else if (key == "member") pendingMember = restOfLine(ls);
         else if (key == "readerhint") pendingReaderHint = restOfLine(ls);
+        else if (key == "materializedissuer" || key == "remoteissuer") {
+            // `remoteissuer` was used by a development build before the key was
+            // generalised to local and remote materialisations.  Accepting it is
+            // harmless and keeps those additive session files readable.
+            const std::string issuer = restOfLine(ls);
+            if (issuer == "reader")
+                pendingMaterializedIssuer = remote::KeyedRef::FromReader;
+            else if (issuer == "npz")
+                pendingMaterializedIssuer = remote::KeyedRef::FromNpz;
+            else
+                pendingMaterializedIssuer = -1;  // malformed/unknown stays fail-safe legacy
+        }
+        else if (key == "materializedrun") {
+            unsigned long long run = 0;
+            pendingMaterializedRun = (ls >> run) ? (uint64_t)run : 0;
+        }
         else if (key == "npyread") {              // §3.3, applies to the next image line
             int r = NR_NATIVE;
             ls >> r;
-            pendingRead = (r >= NR_NATIVE && r <= NR_CHW) ? r : NR_NATIVE;
+            pendingRead = (r >= NR_NATIVE && r <= NR_FCHW) ? r : NR_NATIVE;
         }
         else if (key == "selann") ls >> selAnnIndex;
         else if (key == "imgbatch") {   // batch of the image above, by name
             std::string nm = restOfLine(ls);
             if (!nm.empty() && lastImageOk && cur()) {
                 int bid = batchReuse(nm);
-                // frame ⊂ stack ⊂ batch: a stack the FILE carries is already
-                // whole here (loadNpy/loadNpz/the container build it in one
+                // A stack the file carries is already wholly managed by one
+                // batch here (loadNpy/loadNpz/the container build it in one
                 // call), and assigning cur() alone moved its representative
                 // frame out on its own - the exact thing moveStackToBatch
                 // exists to prevent. "close batch" then closed the whole stack
@@ -2969,7 +3016,7 @@ static std::string loadSession(const std::string& path) {
             ls >> bk >> wt >> kind;
             std::string err;
             const size_t docsBefore = app.images.size();   // "did this line open anything"
-            bool readerLine = false;      // ...and is it a line a READER rebuilds (#219)
+            int materializedIssuer = -1;  // ...and which unit rebuilds this line (#219)
             if (kind == "raw3" || kind == "raw2" || kind == "raw") {
                 RawDialog d;
                 int le = 1, col = 0;
@@ -3021,14 +3068,17 @@ static std::string loadSession(const std::string& path) {
                 // reader" here exactly as it does for a local file. The hint on
                 // the line answers nothing; it only lets the failure say a name.
                 //
-                // The MEMBER decides that this is such a document, not the memo
-                // alone: over a link the ordinary case is a url opened natively
-                // (a Browse double-click), and the same url may sit in the memo
-                // from some other day. Only the line knows which of the two it
-                // was written about. (The local door keys on the memo alone,
-                // where a reader's member is the only way that path opens.)
-                const bool remoteReaderDoc =
-                    isRemote && pendingMember.rfind("__pixels_", 0) == 0;
+                // The additive materializedissuer decides which door produced
+                // this line. That is stronger than MEMBER: Reader and NPZ both
+                // use __pixels_N, and the same url may sit in a stale memo from
+                // some other day. Marker-less legacy sessions retain the old
+                // conservative rules (remote reserved member; local memo), but
+                // an explicit NPZ issuer never grants that memo authority over
+                // this document.
+                const bool remoteReaderDoc = isRemote &&
+                    (pendingMaterializedIssuer == remote::KeyedRef::FromReader ||
+                     (pendingMaterializedIssuer < 0 &&
+                      pendingMember.rfind("__pixels_", 0) == 0));
                 const std::string remoteMemo = remoteReaderDoc ? readerFor(p)
                                                                : std::string();
                 if (remoteReaderDoc && !remoteMemo.empty()) {
@@ -3036,16 +3086,23 @@ static std::string loadSession(const std::string& path) {
                     // session carries one line per doc - the local door's
                     // reasoning (a six-frame series would otherwise come back
                     // six times over). Asked of THIS line's group, not of every
-                    // image sharing the url: see readerSlot (#219 review). The
+                    // image sharing the url: see materializedSlot (#219 review). The
                     // RUN itself is the one stage 1 built: the peer answers a
                     // repeat out of its cache, so a restore does not re-execute
                     // the reader/harness.  The peer still runs its one
                     // provenance probe to verify the producing environment.
-                    readerLine = true;
-                    const bool already = readerSlot(p, pendingMember, nullptr) >= 0;
-                    err = already ? std::string() : openRemoteWithReader(p, remoteMemo);
-                    if (!already && err.empty())
-                        readerRuns.push_back(ReaderRestoreRun{ p, docsBefore, {} });
+                    materializedIssuer = remote::KeyedRef::FromReader;
+                    MaterializedRestoreRun* knownRun = nullptr;
+                    const bool already = materializedSlot(
+                        p, pendingMember, materializedIssuer, pendingMaterializedRun,
+                        &knownRun) >= 0;
+                    const bool reuseRun = already ||
+                        (pendingMaterializedRun != 0 && knownRun != nullptr);
+                    err = reuseRun ? std::string() : openRemoteWithReader(p, remoteMemo);
+                    if (!reuseRun && err.empty())
+                        materializedRuns.push_back(MaterializedRestoreRun{
+                            p, materializedIssuer, pendingMaterializedRun,
+                            docsBefore, app.images.size(), {}, {} });
                 } else if (remoteReaderDoc) {
                     // No memo: NAME it and stop. Not a picker, not a request -
                     // the peer is not even asked, because "may this reader run"
@@ -3077,17 +3134,45 @@ static std::string loadSession(const std::string& path) {
                     // which takes the member name for the reason loadNpz does:
                     // a session records one line per doc and must not reopen
                     // the whole picker to restore one array.
-                    size_t before = app.images.size();
-                    openRemote(p, false, 0, pendingRead, nullptr, nullptr, pendingMember);
-                    err = app.images.size() > before ? "" : "cannot reopen " + p;
+                    // An explicit NPZ issuer is already a declared door.  Call
+                    // it directly so local:// does not fall through openRemote
+                    // to openPath and rebuild the unit once per saved line.
+                    bool opened = false;
+                    if (pendingMaterializedIssuer == remote::KeyedRef::FromNpz) {
+                        materializedIssuer = remote::KeyedRef::FromNpz;
+                        MaterializedRestoreRun* knownRun = nullptr;
+                        const bool already = materializedSlot(
+                            p, pendingMember, materializedIssuer, pendingMaterializedRun,
+                            &knownRun) >= 0;
+                        const bool reuseRun = already ||
+                            (pendingMaterializedRun != 0 && knownRun != nullptr);
+                        // A new occurrence of the same URL is a new group; only
+                        // another line in THIS run may reuse its whole-unit open.
+                        opened = reuseRun || openRemoteNpz(p, pendingMember, false);
+                        if (!reuseRun && opened)
+                            materializedRuns.push_back(MaterializedRestoreRun{
+                                p, materializedIssuer, pendingMaterializedRun,
+                                docsBefore, app.images.size(), {}, {} });
+                    } else {
+                        opened = openRemote(p, false, 0, pendingRead, nullptr, nullptr,
+                                            pendingMember);
+                    }
+                    // A Viewer container is one unit.  Its second saved line
+                    // legitimately adds no docs: openRemoteNpz reports success
+                    // after finding the already-rebuilt member, and the common
+                    // existing-doc branch below applies this line's state.
+                    err = opened ? "" : "cannot reopen " + p;
                 } else {
                     // §4.12: a file that was read by an adapter is read by that
                     // adapter again when the session comes back. Without this
                     // the restore reaches for a member (__pixels_1) that only
                     // exists in the container the reader produces, and a session
                     // that cannot reopen what it saved is not a session.
-                    std::string rspec = readerFor(p);
-                    if (!rspec.empty()) {
+                    const std::string rspec = readerFor(p);
+                    const bool localReaderDoc =
+                        pendingMaterializedIssuer == remote::KeyedRef::FromReader ||
+                        (pendingMaterializedIssuer < 0 && !rspec.empty());
+                    if (localReaderDoc && !rspec.empty()) {
                         // ONE reader run rebuilds every doc that file produced,
                         // but the session carries one line per doc. Run it for
                         // the first line of a GROUP and let the rest recognise
@@ -3095,11 +3180,46 @@ static std::string loadSession(const std::string& path) {
                         // six-frame series comes back six times over. Per group,
                         // not per path: the same file opened twice in one
                         // session is two groups (#219 review, codex 補足2).
-                        readerLine = true;
-                        const bool already = readerSlot(p, pendingMember, nullptr) >= 0;
-                        err = already ? std::string() : openWithReader(p, rspec);
-                        if (!already && err.empty())
-                            readerRuns.push_back(ReaderRestoreRun{ p, docsBefore, {} });
+                        materializedIssuer = remote::KeyedRef::FromReader;
+                        MaterializedRestoreRun* knownRun = nullptr;
+                        const bool already = materializedSlot(
+                            p, pendingMember, materializedIssuer, pendingMaterializedRun,
+                            &knownRun) >= 0;
+                        const bool reuseRun = already ||
+                            (pendingMaterializedRun != 0 && knownRun != nullptr);
+                        err = reuseRun ? std::string() : openWithReader(p, rspec);
+                        if (!reuseRun && err.empty())
+                            materializedRuns.push_back(MaterializedRestoreRun{
+                                p, materializedIssuer, pendingMaterializedRun,
+                                docsBefore, app.images.size(), {}, {} });
+                    } else if (localReaderDoc) {
+                        err = "this document was made by an input adapter, and " + p +
+                              " cannot be reopened without it";
+                        if (!pendingReaderHint.empty())
+                            err += " - this session records it as " + pendingReaderHint +
+                                   ". A session names a reader but never runs one: "
+                                   "open it with that reader again if you trust it, "
+                                   "and this session will find it";
+                        else
+                            err += " - and this machine has no record of which one "
+                                   "(that record is per-machine and bounded). Open it "
+                                   "with the reader again, and this session will find it";
+                    } else if (isNpz &&
+                               pendingMaterializedIssuer == remote::KeyedRef::FromNpz) {
+                        materializedIssuer = remote::KeyedRef::FromNpz;
+                        MaterializedRestoreRun* knownRun = nullptr;
+                        const bool already = materializedSlot(
+                            p, pendingMember, materializedIssuer, pendingMaterializedRun,
+                            &knownRun) >= 0;
+                        const bool reuseRun = already ||
+                            (pendingMaterializedRun != 0 && knownRun != nullptr);
+                        err = reuseRun ? std::string() :
+                            loadNpz(p, pendingMember, pendingRead, std::string(),
+                                    std::string(), false);
+                        if (!reuseRun && err.empty())
+                            materializedRuns.push_back(MaterializedRestoreRun{
+                                p, materializedIssuer, pendingMaterializedRun,
+                                docsBefore, app.images.size(), {}, {} });
                     } else if (isNpz)
                         err = loadNpz(p, pendingMember, pendingRead);
                     else if (imagefile::forPath(p))
@@ -3132,8 +3252,10 @@ static std::string loadSession(const std::string& path) {
                         // legitimately be opened twice in one session). For a
                         // reader line the same sentence is said by the RUN:
                         // its slot, claimed so no later line can take it twice.
-                        int at = readerLine ? readerSlotTake(p, pendingMember)
-                                            : sessionDocAt(p, pendingMember, docsBefore);
+                        int at = materializedIssuer >= 0
+                            ? materializedSlotTake(p, pendingMember, materializedIssuer,
+                                                   pendingMaterializedRun)
+                            : sessionDocAt(p, pendingMember, docsBefore);
                         if (at >= 0) selectImage(at);
                         else if (!pendingMember.empty()) {
                             // The line NAMED a member and that member is not
@@ -3157,8 +3279,11 @@ static std::string loadSession(const std::string& path) {
                             // is named when the member says so, because "that
                             // member is missing" would send the reader looking
                             // inside a file that is not the problem.
-                            const bool fromReader =
-                                pendingMember.rfind("__pixels_", 0) == 0;
+                            const bool fromReader = isRemote
+                                ? remoteReaderDoc
+                                : pendingMaterializedIssuer == remote::KeyedRef::FromReader ||
+                                  (pendingMaterializedIssuer < 0 &&
+                                   pendingMember.rfind("__pixels_", 0) == 0);
                             err = "member " + pendingMember + " is not in what " +
                                   p + " rebuilt";
                             if (fromReader && !pendingReaderHint.empty())
@@ -3187,8 +3312,10 @@ static std::string loadSession(const std::string& path) {
                         // and for a reader line, only one in ITS OWN run, which
                         // is the whole of #219's fix: searching from 0 sent the
                         // second group's lines onto the first group's documents.
-                        int at = readerLine ? readerSlotTake(p, pendingMember)
-                                            : sessionDocAt(p, pendingMember, 0);
+                        int at = materializedIssuer >= 0
+                            ? materializedSlotTake(p, pendingMember, materializedIssuer,
+                                                   pendingMaterializedRun)
+                            : sessionDocAt(p, pendingMember, 0);
                         if (at >= 0) selectImage(at);
                         else err = (pendingMember.empty() ? std::string("the pixels")
                                                           : "member " + pendingMember) +
@@ -3217,6 +3344,8 @@ static std::string loadSession(const std::string& path) {
             }
             pendingMember.clear();
             pendingReaderHint.clear();    // same rule: one image line, one hint
+            pendingMaterializedIssuer = -1; // one image line, one materialised issuer
+            pendingMaterializedRun = 0;      // one image line, one materialisation occurrence
             pendingRead = NR_NATIVE;      // must not leak onto the next image
             if (!err.empty()) {
                 failures.push_back(err);

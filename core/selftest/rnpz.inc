@@ -79,7 +79,9 @@
         //     dialog, and the remote door has to make the same call (R15).
         const std::string lone = root + "/lone.npz";
         selftestWriteNpz(lone, {
-            { "img", selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2) },
+            // A reserved-looking name does not make this a Viewer-NPZ.  Only
+            // `__viewer` is the discriminator (§4.11.1).
+            { "__pixels_0", selftestNpyBytes("<u2", { HH, WW }, flat.data(), flat.size() * 2) },
         });
         // (c) a VIEWER CONTAINER - a series of two stacks under a batch, with
         //     conditions and a unit. This is the one that proves the TREE code
@@ -108,6 +110,81 @@
             { "__parent_3", i32(1) },
             { "__name_3",   str1("e8") },
             { "__pixels_3", selftestNpyBytes("<u2", { 2, HH, WW }, sb.data(), sb.size() * 2) },
+        });
+        // (d) phase 4 typed axes, and a mixed Series so Frame membership is
+        // exercised by the NPZ carrier as well as the Reader stream carrier.
+        std::vector<uint16_t> tf(3 * 2 * 4), ts(2 * 2 * 2 * 3);
+        for (size_t i = 0; i < tf.size(); i++) tf[i] = (uint16_t)(100 + i);
+        for (size_t i = 0; i < ts.size(); i++) ts[i] = (uint16_t)(1000 + i);
+        const std::string typed = root + "/typed.npz";
+        selftestWriteNpz(typed, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(3) },
+            { "__layer_0",  str1("series") },
+            { "__parent_0", i32(-1) },
+            { "__name_0",   str1("mixed typed") },
+            { "__conditions_values_0", f64v({ 1.25, 9.5 }) },
+            { "__conditions_name_0",   str1("exposure") },
+            { "__conditions_unit_0",   str1("ms") },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__name_1",   str1("colour") },
+            { "__layout_1", str1("CHW") },
+            { "__pixels_1", selftestNpyBytes("<u2", { 3, 2, 4 }, tf.data(), tf.size() * 2) },
+            { "__layer_2",  str1("stack") },
+            { "__parent_2", i32(0) },
+            { "__name_2",   str1("burst") },
+            { "__layout_2", str1("FCHW") },
+            { "__pixels_2", selftestNpyBytes("<u2", { 2, 2, 2, 3 }, ts.data(), ts.size() * 2) },
+        });
+        // The same typed keyed path, large enough to make remoteTreeRefine
+        // enqueue a real step-1 fetch after its decimated first view.  Two
+        // frames are deliberate: while the worker owns frame 0, frame 1 stays
+        // in the queue for Stop to sweep.  Axis-coded values distinguish an
+        // FCHW fetch from native/FHWC bytes wearing the right dimensions.
+        const int STOP_H = 2002, STOP_W = 4, STOP_C = 2, STOP_F = 2;
+        std::vector<uint16_t> stopPx((size_t)STOP_F * STOP_C * STOP_H * STOP_W);
+        for (size_t i = 0; i < stopPx.size(); i++) stopPx[i] = (uint16_t)(1000 + i);
+        const std::string typedStop = root + "/typed-stop.npz";
+        selftestWriteNpz(typedStop, {
+            { "__viewer",   i32(3) },
+            { "__n",        i32(1) },
+            { "__layer_0",  str1("stack") },
+            { "__parent_0", i32(-1) },
+            { "__name_0",   str1("stoppable FCHW") },
+            { "__layout_0", str1("FCHW") },
+            { "__pixels_0", selftestNpyBytes("<u2",
+                                { STOP_F, STOP_C, STOP_H, STOP_W },
+                                stopPx.data(), stopPx.size() * 2) },
+        });
+        // Two malformed typed declarations. rawSeries proves a Series cannot
+        // smuggle in a tensor beside an otherwise valid Frame child. lateBad
+        // puts a valid Frame first and a cross-layer layout second: validation
+        // has to reject the whole declaration before that first document lands.
+        const std::string rawSeries = root + "/raw-series.npz";
+        selftestWriteNpz(rawSeries, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(2) },
+            { "__layer_0",  str1("series") },
+            { "__parent_0", i32(-1) },
+            { "__pixels_0", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__pixels_1", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+        });
+        const std::string lateBad = root + "/late-bad-layout.npz";
+        selftestWriteNpz(lateBad, {
+            { "__viewer",   i32(1) },
+            { "__n",        i32(3) },
+            { "__layer_0",  str1("batch") },
+            { "__parent_0", i32(-1) },
+            { "__layer_1",  str1("frame") },
+            { "__parent_1", i32(0) },
+            { "__pixels_1", selftestNpyBytes("<u2", { 2, 4 }, tf.data(), 2 * 4 * 2) },
+            { "__layer_2",  str1("stack") },
+            { "__parent_2", i32(0) },
+            { "__layout_2", str1("CHW") },
+            { "__pixels_2", selftestNpyBytes("<u2", { 3, 2, 4 }, tf.data(), tf.size() * 2) },
         });
 
         const std::string exe = app.remoteExe.empty() ? app.exePath : app.remoteExe;
@@ -144,7 +221,7 @@
         app.remoteExe = exe;
         if (!connect()) return 1;
         check(app.uiSession.peerVersion() == (int)rp::VERSION,
-              "R14a the peer speaks the protocol this build does (14)");
+              "R14a the peer speaks the protocol this build does (15)");
 
         // ---- R14: the same file, both doors -----------------------------------
         {
@@ -245,6 +322,15 @@
             check(got && app.images.size() == before + 1 && !app.npzPickOpen,
                   "R15 an npz holding one image opens with no dialog, remote as local");
             closeAll();
+
+            const std::string le = loadNpz(lone, "__pixels_0", NR_NATIVE,
+                                           std::string(), std::string());
+            check(le.empty() && app.images.size() == 1 &&
+                      app.images[0]->src->member == "__pixels_0" &&
+                      !app.images[0]->src->viewerMaterialized &&
+                      npyReReadAvailable(*app.images[0]->src),
+                  "R15a ordinary __pixels_0 remains an ordinary re-readable NPZ member");
+            closeAll();
         }
 
         // ---- R15b: the PICKER, end to end, over the link ----------------------
@@ -315,6 +401,653 @@
                   "R16c the series conditions are the same values on both sides");
             check(rUnit == lUnit && rUnit == "ms" && rParam == lParam && rParam == "exposure",
                   "R16d ...and so are the condition's name and unit");
+            closeAll();
+        }
+
+        // ---- R26: typed viewer NPZ, local/remote parity and v14 refusal ------
+        {
+            closeAll();
+            const bool ropen = openRemoteNpz(urlOf(typed), std::string());
+            bool rshape = ropen && app.images.size() == 3 &&
+                          app.images[0]->w == 4 && app.images[0]->h == 2 && app.images[0]->ch == 3 &&
+                          app.images[1]->w == 3 && app.images[1]->h == 2 && app.images[1]->ch == 2 &&
+                          app.images[2]->w == 3 && app.images[2]->h == 2 && app.images[2]->ch == 2;
+            check(rshape, "R26a remote viewer NPZ honours Frame/CHW and Stack/FCHW dimensions");
+            bool rpixels = rshape && app.images[0]->src->data[0] == 100 &&
+                           app.images[0]->src->data[1] == 108 &&
+                           app.images[0]->src->data[2] == 116 &&
+                           app.images[0]->src->data[3] == 101 &&
+                           app.images[1]->src->data[0] == 1000 &&
+                           app.images[1]->src->data[1] == 1006 &&
+                           app.images[2]->src->data[0] == 1012 &&
+                           app.images[2]->src->data[1] == 1018;
+            check(rpixels, "R26b remote tiles are scattered back to declaration order before decode");
+            bool rmembers = app.series.size() == 1 && app.series[0].members.size() == 2 &&
+                            app.series[0].members[0].seqId == 0 &&
+                            app.series[0].members[0].frameUid == app.images[0]->uid &&
+                            app.series[0].members[1].seqId == app.images[1]->seqId &&
+                            app.series[0].members[1].frameUid == 0;
+            check(rmembers, "R26c remote mixed Series preserves Frame/Stack identity and order");
+            bool rboundary = app.images.size() == 3 &&
+                             app.images[0]->src->npyRead == NR_CHW &&
+                             app.images[0]->src->remoteKeyRead == NR_CHW &&
+                             app.images[0]->src->remoteKeyLayout == "CHW" &&
+                             app.images[0]->src->remoteKeyRequires15 &&
+                             app.images[1]->src->npyRead == NR_FCHW &&
+                             app.images[1]->src->remoteKeyRead == NR_FCHW &&
+                             app.images[1]->src->remoteKeyLayout == "FCHW" &&
+                             app.images[1]->src->remoteKeyRequires15;
+            check(rboundary,
+                  "R26d logical axes survive on the source beside distinct NPZ wire axes");
+            bool rNoReRead = app.images.size() == 3;
+            for (const auto& d : app.images)
+                rNoReRead = rNoReRead && !npyReReadAvailable(*d->src) &&
+                            !d->src->npyShape.empty();
+            check(rNoReRead,
+                  "R26d2 typed container shows read-as without losing its member in re-read");
+
+            // Protocol 15's MEASURE suffix carries the same FCHW wire reading
+            // that META/TILE used.  Compare the returned statistic with the
+            // pixels now displayed, so dropping the appended word or ignoring
+            // it in openKeyed cannot pass as a merely well-formed reply.
+            remote::MeasureReq mq;
+            mq.op = rp::MOP_TEMPORAL_STATS;
+            mq.hasKeyed = app.images.size() >= 2;
+            if (mq.hasKeyed) {
+                const FrameSource& ks = *app.images[1]->src;
+                mq.keyed.key = ks.remoteKey;
+                mq.keyed.node = ks.remoteNode;
+                mq.keyed.kind = ks.remoteKeyKind;
+                mq.keyed.layout = ks.remoteKeyLayout;
+                mq.keyed.requires15 = ks.remoteKeyRequires15;
+                mq.keyedRead = ks.remoteKeyRead;
+            }
+            remote::MeasureResult mr;
+            std::string me;
+            const bool measured = mq.hasKeyed && app.uiSession.measure(mq, mr, me);
+            double peerSigT = -1.0;
+            if (measured && !mr.cols.empty())
+                for (const auto& it : mr.cols[0])
+                    if (it.kind == 0 && it.key == "sigma_t [DN]") peerSigT = it.num;
+            double displaySigT = -1.0;
+            if (app.images.size() >= 3 &&
+                app.images[1]->src->data.size() == app.images[2]->src->data.size()) {
+                double v = 0.0;
+                for (size_t i = 0; i < app.images[1]->src->data.size(); i++) {
+                    const double d = app.images[2]->src->data[i] -
+                                     app.images[1]->src->data[i];
+                    v += d * d / 2.0;             // unbiased variance, n=2
+                }
+                displaySigT = sqrt(v / app.images[1]->src->data.size());
+            }
+            fprintf(stderr, "rnpzselftest:   R26 typed MEASURE: peer=%g display=%g "
+                            "frames=%d read=%d err=\"%s\"\n",
+                    peerSigT, displaySigT, mr.framesUsed, mq.keyedRead, me.c_str());
+            check(measured && mr.framesUsed == 2 && mq.keyedRead == NR_FCHW &&
+                      peerSigT == displaySigT,
+                  "R26d3 v15 FCHW MEASURE matches the displayed stack and uses all frames");
+            std::vector<std::vector<float>> rpx;
+            std::vector<std::tuple<int,int,int>> rdims;
+            for (const auto& d : app.images) {
+                rpx.push_back(d->src->data);
+                rdims.emplace_back(d->w, d->h, d->ch);
+            }
+            // Runtime materialisation ids are the anti-vacuous witness for the
+            // additive session token.  Series restore may deliberately move a
+            // member between auto-created Series, so Series membership alone
+            // cannot prove that a later saved occurrence did not borrow the
+            // first occurrence's unsaved Frame slot.
+            auto occurrencePairs = [&](float stackABlack, float stackAWhite, int stackALut,
+                                       float frameBBlack, float frameBWhite, int frameBLut,
+                                       float stackBBlack, float stackBWhite, int stackBLut) {
+                struct RunFacts {
+                    uint64_t id = 0;
+                    int docs = 0, frames = 0, stacks = 0;
+                    int frameB = 0, frameOther = 0;
+                    int stackA = 0, stackB = 0, stackOther = 0;
+                };
+                std::vector<RunFacts> runs;
+                bool valid = true;
+                for (const auto& d : app.images) {
+                    if (d->materializedRunId == 0) { valid = false; continue; }
+                    auto it = std::find_if(runs.begin(), runs.end(), [&](const RunFacts& r) {
+                        return r.id == d->materializedRunId;
+                    });
+                    if (it == runs.end()) {
+                        runs.push_back(RunFacts{});
+                        runs.back().id = d->materializedRunId;
+                        it = runs.end() - 1;
+                    }
+                    it->docs++;
+                    if (d->src->member == "__pixels_1") {
+                        it->frames++;
+                        const bool b = d->black == frameBBlack && d->white == frameBWhite &&
+                                       d->displayLut == frameBLut;
+                        if (b) it->frameB++; else it->frameOther++;
+                    } else if (d->src->member == "__pixels_2") {
+                        it->stacks++;
+                        const bool a = d->black == stackABlack && d->white == stackAWhite &&
+                                       d->displayLut == stackALut;
+                        const bool b = d->black == stackBBlack && d->white == stackBWhite &&
+                                       d->displayLut == stackBLut;
+                        if (a) it->stackA++;
+                        else if (b) it->stackB++;
+                        else it->stackOther++;
+                    } else valid = false;
+                }
+                int runA = 0, runB = 0;
+                for (const RunFacts& r : runs) {
+                    const bool a = r.docs == 3 && r.frames == 1 && r.stacks == 2 &&
+                        r.frameB == 0 && r.frameOther == 1 && r.stackA == 2 &&
+                        r.stackB == 0 && r.stackOther == 0;
+                    const bool b = r.docs == 3 && r.frames == 1 && r.stacks == 2 &&
+                        r.frameB == 1 && r.frameOther == 0 && r.stackA == 0 &&
+                        r.stackB == 2 && r.stackOther == 0;
+                    runA += a ? 1 : 0;
+                    runB += b ? 1 : 0;
+                    valid = valid && (a || b);
+                }
+                return valid && runs.size() == 2 && runA == 1 && runB == 1;
+            };
+
+            // A Reader and a Viewer-NPZ both use reserved __pixels_N members.
+            // Put a deliberately stale Reader memo on this NPZ URL: the member
+            // heuristic alone would run that Reader (or fail before SCAN), while
+            // the persisted keyed issuer must keep this on the NPZ door.  The
+            // Frame and the selected Stack frame carry distinct display state,
+            // so treating the container's second saved line as a failed dedupe
+            // cannot pass merely because all three pixel docs came back.
+            const std::string typedUrl = urlOf(typed);
+            const auto memoBefore = app.readerMemo;
+            const bool secondGroup = openRemoteNpz(typedUrl, std::string());
+            check(secondGroup && app.images.size() == 6 && app.series.size() == 2,
+                  "R26d4 the same remote Viewer-NPZ can be opened as two groups");
+            if (app.images.size() >= 6) {
+                app.images[0]->black = 17.0f;
+                app.images[0]->white = 170.0f;
+                app.images[0]->displayLut = 2;
+                selectImage(1);
+                for (size_t i = 1; i <= 2; i++) {
+                    app.images[i]->black = 23.0f;
+                    app.images[i]->white = 230.0f;
+                    app.images[i]->displayLut = 4;
+                }
+                app.images[3]->black = 31.0f;
+                app.images[3]->white = 131.0f;
+                app.images[3]->displayLut = 1;
+                selectImage(4);
+                for (size_t i = 4; i <= 5; i++) {
+                    app.images[i]->black = 47.0f;
+                    app.images[i]->white = 147.0f;
+                    app.images[i]->displayLut = 3;
+                }
+            }
+            // Make the first remote occurrence partial as well.  Its Stack line
+            // rebuilds a free Frame slot; the second occurrence's Frame line
+            // must be bound by materializedrun rather than borrowing that slot.
+            if (app.images.size() == 6) closeImages({ 0 });
+            check(app.images.size() == 5 && app.series.size() == 2,
+                  "R26d4b first remote NPZ group leaves one member unsaved");
+            rememberReader(typedUrl, root + "/not-a-reader.py:load");
+            const std::string sess = root + "/typed-npz.vsession";
+            { std::ofstream f(pathFromUtf8(sess), std::ios::binary); writeSessionTo(f); }
+            std::ifstream sf(pathFromUtf8(sess), std::ios::binary);
+            const std::string sessionBody((std::istreambuf_iterator<char>(sf)),
+                                          std::istreambuf_iterator<char>());
+            int remoteIssuerLines = 0, remoteRunLines = 0;
+            for (size_t at = 0; (at = sessionBody.find(
+                     "materializedissuer npz", at)) != std::string::npos;
+                 at += strlen("materializedissuer npz"))
+                remoteIssuerLines++;
+            std::vector<unsigned long long> remoteRuns;
+            std::istringstream remoteLines(sessionBody);
+            std::string remoteLine;
+            while (std::getline(remoteLines, remoteLine)) {
+                std::istringstream one(remoteLine);
+                std::string key;
+                unsigned long long run = 0;
+                one >> key >> run;
+                if (key == "materializedrun" && run != 0) {
+                    remoteRunLines++;
+                    if (std::find(remoteRuns.begin(), remoteRuns.end(), run) ==
+                        remoteRuns.end())
+                        remoteRuns.push_back(run);
+                }
+            }
+            check(remoteIssuerLines == 3 && remoteRunLines == 3 &&
+                      remoteRuns.size() == 2 &&
+                      sessionBody.find("readerhint ") == std::string::npos,
+                  "R26d5 session records remote NPZ issuer and two occurrence ids");
+
+            closeAll();
+            const std::string sessErr = loadSession(sess);
+            const double remoteSeriesStart = nowSec();
+            while (nowSec() - remoteSeriesStart < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            int frameDocs = 0, stackDocs = 0;
+            bool frameStateB = false;
+            bool stackStateA = false, stackStateB = false;
+            int frameStateBCount = 0;
+            bool sessionAxes = true;
+            for (const auto& d : app.images) {
+                if (d->src->member == "__pixels_1") {
+                    frameDocs++;
+                    const bool isFrameB = d->black == 31.0f && d->white == 131.0f &&
+                                          d->displayLut == 1;
+                    frameStateB = frameStateB || isFrameB;
+                    frameStateBCount += isFrameB ? 1 : 0;
+                    sessionAxes = sessionAxes && d->src->npyRead == NR_CHW &&
+                        d->src->remoteKeyRead == NR_CHW &&
+                        d->src->remoteKeyLayout == "CHW" &&
+                        d->src->remoteKeyKind == remote::KeyedRef::FromNpz &&
+                        d->src->remoteKeyRequires15 &&
+                        d->src->materializedIssuer == remote::KeyedRef::FromNpz;
+                }
+                if (d->src->member == "__pixels_2") {
+                    stackDocs++;
+                    stackStateA = stackStateA ||
+                        (d->black == 23.0f && d->white == 230.0f && d->displayLut == 4);
+                    stackStateB = stackStateB ||
+                        (d->black == 47.0f && d->white == 147.0f && d->displayLut == 3);
+                    sessionAxes = sessionAxes && d->src->npyRead == NR_FCHW &&
+                        d->src->remoteKeyRead == NR_FCHW &&
+                        d->src->remoteKeyLayout == "FCHW" &&
+                        d->src->remoteKeyKind == remote::KeyedRef::FromNpz &&
+                        d->src->remoteKeyRequires15 &&
+                        d->src->materializedIssuer == remote::KeyedRef::FromNpz;
+                }
+            }
+            bool sessionMembers = app.series.size() == 3;
+            int statePairA = 0, statePairB = 0, freeFrameSeries = 0;
+            for (const auto& s : app.series) {
+                bool hasFrameB = false, hasOtherFrame = false;
+                bool stackA = false, stackB = false;
+                for (const auto& d : app.images) {
+                    bool inSeries = false;
+                    for (const auto& m : s.members)
+                        if ((m.frameUid != 0 && d->uid == m.frameUid) ||
+                            (m.seqId != 0 && d->seqId == m.seqId)) {
+                            inSeries = true;
+                            break;
+                        }
+                    if (!inSeries) continue;
+                    if (d->src->member == "__pixels_1") {
+                        const bool fb = d->black == 31.0f && d->white == 131.0f &&
+                                        d->displayLut == 1;
+                        hasFrameB = hasFrameB || fb;
+                        hasOtherFrame = hasOtherFrame || !fb;
+                    }
+                    if (d->src->member == "__pixels_2") {
+                        stackA = stackA || (d->black == 23.0f && d->white == 230.0f &&
+                                            d->displayLut == 4);
+                        stackB = stackB || (d->black == 47.0f && d->white == 147.0f &&
+                                            d->displayLut == 3);
+                    }
+                }
+                if (stackA && !stackB && !hasFrameB && !hasOtherFrame) statePairA++;
+                else if (stackB && !stackA && hasFrameB && !hasOtherFrame) statePairB++;
+                else if (!stackA && !stackB && !hasFrameB && hasOtherFrame)
+                    freeFrameSeries++;
+                else sessionMembers = false;       // catches A/B cross-wiring
+            }
+            const bool remoteRunsBound = occurrencePairs(
+                23.0f, 230.0f, 4, 31.0f, 131.0f, 1, 47.0f, 147.0f, 3);
+            fprintf(stderr, "rnpzselftest:   R26d6 err=\"%s\" docs=%zu series=%zu "
+                            "frameB=%d stackA=%d stackB=%d pairs=%d/%d free=%d "
+                            "members=%d axes=%d runs=%d\n",
+                    sessErr.c_str(), app.images.size(), app.series.size(),
+                    frameStateBCount, stackStateA ? 1 : 0, stackStateB ? 1 : 0,
+                    statePairA, statePairB, freeFrameSeries,
+                    sessionMembers ? 1 : 0, sessionAxes ? 1 : 0,
+                    remoteRunsBound ? 1 : 0);
+            check(sessErr.empty() && app.images.size() == 6 && frameDocs == 2 &&
+                      stackDocs == 4 && sessionMembers && sessionAxes &&
+                      frameStateB && frameStateBCount == 1 &&
+                      stackStateA && stackStateB &&
+                      statePairA == 1 && statePairB == 1 && freeFrameSeries == 1 &&
+                      remoteRunsBound,
+                  "R26d6 remote NPZ session restores two occurrence-scoped groups and axes");
+
+            // Same URL and reserved member are still not enough: a Reader may
+            // have materialised those names too.  Turn the two restored groups
+            // into that exact colliding identity and make the NPZ door prove it
+            // checks issuer before claiming an already-open unit.
+            for (auto& d : app.images) {
+                d->src->remoteKeyKind = remote::KeyedRef::FromReader;
+                d->src->materializedIssuer = remote::KeyedRef::FromReader;
+            }
+            const size_t beforeIssuerOpen = app.images.size();
+            const bool issuerOpen = openRemoteNpz(typedUrl, "__pixels_1");
+            bool issuerSeparated = issuerOpen && app.images.size() == beforeIssuerOpen + 3;
+            for (size_t i = beforeIssuerOpen; i < app.images.size() && issuerSeparated; i++)
+                issuerSeparated = app.images[i]->src->remoteKeyKind ==
+                                  remote::KeyedRef::FromNpz;
+            check(issuerSeparated,
+                  "R26d7 Reader-kind docs with the same URL/member cannot dedupe an NPZ");
+            app.readerMemo = memoBefore;
+            closeAll();
+            const std::string le = loadNpz(typed);
+            bool parity = le.empty() && app.images.size() == rpx.size();
+            for (size_t i = 0; i < app.images.size() && parity; i++)
+                parity = std::make_tuple(app.images[i]->w, app.images[i]->h, app.images[i]->ch) ==
+                             rdims[i] && app.images[i]->src->data == rpx[i] &&
+                         !npyReReadAvailable(*app.images[i]->src) &&
+                         !app.images[i]->src->npyShape.empty();
+            check(parity, "R26e local and remote NPZ are dimension/pixel identical");
+
+            // The same issuer fact is not a remote-only convenience. A stale
+            // local Reader memo used to divert this Viewer-NPZ through the
+            // adapter door, and path/member-only dedupe collapsed the second
+            // occurrence. Save two local groups with cross-wire-sensitive state
+            // and require both to survive a session as NPZ materialisations.
+            const std::string leSecond = loadNpz(typed);
+            check(leSecond.empty() && app.images.size() == 6 && app.series.size() == 2,
+                  "R26e2 the same local Viewer-NPZ can be opened as two groups");
+            if (app.images.size() >= 6) {
+                app.images[0]->black = 61.0f;
+                app.images[0]->white = 161.0f;
+                app.images[0]->displayLut = 1;
+                selectImage(1);
+                for (size_t i = 1; i <= 2; i++) {
+                    app.images[i]->black = 71.0f;
+                    app.images[i]->white = 171.0f;
+                    app.images[i]->displayLut = 2;
+                }
+                app.images[3]->black = 81.0f;
+                app.images[3]->white = 181.0f;
+                app.images[3]->displayLut = 3;
+                selectImage(4);
+                for (size_t i = 4; i <= 5; i++) {
+                    app.images[i]->black = 91.0f;
+                    app.images[i]->white = 191.0f;
+                    app.images[i]->displayLut = 4;
+                }
+            }
+            // Group A deliberately omits its Frame line. Restoring its Stack
+            // still rebuilds the whole Viewer-NPZ and leaves a free Frame slot;
+            // group B must not claim that slot merely because path/issuer/member
+            // match. The additive materializedrun is the occurrence boundary.
+            if (app.images.size() == 6) closeImages({ 0 });
+            check(app.images.size() == 5 && app.series.size() == 2,
+                  "R26e2b first local NPZ group leaves one member unsaved");
+            rememberReader(typed, root + "/not-a-local-reader.py:load");
+            const std::string localSess = root + "/typed-local-npz.vsession";
+            { std::ofstream f(pathFromUtf8(localSess), std::ios::binary); writeSessionTo(f); }
+            std::ifstream lsf(pathFromUtf8(localSess), std::ios::binary);
+            const std::string localSessionBody((std::istreambuf_iterator<char>(lsf)),
+                                               std::istreambuf_iterator<char>());
+            int localIssuerLines = 0;
+            for (size_t at = 0; (at = localSessionBody.find(
+                     "materializedissuer npz", at)) != std::string::npos;
+                 at += strlen("materializedissuer npz"))
+                localIssuerLines++;
+            std::vector<unsigned long long> localRuns;
+            std::istringstream localLines(localSessionBody);
+            std::string localLine;
+            int localRunLines = 0;
+            while (std::getline(localLines, localLine)) {
+                std::istringstream one(localLine);
+                std::string key;
+                unsigned long long run = 0;
+                one >> key >> run;
+                if (key == "materializedrun" && run != 0) {
+                    localRunLines++;
+                    if (std::find(localRuns.begin(), localRuns.end(), run) ==
+                        localRuns.end())
+                        localRuns.push_back(run);
+                }
+            }
+            check(localIssuerLines == 3 && localRunLines == 3 && localRuns.size() == 2 &&
+                      localSessionBody.find("readerhint ") == std::string::npos,
+                  "R26e3 local session records NPZ issuer and two occurrence ids");
+
+            closeAll();
+            const std::string localSessErr = loadSession(localSess);
+            const double localSeriesStart = nowSec();
+            while (nowSec() - localSeriesStart < 120.0 && !app.seriesRestore.empty()) {
+                pumpSequenceAndQueue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            bool localSession = localSessErr.empty() && app.images.size() == 6 &&
+                                 app.series.size() == 3;
+            int localPairA = 0, localPairB = 0, localFreeFrame = 0;
+            int frameBCount = 0, stackACount = 0, stackBCount = 0;
+            for (const auto& d : app.images) {
+                localSession = localSession &&
+                    d->src->materializedIssuer == remote::KeyedRef::FromNpz &&
+                    d->src->remoteKey.empty();
+                const bool frameB = d->src->member == "__pixels_1" &&
+                    d->black == 81.0f && d->white == 181.0f && d->displayLut == 3;
+                const bool stackA = d->src->member == "__pixels_2" &&
+                    d->black == 71.0f && d->white == 171.0f && d->displayLut == 2;
+                const bool stackB = d->src->member == "__pixels_2" &&
+                    d->black == 91.0f && d->white == 191.0f && d->displayLut == 4;
+                frameBCount += frameB ? 1 : 0;
+                stackACount += stackA ? 1 : 0;
+                stackBCount += stackB ? 1 : 0;
+            }
+            for (const auto& s : app.series) {
+                bool hasFrameB = false, hasOtherFrame = false;
+                bool hasStackA = false, hasStackB = false;
+                for (const auto& d : app.images) {
+                    bool inSeries = false;
+                    for (const auto& m : s.members)
+                        if ((m.frameUid != 0 && d->uid == m.frameUid) ||
+                            (m.seqId != 0 && d->seqId == m.seqId)) {
+                            inSeries = true;
+                            break;
+                        }
+                    if (!inSeries) continue;
+                    if (d->src->member == "__pixels_1") {
+                        const bool fb = d->black == 81.0f && d->white == 181.0f &&
+                                        d->displayLut == 3;
+                        hasFrameB = hasFrameB || fb;
+                        hasOtherFrame = hasOtherFrame || !fb;
+                    }
+                    if (d->src->member == "__pixels_2") {
+                        hasStackA = hasStackA || (d->black == 71.0f &&
+                            d->white == 171.0f && d->displayLut == 2);
+                        hasStackB = hasStackB || (d->black == 91.0f &&
+                            d->white == 191.0f && d->displayLut == 4);
+                    }
+                }
+                if (hasStackA && !hasStackB && !hasFrameB && !hasOtherFrame) localPairA++;
+                else if (hasStackB && !hasStackA && hasFrameB && !hasOtherFrame)
+                    localPairB++;
+                else if (!hasStackA && !hasStackB && !hasFrameB && hasOtherFrame)
+                    localFreeFrame++;
+                else localSession = false;
+            }
+            const bool localRunsBound = occurrencePairs(
+                71.0f, 171.0f, 2, 81.0f, 181.0f, 3, 91.0f, 191.0f, 4);
+            fprintf(stderr, "rnpzselftest:   R26e4 err=\"%s\" docs=%zu series=%zu "
+                            "frameB=%d stackA=%d stackB=%d pairs=%d/%d free=%d "
+                            "ok=%d runs=%d\n",
+                    localSessErr.c_str(), app.images.size(), app.series.size(),
+                    frameBCount, stackACount, stackBCount, localPairA, localPairB,
+                    localFreeFrame, localSession ? 1 : 0, localRunsBound ? 1 : 0);
+            check(localSession && frameBCount == 1 &&
+                      stackACount == 2 && stackBCount == 2 &&
+                      localPairA == 1 && localPairB == 1 && localFreeFrame == 1 &&
+                      localRunsBound,
+                  "R26e4 local NPZ session restores two occurrence-scoped groups and state");
+            app.readerMemo = memoBefore;
+            closeAll();
+
+            auto bothRefuseBeforeDocs = [&](const std::string& path,
+                                            const std::string& words) {
+                closeAll();
+                const std::string le2 = loadNpz(path);
+                const bool localClean = !le2.empty() && has(le2, words) && app.images.empty();
+                closeAll();
+                remote::NpzScan badScan;
+                std::string scanErr;
+                const bool scanned2 = app.uiSession.npzScan(path, badScan, scanErr);
+                const std::string re2 = scanned2
+                    ? openRemoteViewerNpz(urlOf(path), badScan) : scanErr;
+                return localClean && scanned2 && re2 == le2 && app.images.empty();
+            };
+            check(bothRefuseBeforeDocs(rawSeries, "series has no raw pixel tensor"),
+                  "R26f local/remote reject a Series tensor identically, before documents");
+            check(bothRefuseBeforeDocs(lateBad, "stack layout CHW belongs to a frame"),
+                  "R26g a later cross-layer layout cannot leave an earlier Frame behind");
+            closeAll();
+
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_PROTOCOL", "14");
+            if (!connect()) return 1;
+            remote::NpzScan sc;
+            std::string se;
+            const bool scanned = app.uiSession.npzScan(typed, sc, se);
+            const uint64_t beforeRx = app.uiSession.bytesReceived();
+            const std::string oe = scanned ? openRemoteViewerNpz(urlOf(typed), sc) : se;
+            check(scanned && !oe.empty() && has(oe, "protocol 14") &&
+                      has(oe, "typed materialisation axes need 15") &&
+                      app.uiSession.bytesReceived() == beforeRx && app.images.empty(),
+                  "R26h v14 is refused after declaration, before META/TILE or partial documents");
+            app.uiSession.stop();
+            setEnv("VIEWER_SERVE_PROTOCOL", "");
+            if (!connect()) return 1;
+        }
+
+        // ---- R27: Stop crosses the typed keyed full-refine path -------------
+        // #238 put the Files button's exact remote Stop body behind this seam.
+        // Phase 4 subsequently put Reader and Viewer-NPZ typed nodes through
+        // the same keyed background refiner.  Exercise the NPZ issuer here: it
+        // is the stronger representative because both its declared identity
+        // AND its wire request are FCHW (a Reader's keyed wire read is native).
+        //
+        // Restart just the fetch worker so its peer observes the lag seam.  The
+        // UI Session stays live and unlagged, hence the initial preview is still
+        // cheap; only the background TILE remains in flight long enough for the
+        // test to press Stop deterministically.
+        {
+            closeAll();
+            stopRemoteFetcher();
+            closeAll();                 // discard any answer the joined worker returned
+            app.rfStop = false;
+            setEnv("VIEWER_SERVE_LAG_MS", "400");
+
+            const bool opened = openRemoteNpz(urlOf(typedStop), std::string());
+            const uint32_t oldGen = app.rfGen.load();
+            std::vector<uint64_t> previewUids;
+            std::vector<std::vector<float>> previewPixels;
+            std::vector<int> previewSteps;
+            for (const auto& d : app.images) {
+                previewUids.push_back(d->uid);
+                previewPixels.push_back(d->src->data);
+                previewSteps.push_back(d->src->remoteStep);
+            }
+            const bool preview = opened && app.images.size() == STOP_F;
+            bool previewTyped = preview;
+            for (const auto& d : app.images) {
+                const int step = d->src->remoteStep;
+                previewTyped = previewTyped && step > 1 &&
+                               d->w == (STOP_W + step - 1) / step &&
+                               d->h == (STOP_H + step - 1) / step && d->ch == STOP_C &&
+                               d->src->npyRead == NR_FCHW &&
+                               d->src->remoteKeyRead == NR_FCHW &&
+                               d->src->remoteKeyLayout == "FCHW" &&
+                               d->src->remoteKeyRequires15;
+            }
+            check(previewTyped,
+                  "R27a a large Viewer-NPZ FCHW node starts as a typed keyed preview");
+
+            // V8 uses this same distinction: pending counts queued + in-flight,
+            // while rfQueue contains only the jobs the worker has not taken.
+            // With two frames, catching one busy also leaves a real queued job
+            // for the button to sweep.
+            bool caught = false;
+            int queuedBefore = -1, pendingBefore = -1;
+            const double catchAt = nowSec();
+            while (nowSec() - catchAt < 10.0) {
+                bool targetBusy = false;
+                {
+                    std::lock_guard<std::mutex> lk(app.rfMtx);
+                    const uint64_t busy = app.rfBusyUid.load();
+                    for (uint64_t uid : previewUids)
+                        if (busy == uid) targetBusy = true;
+                    if (targetBusy) {
+                        queuedBefore = (int)app.rfQueue.size();
+                        pendingBefore = app.rfPending.load();
+                    }
+                }
+                if (targetBusy && pendingBefore > queuedBefore && queuedBefore > 0) {
+                    caught = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            stopRemoteStackFetch();             // the Files panel's actual seam
+            check(caught && pendingBefore == STOP_F && queuedBefore == STOP_F - 1,
+                  "R27b Stop is pressed with one typed fetch held and one queued");
+
+            bool swept = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                swept = app.rfQueue.empty();
+            }
+            check(app.rfGen.load() == oldGen + 1 && swept && app.rbOpenQueue.empty() &&
+                      app.rfPending == 0 && app.rfTotal == 0 && app.rfFetched == 0 &&
+                      app.rfBytesInFlight == 0,
+                  "R27c the real Stop advances generation and zeros queue/counters");
+
+            // Let the one answer already beyond the queue arrive, then pump it.
+            // Its old generation must be ignored before it can change pixels or
+            // decrement the counters Stop already returned to zero.
+            const double staleAt = nowSec();
+            while (app.rfBusyUid != 0 && nowSec() - staleAt < 10.0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            pumpRemoteFetch();
+            bool oldDidNotLand = app.rfBusyUid == 0 && app.images.size() == previewPixels.size();
+            for (size_t i = 0; i < app.images.size() && oldDidNotLand; i++)
+                oldDidNotLand = app.images[i]->src->remoteStep == previewSteps[i] &&
+                                app.images[i]->src->data == previewPixels[i];
+            bool stoppedClean = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                stoppedClean = app.rfQueue.empty() && app.rfDone.empty();
+            }
+            stoppedClean = stoppedClean && app.rfPending == 0 && app.rfTotal == 0 &&
+                           app.rfFetched == 0 && app.rfBytesInFlight == 0;
+            check(oldDidNotLand && stoppedClean,
+                  "R27d the old-generation TILE cannot land or revive stopped counters");
+
+            // The worker itself remains usable after the button: enqueue the
+            // same two typed sources under the new generation and require their
+            // complete step-1 pixels, axes and keyed wire declaration.
+            for (const auto& d : app.images) requestFullRemote(d.get());
+            const bool restarted = app.rfPending > 0;
+            drainRemote(30.0);
+            bool full = restarted && app.images.size() == STOP_F;
+            const size_t plane = (size_t)STOP_H * STOP_W;
+            for (int f = 0; f < (int)app.images.size() && full; f++) {
+                const ImageDoc& d = *app.images[(size_t)f];
+                const size_t base = (size_t)f * STOP_C * plane;
+                full = d.w == STOP_W && d.h == STOP_H && d.ch == STOP_C &&
+                       d.src->remoteStep == 1 && d.src->npyRead == NR_FCHW &&
+                       d.src->remoteKeyRead == NR_FCHW &&
+                       d.src->remoteKeyLayout == "FCHW" &&
+                       d.src->remoteKeyRequires15 && d.src->data.size() == plane * STOP_C &&
+                       d.src->data[0] == stopPx[base] &&
+                       d.src->data[1] == stopPx[base + plane] &&
+                       d.src->data[2] == stopPx[base + 1];
+            }
+            bool restartedClean = false;
+            {
+                std::lock_guard<std::mutex> lk(app.rfMtx);
+                restartedClean = app.rfQueue.empty() && app.rfDone.empty();
+            }
+            restartedClean = restartedClean && app.rfPending == 0 && app.rfTotal == 0 &&
+                             app.rfFetched == 0 && app.rfBytesInFlight == 0;
+            check(full && restartedClean,
+                  "R27e the next typed fetch finishes with FCHW axes and clean counters");
+
+            stopRemoteFetcher();
+            setEnv("VIEWER_SERVE_LAG_MS", "");
+            app.rfStop = false;
             closeAll();
         }
 

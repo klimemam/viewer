@@ -103,10 +103,11 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 | F14 | export と報告面 | `framestats`, `export`, `export-tsv`, `roi-export` | 画面の数値と export の数値・単位・由来情報が一致し、ROI、stack、series、比較側を取り違えない |
 | F15 | UI を伴う機能 | [UI 検証仕様](ui.md) | 操作、レイアウト、表示文字列まで含む項目は UI 仕様の該当行を満たす |
 
-### 4.1 phase④ の受け入れ条件（未実装）
+### 4.1 phase④ の受け入れ条件
 
-次は現行 selftest の合格条件ではなく、[tasks.csv](../tasks.csv) の #230 phase④ 行を
-実装するときに追加する条件である。
+次は #230 phase④ で実装した境界と mixed Series 操作を、今後の selftest で
+継続して保つための合格条件である。[tasks.csv](../tasks.csv) は実行済みの
+統合試験と完了記録を追跡する。
 
 - mixed Series の Move / Close は stack と standalone frame の全memberへ作用し、順序・identity・
   同一batch不変条件を保つ。Close後は全memberが消え、無関係controlとrole-refを壊さない

@@ -305,17 +305,18 @@ harness の木 (§4.11) に足すもの:
   の meta に `reader` を足している先例)。set の provenance の「計算者」欄
   (analysis-layers.md §8) はこれで埋まる。
 
-**現実装の境界 (#230 phase ④):** `Series([Frame(...), ...])` は正典でも
-Reader の木でも合法で、木の検査も series の frame 子を受け入れる。しかし現行
-viewer は着地後の series メンバ登録で `seqId` を持つ stack 子だけを拾い、
-standalone frame 子の `frameUid` を登録しないため、その frame は series から
-落ちる。phase ④ で `frameUid` と条件値を同じ順序で登録するまでは、Reader の
-frame-series が end-to-end で保存されるとは主張しない。
+**現実装の境界 (#230 phase ④):** `Series([Frame(...), Stack(...)])` は正典でも
+Reader の木でも合法。着地時に standalone Frame は `frameUid`、Stack は `seqId` を
+持つ member として条件値と同じ宣言順で登録し、session も種類と順序を保つ。
+Series 自身は raw tensor / layout を持たず、画素は必ず Frame / Stack member に置く。
 
-**版**: set を含む stream / viewer-npz **だけ**が `__viewer 2` を名乗る。
-含まなければ 1 のまま — set の無いファイルの互換は1ミリも動かない。旧 viewer
-は「自分より新しい版は読まずに断る」(§4.11.1) ので、set が黙って落ちた
-不完全な復元は起きない — 断られるのは仕様どおりの正しい失敗である。
+**版**: AnalysisSet 導入時の v2 writer は、set を含む stream / viewer-npz だけを
+version 2 とし、set-free は v1 のままにした。layer/layout 宣言自体はv1から存在する。
+#230 phase④ では、その既存semanticsを正しく適用できることを要求する安全世代として
+carrier v3を設けたため、**現行 writer は set の有無によらず
+NPZ / stream とも v3** を名乗る。現行 reader は v1 / v2 / v3 を読み、v1/v2 にも
+修正版の layer/layout 境界を適用する。pre-v3 reader は v3 全体を版で拒否するので、
+typed node や set を黙って落とした不完全な復元は起きない。
 
 ## 5. セッション — series ブロックの先例に従う
 
@@ -427,7 +428,7 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
 1. input-adapters.md §4.2 の「層モデルの**4語**以外の語を持ち込まない」を、
    正典の5層化 (terminology.md 適用済み) に合わせ「5語」に改めた。同 §4.11
    の予約メンバに §4 の3つ (`analysisset` / `__role_<i>` / `__refs_<i>`) と
-   版の規則 (`__viewer 2`) を足した。
+   当時の版の規則 (`__viewer 2`) を足した。
 2. terminology.md の操作マトリクスに AnalysisSet 列を足した (Close = 束縛の
    破棄・メンバ無傷、rename = 可・セッション保存、他は空欄)。§11 の適用
    パッケージと同じく、修正として明示的に。
@@ -442,6 +443,10 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
 **後続改訂 (2026-08-19, #230):** 5語を、3つの順序付きデータ層
 (`frame ≼ stack ≼ series`) と、`managed-by` / `role-ref` の2関係へ再整理した。
 2026-08-07時点の適用記録は上記のまま保持する。
+
+**後続実装 (2026-09-02, #230 phase④):** typed layer semantics を適用する
+現行 writer generation は §4 のとおり3。既存 generation 1/2 は同じ修正済み
+境界で読み、2026-08-07時点の適用記録は上記のまま保持する。
 
 ## 9. 判断record (2026-08-07 確定 — もう「待ち」ではない)
 
@@ -468,8 +473,9 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
    いれば実行可。dark を1回撮って全解析、が set の存在理由。
 7. **対象アナライザの名指し欄** — 推奨どおり**作らない**で確定 (§1.5)。
    束縛は宣言、実行は人の一手。
-8. **コンテナの版** — 推奨どおり確定 (§4)。set を含むファイルだけ
-   `__viewer 2`。set の無いファイルの互換を動かさない。
+8. **コンテナの版** — 2026-08-07時点の裁定は、set を含むファイルだけ
+   `__viewer 2` とするものだった。#230 phase④ の v3 generation 規則が後続し、
+   現行 writer は set の有無によらず3を出す (§4)。
 9. **セッションの二重宣言** — 推奨どおり **adopt** で確定 (§5.2)。真実は
    再実行側、ブロックはリネームと記録の担い手。同名禁則 (§1.4) が鍵の成立
    根拠。

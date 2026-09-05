@@ -204,6 +204,19 @@ struct FrameSource {
     // silently share pixels.
     std::vector<int64_t> npyShape;
     int npyRead = 0;                  // NpyRead; 0 = NR_NATIVE
+    // This source is one pixel node of a Viewer-NPZ / Reader materialisation.
+    // `member` cannot be used as the discriminator: in an ordinary .npz the
+    // perfectly legal array name "__pixels_0" is still an ordinary member;
+    // only the carrier's `__viewer` declaration establishes this fact.  The
+    // Inspector keeps the authoritative read-as line but does not offer a
+    // loose-.npy re-read that would lose the carrier node identity.
+    bool viewerMaterialized = false;
+    // Which declared mechanism produced the named member for session restore.
+    // Uses remote::KeyedRef::Kind values but is client-side/session provenance:
+    // Reader and NPZ may both call their arrays `__pixels_N`, locally or
+    // remotely, and a stale Reader memo must not choose between them. -1 means
+    // an ordinary non-materialised file.
+    int materializedIssuer = -1;
     // remote frames: opened as a decimated preview, replaced in place by the full
     // frame when the background fetch lands - after that, indistinguishable from
     // a local image. remoteStep > 1 means "still the preview".
@@ -228,6 +241,15 @@ struct FrameSource {
     int remoteNode = 0;
     int remoteKeyKind = 0;            // remote::KeyedRef::Kind - which protocol
                                       // number an old peer is refused from
+    // A typed materialisation has two readings which must never be collapsed:
+    // npyRead is the declaration retained for identity/session/UI, while this
+    // is what later META/TILE/MEASURE requests put on the wire. Reader caches
+    // are native on the wire because their header owns CHW/FCHW; .npz members
+    // may carry the declared read. The named layout is local-only evidence for
+    // refusing a newly connected pre-15 peer before it can return wrong axes.
+    int remoteKeyRead = 0;
+    std::string remoteKeyLayout;
+    bool remoteKeyRequires15 = false;
     std::string remoteErr;            // background fetch failed; preview is all we have
     // raw reload parameters (sessions + post-open reinterpretation; -1 = not raw)
     int rawDtype = -1, rawInterp = 0, rawOffset = 0;
@@ -461,6 +483,13 @@ inline std::string srcIdentityKey(const FrameSource& s) {
 inline bool srcShareable(const FrameSource& s) {
     if (s.path.empty() && s.remoteUrl.empty()) return false;   // montage/processed
     if (s.remoteStep > 1 || !s.remoteErr.empty()) return false;
+    // A materialisation key is part of WHICH pixels these are, but intentionally
+    // is not part of the disk identity tuple above (Reader keys include code;
+    // remote container keys include the peer's scan epoch). vnzBuild keeps
+    // peer pixels out of the registry while decimated; their step=1 landing
+    // must not sneak them back in and adopt another Reader/container result
+    // that happens to share origin + member + logical read.
+    if (!s.remoteKey.empty()) return false;
     // no disk baseline = no tuple, and local:// counts as disk: its embedded
     // path is statLocalUrl-able, so a 0/0 local:// source is one that skipped
     // the stat - refusing it here fails SAFE (no sharing) instead of letting
@@ -615,6 +644,11 @@ struct ImageDoc {
     int displayLut = -1;              // index into plugin_host::displays(), -1 = gray
     int dataRev = 0;                  // bumped on in-place pixel changes (crop)
     uint64_t uid = 0;                 // stable identity for caches (pointers ABA on reopen)
+    // One invocation of a Reader/Viewer-NPZ materialiser. Unlike FrameSource
+    // provenance this is per membership: the source registry may share pixels
+    // across repeated local opens, while a session must still restore each open
+    // as a distinct occurrence. Non-materialised documents keep zero.
+    uint64_t materializedRunId = 0;
     int seqId = 0;                    // 0 = standalone, >0 = frame of that sequence
     int seqIndex = 0;                 // position within the sequence (file number order)
     // (No pendingViewScale here any more. A preview->full swap on an off-screen
@@ -1494,6 +1528,7 @@ struct App {
     int previewPort = 0;
     int nextSeqId = 1;
     uint64_t nextUid = 1;
+    uint64_t nextMaterializedRunId = 1;
     uint64_t imagesRev = 1;           // bumped whenever the image list changes
     int seqLoadMode = 0;              // 0 = ask, 1 = always, 2 = never
     // "all stacks below": how many levels UNDER the opened folder the scan
@@ -1621,7 +1656,9 @@ struct App {
                   int cfaType = 0, cfaPattern = 0; float black = 0, white = 1;
                   int rx = 0, ry = 0, rw = 0, rh = 0; std::string exe;
                   bool hasRecipe = false; rp::RawWire recipe{};
-                  std::string key; int node = 0, keyKind = 0; };
+                  std::string key, keyLayout;
+                  int node = 0, keyKind = 0, keyedRead = 0;
+                  bool keyRequires15 = false; };
     struct MDone { uint64_t token; bool ok = false; std::string err, host;
                    remote::MeasureResult res; };
     std::thread mThread;
@@ -1947,8 +1984,10 @@ struct App {
         // would fetch the whole .npz as one array and get a refusal, or - for a
         // reader - the origin's own pixels under the reader's label, which is
         // the failure protocol 12's version gate exists to prevent.
-        std::string key, member;
-        int node = 0, keyKind = 0;
+        std::string key, member, keyLayout;
+        int node = 0, keyKind = 0, keyedRead = 0;
+        bool keyRequires15 = false;
+        uint64_t materializedRunId = 0;
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -1966,8 +2005,10 @@ struct App {
         int npyRead = 0;              // the reading it was fetched under, back
         int remoteProto = 0;          // from the job: a minted sibling records
         std::vector<int64_t> npyShape;// the same three facts its head does
-        std::string key, member;      // ...and which array of a materialisation
-        int node = 0, keyKind = 0;    // it is, for the same reason (see RFetchJob)
+        std::string key, member, keyLayout; // ...and which array/materialisation
+        int node = 0, keyKind = 0, keyedRead = 0; // + its wire axes (see RFetchJob)
+        bool keyRequires15 = false;
+        uint64_t materializedRunId = 0;
         // ...and what float32 cost THESE samples, measured on the worker where
         // the peer's exact bytes still existed. It cannot be recomputed on the
         // UI thread - by then the only copy is the float one.

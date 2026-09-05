@@ -119,7 +119,11 @@ cmake --build build-mingw
 **通常はサーバ側の手作業は不要です。** 初回接続時は次の順で
 `~/.viewer/viewer-serve` を準備します。
 
-1. 既に動く protocol 14 以上の peer があればそのまま使う
+1. 既に動く protocol 15 の peer があればそのまま使う。protocol 14 は通常の
+   remote image/measure と既存 v1/v2 の canonical Reader carrier には互換だが、
+   現行 Reader writer は安全世代 v3 を常に出すため、新しい Reader 実行には peer の
+   更新が必要。v3 を v2 へ黙ってdowngradeしない。typed CHW/FCHW と blank-layout
+   narrow Stack の wire 自体も protocol 15 が必要で、旧peerには送信前に理由を表示する
 2. 手元の配布物／ビルドツリーにサーバ OS 用 `viewer-serve` があれば、ssh の標準入力で
    `.new` へ送り、実行権を付けて置き換える。**サーバ側の git / network は不要**
 3. 手元に対象バイナリが無い場合だけ、サーバ側の git + network で `binaries`
@@ -332,9 +336,9 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 | **Move to batch** | **全メンバが一緒に**動きます |
 | (メンバ 1 本だけを Move to batch) | そのメンバは series から**外れます**。禁止はせず、画面で告げます |
 
-> **現行実装差分。** standalone frame メンバを含む series では、Move / Close が
-> stack だけを処理して frame を取り残す。上表が正典であり、phase④ で
-> `moveSeriesToBatch` / `closeSeries` と回帰試験を修正する。
+> **実装済み (2026-09-02)。** standalone frame メンバを含む series でも、
+> `moveSeriesToBatch` / `closeSeries` は上表どおり全メンバを扱う。
+> stack だけを処理して frame を取り残さないことを回帰試験で固定した。
 
 Files パネルでは batch 見出しの下に series が先に並び、メンバ行は**値が先頭**に出ます
 (`100 lx · 10lx/frame_000‥023.npy`、未設定なら `value unset · …`)。series に属さない stack は
