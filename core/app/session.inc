@@ -936,13 +936,30 @@ static long long rectOverlap(const WinRect& a, const WinRect& b) {
 //   * the size is clamped to that work area either way, so a window sized on a
 //     4K screen never comes up larger than the panel it is restored onto.
 //
+// positionsKnown is false where the platform has no window POSITIONS to speak
+// of - Wayland, where a client may neither read nor set where it is, so the
+// saved x/y are zeros and every monitor's work area may be reported at the
+// origin. The overlap arithmetic above is then meaningless (a saved rectangle
+// "overlaps" whichever monitor happens to be first), and running it would
+// answer a question about placement that this platform does not have. What is
+// still true, and is exactly the half of #257 the user saw, is that the SIZE
+// must fit: it is clamped against the first monitor's work area - GLFW promises
+// the primary monitor is first - and no position is ever returned.
+//
 // Returns true when the caller should apply r.x/r.y as well as r.w/r.h. Pure,
-// and tested that way (--newwin-selftest N8): a monitor set that no longer
-// contains the saved rectangle is the case nobody can reproduce by hand later.
-static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work) {
+// and tested that way (--newwin-selftest N8, --uiscale-selftest U6): a monitor
+// set that no longer contains the saved rectangle is the case nobody can
+// reproduce by hand later.
+static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work,
+                           bool positionsKnown = true) {
     r.w = std::max(r.w, WIN_MIN_W);
     r.h = std::max(r.h, WIN_MIN_H);
     if (work.empty()) return false;          // nothing answered: keep the size, place it nowhere
+    if (!positionsKnown) {                   // Wayland: the size still has to fit
+        r.w = std::min(r.w, work[0].w);
+        r.h = std::min(r.h, work[0].h);
+        return false;
+    }
     size_t best = 0;
     long long bestOv = 0;
     for (size_t i = 0; i < work.size(); i++) {
@@ -1008,6 +1025,12 @@ static void writePrefsTo(std::ostream& f) {
     f << "linunit " << app.lin.unit << "\n";
     f << "gamma " << displayGammaText(g_prefsBaseActive ? g_prefsBase.dispGamma
                                                          : app.dispGamma) << "\n";
+    // #257. The REQUEST, not the resolved scale: 0 means "work it out from the
+    // display", and writing back the 2.0 that was worked out would turn an
+    // automatic choice into a permanent one the first time this file is saved -
+    // and the next display would then be wrong with nothing saying it had ever
+    // been automatic.
+    f << "uiscale " << fmtExact(app.uiScaleOverride) << "\n";
     f << "grid " << ((g_prefsBaseActive ? g_prefsBase.showGrid : app.showGrid) ? 1 : 0)
       << "\n";
     f << "frame " << app.frameMode << "\n";
@@ -1150,6 +1173,18 @@ static void loadPrefs() {
             float gamma = 0;
             if ((ls >> candidate) && displayGammaValue(candidate, gamma))
                 app.dispGamma = gamma;
+        }
+        // #257. Validated on the way IN, not clamped: a prefs.txt somebody
+        // hand-edited to 12 is not a scale this program can draw at, and the
+        // honest answer to a value it cannot use is the automatic one it would
+        // have used anyway. A file written before this key existed has no such
+        // line, so an upgrading user gets 0 = automatic, which is exactly the
+        // behaviour they already had.
+        else if (key == "uiscale")     {
+            double candidate = 0;
+            if ((ls >> candidate) &&
+                (candidate == 0 || uiScaleOverrideValid((float)candidate)))
+                app.uiScaleOverride = (float)candidate;
         }
         else if (key == "grid")        { ls >> v; app.showGrid = v != 0; }
         else if (key == "frame")       { ls >> app.frameMode;

@@ -1226,6 +1226,9 @@ viewer [options] [files...]
   --stack <ask|always|never> 1枚開いたときの連番兄弟の扱い(フォルダ Open には効かない)
   --mem-budget <GB>          連番ローダが握ってよい量(既定 auto = 物理 RAM の 60%)
   --frame <system|integrated>  タイトルバー: OS のもの / メニューバー統合(既定は前回値)
+  --ui-scale <f>             UI をどれだけ大きく描くか。0 = ディスプレイに訊いて決める
+                             (既定)、それ以外は 0.5 〜 4。settings.jsonc の
+                             appearance.uiScale にこの起動だけ勝つ(§10a)
   --settings-template        手で編集する settings.jsonc の雛形を標準出力へ(§8a)
                              全キーを出し、既定値の行はコメントにします。ファイルは書きません
   ssh://user@host/path.npy   リモートのファイルを開く
@@ -1250,6 +1253,7 @@ viewer [options] [files...]
 | 症状 | 対処 |
 |---|---|
 | Linux でファイルダイアログが開かない | `zenity` か `kdialog` をインストール(D&D は常に可) |
+| 文字が巨大 / ウィンドウが画面に収まらない (Linux) | `viewer --ui-scale 1` で起動。定着させるなら `settings.jsonc` に `appearance.uiScale`(§10a) |
 | ウィンドウを動かせない / 枠が変 | `viewer --frame system` で OS のタイトルバーに戻して起動(`View > Integrated title bar` でも切替。設定は保持されます) |
 | 日本語ファイル名が「?」になる | CJK フォント導入(Ubuntu: `fonts-noto-cjk`)。起動時トーストで警告 |
 | Bayer の crop 位置が 1px ずれる | 仕様: CFA 周期(2/4px)へのスナップ。パターン破壊防止 |
@@ -1294,6 +1298,39 @@ viewer [options] [files...]
 です。EXR には「小さくて正直なリーダ」という選択肢が無いため、そちらを
 取りました。vendor 化や CI キャッシュでこの制約は消せますが、それは別の判断
 です。
+
+### 10a. UI の大きさ — HiDPI と Wayland (#257)
+
+**既定は自動**で、ふつうは何もしなくて構いません。UI の拡大率は、ウィンドウ
+座標が**物理ピクセルか論理ピクセルか**で決まります —— X11 と Windows は物理
+なのでアプリが自分で拡大し、macOS と **Wayland** は論理(platform 側が既に
+拡大している)のでアプリ側の拡大率は 1 です。ここを OS 名で分けていたために、
+Wayland セッションでは**アプリと platform が二重に拡大**していました
+(200% 表示のノート PC で文字も余白も 4倍、復元したウィンドウは画面からはみ出す)。
+
+起動すると **stderr に1行**出ます。どちらの経路を通ったかはこれで分かります:
+
+```
+ui scale: platform=wayland content=2.00 -> ui 1.00 font 2.00 (auto)
+```
+
+自動判定が合わない環境(XWayland + `Xft.dpi`、分数スケール、リモートデスクトップ)
+には**手動の逃げ道**があります。値は 0.5 〜 4、`0` は「ディスプレイに訊いて決める」
+に戻す指定です。範囲外は名指しで断って自動に戻します(勝手に丸めません)。
+
+| どこに書くか | 効き方 |
+|---|---|
+| `viewer --ui-scale 1.25` | **この起動だけ**。試すときはこれ |
+| `settings.jsonc` の `appearance.uiScale` | 常に。`prefs.txt` に勝ち、`--ui-scale` に負けます |
+| `File > Preferences...` の `appearance.uiScale` 行 | `prefs.txt` に保存。**反映は次回起動から**(フォントはウィンドウ生成時に一度だけ焼くので、その旨 toast で出ます) |
+
+アイコンから起動している場合は、`tools/install_shortcut.sh` が作った
+`~/.local/share/applications/viewer.desktop` の `Exec=` 行に
+`--ui-scale 1.25` を足せば、そのランチャからの起動に効きます
+(`settings.jsonc` に書けば起動方法によらず効くので、ふつうはそちらが楽です)。
+
+修正が届くまでの**その場しのぎ**も残しておきます: `WAYLAND_DISPLAY= ./viewer`
+で X11/XWayland バックエンドに倒す、または「Ubuntu on Xorg」でログインする。
 
 ## 11. ショートカット全表
 

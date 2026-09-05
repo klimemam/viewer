@@ -49,6 +49,7 @@ win64\install_shortcut.cmd                                    :: Windows
 | タスクバーに常駐 | 一度起動 → タスクバーのボタンを右クリック → **ピン留め** |
 | ファイルを開く | `.npy` / `.raw` を**ショートカットにドロップ**(起動後のウィンドウへの D&D も可) |
 | **サーバ直結のショートカット** | `install_shortcut.cmd -RemoteHost user@server -RemotePath /data/run42`<br>(Linux/macOS は `--host user@server --path /data/run42`)。起動と同時に接続し、**Browse パネル**にそのフォルダが出ます |
+| **UI が大きすぎる / 小さすぎる (Linux)** | 拡大率は既定で自動です。合わないときは `viewer --ui-scale 1.25` で試し、`settings.jsonc` の `appearance.uiScale` に書くか、`~/.local/share/applications/viewer.desktop` の `Exec=` 行へ足してください([manual §10a](manual.md)) |
 
 パスを省くとホーム(`~`)を開きます。`.npy` を指定すればその画像を直接開きます。
 

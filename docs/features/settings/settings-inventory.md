@@ -474,8 +474,14 @@ measuring 級の設定は、この規則と**構造的に衝突しうる唯一�
     "titleBar": "integrated",     // "integrated" | "system"
     "showFps": false,
     "pixelGrid": false,
-    "displayGamma": 1.0           // 0より大きい有限値。1.0 / 2.2 はプリセット
+    "displayGamma": 1.0,          // 0より大きい有限値。1.0 / 2.2 はプリセット
                                   // 表示だけに適用し、測定値は変えません
+    "uiScale": 0                  // UI をどれだけ大きく描くか。0 = ディスプレイに
+                                  // 訊いて決める(既定)、それ以外は 0.5 〜 4。
+                                  // 範囲外は行・列を名指しで断り、自動に戻します
+                                  // (判断8: 12 と書いた人は 4 を望んでいない)。
+                                  // 反映は次回起動から —— フォントはウィンドウ
+                                  // 生成時に一度だけ焼くので (#257)
   },
 
   "input": {
@@ -852,14 +858,31 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 §10.7 は stage 1 当時の「まだ」であり、現在形ではない。現在は JSONC reader、
 `File > Preferences...`、出所バッジ、Copy as JSONC / Copy template、
 `loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
-`loading.folderScanDepth` まで実装されている。`SETTING_KEYS` の現行照合は
-**27 Read / 5 Later / 2 NotHere = 34行**。`prefs.txt` は
-`writePrefsTo` が28キーを書き、`loadPrefs` が互換入力を含む30キーを読む。
+`loading.folderScanDepth`、`appearance.uiScale` まで実装されている。
+`SETTING_KEYS` の現行照合は **28 Read / 5 Later / 2 NotHere = 35行**。`prefs.txt` は
+`writePrefsTo` が29キーを書き、`loadPrefs` が互換入力を含む31キーを読む。
+
+`appearance.uiScale` (#257) は他のキーと**判定の形が違う**ので、ここに1段落置く。
+値は「UI を何倍で描くか」で、**0 = ディスプレイに訊いて決める**が既定。自動側が
+決めているのは **OS 名ではなく座標系**である —— ウィンドウ座標が物理ピクセルの
+platform (X11 / Win32) では倍率をアプリが持つが、論理座標の platform
+(Cocoa / **Wayland**) では platform 側が既に掛けているので、アプリの倍率は 1 で
+なければならない。Wayland がここで X11 側に倒れていたのが #257 (200% のノート PC
+で 4倍)。このキーはその判定が外れる環境 —— XWayland + Xft.dpi、分数スケール、
+リモートデスクトップ —— のための手動の逃げ道で、`--ui-scale <f>` が同じ意味で
+1回の起動だけ勝つ。範囲は 0.5 〜 4 で、外れた値は判断8 どおり**行・列を名指しで
+断り、自動に戻す**(clamp しない)。反映は次回起動 —— スタイルの拡大とフォント
+アトラスの焼き込みはウィンドウ生成時の一度きりなので、パネルの行はその旨を
+toast で言う。起動時に stderr へ1行、
+`ui scale: platform=wayland content=2.00 -> ui 1.00 font 2.00 (auto)` が出るので、
+次に同種の報告が来たらログで即答できる。
 
 出所は通常の `default` / `this machine` / `settings.jsonc:<line>` /
 `command line (--flag)` に、gamma と grid だけ `session (.vsession)` が加わる。
-現行 `--settings-selftest` の台帳は O1–O5、行モデルとコピーは W1–W5、
-memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。§10 の22キー、27書き/29読み、
+現行 `--settings-selftest` の台帳は O1–O6 (O6 が `appearance.uiScale`: ファイル /
+範囲外の拒否 / 0 / フラグが勝つ)、行モデルとコピーは W1–W5、
+memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。
+拡大率の決定そのものは `--uiscale-selftest` が持つ (純関数の表 + 復元窓のクランプ)。§10 の22キー、27書き/29読み、
 「Preferences 未実装」は、いずれもその時点の履歴として残している。
 
 ただし「キーを読む」と「Preferences から完全に扱える」はまだ同義ではない。
@@ -878,7 +901,7 @@ phase④ で閉じる現行差分は次のとおり。
 - 最初の有効な `.vsession` header 後の gamma/grid だけが下位 prefs 値を別に保持する。
   それ以外は、別のGUI設定を保存したときに App 上の File/CLI 実効値まで
   `prefs.txt` へ焼き付く余地がある。
-- CLI 出所台帳は `--stack` / `--remote-policy` / `--remote-exe` だけで、
+- CLI 出所台帳は `--stack` / `--remote-policy` / `--remote-exe` / `--ui-scale` で、
   `--frame` / `--mem-budget` は同じ5層表示へまだ接続されていない。
 
 未実装の設定そのものは、stage 1 から継続する `state.json`、`loading.raw`、

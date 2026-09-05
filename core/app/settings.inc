@@ -419,6 +419,11 @@ enum SKey {
     // #204: how far "all stacks below" reaches. A key is appended HERE, at the
     // end, which is why SK_Count exists - see it.
     SK_scanDepth,
+    // #257: the manual way out when the display's own answer is wrong. Appended
+    // at the end for the reason above; its ROW sits with the other appearance
+    // keys, because the table's order is what the user reads and the enum's
+    // order is only what the ledgers index by.
+    SK_uiScale,
     // The end marker, and it is not bookkeeping. The origin ledger and the
     // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
     // used to be SK_defaultUnit - the last id on the day they were written. Any
@@ -453,6 +458,10 @@ static const SKeyDef SETTING_KEYS[] = {
     { SK_showFps,     "appearance.showFps",      SS_Read, nullptr, "true" },
     { SK_pixelGrid,   "appearance.pixelGrid",    SS_Read, nullptr, "true" },
     { SK_gamma,       "appearance.displayGamma", SS_Read, nullptr, "2.2" },
+    // #257. 0 is the default AND a meaning of its own ("work it out from the
+    // display"), so the sample is deliberately a real multiplier: the schema
+    // walk has to feed this row a number that actually lands.
+    { SK_uiScale,     "appearance.uiScale",      SS_Read, nullptr, "1.5" },
 
     { SK_dragPans,    "input.dragPans",          SS_Read, nullptr, "true" },
     { SK_wheelZoom,   "input.wheelZoomPlain",    SS_Read, nullptr, "true" },
@@ -995,6 +1004,23 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             A.setF(app.dispGamma, gamma, path);
             break;
         }
+        case SK_uiScale: {
+            double n = 0;
+            if (!A.wantNum(v, path, n)) break;
+            // 0 means "work it out from the display" and is the default; every
+            // other value has to be one this program can actually draw at.
+            // REFUSED rather than clamped, the displayGamma / memoryBudgetGB
+            // rule (判断8): a file that asked for 12 meant something, and
+            // quietly giving it 4 answers a question it did not ask.
+            const float s = (float)n;
+            if (n != 0 && !uiScaleOverrideValid(s)) {
+                A.rangeErr(v, path, "0 (work it out from the display) or 0.5 .. 4");
+                break;
+            }
+            A.setF(app.uiScaleOverride, n == 0 ? 0.0f : s, path);
+            if (app.uiScaleOverride > 0) g_uiScaleOverrideHow = "appearance.uiScale";
+            break;
+        }
         case SK_dragPans:    { bool b; if (A.wantBool(v, path, b)) A.setB(app.dragPans, b, path); break; }
         case SK_wheelZoom:   { bool b; if (A.wantBool(v, path, b)) A.setB(app.wheelZoomPlain, b, path); break; }
         case SK_fitOnSwitch: { bool b; if (A.wantBool(v, path, b)) A.setB(app.fitOnSwitch, b, path); break; }
@@ -1411,6 +1437,12 @@ static SWidget settingsWidgetFor(SKey id) {
             return SW_Bool;
         case SK_accent: case SK_memBudget: case SK_scanDepth:
             return SW_Int;
+        // #257. A multiplier, so a float box rather than the gamma control's
+        // presets: there is no pair of blessed values here - what is right is
+        // whatever this display and these eyes want - and 0 has to remain
+        // typeable, because 0 is how the row is handed back to the machine.
+        case SK_uiScale:
+            return SW_Float;
         // series.defaultUnit is a free string, not an enumeration: the
         // applier accepts any name that fits (a lab measures in whatever it
         // measures in), so a combo would refuse units the file accepts.
@@ -1472,6 +1504,15 @@ static int* prefIntField(SKey id) {
         // below - so the row cannot sit there showing 40 while walks use 16.
         case SK_scanDepth: return &app.folderScanDepth;
         default:           return nullptr;
+    }
+}
+// ...and the one key that is a MULTIPLIER (#257). Separate from prefIntField
+// for the reason the panel needs: 1.25 is a perfectly ordinary answer here and
+// an InputInt cannot hold it.
+static float* prefFloatField(SKey id) {
+    switch (id) {
+        case SK_uiScale: return &app.uiScaleOverride;
+        default:         return nullptr;
     }
 }
 static std::string* prefTextField(SKey id) {
@@ -1554,6 +1595,24 @@ static void prefAfterChange(SKey id) {
         // be the "I set it and nothing happened" this panel exists to end.
         case SK_scanDepth:
             app.folderScanDepth = std::clamp(app.folderScanDepth, 1, 16);
+            break;
+        // #257, the same shape one more time: an InputFloat has no bounds, so
+        // the control's answer is put back inside the window the file enforces.
+        // 0 survives the clamp on purpose - it is the way BACK to automatic,
+        // and a row that could not be handed to the machine again would be a
+        // one-way door. And the change does NOT take effect now: the style is
+        // scaled and the glyphs are baked once, while the window is being made.
+        // Saying so is the point - a control that silently did nothing is the
+        // "I set it and nothing happened" this panel exists to end.
+        case SK_uiScale:
+            if (app.uiScaleOverride != 0)
+                app.uiScaleOverride = std::clamp(app.uiScaleOverride,
+                                                 UI_SCALE_MIN, UI_SCALE_MAX);
+            toast(app.uiScaleOverride == 0
+                      ? "UI scale is back to automatic at the next start."
+                      : "UI scale " + fmtExact(app.uiScaleOverride) +
+                        " takes effect at the next start (the font is baked once, "
+                        "while the window is being created).");
             break;
         case SK_titleBar:
             window_frame::setMode(app.frameMode == 1 ? window_frame::Integrated
@@ -1676,6 +1735,11 @@ static std::string settingsCurrentValue(SKey id) {
         // beside the row instead of leaving "0" to explain itself (M3).
         case SK_memBudget:
             return app.memBudgetGB == 0 ? "" : fmtExact(app.memBudgetGB);
+        // #257, and 0 is the default AND a meaning ("work it out from the
+        // display") for memoryBudgetGB's exact reason - the two coincide, so
+        // empty here still means "not set" as it does on every other row.
+        case SK_uiScale:
+            return app.uiScaleOverride == 0 ? "" : fmtExact(app.uiScaleOverride);
         case SK_watchFiles: return app.watchEnabled ? "" : "false";
         case SK_watchAuto:  return app.watchAutoReload ? "true" : "";
         // 6 is the built-in default (#204), so 6 writes nothing: 判断9 keeps

@@ -772,6 +772,14 @@ struct App {
     bool showGrid = false;
     float dispGamma = 1.0f;           // positive finite; presets are 1.0 and 2.2
     float uiScale = 1.0f;
+    // appearance.uiScale / --ui-scale (#257): 0 = work it out from the display,
+    // anything else is the multiplier to draw the UI at. NOT uiScale above -
+    // that one is the RESOLVED figure this run is actually drawing with, and it
+    // is the same number whether it was detected or asked for. Kept apart so
+    // prefs.txt and the Preferences row carry the REQUEST: writing back the
+    // resolved 2.0 would turn "let the machine decide" into "always 200%", and
+    // the next display would be wrong with no way to tell it was ever automatic.
+    float uiScaleOverride = 0.0f;
     int themeVariant = ui_theme::VariantDark;   // View > Theme
     int themeAccent = 0;                        // index into ui_theme::accents()
     std::string toast; double toastUntil = 0; bool toastErr = false;
