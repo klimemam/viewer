@@ -166,3 +166,4 @@ identity、状態、文字列を観測する。値を出せるようになった
 
 - [2026-08-03 ステージ1 機能検証](results/20260803-functional.md)
 - [2026-08-04 機能 probe 検証](results/20260804-functional-probes.md)
+- [2026-09-08 #230 phase④ model boundary 検証](results/20260908-model-boundaries.md)
