@@ -120,7 +120,15 @@ cmake --build build-mingw
 **通常はサーバ側の手作業は不要です。** 初回接続時は次の順で
 `~/.viewer/viewer-serve` を準備します。
 
-1. 既に動く protocol 14 以上の peer があればそのまま使う
+1. 既に動く protocol 15 以上の peer があればそのまま使う。
+   [Issue #242](https://github.com/klimemam/viewer/issues/242) のユーザー裁定B
+   (2026-09-08、CLOSED) により、現行Readerのwriter / readerはcarrierをexact-v3とする。
+   writerは内容に関係なくv3を出し、readerはv3だけを受け入れ、v1/v2/v4以上はtree/pixelsの
+   前に全体拒否する。phase④生成物は未リリースなので、native-only / set-freeの新規生成物も
+   旧readerでは開けず、v1/v2草案も現行readerでは開けない互換コストを受け入れた。
+   carrierを黙ってdowngradeしない。protocol 14のselftest seamはwire能力だけを模倣するため、
+   canonicalなv3はprotocol 14 wireでも通り得る。このcarrier版門とは別に、typed CHW/FCHWと
+   blank-layout narrow Stackのwireはprotocol 15以上を必要とし、旧peerには送信前に理由を表示する
 2. 手元の配布物／ビルドツリーにサーバ OS 用 `viewer-serve` があれば、ssh の標準入力で
    `.new` へ送り、実行権を付けて置き換える。**サーバ側の git / network は不要**
 3. 手元に対象バイナリが無い場合だけ、サーバ側の git + network で `binaries`
@@ -333,9 +341,9 @@ series が持つのは**パラメータ名**・**単位**・**種類**(linearity
 | **Move to batch** | **全メンバが一緒に**動きます |
 | (メンバ 1 本だけを Move to batch) | そのメンバは series から**外れます**。禁止はせず、画面で告げます |
 
-> **現行実装差分。** standalone frame メンバを含む series では、Move / Close が
-> stack だけを処理して frame を取り残す。上表が正典であり、phase④ で
-> `moveSeriesToBatch` / `closeSeries` と回帰試験を修正する。
+> **実装済み (2026-09-02)。** standalone frame メンバを含む series でも、
+> `moveSeriesToBatch` / `closeSeries` は上表どおり全メンバを扱う。
+> stack だけを処理して frame を取り残さないことを回帰試験で固定した。
 
 Files パネルでは batch 見出しの下に series が先に並び、メンバ行は**値が先頭**に出ます
 (`100 lx · 10lx/frame_000‥023.npy`、未設定なら `value unset · …`)。series に属さない stack は

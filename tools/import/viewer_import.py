@@ -132,16 +132,50 @@ def _check_cfa(layer, cfa):
 
 
 def _check_layout(layer, layout, shape):
+    """Validate the v1 layer/layout pair, not just the layout spelling.
+
+    Empty layout is the layer's canonical axis order.  The only transposed
+    declarations in v1 are Frame/CHW and Stack/FCHW; a Series tensor has no
+    layout because its member kind cannot be recovered from one whole-array
+    axis declaration.
+    """
+    if not isinstance(layout, str):
+        raise TypeError("%s: layout must be a string" % layer)
+    allowed = {"Frame": "CHW", "Stack": "FCHW", "Series": ""}
+    want_layout = allowed[layer]
     if not layout:
         return
     if layout not in LAYOUTS:
-        raise ValueError('%s: layout "%s" is not known -- layout is %s, and only '
-                         'for arrays whose axes are transposed'
+        raise ValueError('%s: layout "%s" is not known -- layout is %s'
                          % (layer, layout, " or ".join(sorted(LAYOUTS))))
+    if layout != want_layout:
+        if layer == "Series":
+            raise ValueError('%s: layout "%s" is not allowed -- a Series tensor '
+                             'has no layout in v1; pass Frame / Stack members '
+                             'that declare their own layout' % (layer, layout))
+        raise ValueError('%s: layout "%s" belongs to %s, not %s -- %s accepts '
+                         'layout="%s" only'
+                         % (layer, layout,
+                            "Stack" if layout == "FCHW" else "Frame", layer,
+                            layer, want_layout))
     want = LAYOUTS[layout]
     if len(shape) != want:
         raise ValueError('%s: layout "%s" needs a %d-D array but shape is %s'
                          % (layer, layout, want, shape))
+
+
+def _check_channels(layer, layout, shape):
+    """The viewer's display boundary is C=1..4 for typed input too."""
+    if layer == "Frame":
+        c = 1 if len(shape) == 2 else shape[0] if layout == "CHW" else shape[2]
+    elif layer == "Stack":
+        c = 1 if len(shape) == 3 else shape[1] if layout == "FCHW" else shape[3]
+    else:
+        return
+    if c < 1 or c > 4:
+        order = layout or ("HWC" if layer == "Frame" else "FHWC")
+        raise ValueError('%s: layout "%s" reads C=%d from shape %s -- the viewer '
+                         'accepts C=1..4' % (layer, order, c, shape))
 
 
 def _check_meta(layer, meta):
@@ -170,7 +204,7 @@ def _check_range(layer, rng, per, per_word, inner=None):
         raise TypeError("%s: range must be (lo,hi) or an array of them" % layer)
     if per is None:
         forms = "(lo,hi)"
-    elif per_word == "stack":                   # a series: one per stack, or per frame too
+    elif per_word in ("stack", "member"):      # a series: one per member, or per frame too
         forms = "(lo,hi), (S,2) or (S,R,2)"
     else:
         forms = "(lo,hi) or (F,2)"
@@ -275,9 +309,8 @@ class Values:
 class Frame:
     """One image.  (H,W) is single channel, (H,W,C) is C channels.
 
-    C is not restricted here: a frame has no frame axis, so there is nothing for
-    it to be confused with.  (3,H,W) as a Frame means three channels only if you
-    also say layout="CHW"; on its own it is three frames -- write Stack(arr).
+    C is 1..4, the viewer's display boundary.  (3,H,W) means three channels only
+    with layout="CHW"; without it a 3-D Frame is always read as (H,W,C).
     """
 
     pixels: Any
@@ -292,12 +325,13 @@ class Frame:
 
     def __post_init__(self):
         shape = _require_shape("Frame", "pixels", self.pixels)
+        _check_layout("Frame", self.layout, shape)
         if len(shape) not in (2, 3):
             raise ValueError("Frame: shape %s is not a frame -- Frame takes (H,W) "
                              "or (H,W,C)" % (shape,))
         _require_numeric("Frame", "pixels", self.pixels)
         _check_cfa("Frame", self.cfa)
-        _check_layout("Frame", self.layout, shape)
+        _check_channels("Frame", self.layout, shape)
         _check_range("Frame", self.range, None, "frame")
         object.__setattr__(self, "meta", _check_meta("Frame", self.meta))
 
@@ -342,12 +376,13 @@ class Stack:
 
     def __post_init__(self):
         shape = _require_shape("Stack", "pixels", self.pixels)
+        _check_layout("Stack", self.layout, shape)
         if len(shape) not in (3, 4):
             raise ValueError("Stack: shape %s is not a stack -- Stack takes (F,H,W) "
                              "or (F,H,W,C); one image is Frame(...)" % (shape,))
         _require_numeric("Stack", "pixels", self.pixels)
         _check_cfa("Stack", self.cfa)
-        _check_layout("Stack", self.layout, shape)
+        _check_channels("Stack", self.layout, shape)
         _check_range("Stack", self.range, shape[0], "frame")
         object.__setattr__(self, "meta", _check_meta("Stack", self.meta))
         if self.timestamps is not None:
@@ -370,13 +405,16 @@ class Stack:
 
 # ---------------------------------------------------------------------- Series
 
-@dataclass(frozen=True, eq=False, repr=False)
+_UNSET = object()
+
+
+@dataclass(frozen=True, eq=False, repr=False, init=False)
 class Series:
     """Stacks (or frames) taken with one condition varied.  `conditions` is required.
 
     Pass a sequence of Stack / Frame, or one array:
 
-        (S,H,W[,C])     S conditions, one frame each
+        (S,H,W)         S conditions, one frame each
         (S,R,H,W[,C])   S conditions, R repeats each
 
     The condition belongs to the series, not to the stacks inside it: that is what
@@ -384,7 +422,7 @@ class Series:
     conditions (sigma_t above all) are refused for a series.
     """
 
-    stacks: Any
+    members: Any
     conditions: Values
     name: str = ""
     note: str = ""
@@ -394,54 +432,98 @@ class Series:
 
     LAYER: ClassVar[str] = "series"
 
+    def __init__(self, members=_UNSET, conditions=_UNSET, name="", note="",
+                 meta=None, range=None, layout="", **legacy):
+        """`members` is canonical; `stacks=` remains a compatibility alias."""
+        stacks = legacy.pop("stacks", _UNSET)
+        if legacy:
+            key = next(iter(legacy))
+            raise TypeError("Series: unexpected keyword argument %r" % key)
+        if members is _UNSET:
+            if stacks is _UNSET:
+                raise TypeError("Series: missing members -- pass Frame / Stack members "
+                                "or one array")
+            members = stacks
+        elif stacks is not _UNSET:
+            raise TypeError("Series: members and legacy stacks were both given -- "
+                            "use members")
+        if conditions is _UNSET:
+            raise TypeError("Series: conditions is required")
+        object.__setattr__(self, "members", members)
+        object.__setattr__(self, "conditions", conditions)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "note", note)
+        object.__setattr__(self, "meta", meta)
+        object.__setattr__(self, "range", range)
+        object.__setattr__(self, "layout", layout)
+        self.__post_init__()
+
     def __post_init__(self):
-        members = self.stacks
+        members = self.members
         count = None
         inner = None
         if isinstance(members, (list, tuple)):
             if not members:
-                raise ValueError("Series: no stacks -- a series is a sequence of "
+                raise ValueError("Series: no members -- a series is a sequence of "
                                  "Stack / Frame, or one array")
             for i, m in enumerate(members):
                 if not isinstance(m, (Stack, Frame)):
                     raise TypeError("Series: member %d is a %s -- a series holds "
                                     "Stack or Frame (or pass one array)"
                                     % (i, type(m).__name__))
-            object.__setattr__(self, "stacks", tuple(members))
+            object.__setattr__(self, "members", tuple(members))
             count = len(members)
         else:
-            shape = _require_shape("Series", "stacks", members)
+            shape = _require_shape("Series", "members", members)
             if len(shape) not in (3, 4, 5):
                 raise ValueError("Series: shape %s is not a series -- Series takes "
                                  "(S,H,W), (S,R,H,W), (S,R,H,W,C), or a sequence "
                                  "of Stack / Frame" % (shape,))
-            _require_numeric("Series", "stacks", members)
+            if len(shape) == 5 and (shape[4] < 1 or shape[4] > 4):
+                raise ValueError("Series: canonical (S,R,H,W,C) shorthand reads "
+                                 "C=%d from shape %s -- the viewer accepts C=1..4"
+                                 % (shape[4], shape))
+            _require_numeric("Series", "members", members)
             count = shape[0]
             inner = 1 if len(shape) == 3 else shape[1]
-        object.__setattr__(self, "_stack_count", count)
-        object.__setattr__(self, "_frames_per_stack", inner)
+        object.__setattr__(self, "_member_count", count)
+        object.__setattr__(self, "_frames_per_member", inner)
 
         _check_layout("Series", self.layout, _shape_of(members) or ())
-        _check_range("Series", self.range, count, "stack", inner)
+        _check_range("Series", self.range, count, "member", inner)
         object.__setattr__(self, "meta", _check_meta("Series", self.meta))
         _check_values("Series", "conditions", self.conditions, need_name=True)
-        _check_length("Series", "conditions", self.conditions, count, "stack")
+        _check_length("Series", "conditions", self.conditions, count, "member")
 
     @property
     def shape(self):
-        return _shape_of(self.stacks) if not isinstance(self.stacks, tuple) else None
+        return _shape_of(self.members) if not isinstance(self.members, tuple) else None
+
+    @property
+    def member_count(self):
+        return self._member_count
+
+    @property
+    def frames_per_member(self):
+        """Frames per member when the series was given as one array, else None."""
+        return self._frames_per_member
+
+    # Compatibility aliases for readers written before #230.  They are views
+    # of the canonical member vocabulary, never a second source of truth.
+    @property
+    def stacks(self):
+        return self.members
 
     @property
     def stack_count(self):
-        return self._stack_count
+        return self.member_count
 
     @property
     def frames_per_stack(self):
-        """Frames in each stack when the series was given as one array, else None."""
-        return self._frames_per_stack
+        return self.frames_per_member
 
     def __repr__(self):
-        return _repr(self, "stacks=%d" % self.stack_count,
+        return _repr(self, "members=%d" % self.member_count,
                      "conditions=%r" % (self.conditions.name,))
 
 
@@ -616,7 +698,7 @@ def _self_check():
     want = {
         Frame: ["pixels", "cfa", "name", "note", "meta", "range", "layout"],
         Stack: ["pixels", "timestamps", "cfa", "name", "note", "meta", "range", "layout"],
-        Series: ["stacks", "conditions", "name", "note", "meta", "range", "layout"],
+        Series: ["members", "conditions", "name", "note", "meta", "range", "layout"],
         Batch: ["members", "name"],
         AnalysisSet: ["roles", "name", "note", "meta"],   # no range: a set has no pixels
         Ref: ["path", "member"],

@@ -9,6 +9,7 @@ static App::SeqInfo* seqInfo(int id);             // fwd - never hold what it
                                     // returns across an open/close (sequence.inc)
 static void stopSequenceLoader();                 // fwd
 static void pruneEmptyBatches();                  // fwd (defined with the moves)
+static void moveImageToBatch(int imageIdx, int batchId);  // fwd (frame member move)
 // The value a stack's NAME suggests, and the text it was read out of. Declared
 // here because the picker proposes one per group long before the linearity
 // code that defines it (the default argument lives on this declaration only).
@@ -115,7 +116,7 @@ static int removeFromSeries(int seqId) {
     return 0;
 }
 // Add a stack to a series. Fails (false) when the stack is not in the series'
-// batch - the canon's strict containment, enforced rather than papered over:
+// batch - the same-batch invariant, enforced rather than papered over:
 // the caller's answer is "Move to batch first", never "we widened the series".
 // Adding a stack that already sits in another series MOVES it (at most one).
 static bool addToSeries(int seriesId, int seqId, double value, bool include = true) {
@@ -790,11 +791,11 @@ static void pruneEmptyBatches() {
     }
 }
 
-// Move a STACK between batches - the whole stack, per the canon's containment
-// (frame ⊂ stack ⊂ batch): frames never move between batches one by one.
-// A member moved out ALONE leaves its series: series ⊂ batch is strict, and the
-// canon says say so rather than forbid it. Moving the series itself is a
-// different operation (it carries every member and its own batchId along).
+// Move a STACK between batches - the whole stack. Frames never move between
+// batches one by one. A member moved out ALONE leaves its series: every member
+// of one series has to be managed by the same batch, and the canon says say so
+// rather than forbid it. Moving the series itself is a different operation (it
+// carries every member and its own batchId along).
 static void moveStackToBatch(int seqId, int batchId) {
     if (App::Series* S = seriesOfStack(seqId))
         if (S->batchId != batchId) {
@@ -825,24 +826,34 @@ static void moveStackToBatch(int seqId, int batchId) {
     pruneEmptyBatches();
 }
 // ---- what the Files panel's series row does (docs/series-plan.md §4) --------
-// Move a SERIES between batches: every member goes with it and so does the
-// series itself, so strict containment holds at every instant. The series'
-// batchId is set FIRST on purpose - moveStackToBatch drops a member whose
-// series stays behind, which is the right rule for a lone stack and exactly
-// the wrong one here.
+// Move a SERIES between batches: every stack and standalone-frame member goes
+// with it. The series' batchId is set FIRST on purpose - the one-member move
+// functions drop a member whose series stays behind, which is the right rule
+// for a lone member and exactly the wrong one here. With the owner changed
+// first, every intermediate state still satisfies the same-batch invariant and
+// the member vector itself (order, identity, values and folds) is untouched.
 static void moveSeriesToBatch(int seriesId, int batchId) {
     App::Series* S = seriesById(seriesId);
     if (!S || batchId == 0 || S->batchId == batchId) return;
-    std::vector<int> ids;
-    for (const auto& m : S->members) ids.push_back(m.seqId);
+    const std::vector<App::Series::Member> members = S->members;
     S->batchId = batchId;
-    for (int s : ids) moveStackToBatch(s, batchId);
+    for (const auto& m : members) {
+        if (m.seqId != 0) {
+            moveStackToBatch(m.seqId, batchId);
+            continue;
+        }
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == m.frameUid) {
+                moveImageToBatch(i, batchId);
+                break;
+            }
+    }
     app.imagesRev++;
 }
 // UNGROUP (解散): take the fence away and leave everything standing. This is
-// NOT Close - nothing is discarded, every stack stays open exactly where it is
-// and merely stops being part of a sweep. The canon lists the two side by side
-// because they are different operations, not two words for one.
+// NOT Close - nothing is discarded, every member stays open exactly where it
+// is and merely stops being part of a sweep. The canon lists the two side by
+// side because they are different operations, not two words for one.
 static void ungroupSeries(int seriesId) {
     for (auto it = app.series.begin(); it != app.series.end(); ++it)
         if (it->id == seriesId) {
@@ -852,30 +863,47 @@ static void ungroupSeries(int seriesId) {
             app.series.erase(it);
             app.imagesRev++;
             toast("ungrouped \"" + n + "\": " + std::to_string(members) +
-                  " stack(s) stay open");
+                  " member(s) stay open");
             break;
         }
     if (!app.curSeriesId && !app.series.empty()) app.curSeriesId = app.series.front().id;
     aSetAuditBindings();   // a role bound to the ungrouped series says so now
 }
-// Close a series: the canon's Close, which discards the CONTENTS. Each member's
-// closeStack removes it from the series, and the last one takes the series with
-// it (pruneEmptySeries) - the erase below is only for a series whose members
-// were all gone already.
+// Close a series: the canon's Close, which discards the CONTENTS. A stack member
+// goes through closeStack and a standalone-frame member through closeImages;
+// those remove the membership too, and the last one takes the series with it
+// (pruneEmptySeries). The erase below is only for a series whose members were
+// all gone already.
 static void closeSeries(int seriesId) {
     App::Series* S = seriesById(seriesId);
     if (!S) return;
     std::string n = S->name;
-    std::vector<int> ids;
-    for (const auto& m : S->members) ids.push_back(m.seqId);
-    {   // §4, scoped to THIS user action: one scan across every member stack,
-        // so no member is called a survivor of a close that takes it too
-        std::vector<int> closing;
-        for (int s : ids)
-            for (int idx : framesOfSeq(s)) closing.push_back(idx);
-        sayCloseNotice(closing, ids, "series \"" + n + "\"");
+    const int memberCount = (int)S->members.size();
+    std::vector<int> stackIds, frameIdxs;
+    for (const auto& m : S->members) {
+        if (m.seqId != 0) {
+            stackIds.push_back(m.seqId);
+            continue;
+        }
+        // Indices are collected before anything is erased. Standalone frames
+        // are closed first below, so stack erasure cannot make them stale.
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->uid == m.frameUid) {
+                frameIdxs.push_back(i);
+                break;
+            }
     }
-    for (int s : ids) closeStack(s, false);
+    {   // §4, scoped to THIS user action: one scan across every member,
+        // so no stack or standalone frame is called a survivor of a close that
+        // takes it too.
+        std::vector<int> closing;
+        closing.insert(closing.end(), frameIdxs.begin(), frameIdxs.end());
+        for (int s : stackIds)
+            for (int idx : framesOfSeq(s)) closing.push_back(idx);
+        sayCloseNotice(closing, stackIds, "series \"" + n + "\"");
+    }
+    closeImages(frameIdxs);
+    for (int s : stackIds) closeStack(s, false);
     for (auto it = app.series.begin(); it != app.series.end(); ++it)
         if (it->id == seriesId) {
             if (app.curSeriesId == seriesId) app.curSeriesId = 0;
@@ -883,12 +911,12 @@ static void closeSeries(int seriesId) {
             app.imagesRev++;
             break;
         }
-    toast("closed series \"" + n + "\": " + std::to_string(ids.size()) + " stack(s)");
+    toast("closed series \"" + n + "\": " + std::to_string(memberCount) + " member(s)");
     aSetAuditBindings();
 }
 // "seqctx > Series > <name>": the one join that does not go through the modal.
 // A function like every other command behind a Files row, so the selftest can
-// press it. Returns false (and a reason) when strict containment refuses.
+// press it. Returns false (and a reason) when the same-batch invariant refuses.
 //
 // The value comes from the stack's NAME and is said out loud - the menu item
 // showed it before the click, and the toast repeats both the number and the text
@@ -929,7 +957,8 @@ static bool seriesJoinFromMenu(int seriesId, int seqId, std::string* msgOut) {
 }
 // A standalone frame (no stack) hangs off the batch directly and moves alone.
 // A frame MEMBER moved out alone leaves its series, exactly like a stack
-// member (series ⊂ batch is strict, and the canon says say so, not forbid).
+// member (all members of one series share a batch, and the canon says say so,
+// not forbid).
 static void moveImageToBatch(int imageIdx, int batchId) {
     if (imageIdx < 0 || imageIdx >= (int)app.images.size()) return;
     ImageDoc* d = app.images[imageIdx].get();

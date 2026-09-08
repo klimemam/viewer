@@ -103,16 +103,37 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 | F14 | export と報告面 | `framestats`, `export`, `export-tsv`, `roi-export` | 画面の数値と export の数値・単位・由来情報が一致し、ROI、stack、series、比較側を取り違えない |
 | F15 | UI を伴う機能 | [UI 検証仕様](ui.md) | 操作、レイアウト、表示文字列まで含む項目は UI 仕様の該当行を満たす |
 
-### 4.1 phase④ の受け入れ条件（未実装）
+### 4.1 phase④ の受け入れ条件
 
-次は現行 selftest の合格条件ではなく、[tasks.csv](../tasks.csv) の #230 phase④ 行を
-実装するときに追加する条件である。
+次は #230 phase④ で実装した境界と mixed Series 操作を、今後の selftest で
+継続して保つための合格条件である。[tasks.csv](../tasks.csv) は実行済みの
+統合試験と完了記録を追跡する。
 
-- mixed Series の Move / Close は stack と standalone frame の全memberへ作用し、順序・identity・
-  同一batch不変条件を保つ。Close後は全memberが消え、無関係controlとrole-refを壊さない
-- Reader由来のFrame+Stack mixed SeriesはNPZ/stream双方でkindと順序を保ち、sessionを往復する
-- typed ReaderはFrame→CHW、Stack→FCHW、`C=1..4`だけを受け、cross-layer・虚偽layout・
-  `C>4`を layer / layout / shape 付きの理由で拒否する。Seriesのkindをshapeから推定しない
+- typed Reader は Frame→CHW、Stack→FCHW、`C=1..4` だけを受け、cross-layer・虚偽
+  layout・`C>4` を layer / layout / shape 付きの理由で拒否する。Series node は raw
+  tensor / layout を持たず、member の kind を shape から推定しない
+- NPZ / streamのwriterは内容に関係なくcarrier v3を出し、readerはversion 3だけを受け入れる。
+  v1/v2の未リリース草案とv4以上はtree/pixelsを一つも作る前に生成物全体を拒否する。
+  AnalysisSetは通常のv3構造であり、固有の最小世代やinverse feature gateを持たない
+- Frame / Stack は pixels member/blob をそれぞれ exactly-one 持ち、Series は持たない。
+  missing / duplicate pixels や後続nodeだけが不正な partial declaration は、最初のdocumentを
+  作る前に生成物全体を local / remote 共通の理由で拒否する
+- protocol 15 の typed axes は双方向にgateする。clientはpre-15 peerへ該当する
+  META/TILE/MEASURE要求を送らずdocumentも作らない。protocol 15 peerはpre-15 clientへ
+  typed Reader cacheのkey/headerを発行しない。named layoutに加え、空layoutのnarrow
+  `Stack(F,H,W)` (`W<=4`)も旧native推測との衝突として扱う。
+  protocol 14 seamはwireだけを模倣してcarrier parserをv2へ戻さず、canonical v3は通り得る
+- Reader由来のFrame+Stack mixed SeriesはNPZ/stream双方でkind・順序・identityを保つ。
+  Move / Close はstackとstandalone frameの全memberへ作用し、同一batch不変条件を保ち、
+  無関係controlとrole-refを壊さない
+- session は `materializedissuer reader|npz` で入口を、`materializedrun <id>` で同一path・
+  同一issuerの呼出しoccurrenceを区別し、保存状態を別runへcross-wireしない。加算keyの無い
+  legacy sessionは従来の保守的fallbackで復元する
+- `remoteKey`を持つkeyed materialisationは`srcShareable`のpath/member registryへ載せず、
+  Reader codeやpeerのscan epochが異なる別keyの画素を同一sourceとしてadoptしない。
+  resident copyが増え得るコストよりpixel identityの正しさを優先する
+- selftestが一時的にreader memoを永続化した場合は、同じpreferences APIで開始前と終了後に
+  cleanupし、反復実行後のprefsへテスト用`readerfor`行を残さない
 
 ## 5. probe の契約
 

@@ -251,14 +251,26 @@ rp:: (core/remote_proto.h, core/serve.cpp)
 スカラはリトルエンディアンのパック、文字列は `[u32 len][bytes]`、64bit 値は
 lo/hi の u32 対。クライアントは 512MB 超の返信を、サーバは 64MB 超の要求を拒みます。
 
-**バージョン** — `rp::VERSION = 14`。HELLO で双方向に交換し、サーバはクライアントの
+**バージョン** — `rp::VERSION = 15`。HELLO で双方向に交換し、サーバはクライアントの
 版に合わせて LIST の形を選び、クライアントは機能を版で gate します。
 番号が動く理由は**枠の変更だけではありません**。v4〜v6 は応答の意味、v7〜v9 は
 測定 op と宣言された配列の読み方、v10 は画像形式、v11 は宣言付き headerless RAW、
 v12 は peer 上の reader、v13 は `.npz` member、v14 は materialise された配列の
-keyed measure を境界にします。古い peer が黙って別の画素や測定を返し得る機能は、
-client が**送る前に**版から拒否します。版ごとの理由と wire 上の差分の正典は
+keyed measure、v15 は typed Reader / container の軸と append-only の `NR_FCHW` を
+境界にします。古い peer が黙って別の画素や測定を返し得る機能は、client が
+**送る前に**版から拒否します。版ごとの理由と wire 上の差分の正典は
 `core/remote_proto.h` の `VERSION` 直前です。
+
+Readerのcontainer / streamが名乗る**carrier generation**は、このwire版とは独立する。
+[Issue #242](https://github.com/klimemam/viewer/issues/242) は2026-09-08にユーザー裁定Bで
+closedとなり、未リリースのphase④生成物には旧viewerとの後方互換を設計条件とせず、
+現行writerは内容に関係なく `__viewer 3` / `VIEWERSTREAM 3` を出力し、現行readerも
+version 3だけを受け入れる。v1/v2は未リリースの内部草案、v4以上は未対応の将来版として、
+いずれもtree/pixelsを一つも作る前に全体拒否する。native-only / set-freeの新規生成物を
+pre-v3 readerで開けず、v1/v2草案を現行readerで開けない互換コストは承認済みである。
+これはremote axesを運べるかを判定するwire protocol 15とは別の番号空間である。
+`VIEWER_SERVE_PROTOCOL=14` seamはwire能力だけを模倣し、carrier parserをv2へ戻さない。
+canonicalなv3はprotocol 14 wireでも通り得るが、typed axesはprotocol 15でgateする。
 
 | opcode | 何をするか |
 |---|---|

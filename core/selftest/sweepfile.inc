@@ -113,8 +113,8 @@
         // `cur()` on frame 0, so everything the line said used to land there
         // while `seqframe` put the user back on the representative frame,
         // looking at the decode-time defaults. Worse than a display slip: the
-        // batch moved ONE frame out of the stack, which breaks the canon's
-        // frame ⊂ stack ⊂ batch (moveStackToBatch's own invariant) and makes
+        // batch moved ONE frame out of the stack, which breaks
+        // moveStackToBatch's same-managed-by-batch invariant and makes
         // the NEXT autosave write the leaf batch and the default range back -
         // one save/load cycle and the user's grouping is silently gone.
         //

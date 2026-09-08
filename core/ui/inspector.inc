@@ -692,7 +692,7 @@ static void drawInspector() {
                 ImGui::TextDisabled("re-read as...   not from this peer");
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", rp::npyReReadTooOldText(proto).c_str());
-            } else if (opts.size() > 1) {
+            } else if (opts.size() > 1 && npyReReadAvailable(*im->src)) {
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.75f);
                 if (ImGui::BeginCombo("##reread", "re-read as...",
                                       ImGuiComboFlags_NoArrowButton)) {

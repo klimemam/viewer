@@ -23,8 +23,8 @@ void apply(int variant, int accentIdx, float uiScale, bool compact = true);
 // darkest layer so letterboxing around the canvas looks intentional.
 ImVec4 clearColor(int variant);
 
-// One ink per layer of the canon (frame ⊂ stack ⊂ series ⊂ batch), so the Files
-// tree says which kind of thing a row is without reading the name.
+// One ink per Files row kind: the data layers frame ≼ stack ≼ series, plus the
+// batch management boundary. The tree says what a row is without reading its name.
 //
 // Deliberately LOW chroma. Rule 2 of this theme is that the accent — and only
 // the accent — means "where am I / what is selected", and the accent is one of

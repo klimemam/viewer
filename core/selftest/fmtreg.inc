@@ -565,7 +565,7 @@
             std::vector<uint16_t> px((size_t)2 * 6 * 8);
             for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(500 + i);
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32(1) },
+                { "__viewer",   i32(3) },
                 { "__n",        i32(2) },
                 { "__layer_0",  str1("batch") },
                 { "__parent_0", i32(-1) },
@@ -609,7 +609,7 @@
             std::vector<uint16_t> px((size_t)6 * 8);
             for (size_t i = 0; i < px.size(); i++) px[i] = (uint16_t)(900 + i);
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32(1) },
+                { "__viewer",   i32(3) },
                 { "__n",        i32(2) },
                 { "__layer_0",  str1("batch") },
                 { "__parent_0", i32(-1) },

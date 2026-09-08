@@ -94,7 +94,7 @@
         //          > stack(2, role image)
         {
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(2) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(3) },
                 { "__layer_0",  strNpy("batch") },
                 { "__parent_0", i32Npy(-1) },
@@ -118,7 +118,7 @@
                     err.c_str(), app.analysisSets.size(), app.images.size(),
                     app.seqs.size());
             check(err.empty() && app.analysisSets.size() == 1,
-                  "A1 a set-bearing v2 container opens and lands ONE set");
+                  "A1 a set-bearing v3 container opens and lands ONE set");
             if (app.analysisSets.size() == 1) {
                 const App::ASet& S = app.analysisSets.front();
                 check(S.name == "PRNU 10lx", "A1 the set keeps its name");
@@ -150,7 +150,7 @@
         // ---- A2: default-name twins are numbered, never refused (1.4) ---------
         {
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(2) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(5) },
                 { "__layer_0",  strNpy("batch") },  { "__parent_0", i32Npy(-1) },
                 { "__layer_1",  strNpy("analysisset") }, { "__parent_1", i32Npy(0) },
@@ -177,56 +177,48 @@
                   "A2 default-name twins get numbered, schema-derived names");
         }
 
-        // ---- A3: the version rule, both directions (4) -------------------------
+        // ---- A3: one carrier generation, refused before its tree (4) -----------
         {
-            // (a) a set-free v1 container: opens exactly as before, no sets
-            std::vector<std::pair<std::string, std::vector<uint8_t>>> v1 = {
-                { "__viewer",   i32Npy(1) },
+            // The v3 control is a real, set-free tree. Lower and higher
+            // generations below differ in one scalar only, so their refusal
+            // cannot pass because the payload was malformed.
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> v3 = {
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(1) },
                 { "__layer_0",  strNpy("stack") }, { "__parent_0", i32Npy(-1) },
                 { "__pixels_0", npyB("<u2", { 3, 8, 8 }, px3.data(), px3.size() * 2) },
             };
-            std::string p1 = (adir / "a3v1.npz").u8string();
-            writeNpz2(p1, v1);
-            closeAll();
-            std::string e1 = loadNpz(p1);
-            check(e1.empty() && app.images.size() == 3 && app.seqs.size() == 1 &&
-                      app.analysisSets.empty(),
-                  "A3 a set-free v1 file round-trips unchanged (compat untouched)");
-            // (b) a v1 file CLAIMING a set: refused by name - the version gate
-            // is the old viewers' whole protection, so the converse holds too
-            std::vector<std::pair<std::string, std::vector<uint8_t>>> v1s = {
-                { "__viewer",   i32Npy(1) },
-                { "__n",        i32Npy(3) },
-                { "__layer_0",  strNpy("batch") }, { "__parent_0", i32Npy(-1) },
-                { "__layer_1",  strNpy("stack") }, { "__parent_1", i32Npy(0) },
-                { "__pixels_1", npyB("<u2", { 3, 8, 8 }, px3.data(), px3.size() * 2) },
-                { "__layer_2",  strNpy("analysisset") }, { "__parent_2", i32Npy(0) },
-                { "__refs_2",   strNpy("{\"dark\": {\"path\": \"" + jesc(darksDir) +
-                                       "\"}}") },
-            };
-            std::string p2 = (adir / "a3v1set.npz").u8string();
-            writeNpz2(p2, v1s);
-            closeAll();
-            std::string e2 = loadNpz(p2);
-            fprintf(stderr, "asetselftest: A3b err=\"%s\"\n", e2.c_str());
-            check(!e2.empty() && e2.find("version 2") != std::string::npos,
-                  "A3 a v1 file holding a set is refused, version named");
-            // (c) a version from the future is refused by name, as ever
-            std::vector<std::pair<std::string, std::vector<uint8_t>>> v3 = v1;
-            v3[0] = { "__viewer", i32Npy(3) };
             std::string p3 = (adir / "a3v3.npz").u8string();
             writeNpz2(p3, v3);
             closeAll();
             std::string e3 = loadNpz(p3);
-            check(!e3.empty() && e3.find("newer") != std::string::npos,
-                  "A3 a future version is still refused by name");
+            check(e3.empty() && app.images.size() == 3 && app.seqs.size() == 1 &&
+                      app.analysisSets.empty(),
+                  "A3 a generation-3 carrier materialises its valid control tree");
+            bool mismatchesRefused = true;
+            for (int version : { 1, 2, 4 }) {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> bad = v3;
+                bad[0] = { "__viewer", i32Npy(version) };
+                const std::string path =
+                    (adir / ("a3v" + std::to_string(version) + ".npz")).u8string();
+                writeNpz2(path, bad);
+                closeAll();
+                const std::string err = loadNpz(path);
+                mismatchesRefused = mismatchesRefused &&
+                    err == viewerNpzVersionError(version) && app.images.empty();
+            }
+            check(mismatchesRefused && viewerNpzVersionError(3).empty() &&
+                      vns::versionError(3).empty() &&
+                      !vns::versionError(1).empty() &&
+                      !vns::versionError(2).empty() &&
+                      !vns::versionError(4).empty(),
+                  "A3 NPZ and stream readers accept exactly carrier generation 3");
         }
 
         // ---- A4: Ref resolution order (2.2), all three cases -------------------
         auto setOnly = [&](const std::string& file, const std::string& refPath) {
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(2) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(1) },
                 { "__layer_0",  strNpy("analysisset") }, { "__parent_0", i32Npy(-1) },
                 { "__name_0",   strNpy("only") },
@@ -312,7 +304,7 @@
         // ---- A6: a node ref - one instance, two roles, one carriage (1.2) ------
         {
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(2) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(3) },
                 { "__layer_0",  strNpy("batch") }, { "__parent_0", i32Npy(-1) },
                 { "__layer_1",  strNpy("analysisset") }, { "__parent_1", i32Npy(0) },
@@ -355,7 +347,7 @@
             // rebuild img10 as the 3-frame stack (A4 rewrote it)
             npyWriteFile(img10, "<u2", { 3, 8, 8 }, px3.data(), px3.size() * 2);
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(2) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(3) },
                 { "__layer_0",  strNpy("batch") }, { "__parent_0", i32Npy(-1) },
                 { "__layer_1",  strNpy("analysisset") }, { "__parent_1", i32Npy(0) },
@@ -490,7 +482,7 @@
                     pxB[(size_t)f * 64 + i] = (uint16_t)(900 + f);
                 }
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",   i32Npy(1) },
+                { "__viewer",   i32Npy(3) },
                 { "__n",        i32Npy(3) },
                 { "__layer_0",  strNpy("batch") }, { "__parent_0", i32Npy(-1) },
                 { "__layer_1",  strNpy("stack") }, { "__parent_1", i32Npy(0) },

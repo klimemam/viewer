@@ -494,7 +494,8 @@
                                 name1.c_str(), RNAME);
                         ok = false;
                     }
-                    {   // frame ⊂ stack ⊂ batch, and the frame it was left on
+                    {   // every stack frame has the same managed-by batch, and
+                        // the restored selection is the frame it was left on
                         int offBatch = 0;
                         for (int idx : fr1)
                             if (!fr1.empty() && app.images[idx]->batchId !=

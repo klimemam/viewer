@@ -2167,7 +2167,7 @@
             const double COND[2] = { 1.5, 40.25 };
             const double TS[3] = { 0.0, 0.5, 1.0 };
             std::vector<std::pair<std::string, std::vector<uint8_t>>> cm = {
-                { "__viewer",              i32Npy(1) },
+                { "__viewer",              i32Npy(3) },
                 { "__n",                   i32Npy(3) },
                 { "__layer_0",             strNpy("series") },
                 { "__parent_0",            i32Npy(-1) },
@@ -2686,18 +2686,18 @@
                 FrameSource st;
                 // parent out of range: 999999 with n = 2
                 const std::string bad = write("bad.vstream",
-                    "VIEWERSTREAM 2\nn 2\nlayer 0 batch\nparent 0 -1\n"
+                    "VIEWERSTREAM 3\nn 2\nlayer 0 batch\nparent 0 -1\n"
                     "layer 1 frame\nparent 1 999999\nend\n");
                 const std::string e1 = loadViewerStream(bad, "", "bad.vstream", st);
                 // ...and a parent that is LATER than the node naming it, which
                 // the npz gate has always refused ("depth first, root 0")
                 const std::string fwd = write("fwd.vstream",
-                    "VIEWERSTREAM 2\nn 2\nlayer 0 batch\nparent 0 -1\n"
+                    "VIEWERSTREAM 3\nn 2\nlayer 0 batch\nparent 0 -1\n"
                     "layer 1 frame\nparent 1 1\nend\n");
                 const std::string e2 = loadViewerStream(fwd, "", "fwd.vstream", st);
                 // ...and a layer nothing here knows
                 const std::string lay = write("lay.vstream",
-                    "VIEWERSTREAM 2\nn 1\nlayer 0 sandwich\nparent 0 -1\nend\n");
+                    "VIEWERSTREAM 3\nn 1\nlayer 0 sandwich\nparent 0 -1\nend\n");
                 const std::string e3 = loadViewerStream(lay, "", "lay.vstream", st);
                 fprintf(stderr, "verifyselftest: V25q stream gate:\n"
                                 "  parent 999999 -> \"%s\"\n"
@@ -2759,7 +2759,7 @@
                     // the reader did not unescape, the second half would be a
                     // LAYER LINE and node 0 would stop being a frame.
                     const std::string inj = write("inj.vstream",
-                        "VIEWERSTREAM 2\nn 1\nlayer 0 frame\nparent 0 -1\n"
+                        "VIEWERSTREAM 3\nn 1\nlayer 0 frame\nparent 0 -1\n"
                         "note 0 danger\\nlayer 0 sandwich\n"
                         "pixels 0 u1 2 2 2 4\nend\n"
                         "\x01\x02\x03\x04");

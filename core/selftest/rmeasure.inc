@@ -150,7 +150,7 @@
         };
         const std::string cont = root + "/tree.npz";
         selftestWriteNpz(cont, {
-            { "__viewer",   i32(1) },                                  // entry 0
+            { "__viewer",   i32(3) },                                  // entry 0
             { "__n",        i32(4) },
             { "__layer_0",  str1("batch") },
             { "__parent_0", i32(-1) },

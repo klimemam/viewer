@@ -1,7 +1,7 @@
 # リモートのデータを手元から見る (`ssh://`)
 
 計算機に置いた大量の画像・配列を、手元のマシンの viewer から開いて測るための仕組みです。
-稼働中の機能です(プロトコル `VERSION = 14`、
+稼働中の機能です(プロトコル `VERSION = 15`、
 [core/remote_proto.h](../../../core/remote_proto.h) /
 [core/serve.cpp](../../../core/serve.cpp) / [core/remote.cpp](../../../core/remote.cpp))。
 現在の対応範囲は `.npy`、PNG、JPEG、TIFF、単一 document の OpenEXR、y4m、
@@ -339,10 +339,19 @@ viewer ssh://user@host/data/run42
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 14`、
+現時点(プロトコル `VERSION = 15`、
 [core/remote_proto.h](../../../core/remote_proto.h))の状態。
 **残っている制限だけ**を書く節です。実装済みの項目を、未実装であるかのように
 残さないでください。この節には過去にその誤記がありました。
+
+Readerのcarrier generationとremote wire protocolは別の版境界である。
+[Issue #242](https://github.com/klimemam/viewer/issues/242) は2026-09-08のユーザー裁定Bで
+CLOSEDとなり、未リリースのphase④生成物について旧viewerとの後方互換を設計条件から
+外した。現行writerは内容に関係なくcarrier v3を出力し、現行readerもv3だけを受け入れる。
+v1/v2の未リリース草案とv4以上はtree/pixelsの前に全体拒否する。pre-v3 readerが
+native-only / set-freeの新規生成物も拒否し、現行readerがv1/v2草案を拒否する互換コストを
+受け入れた。protocol 15はそれとは独立に、typed axesをMETA/TILE/MEASUREで安全に運べる
+client/peer能力をgateする。protocol 14 seamはwireだけを模倣し、carrier parserをv2へ戻さない。
 
 | 項目 | 状態 |
 |---|---|
@@ -350,7 +359,7 @@ viewer ssh://user@host/data/run42
 | **`read as` / `re-read as…`** | **実装済み**([input-adapters.md](../adapters/input-adapters.md) §3.3、protocol 9、issue #124)。META が**ファイルが宣言した shape** を運び(`MR_SHAPE` で本体の後ろに `[u32 ndim][u32 dims[4]]`)、META と TILE が**宣言された読み方**(`rp::NpyRead`)を受ける。peer 側は `serveLayout` が軸割り当てとストライドをやり直すので、`(48,40,1)` を `(F,H,W)` として読み直した TILE が**ローカルの読み直しと1画素も違わない**。古い peer は末尾を読まないため、client が HELLO の数から**送る前に断る** |
 | **ヘッダ無し RAW** | **実装済み**(protocol 11)。手元で指定したレシピ(画素フォーマット × 解釈 × 寸法)を META/TILE/MEASURE の各要求に載せ、peer が宣言どおりに読む。1クリック preview は幾何が未宣言なので行わず、正式に開くときにレシピを選ぶ |
 | **`.npz`** | **実装済み**(protocol 13)。peer はメンバの事実を列挙し、分類と picker は client のローカル経路と同じものを使う。単一 image member は picker 無しで開く。コンテナ自体には単一 geometry がないため、Browse の1クリック preview は行わない |
-| **Reader** | **stage 0〜5 実装済み**(protocol 12〜14)。Reader はファイルのある peer で走り、META/TILE と鍵付き MEASURE は materialisation の同じ生成物を参照する。鍵付き subject で現在走るのは temporal / frame ROI stats の2 op。人が読む source 名を欠く plugin analyzer / set fold と、Ref の名前空間を束縛できない set-bearing Reader の返り値は名指しで拒否する。実行には peer の `--serve-readers` が必要で、通常の viewer の ssh/local session はこのフラグを付けて起動する。standalone peer 自体の既定は閉 |
+| **Reader** | **stage 0〜5 実装済み**(protocol 12〜14)、typed CHW/FCHW は protocol 15。Reader はファイルのある peer で走り、META/TILE と鍵付き MEASURE は materialisation の同じ生成物を参照する。Frame→CHW / Stack→FCHW の named layout は local/remote で同じ軸へ転置する。carrierはwriter / readerともexact-v3で、v1/v2/v4以上はtree/pixelsの前に全体拒否する。protocol 14 seamはwireだけを模倣するためcanonical v3は通り得るが、named layoutと空layoutのnarrow `Stack(F,H,W)` (`W <= 4`) はprotocol 15を必要とする。clientはpre-15 peerへMETA/TILE/MEASUREを送らずdocumentも作らない。逆にv15 peerもpre-15 clientへtyped Readerのkey/headerを発行せず、既存cacheを壊さない。鍵付き subject で現在走るのは temporal / frame ROI stats の2 op。人が読む source 名を欠く plugin analyzer / set fold と、Ref の名前空間を束縛できない set-bearing Reader の返り値は名指しで拒否する。実行には peer の `--serve-readers` が必要で、通常の viewer の ssh/local session はこのフラグを付けて起動する。standalone peer 自体の既定は閉 |
 | **Fortran order の .npy** | **対応済み**。`NpyFile` が軸ごとの要素ストライド(`sFrame`/`sY`/`sX`/`sCh`)を持ち、C order と同じ経路で読む |
 | **`MSG_MEASURE`** | **実装済み**(`serve.cpp` `handleMeasure`)。`MOP_TEMPORAL_STATS` と `MOP_FRAME_ROI_STATS` がサーバ側で走り、結果だけが返る。タイルを引いて手元で測るのは `--remote-policy local-fetch` の経路 |
 | **`MOP_PLUGIN_ANALYZE`** | **実装済み**([abi-v3.md](../../reference/abi-v3.md) §10、protocol 7)。プラグインの **name + version が等値** のときだけ peer で走る。不一致は**両方の版を並べて拒否**し、黙って手元実行に振り替えない。frame / stack の両方に届き、返答は peer 自身の記録を provenance として運ぶ |
