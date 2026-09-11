@@ -937,7 +937,7 @@
                 fprintf(stderr, "seriesselftest: close series (%d member(s)) -> %d series, "
                                 "%d stack(s) left, toast \"%s\"\n", members,
                         (int)app.series.size(), (int)app.seqs.size(), app.toast.c_str());
-                check("Close series discards its stacks",
+                check("Close series discards its members",
                       seriesById(sid2) == nullptr &&
                       (int)app.seqs.size() == stacksBefore - members);
                 check("invariant 1: audit after Close series", audit());
@@ -1075,7 +1075,7 @@
                     if (W->members[i - 1].value > W->members[i].value) asc = false;
                 check("...and the members are in VALUE order", W && asc);
             }
-            check("a sweep forces ONE batch (series ⊂ batch beats the batch radio)",
+            check("a sweep forces ONE batch (all series members share a batch)",
                   bids.size() == 1 && W && W->batchId == bids.front());
             check("invariant 1: audit after the sweep", audit());
             // ...and the half that must NOT happen.

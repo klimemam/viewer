@@ -362,7 +362,7 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     }
     if (!spawn(*p, argv, err)) { stop(); return false; }
     alive_ = true;
-    W w; w.u32(rp::VERSION);
+    W w; w.u32((uint32_t)helloVersion_);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_HELLO, w.b, err) || !recv(type, reply, err)) {
@@ -570,6 +570,10 @@ bool Session::glob(const std::string& root, const std::string& pattern, int dept
 // two cannot drift into disagreeing about which peer is old enough.
 bool Session::readServable(int read, std::string& err) const {
     if (read == rp::NR_NATIVE) return true;
+    if (read == rp::NR_FCHW && peerVersion_ < 15) {
+        err = rp::typedAxesTooOldText(peerVersion_, "remote array", "Stack/FCHW");
+        return false;
+    }
     if (peerVersion_ >= 9) return true;
     err = rp::npyReReadTooOldText(peerVersion_);
     return false;
@@ -639,13 +643,28 @@ bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
 // v12 peer runs readers and cannot list a container, so telling its user "a
 // reader cannot run on this peer" about a native .npz would send them to fix
 // something that is not broken.
-bool Session::keyedServable(const KeyedRef& rd, const std::string& name,
+bool Session::keyedServable(const KeyedRef& rd, const std::string& name, int read,
                             std::string& err) const {
     const int need = rd.kind == KeyedRef::FromNpz ? 13 : 12;
-    if (peerVersion_ >= need) return true;
-    err = rd.kind == KeyedRef::FromNpz ? rp::npzTooOldText(peerVersion_, name)
-                                       : rp::readerTooOldText(peerVersion_, name);
-    return false;
+    if (peerVersion_ < need) {
+        err = rd.kind == KeyedRef::FromNpz ? rp::npzTooOldText(peerVersion_, name)
+                                           : rp::readerTooOldText(peerVersion_, name);
+        return false;
+    }
+    // A v12/13/14 peer accepts the key but either ignores a reader's named
+    // layout or rejects a non-native .npz reading after the request has gone.
+    // Refuse on the client before META/TILE so neither case can yield pixels
+    // under a false axis label.
+    if (peerVersion_ < 15 && (rd.requires15 || !rd.layout.empty() ||
+                              read != rp::NR_NATIVE)) {
+        std::string axes = !rd.layout.empty() ?
+            ((rd.kind == KeyedRef::FromReader ? "Reader " : "container ") + rd.layout) :
+            (rd.kind == KeyedRef::FromReader ? "Reader Stack/FHW"
+                                             : "container Stack/FHW");
+        err = rp::typedAxesTooOldText(peerVersion_, name, axes);
+        return false;
+    }
+    return true;
 }
 
 // ...and the same question asked of the file itself, before a SCAN is sent
@@ -685,7 +704,7 @@ static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
 bool Session::meta(const std::string& path, Meta& out, std::string& err, int read,
                    const rp::RawWire* rw, const KeyedRef* rd) {
     if (rd) {
-        if (!keyedServable(*rd, path, err)) return false;
+        if (!keyedServable(*rd, path, read, err)) return false;
     } else if (!readServable(read, err) || !formatServable(path, err) ||
                !recipeServable(path, rw, err)) {
         return false;
@@ -788,7 +807,7 @@ bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w,
                         int& outCh, uint32_t& dtype, std::string& err, int read,
                         const rp::RawWire* rw, const KeyedRef* rd) {
     if (rd) {
-        if (!keyedServable(*rd, path, err)) return false;
+        if (!keyedServable(*rd, path, read, err)) return false;
     } else if (!readServable(read, err) || !formatServable(path, err) ||
                !recipeServable(path, rw, err)) {
         return false;
@@ -860,7 +879,7 @@ bool Session::readerRun(const std::string& peerPath, const std::string& func,
     out = ReaderRun{};
     {
         KeyedRef probe;                 // the reader family's number, asked once
-        if (!keyedServable(probe, peerPath, err)) return false;
+        if (!keyedServable(probe, peerPath, rp::NR_NATIVE, err)) return false;
     }
     W w;
     w.str(serverPath(peerPath));
@@ -936,6 +955,8 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     // client refuses from the number, and sends no path when it does send.
     if (q.hasKeyed) {
         if (peerVersion_ < 14) { err = rp::measureKeyedTooOldText(peerVersion_); return false; }
+        if (!keyedServable(q.keyed, "remote materialisation", q.keyedRead, err))
+            return false;
         // Two subjects is not a request. A recipe declares the geometry of a
         // FILE, and what a reader or a container materialised declares its own;
         // the peer refuses the pair for META and TILE in the same words, and
@@ -1065,6 +1086,7 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     if (q.hasKeyed) {
         w.str(q.keyed.key);
         w.u32((uint32_t)std::max(0, q.keyed.node));
+        if (peerVersion_ >= 15) w.u32((uint32_t)q.keyedRead);
     }
     // the parity block, last, so that the three older ops send the same bytes
     // they always sent (remote_proto.h)

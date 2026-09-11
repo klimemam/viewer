@@ -175,7 +175,7 @@ reader は**役割名と束縛だけ**を宣言する。「この set は PRNU �
 なく既存契約で返す。生成物の不変条件 (由来を名前と note の両方に・撮った
 ものの顔をしない・セッションにはレシピ) は §5 のまま掛かる。
 
-生成物と「何から作ったか」の**機械的リンク**は v1 では作らない (判断 11)。
+生成物と「何から作ったか」の**機械的リンク**は現行範囲では作らない (判断 11)。
 入力を記録したければ、生成物と並べて set を返す形は今日から書ける:
 
 ```python
@@ -242,7 +242,7 @@ reader の返した数字を identity に使うと、reader の実行時間ぶ�
 ### 2.3 remote
 
 reader 自体は peer 側で走る (§4.13.1) が、**AnalysisSet を含む remote Reader の
-返り値は v1 の境界として拒否する**。Ref は peer の名前空間を指し、client 側の
+返り値は現行実装の境界として拒否する**。Ref は peer の名前空間を指し、client 側の
 registry / identity tuple へ安全に写す契約が未実装だからである。拒否は Reader 全体の
 登録前に処理を止め、不完全な set や member を残さない
 ([remote-reader-design.md](../remote/remote-reader-design.md) §7、`--rreader-selftest` R11)。
@@ -305,17 +305,21 @@ harness の木 (§4.11) に足すもの:
   の meta に `reader` を足している先例)。set の provenance の「計算者」欄
   (analysis-layers.md §8) はこれで埋まる。
 
-**現実装の境界 (#230 phase ④):** `Series([Frame(...), ...])` は正典でも
-Reader の木でも合法で、木の検査も series の frame 子を受け入れる。しかし現行
-viewer は着地後の series メンバ登録で `seqId` を持つ stack 子だけを拾い、
-standalone frame 子の `frameUid` を登録しないため、その frame は series から
-落ちる。phase ④ で `frameUid` と条件値を同じ順序で登録するまでは、Reader の
-frame-series が end-to-end で保存されるとは主張しない。
+**現実装の境界 (#230 phase ④):** `Series([Frame(...), Stack(...)])` は正典でも
+Reader の木でも合法。着地時に standalone Frame は `frameUid`、Stack は `seqId` を
+持つ member として条件値と同じ宣言順で登録し、session も種類と順序を保つ。
+Series 自身は raw tensor / layout を持たず、画素は必ず Frame / Stack member に置く。
 
-**版**: set を含む stream / viewer-npz **だけ**が `__viewer 2` を名乗る。
-含まなければ 1 のまま — set の無いファイルの互換は1ミリも動かない。旧 viewer
-は「自分より新しい版は読まずに断る」(§4.11.1) ので、set が黙って落ちた
-不完全な復元は起きない — 断られるのは仕様どおりの正しい失敗である。
+**版**: AnalysisSet導入時のv2 writerは、setを含むstream / viewer-npzだけをversion 2とし、
+set-freeはv1のままにした。layer/layout宣言自体はv1から存在した。いずれも未リリースの
+内部草案についての履歴であり、現行互換契約ではない。#230 phase④ではtyped semanticsを
+materialize境界まで適用する唯一の現行世代としてcarrier v3を設けた。
+[Issue #242](https://github.com/klimemam/viewer/issues/242)のユーザー裁定Bを2026-09-08に
+採用したため、**現行writerはsetの有無によらずNPZ / streamともv3を名乗り、現行readerも
+version 3だけを読む**。v1/v2およびv4以上はtree/pixelsを一つも作る前に生成物全体を拒否する。
+phase④生成物は未リリースで旧viewerとの後方互換を要求せず、set-free / native-onlyの
+新規生成物がpre-v3 readerで開けないことと、v1/v2草案を現行readerで開けないことの
+互換コストを受け入れた。このcarrier generationはremote wire protocol 15とは別の版門である。
 
 ## 5. セッション — series ブロックの先例に従う
 
@@ -427,7 +431,7 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
 1. input-adapters.md §4.2 の「層モデルの**4語**以外の語を持ち込まない」を、
    正典の5層化 (terminology.md 適用済み) に合わせ「5語」に改めた。同 §4.11
    の予約メンバに §4 の3つ (`analysisset` / `__role_<i>` / `__refs_<i>`) と
-   版の規則 (`__viewer 2`) を足した。
+   当時の版の規則 (`__viewer 2`) を足した。
 2. terminology.md の操作マトリクスに AnalysisSet 列を足した (Close = 束縛の
    破棄・メンバ無傷、rename = 可・セッション保存、他は空欄)。§11 の適用
    パッケージと同じく、修正として明示的に。
@@ -436,12 +440,18 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
    は実装と同時 (存在しない型を輸出可能と言わない)。
 
 **後続実装 (2026-08-17/18):** `viewer_import.py` は `AnalysisSet` / `Ref` を
-実装・公開し、`run_adapter.py` は `analysisset` / `__role_<i>` / `__refs_<i>` と
-`__viewer 2` を出力する。viewer と selftest も同じ契約を読む。
+実装・公開した。当時の `run_adapter.py` は `analysisset` / `__role_<i>` /
+`__refs_<i>` と `__viewer 2` を出力し、viewer と selftest も同じ契約を読んだ。
 
 **後続改訂 (2026-08-19, #230):** 5語を、3つの順序付きデータ層
 (`frame ≼ stack ≼ series`) と、`managed-by` / `role-ref` の2関係へ再整理した。
 2026-08-07時点の適用記録は上記のまま保持する。
+
+**後続実装 (2026-09-02, #230 phase④):** typed layer semanticsを適用する
+writer generationは3とした。2026-08-07時点のv1/v2適用記録は上記の非規範な履歴として
+保持する。2026-09-08の[Issue #242](https://github.com/klimemam/viewer/issues/242)
+ユーザー裁定B (CLOSED) により、現行契約はwriter / readerともexact-v3へ確定した。
+特別なAnalysisSet最小世代やinverse feature gateはなく、AnalysisSetは通常のv3構造である。
 
 ## 9. 判断record (2026-08-07 確定 — もう「待ち」ではない)
 
@@ -468,12 +478,17 @@ reader で set が作れる日に**最低限**必要な分だけを決める:
    いれば実行可。dark を1回撮って全解析、が set の存在理由。
 7. **対象アナライザの名指し欄** — 推奨どおり**作らない**で確定 (§1.5)。
    束縛は宣言、実行は人の一手。
-8. **コンテナの版** — 推奨どおり確定 (§4)。set を含むファイルだけ
-   `__viewer 2`。set の無いファイルの互換を動かさない。
+8. **コンテナの版** — 2026-08-07時点の裁定は、set を含むファイルだけ
+   `__viewer 2` とするものだった。
+   **後続裁定 (2026-09-08, [Issue #242](https://github.com/klimemam/viewer/issues/242)、
+   案B、CLOSED):** #230 phase④の現行writerはsetの有無によらずgeneration 3を出し、
+   現行readerもversion 3だけを読む (§4)。v1/v2は未リリースの内部草案であり、
+   AnalysisSet固有の最小世代やinverse feature gateを現行契約に残さない。旧viewerで新規
+   v3生成物を開けず、現行viewerでv1/v2草案を開けない互換コストを受け入れた。
 9. **セッションの二重宣言** — 推奨どおり **adopt** で確定 (§5.2)。真実は
    再実行側、ブロックはリネームと記録の担い手。同名禁則 (§1.4) が鍵の成立
    根拠。
 10. **series 役割の参照キー** — 推奨どおり (batch 名, series 名) で確定
     (§5.1)。新しい同一性を発明しない。
 11. **生成物↔set の機械的リンク** — 推奨どおり**見送り**で確定 (§1.6)。
-    v1 は note / meta の由来まで。レシピ機構 (#57 / #49 後) と一緒に。
+    現行範囲は note / meta の由来まで。レシピ機構 (#57 / #49 後) と一緒に。

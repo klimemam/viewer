@@ -193,7 +193,7 @@ inline bool peekHeader(const std::vector<uint8_t>& buf, Head& H, std::string& er
 // bytes and there may only be one answer (#221 review). The peer read
 // `__viewer`'s version with a host-order memcpy of its own, so a container
 // written big-endian - `>i4`, which numpy writes the moment its author says so
-// - was version 1 to this side and version 16777216 to the peer. The peer then
+// - was version 3 to this side and version 50331648 to the peer. The peer then
 // carried that number to the client as the file's declared version and the
 // client refused a file it opens perfectly well when the same bytes are local.
 // A header field whose meaning depends on which machine looked is not a
@@ -621,6 +621,40 @@ struct Fact {
     std::vector<uint8_t> bytes;
     bool whole = false;        // `bytes` is the entire member, values included
 };
+
+// The discriminator's VALUE, once its NAME has fixed this file to the
+// container door. Both the local reader and the peer consume the same Facts,
+// so a malformed marker cannot fall back to an ordinary NPZ on one side or be
+// rounded/truncated to a plausible version on the other. The writer's one
+// canonical spelling is a scalar i4; byte order remains the descr's choice.
+inline std::string containerVersion(const std::vector<Fact>& facts, int& version) {
+    version = 0;
+    const Fact* mark = nullptr;
+    int count = 0;
+    for (const Fact& f : facts) if (f.name == "__viewer") {
+        mark = &f;
+        count++;
+    }
+    if (count != 1)
+        return "the container has " + std::to_string(count) +
+               " __viewer members: exactly one is required";
+    if (!mark->err.empty()) return "__viewer: " + mark->err;
+    if (!mark->whole) return "__viewer must be available whole";
+    Head H;
+    std::string err;
+    if (!peekHeader(mark->bytes, H, err)) return "__viewer: " + err;
+    if (!H.shape.empty()) return "__viewer must be a 0-D scalar";
+    if (H.code != "i4")
+        return "__viewer must have dtype i4, not " + H.descr;
+    if (H.dataOff > mark->bytes.size() ||
+        mark->bytes.size() - H.dataOff < sizeof(int32_t))
+        return "__viewer is truncated";
+    const double v = elem(mark->bytes, H, 0);
+    if (v < 1 || v > 2147483647.0)
+        return "__viewer is outside the positive i4 version range";
+    version = (int)v;          // every i4 value in this range is exact in double
+    return {};
+}
 
 // A 1-D member longer than this cannot be any stack's frame axis (a served
 // stack tops out at 2^20 frames - core/serve.cpp serveLayout), so its values

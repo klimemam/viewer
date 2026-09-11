@@ -11,6 +11,16 @@
 [abi-v3.md](../../reference/abi-v3.md) §9-§10 / `include/ps/ps_plugin.h` / 上記4コミットの
 メッセージ / branch 側 `docs/python-plugins.md` §1-§9。
 
+> **後続裁定 (2026-09-08、ユーザー、[Issue #242](https://github.com/klimemam/viewer/issues/242) CLOSED):**
+> 以下の本文は 2026-08-13 時点のレビュー記録であり、当時の版規則を含めて書き換えない。
+> phase④の生成物は未リリースで旧viewerとの後方互換を要求しないため、案B——現行writerが
+> container / streamともcarrier generation 3を常時出力し、現行readerもversion 3だけを
+> 受け入れる——を採用した。v1/v2は未リリースの内部草案として現行readerが拒否し、v4以上も
+> 拒否する。native-only / set-freeの新規生成物をpre-v3 readerで開けず、v1/v2草案を現行readerで
+> 開けない互換コストを明示的に受け入れる。現行契約は
+> [input-adapters.md](../../features/adapters/input-adapters.md) §4.11.2を参照する。
+> carrier generation 3はremote wire protocol 15とは別の版門である。
+
 **前提に置いた訂正2つ (2026-08-04 検証、本文で使う数の台帳もここ):**
 
 1. **段階表の「パイプ 約0.23秒」は根拠を失っている。** 518128f 自身の実測:

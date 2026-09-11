@@ -47,7 +47,8 @@ std::vector<Series> series; int nextSeriesId = 1; int curSeriesId = 0;
 
 **`SeqInfo::level` は削除し、値は `Member::value` へ移す。** level は**単位とパラメータ名が無ければ意味を持たない量**で、それらは
 series の持ち物だから。stack に残すのは「単位はアプリで1つ、値は stack 毎」＝*暗黙の単一 series* を残すこと。値・順序・include
-を1構造体に置けば表の1行が `members[i]` に 1:1 対応し keepInc 保存も消える。値は seqId 紐づけでリネームにも並べ替えにも不変。
+を1構造体に置けば表の1行が `members[i]` に 1:1 対応し keepInc 保存も消える。値は member identity
+(`seqId` / `frameUid`) 紐づけでリネームにも並べ替えにも不変。
 
 不変条件（phase 1 の selftest で全数検査）:
 
@@ -106,19 +107,19 @@ seriesend
 
 ## 4. Files パネルの見え方（phase 4）
 
-- batch 見出しの直下に **series のサブノード**を先に並べ、その後に非メンバ stack を従来どおり**インデント無し**で置く。
+- batch 見出しの直下に **series のサブノード**を先に並べ、その後に非メンバ stack / standalone frame を従来どおり**インデント無し**で置く。
   非メンバが隠れたり下がったりしてはならない。
 - series 行 `▸ 25℃ 照度掃引   [lx] (5)`。メンバ行は1段インデントし、**ラベル先頭に値**を出す
   `  100 lx · 100lx/frame_???.npy`。未設定は `  値未設定 · …` とラベル側に（右端の dim メタに混ぜると見落とす）。順は `members`。
-- `serctx`: rename / 編集…(modal) / Move to batch(**全メンバが動く**) / **解散 (ungroup)**（series だけ消し stack は残す）
+- `serctx`: rename / 編集…(modal) / Move to batch(**全メンバが動く**) / **解散 (ungroup)**（series だけ消し全メンバは残す）
   / **Close series**（正典どおり中身ごと破棄）。後者2つは別項目・別文言で並べる。
 - `seqctx` に「Series ▸」: **同じ batch の** series 一覧（他 batch のものは無効化＋tooltip「別 batch の series。先に Move to
   batch」）、区切り、「新しい series を作る…」。メンバの Move to batch は不変条件 4 の警告付き。
 
-> **現行実装 gap / phase④。** `moveSeriesToBatch()` / `closeSeries()` は現在
-> `seqId` だけを収集し、standalone frame (`frameUid`) を移動・破棄しない。
-> 上の「全メンバ」が正典であり、mixed series の Move / Close 回帰と
-> Files / toast の `member(s)` 語彙を同じ修正で固定する。
+> **実装済み (2026-09-02)。** `moveSeriesToBatch()` / `closeSeries()` は
+> `seqId` のある stack と `frameUid` のある standalone frame の全メンバを扱う。
+> mixed series の Move / Close 回帰と Files / toast の `member(s)` 語彙も
+> 同じ修正で固定した。
 
 ## 5. picker の「掃引として開く」（phase 5）と Files 複数選択（phase 6・任意）
 

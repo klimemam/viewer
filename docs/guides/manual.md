@@ -263,7 +263,7 @@ beta_48x16.bin: opened with "MyCam 32x24" (32x24 u16 gray) - this session's reci
 - **Browse パネルでは、PNG / JPEG / TIFF / 単一 document の OpenEXR / y4m を
   `local://` と `ssh://` のどちらでも同じように扱います。** 1クリック／矢印移動は
   使い捨て preview、ダブルクリック／Enter は Files に登録する正式 open です。
-  protocol 14 の `viewer-serve` が同じ形式表と decoder を使います。
+  protocol 15 の `viewer-serve` が同じ形式表と decoder を使います。
 - **複数 named layer を持つ OpenEXR はローカルでだけ開けます。** 現行 remote wire は
   ファイル内の layer を指せないため、peer は先頭 layer を黙って返さず、理由と
   代替手順として「そのマシンで開く／手元へコピーする」と表示します。

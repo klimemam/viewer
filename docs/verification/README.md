@@ -24,6 +24,7 @@
 | 2026-08-04 | [results/20260804-functional-probes.md](results/20260804-functional-probes.md) | 機能 probe（観測点）の追試 |
 | 2026-08-04 | [results/20260804-ui-probes.md](results/20260804-ui-probes.md) | UI probe（観測点）の追試 |
 | 2026-08-17 | [results/20260817-open-with-reader-ui.md](results/20260817-open-with-reader-ui.md) | Browse「Open with reader...」の UI 検証 |
+| 2026-09-08 | [results/20260908-model-boundaries.md](results/20260908-model-boundaries.md) | #230 phase④ model boundary |
 
 現在の残課題は [tasks.csv](../tasks.csv) で管理します。現行仕様の変更は各仕様文書に、
 実装への反映状況は必要に応じて機能別の実装反映記録に記し、過去の結果とは分けます。

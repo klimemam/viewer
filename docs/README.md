@@ -72,13 +72,14 @@
 | 外部契約 | [reference/README.md](reference/README.md) | plugin ABI と analyzer |
 | 背景 | [background/README.md](background/README.md) | 完了した計画、比較、レビュー |
 
-保存済みの検証結果は、次の5回の検証実施（run）です。
+保存済みの検証結果は、次の6回の検証実施（run）です。
 
 - [verification/results/20260803-functional.md](verification/results/20260803-functional.md)
 - [verification/results/20260803-ui.md](verification/results/20260803-ui.md)
 - [verification/results/20260804-functional-probes.md](verification/results/20260804-functional-probes.md)
 - [verification/results/20260804-ui-probes.md](verification/results/20260804-ui-probes.md)
 - [verification/results/20260817-open-with-reader-ui.md](verification/results/20260817-open-with-reader-ui.md)
+- [verification/results/20260908-model-boundaries.md](verification/results/20260908-model-boundaries.md)
 
 
 再構成より前から存在する背景文書のうち、文書全体の移動（whole-file move）の
