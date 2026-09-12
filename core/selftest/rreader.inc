@@ -538,6 +538,32 @@
                 { "Stack/FCHW", "stack", "FCHW", { 2, 4, 2, 3 }, { 2, 5, 2, 3 }, 1,
                   "deadbeefdeadbe13" },
             };
+            // Literal samples make every channel, row, column and frame
+            // distinguishable. The expected display order is independent of
+            // pixelAxes/scatter and is checked in full, not merely by parity
+            // between two doors that could share the same decoding mistake.
+            const uint16_t exactHwc[] = {
+                   1,  101,  201,  301,    2,  102,  202,  302,    3,  103,  203,  303,
+                  11,  111,  211,  311,   12,  112,  212,  312,   13,  113,  213,  313,
+                1001, 1101, 1201, 1301, 1002, 1102, 1202, 1302, 1003, 1103, 1203, 1303,
+                1011, 1111, 1211, 1311, 1012, 1112, 1212, 1312, 1013, 1113, 1213, 1313,
+            };
+            const uint16_t exactChw[] = {
+                   1,    2,    3,   11,   12,   13,  101,  102,  103,  111,  112,  113,
+                 201,  202,  203,  211,  212,  213,  301,  302,  303,  311,  312,  313,
+                1001, 1002, 1003, 1011, 1012, 1013, 1101, 1102, 1103, 1111, 1112, 1113,
+                1201, 1202, 1203, 1211, 1212, 1213, 1301, 1302, 1303, 1311, 1312, 1313,
+            };
+            // RUN still publishes the carrier and issues its real key. This
+            // carried harness only copies our handwritten bytes to stdout, so
+            // Python's typed constructors cannot supply the acceptance proof
+            // for either C++ materialiser.
+            const std::string exactFiles[3] = {
+                "# R7f5 handwritten C=4 carrier\n", files[1],
+                "import shutil, sys\n"
+                "with open(sys.argv[2], 'rb') as source:\n"
+                "    shutil.copyfileobj(source, sys.stdout.buffer)\n"
+            };
             std::vector<std::string> ceilingPaths;
             for (const CeilingCase& c : ceilingCases) {
                 vns::TreeNode node;
@@ -551,6 +577,101 @@
                 check(exactErr.empty() && exactAxes.iC == c.cAxis &&
                           c.exact[(size_t)exactAxes.iC] == 4,
                       exactWhat.c_str());
+
+                const bool isStack = std::string(c.layer) == "stack";
+                const size_t frameCount = isStack ? 2 : 1;
+                const int exactRead = *c.layout ? (isStack ? NR_FCHW : NR_CHW)
+                                                : (isStack ? NR_STACK : NR_HWC);
+                const std::string exactPath =
+                    root + "/ceiling-c4-" + c.key + ".vstream";
+                ceilingPaths.push_back(exactPath);
+                std::string exactHdr = "VIEWERSTREAM 3\nn 1\nlayer 0 " +
+                    std::string(c.layer) + "\nparent 0 -1\n";
+                if (*c.layout)
+                    exactHdr += "layout 0 " + std::string(c.layout) + "\n";
+                exactHdr += "pixels 0 u2 " + std::to_string(c.exact.size());
+                for (int64_t d : c.exact) exactHdr += " " + std::to_string(d);
+                exactHdr += " " + std::to_string(frameCount * 24 * sizeof(uint16_t)) +
+                            "\nend\n";
+                {
+                    std::ofstream f(pathFromUtf8(exactPath), std::ios::binary);
+                    f.write(exactHdr.data(), (std::streamsize)exactHdr.size());
+                    const uint16_t* samples = *c.layout ? exactChw : exactHwc;
+                    f.write((const char*)samples,
+                            (std::streamsize)(frameCount * 24 * sizeof(uint16_t)));
+                }
+                auto exactShapeAndKind = [&]() {
+                    if (app.images.size() != frameCount || app.batches.size() != 1 ||
+                        !app.series.empty() || app.seqs.size() != (isStack ? 1u : 0u))
+                        return false;
+                    for (size_t f = 0; f < frameCount; f++) {
+                        const ImageDoc& d = *app.images[f];
+                        if (d.w != 3 || d.h != 2 || d.ch != 4 || !d.src ||
+                            d.src->npyShape != c.exact || d.src->npyRead != exactRead ||
+                            d.src->fileFrame != (int)f ||
+                            (isStack ? d.seqId != app.seqs[0].id : d.seqId != 0))
+                            return false;
+                    }
+                    return true;
+                };
+                auto exactPixels = [&]() {
+                    if (app.images.size() != frameCount) return false;
+                    for (size_t f = 0; f < frameCount; f++) {
+                        const auto& src = app.images[f]->src;
+                        if (!src || src->data.size() != 24) return false;
+                        for (size_t p = 0; p < 24; p++)
+                            if (src->data[p] != (float)exactHwc[f * 24 + p]) return false;
+                    }
+                    return true;
+                };
+                closeAll();
+                FrameSource exactStat;
+                const std::string exactLocal =
+                    loadViewerStream(exactPath, "handwritten.py:load", exactPath, exactStat);
+                const std::string localShapeWhat = std::string("R7f5a C=4 ") + c.name +
+                    " local carrier preserves shape, axes and Frame/Stack kind";
+                const std::string localPixelsWhat = std::string("R7f5b C=4 ") + c.name +
+                    " local carrier matches every literal channel/pixel/frame sample";
+                check(exactLocal.empty() && exactShapeAndKind(), localShapeWhat.c_str());
+                check(exactLocal.empty() && exactPixels(), localPixelsWhat.c_str());
+                closeAll();
+
+                remote::ReaderRun exactRun;
+                std::string exactRunErr;
+                const bool exactSent =
+                    ses.readerRun(exactPath, "load", exactFiles, exactRun, exactRunErr);
+                const bool exactRan = exactSent && exactRun.outcome == rp::RO_OK &&
+                    !exactRun.key.empty() && exactRun.header == exactHdr;
+                const std::string runWhat = std::string("R7f5c C=4 ") + c.name +
+                    " real peer RUN accepts the identical v3 carrier and issues its key";
+                check(exactRan, runWhat.c_str());
+                const std::string exactUrl = "local://" + exactPath;
+                const std::string exactPeer = exactRan
+                    ? remoteReaderLand(exactUrl, "handwritten.py:load", "", exactRun)
+                    : "the C=4 peer RUN did not succeed";
+                bool peerIdentity = exactRan && app.images.size() == frameCount;
+                for (size_t f = 0; f < app.images.size() && peerIdentity; f++) {
+                    const auto& src = app.images[f]->src;
+                    peerIdentity = src && src->remoteUrl == exactUrl &&
+                        src->remoteKey == exactRun.key && src->remoteNode == 0 &&
+                        src->remoteFrame == (int)f &&
+                        src->remoteKeyKind == remote::KeyedRef::FromReader &&
+                        src->remoteKeyLayout == c.layout && src->remoteStep == 1;
+                }
+                const std::string peerShapeWhat = std::string("R7f5d C=4 ") + c.name +
+                    " peer materialisation preserves shape, kind and issued-key identity";
+                const std::string peerPixelsWhat = std::string("R7f5e C=4 ") + c.name +
+                    " peer materialisation matches every literal channel/pixel/frame sample";
+                check(exactPeer.empty() && exactShapeAndKind() && peerIdentity,
+                      peerShapeWhat.c_str());
+                check(exactPeer.empty() && exactPixels(), peerPixelsWhat.c_str());
+                if (!exactLocal.empty() || !exactRan || !exactPeer.empty())
+                    fprintf(stderr, "rreaderselftest:   C=4 %s local=\"%s\" "
+                                    "RUN=\"%s\" peer=\"%s\" stderr=\"%s\"\n",
+                            c.name, exactLocal.c_str(), exactRunErr.c_str(),
+                            exactPeer.c_str(), exactRun.stderrText.c_str());
+                closeAll();
+                forgetReader(exactUrl);
 
                 uint64_t badBytes = 2;
                 std::string badDecl = "pixels 2 u2 " + std::to_string(c.over.size());
