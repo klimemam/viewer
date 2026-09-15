@@ -795,6 +795,14 @@ static void drawPanelProjection() {
     // panel, hiding the single-frame limitation exactly where numbers are read.
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
+    int tablePlanes = 0;
+    projForEachRow([&](const App::ProjState&, const char*, int) { ++tablePlanes; });
+    const int tableRows = wide ? tablePlanes : tablePlanes * (int(app.showProjH) + int(app.showProjV));
+    // ScrollX's default height is the REMAINING window space. At a larger UI
+    // scale that can be zero, so scrolling the panel never reveals its rows.
+    // Give the table its content height; the containing panel scrolls vertically.
+    const float tableH = (ImGui::GetTextLineHeight() + 2 * ImGui::GetStyle().CellPadding.y) *
+                         (tableRows + 1) + ImGui::GetStyle().ScrollbarSize + 2;
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
         // sigma_v = sigma of the row means    (horizontal banding / row FPN)
@@ -804,7 +812,8 @@ static void drawPanelProjection() {
         // drawn wrong. It went out of step when "mean" was added back.
         int wCols = (anySide ? 1 : 0) + 1 + 12;
         if (ImGui::BeginTable("projstatw", wCols, ImGuiTableFlags_SizingFixedFit |
-                                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+                                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX,
+                              ImVec2(0, tableH))) {
             if (anySide)
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
@@ -887,7 +896,8 @@ static void drawPanelProjection() {
     {
     int nCols = (anySide ? 3 : 2) + 7;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
-                                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+                                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX,
+                          ImVec2(0, tableH))) {
         // one row per (side, axis, plane). The table's axis is the QUANTITY, so
         // A and B cannot be a column pair here - they are rows, and the side
         // column says which is which (docs/features/compare/ab-stats-plan.md 4).
