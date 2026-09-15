@@ -58,6 +58,7 @@ static std::string g_deriveSelftest;    // --derive-selftest <dir>: derive stack
 static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean as a frame, exit
 static std::string g_precisionSelftest; // --precision-selftest <dir>: the u32/i32/f64 values a
                                         // float32 cannot hold, and what is shown for them, exit
+static bool g_profileNoiseSelftest = false; // single-frame banding/pixel ratios
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -672,6 +673,7 @@ static void printUsage() {
         "  --video-selftest            a stack written as a lossless video (#253): the\n"
         "                              AVI container, the refusals, and that a video\n"
         "                              frame IS the PNG export of that frame\n"
+        "  --profile-noise-selftest    single-frame horizontal/vertical banding ratios\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
         "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
@@ -905,6 +907,8 @@ static void parseCli(int argc, char** argv) {
             g_stackAvgSelftest = next();           // handled in main()
         } else if (a == "--precision-selftest") {
             g_precisionSelftest = next();          // handled in main()
+        } else if (a == "--profile-noise-selftest") {
+            g_profileNoiseSelftest = true;
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {

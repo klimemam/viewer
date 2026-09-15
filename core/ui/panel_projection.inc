@@ -8,6 +8,50 @@
 // cured of, unguarded here because no probe existed to assert it.
 static std::string g_projSideProbe;
 
+// Both clipboard surfaces use these same values and availability statements.
+// H/V here name the direction of the BANDING, not the profile's plot axis.
+static std::string projNoiseStatus(const App::ProjState& P, int plane) {
+    if (plane < 0 || plane >= P.nSeries || plane >= 4)
+        return "unavailable: pooled planes";
+    const auto& n = P.noise[(size_t)plane];
+    if (!n.valid()) return n.reason();
+    std::string s = n.ratioValid() ? "ok" : "unavailable: RN = 0";
+    if (n.clamped()) {
+        s += "; negative variance clamped:";
+        if (n.pClamped) s += " pixel";
+        if (n.rowClamped) s += " row";
+        if (n.colClamped) s += " column";
+    }
+    s += "; " + std::to_string(n.width) + "x" + std::to_string(n.height) +
+         " plane pixels, full ROI";
+    return s;
+}
+
+static std::string projNoiseValue(const App::ProjState& P, int plane,
+                                  bool row, bool display = false) {
+    if (plane < 0 || plane >= P.nSeries || plane >= 4) return "-";
+    const auto& n = P.noise[(size_t)plane];
+    if (!n.ratioValid()) return "-";
+    char buf[80];
+    const double value = row ? n.rowRatio() : n.colRatio();
+    if (display && app.projDecimals >= 0)
+        snprintf(buf, sizeof buf, "%.*f", std::clamp(app.projDecimals, 0, 6), value);
+    else snprintf(buf, sizeof buf, display ? "%.6g" : "%.9g", value);
+    return std::string(buf) + (display && n.clamped() ? "*" : "");
+}
+
+static void drawProjNoiseCell(const App::ProjState& P, int plane, bool row) {
+    textNumStr(projNoiseValue(P, plane, row, true));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s = %s / pixel residual sigma. Dimensionless.\n"
+                          "One-frame spatial estimate for a flat field, NOT a separation\n"
+                          "of fixed pattern and temporal/read noise. H/V vendor names vary.\n"
+                          "Computed from full ROI means, even when plot reduce is max/min.\n%s",
+                          row ? "HFPN/RN" : "VFPN/RN",
+                          row ? "row (horizontal banding) sigma" : "column (vertical banding) sigma",
+                          projNoiseStatus(P, plane).c_str());
+}
+
 // One side of the Projection panel: A, B, or a lettered slot. Built ONCE, above
 // everything, and the plots, the legend, the mismatch notices and the statistics
 // table all walk this one list - so the table can never give a letter numbers
@@ -259,13 +303,13 @@ static void drawPanelProjection() {
     const bool wideGuess = app.projStatLayout == 1 ||
                            (app.projStatLayout == 0 &&
                             ImGui::GetContentRegionAvail().x >=
-                                ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 10 +
-                                ImGui::GetStyle().CellPadding.x * 24);
+                                ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 12 +
+                                ImGui::GetStyle().CellPadding.x * 28);
     if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries + allRows;
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
-                 + lineH;                                  // footnote
+                 + lineH * 3;                              // statistics + ratio caveats
     if (!canOverlay) statsH += lineH;                      // the mismatch notice
     if (tooNarrow) statsH += abNarrowNoteH();
     if (!offMsg.empty())
@@ -605,11 +649,11 @@ static void drawPanelProjection() {
     // means) and spends the row axis on the SIDES instead of the axes. That is
     // the axis that has to grow: A and B are two rows today, and more slots or
     // more frames are more rows - whereas the quantities per plane are a fixed
-    // nine. Auto falls back to the per-axis rows when the nine number columns
+    // twelve. Auto falls back to the per-axis rows when the twelve number columns
     // would not fit, because a table that scrolls sideways is not a table.
     const float wideNeed = ImGui::GetFontSize() * (Bim ? 1.6f : 0.0f) +
-                           ImGui::GetFontSize() * 2.4f + numColW() * 10 +
-                           ImGui::GetStyle().CellPadding.x * 24;
+                           ImGui::GetFontSize() * 2.4f + numColW() * 12 +
+                           ImGui::GetStyle().CellPadding.x * 28;
     bool wide = app.projStatLayout == 1 ||
                 (app.projStatLayout == 0 && ImGui::GetContentRegionAvail().x >= wideNeed);
     {
@@ -709,13 +753,17 @@ static void drawPanelProjection() {
             // comment='#', which would drop exactly this line.
             tsv += "side\tch\tmean\tsigma_frame(ddof=0)\tsigma_row(ddof=1)\tsigma_col(ddof=1)\t"
                    "sigma_frame_pct(ddof=0)\tsigma_row_pct(ddof=1)\tsigma_col_pct(ddof=1)\t"
-                   "pp_frame\tpp_row\tpp_col\n";
+                   "pp_frame\tpp_row\tpp_col\tHFPN/RN(one-frame)\tVFPN/RN(one-frame)\tnoise_status\n";
+            tsv += "# HFPN/RN=row/pixel; VFPN/RN=column/pixel. Full ROI mean-based spatial "
+                   "estimates for a flat field, not separated fixed/temporal noise. "
+                   "H/V vendor names vary; ratios are dimensionless.\n";
             int nRows = 0;
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {
                 const App::ProjState::Stats& f = S.fStat[i];
                 const App::ProjState::Stats& vv = S.vStat[i];
                 const App::ProjState::Stats& hh = S.hStat[i];
-                if (!f.valid && !hh.valid && !vv.valid) return;
+                // Retain an all-invalid plane: the noise cells explain why
+                // the measurement is unavailable instead of hiding its row.
                 char b[512];
                 auto n6 = [](const App::ProjState::Stats& st, double v, char* out, size_t cap) {
                     if (st.valid) snprintf(out, cap, "%.9g", v);
@@ -728,10 +776,11 @@ static void drawPanelProjection() {
                 n6(f, f.pp, pf, sizeof pf);  n6(vv, vv.pp, pv2, sizeof pv2); n6(hh, hh.pp, ph, sizeof ph);
                 // a stale side's numbers carry the caveat INTO the paste - a
                 // dimmed pixel does not survive the clipboard, the word does
-                snprintf(b, sizeof b, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                snprintf(b, sizeof b, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
                          side, sideIsStale(side) ? " (stale)" : "",
                          S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph);
-                tsv += b;
+                tsv += std::string(b) + "\t" + projNoiseValue(S, i, true) + "\t" +
+                       projNoiseValue(S, i, false) + "\t" + projNoiseStatus(S, i) + "\n";
                 nRows++;
             });
             ImGui::SetClipboardText(tsv.c_str());
@@ -742,16 +791,29 @@ static void drawPanelProjection() {
                               "with a provenance line. Full precision - the decimals\n"
                               "setting only affects the display.");
     }
+    // Before the scrolling table: a footer after it can sit below the visible
+    // panel, hiding the single-frame limitation exactly where numbers are read.
+    ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
+                       "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
+    int tablePlanes = 0;
+    projForEachRow([&](const App::ProjState&, const char*, int) { ++tablePlanes; });
+    const int tableRows = wide ? tablePlanes : tablePlanes * (int(app.showProjH) + int(app.showProjV));
+    // ScrollX's default height is the REMAINING window space. At a larger UI
+    // scale that can be zero, so scrolling the panel never reveals its rows.
+    // Give the table its content height; the containing panel scrolls vertically.
+    const float tableH = (ImGui::GetTextLineHeight() + 2 * ImGui::GetStyle().CellPadding.y) *
+                         (tableRows + 1) + ImGui::GetStyle().ScrollbarSize + 2;
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
         // sigma_v = sigma of the row means    (horizontal banding / row FPN)
         // sigma_h = sigma of the column means (vertical striping / column FPN)
-        // side? + ch + the ten value columns below - keep this equal to the
+        // side? + ch + the twelve value columns below - keep this equal to the
         // number of TableSetupColumn calls or ImGui asserts and the table is
         // drawn wrong. It went out of step when "mean" was added back.
-        int wCols = (anySide ? 1 : 0) + 1 + 10;
+        int wCols = (anySide ? 1 : 0) + 1 + 12;
         if (ImGui::BeginTable("projstatw", wCols, ImGuiTableFlags_SizingFixedFit |
-                                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+                                                  ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX,
+                              ImVec2(0, tableH))) {
             if (anySide)
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
@@ -779,10 +841,13 @@ static void drawPanelProjection() {
                                           "p-p frame", "p-p row", "p-p col" };
             for (int c = 0; c < 10; c++)
                 ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("HFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("VFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
             ImGui::TableHeadersRow();
             // the header abbreviations are not self-evident, and this table is
             // the one people will read numbers off into a report
-            if (ImGui::TableGetHoveredColumn() >= (anySide ? 2 : 1))
+            if (ImGui::TableGetHoveredColumn() >= (anySide ? 2 : 1) &&
+                ImGui::TableGetHoveredColumn() < (anySide ? 12 : 11))
                 ImGui::SetTooltip("f = the whole region     v = the row means (horizontal banding)\n"
                                   "h = the column means (vertical striping)\n"
                                   "%% is sigma / mean.  p-p is max - min.  All values in DN.");
@@ -791,7 +856,6 @@ static void drawPanelProjection() {
                     const App::ProjState::Stats& f = S.fStat[i];
                     const App::ProjState::Stats& hh = S.hStat[i];
                     const App::ProjState::Stats& vv = S.vStat[i];
-                    if (!f.valid && !hh.valid && !vv.valid) return;
                     ImGui::TableNextRow();
                     if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
@@ -812,6 +876,8 @@ static void drawPanelProjection() {
                         ImGui::TableNextColumn();
                         if (trio[k]->valid) textStat(trio[k]->pp); else ImGui::TextDisabled("-");
                     }
+                    ImGui::TableNextColumn(); drawProjNoiseCell(S, i, true);
+                    ImGui::TableNextColumn(); drawProjNoiseCell(S, i, false);
                 }
             };
             projForEachRow([&](const App::ProjState& S, const char* side, int i) {
@@ -828,9 +894,10 @@ static void drawPanelProjection() {
         projSayPlaneMismatch();
     } else
     {
-    int nCols = (anySide ? 3 : 2) + 5;
+    int nCols = (anySide ? 3 : 2) + 7;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
-                                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX)) {
+                                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX,
+                          ImVec2(0, tableH))) {
         // one row per (side, axis, plane). The table's axis is the QUANTITY, so
         // A and B cannot be a column pair here - they are rows, and the side
         // column says which is which (docs/features/compare/ab-stats-plan.md 4).
@@ -871,22 +938,29 @@ static void drawPanelProjection() {
         ImGui::TableSetupColumn(SIGMA " (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn(SIGMA " (axis) %", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableSetupColumn("p-p (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("HFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
+        ImGui::TableSetupColumn("VFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
         ImGui::TableHeadersRow();
         auto rows1 = [&](const App::ProjState& S, const char* sideName, int s, bool horizontal) {
             {
                 const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
-                if (!st.valid) return;
                 ImGui::TableNextRow();
                 if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                 ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
-                ImGui::TableNextColumn(); textStat(st.mean);
+                ImGui::TableNextColumn();
+                if (st.valid) textStat(st.mean); else ImGui::TextDisabled("-");
                 ImGui::TableNextColumn();
                 if (S.fStat[s].valid) textStat(S.fStat[s].sd);
                 else                  ImGui::TextDisabled("-");
-                ImGui::TableNextColumn(); textStat(st.sd);
-                ImGui::TableNextColumn(); textStat(st.pct);
-                ImGui::TableNextColumn(); textStat(st.pp);
+                ImGui::TableNextColumn();
+                if (st.valid) textStat(st.sd); else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                if (st.valid) textStat(st.pct); else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                if (st.valid) textStat(st.pp); else ImGui::TextDisabled("-");
+                ImGui::TableNextColumn(); drawProjNoiseCell(S, s, true);
+                ImGui::TableNextColumn(); drawProjNoiseCell(S, s, false);
             }
         };
         auto dimmed = [&](const App::ProjState& S, const char* side, int i, bool horiz) {

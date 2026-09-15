@@ -86,6 +86,10 @@
         check(has(tsv, "sigma_frame [DN]") && has(tsv, "sigma_col [%]") &&
               has(tsv, "sigma_row [%]") && has(tsv, "mean [DN]"),
               "E1 profile/per-frame header units named");
+        check(has(tsv, "HFPN/RN [1](one-frame)\tVFPN/RN [1](one-frame)\tnoise_status") &&
+              has(tsv, "HFPN/RN=row/pixel; VFPN/RN=column/pixel") &&
+              has(tsv, "not separated fixed/temporal noise"),
+              "E1 ratio columns declare units, direction and one-frame limitation");
         // #57 judgment 2 turned this assert around. It used to require the
         // export to say "no sigma_t^2/N subtraction", which was TRUE of the
         // binary and is now false of it: the subtraction is applied to the
@@ -258,6 +262,37 @@
             size_t pat = tsv.find(prow, p2);
             check(pat != npos && pat < p3,
                   "E2 profile row R is proj[0]'s stats verbatim");
+            const std::string suffix = "\t" + projNoiseValue(P, 0, true) + "\t" +
+                                       projNoiseValue(P, 0, false) + "\t" + projNoiseStatus(P, 0);
+            const size_t pend = pat == npos ? npos : tsv.find('\n', pat + 1);
+            check(P.noise[0].valid() && pat != npos && pend != npos &&
+                  tsv.substr(pat, pend - pat).find(suffix) != npos,
+                  "E2 ratio values and status are the same Profile cache, same plane");
+        }
+
+        // E13: the exporter must retain a refused plane even when all of its
+        // older descriptive fields are invalid. This tests the cache->text
+        // boundary; profile-noise tests the pixel->cache boundary separately.
+        {
+            const auto saved = app.proj[0];
+            auto& P = app.proj[0];
+            P.fStat[0] = {}; P.hStat[0] = {}; P.vStat[0] = {};
+            P.noise[0] = {};
+            P.noise[0].status = profile_noise::Status::NonFinite;
+            P.allRow = true;
+            const std::string refused = buildTemporalExport('\t');
+            const size_t start = refused.find("== H/V profile statistics");
+            const size_t end = refused.find("== per-frame statistics");
+            const size_t at = refused.find("\nA\tR\t", start);
+            const size_t lineEnd = at == npos ? npos : refused.find('\n', at + 1);
+            const std::string row = at == npos ? "" : refused.substr(at, lineEnd - at);
+            check(at != npos && at < end &&
+                  has(row, "\t-\t-\tplane contains non-finite pixels"),
+                  "E13 all-invalid plane remains a row with explicit refusal");
+            check(has(refused, "\t-\t-\tunavailable: pooled planes"),
+                  "E13 pooled all never invents a fifth noise estimate");
+            rect(refused, start, end, "E13 refused profile section stays rectangular");
+            app.proj[0] = saved;
         }
 
         // ---- E3: partial-stack honesty (n of N against the EXPECTED total) --

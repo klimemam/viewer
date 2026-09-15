@@ -930,7 +930,8 @@ static std::string buildTemporalExport(char delim) {
               "sigma_row [DN](ddof=1)", "sigma_col [DN](ddof=1)",
               "sigma_frame [%](ddof=0)", "sigma_row [%](ddof=1)",
               "sigma_col [%](ddof=1)",
-              "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]" });
+              "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]",
+              "HFPN/RN [1](one-frame)", "VFPN/RN [1](one-frame)", "noise_status" });
     bool anyAllRow = false;
     for (const TExpSide& s : sides) {
         const App::ProjState& P = *s.proj;
@@ -942,14 +943,16 @@ static std::string buildTemporalExport(char delim) {
             const App::ProjState::Stats& f = P.fStat[i];
             const App::ProjState::Stats& vv = P.vStat[i];
             const App::ProjState::Stats& hh = P.hStat[i];
-            if (!f.valid && !hh.valid && !vv.valid) return;
+            // Invalid planes still own rows: noise_status carries the refusal.
             auto n9 = [](const App::ProjState::Stats& st, double v) {
                 return st.valid ? expNum(v) : std::string("-");
             };
             doc.row({ s.letter, P.seriesNames[i],
                       n9(f, f.mean), n9(f, f.sd), n9(vv, vv.sd), n9(hh, hh.sd),
                       n9(f, f.pct), n9(vv, vv.pct), n9(hh, hh.pct),
-                      n9(f, f.pp), n9(vv, vv.pp), n9(hh, hh.pp) });
+                      n9(f, f.pp), n9(vv, vv.pp), n9(hh, hh.pp),
+                      projNoiseValue(P, i, true), projNoiseValue(P, i, false),
+                      projNoiseStatus(P, i) });
         };
         for (int i = 0; i < P.nSeries; i++) prow(i);
         if (P.allRow) { prow(4); anyAllRow = true; }
@@ -957,6 +960,9 @@ static std::string buildTemporalExport(char delim) {
     doc.comment("sigma_frame = the whole region's own sigma; sigma_row = sigma of "
                 "the row means (horizontal banding); sigma_col = sigma of the "
                 "column means (vertical striping); % is sigma / mean; pp is max - min");
+    doc.comment("HFPN/RN=row/pixel; VFPN/RN=column/pixel. Full ROI mean-based spatial "
+                "estimates for a flat field, independent of plot reduce; not separated "
+                "fixed/temporal noise. H/V vendor names vary. noise_status reports refusals/clamps.");
     if (anyAllRow)
         doc.comment("the 'all' row pools every pixel regardless of plane - a "
                     "different measurement, never a fifth plane");
