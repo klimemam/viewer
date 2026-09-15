@@ -87,8 +87,8 @@ if (g_profileNoiseSelftest) {
           "P3 constant input has RN=0, no clamp and no invented finite ratio");
 
     for (const auto& shape : { std::pair<int, int>{1, 8}, {8, 1}, {2, 2} }) {
-        auto small = make(shape.first, shape.second);
-        const auto r = whole(*small)[0];
+        auto tiny = make(shape.first, shape.second);   // not `small`: <rpcndr.h> defines it as char on MSVC
+        const auto r = whole(*tiny)[0];
         check(r.status == Status::InsufficientPlane && !r.ratioValid(),
               "P4 degenerate 1xN/Nx1/2x2 denominator is unavailable");
     }
