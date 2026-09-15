@@ -1393,6 +1393,7 @@ viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
 # subject is dtypes no other fixture in the tree carries - and every assertion
 # is a number or the string a panel prints, so it gates on all three runners.
 viewer_selftest(precision   NOGL --precision-selftest tools/testdata)
+viewer_selftest(profile-noise NOGL --profile-noise-selftest)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # (frame-lin retired with the §3.3 migration: the frame-axis linearity fit

@@ -108,11 +108,18 @@ plane の後ろに置き `all` と表記する — pooled は別測定であり5
 ない)。列は Projection の Copy table (TSV) と同語彙:
 
 ```text
-side  ch  mean [DN]  sigma_frame [DN](ddof=0)  sigma_row [DN](ddof=1)  sigma_col [DN](ddof=1)  sigma_frame [%](ddof=0)  sigma_row [%](ddof=1)  sigma_col [%](ddof=1)  pp_frame [DN]  pp_row [DN]  pp_col [DN]
+side  ch  mean [DN]  sigma_frame [DN](ddof=0)  sigma_row [DN](ddof=1)  sigma_col [DN](ddof=1)  sigma_frame [%](ddof=0)  sigma_row [%](ddof=1)  sigma_col [%](ddof=1)  pp_frame [DN]  pp_row [DN]  pp_col [DN]  HFPN/RN [1](one-frame)  VFPN/RN [1](one-frame)  noise_status
 ```
 
 - 値は `App::ProjState`(A/B/slot 毎)の `fStat/vStat/hStat` を**そのまま**読む。
   reduce モード(mean/max/min)はセクション見出しに明記。
+- 末尾の2比は同じ状態の `noise` キャッシュを読む。`HFPN/RN=σ_row/σ_p`、
+  `VFPN/RN=σ_col/σ_p` の無次元・1枚推定値
+  ([flat-field-stats.md (a)](../analysis/flat-field-stats.md))。
+  **全 ROI の平均ベース**であり、reduce に追従せず、左の未補正 profile σ を割った値でもない。
+  `noise_status` にプレーン寸法・クランプ成分または算出不可の理由を残す。
+  RN=0 / 非有限値 / 退化領域 / 縮小 preview / 未実体化 / pooled `all` は `-`。
+  平坦画像を前提とし、固定成分と時間成分を分離していないことを注記する。
 - 行の順序は side-major 固定(A の plane 全部 → B の…)。画面の
   `order` トグルは表示の都合であり、ファイルは常に同じ順で出る。
 

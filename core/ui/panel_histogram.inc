@@ -788,6 +788,9 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     P.img = im; P.uid = im->uid; P.dataRev = im->dataRev;
     P.mode = app.projMode; P.cfa = im->cfa; P.cfaPattern = im->cfaPattern;
     P.rx = rx; P.ry = ry; P.rw = rw; P.rh = rh; P.roiUsed = roiUsed;
+    // Always a mean-based decomposition of this frame/ROI, independent of the
+    // plot's reduce mode. Do not combine the orthogonally strided plot samples.
+    P.noise = computeProfileNoise(*im, rx, ry, rw, rh);
 
     bool cfa = im->ch == 1 && im->cfa != 0;
     static const char* CFA_N[4] = { "R", "Gr", "Gb", "B" };

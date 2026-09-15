@@ -35,6 +35,7 @@
 #include "../ui_theme.h"             // ui_theme::VariantDark
 #include "../remote.h"               // remote::Session / Entry / ScanGroup / GlobHit / MeasureResult
 #include "../remote_proto.h"         // rp::F32Loss - what float32 cost THESE pixels
+#include "../profile_noise.h"        // one-frame row/column-to-pixel noise estimates
 #include "../adapter.h"              // adapter::Run (App::ReaderJob)
 #include "../watch.h"                // watch::Finding - what Watch has CONFIRMED
                                      // about a stack's files (watch-design §4)
@@ -45,6 +46,7 @@
                                      // App::BrowseInstance reference is unchanged
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -2506,6 +2508,9 @@ struct App {
         // profile sigmas without it is reading a ratio with no denominator -
         // and it is the third quantity the row/column noise split needs.
         Stats fStat[5];
+        // Full, coherent per-plane ROI samples: the plotted H/V profiles may
+        // stride DIFFERENT pixels, so their statistics cannot feed this split.
+        std::array<profile_noise::Result, 4> noise;
         bool allRow = false;              // slot 4 holds the plane-mixed row
         bool roiUsed = false;
     } proj[2];                        // 0 = A, 1 = B (compare)

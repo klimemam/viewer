@@ -229,6 +229,7 @@ static std::string fmtVal(float v, const std::string& dtype) {
 #include "ui/canvas.inc"
 #include "ui/panel_preferences.inc"
 #include "ui/inspector.inc"
+#include "app/profile_noise.inc"
 #include "ui/panel_histogram.inc"
 #include "ui/panel_projection.inc"
 #include "ui/modal_series.inc"
@@ -1311,6 +1312,7 @@ int main(int argc, char** argv) {
     // and after it because stackavg's "a sum float32 cannot carry" fixture is
     // the nearest neighbour this claim has in the tree.
     #include "selftest/precision.inc"
+    #include "selftest/profile-noise.inc"
 
     #include "selftest/abstats.inc"
 

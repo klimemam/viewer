@@ -788,6 +788,15 @@ compare 中は同じ表に **`A` / `B` / `A-B`** の列が増えます(§3b)。
 ROI を選択している間はその ROI の値になります(未選択なら画像全体)。
 ROI ごとの mean/std/`std / mean [%]`/min/max は **ROIs** パネルの表です。
 
+**Projection > profile statistics** の `HFPN/RN` / `VFPN/RN` は、表示中の1枚の
+横縞(行) / 縦縞(列)成分を、画素残差成分で割った無次元の比です。
+選択 ROI (なければ全面)をプレーン別・全画素で測り、plot reduce が max/min でも
+比の計算は平均ベースです。**平坦画像向けの1枚推定値で、固定ノイズと時間ノイズの
+分離ではありません。** H/V の呼び方はベンダにより異なります。
+`*` は負の分散推定を0にクランプした印。RN=0、小さすぎる ROI、NaN/Inf、
+縮小 remote preview、未実体化画素、pooled `all` 行は `-` とし、ホバーで理由を確認できます。
+Copy table (TSV) と Temporal の統合エクスポートにも、2比と `noise_status` が入ります。
+
 `std / mean [%]` は **その行の σ ÷ その行の mean × 100**(表に出ている σ と mean そのもの。
 間引いて測っていればその標本の比)。**1枚・dark 補正なし・flat 補正なし**なので時間ノイズ
 込みであり、固定パターンとしては**上界**にしかなりません。EMVA が言う PRNU は frame を
