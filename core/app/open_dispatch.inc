@@ -2430,8 +2430,8 @@ static void remoteTreeRefine(const std::string& url, const std::vector<VnzNode>&
 // TILE is one logical frame in HWC byte order.  Most arrays declare that same
 // order (HW/HWC/FHW/FHWC), so their frame is already one contiguous span in
 // the rebuilt C-order .npy and must stay the one-memcpy path this code had
-// before typed layouts.  CHW/FCHW put C before H and genuinely need the sample
-// scatter.  Returning true makes that performance decision directly testable
+// before typed layouts.  CHW/FCHW with multiple channels put C before H and
+// need the sample scatter; C=1 is contiguous. Returning true makes that decision testable
 // without a wall-clock threshold.
 static bool scatterRemoteTileToDeclaration(
         std::vector<uint8_t>& out, size_t pre, const std::vector<uint8_t>& raw,
@@ -2441,7 +2441,7 @@ static bool scatterRemoteTileToDeclaration(
     const bool sameOrder =
         stride[(size_t)iW] == (size_t)tch &&
         stride[(size_t)iH] == (size_t)tw * (size_t)tch &&
-        (iC < 0 || stride[(size_t)iC] == 1) &&
+        (iC < 0 || tch == 1 || stride[(size_t)iC] == 1) &&
         (iF < 0 || stride[(size_t)iF] == frameElems);
     if (sameOrder) {
         const size_t dst = iF >= 0 ? (size_t)frame * stride[(size_t)iF] : 0;
@@ -2530,8 +2530,8 @@ static bool remoteKeyedArray(const std::string& url, const remote::KeyedRef& ref
     const size_t pre = writeNpyHeaderFor(out, npyDt, dec);
     out.resize(pre + elems * esz);
     // C-order strides in the declaration's own order. TILE is HWC per logical
-    // frame. Matching declarations retain one memcpy per frame; only CHW/FCHW
-    // is scattered back to the position the rebuilt .npy header declares.
+    // frame. Matching declarations (including C=1 CHW/FCHW) retain one memcpy
+    // per frame; multi-channel CHW/FCHW is scattered into declaration order.
     std::vector<size_t> stride(rank, 1);
     for (size_t k = rank; k-- > 1; ) stride[k - 1] = stride[k] * (size_t)dec[k];
     for (int64_t f = 0; f < wantF; f++) {

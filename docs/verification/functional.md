@@ -112,6 +112,10 @@ ctest --test-dir build -C Release -R '^selftest\.<name>$' -V
 - typed Reader は Frame→CHW、Stack→FCHW、`C=1..4` だけを受け、cross-layer・虚偽
   layout・`C>4` を layer / layout / shape 付きの理由で拒否する。Series node は raw
   tensor / layout を持たず、member の kind を shape から推定しない
+- `C=4` は Frame/HWC・Frame/CHW・Stack/FHWC・Stack/FCHW の実carrierをlocalとpeer経由で
+  開き、宣言kind・寸法・全channelの全画素が独立した期待値と一致する
+- remote TILE の連続した画素は1 frameにつき1回の一括コピーで復元する。`C=1` の
+  CHW/FCHWもこの経路を使い、複数channelの転置は全画素のbyte一致で検査する
 - NPZ / streamのwriterは内容に関係なくcarrier v3を出し、readerはversion 3だけを受け入れる。
   v1/v2の未リリース草案とv4以上はtree/pixelsを一つも作る前に生成物全体を拒否する。
   AnalysisSetは通常のv3構造であり、固有の最小世代やinverse feature gateを持たない
@@ -167,3 +171,4 @@ identity、状態、文字列を観測する。値を出せるようになった
 - [2026-08-03 ステージ1 機能検証](results/20260803-functional.md)
 - [2026-08-04 機能 probe 検証](results/20260804-functional-probes.md)
 - [2026-09-08 #230 phase④ model boundary 検証](results/20260908-model-boundaries.md)
+- [2026-09-12 #259 typed channel 検証](results/20260912-typed-channels.md)

@@ -433,6 +433,13 @@
                         exact = false;
                 return exact;
             };
+            // A single channel has no inter-channel transpose even when the
+            // declaration spells CHW/FCHW.  Check the path as well as bytes,
+            // prefix guards, and the nonzero FCHW frame destination.
+            check(bulkScatterCase(3, 2, 1, -1, 1, 2, 0, { 6, 3, 1 }),
+                  "R26a0b C=1 CHW uses one memcpy with exact bytes and guards");
+            check(bulkScatterCase(3, 2, 1, 0, 2, 3, 1, { 6, 6, 3, 1 }),
+                  "R26a0c C=1 FCHW uses one memcpy at the correct frame offset");
             const bool allBulk =
                 bulkScatterCase(3, 2, 1, -1, 0, 1, -1, { 3, 1 }) &&       // HW
                 bulkScatterCase(3, 2, 2, -1, 0, 1, 2, { 6, 2, 1 }) &&     // HWC
@@ -463,7 +470,7 @@
             for (size_t i = scatterPre; i < scatterPre + scatterRaw.size(); i++)
                 fchwExact = fchwExact && scatterOut[i] == 0xa5;
             check(fchwExact,
-                  "R26a1 FCHW alone takes the transpose loop and preserves every bit");
+                  "R26a1 multi-channel FCHW takes the transpose loop and preserves every bit");
 
             const bool ropen = openRemoteNpz(urlOf(typed), std::string());
             bool rshape = ropen && app.images.size() == 3 &&
