@@ -723,6 +723,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // saveViewPng, selectImage - exists by now.
 #include "selftest/video.inc"
 
+// The open WORKER (#232 stage 2). Beside video for the same reason: a function,
+// its own fixtures, and everything it drives - openPath, pumpOpenJob,
+// openJobPhase, closeAll, the source registry - exists by now.
+#include "selftest/asyncopen.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -1266,6 +1271,13 @@ int main(int argc, char** argv) {
     // decision is a pure function and this asserts it as one.
     if (g_uiScaleSelftest) return uiScaleSelftest();
     if (g_videoSelftest) return videoSelftest();
+
+    // The open worker (#232 stage 2): openPath returns with nothing read, the
+    // loop runs while the reading happens, pumping lands what the synchronous
+    // door lands, Stop leaves nothing - and the scripted default still opens
+    // synchronously, without which the other four prove nothing. Windowless for
+    // the videoSelftest reasons: counts, pixels and registry lookups.
+    if (!g_asyncOpenSelftest.empty()) return asyncOpenSelftest(g_asyncOpenSelftest);
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
     // through the real panel. Windowless because every assertion is a string.

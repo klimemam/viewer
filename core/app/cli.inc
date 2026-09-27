@@ -174,8 +174,10 @@ static bool g_videoSelftest = false;
 // --async-open exists: the scripted DEFAULT still opens synchronously, and this
 // test proves that too, in the same run. Writes its own fixtures (a 100 MB .npy
 // among them) and needs no window: every expected number is derived by hand.
-// See asyncOpenSelftest().
-static bool g_asyncOpenSelftest = false;
+// Takes tools/testdata, for the one fixture it does not write itself:
+// media/stack3.tif, the multi-page TIFF (a third decoder, neither .npy's nor a
+// zip's). See asyncOpenSelftest().
+static std::string g_asyncOpenSelftest;
 
 // --anaprov-selftest: analyzer results name the dll they came from (#46 stage
 // 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
@@ -667,7 +669,7 @@ static void printUsage() {
         "  --async-scan                scan folders on the worker even in a scripted run\n"
         "  --async-open                read and decode a single file on the worker even\n"
         "                              in a scripted run (issue #232 stage 2)\n"
-        "  --asyncopen-selftest        that worker: the phases, the pump, Stop, and that\n"
+        "  --asyncopen-selftest <dir>  that worker: the phases, the pump, Stop, and that\n"
         "                              a scripted default still opens synchronously\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
@@ -893,7 +895,7 @@ static void parseCli(int argc, char** argv) {
             // windowed run does, and whoever asked for it must pump.
             g_forceAsyncOpen = true;
         } else if (a == "--asyncopen-selftest") {
-            g_asyncOpenSelftest = true;            // handled in main()
+            g_asyncOpenSelftest = next();          // handled in main()
         } else if (a == "--folderscan-selftest") {
             g_folderScanSelftest = true;           // handled in main()
         } else if (a == "--picker-selftest") {

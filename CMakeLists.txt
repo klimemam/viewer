@@ -1293,6 +1293,27 @@ viewer_selftest(uiscale     NOGL --uiscale-selftest)
 # the same thing on every machine - it means MORE where ffmpeg is installed -
 # and it can never mean less.
 viewer_selftest(video       NOGL --video-selftest)
+# The OPEN WORKER (issue #232 stage 2): the ordinary open of a .npy, a .npz or a
+# picture file no longer reads or decodes the pixels on the UI thread. What a
+# headless test can hold down is the STRUCTURE of that - openPath returns with
+# nothing read, the frame loop comes round while the reading happens, pumping
+# lands exactly what the synchronous door lands, and Stop leaves neither a
+# document nor a trace in the source registry.
+#
+# --async-open is passed here on purpose and is part of the subject: every
+# selftest is a scripted run, and a scripted run opens SYNCHRONOUSLY (see
+# g_scriptedRun - openPath is how most of the suite gets a document and a great
+# many assert on the line after it). Without the flag this test would pass by
+# never taking the path it is about; with it, the test also turns the flag back
+# OFF for one case, so the anti-vacuity half - the same 100 MB fixture landing
+# immediately, with zero pumps - is measured in the same process.
+#
+# NOGL: counts, pixel values and registry lookups. It takes tools/testdata for
+# one fixture it does not write itself (media/stack3.tif, the multi-page TIFF -
+# a third decoder, neither .npy's nor a zip's) and writes the rest into its own
+# TMP, including a 100 MB .npy whose size is load-bearing: a worker that
+# finishes before anyone pumps would make the pump count claim vacuous.
+viewer_selftest(asyncopen   NOGL --asyncopen-selftest tools/testdata --async-open)
 # settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
 # (defaults < prefs.txt < settings.jsonc < flags), and the two granularities of
