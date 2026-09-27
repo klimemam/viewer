@@ -1663,8 +1663,8 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const adapter::Run& r,
                                 const FrameSource& originStat,
                                 VstreamPre* pre = nullptr,
-                                const std::string& preErr = std::string());
-                                                                  // fwd: the tail, shared
+                                const std::string& preErr = std::string(),
+                                bool stopped = false);            // fwd: the tail, shared
 // The reader's OUTPUT, read and decoded on the JOB's own thread - the last
 // thing the thread does before it says done, and the thing stage 1 could not
 // move (issue #232 stage 2; see App::ReaderJob::vpre for the measurements).
@@ -1679,18 +1679,22 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
 // id must differ from the UI thread's (stage 2 design §4). Outside the job
 // because the job is gone by the time a test can look - the same reason
 // g_readerStarts is a counter and not a field.
-static std::thread::id g_readerDecodeThread;
-static bool g_readerDecodeCacheHit = false;
-static int g_readerDecodes = 0;
+// ATOMIC, all three: they are written by the JOB's thread and read by the UI's
+// (review P2-6). Only one job runs at a time, so there is no contention to
+// resolve - what atomicity buys here is that the read is defined at all, which a
+// probe a selftest asserts on has to be.
+static std::atomic<std::thread::id> g_readerDecodeThread;
+static std::atomic<bool> g_readerDecodeCacheHit{ false };
+static std::atomic<int> g_readerDecodes{ 0 };
 
 static void readerJobDecode(App::ReaderJob* j) {
     if (j->cancel.load()) return;
     if (!j->cacheHit && (!j->r.started || j->r.timedOut || j->r.cancelled || j->r.exit != 0))
         return;
     j->decodeThread = std::this_thread::get_id();
-    g_readerDecodeThread = j->decodeThread;
-    g_readerDecodeCacheHit = j->cacheHit;
-    g_readerDecodes++;
+    g_readerDecodeThread.store(j->decodeThread);
+    g_readerDecodeCacheHit.store(j->cacheHit);
+    g_readerDecodes.fetch_add(1);
     auto pre = std::make_shared<VstreamPre>();
     j->vdecErr = vstreamDecode(j->out, j->src, *pre, &j->cancel);
     if (j->vdecErr.empty()) j->vpre = std::move(pre);
@@ -1861,13 +1865,28 @@ static std::string openWithReader(const std::string& src, const std::string& spe
 // `pre` / `preErr` are the .vstream read the job's thread already did
 // (readerJobDecode). Null and empty means "read it here", which is the
 // synchronous path: identical work, identical sentences, one thread later.
+// `stopped` is the JOB's cancel flag; see the first line of the body.
 static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::string& out,
                                 const std::vector<std::string>& argv,
                                 const adapter::Run& r,
                                 const FrameSource& originStat,
-                                VstreamPre* pre, const std::string& preErr) {
-    if (r.cancelled) {
+                                VstreamPre* pre, const std::string& preErr,
+                                bool stopped) {
+    // A STOP IS A STOP, whichever half of the job noticed it (review P2-1).
+    // adapter::Run::cancelled is raised only while the CHILD is alive
+    // (core/adapter.cpp) - so a Stop pressed AFTER it exited, while the
+    // .vstream was being decoded, used to arrive here as an ordinary decode
+    // failure and be reported as "the reader ran and returned, but the viewer
+    // could not read what it produced ... check what load() returns". That
+    // blames the reader's author for the user's own button.
+    //
+    // And a Stop that lands in the gap between the child's exit and
+    // readerJobDecode leaves NO decode at all - no vpre, no vdecErr - so
+    // without this the read below would run `loadViewerStream` HERE, on the UI
+    // thread, in full: the Stop ignored and issue #232's whole residual back on
+    // the one path stage 2 exists to clear.
+    if (r.cancelled || stopped || preErr == "stopped") {
         app.readerLastOut += "\nstopped.\n";
         return "the reader was stopped";
     }
@@ -2102,6 +2121,20 @@ static void pollReader() {
         // read it. All that is left here is the landing and the sentence - the
         // same two the synchronous form says, one pump later (openWithReader).
         const std::string src = j->src, spec = j->spec, blame = j->blame, cached = j->out;
+        // STOPPED IS NOT UNREADABLE (review P1-1). readerJobDecode returns at
+        // once on a cancel (no vpre, no vdecErr) and vstreamDecode answers
+        // "stopped" if the Stop lands mid-decode - so without this the branch
+        // below read an empty `lerr` as "the cache could not be read", DELETED
+        // THE CACHE FILE and started the reader for real. A Stop that deletes
+        // work and then does the work is the opposite of a Stop, and it is the
+        // one outcome the cache exists to avoid. Asked before the landing, so
+        // nothing lands either - the same promise the open worker makes.
+        if (j->cancel.load() || j->vdecErr == "stopped") {
+            app.readerLastOut += "\nstopped.\n";
+            app.rdJob.reset();
+            toast(blame + "the reader was stopped", true);
+            return;
+        }
         std::string lerr = j->vdecErr;
         if (lerr.empty() && j->vpre) lerr = loadViewerStream(cached, spec, src, jStat,
                                                             j->vpre.get());
@@ -2124,7 +2157,7 @@ static void pollReader() {
         return;
     }
     std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r, jStat,
-                                 j->vpre.get(), j->vdecErr);
+                                 j->vpre.get(), j->vdecErr, j->cancel.load());
     const std::string blame = j->blame;
     std::error_code ec;
     std::filesystem::remove(pathFromUtf8(j->errFile), ec);

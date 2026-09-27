@@ -2600,6 +2600,62 @@
                                   g_readerDecodeThread != std::this_thread::get_id(),
                               "V25x ...on a thread of its own: a hit no longer finishes "
                               "inside openPath");
+
+                        // ---- V25y: STOPPING a cache hit does not burn the cache
+                        // Review P1-1. The cache-hit job reads the .vstream on
+                        // its own thread, and a Stop makes that read produce
+                        // nothing - no documents, no error. The landing read
+                        // "nothing" as "this cache file cannot be read", which
+                        // has a documented consequence: DELETE IT and earn it
+                        // again by running the reader for real. So pressing Stop
+                        // threw away the very work the cache existed to keep AND
+                        // started the 480 MB Python run the user had just
+                        // stopped - a Stop that does the thing.
+                        //
+                        // Counted rather than reasoned about: the cache
+                        // directory keeps its file, the adapter does not run,
+                        // and exactly ONE reader was started (the bug started
+                        // two). The race does not matter - the decode may well
+                        // have finished before the flag was set - because
+                        // pollReader asks the FLAG, not the result.
+                        auto cacheFileCount = [&]() {
+                            const std::string cdir = adapterCacheDir();
+                            if (cdir.empty()) return -1;
+                            int n = 0;
+                            std::error_code cec;
+                            for (const auto& e :
+                                 std::filesystem::directory_iterator(pathFromUtf8(cdir), cec)) {
+                                (void)e;
+                                n++;
+                            }
+                            return n;
+                        };
+                        closeAll();
+                        app.toast.clear();
+                        app.toastErr = false;
+                        const int cache0 = cacheFileCount();
+                        const int starts2 = g_readerStarts, runs2 = g_adapterRuns;
+                        openPath(srcPath);
+                        const bool hitUp = app.rdJob != nullptr && app.rdJob->cacheHit;
+                        if (app.rdJob) app.rdJob->cancel.store(true);   // the Files row's Stop
+                        waitForReader();
+                        const int cache1 = cacheFileCount();
+                        fprintf(stderr, "verifyselftest: V25y stop-on-hit: hitjob=%d "
+                                        "starts+%d runs+%d cache %d->%d %zu doc(s) "
+                                        "toast=\"%s\"\n", (int)hitUp,
+                                g_readerStarts - starts2, g_adapterRuns - runs2,
+                                cache0, cache1, app.images.size(),
+                                app.toast.substr(0, 80).c_str());
+                        check(hitUp && app.images.empty() &&
+                                  g_readerStarts - starts2 == 1 &&
+                                  g_adapterRuns - runs2 == 0,
+                              "V25y Stop on a cache-hit job lands nothing and does NOT "
+                              "start the reader for real");
+                        check(cache0 > 0 && cache1 == cache0,
+                              "V25y ...and the cache file it was reading is still there");
+                        check(app.readerLastOut.find("stopped") != std::string::npos &&
+                                  app.toast.find("the reader was stopped") != std::string::npos,
+                              "V25y ...and it says it stopped, in the reader's own words");
                     }
 
                     // ---- V25u: a memo replay that fails says the same thing --
