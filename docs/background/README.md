@@ -8,6 +8,7 @@
 | 文書 | 内容 |
 |---|---|
 | [analysis/flat-field-stats.md](analysis/flat-field-stats.md) | 平坦画像統計の判断記録と実施済み計画 |
+| [analysis/measurement-kernel-inventory.md](analysis/measurement-kernel-inventory.md) | 測定カーネルの重複と parity 試験の棚卸し (板 99 行の洗い出し) |
 
 ## browse
 
