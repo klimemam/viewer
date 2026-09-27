@@ -814,6 +814,24 @@ search の入口)** は、**全部このパネルの構造の上に乗ってい�
 **dot by dot は実装済み** (`1641cea`、キャンバス右クリック →
 Copy image / Save image as PNG)。残るのは**表示どおり**のほう。
 
+### 状態更新 (2026-09-27): **表示どおりも入った** —— 板96、裁定は Fable
+
+キャンバス右クリック → **Copy view (as displayed)**。下の「決めること」は裁定済み:
+**倍率は等倍にしない**(等倍の再現可能な絵は上の dot by dot が既に担っている)。
+**倍率も補間もオーバーレイ一覧も画像には焼かず、告知の文に出す** ——
+`copied view WxH · zoom 3.20x · nearest · A|B · overlays: ROI, grid` が
+toast / Messages / stderr に出る。値域ハイライトの書き出しが既に置いた線
+(「バッジは chrome であって画素ではない」)と同じ判断。スケールバーは描きません。
+実装は下の実装メモのとおり(`pumpCopyViewRequest` が
+`ImGui_ImplOpenGL3_RenderDrawData` の直後、`glfwSwapBuffers` の前)。
+**この機械でも検証できた**: `--tile-selftest` T14 が実フレームを描いて
+`glReadPixels` し、キャンバス矩形×framebuffer scale・四隅の plate・
+画像9点が `renderDocRGBA` のバイトそのもの・告知の文言を assert する。
+利用者向けは [manual.md §2.3e](../../guides/manual.md#23e-1枚をクリップボードへ--dot-by-dotと表示どおりは別物です)。
+残るのは**クリップボード自体の自動検証**だけ(テストは走るマシンの
+クリップボードを空にしない方針なので、`clipboardPutImage` は dot by dot と
+同じ経路を通ることで担保している)。
+
 ### 違い
 
 | | dot by dot (済) | 表示どおり (未) |
