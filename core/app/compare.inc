@@ -530,8 +530,10 @@ enum class EscTook { Nothing, RoiDeselected, CompareOff };
 // only ever checkable for the two that end in escapePressed(). A14/A14b assert
 // the ROI/compare pair and, separately, that a popup went away; neither can
 // say that ONE press did not do two of them, which is the whole rule.
-// (docs/verification/ui.md E7.) Recorded at the point each layer acts, so a press
-// consumed twice appears as two entries rather than being reasoned away.
+// (E7 in docs/verification/results/20260803-ui.md; this probe answered it in
+// docs/verification/results/20260804-ui-probes.md, and docs/verification/ui.md
+// §3 now carries its contract.) Recorded at the point each layer acts, so a
+// press consumed twice appears as two entries rather than being reasoned away.
 static std::string g_escProbe;
 static int g_escProbeN = 0;              // entries, so a caller can take a delta
 static int g_escProbeFrame = -1;         // the frame the last entry was made in

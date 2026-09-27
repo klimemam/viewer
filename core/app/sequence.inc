@@ -49,7 +49,8 @@ static size_t claimedImageBytes() {
 // place (residentImageBytes' dedupe, just above), use_count() in exactly one
 // (the crop CoW), rev in none at all, and none of the three has a printing
 // path - so "these two stacks are one source" cannot be asserted from a CLI,
-// which is why docs/verification/functional.md D-1/D-2/D-7 stand at 要probe and A-12
+// which is why D-1/D-2/D-7 stood at 要probe in
+// docs/verification/results/20260803-functional.md, where A-12
 // could be settled only by reading the code. This writes down what the
 // documents ACTUALLY point at, one line per membership.
 //

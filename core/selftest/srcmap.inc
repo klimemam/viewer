@@ -1,5 +1,9 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: 全テーマ共有
-    // ---- who holds which pixels (docs/verification/functional.md D-1/D-2/D-7) ------
+    // ---- who holds which pixels (D-1/D-2/D-7) --------------------------------
+    // Every bare item number in this file (A-12, C1-2, C2-3, D-2, D-7 ...) is a
+    // row of the 2026-08-03 run,
+    // docs/verification/results/20260803-functional.md; what this probe has to
+    // keep saying from now on is docs/verification/functional.md §5.
     // The probe this test exists to exercise is srcMapDump(); the asserts below
     // are what it makes sayable. Every one of them is about a fact that had no
     // printing path at all before: the number of SOURCES behind N documents,

@@ -1549,7 +1549,8 @@
             check(app.images.size() == 5, "V21 only the image-shaped members opened");
             // ...and every one of them carries the Watch baseline of the FILE
             // it came out of. This is the third of statSourceFile's decode
-            // paths; docs/verification/functional.md A-12 traced all three by eye and
+            // paths; A-12 in docs/verification/results/20260803-functional.md
+            // traced all three by eye and
             // recorded 要probe because nothing printed mtime/fsize. srcMapDump
             // prints them, so the npz path is now checked by execution, against
             // the container's own size on disk.

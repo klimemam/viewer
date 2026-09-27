@@ -1,16 +1,22 @@
 #!/bin/bash
-# docs/verification/ui.md section A/B driver: run every UI item that is automatable
-# on a machine that cannot screenshot OpenGL, and print one line per 項番.
+# Driver for the A/B items of docs/verification/ui.md §4 and §5 (that document's
+# §2 records what this script is and is not): run every UI item that is
+# automatable on a machine that cannot screenshot OpenGL, and print one line
+# per 項番.
 #
 #   bash tools/verify/run_ui_matrix.sh [<checkout-dir>]
 #
 # WHY THE APPDATA DANCE (do not remove it):
-# the periodic autosave in the frame loop (core/main.cpp, guarded only by
-# !benchFrames) means a --browse-keys-selftest run WRITES a real
-# autosave.vsession - see docs/verification/ui.md defect D-1. The layout.ini half of
-# that defect is closed (#206): io.IniFilename is now nullptr for any scripted
-# run. The session half is not, so every run below is still pointed at a
-# throwaway config dir and the suite can never touch the operator's own state.
+# this script drives the viewer directly, outside CMake's per-test isolation.
+# Defect D-1 in docs/verification/results/20260803-ui.md is what that isolation
+# exists for: a --browse-keys-selftest run wrote the operator's real
+# layout.ini and autosave.vsession. Both halves are closed in the product now -
+# io.IniFilename is nullptr for a scripted run (#206), and the periodic and
+# at-exit autosaves are both skipped while g_browseKeys is set - and
+# docs/verification/ui.md §3 keeps the verification-side isolation deliberately
+# independent of the product-side guard. This throwaway config dir IS that
+# verification-side half, so the runs below cannot touch the operator's own
+# state even if the product-side guard regresses.
 set -u
 cd "${1:-.}" || exit 1
 V=./build-mingw/viewer.exe
