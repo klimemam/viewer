@@ -1042,12 +1042,14 @@ static void parseCli(int argc, char** argv) {
     // Applied later, not here: with --stack always the sibling frames are still
     // arriving on the loader thread, so at this point there may be only one image.
     if (cliCompare >= 0) app.pendingCompare = cliCompare;
-    if (haveZoom || haveCenter) {
-        if (haveZoom) app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
-        if (haveCenter) app.view.center = ImVec2(cx, cy);
-        else if (cur()) app.view.center = ImVec2(cur()->w * 0.5f, cur()->h * 0.5f);
-        app.fitRequested = false;      // explicit view from CLI wins over fit-on-load
-    }
+    // ...and for the same reason, so are --zoom and --center: the file may still
+    // be on the worker (issue #232 stage 2, review P2-3). See App::pendingViewZoom.
+    if (haveZoom)   { app.pendingViewZoom = true; app.pendingZoom = std::clamp(zoom, 1.0f / 512, 256.0f); }
+    if (haveCenter) { app.pendingViewCenter = true; app.pendingCenter = ImVec2(cx, cy); }
+    if (haveZoom || haveCenter) applyPendingView();   // ...now, if the document is
+                                                      // already here (the synchronous
+                                                      // doors: raw, a session, a
+                                                      // scripted run)
 }
 
 // MEASURE selftest glue: capture what an analyzer emits, formatted the same way

@@ -1036,6 +1036,20 @@ struct App {
     struct SlotWant { int frame; std::string path; std::string member; };
     std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
     int pendingCompare = -1;          // --compare, applied once two images exist
+    // --zoom / --center, applied once a document is here (issue #232 stage 2,
+    // review P2-3). They used to be applied at the end of parseCli, which was
+    // right while openPath was synchronous: `else if (cur())` centred on the
+    // image the command line had just opened, and fitRequested = false said
+    // "the explicit view wins over fit-on-load". With the read on a worker
+    // there is no cur() yet, so the centre fell back to nothing and the
+    // landing's addImage then set fitRequested = true - the fit overwriting the
+    // very view the user named on the command line. pendingCompare's shape and
+    // pendingCompare's reason: a flag about the documents is applied when the
+    // documents are here.
+    bool pendingViewZoom = false;
+    bool pendingViewCenter = false;
+    float pendingZoom = 1.0f;
+    ImVec2 pendingCenter{ 0, 0 };
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
     // The main window's geometry, remembered across runs (prefs.txt "window").

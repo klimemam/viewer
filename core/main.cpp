@@ -2371,6 +2371,7 @@ static bool g_watchSuppressed = false;
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
+        applyPendingView();           // --zoom / --center, once the file is here
         if (app.pendingCompare >= 0 && !app.seqRunning) {
             if (app.pendingCompare == App::CmpOff || app.images.size() < 2) {
                 if (app.images.size() < 2 && app.pendingCompare != App::CmpOff)

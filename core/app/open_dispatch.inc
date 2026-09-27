@@ -3491,7 +3491,22 @@ static void openJobWorker(App::OpenJob* j) {
             if (plan.member.empty() || m.name != plan.member) continue;
             std::vector<uint8_t> member;
             std::string mErr;
-            if (!npzExtract(pre.bytes, entries[m.entry], member, mErr)) { derr = mErr; break; }
+            // WHICH MEMBER could not be read, in the landing's own spelling
+            // (review P2-5). loadNpz's single-image branch answers
+            // "<file>:<member>: <why>" and this door reports the worker's error
+            // instead of calling loadNpz at all, so the prefix has to be put on
+            // here or the member name is simply lost. Only for the branch that
+            // wears it: a NAMED member (a session line, a §3.3 re-read) is
+            // reported bare by loadNpz, and this must not differ from that
+            // either.
+            auto blameMember = [&](const std::string& why) {
+                return j->onlyMember.empty() ? baseName(j->path) + ":" + m.name + ": " + why
+                                             : why;
+            };
+            if (!npzExtract(pre.bytes, entries[m.entry], member, mErr)) {
+                derr = blameMember(mErr);
+                break;
+            }
             // The reading, and the display name, exactly as npzOpenMember would
             // have asked for them: a named member carries the caller's npyRead
             // (a session line, a §3.3 re-read), the single-image case is native.
@@ -3499,6 +3514,7 @@ static void openJobWorker(App::OpenJob* j) {
                                    j->onlyMember.empty() ? 0 /*NR_NATIVE*/ : j->npyRead,
                                    pre.dec, &j->cancel);
             if (derr.empty()) { pre.member = m.name; pre.decoded = true; }
+            else if (derr != "stopped") derr = blameMember(derr);
             break;
         }
     }
@@ -3527,7 +3543,14 @@ static bool startOpenJob(const std::string& path, int kind, int npyRead = 0,
         // already running or already waiting is folded in rather than queued
         // twice - a double-click that landed twice is one open. rdQueue's shape
         // and rdQueue's reason.
-        if (app.openJob->path == path && app.openJob->onlyMember == onlyMember) return true;
+        // ...but never into a job that has been STOPPED (review P2-4). A
+        // cancelled job will land nothing, so folding the same path into it
+        // would answer "this is already opening" about an open that is on its
+        // way to opening nothing - and re-dropping the file you just stopped,
+        // before its phase finished, would silently do nothing at all.
+        if (app.openJob->path == path && app.openJob->onlyMember == onlyMember &&
+            !app.openJob->cancel.load())
+            return true;
         for (const auto& w : app.openQueue)
             if (w.path == path && w.onlyMember == onlyMember) return true;
         app.openQueue.push_back({ path, kind, npyRead, onlyMember });
@@ -3612,6 +3635,32 @@ static void waitForOpenJob() {
         if (app.openJob && !app.openJob->done.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+}
+
+// --zoom / --center, applied when there is something to apply them TO. Called
+// straight after parseCli - so every synchronous door (a raw file, a session, a
+// scripted run) gets them at once, exactly as before - and then once per frame
+// until they land, because the file they are about may be on the worker
+// (issue #232 stage 2, review P2-3; App::pendingViewZoom says what went wrong).
+static void applyPendingView() {
+    if (!app.pendingViewZoom && !app.pendingViewCenter) return;
+    // The ZOOM needs no document, so it is applied at once and `viewer --zoom 2`
+    // with no file still opens zoomed. The CENTRE and "the explicit view wins
+    // over fit-on-load" both need one: addImage raises fitRequested for the
+    // first document, and running after that is the whole point of the wait.
+    if (app.pendingViewZoom) app.view.zoom = app.pendingZoom;
+    if (!cur()) {
+        // ...and if nothing is coming either - no job, no queue, no stack
+        // loading - then there is nothing left to wait for, and the flags are
+        // dropped rather than kept to ambush whatever the user opens by hand.
+        if (!app.openJob && app.openQueue.empty() && !app.seqRunning)
+            app.pendingViewZoom = app.pendingViewCenter = false;
+        return;
+    }
+    if (app.pendingViewCenter) app.view.center = app.pendingCenter;
+    else app.view.center = ImVec2(cur()->w * 0.5f, cur()->h * 0.5f);
+    app.fitRequested = false;      // explicit view from CLI wins over fit-on-load
+    app.pendingViewZoom = app.pendingViewCenter = false;
 }
 
 static void openPath(const std::string& path) {
