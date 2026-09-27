@@ -2408,8 +2408,8 @@ static bool g_watchSuppressed = false;
             // NOT in a scripted run, and that gate is new with the walk. The old
             // hash watched eleven fields and none of them was one a selftest
             // drives, so a mid-run save could not happen; the browse view keys ARE
-            // driven (browse-keys pins flat/tree/natural so its scripted row
-            // indices mean what the script says), and saving
+            // driven (browse-keys pins flat/tree/natural, and now folderClick, so
+            // its scripted row indices mean what the script says), and saving
             // those would rewrite the developer's prefs.txt from a test - into
             // VIEWER_TEST_HOME, which every later test then reads. The exit path
             // has refused to save for scripted runs since it was written; this is
@@ -2744,8 +2744,19 @@ static bool g_watchSuppressed = false;
                         rbKeysT().flat = false;
                         rbKeysT().tree = false;
                         rbKeysT().nameNatural = true;
+                        // Board row 136: the gesture a folder answers is part of
+                        // that absolute pin. A segment whose `click` on a folder
+                        // is meant to navigate must not depend on the value this
+                        // run inherited or on an earlier segment's folderclick.
+                        app.folderClick = 0;
                         rbTreeForget(rbKeysT());
                     }
+                    // ...and the one op that CHANGES it, so a run can be about
+                    // this setting: folderclick:0 = single (enter on a plain
+                    // click, the default), folderclick:1 = double (the plain
+                    // click selects and the double-click enters). Set on app,
+                    // which is where the panel's predicate reads it.
+                    else if (op == "folderclick") app.folderClick = arg ? 1 : 0;
                     else if (a == "focus") rbShowInstance(rbKeysT());
                     // ---- Browse INSTANCES (item 17) ------------------------
                     else if (a == "reconnect") {

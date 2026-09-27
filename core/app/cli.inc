@@ -201,7 +201,11 @@ static bool g_bundledSelftest = false;
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
 // img0 (select the first image); natorder (flip the NAME column between
 // natural and text order - relative, like flat / tree, and pinned back by
-// viewreset); click / ctrlclick / dbl (real mouse clicks on
+// viewreset); folderclick:0|1 (board row 136 - which click enters a folder in
+// the list: 0 = single, the default, 1 = double; ABSOLUTE, and pinned back to 0
+// by viewreset, because a script whose `click` on a folder is meant to navigate
+// must not depend on the value this machine's prefs happened to hold);
+// click / ctrlclick / dbl (real mouse clicks on
 // the cursor's row - a double-click only exists as clicks); clickoff:N /
 // dbloff:N (the same two, N rows BELOW the cursor - the only aim the keyboard
 // has not already previewed, and so the only one where click one pays for the
@@ -370,6 +374,28 @@ static std::string g_browseKeysActs =
     "home,down,chkatrow:digitset,imgmark,dbl,waitdir:digitset,chkimgmark,"
     "chkfwd:0,back,waitdir:rb,chkimgmark,"
     "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    // ---- board row 136: WHICH click enters is a PREFERENCE (browse.folderClick).
+    // The user's ruling (2026-08-04) is that the list has only a single click,
+    // so the gesture that carries "enter" is the user's to choose. The same two
+    // gestures are replayed at both values and the results must be OPPOSITE,
+    // which is the only shape that tells a working setting from a setting that
+    // is read and ignored:
+    //   "double" - the plain click does NOT navigate (the directory is still rb
+    //              and the cursor is still on the folder row, which is what a
+    //              row that merely got selected looks like), and the
+    //              double-click does. The click lands 40 px right of where dbl
+    //              lands, so the two cannot chain into one gesture whatever the
+    //              frame rate - the same property the tree toggles rely on.
+    //   "single" - the plain click enters, exactly as it does with no setting at
+    //              all, which is the half that says the default did not move.
+    // folderclick:0 at the end because viewreset is far above: the tree section
+    // below asserts click-expands, and a folder gesture left at "double" there
+    // would be a different run than the one that paragraph describes.
+    "folderclick:1,home,down,chkatrow:digitset,click,idle:40,"
+    "chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkdir:digitset,"
+    "back,waitdir:rb,"
+    "folderclick:0,home,down,chkatrow:digitset,click,waitdir:digitset,"
+    "chkdir:digitset,back,waitdir:rb,"
     // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
     // the name toggles it in place, a double-click goes to it. That is not the
     // ce02f12 latch this file used to forbid - THAT expanded on click one and

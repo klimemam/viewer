@@ -2105,7 +2105,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // because a file is a thing you compare and open on purpose,
                     // and opening one by brushing past it is expensive.
                     //
-                    // This is safe now only because folders lose their
+                    // This is safe in the list only because folders lose their
                     // double-click verb below. Its predecessor toggled here and
                     // CANCELLED on the second click of a double-click: correct
                     // at rest, but the expand was rendered between the clicks,
@@ -2113,9 +2113,24 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // one gesture owning the verb there is nothing to cancel.
                     // !chevHit: the chevron already toggled on the PRESS, and
                     // this runs on the release - both firing would toggle twice.
+                    //
+                    // WHICH gesture the list gives the folder is board row 136's
+                    // preference (browse.folderClick) since phase④: "single" is
+                    // this paragraph, "double" hands the plain click to selection
+                    // and lets the double-click below enter. Asked through
+                    // rbListFolderEntersOnClick() so the two halves of the
+                    // decision cannot drift - the gate below asks the same pair.
                     if (r.isDir() && !r.up && !chevHit) {
                         std::string full = r.full();
-                        if (!I.tree) { rbGoTo(I, full); rbLeaving = true; }
+                        if (!I.tree) {
+                            if (rbListFolderEntersOnClick()) {
+                                rbGoTo(I, full);
+                                rbLeaving = true;
+                            }
+                            // else: the plain click SELECTS it. The cursor and
+                            // anchor below are the whole verb, which is exactly
+                            // what a file row's first click does.
+                        }
                         else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                         else rbTreeExpand(I, full);
                     } else {
@@ -2147,12 +2162,18 @@ void drawPanelRemote(App::BrowseInstance& I) {
             //          it is (single click, and the chevron) or go to it and
             //          make it the listing (double click). Both are useful and
             //          they are not the same, so both gestures are spoken for.
-            //   list - a folder has ONE. There is no "in place" in a list, so
-            //          the single click is the whole vocabulary and a double
-            //          click is just a click that arrived twice.
+            //   list - a folder has ONE, so browse.folderClick decides which
+            //          gesture carries it (board row 136, phase④). At "single" -
+            //          the default and what shipped - the single click is the
+            //          whole vocabulary and a double click is just a click that
+            //          arrived twice, so this gate stays shut for folders. At
+            //          "double" it opens and the row reads exactly like a file's:
+            //          click selects, double-click commits.
             //
-            // ".." is single-click in both: it is the exit, not a folder row.
-            if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
+            // ".." is single-click in both views and at both values: it is the
+            // exit, not a folder row.
+            if (servable && !r.up && !chevHit &&
+                (!r.isDir() || rbFolderTakesDoubleClick(I.tree)) &&
                 !rbNavGesture && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 rbOpenRow(r);
