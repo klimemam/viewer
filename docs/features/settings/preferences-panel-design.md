@@ -97,7 +97,7 @@ bool → チェックボックス、列挙 → コンボ、数値 → 入力、�
 | browse.grouped | bool | true | rbflat (負論理) | presentation |
 | browse.tree | bool | false | rbtree | presentation |
 | browse.naturalSort | bool | **true** | rbnatural | presentation (F2 の注を行に) |
-| *browse.folderActivate* | **まだ** (板 row 136) | — | — | — |
+| browse.folderClick (板136) | 列挙 single/double | **single** | folderclick | presentation (List のみ。Tree は不変) |
 | *browse.sortColumn / sortDescending* | **まだ** ×2 (§3.7) | — | — | — |
 | loading.stackPrompt | 列挙 ask/always/never | **ask** | seqload | ★ 間接 measuring (N) |
 | loading.rawRecipes | **リンク行** → RAW recipes パネル | [] | — | 不活性 (#166: 選ぶまで効かない) |
@@ -105,14 +105,14 @@ bool → チェックボックス、列挙 → コンボ、数値 → 入力、�
 | remote.peerExecutable | 文字列 | "" | remoteexe | plumbing |
 | remote.policy | 列挙 auto/local-fetch | auto | procpolicy | plumbing (同数値が約束) |
 | remote.lowBandwidth | bool | false | lowbandwidth | presentation |
-| remote.repoUrl | 文字列 | "" (ビルド値) | — | plumbing |
+| remote.repoUrl | 文字列 | "" (ビルド値) | repourl (phase④) | plumbing |
 | *remote.pluginPath / pinBudgetMB* | **ここではない** ×2 (判断18: peer の中で効く) | — | — | — |
 | readers.pythonExecutable | 文字列 | "" | pythonexe | plumbing |
 | readers.searchPath | **リンク行** → Readers パネル | [] | readerplace | plumbing (F7 の注: どのリーダが勝つか = 画素) |
-| readers.editor | 文字列 | "" | — | plumbing ($EDITOR との順を行の注に — 判断18) |
+| readers.editor | 文字列 | "" | editor (phase④) | plumbing ($EDITOR との順を行の注に — 判断18) |
 | series.defaultUnit | 文字列 | "lx" | linunit | presentation (prefill のみ) |
-| *measuring.memoryBudgetGB* | 段2d で編集可に | 0 = 自動 | membudget | **measuring** (§6) |
-| (panels 節) | 注1行:「layout.ini との決着待ち」 | — | — | — |
+| measuring.memoryBudgetGB | 数値 0 または 0.5..4096 (phase④ で実フィールド) | 0 = 自動 | membudget | **measuring** (§6、実効値を行の下に併記) |
+| (panels 節) | 注1行:「layout.ini との決着待ち」(phase④ で `settingSectionNote()` として実装) | — | — | — |
 | loading.watchFiles (段2e) | bool | true | watchfiles | plumbing |
 | loading.watchAutoReload (段2e) | bool | false | watchauto | plumbing (毎回1行名乗る — File メニューの約束のまま) |
 | loading.folderScanDepth (#204) | 数値 1..16 | **6** | scandepth | plumbing (「all stacks below」がローカル・peer とも読む唯一の深さ) |
@@ -254,14 +254,22 @@ struct OriginEntry { SetOrigin who; int line; const char* cliFlag; };
   (`SjVal` が位置を運んでいるので追加費用はほぼ無い)。
 - `parseCli()` の既定を決める 20 フラグのうち表と 1:1 のもの (`--frame`
   `--stack` `--mem-budget` `--remote-exe` `--remote-policy`) が `Cli` を記す。
+  **phase④ で 5本すべてが接続された** (`--ui-scale` を加えて 6本)。
+  `--frame` は parseCli の百行前 —— ウィンドウ生成時 —— に読むので、記帳も
+  main() のその場で行う。`--mem-budget` は同時に、キーと同じ窓
+  (`memBudgetValid()`: 0 = 自動、または 0.5〜4096) を使うようになった —— 以前は
+  自前の literal で clamp していて `0`(= 自動) が 0.5 になり、フラグだけが
+  キーの既定を言えなかった。
 - `.vsession` の有効な `gamma` / `grid` 行は、それぞれ `SK_gamma` /
   `SK_pixelGrid` にだけ `Session` を記す。欠落・不正な行は記帳しない。
-- 最初の有効な session header の直前に、起動時4層を解決した gamma/grid を
-  `PrefsBase` に保存する。session を開かなければ prefs writer は従来どおり
-  App の実効値を書く。
+- **(phase④ で全キーへ拡張)** `loadPrefs()` の直後 —— settings.jsonc も
+  フラグも `.vsession` もまだ話していない時点 —— で、GUI編集できる全キーを
+  `PrefsBase` に凍結する。prefs.txt はこの記録から書き、キーが App の実効値を
+  取るのは「上位の層が誰も決めていない」か「今回の GUI が実際に変えた」ときだけ
+  (`prefsToWrite()`)。原設計の gamma/grid 限定・session 境界限定は、その特殊
+  ケースが一般規則に吸収された形である。
 - GUI変更は `PrefsBase` の対応項目だけを更新し、Session origin は維持する。
-  session save / autosave は App の現値、session 後の prefs writer は
-  `PrefsBase` を書く。
+  session save / autosave は App の現値、prefs writer は `PrefsBase` を書く。
 - Default / このマシン は台帳に**無い**: 描画時に
   `settingsCurrentValue(id).empty()` で判定する (§5.1)。
 
@@ -280,6 +288,19 @@ struct OriginEntry { SetOrigin who; int line; const char* cliFlag; };
 段1 は起動時に「上書きした事実を1行」言うが、それは**次の起動**の話で、
 トグルが戻る理由を学べるのは再起動後だった。台帳で**戻る前に**言える。
 これが段2a 単独の存在価値である (§9)。
+
+**phase④ の実装形。** 「パネルでもメニューでも」を呼び出し側の義務にすると、
+完全でなければならない一覧になり、一覧は腐る (実際に腐っていた —— 警告は
+Preferences と gamma/grid にしか届かず、フレームループの変更検出ハッシュは
+読める 28 キーのうち 11 しか見ていなかったので、File メニューのメモリ予算と
+remote policy は prefs.txt を dirty にすらしなかった)。そこで**変更は観測する**:
+`settingsPollGuiChanges()` が毎フレーム、`SETTING_KEYS` の Read 行を
+`settingsCurrentValue()` で1枚スナップショットと比べ、動いたキーについて
+(1) 粘る警告、(2) `PrefsBase` への記録、(3) prefs dirty を行う。副作用
+(`prefAfterChange`) は描いたウィジェットの責任のまま —— 二重適用になるので
+観測側では走らせない。`.vsession` を読み込んだ直後は
+`settingsResyncGuiSnapshot()` で読み直すので、「文書が運んだ gamma」が
+「手が回したノブ」と混同されることはない。
 
 ### 5.4 既定に戻す
 
@@ -534,24 +555,36 @@ prefs.txt を書くテストが共有 home を汚してはならない。
 Preferences のショートカット、`loading.raw` の 10キー、パネル開閉のセッション
 保存。
 
-### 11.6 後続実装を含む現行照合 (2026-08-20)
+### 11.6 後続実装を含む現行照合 (2026-08-20、phase④ で更新)
 
-現在の `SETTING_KEYS` は **27 Read / 5 Later / 2 NotHere = 34行**。
+現在の `SETTING_KEYS` は **29 Read / 4 Later / 2 NotHere = 35行**。
 実行する試験は別バイナリ案の `--prefspanel-selftest` ではなく、統合された
-`--settings-selftest` の O1–O5、W1–W5、M1–M3、D1–D6 である。O5 は gamma/grid の
-`session (.vsession)` 出所と下位 prefs の凍結、W3/W5 は Custom gamma と
-Copy as JSONC の往復、D1–D6 は folder scan depth を固定する。prefs の現行照合は
-28書き/30読み。§9 と §11.5 の 23/31、26/33、O1–O4、旧試験名は当時の着地記録で、
-この現行値へ書き換えない。
+`--settings-selftest` の O1–O7、W1–W12、M1–M4、D1–D6、F1–F5、G1–G7 である。
+O5 は gamma/grid の `session (.vsession)` 出所と下位 prefs の凍結、W3/W5 は
+Custom gamma と Copy as JSONC の往復、D1–D6 は folder scan depth を固定する。
+prefs の現行照合は 32書き/34読み。§9 と §11.5 の 23/31、26/33、O1–O4、旧試験名は
+当時の着地記録で、この現行値へ書き換えない。34行/27 Read/28書き30読み・O1–O6,
+W1–W5, M1–M3 は phase④ 直前の値で、同じ理由でここに残さない。
 
-実装は表から34行を描くところまで着地しているが、設計全体との残差がある。
-`memoryBudgetGB` は行があっても編集フィールドへ結び付かず、`repoUrl` / `editor` は
-編集後に prefs へ永続化されない。popup は Copy as JSONC のみで Reset は無い。
-`panels` 注と Read 行注は表へ載らず、粘るキーの即時警告も Preferences と
-gamma/grid 以外の全GUI変更経路には届いていない。さらに最初の有効な `.vsession`
-header 後の gamma/grid 以外は下位 prefs 層を分離していないため、無関係なGUI変更時に
-File/CLI の実効値を prefs へ焼き付け得る。これらは設計変更ではなく、phase④ の
-実装・回帰対象である。
+#### phase④ (板 273 / 136) で閉じた残差
+
+| 設計項目 | 何が残差だったか | 何で閉じたか | 試験 |
+|---|---|---|---|
+| `memoryBudgetGB` の値フィールド | 行はあるが `SW_Int` に対応する実フィールドが無く、行から編集できなかった | `SW_Float` + `prefFloatField` (0.5 が合法なので int では持てない)、`prefAfterChange` で 0 または 0.5〜4096 に収める | W9 |
+| 実効予算の表示 | 0 が「自動」の意味を自分で説明できなかった (M3) | `prefEffectiveNote()` が `seqMemBudget()` の解決値を行の下に出す。箱には 0 を残す —— 解決値を書き戻すと自動が恒久になる | W8 |
+| `repoUrl` / `editor` の永続化 | パネルは編集できるが `writePrefsTo` が書かないので再起動を越えない | prefs キー `repourl` / `editor` を新設。App フィールドが無いので prefs 層は `PrefsBase` が持ち、settings.jsonc の reset は「空」ではなく**下の層へ**戻る | W12 |
+| Reset to default | popup は Copy as JSONC だけ (§5.4 未実装) | `prefResetToDefault()` + `settingsResetGui()`。Reset は変更なので記録・dirty・粘る警告まで行う | W6 / W7 |
+| 行の注 | §3.2 の帰結列が表に載らず、パネルへ出なかった | `SKeyDef::note` を SS_Read 行にも許し、控えめな一文としてコントロールの下に描く (F2/F7、`readers.editor` の $EDITOR 順、0 が意味を持つ2キー、watchAuto の「毎回名乗る」、scanDepth の窓) | W10 |
+| `panels` 節の注 | 行が1つも無い節はパネルに現れず、注1行の置き場が無かった | `settingSectionNote()`。行の無い節は「なぜ空か」を言う | W11 |
+| 全GUI編集キーの粘る警告 | Preferences と gamma/grid にしか届いていなかった | 毎フレームの観測 `settingsPollGuiChanges()` (§5.3) | G2 / G3 / G6 |
+| prefs 焼付き | gamma/grid 以外は下位 prefs 層を分離せず、無関係なGUI変更の保存で File/CLI 実効値が prefs に焼き付いた | `PrefsBase` を全キーへ、`loadPrefs()` 直後に凍結。`prefsToWrite()` が「上位が決めていて手が触っていないキーは prefs の値を保つ」 | G5 / G6 / G7 |
+| 5つの CLI 出所 | `--frame` / `--mem-budget` が台帳に接続されていなかった | 記帳を追加。`--mem-budget` はキーと同じ窓 `memBudgetValid()` を使う (0 = 自動が言えるようになった) | O7 / M4 |
+| メモリ予算 / remote policy の dirty 保存 | フレームループの手書きハッシュが 11 キーしか見ておらず、この2つは prefs を dirty にしなかった | ハッシュを `SETTING_KEYS` の走査へ置き換え | G2 / G4 |
+| 板136 `browse.folderClick` | 行は `browse.folderActivate` として「まだ」だった | List の折り畳みクリックを選べる列挙キーに (既定 single = 現行動作、Tree は不変) | F1–F5 + `--browse-keys` の実クリック |
+
+**残差ではないもの** (phase④ が触らない、stage 1 から継続する未実装): `state.json`、
+`loading.raw`、`input.keyBindings`、既定表示レンジ、`browse.sortColumn` /
+`sortDescending`、`panels` を**読む**こと。
 
 ## 12. 数の扱い
 
@@ -561,5 +594,6 @@ File/CLI の実効値を prefs へ焼き付け得る。これらは設計変更�
 生きた写しになり、`--prefspanel-selftest` の構造 assert が写しの腐りを
 検出する。
 
-これは当初案の試験名である。現行では `--settings-selftest` の W1–W5 に統合され、
-W1 が全34行、W2 が全 Read 行の widget 種を構造的に検査する。
+これは当初案の試験名である。現行では `--settings-selftest` の W1–W12 に統合され、
+W1 が全35行と 29/4/2 の内訳、W2 が全 Read 行の widget 種、W6 が全 Read 行の
+「既定へ戻せること」を構造的に検査する。

@@ -89,6 +89,12 @@ static int settingsSelftest() {
         app.rbFlat = false;
         app.rbTree = false;
         app.rbNatural = true;
+        // Board row 136, and here for the reason the four above it are: group S
+        // feeds this key its sample ("double"), and a 1 that survived into T3
+        // would put an extra key in the template and make T3's count measure the
+        // previous group. That is not a hypothetical - it is what this line was
+        // added for, on the first run after the key existed.
+        app.folderClick = 0;
         app.seqLoadMode = 0;
         app.remoteExe.clear();
         app.procPolicy = App::PolAuto;
@@ -106,7 +112,16 @@ static int settingsSelftest() {
         // seventh key and T3's count would be measuring the previous group.
         g_rawLibrary.clear();
         adapter::setSettingsEditor({});
+        // phase④'s three shared ledgers, and they belong here for exactly the
+        // reason the fields above do - this suite's recorded hazard is a value
+        // from one group surviving into the next. g_prefsBase is now the whole
+        // prefs.txt layer (not just gamma/grid), g_prefsGuiOwned says which keys
+        // a GUI change has claimed, and g_prefsSeen is the watcher's snapshot: a
+        // leftover in any of the three makes a later group measure this one.
+        g_prefsBase = PrefsBase{};
         g_prefsBaseActive = false;
+        prefsGuiOwnedClear();
+        g_prefsSeenInit = false;
     };
 
     // ======================================================================
@@ -1223,7 +1238,14 @@ static int settingsSelftest() {
         // #257 adds appearance.uiScale, the second key here that was never a
         // prefs.txt line first (it is one now, for scanDepth's reason - the
         // panel edits it): 28 readable over 35 rows.
-        check(readable == 28, "W1 ...and 28 of them are editable today");
+        // phase④ (board row 136) PROMOTES a row rather than adding one:
+        // browse.folderActivate was held open as "not read yet" and is read now,
+        // as browse.folderClick - the name says which click the user is choosing
+        // rather than which verb the click performs. So the table is still 35
+        // rows and the split moves by one: 29 readable, 4 "later", 2 "not here".
+        check(readable == 29, "W1 ...and 29 of them are editable today");
+        check(later == 4 && notHere == 2,
+              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 35");
         check(rows.size() == 35, "W1 ...over 35 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
@@ -1512,6 +1534,508 @@ static int settingsSelftest() {
               "D6 a key at the end of the enum still names the file that decides it");
         check(bWatch2.rfind("settings.jsonc:", 0) == 0,
               "D6 ...and so do the three keys the old ledger bound had dropped");
+    }
+
+    // ======================================================================
+    //  F — board row 136: WHICH CLICK ENTERS A FOLDER (browse.folderClick)
+    //
+    //  The user's ruling (2026-08-04): "in the List view there is only a single
+    //  click, so make the folder's gesture selectable". The key is the FIFTH
+    //  consumer of the same table as every other - so what this group pins is
+    //  the key's own contract (the two words, the default, a third word
+    //  refused BY NAME) and the two PREDICATES the panel asks, which are what
+    //  the browse-folderclick GL run then exercises with real clicks.
+    // ======================================================================
+    {
+        baseline();
+        loadSettingsFrom(missing);                  // no file: the plain state
+        // F1: the DEFAULT is today's behaviour, in both predicates and in 判断9's
+        // "writes nothing". This is the anti-regression line for "no hand changes
+        // on upgrade": a list folder is entered by a plain click and has no
+        // double-click verb, exactly as it did before the key existed.
+        const bool defList = rbListFolderEntersOnClick();
+        const bool defDblList = rbFolderTakesDoubleClick(false);
+        const bool defDblTree = rbFolderTakesDoubleClick(true);
+        const bool defSilent = settingsCurrentValue(SK_folderClick).empty();
+        fprintf(stderr, "settingsselftest: F default: listEnters=%d listTakesDbl=%d "
+                        "treeTakesDbl=%d silent=%d\n",
+                defList ? 1 : 0, defDblList ? 1 : 0, defDblTree ? 1 : 0,
+                defSilent ? 1 : 0);
+        check(defList && !defDblList && defDblTree && defSilent,
+              "F1 the default is single-click-enters in the list, and writes nothing");
+
+        // F2: the file moves it, and moves BOTH halves of the decision together -
+        // the plain click stops entering and the double-click starts. Asserted as
+        // the pair, because a change that moved only one of them would leave a
+        // folder row with two verbs or with none.
+        const SettingsReport fr =
+            loadSettingsFrom(writeFix("// a comment, so the line is not 1\n"
+                                      "{ \"browse\": { \"folderClick\": \"double\" } }\n"));
+        dumpNotes(fr);
+        const bool dblList = rbFolderTakesDoubleClick(false);
+        const bool dblTree = rbFolderTakesDoubleClick(true);
+        fprintf(stderr, "settingsselftest: F file \"double\": applied=%d field=%d "
+                        "listEnters=%d listTakesDbl=%d treeTakesDbl=%d value=%s\n",
+                fr.applied, app.folderClick, rbListFolderEntersOnClick() ? 1 : 0,
+                dblList ? 1 : 0, dblTree ? 1 : 0,
+                settingsCurrentValue(SK_folderClick).c_str());
+        check(fr.applied == 1 && fr.rejected == 0 && fr.unknown == 0 &&
+              app.folderClick == 1 && !rbListFolderEntersOnClick() && dblList,
+              "F2 \"double\" hands the list's plain click to selection, the double to enter");
+        // ...and the TREE is untouched at both values. It is the half of the rule
+        // that is easiest to get wrong, because it is the half nothing asks for:
+        // there a folder already has two verbs and the setting has nothing to give.
+        check(dblTree, "F2 ...while the tree keeps its double-click navigate either way");
+
+        // F3: a third word is refused BY NAME and changes nothing - the combo is
+        // built from the applier's own list, so this is what stops a control ever
+        // offering a value the file rejects. "single" is fed first so the refusal
+        // has a non-default value to fail to move.
+        baseline();
+        app.folderClick = 1;                        // a value that must SURVIVE
+        const SettingsReport br3 = loadSettingsFrom(writeFix(
+            "{ \"browse\": { \"folderClick\": \"hover\" } }\n"));
+        bool named = anyNote(br3, "folderClick") && anyNote(br3, "\"single\"") &&
+                     anyNote(br3, "\"double\"");
+        dumpNotes(br3);
+        check(br3.rejected == 1 && app.folderClick == 1 && named,
+              "F3 a gesture this panel has no verb for is refused by name, changing nothing");
+        // ...and the badge, on a key appended at the very END of the enum - D6's
+        // bug one key later, and the reason SK_Count is the ledger's bound.
+        baseline();
+        loadSettingsFrom(missing);
+        auto badgeOfF = [&](SKey id) {
+            for (const PrefRow& r : settingsPrefRows()) if (r.id == id) return r.badge;
+            return std::string("<no row>");
+        };
+        const std::string fbNone = badgeOfF(SK_folderClick);
+        loadSettingsFrom(writeFix("{ \"browse\": { \"folderClick\": \"double\" } }\n"));
+        const std::string fbFile = badgeOfF(SK_folderClick);
+        fprintf(stderr, "settingsselftest: F4 folderClick badge: \"%s\" -> \"%s\"\n",
+                fbNone.c_str(), fbFile.c_str());
+        check(fbNone == "default" && fbFile.rfind("settings.jsonc:", 0) == 0,
+              "F4 the newest key at the end of the enum still names the file and the line");
+        // F5: the prefs.txt round trip. The GUI writes prefs.txt and nothing else,
+        // so a setting the panel can change and prefs cannot keep is a setting
+        // that silently reverts - which is what repoUrl and editor were.
+        baseline();
+        app.folderClick = 1;
+        prefsBaseUpdate(SK_folderClick);            // as a GUI change would
+        std::ostringstream fprefs;
+        writePrefsTo(fprefs);
+        baseline();
+        {
+            std::istringstream in(fprefs.str());
+            std::string line;
+            int got = -1;
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                std::string key; ls >> key;
+                if (key == "folderclick") ls >> got;
+            }
+            fprintf(stderr, "settingsselftest: F5 prefs folderclick=%d\n", got);
+            check(got == 1, "F5 prefs.txt carries the gesture, so it survives a restart");
+        }
+        baseline();
+    }
+
+    // ======================================================================
+    //  G — phase④: THE GUI's CHANGES ARE NOTICED, NOT REPORTED
+    //
+    //  Three residuals of the 35-row design meet here, and they are one
+    //  mechanism (settingsPollGuiChanges):
+    //    * the sticky warning reached only Preferences and gamma/grid, so every
+    //      other menu changed a key settings.jsonc decides and said nothing;
+    //    * the File menu's memory budget and remote policy did not even mark
+    //      prefs.txt dirty, so the change was lost on the way out - the frame
+    //      loop's hand-written hash held eleven of the readable keys;
+    //    * a File/CLI value could be baked into prefs.txt when an unrelated
+    //      setting was saved ("prefs 焼付き"), because only gamma and grid kept
+    //      a lower layer and only after a session had been loaded.
+    //
+    //  ANTI-VACUITY runs through the group: every "the watcher noticed" is
+    //  paired with the same code run when nothing moved, and the leak cases
+    //  assert what prefs.txt CONTAINS rather than that a flag was set.
+    // ======================================================================
+    {
+        // What prefs.txt says about one key, read back through its own spelling.
+        auto prefsLine = [&](const std::string& key) {
+            std::ostringstream os;
+            writePrefsTo(os);
+            std::istringstream in(os.str());
+            std::string line;
+            std::string val = "<absent>";
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                std::string k; ls >> k;
+                if (k != key) continue;
+                std::string rest;
+                std::getline(ls, rest);
+                while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+                    rest.erase(0, 1);
+                while (!rest.empty() && (rest.back() == '\r' || rest.back() == ' '))
+                    rest.pop_back();
+                val = rest;
+            }
+            return val;
+        };
+        auto saidSticky = [&](size_t from, const char* path) {
+            for (size_t i = from; i < app.msgLog.size(); i++)
+                if (app.msgLog[i].text.find("settings.jsonc:") != std::string::npos &&
+                    app.msgLog[i].text.find(path) != std::string::npos)
+                    return true;
+            return false;
+        };
+
+        // G1: the first poll only LOOKS. Every value it sees is a startup value -
+        // prefs.txt, the file, a flag - and none of them is news, so nothing may
+        // be marked dirty and nothing may be warned about. Without this the very
+        // first frame of every run would save prefs.txt and toast about the file.
+        baseline();
+        loadSettingsFrom(writeFix("{ \"measuring\": { \"memoryBudgetGB\": 8 } }\n"));
+        app.prefsDirty = false;
+        const size_t log0 = app.msgLog.size();
+        const int firstPoll = settingsPollGuiChanges();
+        const int idlePoll = settingsPollGuiChanges();     // nothing moved
+        fprintf(stderr, "settingsselftest: G1 first poll=%d idle poll=%d dirty=%d\n",
+                firstPoll, idlePoll, app.prefsDirty ? 1 : 0);
+        check(firstPoll == 0 && idlePoll == 0 && !app.prefsDirty &&
+              !saidSticky(log0, "measuring.memoryBudgetGB"),
+              "G1 the watcher's first look is silent, and so is a frame in which nothing moved");
+
+        // G2: the File menu's memory budget. Written EXACTLY as menus.inc writes
+        // it - the field, and nothing else - because the whole point is that a
+        // control which forgets the bookkeeping is now covered anyway. Before this
+        // the change reached neither prefs.txt nor the screen.
+        app.memBudgetGB = 16.0f;                    // the menu's InputFloat
+        const size_t log1 = app.msgLog.size();
+        const int n2 = settingsPollGuiChanges();
+        fprintf(stderr, "settingsselftest: G2 budget 8 -> 16: noticed=%d dirty=%d "
+                        "base=%.9g said=%d\n",
+                n2, app.prefsDirty ? 1 : 0, (double)g_prefsBase.memBudgetGB,
+                saidSticky(log1, "measuring.memoryBudgetGB") ? 1 : 0);
+        check(n2 == 1 && app.prefsDirty && g_prefsBase.memBudgetGB == 16.0f,
+              "G2 a menu that only moves the field still marks prefs dirty and records it");
+        // ...and the SAME change says that settings.jsonc will win at the next
+        // start. This is the sentence that reached no menu before phase④.
+        check(saidSticky(log1, "measuring.memoryBudgetGB"),
+              "G2 ...and says the file wins at the next start, from outside Preferences");
+
+        // G3: once per key per run, from the watcher as from the panel - the
+        // sentence is a fact about the file and repeating it trains the operator
+        // to dismiss it.
+        app.memBudgetGB = 32.0f;
+        const size_t log2 = app.msgLog.size();
+        const int n3 = settingsPollGuiChanges();
+        check(n3 == 1 && !saidSticky(log2, "measuring.memoryBudgetGB"),
+              "G3 the second change to the same key is noticed but not said twice");
+
+        // G4: the remote policy menu, the other control the old hash forgot.
+        baseline();
+        settingsResyncGuiSnapshot();
+        app.prefsDirty = false;
+        app.procPolicy = App::PolLocalFetch;        // menus.inc, one assignment
+        const int n4 = settingsPollGuiChanges();
+        fprintf(stderr, "settingsselftest: G4 policy: noticed=%d dirty=%d base=%d\n",
+                n4, app.prefsDirty ? 1 : 0, g_prefsBase.procPolicy);
+        check(n4 == 1 && app.prefsDirty &&
+              g_prefsBase.procPolicy == App::PolLocalFetch,
+              "G4 the remote policy menu is noticed too (the hash held neither of these)");
+
+        // ---- G5/G6: THE LEAK ------------------------------------------------
+        // A run where settings.jsonc decides one key and a flag decides another,
+        // the prefs layer is frozen the way main() freezes it, and then ONE
+        // unrelated key is changed in the GUI. prefs.txt must come out carrying
+        // the values prefs.txt had, plus that one change - and nothing else.
+        baseline();
+        app.showFps = false;                        // what prefs.txt held: the default
+        app.frameMode = 1;                          // ...and the integrated frame
+        app.memBudgetGB = 0;
+        capturePrefsBase();                         // main() does this after loadPrefs
+        loadSettingsFrom(writeFix("{ \"appearance\": { \"showFps\": true } }\n"));
+        app.frameMode = 0;                          // what `--frame system` does
+        settingsOriginCli(SK_titleBar, "--frame");
+        settingsResyncGuiSnapshot();                // the startup layers are not GUI news
+        // The effective state is the file's and the flag's...
+        check(app.showFps && app.frameMode == 0,
+              "G5 the file and the flag decide the effective state (anti-vacuity)");
+        // ...and one unrelated GUI change is made, the way a checkbox makes it.
+        app.dragPans = true;
+        const int n5 = settingsPollGuiChanges();
+        const std::string pFps = prefsLine("showfps");
+        const std::string pFrame = prefsLine("frame");
+        const std::string pDrag = prefsLine("dragpans");
+        fprintf(stderr, "settingsselftest: G5 noticed=%d | prefs showfps=%s frame=%s "
+                        "dragpans=%s\n",
+                n5, pFps.c_str(), pFrame.c_str(), pDrag.c_str());
+        check(n5 == 1 && pDrag == "1",
+              "G5 the key the GUI changed is what prefs.txt records");
+        check(pFps == "0" && pFrame == "1",
+              "G5 ...and the File and CLI values are NOT baked in beside it");
+        // G6: and the same key, once the GUI DOES change it, becomes this
+        // machine's answer - the leak is closed in one direction only if this
+        // direction still works. Without it the fix would be "prefs.txt can no
+        // longer record anything settings.jsonc mentions", which is worse.
+        app.showFps = false;                        // the user unticks the file's key
+        const size_t log3 = app.msgLog.size();
+        const int n6 = settingsPollGuiChanges();
+        const std::string pFps2 = prefsLine("showfps");
+        fprintf(stderr, "settingsselftest: G6 after the GUI changes it: noticed=%d "
+                        "prefs showfps=%s said=%d\n",
+                n6, pFps2.c_str(), saidSticky(log3, "appearance.showFps") ? 1 : 0);
+        check(n6 == 1 && pFps2 == "0" && saidSticky(log3, "appearance.showFps"),
+              "G6 a key the GUI then changes IS recorded, and warns that the file wins");
+
+        // G7: a loaded document is not a hand on a control. loadSession resyncs
+        // the snapshot, so the gamma it restored is session display state and the
+        // next frame's poll has nothing to say about it - and prefs.txt keeps the
+        // lower value. This is the leak from the other side, and the case that
+        // makes the watcher safe to run every frame.
+        baseline();
+        app.dispGamma = 1.0f;
+        capturePrefsBase();
+        loadSettingsFrom(missing);
+        settingsResyncGuiSnapshot();
+        const std::string sess = writeFix("viewer-session 1\n"
+                                          "gamma 2.2\n");
+        const std::string sessErr = loadSession(sess);
+        app.prefsDirty = false;
+        const int n7 = settingsPollGuiChanges();
+        const std::string pGamma = prefsLine("gamma");
+        fprintf(stderr, "settingsselftest: G7 session gamma: err=\"%s\" app=%g "
+                        "noticed=%d prefs gamma=%s\n",
+                sessErr.c_str(), (double)app.dispGamma, n7, pGamma.c_str());
+        check(sessErr.empty() && app.dispGamma == 2.2f && n7 == 0 && !app.prefsDirty,
+              "G7 a session's gamma is not a GUI change, so the watcher says nothing");
+        // "1.0", not "1": the gamma line is displayGammaText's exact spelling, and
+        // asserting the text is asserting what a restart will read back.
+        check(pGamma == "1.0", "G7 ...and prefs.txt keeps the value prefs.txt had");
+        baseline();
+    }
+
+    // ======================================================================
+    //  W6..W12 / O7 / M4 — phase④: THE ROWS KEEP WHAT THE DESIGN PROMISED
+    //
+    //  §3.2 gave rows a value field, a note and a way back to the default, and
+    //  §5.4's Reset had never been built. Everything here is structural: it
+    //  walks SETTING_KEYS, so a key added to the table and forgotten in one of
+    //  the per-key switches fails on the day it is added.
+    // ======================================================================
+    {
+        baseline();
+        loadSettingsFrom(missing);
+
+        // W6: EVERY readable row can be reset to its default, and "the default"
+        // means what this file already means by it - settingsCurrentValue empty.
+        // The anti-vacuity anchor is the first half: each key is first moved OFF
+        // its default (by its own sample, through the real applier), so a reset
+        // that did nothing would leave a non-empty value behind.
+        int moved = 0, reset = 0;
+        std::string stuck;
+        for (size_t k = 0; k < SETTING_KEY_COUNT; k++) {
+            const SKeyDef& d = SETTING_KEYS[k];
+            if (d.status != SS_Read || !d.sample) continue;
+            baseline();
+            const std::string sec = std::string(d.path).substr(0, std::string(d.path).find('.'));
+            const std::string leaf = std::string(d.path).substr(std::string(d.path).find('.') + 1);
+            loadSettingsFrom(writeFix("{ \"" + sec + "\": { \"" + leaf + "\": " +
+                                      d.sample + " } }\n"));
+            if (!settingsCurrentValue(d.id).empty()) moved++;
+            prefResetToDefault(d.id);
+            if (settingsCurrentValue(d.id).empty()) reset++;
+            else if (stuck.empty()) stuck = d.path;
+        }
+        fprintf(stderr, "settingsselftest: W6 %d row(s) moved off the default, "
+                        "%d came back%s%s\n", moved, reset,
+                stuck.empty() ? "" : "; stuck: ", stuck.c_str());
+        // 29 readable rows, and every one of them has a sample (S1 feeds them
+        // all). `moved` is the anti-vacuity number: a sample equal to the default
+        // would make that row's reset meaningless, and W1's own count is what
+        // says how many rows there are to move.
+        check(moved == 29 && reset == 29 && stuck.empty(),
+              "W6 every readable key is moved off its default by its sample, and resets back");
+
+        // W7: the reset is a CHANGE, so it owes what a change owes - this machine's
+        // preference, prefs.txt dirty, and the sticky warning, because resetting a
+        // key the file decides is exactly as temporary as changing it.
+        baseline();
+        loadSettingsFrom(writeFix("{ \"input\": { \"dragPans\": true } }\n"));
+        app.prefsDirty = false;
+        const size_t rlog = app.msgLog.size();
+        settingsResetGui(SK_dragPans, "input.dragPans");
+        bool said = false;
+        for (size_t i = rlog; i < app.msgLog.size(); i++)
+            if (app.msgLog[i].text.find("input.dragPans") != std::string::npos &&
+                app.msgLog[i].text.find("settings.jsonc:") != std::string::npos)
+                said = true;
+        fprintf(stderr, "settingsselftest: W7 reset: dragPans=%d dirty=%d base=%d said=%d\n",
+                app.dragPans ? 1 : 0, app.prefsDirty ? 1 : 0,
+                g_prefsBase.dragPans ? 1 : 0, said ? 1 : 0);
+        check(!app.dragPans && app.prefsDirty && !g_prefsBase.dragPans && said,
+              "W7 Reset to default is a change: recorded, dirty, and warned about");
+
+        // W8: the resolved figure beside a value that says "decide for me" (M3).
+        // The row shows 0 because 0 is the honest contents of the box, so the
+        // number the user came for has to be printed next to it.
+        baseline();
+        app.memBudgetGB = 0;
+        const std::string autoNote = prefEffectiveNote(SK_memBudget);
+        app.memBudgetGB = 8.0f;
+        const std::string setNote = prefEffectiveNote(SK_memBudget);
+        const std::string noNote = prefEffectiveNote(SK_compact);
+        fprintf(stderr, "settingsselftest: W8 effective: auto=\"%s\" set=\"%s\" "
+                        "other=\"%s\"\n",
+                autoNote.c_str(), setNote.c_str(), noNote.c_str());
+        check(autoNote.find("worked out") != std::string::npos &&
+              autoNote.find("0.0 GB") == std::string::npos,
+              "W8 a budget of 0 prints the figure the machine worked out, not 0");
+        check(setNote == "in effect: 8.0 GB" && noNote.empty(),
+              "W8 ...a budget that was set prints itself, and no other row has a figure");
+
+        // W9: memoryBudgetGB has a FIELD now. The design said "編集可" in 段2d and
+        // the row has been drawing nothing ever since, because the widget kind
+        // said SW_Int and there was no int to point at.
+        baseline();
+        const std::vector<PrefRow> rows = settingsPrefRows();
+        const PrefRow* mb = nullptr;
+        const PrefRow* fc = nullptr;
+        for (const PrefRow& r : rows) {
+            if (r.id == SK_memBudget) mb = &r;
+            if (r.id == SK_folderClick) fc = &r;
+        }
+        check(mb && mb->widget == SW_Float && prefFloatField(SK_memBudget) == &app.memBudgetGB,
+              "W9 the memory budget row has a real field, and it is a float (0.5 is legal)");
+        check(fc && fc->widget == SW_Enum, "W9 ...and folderClick is a combo, like titleBar");
+
+        // W10: EVERY row that is not a bare control carries its sentence, and the
+        // keys the design named have one. Counted rather than spot-checked: the
+        // point is that a note is a property of the table, so the panel cannot
+        // have a row the design gave words to and the table did not.
+        int readNoted = 0;
+        for (const PrefRow& r : rows)
+            if (r.status == SS_Read && r.note && *r.note) readNoted++;
+        const char* wantNotes[] = { "browse.naturalSort", "browse.folderClick",
+                                    "readers.searchPath", "readers.editor",
+                                    "series.defaultUnit", "measuring.memoryBudgetGB",
+                                    "loading.watchAutoReload", "loading.folderScanDepth" };
+        int found = 0;
+        for (const char* w : wantNotes)
+            for (const PrefRow& r : rows)
+                if (r.path && strcmp(r.path, w) == 0 && r.note && *r.note) found++;
+        fprintf(stderr, "settingsselftest: W10 %d readable row(s) carry a note; "
+                        "%d of the %d the design names\n",
+                readNoted, found, (int)(sizeof wantNotes / sizeof wantNotes[0]));
+        check(found == (int)(sizeof wantNotes / sizeof wantNotes[0]) && readNoted == found,
+              "W10 every row the design gave a sentence has one, and no other row invents one");
+
+        // W11: the `panels` section's note. It has no rows at all, so without this
+        // the section is simply absent from the panel and the design's 注1行 has
+        // nowhere to be - and a section that is missing tells the reader nothing.
+        // Also: every name this answers for must BE a section, or the note would
+        // be for something the file cannot contain.
+        int noteCount = 0, notASection = 0;
+        for (size_t s = 0; s < SETTING_SECTION_COUNT; s++)
+            if (settingSectionNote(SETTING_SECTIONS[s])) noteCount++;
+        for (const char* n : { "panels" }) {
+            bool isSec = false;
+            for (size_t s = 0; s < SETTING_SECTION_COUNT; s++)
+                if (strcmp(SETTING_SECTIONS[s], n) == 0) isSec = true;
+            if (!isSec) notASection++;
+        }
+        int panelRows = 0;
+        for (const PrefRow& r : rows)
+            if (r.path && strncmp(r.path, "panels.", 7) == 0) panelRows++;
+        fprintf(stderr, "settingsselftest: W11 section notes=%d panels rows=%d "
+                        "notASection=%d\n", noteCount, panelRows, notASection);
+        check(settingSectionNote("panels") && noteCount == 1 && notASection == 0 &&
+              panelRows == 0 && !settingSectionNote("appearance"),
+              "W11 the one section with no rows carries the sentence that says why");
+
+        // W12: repoUrl and editor survive a restart. The panel has offered both
+        // edits since 段2b and prefs.txt kept neither, so the value was gone at
+        // the next start - an edit the panel could not keep. Asserted through the
+        // real writer and the real reader, so it is the round trip and not a flag.
+        baseline();
+        g_settingsRepoUrl = "https://fork.invalid/g.git";
+        g_settingsEditorCmd = "micro -w";
+        prefsBaseUpdate(SK_repoUrl);                // as the panel's text field does
+        prefsBaseUpdate(SK_editor);
+        std::ostringstream pout;
+        writePrefsTo(pout);
+        const std::string ptxt = pout.str();
+        check(ptxt.find("\nrepourl https://fork.invalid/g.git\n") != std::string::npos &&
+              ptxt.find("\neditor micro -w\n") != std::string::npos,
+              "W12 prefs.txt carries remote.repoUrl and readers.editor");
+        // ...and they come back, as the layer UNDER settings.jsonc: a file that
+        // does not name them leaves the prefs value standing, which is what every
+        // other key already does and what "delete the key" has to mean here too.
+        baseline();
+        g_prefsBase.repoUrl = "https://fork.invalid/g.git";
+        g_prefsBase.editorCmd = "micro -w";
+        loadSettingsFrom(writeFix("{ \"appearance\": { \"showFps\": true } }\n"));
+        const std::string keptUrl = g_settingsRepoUrl, keptEd = g_settingsEditorCmd;
+        // ...while a file that DOES name them wins, which is the precedence.
+        loadSettingsFrom(writeFix(
+            "{ \"remote\": { \"repoUrl\": \"https://file.invalid/f.git\" } }\n"));
+        fprintf(stderr, "settingsselftest: W12 kept url=\"%s\" ed=\"%s\" | file url=\"%s\"\n",
+                keptUrl.c_str(), keptEd.c_str(), g_settingsRepoUrl.c_str());
+        check(keptUrl == "https://fork.invalid/g.git" && keptEd == "micro -w",
+              "W12 ...and a file silent about them leaves the prefs value standing");
+        check(g_settingsRepoUrl == "https://file.invalid/f.git" &&
+              g_settingsEditorCmd == "micro -w",
+              "W12 ...while a file that names one wins for that one only");
+
+        // O7: the five CLI flags that decide a readable key all reach the ledger.
+        // --frame and --mem-budget were the two that never did, so the Preferences
+        // row showed "this machine" for a value no preference of this machine set.
+        // The badge is what the operator reads, so the badge is what is asserted.
+        baseline();
+        loadSettingsFrom(missing);
+        struct FlagKey { SKey id; const char* flag; };
+        const FlagKey flags[] = {
+            { SK_stackPrompt, "--stack" },
+            { SK_policy,      "--remote-policy" },
+            { SK_peerExe,     "--remote-exe" },
+            { SK_titleBar,    "--frame" },
+            { SK_memBudget,   "--mem-budget" },
+        };
+        int before = 0, after = 0;
+        for (const FlagKey& f : flags) {
+            if (settingsBadgeFor(f.id).rfind("command line", 0) == 0) before++;
+            settingsOriginCli(f.id, f.flag);
+            if (settingsBadgeFor(f.id) == std::string("command line (") + f.flag + ")")
+                after++;
+        }
+        fprintf(stderr, "settingsselftest: O7 flag badges before=%d after=%d of %d\n",
+                before, after, (int)(sizeof flags / sizeof flags[0]));
+        check(before == 0 && after == 5,
+              "O7 all five flags that decide a key can name themselves on its row");
+
+        // M4: ...and the flag's own domain is the KEY's domain. --mem-budget used
+        // to clamp to its own literals, so 0 - the way to say "work it out from
+        // this machine", and the key's default - arrived as 0.5 and the flag could
+        // not express the default at all. One window now, asked by both doors.
+        const double okBudget[] = { 0, 0.5, 8, 4096 };
+        const double badBudget[] = { 0.1, -1, 4097, 1e9 };
+        bool domainOk = true;
+        for (double g : okBudget) domainOk = domainOk && memBudgetValid(g);
+        for (double g : badBudget) domainOk = domainOk && !memBudgetValid(g);
+        // ...and the FILE refuses exactly what the predicate refuses, which is
+        // what makes it one window and not two that happen to agree today.
+        baseline();
+        app.memBudgetGB = 2.0f;
+        const SettingsReport fb = loadSettingsFrom(writeFix(
+            "{ \"measuring\": { \"memoryBudgetGB\": 0.1 } }\n"));
+        baseline();
+        const SettingsReport zb = loadSettingsFrom(writeFix(
+            "{ \"measuring\": { \"memoryBudgetGB\": 0 } }\n"));
+        fprintf(stderr, "settingsselftest: M4 domain=%d | file 0.1 rejected=%d | "
+                        "file 0 rejected=%d value=%.9g\n",
+                domainOk ? 1 : 0, fb.rejected, zb.rejected, (double)app.memBudgetGB);
+        check(domainOk, "M4 0 is automatic and 0.5..4096 is the window, in ONE predicate");
+        check(fb.rejected == 1 && zb.rejected == 0 && app.memBudgetGB == 0,
+              "M4 ...and the file's own answers are that predicate's, key for key");
+        baseline();
     }
 
     baseline();

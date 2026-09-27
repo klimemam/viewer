@@ -1007,54 +1007,134 @@ static bool fitSavedWindow(WinRect& r, const std::vector<WinRect>& work,
 // saveSession: the bytes are one thing and getting them onto the disk safely is
 // another, and only the second one has a failure worth talking about.
 //
-// gamma/grid are also session display state.  Their effective App fields can
-// therefore contain a value restored from .vsession, but that must not silently
-// become this machine's preference when an unrelated preference is saved.  Keep
-// the lower prefs.txt layer separately for just these two overlapping keys.
+// THE PREFS.TXT LAYER, KEPT APART FROM THE EFFECTIVE STATE. This is phase④'s
+// half of the "prefs 焼付き" leak (settings-inventory §11): App's fields carry
+// the RESOLVED value - built-in default, then prefs.txt, then settings.jsonc,
+// then a flag, then (for gamma/grid) the loaded .vsession - and prefs.txt used
+// to be written straight out of them. So toggling ONE unrelated checkbox baked
+// every File/CLI value of that run into this machine's preferences, where it
+// then outlived the file or the flag that set it and could not be told from a
+// choice the user had made. Deleting the key from settings.jsonc did not hand
+// the toggle back, which is #50's own symptom produced by the layering that was
+// supposed to end it.
+//
+// So prefs.txt is written from THIS record - what the lower layer held - and a
+// key only takes its live App value once a GUI change in this run has actually
+// made it this machine's answer. Which keys those are is decided one file over,
+// in core/app/settings.inc, beside the origin ledger that knows who spoke:
+// prefsToWrite() hands back this struct with exactly those fields replaced.
+// gamma/grid were the first two fields here and are no longer special.
 struct PrefsBase {
+    int themeVariant = 0, themeAccent = 0;
+    bool compactUi = true;
+    bool dragPans = false, wheelZoomPlain = false, fitOnSwitch = false;
+    bool watchEnabled = true, watchAutoReload = false;
+    int seqLoadMode = 0;
+    int folderScanDepth = 6;
+    bool showFps = false;
+    bool lowBandwidth = false;
+    float memBudgetGB = 0;
+    int procPolicy = 0;
+    std::string linUnit = "lx";
     float dispGamma = 1.0f;
+    float uiScaleOverride = 0;
     bool showGrid = false;
+    int frameMode = 1;
+    bool rbFlat = false, rbTree = false, rbNatural = true;
+    int folderClick = 0;                 // board row 136
+    std::string remoteExe, pythonExe;
+    std::vector<std::string> readerPlaces;
+    // The two keys that had no prefs.txt line at all until phase④ closed
+    // "repoUrl / editor do not survive a restart". They have no App field -
+    // settings.inc owns the variables - so loadPrefs fills them HERE and that
+    // is the layer settings.inc falls back to when the file stops naming them.
+    std::string repoUrl, editorCmd;
 };
 static PrefsBase g_prefsBase;
-// Inactive until the first valid .vsession header. Before that point prefs.txt
-// keeps its historical behaviour and writes App's effective startup value,
-// including a settings.jsonc override. At the first session boundary we freeze
-// that exact lower value so only the later session value is excluded.
+// Inactive until the lower layer has actually been captured. main() captures it
+// immediately after loadPrefs(), i.e. BEFORE settings.jsonc and the flags, so in
+// a real run this record is prefs.txt itself. While it is inactive - a scripted
+// or windowless run that never called either - prefs writing keeps its
+// historical behaviour and emits App's effective values, so a test that pokes a
+// field and saves still round-trips exactly as it did.
 static bool g_prefsBaseActive = false;
 
+// Defined in core/app/settings.inc, which is where SKey, the origin ledger and
+// the "the GUI changed this one" ledger live; declared here because writePrefsTo
+// is the caller and this file is included first. Hands back g_prefsBase with the
+// GUI-owned fields replaced by App's live values.
+static PrefsBase prefsToWrite();
+// ...and the watcher that decides which keys the answer above lets through.
+// savePrefs() runs it FIRST rather than trusting the frame loop to have run it:
+// a dozen places (the Connect dialog, the Browse header, the bookmark star) call
+// savePrefs directly, in the same frame they changed a preference, and a save
+// that happened before the change was noticed would write the layer under it.
+static int settingsPollGuiChanges();
+
 static void capturePrefsBase() {
+    g_prefsBase.themeVariant = app.themeVariant;
+    g_prefsBase.themeAccent = app.themeAccent;
+    g_prefsBase.compactUi = app.compactUi;
+    g_prefsBase.dragPans = app.dragPans;
+    g_prefsBase.wheelZoomPlain = app.wheelZoomPlain;
+    g_prefsBase.fitOnSwitch = app.fitOnSwitch;
+    g_prefsBase.watchEnabled = app.watchEnabled;
+    g_prefsBase.watchAutoReload = app.watchAutoReload;
+    g_prefsBase.seqLoadMode = app.seqLoadMode;
+    g_prefsBase.folderScanDepth = app.folderScanDepth;
+    g_prefsBase.showFps = app.showFps;
+    g_prefsBase.lowBandwidth = app.lowBandwidth;
+    g_prefsBase.memBudgetGB = app.memBudgetGB;
+    g_prefsBase.procPolicy = app.procPolicy;
+    g_prefsBase.linUnit = app.lin.unit;
     g_prefsBase.dispGamma = app.dispGamma;
+    g_prefsBase.uiScaleOverride = app.uiScaleOverride;
     g_prefsBase.showGrid = app.showGrid;
+    g_prefsBase.frameMode = app.frameMode;
+    g_prefsBase.rbFlat = app.rbFlat;
+    g_prefsBase.rbTree = app.rbTree;
+    g_prefsBase.rbNatural = app.rbNatural;
+    g_prefsBase.folderClick = app.folderClick;
+    g_prefsBase.remoteExe = app.remoteExe;
+    g_prefsBase.pythonExe = app.pythonExe;
+    g_prefsBase.readerPlaces = app.readerPlaces;
+    // repoUrl / editorCmd are NOT copied: they have no App field, loadPrefs put
+    // them here already, and settings.inc reads them back out of this record.
     g_prefsBaseActive = true;
 }
 
 static void writePrefsTo(std::ostream& f) {
+    // One record, decided once (prefsToWrite), so no line below can accidentally
+    // reach for an effective value the layer above set.
+    const PrefsBase P = prefsToWrite();
     f << "viewer-prefs 1\n";
-    f << "theme " << app.themeVariant << " " << app.themeAccent << "\n";
-    f << "compact " << (app.compactUi ? 1 : 0) << "\n";
-    f << "dragpans " << (app.dragPans ? 1 : 0) << "\n";
-    f << "wheelzoom " << (app.wheelZoomPlain ? 1 : 0) << "\n";
-    f << "fitonswitch " << (app.fitOnSwitch ? 1 : 0) << "\n";
-    f << "watchfiles " << (app.watchEnabled ? 1 : 0) << "\n";
-    f << "watchauto " << (app.watchAutoReload ? 1 : 0) << "\n";
-    f << "seqload " << app.seqLoadMode << "\n";
-    f << "scandepth " << app.folderScanDepth << "\n";
-    f << "showfps " << (app.showFps ? 1 : 0) << "\n";
-    f << "lowbandwidth " << (app.lowBandwidth ? 1 : 0) << "\n";
-    f << "membudget " << app.memBudgetGB << "\n";
-    f << "procpolicy " << app.procPolicy << "\n";
-    f << "linunit " << app.lin.unit << "\n";
-    f << "gamma " << displayGammaText(g_prefsBaseActive ? g_prefsBase.dispGamma
-                                                         : app.dispGamma) << "\n";
+    f << "theme " << P.themeVariant << " " << P.themeAccent << "\n";
+    f << "compact " << (P.compactUi ? 1 : 0) << "\n";
+    f << "dragpans " << (P.dragPans ? 1 : 0) << "\n";
+    f << "wheelzoom " << (P.wheelZoomPlain ? 1 : 0) << "\n";
+    f << "fitonswitch " << (P.fitOnSwitch ? 1 : 0) << "\n";
+    f << "watchfiles " << (P.watchEnabled ? 1 : 0) << "\n";
+    f << "watchauto " << (P.watchAutoReload ? 1 : 0) << "\n";
+    f << "seqload " << P.seqLoadMode << "\n";
+    f << "scandepth " << P.folderScanDepth << "\n";
+    f << "showfps " << (P.showFps ? 1 : 0) << "\n";
+    f << "lowbandwidth " << (P.lowBandwidth ? 1 : 0) << "\n";
+    f << "membudget " << P.memBudgetGB << "\n";
+    f << "procpolicy " << P.procPolicy << "\n";
+    f << "linunit " << P.linUnit << "\n";
+    f << "gamma " << displayGammaText(P.dispGamma) << "\n";
     // #257. The REQUEST, not the resolved scale: 0 means "work it out from the
     // display", and writing back the 2.0 that was worked out would turn an
     // automatic choice into a permanent one the first time this file is saved -
     // and the next display would then be wrong with nothing saying it had ever
     // been automatic.
-    f << "uiscale " << fmtExact(app.uiScaleOverride) << "\n";
-    f << "grid " << ((g_prefsBaseActive ? g_prefsBase.showGrid : app.showGrid) ? 1 : 0)
-      << "\n";
-    f << "frame " << app.frameMode << "\n";
+    f << "uiscale " << fmtExact(P.uiScaleOverride) << "\n";
+    f << "grid " << (P.showGrid ? 1 : 0) << "\n";
+    f << "frame " << P.frameMode << "\n";
+    // Board row 136. Written unconditionally like every other enumerated
+    // preference: 0 is the default and writing it changes nothing today, but the
+    // line is what lets a later default move without silently moving this user.
+    f << "folderclick " << P.folderClick << "\n";
     // The window: logical size, raw position, then the maximized flag (see
     // fitSavedWindow). Written only once a real window has reported a geometry,
     // so a run that never samples one - every scripted run - hands back exactly
@@ -1062,23 +1142,29 @@ static void writePrefsTo(std::ostream& f) {
     if (app.winW > 0 && app.winH > 0)
         f << "window " << app.winX << " " << app.winY << " "
           << app.winW << " " << app.winH << " " << (app.winMax ? 1 : 0) << "\n";
-    f << "rbflat " << (app.rbFlat ? 1 : 0) << "\n";
+    f << "rbflat " << (P.rbFlat ? 1 : 0) << "\n";
     // ("rbadv" - the Browse drawer's open/closed state - is no longer written.
     //  A prefs file that still carries one is read and ignored, below.)
-    f << "rbtree " << (app.rbTree ? 1 : 0) << "\n";
-    f << "rbnatural " << (app.rbNatural ? 1 : 0) << "\n";
+    f << "rbtree " << (P.rbTree ? 1 : 0) << "\n";
+    f << "rbnatural " << (P.rbNatural ? 1 : 0) << "\n";
+    // remote.repoUrl / readers.editor (phase④). They had no prefs.txt line, so a
+    // value typed into the Preferences panel was gone at the next start - the
+    // panel offered an edit it could not keep. Written only when set: empty is
+    // "not set" for both (判断9), and an empty line would be a third state.
+    if (!P.repoUrl.empty()) f << "repourl " << P.repoUrl << "\n";
+    if (!P.editorCmd.empty()) f << "editor " << P.editorCmd << "\n";
     // paths may contain spaces: value is the rest of the line
-    if (!app.remoteExe.empty()) f << "remoteexe " << app.remoteExe << "\n";
+    if (!P.remoteExe.empty()) f << "remoteexe " << P.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
     for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
     for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
-    if (!app.pythonExe.empty()) f << "pythonexe " << app.pythonExe << "\n";
+    if (!P.pythonExe.empty()) f << "pythonexe " << P.pythonExe << "\n";
     // §4.13.2: the registered reader places, IN ORDER - the order is the setting
     // as much as the paths are, because first-match-wins is only answerable when
     // the order holds still. ("readerdir", the single folder these replaced, is
     // read once more below and then written out here as a place; it is never
     // written again, so an old prefs.txt is migrated by being loaded and saved.)
-    for (const auto& p : app.readerPlaces) f << "readerplace " << p << "\n";
+    for (const auto& p : P.readerPlaces) f << "readerplace " << p << "\n";
     // §4.12: path -> reader, most recent first. A TAB separates them because
     // both halves can contain spaces and only one of them can contain a tab
     // (no filesystem this tool runs on puts one in a path).
@@ -1086,6 +1172,12 @@ static void writePrefsTo(std::ostream& f) {
 }
 
 static void savePrefs() {
+    // Reconcile before writing. Whoever is calling may have changed a preference
+    // one line ago, and prefsToWrite() only lets a key's live value through once
+    // that change has been NOTICED - so a save that skipped this would write the
+    // layer underneath the change it was called to persist. Costs one comparison
+    // per readable key, and returns 0 when the frame loop already did it.
+    settingsPollGuiChanges();
     if (g_secondary) {
         // Secondary windows read prefs but never write them: prefs.txt is one
         // file and last-writer-wins, so a spawned scratch window saving on exit
@@ -1131,6 +1223,12 @@ static std::vector<std::string> g_prefsUnknownKeys;
 
 static void loadPrefs() {
     g_prefsUnknownKeys.clear();
+    // The two keys with no App field of their own (phase④). They live in this
+    // record because settings.inc, which owns the variables, falls back to it
+    // when the settings file stops naming them - so "no prefs.txt" has to mean
+    // "no lower layer" rather than "whatever the last read left here".
+    g_prefsBase.repoUrl.clear();
+    g_prefsBase.editorCmd.clear();
     std::vector<uint8_t> buf;
     std::string p = prefsPath();
     if (p.empty() || !readFileBytes(p, buf)) return;
@@ -1231,16 +1329,25 @@ static void loadPrefs() {
         // absent from a prefs file written before the toggle existed, which is
         // exactly right: the default this initialises to IS natural
         else if (key == "rbnatural")   { ls >> v; app.rbNatural = v != 0; }
+        // Board row 136. Validated on the way in rather than clamped: the only
+        // two values are 0 and 1, and a hand-edited 7 is not a gesture - the
+        // honest answer to it is the default, which is also today's behaviour.
+        else if (key == "folderclick") { ls >> v; if (v == 0 || v == 1) app.folderClick = v; }
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent" ||
                  key == "pythonexe" || key == "readerfor" || key == "readerdir" ||
-                 key == "readerplace") {
+                 key == "readerplace" || key == "repourl" || key == "editor") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
             while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
             if (s.empty()) continue;
             if      (key == "remoteexe") app.remoteExe = s;
+            // The prefs LAYER for the two keys settings.inc owns the variables
+            // for. Not applied to those variables here: loadSettings() runs
+            // next and is the one place that resolves file-over-prefs for them.
+            else if (key == "repourl")   g_prefsBase.repoUrl = s;
+            else if (key == "editor")    g_prefsBase.editorCmd = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
             else if (key == "pythonexe") app.pythonExe = s;
@@ -2521,6 +2628,12 @@ static std::string loadSession(const std::string& path) {
     std::string line;
     if (!std::getline(ss, line) || line.rfind("viewer-session", 0) != 0)
         return "not a viewer session file";
+    // A safety net, not the capture: main() freezes the prefs layer right after
+    // loadPrefs() and every windowed run therefore arrives here with it already
+    // active. This still catches the paths that never went through main()'s
+    // startup - the windowless selftests - and it is deliberately a no-op when
+    // the layer is already frozen, because the values here are the EFFECTIVE
+    // ones and freezing them now would be the leak all over again.
     if (!g_prefsBaseActive) capturePrefsBase();
     closeAll();                    // stops the loader and empties every open
                                    // queue: orphan frames from a previous load
@@ -3605,6 +3718,13 @@ static std::string loadSession(const std::string& path) {
     g_sessionRestoring = false;        // deferred refs resolve at the drain gate
     if (gammaFromSession) settingsOriginSessionPath("appearance.displayGamma");
     if (gridFromSession)  settingsOriginSessionPath("appearance.pixelGrid");
+    // ...and the per-frame watcher that turns a CHANGED setting into "this
+    // machine chose it" is told that these two moved because a DOCUMENT was
+    // opened, not because a hand touched a control. Without this line, loading a
+    // session with a gamma in it would be indistinguishable from turning the
+    // gamma knob, and the session's value would be written into prefs.txt one
+    // frame later - the leak this phase closes, re-opened from the other side.
+    settingsResyncGuiSnapshot();
     markAllTexDirty();                 // gamma may have changed
     return {};
 }

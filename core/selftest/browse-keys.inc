@@ -23,6 +23,13 @@
         // rbnatural off in the developer's prefs, rb/unpadded lists lv1, lv10,
         // lv2 and every chkatrow below it is aimed at the wrong row.
         rbMain().nameNatural = app.rbNatural = true;
+        // ...and WHICH CLICK enters a folder (board row 136), for the same reason
+        // a third time: with browse.folderClick left at "double" in the
+        // developer's prefs, every `click` a script aims at a folder row selects
+        // instead of navigating and every `waitdir` after it times out. The
+        // folderclick op below is how a run that is ABOUT this setting asks for
+        // the other value, by name.
+        app.folderClick = 0;
         // Key REPEAT is a human affordance; for injected keys it is a race.
         // Each scripted press is held for ~one frame, but a trickle-delayed
         // release across a slow frame (texture uploads after a stack lands)

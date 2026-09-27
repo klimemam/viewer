@@ -287,6 +287,8 @@ F10 は特に読む値打ちがある —— **設定にしないと決めた記
 
 - **Browse のソート列/向きだけが完全に揮発する。** `rbFlat`/`rbTree`/
   `rbNatural` は prefs.txt に載るのに、同じテーブルのソートは載らない。
+  (`folderclick` —— List で折り畳みを開くクリック —— は phase④ で
+  `rbFlat` らの隣に載った。板 row 136、裁定 2026-08-04。)
 
 ### 3.8 (H) どこにも無い —— 「設定できる」と書かれているのにできないもの
 
@@ -496,7 +498,9 @@ measuring 級の設定は、この規則と**構造的に衝突しうる唯一�
     "tree": false,                // false = List
     "naturalSort": true,          // frame_1, frame_2, ... frame_10 の順
                                   // 既定でないときは一覧に "a-z" チップが立ちます
-    "folderActivate": "single",   // "single" | "double"  —— 未実装 (板 row 136)
+    "folderClick": "single",      // "single" | "double" —— 実装済 (phase④、板 row 136)
+                                  // List のみ。Tree は値に関係なく
+                                  // クリック=名前展開 / ダブルクリック=移動
     "sortColumn": "name",         // 今はどこにも保存されず毎回リセットされます (§3.7)
     "sortDescending": false
   },
@@ -853,14 +857,17 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 - **`browse.folderActivate` / `sortColumn` / `sortDescending` / `panels`** ——
   機構そのものが無い。設定にしても効かないので、v1 は「まだ」と名指しする。
 
-## 11. 現行の実装帳簿 (2026-08-20)
+## 11. 現行の実装帳簿 (2026-08-20、phase④ で更新)
 
 §10.7 は stage 1 当時の「まだ」であり、現在形ではない。現在は JSONC reader、
-`File > Preferences...`、出所バッジ、Copy as JSONC / Copy template、
-`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
-`loading.folderScanDepth`、`appearance.uiScale` まで実装されている。
-`SETTING_KEYS` の現行照合は **28 Read / 5 Later / 2 NotHere = 35行**。`prefs.txt` は
-`writePrefsTo` が29キーを書き、`loadPrefs` が互換入力を含む31キーを読む。
+`File > Preferences...`、出所バッジ、Copy as JSONC / Copy template / Reset to
+default、`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
+`loading.folderScanDepth`、`appearance.uiScale`、`browse.folderClick` まで
+実装されている。
+`SETTING_KEYS` の現行照合は **29 Read / 4 Later / 2 NotHere = 35行**。`prefs.txt` は
+`writePrefsTo` が32キーを書き、`loadPrefs` が互換入力を含む34キーを読む
+(phase④ が `folderclick` / `repourl` / `editor` を足した。28 Read / 5 Later と
+29書き/31読みは phase④ 直前の値で、当時の記録として書き換えない)。
 
 `appearance.uiScale` (#257) は他のキーと**判定の形が違う**ので、ここに1段落置く。
 値は「UI を何倍で描くか」で、**0 = ディスプレイに訊いて決める**が既定。自動側が
@@ -885,26 +892,46 @@ memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。
 拡大率の決定そのものは `--uiscale-selftest` が持つ (純関数の表 + 復元窓のクランプ)。§10 の22キー、27書き/29読み、
 「Preferences 未実装」は、いずれもその時点の履歴として残している。
 
-ただし「キーを読む」と「Preferences から完全に扱える」はまだ同義ではない。
-phase④ で閉じる現行差分は次のとおり。
+「キーを読む」と「Preferences から完全に扱える」が同義でなかった差分は、
+**phase④ (板 273) で閉じた**。当時の残差と、それぞれの閉じ方:
 
-- `measuring.memoryBudgetGB` は JSONC/CLI/prefs の読み書き対象だが、パネルの
-  `SW_Int` に対応する実フィールドが無く、行から編集できない。実効予算の表示も無い。
-- `remote.repoUrl` と `readers.editor` はパネルで編集できるが、`writePrefsTo` が
-  その2値を保存しないため、再起動を越えない。
-- 値セルの右クリックは **Copy as JSONC** だけで、設計にある
-  **Reset to default** は未実装。値ウィジェットの無い行では popup の入口自体も無い。
-- `panels` は `SETTING_KEYS` に無く、Read 行の補足文も現在の表では保持していない。
-  そのため設計した節注・行注の一部はパネルへ出ない。
-- 粘る `settings.jsonc` の警告は Preferences と gamma/grid の共通変更経路にはあるが、
-  それ以外の既存メニュー変更すべてには接続されていない。
-- 最初の有効な `.vsession` header 後の gamma/grid だけが下位 prefs 値を別に保持する。
-  それ以外は、別のGUI設定を保存したときに App 上の File/CLI 実効値まで
-  `prefs.txt` へ焼き付く余地がある。
-- CLI 出所台帳は `--stack` / `--remote-policy` / `--remote-exe` / `--ui-scale` で、
-  `--frame` / `--mem-budget` は同じ5層表示へまだ接続されていない。
+- `measuring.memoryBudgetGB` は行があっても `SW_Int` に対応する実フィールドが
+  無く編集できなかった → `SW_Float` + `prefFloatField`(0.5 が合法なので int では
+  持てない)。実効予算は `prefEffectiveNote()` が行の下に出す (箱には 0 を残す)。
+- `remote.repoUrl` / `readers.editor` が prefs に保存されず再起動を越えなかった
+  → prefs キー `repourl` / `editor`。App フィールドを持たないので prefs 層は
+  `PrefsBase` が持ち、settings.jsonc の reset は「空」ではなく**下の層へ**戻る
+  (= 他の全キーと同じ「ファイルが黙っていれば prefs が残る」)。
+- popup が Copy as JSONC だけだった → **Reset to default** を追加
+  (`prefResetToDefault` / `settingsResetGui`)。popup は名前セルにも付くので、
+  控えの大きさに左右されず全行に入口がある。
+- `panels` 節注と Read 行の補足文が表に無かった → `settingSectionNote()` と
+  `SKeyDef::note` の SS_Read 行への拡張。
+- 粘る `settings.jsonc` の警告が Preferences と gamma/grid にしか届かなかった
+  → 毎フレームの観測 `settingsPollGuiChanges()` が `SETTING_KEYS` の Read 行を
+  走査し、動いたキーについて警告・記録・dirty を行う。呼び出し側の登録は要らない。
+- gamma/grid 以外は下位 prefs 層を分離せず、別のGUI設定の保存で File/CLI 実効値が
+  `prefs.txt` へ焼き付いた → `PrefsBase` を全キーへ拡張し、`loadPrefs()` の直後に
+  凍結。`prefsToWrite()` の規則は「上位の層が決めていて、手が触っていないキーは
+  prefs.txt が持っていた値を保つ」。
+- CLI 出所台帳に `--frame` / `--mem-budget` が無かった → 記帳を追加し、5本すべてが
+  接続された (`--ui-scale` を含めて6本)。`--mem-budget` は同時にキーと同じ窓
+  `memBudgetValid()` を使うようになり、`0`(= 自動) が言えるようになった
+  —— 以前は自前の literal で clamp していて 0 が 0.5 になっていた。
+- File メニューのメモリ予算と remote policy が prefs を dirty にしなかった
+  (フレームループの手書きハッシュが読める28キーのうち11しか見ていなかった)
+  → 同じ観測が受け持つ。
+
+固定するのは `--settings-selftest` の O1–O7 / W1–W12 / M1–M4 / D1–D6 / F1–F5 /
+G1–G7 で、G 群が観測と焼付き、W6–W12 が行の契約、F 群が `browse.folderClick`、
+O7/M4 が CLI 出所と予算の窓を持つ。
 
 未実装の設定そのものは、stage 1 から継続する `state.json`、`loading.raw`、
-`input.keyBindings`、既定表示レンジ、`browse.folderActivate` / sort 2キー /
-`panels` である。上の差分は「未実装キー」ではなく、既に読めるキーとGUIの
-契約を最後まで揃える仕事として区別する。
+`input.keyBindings`、既定表示レンジ、sort 2キー、`panels` を**読む**ことである。
+`browse.folderActivate` はこの一覧から外れた: 板 row 136 の裁定
+(2026-08-04、「List にはシングルクリックしか無いのだから Preferences で選べる
+ようにする」) を `browse.folderClick` として実装した —— 名前が動いたのは、
+利用者が選ぶのは**どのクリックか**であって動詞ではないからである。既定は
+List が `single`(現行動作)、Tree は値に関係なく「クリックで名前展開・
+ダブルクリックで移動」のまま —— Tree では折り畳みに動詞が2つあり、設定に
+渡せるものが残っていない。

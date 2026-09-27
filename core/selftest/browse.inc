@@ -1258,6 +1258,63 @@
                     txtFrames != stacked ? 1 : 0, ordOk ? "ok" : "FAIL");
             if (!ordOk) ok = false;
         }
+        {   // STACK ORDER, AS DECLARED (board row 113; ruling Fable 2026-09-27).
+            //
+            // The block above holds the listing and the stack to ONE order. The
+            // open question it could not answer was about SEARCH RESULTS, which
+            // come from more than one folder: rp::naturalLess runs over the whole
+            // PATH, so the frames stack folder-major, and "frames stack in
+            // numeric name order" - what the panel said - is then not true of
+            // them. The ruling keeps the order (basename order would interleave
+            // captures from different folders, and sigma_t is computed along the
+            // frame axis in the order the stack was built) and changes the
+            // sentence, so both halves are asserted here: the words, and the
+            // order the words are about.
+            auto check = [&](bool cond, const char* what) {
+                fprintf(stderr, "browseselftest: %-72s %s\n", what,
+                        cond ? "PASS" : "FAIL");
+                if (!cond) ok = false;
+            };
+            auto say = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& n : v) s += (s.empty() ? "" : " ") + n;
+                return s;
+            };
+            const std::string searchSaid = rbStackOrderSaid(true, true);
+            check(searchSaid == "frames stack in path order (folder, then numeric name)",
+                  "stack order: a search result declares PATH order");
+            check(searchSaid == rbStackOrderSaid(true, false),
+                  "stack order: ...whichever way the listing itself is sorted");
+            check(rbStackOrderSaid(false, true) != searchSaid &&
+                  rbStackOrderSaid(false, false) != rbStackOrderSaid(false, true),
+                  "stack order: a one-folder listing still names its own two cases");
+            // ...and the claim is TRUE of the order the open actually builds.
+            // lv2 before lv10 is the natural part; both of lv2's frames before
+            // either of lv10's is the FOLDER-major part, which is the whole
+            // question row 113 held.
+            std::vector<std::string> hits = { "/r/lv10/frame_2.npy", "/r/lv2/frame_10.npy",
+                                              "/r/lv2/frame_2.npy", "/r/lv10/frame_10.npy" };
+            sortFramesNumerically(hits);            // exactly what the open does
+            const std::vector<std::string> wantPath = {
+                "/r/lv2/frame_2.npy", "/r/lv2/frame_10.npy",
+                "/r/lv10/frame_2.npy", "/r/lv10/frame_10.npy" };
+            fprintf(stderr, "browseselftest: stack order across folders: [%s]\n",
+                    say(hits).c_str());
+            check(hits == wantPath,
+                  "stack order: folder first, then the numeric name - as declared");
+            // ANTI-VACUOUS: basename order is the alternative the ruling
+            // REFUSED, and it really is a different order - it interleaves the
+            // two folders, which is the thing that would destroy sigma_t.
+            std::vector<std::string> byBase = hits;
+            std::stable_sort(byBase.begin(), byBase.end(),
+                             [](const std::string& a, const std::string& b) {
+                                 return rp::naturalLess(baseName(a), baseName(b));
+                             });
+            fprintf(stderr, "browseselftest: the refused basename order:  [%s]\n",
+                    say(byBase).c_str());
+            check(byBase != hits,
+                  "stack order: basename order differs, so the ruling had a choice");
+        }
         {   // CURSOR ACROSS A RE-LISTING. The keyboard cursor was keyed on
             // host|dir|REV, and B.rev bumps on every listing that arrives -
             // including a second listing of the folder the panel is already

@@ -430,8 +430,19 @@ static void pumpCompareSlotRestore() {
     }
 }
 
-// Default B = the image next to A in the list: with two images open, "compare"
-// should just work without first picking a partner.
+// Default B, in the user's own two clauses (2026-07-30, recorded as
+// docs/background/project/todo-open.md §25): 「Bが**前のやつあったらそれ，無かったら
+// 選択のやつ**」- the B you last chose if there is one, and otherwise the image you
+// are looking at. The first clause landed in 6047aab; the second is this
+// (board 270). Until now "otherwise" meant the image NEXT to A in the list -
+// a partner nobody picked, which with one image open was no partner at all and
+// left the compare pane empty.
+//
+// A == B is not a special case to avoid: §25.1's ruling (a) removed every
+// behaviour change that keyed on the two sides resolving to one document,
+// precisely so that "compare a thing with itself and see the two agree" is a
+// thing you can do. The statistics tables show the same row twice, the plots
+// the same curve twice, slotInk keeps them apart, and nothing goes quiet.
 static void ensureCompareB() {
     if (resolveB()) return;       // mode-independent: called before the mode changes
     setCompareB(nullptr);
@@ -446,7 +457,23 @@ static void ensureCompareB() {
     if (app.lastCompareBUid)
         for (const auto& d : app.images)
             if (d->uid == app.lastCompareBUid && free(d.get())) { setCompareB(d.get()); return; }
-    // 2. otherwise the image you were just looking at
+    // 2. no remembered B: the image you are looking at, which is the user's
+    //    「無かったら選択のやつ」. It is the one candidate that always exists, so
+    //    the first compare of a session is never an empty pane - and it is a
+    //    statement the reader can check ("these are the same picture") rather
+    //    than a partner picked by list position.
+    //
+    //    slotOf, not `free`: `free` excludes cur() by construction, and it is
+    //    kept for the candidates below. The letter test stays, because it is
+    //    the whole of the 2026-07-30 defect - a default B wearing C tiled the
+    //    same pixels into two panes and read as an "A,C compare" - and since
+    //    §25.1 a slot letter may sit on A.
+    if (ImageDoc* a = cur())
+        if (slotOf(a).empty()) { setCompareB(a); return; }
+    // 3. ...and with no current image at all (app.current out of range, i.e.
+    //    nothing selected), the one you were last looking at, then the list.
+    //    Only reachable in that state: 2 answers whenever there IS an A that
+    //    holds no letter.
     // (after Process > demosaic that is the source, not images[0])
     if (app.prevImageUid)
         for (const auto& d : app.images)

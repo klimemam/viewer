@@ -121,6 +121,10 @@ App app;
 // session.inc restores two settings before settings.inc defines the origin
 // ledger.  Resolve them by canonical path once that ledger is available.
 static void settingsOriginSessionPath(const char* path);
+// ...and it must be able to say "these settings moved because a DOCUMENT was
+// read, not because a hand moved a control", for the same reason and in the same
+// direction: the watcher that notices GUI changes lives one file later.
+static void settingsResyncGuiSnapshot();
 
 #include "app/session.inc"
 
@@ -350,6 +354,68 @@ static bool panelBegin(const char* label, bool* open, ImGuiWindowFlags flags = 0
         if (vis) it->second.drew++;
     }
     return vis;
+}
+// ---- where the FLOATING panels open on a first launch ------------------------
+// ImGui's name-addressed SetWindowPos goes through FindWindowByName, so it moves
+// NOTHING on a window that has never been Begin'd. The DockBuilder branch below
+// used it on "ROIs" and "Analysis" - the two panels it deliberately leaves
+// undocked, and so the two with no Begin before it - and both therefore opened
+// where ImGui puts a brand-new window: measured ROIs (60,60) 690x450 and
+// Analysis (60,60) 630x390, one on top of the other over the corner of the
+// image. (Reported from PR #216: this is the ground a click landed on "another
+// window" from.) The comment there said x = 34% and meant it; nothing did it.
+//
+// So the reset ARMS a one-shot per panel, and each panel's own Begin - where
+// SetNextWindowPos does work, because it is addressed to the window about to be
+// submitted rather than to a name - spends it. ImGuiCond_Always, not
+// FirstUseEver: View > Reset layout has to move windows that already exist, and
+// FirstUseEver is exactly the condition that would refuse to.
+//
+// The geometry is a pure function of the work area and the UI scale, so the
+// expected numbers are arithmetic and not a function of this machine's display
+// (--tile-selftest T14). The x both panels share is the 34% the old code
+// intended. What changed is the y: ROIs at 8% and Analysis at 42% of the work
+// HEIGHT overlap for every work area shorter than roisHeight / 0.34 - 1059
+// logical px at scale 1, 1588 at 1.5, i.e. most of them - so Analysis is
+// stacked directly under ROIs instead, and the pair is lifted back inside the
+// work area when it would hang off the bottom. Two windows opening on top of
+// each other is the whole defect; replacing one overlap with another would not
+// be a fix.
+struct FloatPlace {
+    bool armed = false;
+    ImVec2 pos = ImVec2(0, 0), size = ImVec2(0, 0);
+};
+static FloatPlace g_placeRois, g_placeAnalysis;
+static void floatPanelPlacement(ImVec2 workPos, ImVec2 workSize, float scale,
+                                FloatPlace& rois, FloatPlace& analysis) {
+    rois.size     = ImVec2(620 * scale, 360 * scale);
+    analysis.size = ImVec2(560 * scale, 420 * scale);
+    const float gap = 8 * scale;
+    // ONE x for both, pulled left if the wider of the two would hang off the
+    // right edge - never left of the work area itself.
+    const float widest = std::max(rois.size.x, analysis.size.x);
+    float x = std::min(workPos.x + workSize.x * 0.34f,
+                       std::max(workPos.x, workPos.x + workSize.x - widest));
+    const float y = workPos.y + workSize.y * 0.08f;
+    rois.pos     = ImVec2(x, y);
+    analysis.pos = ImVec2(x, y + rois.size.y + gap);
+    // ...and never above the TOP of the work area: a title bar the user cannot
+    // reach is worse than a window hanging off the bottom.
+    const float over = analysis.pos.y + analysis.size.y - (workPos.y + workSize.y);
+    if (over > 0) {
+        const float lift = std::min(over, rois.pos.y - workPos.y);
+        rois.pos.y     -= lift;
+        analysis.pos.y -= lift;
+    }
+    rois.armed = analysis.armed = true;
+}
+// Spent at the panel's Begin, once. Cleared BEFORE the calls, so a panel that
+// somehow never draws cannot leave the arming behind for a later frame.
+static void floatPlaceApply(FloatPlace& p) {
+    if (!p.armed) return;
+    p.armed = false;
+    ImGui::SetNextWindowPos(p.pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(p.size, ImGuiCond_Always);
 }
 static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
@@ -906,6 +972,13 @@ int main(int argc, char** argv) {
         atexit(releaseAutosaveLock);
     }
     loadPrefs();       // before the theme is applied and before the CLI is parsed
+    // ...and THIS is the prefs.txt layer, frozen before anything above it speaks.
+    // Everything after this line - settings.jsonc, the flags, a loaded .vsession -
+    // changes the EFFECTIVE state, and prefs.txt is written from this record plus
+    // whatever the GUI actually changes in this run. Without the freeze, saving
+    // one checkbox wrote the whole resolved state back and a file key or a one-off
+    // flag became this machine's permanent preference (settings-inventory §11).
+    capturePrefsBase();
     // ...and settings.jsonc immediately after it, which IS the precedence
     // (docs/features/settings/settings-inventory.md 判断13/18, and --settings-selftest L2/L5):
     //
@@ -916,7 +989,16 @@ int main(int argc, char** argv) {
     // file. Nothing between these two lines and the cliFrame line below may
     // set a preference, or that order stops being true.
     loadSettings();
-    if (cliFrame >= 0) app.frameMode = cliFrame;   // for this run only: not saved
+    if (cliFrame >= 0) {
+        app.frameMode = cliFrame;                  // for this run only: not saved
+        // ...and the ledger, so the Preferences row says which of the five layers
+        // is deciding the title bar (判断13). --frame is claimed HERE rather than
+        // in parseCli because it is read a hundred lines before parseCli runs -
+        // the frame is chosen while the window is being created - and a flag that
+        // decided a value but claimed nothing is the badge showing "this machine"
+        // for something no preference of this machine set.
+        settingsOriginCli(SK_titleBar, "--frame");
+    }
     // ...and --ui-scale, applied HERE so it beats settings.jsonc (判断13: the
     // command line is the temporary override, and there must not be two truths).
     // A value this program cannot draw at is refused BY NAME and the run carries
@@ -1647,13 +1729,12 @@ static bool g_watchSuppressed = false;
             }
             ImGui::DockBuilderFinish(dockId);
             ImGui::SetWindowFocus("Projection");
-            // ROIs and Analysis stay floating (they follow the work, not the frame)
-            ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
-                                               vp->WorkPos.y + vp->WorkSize.y * 0.08f));
-            ImGui::SetWindowSize("ROIs", ImVec2(620 * uiScale, 360 * uiScale));
-            ImGui::SetWindowPos("Analysis", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
-                                                   vp->WorkPos.y + vp->WorkSize.y * 0.42f));
-            ImGui::SetWindowSize("Analysis", ImVec2(560 * uiScale, 420 * uiScale));
+            // ROIs and Analysis stay floating (they follow the work, not the
+            // frame). ARMED here, applied at each panel's own Begin: addressed
+            // by NAME from this line, a window neither of them has submitted
+            // yet, it moved nothing at all. See floatPanelPlacement.
+            floatPanelPlacement(vp->WorkPos, vp->WorkSize, uiScale,
+                                g_placeRois, g_placeAnalysis);
         }
 
         if (app.showFiles) { if (panelBegin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
@@ -1787,12 +1868,14 @@ static bool g_watchSuppressed = false;
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small
+            floatPlaceApply(g_placeRois);       // the first place after a layout reset
             ImGui::SetNextWindowSizeConstraints(ImVec2(460 * uiScale, 300 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
             if (panelBegin("ROIs", &app.showRois)) drawPanelRois();
             ImGui::End();
         }
         if (app.showAnalysis) {
+            floatPlaceApply(g_placeAnalysis);   // ...and the one under it
             ImGui::SetNextWindowSizeConstraints(ImVec2(420 * uiScale, 260 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
             if (panelBegin("Analysis", &app.showAnalysis)) drawPanelAnalysis();
@@ -2398,16 +2481,27 @@ static bool g_watchSuppressed = false;
         }
         {   // Preferences are tiny: write them the moment they change, so a crash
             // or a kill never costs the user their setup.
-            static uint64_t lastPrefs = 0;
-            uint64_t h = (uint64_t)app.themeVariant * 31 + (uint64_t)app.themeAccent * 131 +
-                         (app.compactUi ? 1u : 0u) * 7 + (app.dragPans ? 1u : 0u) * 13 +
-                         (app.wheelZoomPlain ? 1u : 0u) * 17 + (app.fitOnSwitch ? 1u : 0u) * 19 +
-                         (uint64_t)app.seqLoadMode * 23 + (app.showFps ? 1u : 0u) * 29 +
-                         (app.lowBandwidth ? 1u : 0u) * 43 +
-                         (uint64_t)displayGammaBits(app.dispGamma) * 37 +
-                         (app.showGrid ? 1u : 0u) * 41 + 1;
-            if (lastPrefs && h != lastPrefs) { app.prefsDirty = true; savePrefs(); }
-            lastPrefs = h;
+            //
+            // This used to be a hand-written hash of ELEVEN App fields, which is
+            // the shape settings.inc's own comments call out as the one that rots:
+            // twenty-nine keys are readable, so changing the memory budget or the
+            // remote policy from the File menu marked nothing dirty and was lost
+            // on the way out, and no key outside Preferences and gamma/grid ever
+            // warned that the change springs back at the next start. The walk is
+            // over SETTING_KEYS now (settingsPollGuiChanges), so a key added to
+            // that table is watched, warned about and recorded on the day it is
+            // added - and there is no second list to forget.
+            //
+            // NOT in a scripted run, and that gate is new with the walk. The old
+            // hash watched eleven fields and none of them was one a selftest
+            // drives, so a mid-run save could not happen; the browse view keys ARE
+            // driven (browse-keys pins flat/tree/natural, and now folderClick, so
+            // its scripted row indices mean what the script says), and saving
+            // those would rewrite the developer's prefs.txt from a test - into
+            // VIEWER_TEST_HOME, which every later test then reads. The exit path
+            // has refused to save for scripted runs since it was written; this is
+            // the same refusal, at the same file, one cadence earlier.
+            if (!g_scriptedRun && settingsPollGuiChanges() > 0) savePrefs();
         }
         {   // The window's own geometry, on the same cadence but not in the hash
             // above: a checkbox changes once and is worth a write, whereas a
@@ -2739,8 +2833,19 @@ static bool g_watchSuppressed = false;
                         rbKeysT().flat = false;
                         rbKeysT().tree = false;
                         rbKeysT().nameNatural = true;
+                        // Board row 136: the gesture a folder answers is part of
+                        // that absolute pin. A segment whose `click` on a folder
+                        // is meant to navigate must not depend on the value this
+                        // run inherited or on an earlier segment's folderclick.
+                        app.folderClick = 0;
                         rbTreeForget(rbKeysT());
                     }
+                    // ...and the one op that CHANGES it, so a run can be about
+                    // this setting: folderclick:0 = single (enter on a plain
+                    // click, the default), folderclick:1 = double (the plain
+                    // click selects and the double-click enters). Set on app,
+                    // which is where the panel's predicate reads it.
+                    else if (op == "folderclick") app.folderClick = arg ? 1 : 0;
                     else if (a == "focus") rbShowInstance(rbKeysT());
                     // ---- Browse INSTANCES (item 17) ------------------------
                     else if (a == "reconnect") {

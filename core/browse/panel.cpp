@@ -108,6 +108,31 @@ static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
     if (rp::naturalLess(b, a)) return 1;
     return 0;
 }
+// The ORDER the stack will be built in, in words. Declared in browse.h because
+// --browse-selftest asserts this sentence and the panel draws it, and a promise
+// written out twice is how a panel comes to say one order and deliver another.
+//
+// RULING (Fable 2026-09-27; board row 113, the last open question of issue #59):
+// a multi-folder SEARCH result keeps the full-path natural order - folder first,
+// then the numeric name - and is NOT re-sorted by basename. sortFramesNumerically
+// runs rp::naturalLess over the WHOLE path, so basename order would interleave
+// captures from different folders; sigma_t is computed along the frame axis in
+// the order the stack was built, and interleaving two captures destroys it. So
+// the order stands and only the sentence changes: "numeric name order" is not
+// what a search result gets, and nothing on screen let the reader tell.
+//
+// In an ordinary single-folder listing the folder is constant, so both sentences
+// describe the same order and the thing worth naming is the listing's own sort -
+// whether the rows on screen are the rows the stack is built from (2026-08-05).
+std::string rbStackOrderSaid(bool searchResults, bool nameNatural) {
+    if (searchResults)
+        return "frames stack in path order (folder, then numeric name)";
+    return nameNatural
+        ? "frames stack in natural name order - the order this listing is "
+          "showing them in"
+        : "frames stack in natural name order (frame_2 before frame_10), NOT "
+          "the text order this listing is showing";
+}
 // (The keyboard cursor and the stashed sort spec were file-scope singletons
 // here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
 // BrowseInstance::cursor / sortCol / sortDesc.)
@@ -2105,7 +2130,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // because a file is a thing you compare and open on purpose,
                     // and opening one by brushing past it is expensive.
                     //
-                    // This is safe now only because folders lose their
+                    // This is safe in the list only because folders lose their
                     // double-click verb below. Its predecessor toggled here and
                     // CANCELLED on the second click of a double-click: correct
                     // at rest, but the expand was rendered between the clicks,
@@ -2113,9 +2138,24 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // one gesture owning the verb there is nothing to cancel.
                     // !chevHit: the chevron already toggled on the PRESS, and
                     // this runs on the release - both firing would toggle twice.
+                    //
+                    // WHICH gesture the list gives the folder is board row 136's
+                    // preference (browse.folderClick) since phase④: "single" is
+                    // this paragraph, "double" hands the plain click to selection
+                    // and lets the double-click below enter. Asked through
+                    // rbListFolderEntersOnClick() so the two halves of the
+                    // decision cannot drift - the gate below asks the same pair.
                     if (r.isDir() && !r.up && !chevHit) {
                         std::string full = r.full();
-                        if (!I.tree) { rbGoTo(I, full); rbLeaving = true; }
+                        if (!I.tree) {
+                            if (rbListFolderEntersOnClick()) {
+                                rbGoTo(I, full);
+                                rbLeaving = true;
+                            }
+                            // else: the plain click SELECTS it. The cursor and
+                            // anchor below are the whole verb, which is exactly
+                            // what a file row's first click does.
+                        }
                         else if (rbHas(I.expanded, full)) rbTreeCollapse(I, full);
                         else rbTreeExpand(I, full);
                     } else {
@@ -2147,12 +2187,18 @@ void drawPanelRemote(App::BrowseInstance& I) {
             //          it is (single click, and the chevron) or go to it and
             //          make it the listing (double click). Both are useful and
             //          they are not the same, so both gestures are spoken for.
-            //   list - a folder has ONE. There is no "in place" in a list, so
-            //          the single click is the whole vocabulary and a double
-            //          click is just a click that arrived twice.
+            //   list - a folder has ONE, so browse.folderClick decides which
+            //          gesture carries it (board row 136, phase④). At "single" -
+            //          the default and what shipped - the single click is the
+            //          whole vocabulary and a double click is just a click that
+            //          arrived twice, so this gate stays shut for folders. At
+            //          "double" it opens and the row reads exactly like a file's:
+            //          click selects, double-click commits.
             //
-            // ".." is single-click in both: it is the exit, not a folder row.
-            if (servable && !r.up && !chevHit && (!r.isDir() || I.tree) &&
+            // ".." is single-click in both views and at both values: it is the
+            // exit, not a folder row.
+            if (servable && !r.up && !chevHit &&
+                (!r.isDir() || rbFolderTakesDoubleClick(I.tree)) &&
                 !rbNavGesture && ImGui::IsItemHovered() &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 rbOpenRow(r);
@@ -2202,14 +2248,18 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // can say which of the two it is - and when the panel is
                     // in text order it names the disagreement instead of
                     // leaving the user to find it in the frame numbers.
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("%s", !rbSelStackWhyNot.empty()
-                            ? rbSelStackWhyNot.c_str()
-                            : I.nameNatural
-                            ? "frames stack in natural name order - the order this "
-                              "listing is showing them in"
-                            : "frames stack in natural name order (frame_2 before "
-                              "frame_10), NOT the text order this listing is showing");
+                    //
+                    // In the SEARCH RESULTS view the rows come from more than
+                    // one folder, and then "name order" is not what the stack
+                    // gets at all: the sort is over the whole path. Board row
+                    // 113's ruling is that the order stays and the sentence
+                    // says so - rbStackOrderSaid carries both.
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        const std::string said = !rbSelStackWhyNot.empty()
+                            ? rbSelStackWhyNot
+                            : rbStackOrderSaid(I.search.active, I.nameNatural);
+                        ImGui::SetTooltip("%s", said.c_str());
+                    }
 
                     // ...and the same selection AVERAGED, which is where it stops
                     // being the same operation (#81). Above merges the ticked

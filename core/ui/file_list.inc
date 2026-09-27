@@ -173,6 +173,31 @@ static std::string filesShareSentence(const std::vector<const ImageDoc*>& shared
     return s;
 }
 
+// ---- how many BYTES a row is holding ----------------------------------------
+// The sum over UNIQUE FrameSource, and never the stack x frame product. That is
+// docs/reference-design.md §7's one-line lesson, turned into a decision by its §9
+// 判断3 ("Files のバイト列: 追加する。unique source の和で"): two rows can point at
+// ONE source - the same folder opened twice, a derived stack beside its
+// original, one .npz member in two stacks - and pixels counted twice tell the
+// reader a stack costs double what it does, in the panel whose whole job is to
+// say what is open. The share mark (§4) already says THAT the pixels are shared;
+// this is the same fact as a number.
+//
+// Dedupe by srcId, exactly as residentImageBytes does it and for its reason:
+// srcId IS the frame's identity (§3.1), and it is the one field the accounting
+// is allowed to read.
+static size_t filesUniqueBytes(const std::vector<int>& rows) {
+    size_t n = 0;
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(rows.size());
+    for (int i : rows) {
+        if (i < 0 || i >= (int)app.images.size() || !app.images[i]) continue;
+        const ImageDoc& d = *app.images[i];
+        if (seen.insert(d.src->srcId).second) n += d.px().size() * sizeof(float);
+    }
+    return n;
+}
+
 // The ink for one layer of the canon, in whichever theme is on. Wrapped so the
 // Files rows read as "this row is a series" rather than as a colour lookup.
 static ImVec4 inkOf(int layer) { return ui_theme::layerInk(app.themeVariant, layer); }
@@ -1032,15 +1057,20 @@ static void drawFileList() {
               snprintf(lb, sizeof lb, "%*s%s%s", (int)std::max<size_t>(badge.size() * 2, 2),
                        "", sname, rmark);
           }
-          char frames[32];
+          char frames[64];
           {   // "8f" for an 8-of-300 stack states nothing; say the ratio while
               // the total is known and the load is short of it
               const App::SeqInfo* fsi = seqInfo(head.seqId);
               int exp = fsi ? fsi->expectedFrames : 0;
+              char cnt[32];
               if (exp > (int)stack.size())
-                  snprintf(frames, sizeof frames, "  %d/%df", (int)stack.size(), exp);
+                  snprintf(cnt, sizeof cnt, "%d/%df", (int)stack.size(), exp);
               else
-                  snprintf(frames, sizeof frames, "  %df", (int)stack.size());
+                  snprintf(cnt, sizeof cnt, "%df", (int)stack.size());
+              // ...and what those frames COST. Over unique sources, not frames
+              // times one frame's size - see filesUniqueBytes.
+              snprintf(frames, sizeof frames, "  %s  %s", cnt,
+                       fmtBytesHuman(filesUniqueBytes(stack)).c_str());
           }
           std::string share;                   // §4: any member's pixels, elsewhere
           {
