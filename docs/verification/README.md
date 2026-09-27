@@ -7,7 +7,7 @@
 
 | 読む順 | 文書 | 役割 |
 |---:|---|---|
-| 1 | [matrix.md](matrix.md) | 形式 × 入口 × 操作の2026-08-11凍結測定（§1〜§6）＋現況台帳（§7以降）。分離の再裁定は tasks.csv で追跡中 |
+| 1 | [matrix.md](matrix.md) | 形式 × 入口 × 操作の3軸と状態の定義（§0・§1）＋落穂の現況台帳（§7以降）。2026-08-11 の測定そのものは [results/20260811-matrix.md](results/20260811-matrix.md) |
 | 2 | [functional.md](functional.md) | 機能の手順・期待結果・合格条件 |
 | 3 | [ui.md](ui.md) | UI の手順・期待結果・自動検証と実機確認の境界 |
 
@@ -23,6 +23,7 @@
 | 2026-08-03 | [results/20260803-ui.md](results/20260803-ui.md) | frame 参照化の UI 検証 |
 | 2026-08-04 | [results/20260804-functional-probes.md](results/20260804-functional-probes.md) | 機能 probe（観測点）の追試 |
 | 2026-08-04 | [results/20260804-ui-probes.md](results/20260804-ui-probes.md) | UI probe（観測点）の追試 |
+| 2026-08-11 | [results/20260811-matrix.md](results/20260811-matrix.md) | 形式 × 入口 × 操作 299セルのマトリクス測定 |
 | 2026-08-17 | [results/20260817-open-with-reader-ui.md](results/20260817-open-with-reader-ui.md) | Browse「Open with reader...」の UI 検証 |
 | 2026-09-08 | [results/20260908-model-boundaries.md](results/20260908-model-boundaries.md) | #230 phase④ model boundary |
 | 2026-09-12 | [results/20260912-typed-channels.md](results/20260912-typed-channels.md) | #259 C=1連続コピー・C=4両経路検査 |

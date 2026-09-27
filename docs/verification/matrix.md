@@ -1,9 +1,12 @@
 # 形式 × 入口 × 操作 の検証マトリクス
 
-> **読み方:** §1〜§6 は 2026-08-11 の測定記録として凍結し、§7 が G1〜G11 の
-> 現況を示す。過去の `×落` は修正後も書き換えない。
-> 凍結測定と現況台帳は旧判断により本書へ同居している。別文書へ分けるかは
-> [tasks.csv](../tasks.csv) の Fable 行で再裁定し、ここでは先に書き換えない。
+> **読み方:** 本書は**現況台帳**である。3軸の定義 (§0・§1) と、軸の交差から
+> 落ちていた事実の現況 (§7 以降) を置く。**2026-08-11 の測定そのもの**——
+> 表A / 表B / 表C の 299セル、セルの数え、どのセルを selftest が証明しているか
+> (旧 §2〜§6)——は [results/20260811-matrix.md](results/20260811-matrix.md) へ
+> 凍結した (2026-09-27 分離)。**凍結測定と現況台帳を1つのファイルに同居させない**
+> のが現在の規則である。§2〜§6 の番号は詰めずに空けてある——§7 以降を指している
+> 既存の参照を動かさないため。
 
 本書でいう「入口」は、ファイルやデータを製品へ取り込む操作経路を指す。たとえば
 File > Open、Browse、フォルダ走査、リモート接続、リーダはそれぞれ別の入口である。
@@ -11,22 +14,12 @@ File > Open、Browse、フォルダ走査、リモート接続、リーダはそ
 このリポジトリは「どの形式が読めるか」を `core/imagefile.h` の表で、「どの入口から
 入れるか」を `openPath` / `openRemote` / `scanFolderGroups` / `serve.cpp` の述語で、
 「入ったあと何ができるか」を各パネルで決めている。**その3つを一度に見る場所が
-無かった。**
+無かった。** 代償が 2026-08-11 に「remoteで、.rawが開けないね」として現れた経緯と、
+そのとき数えた 299セルは [results/20260811-matrix.md](results/20260811-matrix.md)
+にある。
 
-無かったことの代償は 2026-08-11 に現れた——「remoteで、.rawが開けないね」。
-対象はヘッダ無し RAW (`.raw`) だった。
-調べると、これは**判断ではなく落穂**だった。ベンダ RAW (`.nef` / `.cr2` / `.dng`) が
-リンクを渡らないのは `Backend::overLink = false` という**表の列**で、理由 (LibRaw が
-CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無し RAW (`.raw` / `.bin`) は
-そもそも表に**行が無い**。行が無いのは正しい (ヘッダが無いファイルの形は人が宣言する
-ものなので、ライブラリに渡すのは「そのライブラリがファイルより物を知っている」と
-言うことになる、`core/imagefile.cpp:230-234`)。しかしその結果として
-`imagefile::peerServes()` が false を返し、拒否文は generic な
-`"the peer serves " + servedList()` に落ちる。**誰もヘッダ無し RAW がリンクを
-渡れないと決めていない。表の端から落ちただけである。**
-
-判断の服を着た落穂は、マトリクスにしないと見えない。この文書はそのマトリクスで
-ある。
+**判断の服を着た落穂は、マトリクスにしないと見えない。** §7 がその一覧の現況で、
+§10 が同じことを次に起こさないための保ち方である。
 
 ---
 
@@ -36,7 +29,7 @@ CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無
 
 | 記号 | 意味 |
 |---|---|
-| **○** | 通る。根拠キー付き (selftest 名 = 最強、無ければ file:line か手で確かめた記録) |
+| **○** | 通る。根拠キー付き (selftest 名 = 最強、無ければ symbol か手で確かめた記録) |
 | **×決** | 断る。**判断が記録されている**——issue 番号 / 文書の節 / コードのコメント |
 | **×落** | 断る。**何も決めていない。届かないだけ。**←これが見つけたいもの |
 | **—** | 対象外。理由を添える |
@@ -45,240 +38,60 @@ CDDL-1.0) も拒否文も付いている——**決めてある**。ヘッダ無
 
 - `[T:name]` — selftest。`viewer_selftest(name ...)` (CMakeLists.txt) で CI が走らせて
   いるもの。**セルの証拠としては最強**
-- `[C:file:line]` — コードを読んだ。行は 9d307b8 時点
-- `[D:...]` — 文書の節 / issue 番号
+- `[S:symbol]` — コードを読んだ。**関数名・配列名で指す**。ファイル名は添えてよいが
+  **行番号は書かない**
+- `[D:...]` — 文書の節 anchor / issue 番号
 - `[P]` — **手で確かめた**。§9 に何をどう走らせたか
 
-`[C:...]` の略記 (行番号は 9d307b8 時点):
-
-| 略記 | ファイル |
-|---|---|
-| `[C:NNNN]` (略記無し) | `core/app/open_dispatch.inc` |
-| `[C:od:NNNN]` | 同上 (他と並べるとき) |
-| `[C:seq:NNNN]` | `core/app/sequence.inc` |
-| `[C:cli:NNN]` | `core/app/cli.inc` |
-| `[C:sess:NNNN]` | `core/app/session.inc` |
-| `[C:watch:NN]` | `core/app/watch.inc` |
-| `[C:menus:NNN]` | `core/ui/menus.inc` |
-| `[C:pt:NNN]` | `core/ui/panel_temporal.inc` |
-| `[C:serve:NNN]` | `core/serve.cpp` |
-| `[C:imagefile:NNN]` | `core/imagefile.cpp` |
+**現況側に `file:line` を書かない。** 行はコミットごとに動くので、生きた台帳に
+書くと「読んだ時点では正しかった」しか意味しなくなる。行で指してよいのは対象
+コミットを宣言した凍結結果だけで、そちらは
+[results/20260811-matrix.md](results/20260811-matrix.md) が `[C:file:line]`
+(行は `9d307b8` 時点) として持っている。
 
 ---
 
 ## 1. 軸
 
-### 1.1 形式 (13)
+軸は3つ。どれも**今日のコードから数え直せる**定義として置く——2026-08-11 に
+数えた 13 × 9 × 7 の内訳そのものは
+[results/20260811-matrix.md](results/20260811-matrix.md) §1 にある。
 
-| # | 形式 | 拡張子 | 表の行 |
-|---|---|---|---|
-| F1 | `.npy` | `.npy` | 無 (`core/main.cpp` 自身の入口) |
-| F2 | `.npz` | `.npz` | 無 (同上) |
-| F3 | PNG | `.png` | 有 `overLink=1` |
-| F4 | JPEG | `.jpg .jpeg .jpe` | 有 `overLink=1` |
-| F5 | TIFF | `.tif .tiff` | 有 `overLink=1` |
-| F6 | OpenEXR | `.exr` | 有 `overLink=1` |
-| F7 | y4m | `.y4m` | 有 `overLink=1` |
-| F8 | ベンダ RAW | `.dng .cr2 .nef ...` (28) | 有 `overLink=0` |
-| F9 | **ヘッダ無し RAW** | `.raw .bin .yuv .dat` | **無** |
-| F10 | **ヘッダ無し RAW (`.rggb`)** | `.rggb` | **無** |
-| F11 | 動画コンテナ | `.mp4` ほか | 無 (名指しで断る) |
-| F12 | `.vsession` | `.vsession` | 無 |
-| F13 | reader 出力 / viewer container | ディスク上は `.npz` (`__viewer` ツリー)、メンバ名 `__pixels_*` | 無 |
-
-F9 と F10 を分けたのは、**`.rggb` だけ `SEQ_EXTS` にあって File ▸ Open の
-フィルタに無い**からである (§7 G8)。同じ形式が入口によって違う答えを返すなら、
-それは別の行として数えるべきである。
-
-### 1.2 入口 (9)
-
-| # | 入口 | 実装箇所 |
+| 軸 | 定義 | 今日の正典 |
 |---|---|---|
-| D1 | CLI 引数 | `parseCli` (`core/app/cli.inc`) |
-| D2 | ファイルの D&D | `dropCallback` (`core/main.cpp`) → `openPath` (`core/app/open_dispatch.inc`) |
-| D3 | フォルダの D&D | 同上 → `openPath` → `openFolder` |
-| D4 | File ▸ Open | `openFileDialog` (`core/app/open_dispatch.inc`) |
-| D5 | File ▸ Open Folder | `openFolderDialog` → `openFolder` → `scanFolderGroups` |
-| D6 | Browse (このマシン, `local://`) | `browseLocalFolder` → `openRemote` |
-| D7 | Browse (peer, `ssh://`) | `startRemote` → `openRemote` |
-| D8 | セッション復元 | `loadSession` (`core/app/session.inc`) |
-| D9 | 登録済み reader | `readerFor` → `openWithReader` (`core/app/session.inc`) |
+| 形式 | 読める / 読めないを分ける単位。**表に行を持つ絵の形式**と、**行を持たない自己記述・ヘッダ無し・コンテナ・セッション**を別に数える | `imagefile::backends()` の表 (`Backend::overLink` を含む)、`SELFDESC_EXTS` / `HEADERLESS_EXTS` (`core/app/sequence.inc`)、`.vsession` |
+| 入口 | データを製品へ取り込む操作経路。**同じ形式が入口によって違う答えを返すなら、それは別の行として数える** | `parseCli` / `dropCallback` / `openPath` / `openFolder` / `openFileDialog` / `openFolderDialog` / `scanFolderGroups` / `browseLocalFolder` / `startRemote` / `openRemote` / `loadSession` / `readerFor` → `openWithReader` |
+| 操作 | 入ったあとにできること | `ImageDoc` が1つ立つ、`scanFolderGroups` / `startSequenceLoad` / peer `SCAN`、`copyPerFrameStats`、`handleMeasure`、`watchTargetsNow`、`reloadSource` / `planStackMembership`、`exportDocRGBA` |
 
-### 1.3 操作 (7)
+**由来で操作の表を割る。** peer 側 MEASURE は `serverComputes` が
+「`remoteUrl` も `remoteFiles` も空なら false」と決めているので、直接の入口から
+入った doc には**構造上あり得ない**。ゆえに操作の表は必ず2枚になる——直接の入口
+から入った doc (このディスクのファイル) と、Browse 経由で `remoteUrl` を持つ doc。
 
-| # | 操作 | 入口 |
-|---|---|---|
-| O1 | 1フレームを見る | `ImageDoc` が1つ立つ |
-| O2 | stack にまとめる | `scanFolderGroups` / `startSequenceLoad` / peer `SCAN` |
-| O3 | フレーム毎統計 | `copyPerFrameStats` `core/ui/panel_temporal.inc:527` |
-| O4 | peer 側 MEASURE | `handleMeasure` `core/serve.cpp:2341` |
-| O5 | Watch 検出 | `watchTargetsNow` `core/app/watch.inc:69` |
-| O6 | Reload (メンバ再構成) | `reloadSource` `core/app/open_dispatch.inc:586` / `planStackMembership` |
-| O7 | export | `exportDocRGBA` `core/app/export.inc:77` ほか |
-
-**由来で表を割る。** O4 は `serverComputes` (`core/app/open_dispatch.inc:408`) が
-「`remoteUrl` も `remoteFiles` も空なら false」と決めているので、直接の入口から入った
-doc には**構造上あり得ない**。したがって操作の表は 2枚になる:
-
-- **表B** = 直接の入口 (D1–D5, D8, D9) から入った doc = このディスクのファイル
-- **表C** = Browse 経由 (D6, D7) = `remoteUrl` を持つ doc
+**形式軸を入口で割る根拠の実例:** ヘッダ無し RAW のうち `.rggb` だけが
+`SEQ_EXTS` にあって File ▸ Open のフィルタに無かった (§7 G8)。同じ形式が入口に
+よって違う答えを返したので、別の行として数える。
 
 ---
 
-## 2. 表A — 形式 × 入口 (117セル)
-
-| | D1 CLI | D2 D&D file | D3 D&D folder | D4 Open | D5 Open Folder | D6 Browse local | D7 Browse peer | D8 session | D9 reader |
-|---|---|---|---|---|---|---|---|---|---|
-| **F1 .npy** | ○ `[T:remote]` | ○ `[C:main.cpp:359]` | ○ `[C:2339]` | ○ `[C:2369]` | ○ `[T:scan]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[T:verify V15]` | ○ `[T:verify V25m]` |
-| **F2 .npz** | ○ `[C:2311]` | ○ `[C:2311]` | **×落 G3** | ○ `[C:2369]` | **×落 G3** `[C:seq:1454]` | ○ `[C:1734]` | ○ SCAN → picker `[T:rnpz R14/R15]` | ○ `[T:verify V21]` | ○ `[C:sess:2591]` |
-| **F3 PNG** | ○ `[T:media]` | ○ | ○ `[T:scan S3]` | ○ `[P]` | ○ `[T:scan S3]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2/P7]` | ○ `[T:media M9]` | ○ |
-| **F4 JPEG** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[C:sess:2604]` | ○ |
-| **F5 TIFF** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[T:media M12]` | ○ |
-| **F6 OpenEXR** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[T:media M18]` | ○ |
-| **F7 y4m** | ○ `[T:media]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ○ `[T:fmtgate P1/P2]` | ○ `[C:sess:2604]` 無試験 | ○ |
-| **F8 ベンダ RAW** | ○ `[T:fmtreg]` | ○ | ○ | ○ `[P]` | ○ `[C:seq:1383]` | ○ `[T:fmtgate F1]` | ×決 `[T:fmtgate F3/P6]` `[D:#148 B]` | ○ `[C:sess:2604]` 無試験 | ○ |
-| **F9 ヘッダ無し RAW** | ○ `[C:cli:836]` | ○ `[C:2355]` | ○ `[C:seq:1509]` | ○ `[C:2369]` | ○ `[C:seq:1380]` | **×落 G2** `[P]` | **×落 G1** `[P]` | ○ `[C:sess:2537]` 無試験 | ○ `[D:§4.12]` |
-| **F10 `.rggb`** | ○ `[C:cli:836]` | ○ | ○ | **×落 G8** `[C:2369]` | ○ `[C:seq:1380]` | **×落 G2** `[P]` | **×落 G1** `[P]` | ○ `[C:sess:2537]` 無試験 | ○ |
-| **F11 動画** | ×決 `[T:fmtgate F2]` | ×決 | — 束ねない `[C:seq:1383]` | ×決 `[C:2341]` | — 同上 | ×決 `[T:fmtgate F3 local]` | **×落 G7** `[P]` | — | ○ `[C:2353]` |
-| **F12 `.vsession`** | ○ `[C:2317]` | ○ `[C:2317]` | — 画像ではない | ○ `[C:2372]` | — `SEQ_EXTS` に無い | **×落 G2** `[P]` | — peer にセッションは無い | — | ○ `[C:2289]` |
-| **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ | **×落 G3** (`.npz` として) | ○ `[C:2369]` | **×落 G3** | ○ `[C:menus:669]` | ○ SCAN → `vnzBuild` `[T:rnpz R16]` | **×落 G6** `[C:sess:2591]` | ○ `[T:verify V25m]` |
-
-**D9 はこのマシンのパスにしか効かない。** `readerFor` が引かれるのは `openPath` の
-先頭 (`core/app/open_dispatch.inc:2289`) だけで、`openRemote` は
-`peerServesName` が false なら reader を提案せずに断る (`:1748`)。
-`docs/features/adapters/input-adapters.md §4.13.1` (2026-08-03) は「adapter は peer 側で走る」と
-**決めている**が、`core/serve.cpp` にその API は無い → **G11**。
-
-**この表の読みどころ。** D1–D5 (直接の入口) はほぼ全部 ○ で、× は動画に対する意図的な
-拒否だけ。**未対応項目は D6 / D7 の列に集中している**——つまり **Browse という入口が、
-他の入口で開けるファイルを開けない**。これは #111 と #148 が2回続けて直した欠陥の
-**3回目**で、直っていないのは 形式表に**行を持たない**形式 (F9/F10/F12) である。
-述語 `viewerReadsName` / `peerServesName` はどちらも「表の行かどうか」で答えるので、
-表に行が無い形式は**述語の外側にいる**。
-
----
-
-## 3. 表B — 形式 × 操作 (直接の入口から入った doc, 91セル)
-
-| | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
-|---|---|---|---|---|---|---|---|
-| **F1 .npy** | ○ `[T:remote]` | ○ `[T:scan]` | ○ `[T:framestats]` | — 構造上 `[C:od:408]` | ○ `[T:watch]` | ○ `[T:reload]` | ○ `[T:export]` |
-| **F2 .npz** | ○ `[T:verify V21]` | ○ ファイル内フレーム軸 / **×落 G3** フォルダ連番 | ○ `[C:pt:527]` | — | ○ `[C:watch:135]` | ○ `[C:od:768-783]` | ○ |
-| **F3 PNG** | ○ `[T:media]` | ○ `[T:scan S3]` | ○ | — | ○ `[C:watch:135]` 無試験 | ○ `[T:fmtreg F2]` | ○ |
-| **F4 JPEG** | ○ `[T:media]` | ○ `[C:seq:392]` 無試験 | ○ | — | ○ 無試験 | ○ `[T:fmtreg F2]` | ○ |
-| **F5 TIFF** | ○ `[T:media]` | ○ 複数ページ `[T:fmtreg F4]` | ○ | — | ○ 無試験 | ○ `[T:fmtreg F2/F4]` | ○ |
-| **F6 OpenEXR** | ○ `[T:media]` | ○ 連番 / レイヤは documents `[T:fmtreg F5]` | ○ | — | ○ 無試験 | ○ `[T:fmtreg F5]` | ○ |
-| **F7 y4m** | ○ `[T:media]` | ○ 1ファイル=1 stack `[T:fmtreg F4]` | ○ | — | ○ 無試験 | ○ `[T:fmtreg F2]` | ○ |
-| **F8 ベンダ RAW** | ○ `[T:fmtreg]` | ○ `[C:seq:1383]` 無試験 | ○ | — | ○ 無試験 | ○ `[T:fmtreg F2]` | ○ |
-| **F9 ヘッダ無し RAW** | ○ `[T:srcmap M3]` | ○ `[C:seq:1524]` 無試験 | ○ | — | ○ `[T:srcmap M3]` (baseline) | ○ `[C:od:690]` **無試験** | ○ |
-| **F10 `.rggb`** | ○ 同 F9 | ○ 同 F9 | ○ | — | ○ | ○ **無試験** | ○ |
-| **F11 動画** | — doc にならない (表A の D1–D8 が全部 × 。reader 経由で開いた場合は F13 の行になる) | — | — | — | — | — | — |
-| **F12 `.vsession`** | — 画像ではない (セッションは状態であって doc ではない) | — | — | — | — | — | — |
-| **F13 container / reader 出力** | ○ `[T:fmtreg F6]` | ○ `stack` 層 → 2 doc `[T:fmtreg F6]` | ○ | — | ○ 起点ファイルを見る `[C:watch:32]` | ×決 `[T:fmtreg F6/F8]` `[C:od:610]` | ○ |
-
-`O4` の列が丸ごと「—」なのは欠落ではなく**設計**である: 直接の入口から入った doc は
-`remoteUrl` も `remoteFiles` も持たないので `serverComputes` が false を返し、
-MEASURE は発射されない (`core/app/open_dispatch.inc:408-411`)。この列に意味が
-生じるのは表C だけである。
-
-`O7` が形式に依らず全部 ○ なのは、export が**デコード後の float32 バッファしか
-読まない**からである (`exportDocRGBA` `core/app/export.inc:77-82`、
-`renderDocRGBA` `core/app/compare.inc:799`、`buildRoiExport` `core/ui/panel_rois.inc:30`)。
-形式・dtype・path は provenance 行に**印字されるだけ**で、分岐には使われない。
-**ただし試験は `.npy` float32 しか通していない** (`selftest.export` / `export-tsv` は
-`tools/testdata/multi`、`roi-export` はファイルを一切開かない)。
-
----
-
-## 4. 表C — 形式 × 操作 (Browse 経由の doc, 91セル)
-
-記号が 2つ入っているセルの読み方:
-
-- `A | B` — **由来で割れる**。左が `local://`、右が `ssh://`
-- `A / B` — **フレームの状態で割れる**。左が全解像度の読込み完了後、右が
-  間引かれた preview のあいだ (O7 の列だけ)
-
-| | O1 見る | O2 stack | O3 フレーム毎統計 | O4 peer MEASURE | O5 Watch | O6 Reload | O7 export |
-|---|---|---|---|---|---|---|---|
-| **F1 .npy** | ○ `[T:fmtgate P1/P2]` | ○ `[T:scan]` `[T:browse]` | ○ 常駐分のみ `[C:pt:429]` | ○ `[T:rtemporal]` | ○ `[T:rwatch]` | ○ `[T:rwatch R]` `[C:od:616]` | ○ / **×落 G4** preview |
-| **F2 .npz** | ○ ローカルの入口へ再ルート `[C:od:1734]` \| ○ SCAN の経路 `[T:rnpz]` | — 再ルート後は表B \| メンバごとに表B | — \| — | — \| — | — \| — | — \| — | — \| **×決** preview 無し `[T:fmtgate F4g]` |
-| **F3 PNG** | ○ `[T:fmtgate P1/P2]` | ○ `[T:fmtgate P7]` | ○ | ○ `[T:rtemporal-png]` | ○ `[T:rwatch R12]` | ○ `[T:rwatch]` | ○ / **×落 G4** |
-| **F4 JPEG** | ○ `[T:fmtgate P1/P2]` | ○ `[C:serve:1129]` | ○ | ○ `[C:serve:558]` 無試験 | ○ `[C:watch:51]` | ○ | ○ / **×落 G4** |
-| **F5 TIFF** | ○ `[T:fmtgate P1/P2]` | ○ 複数ページ `[T:fmtgate P2]` | ○ | ○ `[C:serve:558]` 無試験 | ○ | ○ | ○ / **×落 G4** |
-| **F6 OpenEXR** | ○ `[T:fmtgate P1/P2]` | ○ | ○ | ○ `[C:serve:558]` 無試験 | ○ | ○ | ○ / **×落 G4** |
-| **F7 y4m** | ○ `[T:fmtgate P1/P2]` | ○ フレーム軸 | ○ | ○ `[C:serve:558]` 無試験 | ○ | ○ | ○ / **×落 G4** |
-| **F8 ベンダ RAW** | ○ 再ルート `[T:fmtgate F1]` \| ×決 `[T:fmtgate F3/P6]` | — \| — | — \| — | — \| — | — \| — | — \| — | — \| — |
-| **F9 ヘッダ無し RAW** | **×落 G2** \| **×落 G1** | — 届かない | — | — | — | — | — |
-| **F10 `.rggb`** | **×落 G2** \| **×落 G1** | — | — | — | — | — | — |
-| **F11 動画** | ×決 `[T:fmtgate F3 local]` \| **×落 G7** | — | — | — | — | — | — |
-| **F12 `.vsession`** | **×落 G2** \| — | — | — | — | — | — | — |
-| **F13 container / reader 出力** | ○ 再ルート `[C:od:1734]` \| ×決 `[C:imagefile:422]` | — \| — | — \| — | — \| — | — \| — | ×決 `[T:fmtreg F8]` \| — | — \| — |
-
-### 表C で気付いたこと
-
-**`local://` の非 peer 形式は、入口でローカル処理へ再ルートされる。** `.npz` と ベンダ RAW は
-`openRemote` の #111 分岐 (`core/app/open_dispatch.inc:1733-1743`) で `openPath` に
-渡され、`remoteUrl` を持たない doc になる。したがって表C の行としては O1 だけが
-意味を持ち、以降は表B の行と同一になる。これは判断であって落穂ではない
-(`[D:input-adapters §3.6.4]`)。
-
-**stack 系の動詞がローカル行でも peer の問いのままなのは判断である**
-(`[D:input-adapters §3.6.4]`「stack 系の動詞は peer の問いのまま……出して押させて
-断るより出さない」、`core/browse/panel.cpp:444/1048/1136/1501`)。プレビューが付か
-ないのも同じ節で決めてある。
-
----
-
-## 5. セルの数え
-
-| | 表A | 表B | 表C | 合計 |
-|---|---|---|---|---|
-| セル総数 | 117 | 91 | 91 | **299** |
-| **○ 通る** | 91 | 64 | 36 | **191** |
-| **×決 判断あり** | 7 | 1 | 4 | **12** |
-| **×落 落穂** | **12** | **1** | **10** | **23** |
-| **— 対象外** | 7 | 25 | 41 | **73** |
-
-`local:// \| ssh://` で割れているセルは 1セルと数え、片方が `×落` ならそのセルは
-`×落` に数えた (落穂を薄めないため)。表B F2 の O2 も同じ扱い。
-
-`×落` 23セルは重複を除くと **11件の原因** (G1–G11) に落ちる。§7。
-セルを最も多く占めているのは **G4 (6セル)**、**G3 (5セル)**、**G1 (4セル)**、
-**G2 (3セル + G1 と共有 2セル)** で、残りの 7件は 1セルずつである。
-**セル数と噛みやすさは別物**なので、§7 の順序はセル数ではなく被害で並べてある。
-
-**selftest が直接証明しているセル: 80**
-(表A 34、表B 28、表C 18)。残りの ○ はコードを読んだ結果か `[P]` である。
-形式別の試験の厚みは極端に偏っている——`.npy` が 8試験、PNG が 6、TIFF/EXR/y4m/JPEG/
-ベンダ RAW が 3–4、**ヘッダ無し RAW は 1 (`selftest.srcmap` M3 の 1ブロックだけ)**、
-`.rggb` は 0。
-
----
-
-## 6. どのセルを selftest が証明しているか
-
-| selftest | 証明しているセル |
-|---|---|
-| `fmtgate` | 表A F1/F3–F8 × D6/D7 (一覧・開ける・断り文)、表C F1/F3–F7 × O1 (peer META/TILE が local デコードとビット一致)、F8 × D7 の**理由付き拒否**、F3 × O2 (peer SCAN が連番 PNG を1つに束ねる) |
-| `media` | 表A F3–F7 × D1、表B F3–F7 × O1、TIFF の複数ページ = stack、EXR のレイヤ = documents |
-| `fmtreg` | 表B F3–F8 × O6 (register / reload / 2度目の open が共有)、F13 × O6 の**判断された拒否** |
-| `scan` | 表A F1/F3 × D5、表B F1/F3 × O2、表C F1 × O2 |
-| `rtemporal` / `rtemporal-png` | 表C F1 × O4、**F3 × O4** (peer 側 σ_t が独立な f64 参照と一致し、同じ stack をローカルで測った値ともビット一致) |
-| `rwatch` | 表C F1/F3 × O5/O6 (R12 が「watch 対象のリモートフォルダはもう `.npy` とは限らない」を担保) |
-| `watch` / `reload` | 表B F1 × O5/O6 |
-| `srcmap` | **表B F9 × O1/O5** (ヘッダ無し RAW が Watch の baseline を残す) ——ヘッダ無し RAW の唯一の試験 |
-| `browse` / `browse-keys` / `localbrowse` | 表A F1 × D6、一覧の行・キー操作 |
-| `export` / `export-tsv` / `roi-export` | O7 (ただし `.npy` float32 のみ) |
-| `framestats` | O3 (`.npy` のみ) |
-| `verify` | 表A F1/F2/F13 × D8/D9 |
+> **§2〜§6 は本書に無い。** 表A (形式 × 入口 117セル)、表B / 表C
+> (形式 × 操作 各91セル)、セルの数え、selftest が証明しているセルの対応表は
+> すべて [results/20260811-matrix.md](results/20260811-matrix.md) にある。
+> 再測定するときは新しい `results/<YYYYMMDD>-matrix.md` を作り、本書の §7 以降を
+> 更新する——凍結した測定を書き換えない。
 
 ---
 
 ## 7. 落穂 (fall-through) — 見つかったもの
 
 **噛みやすい順。** 各件について「決めて記録する」と「道を開く」の両方を書く。
-**§1–§6 のセルは測定の記録なので、直した後も書き換えない**——下の一覧が現況で、
-セルは「2026-08-11 に何が出荷されていたか」である。
+**下の一覧が現況である。**[results/20260811-matrix.md](results/20260811-matrix.md)
+のセルは測定の記録なので直した後も書き換えない——あちらは「2026-08-11 に何が
+出荷されていたか」で、こちらは「今どうなっているか」である。
+
+各件の「**どこ。**」以下は 2026-08-11 の調査そのままで、そこに出る行番号は
+**当時の所見**である。生きた指し先は関数名・配列名のほうで、行は照合の助けに
+すぎない (§0 の規則)。
 
 | | 件 | 状態 |
 |---|---|---|
@@ -736,26 +549,32 @@ peer が古いという文ではない。試験は `--rmeasure-selftest`
 ## 8. 落穂ではないもの (=判断が記録されている拒否)
 
 マトリクスを作った副産物として、**ちゃんと決めてある**ものを一覧にしておく。
-次に同じ問いが出たときに探し直さないため。
+次に同じ問いが出たときに探し直さないため。**記録場所は symbol と節 anchor で
+指す** (§0 の規則)。
 
 | 拒否 | 記録場所 |
 |---|---|
-| ベンダ RAW は peer に渡らない | `Backend::overLink=0` + `core/imagefile.h:126-145` + `docs/features/adapters/input-adapters.md §3.6.4b` + issue #148 判断B。試験: `fmtgate` F3/P6 |
-| ~~`.npz` は peer に渡らない~~ **渡る (#217, protocol 13)** | `MSG_NPZ_SCAN` + `docs/features/remote/remote-reader-design.md §10`。`docs/features/adapters/npz-design.md:91` が名指しした「zip の中身一覧を返す動詞」がこれ。残る拒否は「`.npz` 丸ごとを 1 配列として指した要求」だけで、文面は `core/imagefile.cpp` の `isNpz` 分岐。試験: `fmtgate` F4g / `--rnpz-selftest` |
+| ベンダ RAW は peer に渡らない | `Backend::overLink=0` の列とその隣のコメント (`core/imagefile.h`) + `docs/features/adapters/input-adapters.md §3.6.4b` + issue #148 判断B。試験: `fmtgate` F3/P6 |
+| ~~`.npz` は peer に渡らない~~ **渡る (#217, protocol 13)** | `MSG_NPZ_SCAN` + `docs/features/remote/remote-reader-design.md §10`。`docs/features/adapters/npz-design.md §2.3` が名指しした「zip の中身一覧を返す動詞」がこれ。残る拒否は「`.npz` 丸ごとを 1 配列として指した要求」だけで、文面は `core/imagefile.cpp` の `isNpz` 分岐。試験: `fmtgate` F4g / `--rnpz-selftest` |
 | 動画コンテナは読まない | `imagefile::videoRefusal` + `docs/features/media/video-support.md §1` (実測: σ_t 40 DN16 → 0.00) + issue #54 |
-| CFA TIFF は当てずに断る | `core/tiffread.cpp` + `core/imagefile.h:41-47` (規則3) + `docs/guides/manual.md:270` |
-| container / reader メンバは per-member reload しない | `reloadUnavailable` `core/app/open_dispatch.inc:505` + `reloadSource:610`。試験: `fmtreg` F6/F8 |
+| CFA TIFF は当てずに断る | `core/tiffread.cpp` + `core/imagefile.h` 冒頭の規則3「CFA IS READ OR ABSENT, NEVER GUESSED」 + `docs/guides/manual.md §2.3b` |
+| container / reader メンバは per-member reload しない | `reloadUnavailable` と `reloadSource` (`core/app/open_dispatch.inc`)。試験: `fmtreg` F6/F8 |
 | Browse の stack 系の動詞は peer の問いのまま | `docs/features/adapters/input-adapters.md §3.6.4` |
 | Browse のローカル行にプレビューは付かない | 同上 (「1クリックは選択・ダブルクリックで開く」) |
 | peer が配れない行も一覧から落とさない | 同上 (#111 の裁定「見せて理由を言う」)。試験: `fmtgate` F2/F3 |
-| 直接の入口から入った doc は MEASURE を peer に投げない | `serverComputes` `core/app/open_dispatch.inc:408` |
-| 単独フレームは Watch しない (手動 Reload) | `docs/features/watch/watch-design.md §9` + `core/app/watch.inc:66-68` |
-| 自動 reload は peer の stack に対して走らない | `watchAutoRefusal` `core/app/watch.inc:680-688` + `docs/features/watch/watch-design.md §16.6` |
-| `.raw` を LibRaw に渡さない | `core/imagefile.cpp:230-234` + `docs/features/adapters/input-adapters.md:577` |
+| 直接の入口から入った doc は MEASURE を peer に投げない | `serverComputes` (`core/app/open_dispatch.inc`) |
+| 単独フレームは Watch しない (手動 Reload) | `docs/features/watch/watch-design.md §9` + `watchTargetsNow` 冒頭の「何がここに無いか」コメント (`core/app/watch.inc`) |
+| 自動 reload は peer の stack に対して走らない | `watchAutoRefusal` (`core/app/watch.inc`) + `docs/features/watch/watch-design.md §16.6` |
+| `.raw` を LibRaw に渡さない | `core/imagefile.cpp` の vendor RAW 行のコメント (「".raw" is deliberately NOT among these extensions」) + `docs/features/adapters/input-adapters.md §3.6.5` |
 
 ---
 
 ## 9. `[P]` — 手で確かめたもの
+
+> **この節は 2026-08-11 の実施記録**である (commit `5906542e`)。
+> [results/20260811-matrix.md](results/20260811-matrix.md) のセルが `[P]` と
+> 書いているのはここを指す。実施記録なので、以下の関数名・行・出力は当時のもの
+> として読み、書き換えない。
 
 **何を。** 形式の可否判定 (`imagefile::forPath` / `peerServes` / `peerRefusal` /
 `videoRefusal` / `dialogPattern` / `backends`) が**実際に返す値**。ソースを読んだ
@@ -805,8 +624,9 @@ decodableFormats: PNG, JPEG, TIFF, OpenEXR, y4m
 
 ## 10. この表の保ち方
 
-**この文書は手作業だけで保守するものではない。** 上の表のうち、形式の可否判定の列
-(`forPath` / `viewerReadsName` / `peerServes`) は `selftest.fmtgate` の F4 が
+**この文書は手作業だけで保守するものではない。** 形式の可否判定の列
+(`forPath` / `viewerReadsName` / `peerServes` — §9 が実測したもの) は
+`selftest.fmtgate` の F4 が
 **表の全行について不変条件として** assert している——「peer が配れるものは
 必ずこの viewer も読む」「`peerServesName(x) == b.overLink`」。だから
 **表に行を足せば F4 が勝手に見る。**
