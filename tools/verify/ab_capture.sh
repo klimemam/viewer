@@ -6,7 +6,9 @@
 #
 # usage: ab_capture.sh <viewer.exe> <viewer-serve.exe> <outdir> <ab-root>
 #
-# Determinism controls (each is a deliberate choice, see docs/verification/functional.md):
+# Determinism controls (each is a deliberate choice; the 決定性の担保 table in
+# docs/verification/results/20260803-functional.md §1 records why each one is
+# here):
 #   * cwd is the SHARED <ab-root>, never a worktree, so every relative fixture
 #     path in the command list is the same string for both builds.
 #   * APPDATA is pinned to a FRESH empty dir per pass. The selftests read the

@@ -1,5 +1,8 @@
 #!/bin/bash
-# Section B: the measurement invariants that must hold at EVERY future stage.
+# The measurement invariants that must hold at EVERY future stage - section B
+# of docs/verification/results/20260803-functional.md, whose standing statement
+# is the invariant table in docs/verification/functional.md §1 (item F2 there
+# is what gates them today).
 # Asserted against a capture dir produced by ab_capture.sh, so every one is a
 # statement about real captured output, not about the source.
 #

@@ -3,7 +3,7 @@
 **状態: 設計 (2026-08-17, Fable)。** issue #180 のユーザー裁定 B —
 `docs/features/adapters/input-adapters.md` §4.13.1 (2026-08-03)「**adapter は peer 側で走る**」を
 そのとおり実装する — を受けた設計。対象は verify-matrix **G11**
-(「決定はあるが実装が無く、拒否文もそれを言わない」、`docs/verification/matrix.md:640`)。
+(「決定はあるが実装が無く、拒否文もそれを言わない」、`docs/verification/matrix.md` §7 G11)。
 
 > **現行追記:** stage 0〜5 は 2026-08-17 に protocol 12〜14 として実装済み。
 > §0、§7、§8〜§10 は現行契約・境界・実装台帳、§1〜§6 は実装前設計記録として
