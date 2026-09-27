@@ -250,14 +250,14 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 | # | 対 | 一致すべきか | parity 試験 | 試験の強さ |
 |---|---|---|---|---|
 | P1 | σ_t: local (K4#1) ↔ peer (K4#3) | **はい** (正典: 「local と server は転送路であって量ではない」) | **あり** `--rtemporal-selftest` P1 (+ `-png` 版)、`--rmeasure-selftest` M1f/M2d/M2f/M6d/M6f/M6h/M7c | **ビット単位** (`==`、許容を明示的に拒否)。加えて独立 f64 参照と rel 1e-9 |
-| P2 | σ_fpn / fpn_corr / clamp / σ_tot: local ↔ peer | **はい** | **あり** 同 P2/P3/P4/P5 | ビット単位。**補正量とクランプ旗まで**比べる (両側がクランプして 0 同士で一致するのを防ぐため) |
+| P2 | σ_fpn / fpn_corr / clamp / σ_tot: local ↔ peer | **はい** | **あり** `--rtemporal-selftest` の P2/P3/P4/P5 | ビット単位。**補正量とクランプ旗まで**比べる (両側がクランプして 0 同士で一致するのを防ぐため) |
 | P3 | set fold: local (K4#4) ↔ peer (`foldOneRole`) | **はい** | **あり** `--rset-selftest` RS3/RS5c/RS7/RS9/RS10/RS11/RS24 | ビット単位、全欄 (値・補正量・非補正上界・μ・σ_d・クランプ・標本数・遮蔽 p-p / % / 可否) + タイトル/form/cutoff/拒否文の文字列。fixture に**非2進小数の項を意図的に混ぜて**「厳密一致が入力のせいで成立する」のを防いでいる |
 | P4 | plugin 結果: local 実行 ↔ peer 実行 | **はい** | **あり** `--rplugin-selftest` RP24 (出荷 `stats/moments`)、RP3/RP21、`--remote-selftest` MEASURE (pooled と Bayer 宣言の2回) | **`%.9g` の文字列一致**。同じ dll を両側で走らせるので算術は同一。**`mean/var/std/min/max/p1/p50/p99/entropy/finite ratio` がこの1本でだけ2回計算されて比べられている** |
 | P5 | 領域 mean: `fStat.mean` (K1#3) ↔ 列平均の平均 `hStat.mean` (K2#1) | **はい** (同じ標本の同じ平均を2回計算している) | **あり** `--precision-selftest` P7c/P7d | **float 1 ulp** (`\|m\|·2⁻²³ + 1e-12`)。P7e は**V profile の平均は別の数**であることを逆に固定する (#145) |
 | P6 | Temporal export §3 の per-frame σ ↔ ddof=0 の閉形式 | はい | **あり** `--export-tsv-selftest` E11 | `%.9g` で最終桁まで一致し、**ddof=1 とは一致しないこと**も検査 |
 | P7 | パネル表示 ↔ エクスポート (ROIs / Projection / Analysis / Set / Series / Temporal §1-2) | **はい** | **あり (構造的)** `--export-tsv-selftest` E2/E9/E13、`--roi-export-selftest` X4 | **再計算しないので定義上一致**。E2 は σ_t / σ_fpn / `fStat.mean` / `fStat.sd` / `vStat.sd` / `hStat.sd` / HFPN-RN / VFPN-RN / status を `%.9g` で突き合わせる。E9 は「B 列は A を貼り替えたものではない」 |
 | P8 | σ_fpn: Temporal パネル (K5 local) ↔ Set Analysis の DSNU (K4#4→`setPlaneFpn`) | **はい** (DSNU は同じ推定量を dark に当てたもの) | **あり** `--setanalysis-selftest` S2 (+ F2 / F10) | **ビット単位**。値・補正量・クランプ旗。許容を使わない理由をコメントが述べている |
-| P9 | K3 の HFPN/RN・VFPN/RN: `ProjState` キャッシュ ↔ `computeProfileNoise` 直呼び | はい | **あり** `--profile-noise-selftest` P7 | **厳密 `==`**、プロット reduce mode 3種すべてで。値そのものは P1–P6 が**手で導いた有理数**に 1e-10 で当てる |
+| P9 | K3 の HFPN/RN・VFPN/RN: `ProjState` キャッシュ ↔ `computeProfileNoise` 直呼び | はい | **あり** `--profile-noise-selftest` P7 | **厳密 `==`**、プロット reduce mode 3種すべてで。値そのものは同 selftest の P1–P6 が**手で導いた有理数**に 1e-10 で当てる |
 | P10 | σ_t: K4#1 ↔ K4#2 (`computeStackStats`) | **はい** (正典: 3実装すべて同じ式) | **間接のみ** | `--verify-selftest` V13 は同じ NaN fixture を**両実装で測るが、各々を解析真値に当てるだけで互いを比べない**。`--abstats-selftest` A2 は K4#1 を試験内参照 `refSigmaT` に面別 1e-6 で当てる (K4#2 には相方が無い)。**2つを並べる assert は無い** |
 | P11 | σ_t: K4#2 ↔ K4#3 (peer) | はい | **なし** (P1 は #1↔#3 のみ) | — |
 | P12 | K4 の **CFA 面規則** 3種 | **はい** | **なし** | P1 の fixture は `T.nPl == 1` を assert している = **非 CFA でしか local/peer parity を見ていない**。`--rmeasure-selftest` M7b/M7d はモザイクを peer 側で4面に割ることは見るが、**local の面規則と突き合わせない** |
