@@ -1600,10 +1600,24 @@
             check(readerFor(natUrl) == natSpec, "R14c ...and the choice is remembered");
 
             // (c) FRESH OPEN of a natively-supported url: the memo wins.
+            //
+            // ...and the memo door STARTS the reader instead of waiting for it
+            // (issue #232 stage 2): openPath returns with a ReaderJob up and no
+            // document, so this test drives that job the way the frame loop
+            // drives it. The claim is unchanged - WHOSE PIXELS come back - and
+            // the new line is what makes it still be about the door a person
+            // uses. R14m below asserts the asynchrony itself.
             closeAll();
             openPath(natUrl);
+            const bool r14async = app.rdJob != nullptr && app.images.empty();
+            waitForReader();
             check(isReaderDoc() && firstPx() == (float)(BASE + BUMP),
                   "R14d a fresh open of a NATIVE-readable url returns the reader's pixels");
+            fprintf(stderr, "rreaderselftest:   R14m after openPath: job=%d %zu doc(s)\n",
+                    (int)r14async, app.images.size());
+            check(r14async,
+                  "R14m ...and the remote memo door STARTED it: openPath returned "
+                  "with a job up and nothing read");
             fprintf(stderr, "rreaderselftest:   R14 fresh open: %zu doc(s) member=\"%s\"\n",
                     app.images.size(), cur() ? cur()->src->member.c_str() : "");
             check(app.images.size() == (size_t)NF,
@@ -1612,6 +1626,7 @@
             // (d) ...and the Browse panel's registered open, the other door.
             closeAll();
             const bool bo = browseOpenRemote(natUrl, false, 0, rp::NR_NATIVE);
+            waitForReader();               // the same started job, driven (see R14d)
             check(bo && isReaderDoc() && firstPx() == (float)(BASE + BUMP),
                   "R14f Browse Open returns them too - one rule, both doors");
 
@@ -1666,6 +1681,7 @@
             check(rerr2.empty(), "R14k (setup) the rank-5 origin opens through its reader");
             closeAll();
             openPath(url);
+            waitForReader();               // started, not waited for (see R14d)
             check(app.images.size() == (size_t)S && isReaderDoc(),
                   "R14l a fresh open of an UNSUPPORTED url returns the reader's pixels too");
 

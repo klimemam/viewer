@@ -2542,6 +2542,7 @@
                                      "the wait is off the UI thread");
                         // ...and the same job, driven to the end the way the
                         // frame loop drives it, opens what it always opened.
+                        const int dec0 = g_readerDecodes;
                         waitForReader();
                         fprintf(stderr, "verifyselftest: V25t landed: runs+%d %zu doc(s) "
                                         "ok=%d\n", g_adapterRuns - runs0, app.images.size(),
@@ -2549,6 +2550,55 @@
                         check(g_adapterRuns - runs0 == 1 && app.readerLastOk &&
                                   app.images.size() == 6 && app.series.size() == 1,
                               "V25t ...and finishing it opens what the reader declared");
+
+                        // ---- V25w: the .vstream was READ on the job's thread --
+                        // Issue #232 stage 2. Stage 1 moved the WAIT off this
+                        // thread and measured 452 ms of window still not
+                        // answering at 480 MB, 746 ms at 768 MB: every one of
+                        // those milliseconds was pollReader -> readerFinish ->
+                        // loadViewerStream, on the UI thread, after the child had
+                        // already exited. A headless test cannot watch a window
+                        // fail to freeze, but it can watch WHICH THREAD did the
+                        // reading, and that is the whole claim - so the thread id
+                        // is recorded where the decode happens and compared with
+                        // this one. Equal ids would mean the split is decorative.
+                        const bool offThread = g_readerDecodes - dec0 == 1 &&
+                                               g_readerDecodeThread !=
+                                                   std::this_thread::get_id() &&
+                                               !g_readerDecodeCacheHit;
+                        fprintf(stderr, "verifyselftest: V25w decodes+%d cacheHit=%d "
+                                        "sameThreadAsUi=%d\n", g_readerDecodes - dec0,
+                                (int)g_readerDecodeCacheHit,
+                                (int)(g_readerDecodeThread == std::this_thread::get_id()));
+                        check(offThread,
+                              "V25w a RUN's .vstream is read and decoded on the job's "
+                              "thread, not the UI's");
+
+                        // ---- V25x: ...and so is a CACHE HIT -------------------
+                        // The hit was the worse of the two in kind: 592 ms with
+                        // no Python running at all, because "a cache hit finishes
+                        // with no thread" was true of the child and false of the
+                        // work. Same key, same reader, opened again: the run
+                        // count must NOT move, the cache must be what answered,
+                        // and it must still have happened on another thread.
+                        closeAll();
+                        const int runs1 = g_adapterRuns, dec1 = g_readerDecodes;
+                        openPath(srcPath);
+                        const bool hitAsync = app.rdJob != nullptr && app.images.empty();
+                        waitForReader();
+                        fprintf(stderr, "verifyselftest: V25x cache open: runs+%d decodes+%d "
+                                        "hit=%d job-at-return=%d %zu doc(s)\n",
+                                g_adapterRuns - runs1, g_readerDecodes - dec1,
+                                (int)g_readerDecodeCacheHit, (int)hitAsync,
+                                app.images.size());
+                        check(g_adapterRuns - runs1 == 0 && g_readerDecodeCacheHit &&
+                                  app.images.size() == 6,
+                              "V25x the second open reads the cache and does not re-run "
+                              "Python");
+                        check(hitAsync && g_readerDecodes - dec1 == 1 &&
+                                  g_readerDecodeThread != std::this_thread::get_id(),
+                              "V25x ...on a thread of its own: a hit no longer finishes "
+                              "inside openPath");
                     }
 
                     // ---- V25u: a memo replay that fails says the same thing --

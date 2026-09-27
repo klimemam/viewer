@@ -2335,6 +2335,7 @@ static bool g_watchSuppressed = false;
         // BEFORE this frame's draw, so an instance drawn in the frame that just
         // finished carries uiFrame - 1 when rbPollDue is asked about it.
         app.uiFrame++;
+        pumpOpenJob();                // land a single-file open the worker finished
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpRestoreWaits();           // session lines waiting for a remote arrival

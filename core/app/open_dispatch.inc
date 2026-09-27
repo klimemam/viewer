@@ -1916,10 +1916,26 @@ static bool openRemoteMemoFirst(const std::string& url, bool& opened) {
     opened = false;
     const std::string spec = readerFor(url);
     if (spec.empty()) return false;              // no record: not this door's business
-    const size_t before = app.images.size();
-    const std::string err = openRemoteWithReader(url, spec);
-    if (err.empty()) opened = app.images.size() > before;
-    else toast(baseName(url) + " via " + spec + ": " + err, true);
+    // STARTED, not waited for (issue #232 stage 2). This was the last door still
+    // calling the synchronous round trip - stage 1 left it because a selftest
+    // depended on it - and it is the same door the local memo replay was: the
+    // ordinary reopen of a url a reader was once chosen for, which spent the
+    // whole of a 300 s timeout's worth of possible wait on the UI thread.
+    //
+    // startReader has carried REMOTE jobs since #180: a session of its own on a
+    // thread of its own (two threads framing requests into one ssh stdin
+    // desynchronise the stream permanently), the Files row's timer, and a Stop.
+    // There is nothing to add - only this call to redirect.
+    //
+    // `opened` now means THIS DOOR HAS IT, which is the only thing a door can
+    // honestly report once the reading is another thread's: a job running or
+    // waiting. It is false exactly where it was false before - when the link
+    // could not even be prepared, which startReader has already said. Nothing
+    // falls through to the native path either way: a url the user chose a reader
+    // for is that reader's to refuse, and quietly handing back the origin's own
+    // array instead is the silence this door exists to prevent.
+    startReader(url, spec, baseName(url) + " via " + spec + ": ");
+    opened = app.rdJob != nullptr || !app.rdQueue.empty();
     return true;
 }
 
@@ -1978,8 +1994,14 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
             // handed a registered open it did not want.
             if (asPreview) return false;
             const size_t before = app.images.size();
+            const int starts0 = g_openStarts;
             openPath(rpath);              // the File > Open door, which SAYS what
-            return app.images.size() > before;   // it did - including refusals
+            // ...it did - including refusals. An open that went to a WORKER has
+            // landed nothing yet and has still been answered, so "did this door
+            // take it" is either a document or a started job (issue #232 stage
+            // 2): a door cannot report failure because the reading moved off
+            // this thread.
+            return app.images.size() > before || g_openStarts != starts0;
         }
         // A CONTAINER on the far side (issue #217). It comes after the local
         // fall-through above on purpose: a local:// url names a file on THIS
@@ -3343,6 +3365,255 @@ static void promotePreview(ImageDoc* d) {
     toast(d->name + ": opened");
 }
 
+// ---- the ordinary open, off the UI thread (issue #232 stage 2) --------------
+//
+// A .npy, a .npz or a picture file used to be read and decoded HERE, inside
+// openPath, on the UI thread, for as long as the file took. Measured on this
+// repo: 451 ms of a window answering nothing for a 480 MB .npy and 593 ms for a
+// stored 480 MB .npz, against 74 ms of actual disk time - the cost is the float
+// conversion, not the I/O, and none of it needs this thread.
+//
+// No new machinery. App::OpenJob is App::ReaderJob's shape (one at a time, a
+// queue in front of it, a cancel flag, a start time that IS the progress), the
+// split between decode and landing is the one pumpSequence has had since the
+// folder loader was written, and the row it draws is the row the reader, the
+// stack loader and the video export already draw.
+//
+// WHAT THE WORKER MAY TOUCH is the whole discipline: the pre-stat, the bytes and
+// the decode - every one of them pure, and every one of them already run on a
+// thread by the sequence loader. What it may NOT touch is app.images, the source
+// registry's publication, the batches or GL. That is the landing, below, and it
+// is the same list pumpSequence keeps.
+// (g_openStarts / g_openPumps live in state.h beside g_forceAsyncOpen: openRemote
+// reads the first one far above this block. See the note there.)
+//
+// What the Files row says while a job runs: the elapsed seconds and the NAME OF
+// THE PHASE, and no percentage. The read has a denominator - the file's size -
+// and the decode has none, so one bar carrying both would be measuring two
+// things with one number; and a bar that jumps from a true fraction to a made-up
+// one is worse than no bar. So the phases are named instead and the seconds are
+// the progress, exactly as they are for a reader and for a video export.
+static std::string openJobPhase(const App::OpenJob& j) {
+    switch (j.phase.load()) {
+    case App::OpenJob::PhReading: {
+        const uint64_t b = j.bytes.load();
+        if (!b) return "reading";
+        char n[48];
+        if (b >= (uint64_t)1 << 30) snprintf(n, sizeof n, "%.1f GB", (double)b / 1073741824.0);
+        else                        snprintf(n, sizeof n, "%.0f MB", (double)b / 1048576.0);
+        return std::string("reading ") + n;
+    }
+    case App::OpenJob::PhDecoding: return "decoding";
+    default:                       return "landing";
+    }
+}
+
+// The landing, and the ONE place the three local doors' sentences live. openPath
+// reaches it with nothing pre-decoded (the synchronous door) and pumpOpenJob
+// reaches it with a worker's OpenPre, so the wording, the offers and the stack
+// question cannot differ by which thread read the file.
+static void openLocalLand(const std::string& path, int kind, int npyRead,
+                          const std::string& onlyMember, OpenPre* pre) {
+    if (kind == OK_Npy) {
+        std::string err = loadNpy(path, npyRead, pre);
+        // §3.2's third line, attached: the refusal that named the shape is the
+        // same place the way out is offered. Nothing runs yet - the picker is a
+        // question, and only what the user then chooses is ever executed.
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+        else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
+        return;
+    }
+    if (kind == OK_Npz) {
+        // loadNpz says what it did (or raises the member picker, which says it
+        // after): a blanket "loaded x.npz" over a dialog would be a lie about
+        // both what happened and when
+        std::string err = loadNpz(path, onlyMember, npyRead, std::string(), std::string(),
+                                  true, pre);
+        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+        return;
+    }
+    // PNG / JPEG / TIFF. The extension only chose this door; what decodes is
+    // decided by the bytes behind it. A multi-page TIFF becomes a stack in
+    // loadImageFile, so this door opens one file and may gain N documents.
+    const size_t before = app.images.size();
+    std::string err = loadImageFile(path, onlyMember, pre);
+    if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+    // A file whose parts are NAMED, that produced several of them, has already
+    // said WHICH ones inside loadImageFile. A blanket "loaded x.exr" on top
+    // would be a second and vaguer sentence about the same event. Everything
+    // else - one picture, or the pages of a stack - is announced here exactly as
+    // it always was.
+    else if (app.images.size() - before <= 1 || !imagefile::forPath(path) ||
+             !imagefile::forPath(path)->partWord)
+        toast("loaded " + baseName(path));
+}
+
+// Everything the worker does, and nothing else. Every call in here is pure or is
+// already called from the sequence loader's thread for the same reason.
+static void openJobWorker(App::OpenJob* j) {
+    OpenPre& pre = j->pre;
+    // identity BEFORE the bytes (§6.2), and taken on THIS thread before THIS
+    // thread's read: the tuple the landing binds its documents to is the stat of
+    // the generation of the file whose bytes were actually read.
+    pre.stat.path = j->path;
+    statSourceFile(pre.stat);
+    j->bytes.store(pre.stat.fsize);
+    // Between the phases, never inside one (the design's promise: "it stops as
+    // soon as the phase it is on is finished"). A cancelled job lands nothing,
+    // which pumpOpenJob guarantees structurally rather than by being careful.
+    if (j->cancel.load()) { j->done.store(true); return; }
+    if (!readFileBytes(j->path, pre.bytes)) {
+        j->err = "cannot read file";
+        j->done.store(true);
+        return;
+    }
+    if (j->cancel.load()) { j->done.store(true); return; }
+    j->phase.store(App::OpenJob::PhDecoding);
+    std::string derr;
+    if (j->kind == OK_Npy) {
+        derr = npyDecodeFrames(pre.bytes, j->path, "", j->npyRead, pre.dec, &j->cancel);
+        if (derr.empty()) pre.decoded = true;
+    } else if (j->kind == OK_Picture) {
+        derr = picDecodeAll(j->path, pre.bytes, pre.stat, j->onlyMember, pre.dec, &j->cancel);
+        if (derr.empty()) pre.decoded = true;
+    } else if (j->kind == OK_Npz) {
+        // The one member this container answers with NO QUESTION ASKED, found
+        // with the very predicate the landing will use (npzPlanOf). Everything
+        // else - the `__viewer` container reading, a member picker, a refusal -
+        // is left to the landing with the bytes already in memory: a question is
+        // the UI thread's to ask, and there is nothing to pre-decode for one.
+        std::vector<NpzEntry> entries;
+        std::string lerr;
+        if (!npzList(pre.bytes, entries, lerr)) { j->err = lerr; j->done.store(true); return; }
+        NpzPlan plan;
+        npzPlanOf(pre.bytes, entries, j->onlyMember, plan);
+        for (const auto& m : plan.mem) {
+            if (plan.member.empty() || m.name != plan.member) continue;
+            std::vector<uint8_t> member;
+            std::string mErr;
+            if (!npzExtract(pre.bytes, entries[m.entry], member, mErr)) { derr = mErr; break; }
+            // The reading, and the display name, exactly as npzOpenMember would
+            // have asked for them: a named member carries the caller's npyRead
+            // (a session line, a §3.3 re-read), the single-image case is native.
+            derr = npyDecodeFrames(member, j->path, baseName(j->path) + ":" + m.name,
+                                   j->onlyMember.empty() ? 0 /*NR_NATIVE*/ : j->npyRead,
+                                   pre.dec, &j->cancel);
+            if (derr.empty()) { pre.member = m.name; pre.decoded = true; }
+            break;
+        }
+    }
+    // "stopped" is the user's Stop and not the file's fault: it carries no
+    // sentence, because nothing will be said about a job nobody is waiting for.
+    if (!derr.empty() && derr != "stopped") j->err = derr;
+    j->done.store(true);
+}
+
+// Start an open without waiting for it. Returns whether the asynchronous door
+// took it - false means the caller must do the open itself, here and now.
+static bool startOpenJob(const std::string& path, int kind, int npyRead = 0,
+                         const std::string& onlyMember = std::string()) {
+    if (kind == OK_None) return false;
+    // THE SYNCHRONOUS DOOR, and it is wide on purpose. openPath is how nearly
+    // every selftest gets a document on screen and a great many of them assert
+    // on app.images on the line AFTER it - the same reasoning g_scriptedRun's
+    // folder-scan branch is built on, and the same count (#236's 103 sites).
+    // --async-open is the lid: a scripted run that asks for the worker and then
+    // pumps, so the path a person takes is not the one path the suite never runs.
+    if (g_scriptedRun && !g_forceAsyncOpen) return false;
+    if (app.openJob) {
+        // Already reading one. A drop of five files, or a multi-select, calls
+        // openPath in a loop, and a loop that opened five files must still open
+        // five: the rest WAIT rather than being refused. Asking for what is
+        // already running or already waiting is folded in rather than queued
+        // twice - a double-click that landed twice is one open. rdQueue's shape
+        // and rdQueue's reason.
+        if (app.openJob->path == path && app.openJob->onlyMember == onlyMember) return true;
+        for (const auto& w : app.openQueue)
+            if (w.path == path && w.onlyMember == onlyMember) return true;
+        app.openQueue.push_back({ path, kind, npyRead, onlyMember });
+        return true;
+    }
+    g_openStarts++;
+    app.openJob.reset(new App::OpenJob());
+    App::OpenJob* j = app.openJob.get();
+    j->path = path;
+    j->kind = kind;
+    j->npyRead = npyRead;
+    j->onlyMember = onlyMember;
+    j->startedAt = nowSec();
+    j->th = std::thread(openJobWorker, j);
+    return true;
+}
+
+// One local file, whichever door is open. The three branches of openPath that
+// used to call loadNpy / loadNpz / loadImageFile go through here, so neither the
+// worker nor the synchronous fall-back can be reached without the other.
+static void openLocalFile(const std::string& path, int kind) {
+    if (startOpenJob(path, kind)) return;      // a worker has it; pumpOpenJob lands it
+    openLocalLand(path, kind, 0, std::string(), nullptr);
+}
+
+static void startNextQueuedOpen() {
+    if (app.openJob || app.openQueue.empty()) return;
+    const App::OpenWait w = app.openQueue.front();
+    app.openQueue.erase(app.openQueue.begin());
+    // The fall-back matters: a queue can outlive the flag that filled it, and a
+    // queued file that quietly disappeared is the failure the queue exists to
+    // prevent in the first place.
+    if (!startOpenJob(w.path, w.kind, w.npyRead, w.onlyMember))
+        openLocalLand(w.path, w.kind, w.npyRead, w.onlyMember, nullptr);
+}
+
+// Called once per frame. Until the worker is done this does NOTHING but count
+// itself - there is no live output to tail, because the phase and the clock are
+// the whole of what a read has to say. The landing happens here, on the UI
+// thread, when the worker has finished.
+static void pumpOpenJob() {
+    if (!app.openJob) { startNextQueuedOpen(); return; }
+    App::OpenJob* j = app.openJob.get();
+    if (!j->done.load()) { g_openPumps++; return; }
+    j->th.join();
+    const bool cancelled = j->cancel.load();
+    const std::string path = j->path;
+    const int kind = j->kind, npyRead = j->npyRead;
+    const std::string onlyMember = j->onlyMember;
+    const std::string err = j->err;
+    j->phase.store(App::OpenJob::PhLanding);
+    // Taken out of App before anything lands. The landing can open the member
+    // picker, offer a stack, or reach openPath again through a session recipe,
+    // and every one of those asks "is an open running?" - it must see the truth,
+    // which is no. The job stays alive in this frame only to own `pre`.
+    std::unique_ptr<App::OpenJob> held = std::move(app.openJob);
+    if (cancelled) {
+        // STOP MEANS NOTHING LANDED, and it is structural rather than promised:
+        // landing happens only here and only for a job that was not cancelled,
+        // so a stopped open leaves no document, no batch and no source in the
+        // registry. There is nothing to undo because nothing was done.
+        toast("stopped: " + baseName(path));
+        return;
+    }
+    if (!err.empty()) {
+        toast(baseName(path) + ": " + err, true);
+        openReaderPicker(path, err);
+        return;
+    }
+    openLocalLand(path, kind, npyRead, onlyMember, &held->pre);
+}
+
+// Drive a started open to the end on THIS thread. The frame loop is the only
+// other caller of pumpOpenJob, and a run with no frame loop - a selftest, or the
+// command line before the window exists - would otherwise leave the job hanging
+// and the file unopened. The waiting is the ONLY thing this puts back: the job,
+// the cancel flag and the landing are the ones the window drives, so a test that
+// calls this is testing the path the user takes. (waitForReader's twin.)
+static void waitForOpenJob() {
+    while (app.openJob || !app.openQueue.empty()) {
+        pumpOpenJob();
+        if (app.openJob && !app.openJob->done.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 static void openPath(const std::string& path) {
     if (hasUrlScheme(path)) {
         // A url naming a file opens that file. A url naming a host or a
@@ -3410,19 +3681,13 @@ static void openPath(const std::string& path) {
         size_t n = strlen(suf);
         return low.size() >= n && low.compare(low.size() - n, n, suf) == 0;
     };
+    // STARTED, not waited for (issue #232 stage 2). The bytes and the decode are
+    // a worker's; only the landing is this thread's, and openLocalLand is where
+    // both doors say what happened. See openLocalFile.
     if (ends(".npy")) {
-        std::string err = loadNpy(path);
-        // §3.2's third line, attached: the refusal that named the shape is the
-        // same place the way out is offered. Nothing runs yet - the picker is a
-        // question, and only what the user then chooses is ever executed.
-        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
-        else { toast("loaded " + baseName(path)); maybeOfferSequence(app.current); }
+        openLocalFile(path, OK_Npy);
     } else if (ends(".npz")) {
-        // loadNpz says what it did (or raises the member picker, which says it
-        // after): a blanket "loaded x.npz" over a dialog would be a lie about
-        // both what happened and when
-        std::string err = loadNpz(path);
-        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
+        openLocalFile(path, OK_Npz);
     } else if (ends(".vsession")) {
         std::string err = loadSession(path);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
@@ -3435,16 +3700,7 @@ static void openPath(const std::string& path) {
         // falling through to the raw dialog and asking a user who opened a .tif
         // to type in its width. A multi-page TIFF becomes a stack in
         // loadImageFile, so this door opens one file and may gain N documents.
-        const size_t before = app.images.size();
-        std::string err = loadImageFile(path);
-        if (!err.empty()) { toast(baseName(path) + ": " + err, true); openReaderPicker(path, err); }
-        // A file whose parts are NAMED, that produced several of them, has
-        // already said WHICH ones inside loadImageFile. A blanket "loaded
-        // x.exr" on top would be a second and vaguer sentence about the same
-        // event. Everything else - one picture, or the pages of a stack - is
-        // announced here exactly as it always was.
-        else if (app.images.size() - before <= 1 || !imagefile::forPath(path)->partWord)
-            toast("loaded " + baseName(path));
+        openLocalFile(path, OK_Picture);
     } else if (std::filesystem::is_directory(pathFromUtf8(path))) {
         openFolder(path);                     // dropping a folder loads every stack below it
     } else if (!imagefile::videoRefusal(path).empty()) {

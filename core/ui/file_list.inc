@@ -324,6 +324,34 @@ static void drawFileList() {
         ImGui::SameLine();
         if (ImGui::SmallButton("Stop##rq")) app.rbOpenQueue.clear();
     }
+    // A FILE IS BEING READ (issue #232 stage 2). The same row as the reader's,
+    // the stack loader's and the video export's, and the same vocabulary - which
+    // is the point: "this is busy with something long, and here is the Stop" is
+    // one idea and it is said in one place on screen.
+    //
+    // Elapsed seconds and the name of the phase; NO percentage. A read has a
+    // denominator and a decode has none, and one bar carrying two units measures
+    // neither honestly (openJobPhase says this at the source). A file small
+    // enough to open in a frame never draws this at all.
+    if (app.openJob) {
+        ImGui::TextDisabled("opening %s: %s  %.1f s", baseName(app.openJob->path).c_str(),
+                            openJobPhase(*app.openJob).c_str(),
+                            nowSec() - app.openJob->startedAt);
+        if (!app.openQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d file%s)", (int)app.openQueue.size(),
+                                app.openQueue.size() == 1 ? "" : "s");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##open")) {
+            app.openJob->cancel.store(true);
+            app.openQueue.clear();   // Stop means stop - see the reader row's Stop
+            toast("stopping...");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("stop as soon as the phase it is on finishes -\n"
+                              "a stopped open leaves nothing behind");
+    }
     // A reader is running (issue #232). The Reader panel says this too, in more
     // detail and with what the reader has printed so far - but a MEMO REPLAY
     // opens no panel and produces no document until it is done, so without a

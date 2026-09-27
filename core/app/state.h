@@ -801,6 +801,18 @@ enum AutoFlavor { AF_MinMax = 0, AF_Pct = 1, AF_Median = 2 };
 // is the one to pick when a dead column or a cold pixel owns vmin.
 enum MedBlackMode { MB_Value = 0, MB_Min = 1, MB_MinPct = 2 };
 
+// A reader's .vstream, read and decoded on the job's own thread (issue #232
+// stage 2). Defined in loader_npz.inc, where the container vocabulary lives;
+// named here because App::ReaderJob carries one.
+//
+// A shared_ptr and not a unique_ptr, and that is a language fact rather than a
+// preference: unique_ptr's destructor has to see a COMPLETE type, and
+// ~ReaderJob is written inline below - hundreds of lines before VstreamPre
+// exists. shared_ptr captures its deleter where the object is made (session.inc,
+// which does see the definition), so it can be declared and destroyed here on
+// nothing but this line. Nothing is ever shared: exactly one job owns it.
+struct VstreamPre;
+
 // ---- what a DECODE WORKER already did, handed to the landing (issue #232) ----
 //
 // Opening one file is four steps: stat it (identity before bytes, §6.2), read
@@ -2426,6 +2438,26 @@ struct App {
         // it, so "x.dat via r.py:load: ..." is the sentence, and it must not
         // change just because the wait moved off the UI thread.
         std::string blame;
+        // ---- ...and what it WROTE, read on this thread too (#232 stage 2) ----
+        // Stage 1 moved the WAIT off the UI thread and measured 452 ms of window
+        // still not answering at 480 MB, 746 ms at 768 MB - all of it
+        // pollReader -> readerFinish -> loadViewerStream, reading and decoding
+        // the .vstream the child had just written. A CACHE HIT was worse in kind
+        // if not in size: 592 ms with no child running at all, because a hit
+        // finished without a thread and the read was the whole of the work.
+        //
+        // So the job's thread does not stop when the child exits: it goes on to
+        // read what the child wrote and turn it into documents, and only then
+        // says done. The UI thread lands them (readerFinish's tail) and nothing
+        // else. `cacheHit` is the same journey with no child at the front of it.
+        std::shared_ptr<VstreamPre> vpre;   // the decoded stream, waiting to land
+        std::string vdecErr;               // ...or why there is none
+        bool decoded = false;              // the decode was attempted at all
+        bool cacheHit = false;             // no child ran: the cache answered
+        // WHICH THREAD decoded. A probe, and the only thing a headless selftest
+        // can assert about a freeze that is about to not happen: the decode's
+        // thread id must differ from the UI thread's (stage 2 design §4).
+        std::thread::id decodeThread;
         // ---- the reader ran on a PEER (issue #180) --------------------------
         // The same job, with the process on the other machine. The thread owns
         // a SESSION OF ITS OWN rather than borrowing app.uiSession, for that
@@ -2696,6 +2728,15 @@ inline bool g_forceAsyncScan = false;
 // changes. (Session restore stays synchronous whatever this says: V25m / R18 /
 // V25p-r1 depend on the lines completing in order - stage 1's decision.)
 inline bool g_forceAsyncOpen = false;
+// How many opens took that asynchronous door, and how often the frame loop came
+// round while one was still working. Both exist because of what a headless test
+// CANNOT do: it cannot watch a window fail to freeze. It can watch which door
+// was taken and that the loop ran during the read, which is what the stage 2
+// design asks the suite to fix. Declared here, beside the flag, because
+// openRemote's local fall-through reads the first one hundreds of lines above
+// where startOpenJob defines it (g_readerStarts' twin, one file over).
+inline int g_openStarts = 0;
+inline int g_openPumps = 0;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)
