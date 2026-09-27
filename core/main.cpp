@@ -2089,6 +2089,15 @@ static bool g_watchSuppressed = false;
         glClearColor(cc.x, cc.y, cc.z, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        // THE one moment the composed frame exists and can be read: the canvas,
+        // its overlays, every panel and the toast are drawn, and the swap below
+        // gives the buffer away. "Copy view (as displayed)" is filed as a request
+        // from inside a frame precisely because it cannot be answered from inside
+        // one (core/app/export.inc). Before the swap, not after: on a
+        // double-buffered context the buffer we just drew into is the BACK one,
+        // and after the swap glReadPixels reads whatever the driver handed back -
+        // undefined by the spec, and in practice the frame before last.
+        pumpCopyViewRequest();
         // Split the frame: our drawing versus getting it onto the screen. Over a
         // remote display the second number is the whole story (a full window per
         // frame across the link), and no amount of work on our side moves it.

@@ -1379,7 +1379,10 @@ viewer_selftest(rtemporal-png NOGL --rtemporal-selftest tools/testdata/media/png
 viewer_selftest(framestats  NOGL --stack always
                             --framestats-selftest tools/testdata/linset/80lx)
 viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --stack always)
-# T12 lays the canvas out for real to read back the pane rectangles and badges.
+# T12 lays the canvas out for real to read back the pane rectangles and badges;
+# T14 goes one step further and RENDERS, then reads the framebuffer back the way
+# "Copy view (as displayed)" does (board 96) - the one assertion in this tree
+# that is made against drawn pixels rather than against arithmetic.
 viewer_selftest(tile        --tile-selftest tools/testdata/multi)
 viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
 # The frame average is arithmetic over pixels, so none of it needs a context:
