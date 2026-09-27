@@ -355,6 +355,68 @@ static bool panelBegin(const char* label, bool* open, ImGuiWindowFlags flags = 0
     }
     return vis;
 }
+// ---- where the FLOATING panels open on a first launch ------------------------
+// ImGui's name-addressed SetWindowPos goes through FindWindowByName, so it moves
+// NOTHING on a window that has never been Begin'd. The DockBuilder branch below
+// used it on "ROIs" and "Analysis" - the two panels it deliberately leaves
+// undocked, and so the two with no Begin before it - and both therefore opened
+// where ImGui puts a brand-new window: measured ROIs (60,60) 690x450 and
+// Analysis (60,60) 630x390, one on top of the other over the corner of the
+// image. (Reported from PR #216: this is the ground a click landed on "another
+// window" from.) The comment there said x = 34% and meant it; nothing did it.
+//
+// So the reset ARMS a one-shot per panel, and each panel's own Begin - where
+// SetNextWindowPos does work, because it is addressed to the window about to be
+// submitted rather than to a name - spends it. ImGuiCond_Always, not
+// FirstUseEver: View > Reset layout has to move windows that already exist, and
+// FirstUseEver is exactly the condition that would refuse to.
+//
+// The geometry is a pure function of the work area and the UI scale, so the
+// expected numbers are arithmetic and not a function of this machine's display
+// (--tile-selftest T14). The x both panels share is the 34% the old code
+// intended. What changed is the y: ROIs at 8% and Analysis at 42% of the work
+// HEIGHT overlap for every work area shorter than roisHeight / 0.34 - 1059
+// logical px at scale 1, 1588 at 1.5, i.e. most of them - so Analysis is
+// stacked directly under ROIs instead, and the pair is lifted back inside the
+// work area when it would hang off the bottom. Two windows opening on top of
+// each other is the whole defect; replacing one overlap with another would not
+// be a fix.
+struct FloatPlace {
+    bool armed = false;
+    ImVec2 pos = ImVec2(0, 0), size = ImVec2(0, 0);
+};
+static FloatPlace g_placeRois, g_placeAnalysis;
+static void floatPanelPlacement(ImVec2 workPos, ImVec2 workSize, float scale,
+                                FloatPlace& rois, FloatPlace& analysis) {
+    rois.size     = ImVec2(620 * scale, 360 * scale);
+    analysis.size = ImVec2(560 * scale, 420 * scale);
+    const float gap = 8 * scale;
+    // ONE x for both, pulled left if the wider of the two would hang off the
+    // right edge - never left of the work area itself.
+    const float widest = std::max(rois.size.x, analysis.size.x);
+    float x = std::min(workPos.x + workSize.x * 0.34f,
+                       std::max(workPos.x, workPos.x + workSize.x - widest));
+    const float y = workPos.y + workSize.y * 0.08f;
+    rois.pos     = ImVec2(x, y);
+    analysis.pos = ImVec2(x, y + rois.size.y + gap);
+    // ...and never above the TOP of the work area: a title bar the user cannot
+    // reach is worse than a window hanging off the bottom.
+    const float over = analysis.pos.y + analysis.size.y - (workPos.y + workSize.y);
+    if (over > 0) {
+        const float lift = std::min(over, rois.pos.y - workPos.y);
+        rois.pos.y     -= lift;
+        analysis.pos.y -= lift;
+    }
+    rois.armed = analysis.armed = true;
+}
+// Spent at the panel's Begin, once. Cleared BEFORE the calls, so a panel that
+// somehow never draws cannot leave the arming behind for a later frame.
+static void floatPlaceApply(FloatPlace& p) {
+    if (!p.armed) return;
+    p.armed = false;
+    ImGui::SetNextWindowPos(p.pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(p.size, ImGuiCond_Always);
+}
 static double g_lastInputAt = 0;      // for the input-latency readout
 static void wakeUi(int frames = 3) {
     app.wakeFrames = std::max(app.wakeFrames, frames);
@@ -1655,13 +1717,12 @@ static bool g_watchSuppressed = false;
             }
             ImGui::DockBuilderFinish(dockId);
             ImGui::SetWindowFocus("Projection");
-            // ROIs and Analysis stay floating (they follow the work, not the frame)
-            ImGui::SetWindowPos("ROIs", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
-                                               vp->WorkPos.y + vp->WorkSize.y * 0.08f));
-            ImGui::SetWindowSize("ROIs", ImVec2(620 * uiScale, 360 * uiScale));
-            ImGui::SetWindowPos("Analysis", ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.34f,
-                                                   vp->WorkPos.y + vp->WorkSize.y * 0.42f));
-            ImGui::SetWindowSize("Analysis", ImVec2(560 * uiScale, 420 * uiScale));
+            // ROIs and Analysis stay floating (they follow the work, not the
+            // frame). ARMED here, applied at each panel's own Begin: addressed
+            // by NAME from this line, a window neither of them has submitted
+            // yet, it moved nothing at all. See floatPanelPlacement.
+            floatPanelPlacement(vp->WorkPos, vp->WorkSize, uiScale,
+                                g_placeRois, g_placeAnalysis);
         }
 
         if (app.showFiles) { if (panelBegin("Files", &app.showFiles)) drawFileList(); ImGui::End(); }
@@ -1795,12 +1856,14 @@ static bool g_watchSuppressed = false;
             ImGui::End();
         }
         if (app.showRois) {   // min size: the table stays readable even if dragged small
+            floatPlaceApply(g_placeRois);       // the first place after a layout reset
             ImGui::SetNextWindowSizeConstraints(ImVec2(460 * uiScale, 300 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
             if (panelBegin("ROIs", &app.showRois)) drawPanelRois();
             ImGui::End();
         }
         if (app.showAnalysis) {
+            floatPlaceApply(g_placeAnalysis);   // ...and the one under it
             ImGui::SetNextWindowSizeConstraints(ImVec2(420 * uiScale, 260 * uiScale),
                                                 ImVec2(FLT_MAX, FLT_MAX));
             if (panelBegin("Analysis", &app.showAnalysis)) drawPanelAnalysis();

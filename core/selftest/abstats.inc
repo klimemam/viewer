@@ -1047,7 +1047,14 @@
                     check(abRowItem(app.images[fa[1]].get()) == AbSetB,
                           "A7 a different frame of A's stack can still be B");
                 // and the swap really moves A, which is what makes the row
-                // right-clickable as B a moment later
+                // right-clickable as B a moment later. B is armed EXPLICITLY
+                // for it: since board 270 a default B with nothing remembered
+                // is A ITSELF, and swapping a document with itself moves
+                // nothing - correct arithmetic, and no longer a fixture for
+                // "the swap moves A". WHICH document is B was never this
+                // check's subject, and leaving it to the ladder made the check
+                // depend on what earlier groups had left in lastCompareBUid.
+                setCompareB(app.images[fb.front()].get());
                 ImageDoc* wasA = cur();
                 swapCompare();
                 check(cur() != wasA && abRowItem(wasA) == AbSetB,
@@ -1105,6 +1112,56 @@
                         check(back2 && back2->uid == chosen,
                               "A9 compare off and on returns to the same B");
                     }
+                }
+
+                // A9b: the FIRST compare, with no remembered B at all (board
+                // 270). The user's rule has two clauses - 「Bが前のやつあったら
+                // それ，無かったら選択のやつ」- and only the first was
+                // implemented. "Otherwise" meant the image NEXT to A in the
+                // list: a partner nobody picked, and with a single image open,
+                // no partner at all and an empty compare pane.
+                {
+                    const uint64_t keepLast = app.lastCompareBUid;
+                    const uint64_t keepPrev = app.prevImageUid;
+                    const std::vector<uint64_t> keepExtra = app.cmpExtra;
+                    app.compareMode = App::CmpOff;
+                    setCompareB(nullptr);
+                    app.cmpExtra.clear();
+                    app.lastCompareBUid = 0;     // no history: a first compare
+                    app.prevImageUid = 0;
+                    selectImage(fa.front());
+                    ImageDoc* firstA = cur();
+                    ensureCompareB();
+                    app.compareMode = App::CmpWipe;   // cmpB() answers null while off
+                    ImageDoc* firstB = cmpB();
+                    fprintf(stderr, "abstatsselftest: A9b first compare, no history: "
+                                    "A=%s B=%s\n",
+                            firstA ? firstA->name.c_str() : "(none)",
+                            firstB ? firstB->name.c_str() : "(none)");
+                    check(firstB && firstB == firstA,
+                          "A9b no remembered B: the default is the image you are on");
+                    check(abStatsB() == firstA,
+                          "A9b ...and it has pixels, so the first compare is never empty");
+                    // ...and with a history the last B still wins. The chosen B
+                    // is a document OTHER than A, so this cannot pass by
+                    // accidentally agreeing with the clause above.
+                    ImageDoc* pick = app.images[fb.front()].get();
+                    check(pick != firstA, "A9b fixture: the chosen B is not A");
+                    setCompareB(pick);
+                    app.compareMode = App::CmpOff;
+                    setCompareB(nullptr);             // as switching off does
+                    ensureCompareB();
+                    app.compareMode = App::CmpWipe;
+                    ImageDoc* again = cmpB();
+                    fprintf(stderr, "abstatsselftest: A9b re-enter after choosing B: "
+                                    "B=%s (A=%s)\n",
+                            again ? again->name.c_str() : "(none)",
+                            cur() ? cur()->name.c_str() : "(none)");
+                    check(again == pick,
+                          "A9b a remembered B outranks the image you are on");
+                    app.lastCompareBUid = keepLast;
+                    app.prevImageUid = keepPrev;
+                    app.cmpExtra = keepExtra;
                 }
             }
         }
@@ -1797,6 +1854,98 @@
                       "N8 ...and to the same single plane, named the same way");
 
                 app.histPlane = keepPlane;
+            }
+
+            // ---- N9: "ch, then side" pairs planes BY NAME (board 265) --------
+            // A is a mosaic - R, Gr, Gb, B - and B is a plain 1-channel image
+            // with one plane called ch0. The walk ran `for i < maxSeries` and
+            // printed whatever each side held at INDEX i, so the line directly
+            // under R:A was ch0:B: two different planes offered as a pair, in
+            // the one row order whose entire purpose is comparing ONE plane
+            // across sides. ch0 is not R, and the canon's iron rule is that CFA
+            // planes are never mixed.
+            //
+            // CFA interpretation is per IMAGE (Inspector > Interpret), so this
+            // pair is made by setting it on A and clearing it on B - the same
+            // white-box move P2 makes for the size mismatch, and the only way to
+            // get the fixture under BOTH runners: --cfa bayer arms every image.
+            {
+                const int keepOrder = app.projStatOrder;
+                const int keepPlane = app.histPlane;
+                const int keepLayout = app.projStatLayout;
+                const bool keepAll = app.projAllRow;
+                app.cmpExtra.clear();            // A and B: two sides, the smallest
+                app.projAllRow = false;          // ...and no pooled row, which is
+                                                 // not a plane and never pairs
+                app.compareMode = App::CmpWipe;
+                selectImage(f0[0]);
+                setCompareB(app.images[f1[0]].get());
+                abStatsFrame();
+                // The step throttle skips B's recompute (P2b's subject), and
+                // selecting a frame arms it - so a B whose CFA setting has just
+                // changed would keep the cache from before the change and this
+                // group would be reading a stale plane count. Cleared for every
+                // frame below, which is the only reason they are all taken
+                // through one lambda.
+                auto projFrameNow = [&]() { app.abStepBusyUntil = 0; projFrame(); };
+                ImageDoc* nA = cur();
+                ImageDoc* nB = cmpB();
+                check(nA && nB && nA != nB, "N9 fixture: A and B are two documents");
+                if (nA && nB) {
+                    const int keepCfaA = nA->cfa, keepPatA = nA->cfaPattern;
+                    const int keepCfaB = nB->cfa;
+                    nA->cfa = 1; nA->cfaPattern = 0;   // A is told it is a mosaic
+                    nB->cfa = 0;                       // B is told it is not
+                    app.projStatOrder = 1;             // "ch, then side"
+                    app.histPlane = 0;
+                    app.projStatLayout = 1;            // wide
+                    projFrameNow();
+                    const std::string wideRows = field(g_projSideProbe, "planerows=");
+                    app.projStatLayout = 2;            // ...and per axis
+                    projFrameNow();
+                    const std::string axisRows = field(g_projSideProbe, "planerows=");
+                    fprintf(stderr, "abstatsselftest: N9 A %d plane(s) / B %d plane(s), "
+                                    "ch-then-side rows: '%s'\n",
+                            app.proj[0].nSeries, app.proj[1].nSeries, wideRows.c_str());
+                    check(app.proj[0].nSeries == 4 && app.proj[1].nSeries == 1,
+                          "N9 fixture: A really has four planes and B one");
+                    check(wideRows == "R@A,R@B-,Gr@A,Gr@B-,Gb@A,Gb@B-,B@A,B@B-,"
+                                      "ch0@A-,ch0@B",
+                          "N9 every row is ONE plane name, and the missing side says -");
+                    // ANTI-VACUOUS: the index-matched order this replaced put
+                    // ch0:B under R:A. That exact adjacency must be gone.
+                    check(wideRows.find("R@A,ch0@B") == std::string::npos,
+                          "N9 ...so R:A is no longer followed by ch0:B");
+                    check(wideRows == axisRows,
+                          "N9 both layouts walk the same rows in the same order");
+                    // ...and with the mosaic off again the two sides pair 1:1
+                    // with no "-" at all: the "-" is a statement about a missing
+                    // plane, not decoration the walk always adds.
+                    nA->cfa = 0;
+                    projFrameNow();
+                    const std::string same = field(g_projSideProbe, "planerows=");
+                    fprintf(stderr, "abstatsselftest: N9 same planes both sides: '%s'\n",
+                            same.c_str());
+                    check(same == "ch0@A,ch0@B",
+                          "N9 equal plane sets pair one for one, with no - row");
+                    // side major is untouched by any of this: it never asked the
+                    // pairing question, and its order is A's planes then B's
+                    app.projStatOrder = 0;
+                    nA->cfa = 1;
+                    projFrameNow();
+                    const std::string sideMajor = field(g_projSideProbe, "planerows=");
+                    fprintf(stderr, "abstatsselftest: N9 side-major rows: '%s'\n",
+                            sideMajor.c_str());
+                    check(sideMajor == "R@A,Gr@A,Gb@A,B@A,ch0@B",
+                          "N9 'side, then ch' still lists each side's own planes");
+                    nA->cfa = keepCfaA; nA->cfaPattern = keepPatA;
+                    nB->cfa = keepCfaB;
+                }
+                app.projStatOrder = keepOrder;
+                app.projStatLayout = keepLayout;
+                app.projAllRow = keepAll;
+                app.histPlane = keepPlane;
+                projFrameNow();                     // leave the cache on the real CFA
             }
 
             app.cmpExtra.clear();

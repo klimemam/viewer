@@ -631,20 +631,67 @@ static void drawPanelProjection() {
         for (const auto& sr : sides) if (sr.name == name) return sr.stale;
         return false;
     };
-    auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*, int)>& row) {
+    // "ch, then side" pairs planes BY NAME, never by index (board 265 /
+    // docs/background/project/todo-open.md §24). A is a mosaic with R, Gr, Gb, B and
+    // B is a plain 1-channel image with ch0; the old walk ran `for i < maxSeries`
+    // and put whatever each side held at index i on consecutive lines, so R:A was
+    // followed by ch0:B and the whole point of the order - "R:A directly above
+    // R:B, for comparing ONE plane across sides" - said the opposite of the
+    // truth. ch0 is not R, and the canon's iron rule is that CFA planes are
+    // never mixed; two rows the reader is invited to compare ARE mixed planes.
+    //
+    // So the row axis is the union of the plane NAMES, in first-appearance order
+    // across the sides (arming a letter must not reorder what is already on
+    // screen, exactly as for the sides themselves), and abSeriesMatch - the
+    // matching predicate everything else in the panel already uses - answers
+    // where each side keeps that name. A plane a side does not have gets a row
+    // with its name and "-" in every value: dropping it would slide the next
+    // plane's numbers onto this side's line, which is the defect restated.
+    //
+    // `i` is that side's series slot, or -1 for "not on this side"; `plane` is
+    // the name the row is about, and is the only thing a -1 row has.
+    auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*,
+                                                      int, const char*)>& row) {
         if (app.projStatOrder == 0) {
             for (const auto& sr : sides) {
-                for (int i = 0; i < sr.S->nSeries; i++) row(*sr.S, sr.name.c_str(), i);
-                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4);
+                for (int i = 0; i < sr.S->nSeries; i++)
+                    row(*sr.S, sr.name.c_str(), i, sr.S->seriesNames[i]);
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
             }
         } else {
-            for (int i = 0; i < maxSeries; i++)
-                for (const auto& sr : sides)
-                    if (i < sr.S->nSeries) row(*sr.S, sr.name.c_str(), i);
+            std::vector<const char*> planes;     // the union, in the sides' order
             for (const auto& sr : sides)
-                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4);
+                for (int i = 0; i < sr.S->nSeries; i++) {
+                    const char* nm = sr.S->seriesNames[i];
+                    if (!nm) continue;
+                    if (abSeriesMatch(planes.data(), (int)planes.size(), nm) < 0)
+                        planes.push_back(nm);
+                }
+            for (const char* nm : planes)
+                for (const auto& sr : sides)
+                    row(*sr.S, sr.name.c_str(),
+                        abSeriesMatch(sr.S->seriesNames, sr.S->nSeries, nm), nm);
+            // the pooled row is always last of its group - it is not a plane,
+            // and sorting it among them would invite reading it as one
+            for (const auto& sr : sides)
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
         }
     };
+    // The row walk, as a string, for --abstats-selftest: "R@A,R@B-,Gr@A,Gr@B-,..."
+    // where a trailing '-' is a plane that side does not have. The row ORDER is
+    // the entire content of the "ch, then side" ruling and it had no printing
+    // path whatever, which is how matching by index survived being read: on a
+    // pair of images with the same plane count the two walks agree exactly.
+    // '@' rather than ':' because a CFA plane is called "B" and so is a side.
+    {
+        std::string pr;
+        projForEachRow([&](const App::ProjState&, const char* side, int i,
+                           const char* plane) {
+            pr += std::string(plane ? plane : "?") + "@" + side + (i < 0 ? "-" : "") + ",";
+        });
+        if (!pr.empty()) pr.pop_back();
+        g_projSideProbe += "planerows=" + pr + ";";
+    }
     // WIDE puts a plane's three sigmas on one line (region, row means, column
     // means) and spends the row axis on the SIDES instead of the axes. That is
     // the axis that has to grow: A and B are two rows today, and more slots or
@@ -758,7 +805,16 @@ static void drawPanelProjection() {
                    "estimates for a flat field, not separated fixed/temporal noise. "
                    "H/V vendor names vary; ratios are dimensionless.\n";
             int nRows = 0;
-            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+            projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                               const char* plane) {
+                if (i < 0) {   // a plane the other side has and this one does not
+                    tsv += std::string(side) + (sideIsStale(side) ? " (stale)" : "") +
+                           "\t" + (plane ? plane : "?");
+                    for (int k = 0; k < 12; k++) tsv += "\t-";   // 10 values + the 2 ratios
+                    tsv += "\tunavailable: no such plane on this side\n";
+                    nRows++;
+                    return;
+                }
                 const App::ProjState::Stats& f = S.fStat[i];
                 const App::ProjState::Stats& vv = S.vStat[i];
                 const App::ProjState::Stats& hh = S.hStat[i];
@@ -796,7 +852,8 @@ static void drawPanelProjection() {
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
     int tablePlanes = 0;
-    projForEachRow([&](const App::ProjState&, const char*, int) { ++tablePlanes; });
+    // every row the walk will draw, the "-" ones included: they take a line too
+    projForEachRow([&](const App::ProjState&, const char*, int, const char*) { ++tablePlanes; });
     const int tableRows = wide ? tablePlanes : tablePlanes * (int(app.showProjH) + int(app.showProjV));
     // ScrollX's default height is the REMAINING window space. At a larger UI
     // scale that can be zero, so scrolling the panel never reveals its rows.
@@ -880,11 +937,24 @@ static void drawPanelProjection() {
                     ImGui::TableNextColumn(); drawProjNoiseCell(S, i, false);
                 }
             };
-            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
+            // ...and a plane this side does not have: the name, then nothing.
+            // The row is KEPT so that the line under R:A is still about R.
+            auto wmissing = [&](const char* sideName, const char* plane) {
+                ImGui::TableNextRow();
+                if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", plane ? plane : "?");
+                for (int k = 0; k < 12; k++) {
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("-");
+                }
+            };
+            projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                               const char* plane) {
                 const bool st = sideIsStale(side);
                 if (st) ImGui::PushStyleColor(ImGuiCol_Text,
                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-                wrow1(S, side, i);
+                if (i < 0) wmissing(side, plane);
+                else       wrow1(S, side, i);
                 if (st) ImGui::PopStyleColor();
             });
             ImGui::EndTable();
@@ -963,20 +1033,35 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn(); drawProjNoiseCell(S, s, false);
             }
         };
-        auto dimmed = [&](const App::ProjState& S, const char* side, int i, bool horiz) {
+        // the same "-" row as the wide table's, one per axis here
+        auto missing1 = [&](const char* sideName, const char* plane, bool horizontal) {
+            ImGui::TableNextRow();
+            if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
+            ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", plane ? plane : "?");
+            for (int k = 0; k < 7; k++) {
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("-");
+            }
+        };
+        auto dimmed = [&](const App::ProjState& S, const char* side, int i,
+                          const char* plane, bool horiz) {
             const bool st = sideIsStale(side);
             if (st) ImGui::PushStyleColor(ImGuiCol_Text,
                                           ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            rows1(S, side, i, horiz);
+            if (i < 0) missing1(side, plane, horiz);
+            else       rows1(S, side, i, horiz);
             if (st) ImGui::PopStyleColor();
         };
         if (app.showProjH)
-            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
-                dimmed(S, side, i, true);
+            projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                               const char* plane) {
+                dimmed(S, side, i, plane, true);
             });
         if (app.showProjV)
-            projForEachRow([&](const App::ProjState& S, const char* side, int i) {
-                dimmed(S, side, i, false);
+            projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                               const char* plane) {
+                dimmed(S, side, i, plane, false);
             });
         ImGui::EndTable();
     }

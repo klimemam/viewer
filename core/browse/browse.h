@@ -69,6 +69,11 @@ void startRemote(App::BrowseInstance& I, const std::string& hostSpec);
 // row formatting the CLI's remote selftest reuses (cli.inc)
 std::string fmtBytesHuman(uint64_t n);
 std::string fmtEntryShape(const remote::Entry& e);
+// What "Open N selected as stack" promises about the frames' ORDER. One
+// function, because the sentence is drawn in a tooltip and asserted in
+// --browse-selftest, and a claim written twice is how a panel comes to promise
+// one order and deliver another. See the definition for the ruling it carries.
+std::string rbStackOrderSaid(bool searchResults, bool nameNatural);
 
 // ---- listing view: one row of the Browse table --------------------------------
 // A numbered sequence arrives as ONE synthetic entry carrying `.members`, so
