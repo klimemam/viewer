@@ -987,6 +987,16 @@ static void closeAll() {
     // stop; loadSession used to open-code half of it two lines above its own
     // closeAll() and inherits the whole rule now.
     stopSequenceLoader();
+    // ...and the SINGLE-FILE open worker, which is a thing that produces images
+    // too (issue #232 stage 2, review P2-2). Without this a file still being
+    // read landed AFTER the close - and loadSession closes before it restores,
+    // so a 480 MB open in flight when a session was restored put its document
+    // into the restored session, in a batch that session never had.
+    // Cancel, not join: the landing happens in pumpOpenJob and only for a job
+    // that was not cancelled, so a cancelled job leaves nothing behind whenever
+    // the next pump gets to it (the join is that path's, on the held job).
+    if (app.openJob) app.openJob->cancel.store(true);
+    app.openQueue.clear();            // ...and the files waiting behind it
     app.seqLoadingId = 0;
     app.seqQueue.clear();
     app.seqRestore.clear();

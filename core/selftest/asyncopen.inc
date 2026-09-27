@@ -303,6 +303,130 @@ static int asyncOpenSelftest(const std::string& root) {
               "A8 ...and draining the queue opens BOTH of them");
     }
 
+    // ---- A9: closeAll stops the worker too ----------------------------------
+    // Review P2-2. closeAll's own comment says "FIRST: stop everything that
+    // produces images, or Close All does not close" - and the open worker is a
+    // thing that produces images. It was not in the list, so a file still being
+    // read landed AFTER the close; and because loadSession closes before it
+    // restores, a 480 MB open in flight when a session was restored put its
+    // document into the restored session, in a batch that session never had.
+    {
+        closeAll();
+        openPath(big);
+        const bool up = app.openJob != nullptr;
+        closeAll();                        // ...as File > Close All and loadSession do
+        const bool cancelled = app.openJob && app.openJob->cancel.load();
+        const bool queueGone = app.openQueue.empty();
+        const bool drained = drive(4000);
+        fprintf(stderr, "asyncopenselftest: A9 closeAll: job-up=%d cancelled=%d "
+                        "queue-empty=%d drained=%d %zu doc(s) %zu seq\n", (int)up,
+                (int)cancelled, (int)queueGone, (int)drained, app.images.size(),
+                app.seqs.size());
+        check(up && cancelled && queueGone && drained && app.images.empty() &&
+                  app.seqs.empty(),
+              "A9 closeAll cancels the open in flight: nothing lands after the close");
+        check(!inRegistry(big, 0, std::string()),
+              "A9 ...and leaves no trace of it in the source registry");
+    }
+
+    // ---- A10: Stop, then the same file again --------------------------------
+    // Review P2-4. The one-at-a-time door folds a repeat of the path it is
+    // already reading into the open in flight - that is what makes a
+    // double-click that landed twice one open. A CANCELLED job lands nothing, so
+    // folding into it answers "already opening" about an open that is on its way
+    // to opening nothing: press Stop, drop the same file again before its phase
+    // has finished, and the second drop used to vanish.
+    {
+        closeAll();
+        openPath(onez);
+        const bool up = app.openJob != nullptr;
+        if (app.openJob) app.openJob->cancel.store(true);
+        const int starts0 = g_openStarts;
+        openPath(onez);                    // the same file, while the stopped one is up
+        // Read at the moment it is claimed, not after the pump: by the time the
+        // queue has drained it is empty again and the counter has moved, and a
+        // line printed then would be evidence for a different sentence.
+        const int startsAtAsk = g_openStarts - starts0;
+        const size_t queuedAtAsk = app.openQueue.size();
+        const bool notFolded = startsAtAsk == 1 || queuedAtAsk > 0;
+        const bool drained = drive(8000);
+        fprintf(stderr, "asyncopenselftest: A10 stop-then-reopen: up=%d at-ask starts+%d "
+                        "queued=%zu -> drained=%d %zu doc(s)\n", (int)up,
+                startsAtAsk, queuedAtAsk, (int)drained, app.images.size());
+        check(up && notFolded, "A10 a re-drop is NOT folded into a STOPPED job");
+        check(drained && app.images.size() == (size_t)NZF,
+              "A10 ...and it opens: the stopped one lands nothing, the new one lands");
+    }
+
+    // ---- A11: the door with no frame loop ----------------------------------
+    // waitForOpenJob is pumpOpenJob's twin for a caller that has no frame loop -
+    // a selftest, or the command line before the window exists. It is asserted
+    // here rather than deleted (review P2-6): it puts back ONLY the waiting, so
+    // a test that uses it is testing the path the window drives, and an
+    // unreferenced function is one nobody has ever run.
+    {
+        closeAll();
+        openPath(big);
+        const bool up = app.openJob != nullptr && app.images.empty();
+        waitForOpenJob();
+        fprintf(stderr, "asyncopenselftest: A11 waitForOpenJob: up=%d %zu doc(s) "
+                        "job=%d\n", (int)up, app.images.size(),
+                (int)(app.openJob != nullptr));
+        check(up && app.openJob == nullptr && app.openQueue.empty() &&
+                  app.images.size() == (size_t)BF,
+              "A11 waitForOpenJob drives a started open to the end with no frame loop");
+    }
+
+    // ---- A12: --zoom / --center survive the worker --------------------------
+    // Review P2-3. parseCli used to apply them at the end of itself, which was
+    // right while openPath was synchronous: cur() was the file just opened, and
+    // `fitRequested = false` said "the view the user named wins over
+    // fit-on-load". With the read on a worker there is no cur() yet, so the
+    // centre fell back to nothing AND the landing's addImage then raised
+    // fitRequested - the fit overwriting the very view the command line asked
+    // for. The deferral is asserted the way the frame loop runs it: pumpOpenJob
+    // first, applyPendingView after, in the same turn.
+    {
+        closeAll();
+        const float zoom0 = app.view.zoom;
+        const ImVec2 center0 = app.view.center;
+        const bool fit0 = app.fitRequested;
+        app.view.zoom = 1.0f;
+        app.view.center = ImVec2(0, 0);
+        app.pendingViewZoom = true;    app.pendingZoom = 4.0f;
+        app.pendingViewCenter = true;  app.pendingCenter = ImVec2(7, 9);
+        openPath(big);
+        applyPendingView();            // the call parseCli itself makes
+        // Nothing to centre ON yet, so the centre waits. The ZOOM does not need
+        // a document and is applied at once, which is what keeps `viewer
+        // --zoom 2` with no file working.
+        const bool waited = app.pendingViewCenter && app.view.center.x == 0.0f &&
+                            app.view.zoom == 4.0f;
+        int it = 0;
+        while ((app.openJob || !app.openQueue.empty()) && it++ < 4000) {
+            pumpOpenJob();
+            applyPendingView();        // ...the frame loop's order, exactly
+            if (app.openJob && !app.openJob->done.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        fprintf(stderr, "asyncopenselftest: A12 view: waited=%d zoom=%g center=%g,%g "
+                        "fitRequested=%d pending=%d/%d %zu doc(s)\n", (int)waited,
+                (double)app.view.zoom, (double)app.view.center.x,
+                (double)app.view.center.y, (int)app.fitRequested,
+                (int)app.pendingViewZoom, (int)app.pendingViewCenter,
+                app.images.size());
+        check(waited, "A12 the centre waits for the document instead of centring on "
+                      "nothing");
+        check(app.images.size() == (size_t)BF && app.view.zoom == 4.0f &&
+                  app.view.center.x == 7.0f && app.view.center.y == 9.0f &&
+                  !app.fitRequested && !app.pendingViewZoom && !app.pendingViewCenter,
+              "A12 ...and once it lands the named view WINS over fit-on-load");
+        app.view.zoom = zoom0;         // borrowed state, given back
+        app.view.center = center0;
+        app.fitRequested = fit0;
+        app.pendingViewZoom = app.pendingViewCenter = false;
+    }
+
     closeAll();
     g_forceAsyncOpen = flagOnEntry;        // borrowed state, given back
     if (!shared.intact("asyncopenselftest")) ok = false;
