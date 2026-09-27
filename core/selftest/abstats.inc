@@ -1047,7 +1047,14 @@
                     check(abRowItem(app.images[fa[1]].get()) == AbSetB,
                           "A7 a different frame of A's stack can still be B");
                 // and the swap really moves A, which is what makes the row
-                // right-clickable as B a moment later
+                // right-clickable as B a moment later. B is armed EXPLICITLY
+                // for it: since board 270 a default B with nothing remembered
+                // is A ITSELF, and swapping a document with itself moves
+                // nothing - correct arithmetic, and no longer a fixture for
+                // "the swap moves A". WHICH document is B was never this
+                // check's subject, and leaving it to the ladder made the check
+                // depend on what earlier groups had left in lastCompareBUid.
+                setCompareB(app.images[fb.front()].get());
                 ImageDoc* wasA = cur();
                 swapCompare();
                 check(cur() != wasA && abRowItem(wasA) == AbSetB,
@@ -1105,6 +1112,56 @@
                         check(back2 && back2->uid == chosen,
                               "A9 compare off and on returns to the same B");
                     }
+                }
+
+                // A9b: the FIRST compare, with no remembered B at all (board
+                // 270). The user's rule has two clauses - 「Bが前のやつあったら
+                // それ，無かったら選択のやつ」- and only the first was
+                // implemented. "Otherwise" meant the image NEXT to A in the
+                // list: a partner nobody picked, and with a single image open,
+                // no partner at all and an empty compare pane.
+                {
+                    const uint64_t keepLast = app.lastCompareBUid;
+                    const uint64_t keepPrev = app.prevImageUid;
+                    const std::vector<uint64_t> keepExtra = app.cmpExtra;
+                    app.compareMode = App::CmpOff;
+                    setCompareB(nullptr);
+                    app.cmpExtra.clear();
+                    app.lastCompareBUid = 0;     // no history: a first compare
+                    app.prevImageUid = 0;
+                    selectImage(fa.front());
+                    ImageDoc* firstA = cur();
+                    ensureCompareB();
+                    app.compareMode = App::CmpWipe;   // cmpB() answers null while off
+                    ImageDoc* firstB = cmpB();
+                    fprintf(stderr, "abstatsselftest: A9b first compare, no history: "
+                                    "A=%s B=%s\n",
+                            firstA ? firstA->name.c_str() : "(none)",
+                            firstB ? firstB->name.c_str() : "(none)");
+                    check(firstB && firstB == firstA,
+                          "A9b no remembered B: the default is the image you are on");
+                    check(abStatsB() == firstA,
+                          "A9b ...and it has pixels, so the first compare is never empty");
+                    // ...and with a history the last B still wins. The chosen B
+                    // is a document OTHER than A, so this cannot pass by
+                    // accidentally agreeing with the clause above.
+                    ImageDoc* pick = app.images[fb.front()].get();
+                    check(pick != firstA, "A9b fixture: the chosen B is not A");
+                    setCompareB(pick);
+                    app.compareMode = App::CmpOff;
+                    setCompareB(nullptr);             // as switching off does
+                    ensureCompareB();
+                    app.compareMode = App::CmpWipe;
+                    ImageDoc* again = cmpB();
+                    fprintf(stderr, "abstatsselftest: A9b re-enter after choosing B: "
+                                    "B=%s (A=%s)\n",
+                            again ? again->name.c_str() : "(none)",
+                            cur() ? cur()->name.c_str() : "(none)");
+                    check(again == pick,
+                          "A9b a remembered B outranks the image you are on");
+                    app.lastCompareBUid = keepLast;
+                    app.prevImageUid = keepPrev;
+                    app.cmpExtra = keepExtra;
                 }
             }
         }
