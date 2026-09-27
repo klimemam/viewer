@@ -801,6 +801,41 @@ enum AutoFlavor { AF_MinMax = 0, AF_Pct = 1, AF_Median = 2 };
 // is the one to pick when a dead column or a cold pixel owns vmin.
 enum MedBlackMode { MB_Value = 0, MB_Min = 1, MB_MinPct = 2 };
 
+// ---- what a DECODE WORKER already did, handed to the landing (issue #232) ----
+//
+// Opening one file is four steps: stat it (identity before bytes, §6.2), read
+// its bytes, decode them into documents, and LAND those documents - addImage,
+// shareOrRegisterSource, defaultRange, the toast. The first three touch no app
+// state and they are where all the time goes (measured on this repo: 451 ms of
+// a window answering nothing for a 480 MB .npy, 593 ms for a stored .npz); the
+// fourth is the only one that needs the UI thread at all.
+//
+// They are separated by a VALUE rather than by a second copy of each loader.
+// Every loader takes an `OpenPre*`: a null one means "do all four here", which
+// is what the synchronous door keeps doing (a scripted run, a session restore,
+// a reload), and a non-null one means "the first three are done, land these".
+// Two copies of loadNpy - one threaded and one not - is the shape issue #71
+// forbids, and it is how the .npz and .npy frame loops drifted apart once
+// already (see loadNpyBuffer).
+struct OpenDecoded {
+    int frames = 1;                                  // what the array or file declared
+    std::vector<std::unique_ptr<ImageDoc>> docs;     // docs[k] = frame/page k; may be null
+    std::vector<std::string> errs;                   // ...and then why it is null
+    std::vector<std::string> members;                // pictures: the part name of docs[k]
+    bool named = false;                              // pictures: some part is named (.exr)
+};
+// Which door a path goes through. Not the extension table itself - that stays
+// in openPath, which is the one place allowed to decide what a name means; this
+// is the answer it reached, carried to the worker.
+enum OpenKind { OK_None = 0, OK_Npy = 1, OK_Npz = 2, OK_Picture = 3 };
+struct OpenPre {
+    FrameSource stat;                  // the PRE-read stat (§6.2), taken by the worker
+    std::vector<uint8_t> bytes;        // the file, already read
+    std::string member;                // .npz: which member `dec` holds, if any
+    OpenDecoded dec;
+    bool decoded = false;              // `dec` is usable (false = bytes only)
+};
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;
@@ -2427,6 +2462,53 @@ struct App {
     // not silently displace the first.
     struct ReaderWait { std::string src, spec, blame; };
     std::vector<ReaderWait> rdQueue;
+    // ---- the ORDINARY open, off the UI thread (issue #232 stage 2) ----------
+    // A .npy, a .npz or a picture file used to be read and decoded inside
+    // openPath, on the UI thread, for as long as the file took. Same shape as
+    // ReaderJob above and as the sequence loader's worker: one at a time, a
+    // queue in front of it, a cancel flag, and a start time that IS the
+    // progress (see the Files row - there is no percentage, and openJobPhase
+    // says why).
+    //
+    // `phase` is read by the UI while the worker writes it, so it is atomic and
+    // it is the only field that is: everything else is written by the worker
+    // before `done` and read by the UI after it, which `done`'s release/acquire
+    // orders. `bytes` is the exception the row needs - what the pre-stat said,
+    // so "reading 480 MB" can be on screen before the read has finished.
+    struct OpenJob {
+        std::string path;
+        int kind = OK_None;
+        int npyRead = 0;                   // §3.3's declared reading, carried
+        std::string onlyMember;            // an .npz member chosen in the picker
+        enum Phase { PhReading = 0, PhDecoding = 1, PhLanding = 2 };
+        std::atomic<int> phase{ PhReading };
+        double startedAt = 0;
+        std::atomic<uint64_t> bytes{ 0 };  // the pre-stat's size, for the row
+        std::atomic<bool> cancel{ false };
+        std::atomic<bool> done{ false };
+        std::thread th;
+        OpenPre pre;
+        std::string err;                   // what the worker refused it for
+        // Quitting mid-open. Same reason ~ReaderJob does it: a joinable
+        // std::thread that is destroyed is std::terminate, and this object is
+        // owned by the global App, so "close the window while a 768 MB file is
+        // decoding" would abort on the way out.
+        ~OpenJob() {
+            cancel.store(true);
+            if (th.joinable()) th.join();
+        }
+    };
+    std::unique_ptr<OpenJob> openJob;
+    // Several files at once - a drop, a multi-select - calls openPath in a loop.
+    // rdQueue's shape and its reason: the second request must not be lost and
+    // must not displace the first.
+    struct OpenWait {
+        std::string path;
+        int kind = OK_None;
+        int npyRead = 0;
+        std::string onlyMember;
+    };
+    std::vector<OpenWait> openQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
                videoDlg || folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
@@ -2603,6 +2685,17 @@ inline bool g_scriptedRun = false;
 // (browse-keys' `waitpick`). Only openFolder reads it; everything else about a
 // scripted run is unchanged.
 inline bool g_forceAsyncScan = false;
+
+// ...and the same lid for the OPEN worker (issue #232 stage 2, --async-open).
+// The hole is the same one and it is bigger here: openPath is what nearly every
+// selftest uses to get a document on screen, and a great many of them assert on
+// app.images on the line AFTER it. So a scripted run reads and decodes on this
+// thread exactly as before, and this flag is how the suite can still run the
+// path a person gets - --asyncopen-selftest sets it and then pumps, the way the
+// window pumps. Read by startOpenJob only; nothing else about a scripted run
+// changes. (Session restore stays synchronous whatever this says: V25m / R18 /
+// V25p-r1 depend on the lines completing in order - stage 1's decision.)
+inline bool g_forceAsyncOpen = false;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)

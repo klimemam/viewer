@@ -301,22 +301,78 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
                                                 int64_t& frameStrideOut,
                                                 int npyRead = 0 /*NR_NATIVE*/);   // defined below
 
-// Shared by .npy files and .npz members: build a stack when the array has a
-// frame axis, otherwise a single image. npyRead is the user's declaration
-// (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
-static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
-                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/,
-                                 bool forceStack = false) {
+// The DECODE half of loadNpyBuffer, and not one line of it touches app state.
+// Every frame of one .npy buffer, turned into a document and MEASURED - which
+// is the expensive part of opening a file (a 480 MB u16 array is 960 MB of
+// float32 written one sample at a time) and therefore the part issue #232
+// stage 2 moves to a worker. loadNpyBuffer calls it when it was handed nothing,
+// so the two doors run the same loop in the same order rather than two copies
+// of it (§71: a second copy is a copy that drifts - this very frame loop
+// already drifted once, see loadNpy).
+//
+// `cancel`, when given, is looked at between FRAMES and never inside one: half
+// a frame is not a frame. A cancelled decode returns an error rather than a
+// short stack, because a stopped open must land NOTHING - "n of N" is for a
+// file that could not be read, not for a user who said stop.
+static std::string npyDecodeFrames(const std::vector<uint8_t>& buf, const std::string& path,
+                                   const std::string& displayName, int npyRead,
+                                   OpenDecoded& out,
+                                   const std::atomic<bool>* cancel = nullptr) {
     std::string err;
     int frames = 1;
     int64_t fstride = 0;
     auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
     if (!first) return err.empty() ? "decode failed" : err;
+    // Measured HERE, off the UI thread, exactly as the sequence worker measures
+    // its frames - and addImage is told `measured` below so it does not repeat
+    // the pass. computeMinMax is pure (see its note in compare.inc).
+    computeMinMax(*first);
+    out.frames = frames;
+    out.docs.resize((size_t)frames);
+    out.errs.resize((size_t)frames);
+    out.docs[0] = std::move(first);
+    for (int f = 1; f < frames; f++) {
+        if (cancel && cancel->load()) return "stopped";
+        std::string e2;
+        int fr = 1;
+        int64_t fs = 0;
+        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
+        if (!doc) {
+            // The first frame that would not decode ends the stack, and the
+            // landing says "n of N" about it - which is what the synchronous
+            // loop did, in this order, with this message.
+            out.errs[(size_t)f] = e2.empty() ? std::string("decode failed") : e2;
+            break;
+        }
+        computeMinMax(*doc);
+        out.docs[(size_t)f] = std::move(doc);
+    }
+    return {};
+}
+
+// Shared by .npy files and .npz members: build a stack when the array has a
+// frame axis, otherwise a single image. npyRead is the user's declaration
+// (§3.3) and applies to EVERY frame of the stack, not just the one that opened.
+//
+// `pre` is a decode a worker already did (issue #232 stage 2). Null means "do
+// it here", which is the synchronous door and what every existing caller gets.
+static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::string& path,
+                                 const std::string& displayName, int npyRead = 0 /*NR_NATIVE*/,
+                                 bool forceStack = false, OpenDecoded* pre = nullptr) {
+    OpenDecoded own;
+    if (!pre) {
+        std::string derr = npyDecodeFrames(buf, path, displayName, npyRead, own);
+        if (!derr.empty()) return derr;
+        pre = &own;
+    }
+    if (pre->docs.empty() || !pre->docs[0]) return "decode failed";
+    const int frames = pre->frames;
+    auto first = std::move(pre->docs[0]);
     std::string label = first->name;
     // A typed Stack remains a stack when F==1.  Layer identity is not inferred
     // from cardinality: dropping this SeqInfo loses its timestamps, its Series
     // member kind and its session identity.
-    if (frames <= 1 && !forceStack) { addImage(std::move(first)); return {}; }
+    if (frames <= 1 && !forceStack) { addImage(std::move(first), true); return {}; }
 
     App::SeqInfo info;
     info.id = app.nextSeqId++;
@@ -325,16 +381,20 @@ static std::string loadNpyBuffer(const std::vector<uint8_t>& buf, const std::str
     first->seqId = info.id;
     first->seqIndex = 0;
     int firstIdx = (int)app.images.size();
-    addImage(std::move(first));
+    addImage(std::move(first), true);
     const ImageDoc* ref = app.images[firstIdx].get();
     for (int f = 1; f < frames; f++) {
-        std::string e2;
-        int fr = 1; int64_t fs = 0;
-        auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
-        if (!doc) { toast(label + ": frame " + std::to_string(f) + ": " + e2, true); break; }
+        auto doc = (size_t)f < pre->docs.size() ? std::move(pre->docs[(size_t)f])
+                                                : std::unique_ptr<ImageDoc>();
+        if (!doc) {
+            const std::string e2 = (size_t)f < pre->errs.size() ? pre->errs[(size_t)f]
+                                                                : std::string();
+            toast(label + ": frame " + std::to_string(f) + ": " +
+                      (e2.empty() ? std::string("decode failed") : e2), true);
+            break;
+        }
         doc->seqId = info.id;
         doc->seqIndex = f;
-        computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
         // ...and the batch, which addImage assigns to the HEAD frame only: these
         // go straight into app.images, so a stack built inside one file used to
@@ -565,6 +625,56 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
     return npzClassify(nz::readFacts(zip, entries));
 }
 
+// WHAT AN .npz OPEN IS GOING TO DO, decided from the container alone - the
+// reading (§4.11.1's `__viewer` mark or the plain members), what the members
+// are, and whether ONE of them is the answer with no question asked. Cheap: a
+// zip directory plus the members' headers, never their pixels.
+//
+// It exists as a value because TWO threads ask it (issue #232 stage 2). The
+// open worker asks it to find the one member worth inflating and decoding
+// before the UI thread lands anything; loadNpz asks it for the same decision it
+// has always made. One answer, asked twice, rather than a worker guessing which
+// member the landing will want - a worker that guessed wrong would decode twice
+// and put the first member's pixels under the second one's name.
+struct NpzPlan {
+    bool container = false;          // the viewer container reading, not members
+    std::vector<NpzMember> mem;      // every member, classified
+    int images = 0;                  // ...how many of them are image-shaped
+    int axes = 0;                    // ...and how many 1-D keys could be an axis
+    std::string member;              // the ONE member to open, or "" - see below
+};
+static void npzPlanOf(const std::vector<uint8_t>& zip, const std::vector<NpzEntry>& entries,
+                      const std::string& onlyMember, NpzPlan& P) {
+    if (nz::hasContainerMark(entries)) { P.container = true; return; }
+    P.mem = npzScan(zip, entries);
+    if (P.mem.empty()) return;
+    if (!onlyMember.empty()) {
+        // A session line, or a §3.3 re-read: the member is named and there is
+        // nothing to decide. A named member that is not an image is left to
+        // loadNpz to refuse, by name and with the reason - so `member` stays
+        // empty and nothing is decoded for it.
+        for (const auto& m : P.mem)
+            if (m.name == onlyMember && m.role == NpzMember::RImage) P.member = m.name;
+        return;
+    }
+    for (const auto& m : P.mem) if (m.role == NpzMember::RImage) P.images++;
+    // An axis CANDIDATE is a 1-D numeric member exactly as long as some image
+    // member's frame count. Anything else 1-D stays metadata - and either way
+    // it is never pixels.
+    for (const auto& m : P.mem) {
+        if (m.role != NpzMember::RAxis || m.vals.empty()) continue;
+        for (const auto& im : P.mem)
+            if (im.role == NpzMember::RImage && im.frames > 1 &&
+                (size_t)im.frames == m.vals.size()) { P.axes++; break; }
+    }
+    // ONE image and nothing to decide: that member, no dialog. Everything else
+    // - none, or several, or a key that could be an axis - is a QUESTION, and a
+    // question is the UI thread's to ask, so nothing is pre-decoded for it.
+    if (P.images == 1 && P.axes == 0)
+        for (const auto& m : P.mem)
+            if (m.role == NpzMember::RImage) { P.member = m.name; return; }
+}
+
 // Open ONE image-shaped member: the stack (or the frame) it makes, tagged with
 // the array name so a session can come back to exactly this member.
 // zipStat is the CALLER's stat of the zip, taken BEFORE its bytes were read:
@@ -572,15 +682,20 @@ static std::vector<NpzMember> npzScan(const std::vector<uint8_t>& zip,
 // would exploit, and identity-before-bytes binds the OLD tuple to the OLD
 // pixels - the safe direction (§6.2). Required, not defaulted: a zero stat
 // would silently keep the member out of the registry.
+//
+// `pre`, when given, is the inflate AND the decode a worker already did for
+// THIS member (issue #232 stage 2). The zip is then never touched here.
 static std::string npzOpenMember(const std::string& path, const std::vector<uint8_t>& zip,
                                  const NpzEntry& e, const std::string& arrayName,
                                  int npyRead /*NR_NATIVE = 0*/,
-                                 const FrameSource& zipStat) {
+                                 const FrameSource& zipStat,
+                                 OpenDecoded* pre = nullptr) {
     std::vector<uint8_t> member;
     std::string mErr;
-    if (!npzExtract(zip, e, member, mErr)) return mErr;
+    if (!pre && !npzExtract(zip, e, member, mErr)) return mErr;
     size_t before = app.images.size();
-    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead);
+    std::string lErr = loadNpyBuffer(member, path, baseName(path) + ":" + arrayName, npyRead,
+                                     false, pre);
     if (!lErr.empty()) return lErr;
     const uint64_t materializedRunId = app.nextMaterializedRunId++;
     for (size_t k = before; k < app.images.size(); k++) {
@@ -690,10 +805,13 @@ static std::string loadNpz(const std::string& path,
                            int npyRead = 0 /*NR_NATIVE*/,
                            const std::string& readerSpec = std::string(),
                            const std::string& origin = std::string(),
-                           bool reuseExisting = true);       // fwd (below)
-static std::string loadNpy(const std::string& path, int npyRead);  // fwd (below)
+                           bool reuseExisting = true,
+                           OpenPre* pre = nullptr);          // fwd (below)
+static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/,
+                           OpenPre* pre = nullptr);          // fwd (below)
 static std::string loadImageFile(const std::string& path,
-                                 const std::string& onlyMember = "");   // fwd (below)
+                                 const std::string& onlyMember = "",
+                                 OpenPre* pre = nullptr);    // fwd (below)
 static std::unique_ptr<ImageDoc> decodeImageFileFrame(const std::string& path,
                                                       std::string& errOut);  // fwd (below)
 
@@ -1063,10 +1181,33 @@ using VnzFetch = std::function<bool(int i, const VnzNode& v,
 using VnzHeadFetch = std::function<bool(int i, const VnzNode& v,
                                         std::vector<int64_t>& shape, std::string& err)>;
 using VnzPreflight = std::function<std::string(const std::vector<VnzNode>& nodes, int n)>;
+// ---- a container's pixels, already read and decoded (issue #232 stage 2) -----
+// One entry per NODE of the tree: what its .npy header said, which §3.3 reading
+// that resolved to, and its frames as documents. Handed to vnzBuild in place of
+// the VnzFetch, so the landing walks the tree doing nothing but landing.
+//
+// It exists for the reader's cache file. `readerFinish` used to call
+// loadViewerStream on the UI THREAD after the child exited - 452 ms measured on
+// a 480 MB stream, 746 ms on 768 MB, and 592 ms even when the reader was not
+// re-run at all because the cache was warm. That was every millisecond stage 1
+// left behind (PR #234).
+struct VnzPreNode {
+    bool has = false;                // this node was reached by the pre-decode
+    std::vector<int64_t> shape;      // the .npy header's shape, peeked
+    int read = 0;                    // NR_* - what vnzPixelRead resolved
+    OpenDecoded dec;                 // ...and its frames, decoded and measured
+    std::string err;                 // or why not, in vnzBuild's own words
+};
+struct VnzPre { std::vector<VnzPreNode> pix; };   // indexed by node index
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn,
-                            const FrameSource& originStat, bool peerPixels = false);
+                            const FrameSource& originStat, bool peerPixels = false,
+                            VnzPre* pre = nullptr);
+// What one node's documents are called. Defined beside vnzBuild, declared here
+// because the pre-decode above it has to produce the very same name.
+static std::string vnzNodeLabel(const std::vector<VnzNode>& nodes, int i,
+                               const std::string& origin);
 
 // ---- the framed stream ------------------------------------------------------
 // What the harness writes with --stream: a line-based header, then the pixel
@@ -1262,42 +1403,95 @@ static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode
     return {};
 }
 
-static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
-                                    const std::string& origin,
-                                    const FrameSource& originStat) {
-    std::ifstream f(pathFromUtf8(path), std::ios::binary);
-    if (!f) return "cannot open what the reader wrote: " + path;
+// What a .vstream holds, READ AND DECODED, with nothing landed (issue #232
+// stage 2). The thing a reader job hands to the UI thread.
+struct VstreamPre {
     int ver = 0, n = -1;
     std::vector<VnzNode> nodes;
-    std::vector<VnzBlob> blobs;
     std::vector<std::pair<std::string, std::string>> meta;
-    std::string herr = vnsParseHeader(f, ver, nodes, n, blobs, meta);
-    if (!herr.empty()) return herr;
+    VnzPre pre;
+};
 
-    // The blobs follow, in order. Read one, hand it to the same decoder a loose
-    // .npy goes through, move on: only one blob is in memory at a time.
+// The half of loadViewerStream that touches no app state: the header, then every
+// blob read and turned into documents. Safe on any thread, and that is where it
+// runs - inside the ReaderJob's own thread, after the child has exited and
+// BEFORE done=true, so the window keeps answering through the part of a reader
+// open that stage 1 could not move (PR #234's measured residual: 452 ms at
+// 480 MB, 746 ms at 768 MB, and 592 ms on a cache hit, where no child runs at
+// all and this is the ENTIRE cost).
+//
+// `cancel` is looked at between NODES and inside npyDecodeFrames between frames.
+// A stopped decode returns an error and the job lands nothing.
+static std::string vstreamDecode(const std::string& path, const std::string& origin,
+                                 VstreamPre& P, const std::atomic<bool>* cancel = nullptr) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return "cannot open what the reader wrote: " + path;
+    std::vector<VnzBlob> blobs;
+    std::string herr = vnsParseHeader(f, P.ver, P.nodes, P.n, blobs, P.meta);
+    if (!herr.empty()) return herr;
+    if (P.n < 0) return "the stream declared no nodes";
+    P.pre.pix.resize((size_t)P.n);        // resize, not assign: a VnzPreNode holds
+                                          // unique_ptrs and cannot be copied
+    // The blobs follow, in order, and the order is the order vnzBuild walks the
+    // nodes in - which is why this loop skips exactly the layers that loop
+    // skips. Only one blob is in memory at a time here as well: `member` is
+    // freed at the end of each turn and what is kept is the decoded documents,
+    // which are what the landing needs and what the open would have ended up
+    // holding anyway.
     size_t next = 0;
-    return vnzBuild(nodes, n, origin, readerSpec,
-                    [&](int, const VnzNode& v, std::vector<uint8_t>& out,
-                        std::string& e) -> bool {
-                        if (v.pixelEntry != next) {
-                            e = "the stream's blobs are out of order";
-                            return false;
-                        }
-                        const VnzBlob& b = blobs[v.pixelEntry];
-                        size_t pre = writeNpyHeaderFor(out, b.dtype, b.shape);
-                        out.resize(pre + (size_t)b.nbytes);
-                        f.read((char*)out.data() + pre, (std::streamsize)b.nbytes);
-                        if ((uint64_t)f.gcount() != b.nbytes) {
-                            e = "the stream ended " +
-                                std::to_string(b.nbytes - (uint64_t)f.gcount()) +
-                                " byte(s) short of what it declared";
-                            return false;
-                        }
-                        next++;
-                        return true;
-                    },
-                    meta, originStat);
+    for (int i = 0; i < P.n; i++) {
+        VnzNode& v = P.nodes[(size_t)i];
+        if (v.layer == "batch" || v.layer == "series" || v.layer == "analysisset") continue;
+        if (cancel && cancel->load()) return "stopped";
+        VnzPreNode& pn = P.pre.pix[(size_t)i];
+        pn.has = true;
+        if (v.pixelEntry != next || v.pixelEntry >= blobs.size()) {
+            pn.err = "the stream's blobs are out of order";
+            break;
+        }
+        const VnzBlob& b = blobs[v.pixelEntry];
+        std::vector<uint8_t> member;
+        size_t prefix = writeNpyHeaderFor(member, b.dtype, b.shape);
+        member.resize(prefix + (size_t)b.nbytes);
+        f.read((char*)member.data() + prefix, (std::streamsize)b.nbytes);
+        if ((uint64_t)f.gcount() != b.nbytes) {
+            pn.err = "the stream ended " +
+                     std::to_string(b.nbytes - (uint64_t)f.gcount()) +
+                     " byte(s) short of what it declared";
+            break;
+        }
+        next++;
+        NpyHead typedHead;
+        std::string e;
+        if (!npyPeekHeader(member, typedHead, e)) { pn.err = e; break; }
+        pn.shape = typedHead.shape;
+        if (!vnzPixelRead(v, typedHead.shape, pn.read, e)) { pn.err = e; break; }
+        std::string derr = npyDecodeFrames(member, origin, vnzNodeLabel(P.nodes, i, origin),
+                                           pn.read, pn.dec, cancel);
+        if (!derr.empty()) {
+            if (derr == "stopped") return derr;   // the user's Stop, not the file's fault
+            pn.err = derr;
+            break;
+        }
+    }
+    return {};
+}
+
+// ...and the landing. `pre` is a vstreamDecode another thread already did; null
+// means do it here, which is the synchronous door (the selftests, and anything
+// that is not a ReaderJob).
+static std::string loadViewerStream(const std::string& path, const std::string& readerSpec,
+                                    const std::string& origin,
+                                    const FrameSource& originStat,
+                                    VstreamPre* pre = nullptr) {
+    VstreamPre own;
+    if (!pre) {
+        std::string derr = vstreamDecode(path, origin, own);
+        if (!derr.empty()) return derr;
+        pre = &own;
+    }
+    return vnzBuild(pre->nodes, pre->n, origin, readerSpec, VnzFetch{}, pre->meta,
+                    originStat, false, &pre->pre);
 }
 
 // A viewer container, whatever is carrying it (docs/features/adapters/input-adapters.md §4.11).
@@ -1807,12 +2001,40 @@ static std::string vnzBuildSets(std::vector<VnzNode>& nodes, int n, int batchId,
 }
 
 // ---- build ---------------------------------------------------------------
+// What ONE node's documents are called. Pulled out of vnzBuild because the
+// pre-decode (vstreamDecode) has to produce the SAME name - the name is what
+// decodeNpyBuffer stamps on the document, so a worker that spelled it
+// differently would rename every frame of a reader's output. One spelling, two
+// callers (§71).
+//
+// The fallback counts POSITION AMONG SIBLINGS, from zero - so the first stack of
+// a series is ":0" and lines up with stacks[0] in the Python that produced it.
+// It used to be the container's flat node index, which counts the batch and the
+// series nodes too: the first stack of a plain sweep came out ":2" and matched
+// nothing the author could point at.
+static std::string vnzNodeLabel(const std::vector<VnzNode>& nodes, int i,
+                                const std::string& origin) {
+    const VnzNode& v = nodes[(size_t)i];
+    if (!v.name.empty()) return v.name;
+    int ord = 0;
+    for (int k = 0; k < i; k++)
+        if (nodes[(size_t)k].parent == v.parent &&
+            nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series" &&
+            nodes[(size_t)k].layer != "analysisset")
+            ord++;
+    return baseName(origin) + ":" + std::to_string(ord);
+}
+
 // Shared by both carriers (see VnzFetch). Everything here reads `nodes`; the one
 // thing that knew where the bytes live is now the callback.
+//
+// `pre`, when given, is that callback's work already done on another thread
+// (VnzPre): no fetch is called, nothing is inflated or decoded here, and this
+// walk does only what needs the UI thread.
 static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::string& origin,
                             const std::string& readerSpec, const VnzFetch& fetch,
                             const std::vector<std::pair<std::string, std::string>>& metaIn,
-                            const FrameSource& originStat, bool peerPixels) {
+                            const FrameSource& originStat, bool peerPixels, VnzPre* pre) {
     int prevBatch = app.loadBatchId;
     std::string batchName = nodes[0].layer == "batch" && !nodes[0].name.empty()
                                 ? nodes[0].name : baseName(origin);
@@ -1846,36 +2068,44 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
         // uses, so a container and a loose .npy of the same array cannot drift.
         std::vector<uint8_t> member;
         std::string mErr;
-        if (!fetch(i, v, member, mErr)) {
-            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
-            break;
-        }
-        NpyHead typedHead;
-        if (!npyPeekHeader(member, typedHead, mErr)) {
-            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
-            break;
-        }
         int typedRead = NR_NATIVE;
-        if (!vnzPixelRead(v, typedHead.shape, typedRead, mErr)) {
-            firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
-            break;
+        OpenDecoded* nodeDec = nullptr;
+        if (pre) {
+            // Already read, peeked, resolved and decoded - on a job thread, in
+            // this same order, by vstreamDecode. Its refusals wear the same
+            // sentence because they ARE the same sentences: the strings come
+            // from npyPeekHeader / vnzPixelRead / npyDecodeFrames either way.
+            VnzPreNode* pn = (size_t)i < pre->pix.size() ? &pre->pix[(size_t)i] : nullptr;
+            if (!pn || !pn->has) {
+                firstErr = "__pixels_" + std::to_string(i) +
+                           ": the stream declared no pixels for this node";
+                break;
+            }
+            if (!pn->err.empty()) {
+                firstErr = "__pixels_" + std::to_string(i) + ": " + pn->err;
+                break;
+            }
+            typedRead = pn->read;
+            nodeDec = &pn->dec;
+        } else {
+            if (!fetch(i, v, member, mErr)) {
+                firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+                break;
+            }
+            NpyHead typedHead;
+            if (!npyPeekHeader(member, typedHead, mErr)) {
+                firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+                break;
+            }
+            if (!vnzPixelRead(v, typedHead.shape, typedRead, mErr)) {
+                firstErr = "__pixels_" + std::to_string(i) + ": " + mErr;
+                break;
+            }
         }
         size_t before = app.images.size();
-        // The fallback name counts POSITION AMONG SIBLINGS, from zero - so the
-        // first stack of a series is ":0" and lines up with stacks[0] in the
-        // Python that produced it. It used to be the container's flat node
-        // index, which counts the batch and the series nodes too: the first
-        // stack of a plain sweep came out ":2" and matched nothing the author
-        // could point at.
-        int ord = 0;
-        for (int k = 0; k < i; k++)
-            if (nodes[(size_t)k].parent == v.parent &&
-                nodes[(size_t)k].layer != "batch" && nodes[(size_t)k].layer != "series" &&
-                nodes[(size_t)k].layer != "analysisset")
-                ord++;
-        std::string label = v.name.empty() ? baseName(origin) + ":" + std::to_string(ord) : v.name;
+        std::string label = vnzNodeLabel(nodes, i, origin);
         std::string lErr = loadNpyBuffer(member, origin, label, typedRead,
-                                         v.layer == "stack");
+                                         v.layer == "stack", nodeDec);
         if (!lErr.empty()) {
             firstErr = "__pixels_" + std::to_string(i) + ": " + lErr;
             break;
@@ -2076,22 +2306,42 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
 // picker and no batch of its own, because the session owns both.
 static std::string loadNpz(const std::string& path, const std::string& onlyMember,
                            int npyRead, const std::string& readerSpec,
-                           const std::string& origin, bool reuseExisting) {
+                           const std::string& origin, bool reuseExisting, OpenPre* pre) {
     // identity BEFORE the bytes: see decodeNpyFrame - the multi-second member
     // decode below is exactly the window an overwrite would exploit. Every
-    // member opened from THIS zip binds to this stat (npzOpenMember).
+    // member opened from THIS zip binds to this stat (npzOpenMember). Taken by
+    // the WORKER when there is one, before ITS read, for the same reason.
     FrameSource zipStat;
-    zipStat.path = path;
-    statSourceFile(zipStat);
-    std::vector<uint8_t> zip;
-    if (!readFileBytes(path, zip)) return "cannot read file";
+    std::vector<uint8_t> ownZip;
+    // The decision below - container or members, one member or a picker - is
+    // cheap (a zip directory and the members' HEADERS) and it is made again
+    // here rather than carried across the seam, because it is the decision that
+    // must not be able to differ between the two doors. What the worker carries
+    // is only the expensive part: these bytes, and the ONE member it inflated
+    // and decoded (openJobWorker asks npzPlanOf, which is the same answer this
+    // function reaches below).
+    if (pre) { zipStat = pre->stat; }
+    else {
+        zipStat.path = path;
+        statSourceFile(zipStat);
+        if (!readFileBytes(path, ownZip)) return "cannot read file";
+    }
+    const std::vector<uint8_t>& zip = pre ? pre->bytes : ownZip;
     std::vector<NpzEntry> entries;
     std::string err;
     if (!npzList(zip, entries, err)) return err;
+    NpzPlan plan;
+    npzPlanOf(zip, entries, onlyMember, plan);
+    // The decode the worker did, and only if it is for the member this door has
+    // just independently decided on. Anything else - a container, a picker, a
+    // refusal - lands with nothing pre-decoded, which is what npzPlanOf's empty
+    // `member` says and what the worker read it as.
+    OpenDecoded* memberPre = (pre && pre->decoded && !plan.member.empty() &&
+                              pre->member == plan.member) ? &pre->dec : nullptr;
     // §4.11.1: `__viewer` and nothing else decides which of the two readings
     // this file gets. Checked before the members are classified, because a
     // container's reserved members would otherwise be offered as pictures.
-    if (nz::hasContainerMark(entries)) {
+    if (plan.container) {
         const std::vector<nz::Fact> facts = nz::readFacts(zip, entries);
         int vver = 0;
         const std::string markerErr = nz::containerVersion(facts, vver);
@@ -2140,7 +2390,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
         };
         return loadViewerNpz(mem, byName, vver, readerSpec, src, zipStat, pixels, heads);
     }
-    std::vector<NpzMember> mem = npzScan(zip, entries);
+    const std::vector<NpzMember>& mem = plan.mem;
     if (mem.empty()) return "no arrays in npz";
     if (!onlyMember.empty()) {
         for (const auto& m : mem) {
@@ -2152,21 +2402,12 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
             // npyRead rides along: a session restoring a member, and a §3.3
             // re-read of one, both come through here and both must land on the
             // reading the user declared rather than on the native one.
-            return npzOpenMember(path, zip, entries[m.entry], m.name, npyRead, zipStat);
+            return npzOpenMember(path, zip, entries[m.entry], m.name, npyRead, zipStat,
+                                 memberPre);
         }
         return "no member named " + onlyMember + " in this npz";
     }
-    int images = 0, axes = 0;
-    for (const auto& m : mem) if (m.role == NpzMember::RImage) images++;
-    // An axis CANDIDATE is a 1-D numeric member exactly as long as some image
-    // member's frame count. Anything else 1-D stays metadata - and either way
-    // it is never pixels.
-    for (const auto& m : mem) {
-        if (m.role != NpzMember::RAxis || m.vals.empty()) continue;
-        for (const auto& im : mem)
-            if (im.role == NpzMember::RImage && im.frames > 1 &&
-                (size_t)im.frames == m.vals.size()) { axes++; break; }
-    }
+    const int images = plan.images, axes = plan.axes;
     // Nothing in here is pixels. Say what IS in here - a dialog whose only live
     // button is Cancel answers a question nobody can act on.
     if (images == 0) {
@@ -2186,7 +2427,7 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
             int prevBatch = app.loadBatchId;
             app.loadBatchId = newBatch(uniqueBatchName(baseName(path)));
             std::string oErr = npzOpenMember(path, zip, entries[m.entry], m.name,
-                                             0 /*NR_NATIVE*/, zipStat);
+                                             0 /*NR_NATIVE*/, zipStat, memberPre);
             app.loadBatchId = prevBatch;
             if (!oErr.empty()) return baseName(path) + ":" + m.name + ": " + oErr;
             std::string say = npzSummary(path, mem, { m.name }, m.frames > 1 ? 1 : 0,
@@ -2226,16 +2467,29 @@ static std::string loadNpz(const std::string& path, const std::string& onlyMembe
 // The duplicated loop is also how the two doors drifted apart - 452c62a taught
 // the .npz copy to say "n of N" on a partial load and this one kept claiming
 // the full count, which docs/terminology.md 実装上の不変条件 forbids.
-static std::string loadNpy(const std::string& path, int npyRead = 0 /*NR_NATIVE*/) {
+//
+// `pre` is the stat, the bytes and the decode a worker already did (issue #232
+// stage 2, openJobWorker). Null is the synchronous door: this function does all
+// three itself, which is what every existing caller gets and what a scripted
+// run, a session restore and a reload keep doing.
+static std::string loadNpy(const std::string& path, int npyRead, OpenPre* pre) {
     // identity BEFORE the bytes (§6.2): an overwrite completing during the
-    // read binds the OLD tuple to the OLD pixels - the safe direction
+    // read binds the OLD tuple to the OLD pixels - the safe direction. Taken by
+    // the WORKER when there is one, and before its read for the same reason.
     FrameSource preStat;
-    preStat.path = path;
-    statSourceFile(preStat);
-    std::vector<uint8_t> buf;
-    if (!readFileBytes(path, buf)) return "cannot read file";
+    std::vector<uint8_t> own;
+    const std::vector<uint8_t>* buf = &own;
+    if (pre) {
+        preStat = pre->stat;
+        buf = &pre->bytes;
+    } else {
+        preStat.path = path;
+        statSourceFile(preStat);
+        if (!readFileBytes(path, own)) return "cannot read file";
+    }
     size_t before = app.images.size();
-    std::string err = loadNpyBuffer(buf, path, "", npyRead);
+    std::string err = loadNpyBuffer(*buf, path, "", npyRead, false,
+                                    pre && pre->decoded ? &pre->dec : nullptr);
     if (!err.empty()) return err;
     // The Watch baseline, stamped from the PRE-read stat. decodeNpyBuffer
     // cannot: for an .npz member the file on disk is the CONTAINER, not the
@@ -2330,27 +2584,71 @@ static std::unique_ptr<ImageDoc> imageDocFromPicture(imagefile::Image& img,
 // whole and the other parts are dropped - honest about the cost rather than
 // teaching the seam a selective decode, and it is no more work than opening
 // the file normally was.
-static std::string loadImageFile(const std::string& path, const std::string& onlyMember) {
+// The DECODE half of loadImageFile, and it touches no app state - the twin of
+// npyDecodeFrames and there for the same reason (issue #232 stage 2): a large
+// .exr or a multi-page TIFF is seconds of decompression, and the UI thread does
+// not do it. `onlyMember` is honoured here as well as at the landing, and it
+// means what it meant before: imagefile::decode still decodes the file WHOLE
+// (the note above says why), and what is skipped is only turning the parts
+// nobody asked for into documents - which is exactly what the lazy `build` this
+// replaced skipped.
+static std::string picDecodeAll(const std::string& path, const std::vector<uint8_t>& buf,
+                                const FrameSource& stat, const std::string& onlyMember,
+                                OpenDecoded& out, const std::atomic<bool>* cancel = nullptr) {
+    std::vector<imagefile::Image> imgs;
+    std::string err;
+    if (!imagefile::decode(path, buf, imgs, err)) return err;
+    const std::string label = baseName(path);
+    for (const auto& img : imgs) if (!img.member.empty()) out.named = true;
+    out.frames = (int)imgs.size();
+    out.docs.resize(imgs.size());
+    out.errs.resize(imgs.size());
+    out.members.resize(imgs.size());
+    for (size_t i = 0; i < imgs.size(); i++) {
+        out.members[i] = imgs[i].member;
+        if (out.named && !onlyMember.empty() && imgs[i].member != onlyMember) continue;
+        if (cancel && cancel->load()) return "stopped";
+        // page: 0 for every NAMED part (they are parts of one page, and
+        // FrameSource::fileFrame is the registry's frame index), the index
+        // otherwise (the pages of a multi-page TIFF are a stack). The landing
+        // below reads `named` the same way - this is the one decision about it.
+        out.docs[i] = imageDocFromPicture(imgs[i], path, out.named ? 0 : (int)i, label, stat);
+        if (out.docs[i]) computeMinMax(*out.docs[i]);   // measured off the UI thread
+    }
+    return {};
+}
+
+static std::string loadImageFile(const std::string& path, const std::string& onlyMember,
+                                 OpenPre* pre) {
     // identity BEFORE the bytes (§6.2): see decodeNpyFrame. An overwrite
     // completing during a decode that can take seconds (a large .exr, a
     // multi-page TIFF) binds the OLD tuple to the OLD pixels, which is the safe
     // direction - the next open of the NEW tuple misses the registry and reads
     // the disk. Taken here rather than inside the builder for the same reason
     // npzOpenMember takes the caller's stat: one open is one generation of the
-    // file, however many documents come out of it.
+    // file, however many documents come out of it. (Or taken by the WORKER,
+    // before ITS read, for that same reason - see OpenPre.)
     FrameSource preStat;
-    preStat.path = path;
-    statSourceFile(preStat);
-    std::vector<uint8_t> buf;
-    if (!readFileBytes(path, buf)) return "cannot read file";
-    std::vector<imagefile::Image> imgs;
-    std::string err;
-    if (!imagefile::decode(path, buf, imgs, err)) return err;
-
+    OpenDecoded own;
+    OpenDecoded* dec = nullptr;
+    if (pre && pre->decoded) {
+        preStat = pre->stat;
+        dec = &pre->dec;
+    } else {
+        std::vector<uint8_t> ownBytes;
+        if (pre) preStat = pre->stat;
+        else {
+            preStat.path = path;
+            statSourceFile(preStat);
+            if (!readFileBytes(path, ownBytes)) return "cannot read file";
+        }
+        std::string derr = picDecodeAll(path, pre ? pre->bytes : ownBytes, preStat,
+                                        onlyMember, own);
+        if (!derr.empty()) return derr;
+        dec = &own;
+    }
     const std::string label = baseName(path);
-    auto build = [&](imagefile::Image& img, int page) {
-        return imageDocFromPicture(img, path, page, label, preStat);
-    };
+    const size_t nPic = dec->docs.size();
 
     // §6.2, once for however many documents this file produced: each one either
     // joins the source already resident under its tuple or registers its own.
@@ -2365,14 +2663,13 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
     };
 
     // ---- named parts: one document each -------------------------------------
-    bool named = false;
-    for (const auto& img : imgs) if (!img.member.empty()) named = true;
-    if (named) {
+    if (dec->named) {
         std::vector<std::string> opened;
-        for (auto& img : imgs) {
-            if (!onlyMember.empty() && img.member != onlyMember) continue;
-            opened.push_back(img.member.empty() ? std::string("(base)") : img.member);
-            addImage(build(img, 0));
+        for (size_t i = 0; i < nPic; i++) {
+            if (!onlyMember.empty() && dec->members[i] != onlyMember) continue;
+            if (!dec->docs[i]) continue;
+            opened.push_back(dec->members[i].empty() ? std::string("(base)") : dec->members[i]);
+            addImage(std::move(dec->docs[i]), true);
         }
         if (opened.empty())
             return onlyMember.empty()
@@ -2390,27 +2687,28 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
         return {};
     }
 
-    if (imgs.size() == 1) {
-        addImage(build(imgs[0], 0));
+    if (nPic == 0 || !dec->docs[0]) return "nothing readable in this file";
+    if (nPic == 1) {
+        addImage(std::move(dec->docs[0]), true);
         registerFrom();
         return {};
     }
 
     App::SeqInfo info;
     info.id = app.nextSeqId++;
-    info.name = label + "  (" + std::to_string(imgs.size()) + " frames)";
+    info.name = label + "  (" + std::to_string(nPic) + " frames)";
     app.seqs.push_back(info);
-    auto head = build(imgs[0], 0);
+    auto head = std::move(dec->docs[0]);
     head->seqId = info.id;
     head->seqIndex = 0;
     const int firstIdx = (int)app.images.size();
-    addImage(std::move(head));
+    addImage(std::move(head), true);
     const ImageDoc* ref = app.images[firstIdx].get();
-    for (size_t f = 1; f < imgs.size(); f++) {
-        auto doc = build(imgs[f], (int)f);
+    for (size_t f = 1; f < nPic; f++) {
+        auto doc = std::move(dec->docs[f]);
+        if (!doc) break;
         doc->seqId = info.id;
         doc->seqIndex = (int)f;
-        computeMinMax(*doc);
         doc->black = ref->black; doc->white = ref->white;   // frames stay comparable
         doc->batchId = ref->batchId;                        // a stack is in ONE batch
         doc->texDirty = true;
@@ -2422,7 +2720,7 @@ static std::string loadImageFile(const std::string& path, const std::string& onl
         if (s.id == info.id) s.lastImageIdx = firstIdx;
     registerFrom();
     fprintf(stderr, "picture stack: %s - %zu frames (%dx%d %dch)\n", label.c_str(),
-            imgs.size(), ref->w, ref->h, ref->ch);
+            nPic, ref->w, ref->h, ref->ch);
     return {};
 }
 

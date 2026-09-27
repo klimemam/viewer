@@ -745,7 +745,8 @@ static void saveSession(std::string path, bool quiet = false) {
     toast(msg, lostSeries > 0 || lostMembers > 0 || lostSets > 0 || lostSetRoles > 0);
 }
 
-static std::string loadNpy(const std::string& path, int npyRead);   // fwd (defined above)
+static std::string loadNpy(const std::string& path, int npyRead,
+                           OpenPre* pre);                            // fwd (defined above)
 
 // ---- instance identity (Open in new window, todo-open item 28 / A7) ---------
 // Two viewers used to share ONE autosave file: whichever exited last overwrote
