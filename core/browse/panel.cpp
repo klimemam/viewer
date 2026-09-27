@@ -108,6 +108,31 @@ static int rbNameCmp(const std::string& a, const std::string& b, bool natural) {
     if (rp::naturalLess(b, a)) return 1;
     return 0;
 }
+// The ORDER the stack will be built in, in words. Declared in browse.h because
+// --browse-selftest asserts this sentence and the panel draws it, and a promise
+// written out twice is how a panel comes to say one order and deliver another.
+//
+// RULING (Fable 2026-09-27; board row 113, the last open question of issue #59):
+// a multi-folder SEARCH result keeps the full-path natural order - folder first,
+// then the numeric name - and is NOT re-sorted by basename. sortFramesNumerically
+// runs rp::naturalLess over the WHOLE path, so basename order would interleave
+// captures from different folders; sigma_t is computed along the frame axis in
+// the order the stack was built, and interleaving two captures destroys it. So
+// the order stands and only the sentence changes: "numeric name order" is not
+// what a search result gets, and nothing on screen let the reader tell.
+//
+// In an ordinary single-folder listing the folder is constant, so both sentences
+// describe the same order and the thing worth naming is the listing's own sort -
+// whether the rows on screen are the rows the stack is built from (2026-08-05).
+std::string rbStackOrderSaid(bool searchResults, bool nameNatural) {
+    if (searchResults)
+        return "frames stack in path order (folder, then numeric name)";
+    return nameNatural
+        ? "frames stack in natural name order - the order this listing is "
+          "showing them in"
+        : "frames stack in natural name order (frame_2 before frame_10), NOT "
+          "the text order this listing is showing";
+}
 // (The keyboard cursor and the stashed sort spec were file-scope singletons
 // here - g_rbCursor / g_rbSortCol / g_rbSortDesc. They live per instance now:
 // BrowseInstance::cursor / sortCol / sortDesc.)
@@ -2202,14 +2227,18 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     // can say which of the two it is - and when the panel is
                     // in text order it names the disagreement instead of
                     // leaving the user to find it in the frame numbers.
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("%s", !rbSelStackWhyNot.empty()
-                            ? rbSelStackWhyNot.c_str()
-                            : I.nameNatural
-                            ? "frames stack in natural name order - the order this "
-                              "listing is showing them in"
-                            : "frames stack in natural name order (frame_2 before "
-                              "frame_10), NOT the text order this listing is showing");
+                    //
+                    // In the SEARCH RESULTS view the rows come from more than
+                    // one folder, and then "name order" is not what the stack
+                    // gets at all: the sort is over the whole path. Board row
+                    // 113's ruling is that the order stays and the sentence
+                    // says so - rbStackOrderSaid carries both.
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        const std::string said = !rbSelStackWhyNot.empty()
+                            ? rbSelStackWhyNot
+                            : rbStackOrderSaid(I.search.active, I.nameNatural);
+                        ImGui::SetTooltip("%s", said.c_str());
+                    }
 
                     // ...and the same selection AVERAGED, which is where it stops
                     // being the same operation (#81). Above merges the ticked
