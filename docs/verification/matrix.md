@@ -1,12 +1,13 @@
 # 形式 × 入口 × 操作 の検証マトリクス
 
 > **読み方:** 本書は**現況台帳**である。3軸の定義 (§0・§1) と、軸の交差から
-> 落ちていた事実の現況 (§7 以降) を置く。**2026-08-11 の測定そのもの**——
+> 落ちていた事実の現況 (§7・§8・§10) を置く。**2026-08-11 の測定そのもの**——
 > 表A / 表B / 表C の 299セル、セルの数え、どのセルを selftest が証明しているか
-> (旧 §2〜§6)——は [results/20260811-matrix.md](results/20260811-matrix.md) へ
-> 凍結した (2026-09-27 分離)。**凍結測定と現況台帳を1つのファイルに同居させない**
-> のが現在の規則である。§2〜§6 の番号は詰めずに空けてある——§7 以降を指している
-> 既存の参照を動かさないため。
+> (旧 §2〜§6)、および `[P]` の実測 (旧 §9)——は
+> [results/20260811-matrix.md](results/20260811-matrix.md) へ凍結した
+> (2026-09-27 分離)。**凍結測定と現況台帳を1つのファイルに同居させない**のが現在の
+> 規則で、割る境界は節番号ではなく**凍結された実測かどうか**である。番号は詰めずに
+> 空けてある——§7 以降を指している既存の参照を動かさないため。
 
 本書でいう「入口」は、ファイルやデータを製品へ取り込む操作経路を指す。たとえば
 File > Open、Browse、フォルダ走査、リモート接続、リーダはそれぞれ別の入口である。
@@ -41,7 +42,8 @@ File > Open、Browse、フォルダ走査、リモート接続、リーダはそ
 - `[S:symbol]` — コードを読んだ。**関数名・配列名で指す**。ファイル名は添えてよいが
   **行番号は書かない**
 - `[D:...]` — 文書の節 anchor / issue 番号
-- `[P]` — **手で確かめた**。§9 に何をどう走らせたか
+- `[P]` — **手で確かめた**。何をどう走らせたかは
+  [results/20260811-matrix.md](results/20260811-matrix.md) §9
 
 **現況側に `file:line` を書かない。** 行はコミットごとに動くので、生きた台帳に
 書くと「読んだ時点では正しかった」しか意味しなくなる。行で指してよいのは対象
@@ -76,8 +78,9 @@ File > Open、Browse、フォルダ走査、リモート接続、リーダはそ
 
 > **§2〜§6 は本書に無い。** 表A (形式 × 入口 117セル)、表B / 表C
 > (形式 × 操作 各91セル)、セルの数え、selftest が証明しているセルの対応表は
-> すべて [results/20260811-matrix.md](results/20260811-matrix.md) にある。
-> 再測定するときは新しい `results/<YYYYMMDD>-matrix.md` を作り、本書の §7 以降を
+> すべて [results/20260811-matrix.md](results/20260811-matrix.md) にある。§9 の
+> `[P]` 実測も同じ理由でそちらにある。
+> 再測定するときは新しい `results/<YYYYMMDD>-matrix.md` を作り、本書の §7・§8・§10 を
 > 更新する——凍結した測定を書き換えない。
 
 ---
@@ -571,61 +574,15 @@ peer が古いという文ではない。試験は `--rmeasure-selftest`
 
 ## 9. `[P]` — 手で確かめたもの
 
-> **この節は 2026-08-11 の実施記録**である (commit `5906542e`)。
-> [results/20260811-matrix.md](results/20260811-matrix.md) のセルが `[P]` と
-> 書いているのはここを指す。実施記録なので、以下の関数名・行・出力は当時のもの
-> として読み、書き換えない。
-
-**何を。** 形式の可否判定 (`imagefile::forPath` / `peerServes` / `peerRefusal` /
-`videoRefusal` / `dialogPattern` / `backends`) が**実際に返す値**。ソースを読んだ
-結果ではなく、**出荷されるオブジェクトが答えたもの**。
-
-**どうやって。** `viewer-serve` がリンクしているのと同一の
-`build-vm/CMakeFiles/viewer-serve.dir/core/imagefile.cpp.obj` (と
-`tiffread` / `exrread` / `y4mread` / `rawread` / `miniz` / `stb` / OpenEXR) に、
-19個の名前を上の関数群に通して印字するだけの `main()` を**リポジトリの外で**
-リンクして走らせた。`viewerReadsName` は `core/main.cpp` の中にいてリンクでき
-ないので、`core/ui/menus.inc:668` の 3行をそのまま写した。
-
-**結果 (抜粋)。**
-
-```
-name         forPath      vRead  peer   | peerRefusal
-a.npy        -            1      1      |
-a.npz        -            1      0      | .npz is read on this machine, but the peer serves
-                                        | one array per file, not a container | browse it
-                                        | locally (File > Browse Folder), or copy it here first
-a.png        PNG          1      1      |
-a.dng        vendor RAW   1      0      | vendor RAW is read on this machine, but the peer does
-                                        | not serve it: LibRaw is CDDL-1.0 and viewer-serve
-                                        | installs itself onto another machine over ssh | ...
-a.raw        -            0      0      | the peer serves .npy, PNG, JPEG, TIFF, OpenEXR and y4m
-a.bin        -            0      0      | (同上)
-a.rggb       -            0      0      | (同上)
-A.RAW        -            0      0      | (同上、大文字でも同じ)
-a.mp4        -            0      0      | (同上)   VIDEO: MP4 (H.264/HEVC) needs a video codec...
-a.vsession   -            0      0      | (同上)
-
-dialogPattern: *.png *.jpg *.jpeg *.jpe *.dng ... *.tif *.tiff *.exr *.y4m
-decodableFormats: PNG, JPEG, TIFF, OpenEXR, y4m
-```
-
-`vRead=0` かつ `peer=0` の行 (`a.raw` / `a.bin` / `a.rggb` / `A.RAW` /
-`a.vsession`) が **G1 と G2 の実測**である。`a.mp4` の 2つの列が **G7 の実測**——
-同じファイルについて 2つの関数が別のことを言っている。
-
-**履歴（初出 2026-08-11、commit `5906542e`）— 当時走らせた試験。**
-`bash tools/run_selftests.sh build-vm` →
-`ran 50, skipped 0` / `100% tests passed, 0 tests failed out of 50` /
-`run_selftests: PASS`、exit 0。この文書は**製品の振る舞いを 1バイトも変えて
-いない**ので、この結果は base と同じである (この PR は文書のみ)。
+実施記録なので [results/20260811-matrix.md](results/20260811-matrix.md) §9 へ移した。
 
 ---
 
 ## 10. この表の保ち方
 
 **この文書は手作業だけで保守するものではない。** 形式の可否判定の列
-(`forPath` / `viewerReadsName` / `peerServes` — §9 が実測したもの) は
+(`forPath` / `viewerReadsName` / `peerServes` —
+[results/20260811-matrix.md](results/20260811-matrix.md) §9 が実測したもの) は
 `selftest.fmtgate` の F4 が
 **表の全行について不変条件として** assert している——「peer が配れるものは
 必ずこの viewer も読む」「`peerServesName(x) == b.overLink`」。だから

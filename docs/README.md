@@ -172,7 +172,7 @@ stub の有無を自動判定する契約には含めません。
 |---|---|---|
 | [docs/flat-field-stats.md](flat-field-stats.md) | [docs/background/analysis/flat-field-stats.md](background/analysis/flat-field-stats.md) | 判断記録と実施済み計画 |
 | [docs/media-support.md](media-support.md) | [docs/background/media/media-support.md](background/media/media-support.md) | 候補比較と採用しなかった tinyexr 案 |
-| [docs/verification/matrix.md](verification/matrix.md) | [docs/verification/results/20260811-matrix.md](verification/results/20260811-matrix.md) | 2026-08-11 の凍結測定（旧 §1〜§6 の表A/表B/表C・セルの数え・selftest 対応。2026-09-27 分離） |
+| [docs/verification/matrix.md](verification/matrix.md) | [docs/verification/results/20260811-matrix.md](verification/results/20260811-matrix.md) | 2026-08-11 の凍結測定（旧 §1〜§6 の表A/表B/表C・セルの数え・selftest 対応と、旧 §9 の `[P]` 実測。2026-09-27 分離） |
 <!-- DOCS-SPLIT-HISTORY:END -->
 
 ## 未作成文書の例外
