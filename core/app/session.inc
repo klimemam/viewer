@@ -1728,11 +1728,6 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (script.empty())
         return "cannot find tools/import/run_adapter.py - the adapter harness ships "
                "with the viewer and this build cannot see it";
-    std::string why;
-    std::string py = adapter::findPython(app.pythonExe, why);
-    if (py.empty())
-        return readerNoPythonText("", why,
-                                  "set one in Settings, or install numpy for the one you have");
 
     std::string cacheDir = adapterCacheDir();
     std::string cached;
@@ -1783,6 +1778,22 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         }
         std::filesystem::remove(pathFromUtf8(cached), ec);   // unreadable: earn it again
     }
+
+    // WHICH INTERPRETER, and it is asked AFTER the cache, not before (issue #232
+    // stage 2). adapter::findPython's first call in a process starts a Python to
+    // check that numpy imports - measured on this box at 113 ms, and it was
+    // being spent on the UI thread by every open that came through this door,
+    // INCLUDING the ones that then answered out of the cache and never started
+    // Python at all. §7 stage 5's promise is that "the second open does not
+    // start Python"; it was starting one to find out which one not to start.
+    // Nothing else moved: the reader is still located before Python is reached
+    // (§4.13.2, above), and the sentence a missing interpreter produces is
+    // unchanged - it simply arrives after a cache that could answer has.
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    if (py.empty())
+        return readerNoPythonText("", why,
+                                  "set one in Settings, or install numpy for the one you have");
 
     std::string out = cached;
     if (out.empty()) {
