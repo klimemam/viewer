@@ -391,8 +391,10 @@ static std::string g_paneBadgeProbe;
 // g_paneBadgeProbe, and the same rule: it records the STRINGS that went to
 // AddText, not the numbers they were built from - the zoom readout has two
 // formats and the one it chose is the thing worth asserting, which a test
-// re-deriving "zoom * 100" would never see. (docs/verification/ui.md E3: the row was
-// moved out of the A section precisely because nothing here was observable.)
+// re-deriving "zoom * 100" would never see. (E3 in
+// docs/verification/results/20260803-ui.md: that run moved the row out of its
+// A section precisely because nothing here was observable.
+// docs/verification/ui.md §3 now carries the probe's contract.)
 static std::string g_footerProbe;
 static std::string elideFront(const std::string& s, size_t keep);   // fwd
 // The batch a document belongs to - the context line of the two-line identity

@@ -9,7 +9,8 @@
 # exit 1 and print FAIL; the right one must exit 0 and print ok.
 #
 # The recipe below is also the template for every new --browse-keys script
-# (docs/verification/ui.md section C uses it verbatim). Two non-obvious rules:
+# (docs/verification/ui.md §3, "Script template and calibration", carries it
+# verbatim). Two non-obvious rules:
 #
 #   PROLOG  waitdir:<leaf>,viewreset,w400,home
 #           viewreset is the ABSOLUTE grouped+list+folded pin (the flat/tree/
@@ -19,10 +20,12 @@
 #   EPILOG  >=6 nav keys while focused, then blur,down,up,end,home, then
 #           rawopen,popupcheck,seqask,popupcheck
 #           because the run's exit code is
-#             keysOk = routeOk && popOk && keysCheckBad == 0   (main.cpp:29132)
-#           and routeOk/popOk read counters that only the blur and popup
-#           actions ever set. Omit the epilog and a script whose checks all
-#           pass still exits 1 with "the action list did not finish".
+#             keysOk = routeOk && popOk && watchOff && keysCheckBad == 0
+#           (the assignment in core/main.cpp, quoted by
+#           docs/verification/ui.md §3) and routeOk/popOk read counters that
+#           only the blur and popup actions ever set. Omit the epilog and a
+#           script whose checks all pass still exits 1 with "the action list
+#           did not finish".
 set -u
 cd "${1:-.}" || exit 1
 V=./build-mingw/viewer.exe
