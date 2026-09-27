@@ -165,6 +165,20 @@ static bool g_uiScaleSelftest = false;
 // videoSelftest().
 static bool g_videoSelftest = false;
 
+// --asyncopen-selftest: the open WORKER (issue #232 stage 2). What it fixes is
+// the one thing a headless test can fix about a freeze - not the milliseconds,
+// which need a real window and a WM_NULL ping, but the STRUCTURE: that openPath
+// returns with nothing read, that the frame loop runs while the reading happens,
+// that pumping lands exactly what the synchronous door lands, and that Stop
+// leaves no trace. Plus the anti-vacuity case, which is the whole reason
+// --async-open exists: the scripted DEFAULT still opens synchronously, and this
+// test proves that too, in the same run. Writes its own fixtures (a 100 MB .npy
+// among them) and needs no window: every expected number is derived by hand.
+// Takes tools/testdata, for the one fixture it does not write itself:
+// media/stack3.tif, the multi-page TIFF (a third decoder, neither .npy's nor a
+// zip's). See asyncOpenSelftest().
+static std::string g_asyncOpenSelftest;
+
 // --anaprov-selftest: analyzer results name the dll they came from (#46 stage
 // 1, the host's ledger) - and builtin statistics wear no plugin tag. Takes no
 // directory and no window for the --roistats-selftest reasons: the fixture is
@@ -679,6 +693,10 @@ static void printUsage() {
         "  --scan-selftest <dir>       Open Folder: every stack below a root\n"
         "  --folderscan-selftest       the local folder scan's answer, group by group\n"
         "  --async-scan                scan folders on the worker even in a scripted run\n"
+        "  --async-open                read and decode a single file on the worker even\n"
+        "                              in a scripted run (issue #232 stage 2)\n"
+        "  --asyncopen-selftest <dir>  that worker: the phases, the pump, Stop, and that\n"
+        "                              a scripted default still opens synchronously\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
@@ -897,6 +915,13 @@ static void parseCli(int argc, char** argv) {
             // take back g_scriptedRun's synchronous-scan branch: this run walks
             // the folder on the WORKER, exactly as a windowed run does
             g_forceAsyncScan = true;
+        } else if (a == "--async-open") {
+            // ...and the same lid for the OPEN worker (issue #232 stage 2): this
+            // run reads and decodes a single file on a thread, exactly as a
+            // windowed run does, and whoever asked for it must pump.
+            g_forceAsyncOpen = true;
+        } else if (a == "--asyncopen-selftest") {
+            g_asyncOpenSelftest = next();          // handled in main()
         } else if (a == "--folderscan-selftest") {
             g_folderScanSelftest = true;           // handled in main()
         } else if (a == "--picker-selftest") {
@@ -1061,12 +1086,14 @@ static void parseCli(int argc, char** argv) {
     // Applied later, not here: with --stack always the sibling frames are still
     // arriving on the loader thread, so at this point there may be only one image.
     if (cliCompare >= 0) app.pendingCompare = cliCompare;
-    if (haveZoom || haveCenter) {
-        if (haveZoom) app.view.zoom = std::clamp(zoom, 1.0f / 512, 256.0f);
-        if (haveCenter) app.view.center = ImVec2(cx, cy);
-        else if (cur()) app.view.center = ImVec2(cur()->w * 0.5f, cur()->h * 0.5f);
-        app.fitRequested = false;      // explicit view from CLI wins over fit-on-load
-    }
+    // ...and for the same reason, so are --zoom and --center: the file may still
+    // be on the worker (issue #232 stage 2, review P2-3). See App::pendingViewZoom.
+    if (haveZoom)   { app.pendingViewZoom = true; app.pendingZoom = std::clamp(zoom, 1.0f / 512, 256.0f); }
+    if (haveCenter) { app.pendingViewCenter = true; app.pendingCenter = ImVec2(cx, cy); }
+    if (haveZoom || haveCenter) applyPendingView();   // ...now, if the document is
+                                                      // already here (the synchronous
+                                                      // doors: raw, a session, a
+                                                      // scripted run)
 }
 
 // MEASURE selftest glue: capture what an analyzer emits, formatted the same way

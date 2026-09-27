@@ -2543,6 +2543,7 @@
                                      "the wait is off the UI thread");
                         // ...and the same job, driven to the end the way the
                         // frame loop drives it, opens what it always opened.
+                        const int dec0 = g_readerDecodes;
                         waitForReader();
                         fprintf(stderr, "verifyselftest: V25t landed: runs+%d %zu doc(s) "
                                         "ok=%d\n", g_adapterRuns - runs0, app.images.size(),
@@ -2550,6 +2551,111 @@
                         check(g_adapterRuns - runs0 == 1 && app.readerLastOk &&
                                   app.images.size() == 6 && app.series.size() == 1,
                               "V25t ...and finishing it opens what the reader declared");
+
+                        // ---- V25w: the .vstream was READ on the job's thread --
+                        // Issue #232 stage 2. Stage 1 moved the WAIT off this
+                        // thread and measured 452 ms of window still not
+                        // answering at 480 MB, 746 ms at 768 MB: every one of
+                        // those milliseconds was pollReader -> readerFinish ->
+                        // loadViewerStream, on the UI thread, after the child had
+                        // already exited. A headless test cannot watch a window
+                        // fail to freeze, but it can watch WHICH THREAD did the
+                        // reading, and that is the whole claim - so the thread id
+                        // is recorded where the decode happens and compared with
+                        // this one. Equal ids would mean the split is decorative.
+                        const bool offThread = g_readerDecodes - dec0 == 1 &&
+                                               g_readerDecodeThread !=
+                                                   std::this_thread::get_id() &&
+                                               !g_readerDecodeCacheHit;
+                        fprintf(stderr, "verifyselftest: V25w decodes+%d cacheHit=%d "
+                                        "sameThreadAsUi=%d\n", g_readerDecodes - dec0,
+                                (int)g_readerDecodeCacheHit,
+                                (int)(g_readerDecodeThread == std::this_thread::get_id()));
+                        check(offThread,
+                              "V25w a RUN's .vstream is read and decoded on the job's "
+                              "thread, not the UI's");
+
+                        // ---- V25x: ...and so is a CACHE HIT -------------------
+                        // The hit was the worse of the two in kind: 592 ms with
+                        // no Python running at all, because "a cache hit finishes
+                        // with no thread" was true of the child and false of the
+                        // work. Same key, same reader, opened again: the run
+                        // count must NOT move, the cache must be what answered,
+                        // and it must still have happened on another thread.
+                        closeAll();
+                        const int runs1 = g_adapterRuns, dec1 = g_readerDecodes;
+                        openPath(srcPath);
+                        const bool hitAsync = app.rdJob != nullptr && app.images.empty();
+                        waitForReader();
+                        fprintf(stderr, "verifyselftest: V25x cache open: runs+%d decodes+%d "
+                                        "hit=%d job-at-return=%d %zu doc(s)\n",
+                                g_adapterRuns - runs1, g_readerDecodes - dec1,
+                                (int)g_readerDecodeCacheHit, (int)hitAsync,
+                                app.images.size());
+                        check(g_adapterRuns - runs1 == 0 && g_readerDecodeCacheHit &&
+                                  app.images.size() == 6,
+                              "V25x the second open reads the cache and does not re-run "
+                              "Python");
+                        check(hitAsync && g_readerDecodes - dec1 == 1 &&
+                                  g_readerDecodeThread != std::this_thread::get_id(),
+                              "V25x ...on a thread of its own: a hit no longer finishes "
+                              "inside openPath");
+
+                        // ---- V25y: STOPPING a cache hit does not burn the cache
+                        // Review P1-1. The cache-hit job reads the .vstream on
+                        // its own thread, and a Stop makes that read produce
+                        // nothing - no documents, no error. The landing read
+                        // "nothing" as "this cache file cannot be read", which
+                        // has a documented consequence: DELETE IT and earn it
+                        // again by running the reader for real. So pressing Stop
+                        // threw away the very work the cache existed to keep AND
+                        // started the 480 MB Python run the user had just
+                        // stopped - a Stop that does the thing.
+                        //
+                        // Counted rather than reasoned about: the cache
+                        // directory keeps its file, the adapter does not run,
+                        // and exactly ONE reader was started (the bug started
+                        // two). The race does not matter - the decode may well
+                        // have finished before the flag was set - because
+                        // pollReader asks the FLAG, not the result.
+                        auto cacheFileCount = [&]() {
+                            const std::string cdir = adapterCacheDir();
+                            if (cdir.empty()) return -1;
+                            int n = 0;
+                            std::error_code cec;
+                            for (const auto& e :
+                                 std::filesystem::directory_iterator(pathFromUtf8(cdir), cec)) {
+                                (void)e;
+                                n++;
+                            }
+                            return n;
+                        };
+                        closeAll();
+                        app.toast.clear();
+                        app.toastErr = false;
+                        const int cache0 = cacheFileCount();
+                        const int starts2 = g_readerStarts, runs2 = g_adapterRuns;
+                        openPath(srcPath);
+                        const bool hitUp = app.rdJob != nullptr && app.rdJob->cacheHit;
+                        if (app.rdJob) app.rdJob->cancel.store(true);   // the Files row's Stop
+                        waitForReader();
+                        const int cache1 = cacheFileCount();
+                        fprintf(stderr, "verifyselftest: V25y stop-on-hit: hitjob=%d "
+                                        "starts+%d runs+%d cache %d->%d %zu doc(s) "
+                                        "toast=\"%s\"\n", (int)hitUp,
+                                g_readerStarts - starts2, g_adapterRuns - runs2,
+                                cache0, cache1, app.images.size(),
+                                app.toast.substr(0, 80).c_str());
+                        check(hitUp && app.images.empty() &&
+                                  g_readerStarts - starts2 == 1 &&
+                                  g_adapterRuns - runs2 == 0,
+                              "V25y Stop on a cache-hit job lands nothing and does NOT "
+                              "start the reader for real");
+                        check(cache0 > 0 && cache1 == cache0,
+                              "V25y ...and the cache file it was reading is still there");
+                        check(app.readerLastOut.find("stopped") != std::string::npos &&
+                                  app.toast.find("the reader was stopped") != std::string::npos,
+                              "V25y ...and it says it stopped, in the reader's own words");
                     }
 
                     // ---- V25u: a memo replay that fails says the same thing --

@@ -789,6 +789,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // saveViewPng, selectImage - exists by now.
 #include "selftest/video.inc"
 
+// The open WORKER (#232 stage 2). Beside video for the same reason: a function,
+// its own fixtures, and everything it drives - openPath, pumpOpenJob,
+// openJobPhase, closeAll, the source registry - exists by now.
+#include "selftest/asyncopen.inc"
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     {
@@ -1349,6 +1354,13 @@ int main(int argc, char** argv) {
     // decision is a pure function and this asserts it as one.
     if (g_uiScaleSelftest) return uiScaleSelftest();
     if (g_videoSelftest) return videoSelftest();
+
+    // The open worker (#232 stage 2): openPath returns with nothing read, the
+    // loop runs while the reading happens, pumping lands what the synchronous
+    // door lands, Stop leaves nothing - and the scripted default still opens
+    // synchronously, without which the other four prove nothing. Windowless for
+    // the videoSelftest reasons: counts, pixels and registry lookups.
+    if (!g_asyncOpenSelftest.empty()) return asyncOpenSelftest(g_asyncOpenSelftest);
 
     // Which dll computed the Analysis grid (#46 stage 1): the host's ledger,
     // through the real panel. Windowless because every assertion is a string.
@@ -2428,6 +2440,7 @@ static bool g_watchSuppressed = false;
         // BEFORE this frame's draw, so an instance drawn in the frame that just
         // finished carries uiFrame - 1 when rbPollDue is asked about it.
         app.uiFrame++;
+        pumpOpenJob();                // land a single-file open the worker finished
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpRestoreWaits();           // session lines waiting for a remote arrival
@@ -2441,6 +2454,7 @@ static bool g_watchSuppressed = false;
         // --compare, deferred until the files (and their background-loaded frames)
         // are actually here. B is the first doc from a DIFFERENT source file, so a
         // stack on the command line does not end up compared against itself.
+        applyPendingView();           // --zoom / --center, once the file is here
         if (app.pendingCompare >= 0 && !app.seqRunning) {
             if (app.pendingCompare == App::CmpOff || app.images.size() < 2) {
                 if (app.images.size() < 2 && app.pendingCompare != App::CmpOff)

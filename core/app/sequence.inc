@@ -2441,6 +2441,7 @@ static void pickerAccept() {
 static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
                                std::vector<double> vals, std::string& err);   // fwd
 static std::string trimAxisLabel(const std::string& s);                       // fwd
+static void openLocalFile(const std::string& path, int kind);   // fwd (open_dispatch.inc)
 // The next .npz that was dropped while this picker was up. Draining here and on
 // Cancel is what makes the queue a queue rather than a place files go to die.
 static void npzPickNext() {
@@ -2451,8 +2452,10 @@ static void npzPickNext() {
     // issue #217, and "waiting its turn" has to end at the same door that put
     // it there.
     if (isRemoteUrl(next)) { openRemoteNpz(next, std::string()); return; }
-    std::string err = loadNpz(next);
-    if (!err.empty()) toast(baseName(next) + ": " + err, true);
+    // ...and through the same door openPath uses (issue #232 stage 2): the file
+    // that waited for the picker is read and decoded by the worker exactly as it
+    // would have been had it arrived on its own.
+    openLocalFile(next, OK_Npz);
 }
 static void npzPickAccept() {
     std::vector<NpzMember> mem = std::move(app.npzPick);

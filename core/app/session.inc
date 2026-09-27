@@ -745,7 +745,8 @@ static void saveSession(std::string path, bool quiet = false) {
     toast(msg, lostSeries > 0 || lostMembers > 0 || lostSets > 0 || lostSetRoles > 0);
 }
 
-static std::string loadNpy(const std::string& path, int npyRead);   // fwd (defined above)
+static std::string loadNpy(const std::string& path, int npyRead,
+                           OpenPre* pre);                            // fwd (defined above)
 
 // ---- instance identity (Open in new window, todo-open item 28 / A7) ---------
 // Two viewers used to share ONE autosave file: whichever exited last overwrote
@@ -1767,7 +1768,45 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::string& out,
                                 const std::vector<std::string>& argv,
                                 const adapter::Run& r,
-                                const FrameSource& originStat);   // fwd: the tail, shared
+                                const FrameSource& originStat,
+                                VstreamPre* pre = nullptr,
+                                const std::string& preErr = std::string(),
+                                bool stopped = false);            // fwd: the tail, shared
+// The reader's OUTPUT, read and decoded on the JOB's own thread - the last
+// thing the thread does before it says done, and the thing stage 1 could not
+// move (issue #232 stage 2; see App::ReaderJob::vpre for the measurements).
+//
+// Only for a run that WORKED. readerFinish's table of refusals - cancelled, not
+// started, timed out, exited non-zero - comes first and comes from the run, and
+// decoding the truncated file a failed run left behind would produce a second
+// and worse sentence about a failure that already has the adapter's own.
+// WHICH THREAD last read a reader's output, whether the cache was what answered,
+// and how many times it has happened. Probes, and they are the only thing a
+// headless selftest can assert about a freeze that is about to not happen: the
+// id must differ from the UI thread's (stage 2 design §4). Outside the job
+// because the job is gone by the time a test can look - the same reason
+// g_readerStarts is a counter and not a field.
+// ATOMIC, all three: they are written by the JOB's thread and read by the UI's
+// (review P2-6). Only one job runs at a time, so there is no contention to
+// resolve - what atomicity buys here is that the read is defined at all, which a
+// probe a selftest asserts on has to be.
+static std::atomic<std::thread::id> g_readerDecodeThread;
+static std::atomic<bool> g_readerDecodeCacheHit{ false };
+static std::atomic<int> g_readerDecodes{ 0 };
+
+static void readerJobDecode(App::ReaderJob* j) {
+    if (j->cancel.load()) return;
+    if (!j->cacheHit && (!j->r.started || j->r.timedOut || j->r.cancelled || j->r.exit != 0))
+        return;
+    j->decodeThread = std::this_thread::get_id();
+    g_readerDecodeThread.store(j->decodeThread);
+    g_readerDecodeCacheHit.store(j->cacheHit);
+    g_readerDecodes.fetch_add(1);
+    auto pre = std::make_shared<VstreamPre>();
+    j->vdecErr = vstreamDecode(j->out, j->src, *pre, &j->cancel);
+    if (j->vdecErr.empty()) j->vpre = std::move(pre);
+    j->decoded = true;
+}
 static std::string openWithReader(const std::string& src, const std::string& specIn,
                                   bool allowCache = true,
                                   App::ReaderJob* job = nullptr) {
@@ -1800,11 +1839,6 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (script.empty())
         return "cannot find tools/import/run_adapter.py - the adapter harness ships "
                "with the viewer and this build cannot see it";
-    std::string why;
-    std::string py = adapter::findPython(app.pythonExe, why);
-    if (py.empty())
-        return readerNoPythonText("", why,
-                                  "set one in Settings, or install numpy for the one you have");
 
     std::string cacheDir = adapterCacheDir();
     std::string cached;
@@ -1822,6 +1856,29 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (allowCache && !cached.empty() && std::filesystem::exists(pathFromUtf8(cached), ec)) {
         // §7 stage 5: the second open does not start Python. The key already
         // covers the adapter's mtime, so "cached" cannot mean "stale".
+        //
+        // A HIT STILL GETS A THREAD (issue #232 stage 2). It used to finish
+        // right here, synchronously, "because there is nothing to wait for" -
+        // and that was true of the child and false of the work: reading the
+        // .vstream and turning 480 MB into documents is 592 ms of a window
+        // answering nothing, with no Python involved at all. The thread is
+        // short and that is fine; what matters is that the window answers
+        // through it. pollReader lands it, by the same door a real run lands.
+        if (job) {
+            job->src = src; job->spec = spec; job->out = cached;
+            job->startedAt = nowSec();
+            job->srcMtime = originStat.mtime;
+            job->srcFsize = originStat.fsize;
+            job->cacheHit = true;
+            app.readerLastOut = "reading what " + baseName(readerFileOf(spec)) +
+                                " left in the cache ...\n";
+            App::ReaderJob* j = job;
+            j->th = std::thread([j]() {
+                readerJobDecode(j);
+                j->done.store(true);
+            });
+            return {};
+        }
         std::string lerr = loadViewerStream(cached, spec, src, originStat);
         if (lerr.empty()) {
             rememberReader(src, spec);
@@ -1832,6 +1889,22 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         }
         std::filesystem::remove(pathFromUtf8(cached), ec);   // unreadable: earn it again
     }
+
+    // WHICH INTERPRETER, and it is asked AFTER the cache, not before (issue #232
+    // stage 2). adapter::findPython's first call in a process starts a Python to
+    // check that numpy imports - measured on this box at 113 ms, and it was
+    // being spent on the UI thread by every open that came through this door,
+    // INCLUDING the ones that then answered out of the cache and never started
+    // Python at all. §7 stage 5's promise is that "the second open does not
+    // start Python"; it was starting one to find out which one not to start.
+    // Nothing else moved: the reader is still located before Python is reached
+    // (§4.13.2, above), and the sentence a missing interpreter produces is
+    // unchanged - it simply arrives after a cache that could answer has.
+    std::string why;
+    std::string py = adapter::findPython(app.pythonExe, why);
+    if (py.empty())
+        return readerNoPythonText("", why,
+                                  "set one in Settings, or install numpy for the one you have");
 
     std::string out = cached;
     if (out.empty()) {
@@ -1867,7 +1940,8 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     std::string errFile = (td / (std::string(sn) + ".err")).u8string();
     if (job) {
         // Asynchronous: the window keeps drawing and pollReader() picks this up.
-        // Only the wait is off-thread - readerFinish touches images and GL.
+        // The wait AND THE READ are off-thread; what is left on the UI thread is
+        // the landing, which touches images and GL and nothing else (#232).
         job->src = src; job->spec = spec; job->out = out; job->argv = argv;
         job->outFile = outFile; job->errFile = errFile;
         job->startedAt = nowSec();
@@ -1877,6 +1951,10 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         App::ReaderJob* j = job;
         j->th = std::thread([j]() {
             j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile, false);
+            // ...and on, without handing the thread back: the stream the child
+            // just wrote is read and decoded HERE, before the UI is told this
+            // job is done. readerJobDecode says why it is this thread's work.
+            readerJobDecode(j);
             j->done.store(true);
         });
         return {};
@@ -1890,12 +1968,32 @@ static std::string openWithReader(const std::string& src, const std::string& spe
 // Everything after the process has run. Shared by the synchronous path
 // (selftests, session restore) and the asynchronous one the UI uses, so the two
 // cannot drift into reporting the same failure differently.
+//
+// `pre` / `preErr` are the .vstream read the job's thread already did
+// (readerJobDecode). Null and empty means "read it here", which is the
+// synchronous path: identical work, identical sentences, one thread later.
+// `stopped` is the JOB's cancel flag; see the first line of the body.
 static std::string readerFinish(const std::string& src, const std::string& spec,
                                 const std::string& out,
                                 const std::vector<std::string>& argv,
                                 const adapter::Run& r,
-                                const FrameSource& originStat) {
-    if (r.cancelled) {
+                                const FrameSource& originStat,
+                                VstreamPre* pre, const std::string& preErr,
+                                bool stopped) {
+    // A STOP IS A STOP, whichever half of the job noticed it (review P2-1).
+    // adapter::Run::cancelled is raised only while the CHILD is alive
+    // (core/adapter.cpp) - so a Stop pressed AFTER it exited, while the
+    // .vstream was being decoded, used to arrive here as an ordinary decode
+    // failure and be reported as "the reader ran and returned, but the viewer
+    // could not read what it produced ... check what load() returns". That
+    // blames the reader's author for the user's own button.
+    //
+    // And a Stop that lands in the gap between the child's exit and
+    // readerJobDecode leaves NO decode at all - no vpre, no vdecErr - so
+    // without this the read below would run `loadViewerStream` HERE, on the UI
+    // thread, in full: the Stop ignored and issue #232's whole residual back on
+    // the one path stage 2 exists to clear.
+    if (r.cancelled || stopped || preErr == "stopped") {
         app.readerLastOut += "\nstopped.\n";
         return "the reader was stopped";
     }
@@ -1924,7 +2022,10 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
         app.readerLastOut = msg;
         return msg;
     }
-    std::string lerr = loadViewerStream(out, spec, src, originStat);
+    // The bytes are already documents when a job thread read them; otherwise
+    // they are read now. Either way this is the same call and the same failure.
+    std::string lerr = preErr;
+    if (lerr.empty()) lerr = loadViewerStream(out, spec, src, originStat, pre);
     if (!lerr.empty()) {
         // The one failure that used to leave the panel EMPTY. The reader ran and
         // exited 0, so it is not the reader's traceback that is wrong - what it
@@ -2061,8 +2162,10 @@ static void startReader(const std::string& src, const std::string& spec,
     app.rdJob.reset(new App::ReaderJob());
     app.rdJob->blame = blame;
     std::string e = openWithReader(src, spec, true, app.rdJob.get());
-    // A cache hit, or a failure before Python was reached, finishes with no
-    // thread: there is nothing to wait for and nothing to stop.
+    // A failure before Python was reached finishes with no thread: there is
+    // nothing to wait for and nothing to stop. A CACHE HIT used to be in this
+    // sentence too and no longer is - it gets a thread of its own, because
+    // reading the .vstream is where its 592 ms went (issue #232 stage 2).
     if (!app.rdJob->th.joinable()) {
         app.rdJob.reset();
         if (!e.empty()) toast(blame + e, true);
@@ -2120,7 +2223,48 @@ static void pollReader() {
     FrameSource jStat;                     // the stat openWithReader took at start
     jStat.mtime = j->srcMtime;
     jStat.fsize = j->srcFsize;
-    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r, jStat);
+    if (j->cacheHit) {
+        // THE CACHE ANSWERED, and the thread that just ended is the one that
+        // read it. All that is left here is the landing and the sentence - the
+        // same two the synchronous form says, one pump later (openWithReader).
+        const std::string src = j->src, spec = j->spec, blame = j->blame, cached = j->out;
+        // STOPPED IS NOT UNREADABLE (review P1-1). readerJobDecode returns at
+        // once on a cancel (no vpre, no vdecErr) and vstreamDecode answers
+        // "stopped" if the Stop lands mid-decode - so without this the branch
+        // below read an empty `lerr` as "the cache could not be read", DELETED
+        // THE CACHE FILE and started the reader for real. A Stop that deletes
+        // work and then does the work is the opposite of a Stop, and it is the
+        // one outcome the cache exists to avoid. Asked before the landing, so
+        // nothing lands either - the same promise the open worker makes.
+        if (j->cancel.load() || j->vdecErr == "stopped") {
+            app.readerLastOut += "\nstopped.\n";
+            app.rdJob.reset();
+            toast(blame + "the reader was stopped", true);
+            return;
+        }
+        std::string lerr = j->vdecErr;
+        if (lerr.empty() && j->vpre) lerr = loadViewerStream(cached, spec, src, jStat,
+                                                            j->vpre.get());
+        else if (lerr.empty()) lerr = "the cache was not read";
+        app.rdJob.reset();
+        if (lerr.empty()) {
+            rememberReader(src, spec);
+            app.readerLastOk = true;
+            app.readerLastOut = "read from cache - the reader was not re-run.\n"
+                                "Edit the reader and press Load again to re-run it.";
+            return;
+        }
+        // Unreadable: EARN IT AGAIN. The same two lines the synchronous form had
+        // - delete the cache and run the reader for real - except that the run
+        // is now a new job rather than the rest of this function, so it arrives
+        // one pump later and with its own timer and Stop.
+        std::error_code rec;
+        std::filesystem::remove(pathFromUtf8(cached), rec);
+        startReader(src, spec, blame);
+        return;
+    }
+    std::string e = readerFinish(j->src, j->spec, j->out, j->argv, j->r, jStat,
+                                 j->vpre.get(), j->vdecErr, j->cancel.load());
     const std::string blame = j->blame;
     std::error_code ec;
     std::filesystem::remove(pathFromUtf8(j->errFile), ec);

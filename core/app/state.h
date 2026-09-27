@@ -801,6 +801,53 @@ enum AutoFlavor { AF_MinMax = 0, AF_Pct = 1, AF_Median = 2 };
 // is the one to pick when a dead column or a cold pixel owns vmin.
 enum MedBlackMode { MB_Value = 0, MB_Min = 1, MB_MinPct = 2 };
 
+// A reader's .vstream, read and decoded on the job's own thread (issue #232
+// stage 2). Defined in loader_npz.inc, where the container vocabulary lives;
+// named here because App::ReaderJob carries one.
+//
+// A shared_ptr and not a unique_ptr, and that is a language fact rather than a
+// preference: unique_ptr's destructor has to see a COMPLETE type, and
+// ~ReaderJob is written inline below - hundreds of lines before VstreamPre
+// exists. shared_ptr captures its deleter where the object is made (session.inc,
+// which does see the definition), so it can be declared and destroyed here on
+// nothing but this line. Nothing is ever shared: exactly one job owns it.
+struct VstreamPre;
+
+// ---- what a DECODE WORKER already did, handed to the landing (issue #232) ----
+//
+// Opening one file is four steps: stat it (identity before bytes, §6.2), read
+// its bytes, decode them into documents, and LAND those documents - addImage,
+// shareOrRegisterSource, defaultRange, the toast. The first three touch no app
+// state and they are where all the time goes (measured on this repo: 451 ms of
+// a window answering nothing for a 480 MB .npy, 593 ms for a stored .npz); the
+// fourth is the only one that needs the UI thread at all.
+//
+// They are separated by a VALUE rather than by a second copy of each loader.
+// Every loader takes an `OpenPre*`: a null one means "do all four here", which
+// is what the synchronous door keeps doing (a scripted run, a session restore,
+// a reload), and a non-null one means "the first three are done, land these".
+// Two copies of loadNpy - one threaded and one not - is the shape issue #71
+// forbids, and it is how the .npz and .npy frame loops drifted apart once
+// already (see loadNpyBuffer).
+struct OpenDecoded {
+    int frames = 1;                                  // what the array or file declared
+    std::vector<std::unique_ptr<ImageDoc>> docs;     // docs[k] = frame/page k; may be null
+    std::vector<std::string> errs;                   // ...and then why it is null
+    std::vector<std::string> members;                // pictures: the part name of docs[k]
+    bool named = false;                              // pictures: some part is named (.exr)
+};
+// Which door a path goes through. Not the extension table itself - that stays
+// in openPath, which is the one place allowed to decide what a name means; this
+// is the answer it reached, carried to the worker.
+enum OpenKind { OK_None = 0, OK_Npy = 1, OK_Npz = 2, OK_Picture = 3 };
+struct OpenPre {
+    FrameSource stat;                  // the PRE-read stat (§6.2), taken by the worker
+    std::vector<uint8_t> bytes;        // the file, already read
+    std::string member;                // .npz: which member `dec` holds, if any
+    OpenDecoded dec;
+    bool decoded = false;              // `dec` is usable (false = bytes only)
+};
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;
@@ -989,6 +1036,20 @@ struct App {
     struct SlotWant { int frame; std::string path; std::string member; };
     std::vector<SlotWant> cmpSlotRestore;    // parsed from a session, not yet resolved
     int pendingCompare = -1;          // --compare, applied once two images exist
+    // --zoom / --center, applied once a document is here (issue #232 stage 2,
+    // review P2-3). They used to be applied at the end of parseCli, which was
+    // right while openPath was synchronous: `else if (cur())` centred on the
+    // image the command line had just opened, and fitRequested = false said
+    // "the explicit view wins over fit-on-load". With the read on a worker
+    // there is no cur() yet, so the centre fell back to nothing and the
+    // landing's addImage then set fitRequested = true - the fit overwriting the
+    // very view the user named on the command line. pendingCompare's shape and
+    // pendingCompare's reason: a flag about the documents is applied when the
+    // documents are here.
+    bool pendingViewZoom = false;
+    bool pendingViewCenter = false;
+    float pendingZoom = 1.0f;
+    ImVec2 pendingCenter{ 0, 0 };
     uint64_t prevImageUid = 0;        // the doc looked at before this one (B default)
     bool prefsDirty = false;          // a preference actually changed in this run
     // The main window's geometry, remembered across runs (prefs.txt "window").
@@ -2403,6 +2464,26 @@ struct App {
         // it, so "x.dat via r.py:load: ..." is the sentence, and it must not
         // change just because the wait moved off the UI thread.
         std::string blame;
+        // ---- ...and what it WROTE, read on this thread too (#232 stage 2) ----
+        // Stage 1 moved the WAIT off the UI thread and measured 452 ms of window
+        // still not answering at 480 MB, 746 ms at 768 MB - all of it
+        // pollReader -> readerFinish -> loadViewerStream, reading and decoding
+        // the .vstream the child had just written. A CACHE HIT was worse in kind
+        // if not in size: 592 ms with no child running at all, because a hit
+        // finished without a thread and the read was the whole of the work.
+        //
+        // So the job's thread does not stop when the child exits: it goes on to
+        // read what the child wrote and turn it into documents, and only then
+        // says done. The UI thread lands them (readerFinish's tail) and nothing
+        // else. `cacheHit` is the same journey with no child at the front of it.
+        std::shared_ptr<VstreamPre> vpre;   // the decoded stream, waiting to land
+        std::string vdecErr;               // ...or why there is none
+        bool decoded = false;              // the decode was attempted at all
+        bool cacheHit = false;             // no child ran: the cache answered
+        // WHICH THREAD decoded. A probe, and the only thing a headless selftest
+        // can assert about a freeze that is about to not happen: the decode's
+        // thread id must differ from the UI thread's (stage 2 design §4).
+        std::thread::id decodeThread;
         // ---- the reader ran on a PEER (issue #180) --------------------------
         // The same job, with the process on the other machine. The thread owns
         // a SESSION OF ITS OWN rather than borrowing app.uiSession, for that
@@ -2439,6 +2520,53 @@ struct App {
     // not silently displace the first.
     struct ReaderWait { std::string src, spec, blame; };
     std::vector<ReaderWait> rdQueue;
+    // ---- the ORDINARY open, off the UI thread (issue #232 stage 2) ----------
+    // A .npy, a .npz or a picture file used to be read and decoded inside
+    // openPath, on the UI thread, for as long as the file took. Same shape as
+    // ReaderJob above and as the sequence loader's worker: one at a time, a
+    // queue in front of it, a cancel flag, and a start time that IS the
+    // progress (see the Files row - there is no percentage, and openJobPhase
+    // says why).
+    //
+    // `phase` is read by the UI while the worker writes it, so it is atomic and
+    // it is the only field that is: everything else is written by the worker
+    // before `done` and read by the UI after it, which `done`'s release/acquire
+    // orders. `bytes` is the exception the row needs - what the pre-stat said,
+    // so "reading 480 MB" can be on screen before the read has finished.
+    struct OpenJob {
+        std::string path;
+        int kind = OK_None;
+        int npyRead = 0;                   // §3.3's declared reading, carried
+        std::string onlyMember;            // an .npz member chosen in the picker
+        enum Phase { PhReading = 0, PhDecoding = 1, PhLanding = 2 };
+        std::atomic<int> phase{ PhReading };
+        double startedAt = 0;
+        std::atomic<uint64_t> bytes{ 0 };  // the pre-stat's size, for the row
+        std::atomic<bool> cancel{ false };
+        std::atomic<bool> done{ false };
+        std::thread th;
+        OpenPre pre;
+        std::string err;                   // what the worker refused it for
+        // Quitting mid-open. Same reason ~ReaderJob does it: a joinable
+        // std::thread that is destroyed is std::terminate, and this object is
+        // owned by the global App, so "close the window while a 768 MB file is
+        // decoding" would abort on the way out.
+        ~OpenJob() {
+            cancel.store(true);
+            if (th.joinable()) th.join();
+        }
+    };
+    std::unique_ptr<OpenJob> openJob;
+    // Several files at once - a drop, a multi-select - calls openPath in a loop.
+    // rdQueue's shape and its reason: the second request must not be lost and
+    // must not displace the first.
+    struct OpenWait {
+        std::string path;
+        int kind = OK_None;
+        int npyRead = 0;
+        std::string onlyMember;
+    };
+    std::vector<OpenWait> openQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
                videoDlg || folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
@@ -2615,6 +2743,26 @@ inline bool g_scriptedRun = false;
 // (browse-keys' `waitpick`). Only openFolder reads it; everything else about a
 // scripted run is unchanged.
 inline bool g_forceAsyncScan = false;
+
+// ...and the same lid for the OPEN worker (issue #232 stage 2, --async-open).
+// The hole is the same one and it is bigger here: openPath is what nearly every
+// selftest uses to get a document on screen, and a great many of them assert on
+// app.images on the line AFTER it. So a scripted run reads and decodes on this
+// thread exactly as before, and this flag is how the suite can still run the
+// path a person gets - --asyncopen-selftest sets it and then pumps, the way the
+// window pumps. Read by startOpenJob only; nothing else about a scripted run
+// changes. (Session restore stays synchronous whatever this says: V25m / R18 /
+// V25p-r1 depend on the lines completing in order - stage 1's decision.)
+inline bool g_forceAsyncOpen = false;
+// How many opens took that asynchronous door, and how often the frame loop came
+// round while one was still working. Both exist because of what a headless test
+// CANNOT do: it cannot watch a window fail to freeze. It can watch which door
+// was taken and that the loop ran during the read, which is what the stage 2
+// design asks the suite to fix. Declared here, beside the flag, because
+// openRemote's local fall-through reads the first one hundreds of lines above
+// where startOpenJob defines it (g_readerStarts' twin, one file over).
+inline int g_openStarts = 0;
+inline int g_openPumps = 0;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)
