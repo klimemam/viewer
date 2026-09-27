@@ -137,6 +137,20 @@
             ImageDoc* b = app.images[f0[1]].get();
             size_t bytesBefore = residentImageBytes();
             size_t oneFrame = b->px().size() * sizeof(float);
+            // What the Files stack row would print, and what it would have
+            // printed before this fix: the naive walk is the stack x frame
+            // product (one term per ROW), the other is the sum over unique
+            // sources. Captured BEFORE the alias so that "they differ once
+            // something is shared" has its own control - while nothing shares
+            // the two figures are the same number, which is the only state a
+            // constant could also pass in.
+            auto filesNaiveBytes = [](const std::vector<int>& rows) {
+                size_t n = 0;
+                for (int i : rows) n += app.images[i]->px().size() * sizeof(float);
+                return n;
+            };
+            const size_t naiveBefore = filesNaiveBytes(f0);
+            const size_t uniqBefore = filesUniqueBytes(f0);
             b->src = a->src;                    // stage 2, by hand
             b->syncMirrors();
             srcMapDump("M4 two documents, one source");
@@ -157,6 +171,30 @@
                             "%zu B)\n", bytesBefore, residentImageBytes(), oneFrame);
             check(residentImageBytes() == bytesBefore - oneFrame,
                   "M4 shared pixels are counted once, not twice");
+
+            // ---- M4b: the Files bytes figure (board 268) ---------------------
+            // docs/reference-design.md §7's one-line lesson, made a decision by its
+            // §9 判断3: the figure on a stack row is the sum over unique
+            // FrameSource, not frames times one frame's size. M4's alias is a
+            // shared source inside ONE stack, so the two walks must now part
+            // company - by exactly one frame's pixels, which is the only amount
+            // they can differ by when exactly one row's source is a duplicate.
+            {
+                const size_t naiveNow = filesNaiveBytes(f0);
+                const size_t uniqNow = filesUniqueBytes(f0);
+                fprintf(stderr, "srcmapselftest: M4b Files bytes over %zu row(s): "
+                                "unique %zu vs naive %zu (was %zu vs %zu before the "
+                                "alias; one frame is %zu B)\n",
+                        f0.size(), uniqNow, naiveNow, uniqBefore, naiveBefore, oneFrame);
+                check(uniqBefore == naiveBefore,
+                      "M4b with nothing shared the two walks agree - the control");
+                check(uniqNow < naiveNow,
+                      "M4b sharing makes the product over-count, so they must differ");
+                check(uniqNow == naiveNow - oneFrame,
+                      "M4b ...by exactly the one frame that is now a second name");
+                check(naiveNow == naiveBefore,
+                      "M4b the naive product did not notice the sharing at all");
+            }
 
             // ---- M5: the crop CoW (C2-3), which stage 1 cannot reach --------
             // cropInPlace's use_count()>1 branch is dead code until something
