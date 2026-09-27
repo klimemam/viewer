@@ -271,6 +271,13 @@ beta_48x16.bin: opened with "MyCam 32x24" (32x24 u16 gray) - this session's reci
   淡色になり、理由と代替手順として「Reader を選ぶ／ローカルで開く／コピーする」と表示します。
   ヘッダ無し RAW と `.npz` は開く前にレシピ／member 選択が要るため、1クリックは
   preview せず選択だけです。
+- **フォルダの行だけは、どのクリックで入るかを選べます** (`browse.folderClick`、
+  Preferences の browse 節)。既定の `single` は現行どおり **1クリックで中へ** ——
+  List にはフォルダに与えられる動詞が1つしか無いからです。`double` にすると
+  1クリックは**選択だけ**になり、ダブルクリックで入ります (ファイルの行と同じ
+  約束になります)。**`tree` 表示はこの設定に関係ありません**: そこはクリックが
+  その場での展開、ダブルクリックが移動で、2つの動詞に2つのジェスチャが
+  すでに割り当てられています。`..` はどちらの表示・どちらの値でも1クリックです。
 
 **ベンダ RAW は「モザイクをそのまま」開きます。** カメラの `.NEF` や `.CR3` を
 開くと、**現像された写真ではなく、センサが数えた CFA モザイク**が 1ch の画像として
@@ -1238,27 +1245,37 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
 読むキーのうち `loading.rawRecipes` だけは**オブジェクトの配列**です(§2.2b)。
 1件が読めなくても**その1件だけ**を名指しで断り、残りのレシピは読み込みます。
 
-まだ読まないキー(キーバインド、raw の既定、Browse の起動方法／並び順)は
+まだ読まないキー(キーバインド、raw の既定、Browse の並び順)は
 ファイルに書くと「まだ読みません」と名指しで言います。詳細は
 [settings-inventory.md](../features/settings/settings-inventory.md) §10。
 
 ### 8b. Preferences パネル
 
-`File > Preferences...` は設定表34行を並べます。Read 27行には現在値と、
+`File > Preferences...` は設定表35行を並べます。Read 29行には現在値と、
 **どの層が決めたか** (`default` / `this machine` /
 `settings.jsonc:<line>` / `command line` / `session (.vsession)`) が出ます。session の
 出所は `.vsession` が復元する表示ガンマとピクセルグリッドの2行だけです。
-Later 5行 / NotHere 2行は値の代わりに、その場で扱わない理由を示します。
+Later 4行 / NotHere 2行は値の代わりに、その場で扱わない理由を示します。
+行が1つも無い `panels` 節は、なぜ空かを1行で言います。
 
-- パネルで変えた値はこのマシンの `prefs.txt` に保存されます。ただし現行版では
-  `remote.repoUrl` / `readers.editor` の永続化と `memoryBudgetGB` の編集が未完です
+- パネルで変えた値はこのマシンの `prefs.txt` に保存されます
+  (`remote.repoUrl` と `readers.editor` も含みます)
 - 同じキーを `settings.jsonc` が決めている場合は、その場の変更が次回起動で戻ることを
-  変更時に警告します。編集できる値セルの右クリックから **Copy as JSONC** を選べます。
-  **Reset to default** はまだ実装されていません
+  変更時に警告します。**この警告は Preferences だけでなく、メニューなど
+  どこから変えても出ます**
+- 行の右クリック (名前セル・値セルのどちらでも) から **Copy as JSONC** と
+  **Reset to default**。Reset が書くのは組み込みの既定値で、`settings.jsonc` が
+  そのキーを決めている場合は次回起動でファイルが勝つことをそのとき言います
+  (本当に戻すにはファイルのキーを消してください)
+- `measuring.memoryBudgetGB` は数値欄で、`0` = このマシンから決める。行の下に
+  **実際に使う量**が出ます (`in effect: 38.3 GB (worked out from this machine)`)
 - **Copy template** は現在値を含む全体雛形をコピーし、**Open settings.jsonc** は
   `readers.editor` → `$EDITOR` → `code -g` → OS 関連付けの順で外部エディタを開きます
 - Reader の登録場所は `readers.searchPath`。Preferences の **Open...** から Reader
   パネルへ移り、ファイル／フォルダの追加・削除・順序変更を行います
+- `settings.jsonc` やコマンドラインが決めているキーは、**あなたがそれを変えるまで**
+  `prefs.txt` に焼き付きません。別の設定を保存しても、そのキーについて
+  `prefs.txt` が持っていた値がそのまま残ります (キーを消せば元に戻ります)
 
 ## 9. コマンドライン
 
@@ -1275,7 +1292,8 @@ viewer [options] [files...]
   --zoom <z>  --center <x,y> 起動時の表示状態
   --compare <off|wipe|split|diff|blink>  先頭2枚を A/B 比較で開く (`flip` は互換 alias)
   --stack <ask|always|never> 1枚開いたときの連番兄弟の扱い(フォルダ Open には効かない)
-  --mem-budget <GB>          連番ローダが握ってよい量(既定 auto = 物理 RAM の 60%)
+  --mem-budget <GB>          連番ローダが握ってよい量。0 = 自動(既定、物理 RAM の
+                             60%)、それ以外は 0.5 〜 4096。範囲外は名指しで断ります
   --frame <system|integrated>  タイトルバー: OS のもの / メニューバー統合(既定は前回値)
   --ui-scale <f>             UI をどれだけ大きく描くか。0 = ディスプレイに訊いて決める
                              (既定)、それ以外は 0.5 〜 4。settings.jsonc の
@@ -1415,7 +1433,7 @@ ui scale: platform=wayland content=2.00 -> ui 1.00 font 2.00 (auto)
 |---|---|
 | `↑` `↓` | 行を移動しながら**都度プレビュー**(フォルダの上では入りません) |
 | `Home` / `End` | 先頭 / 末尾の行 |
-| `Enter` | 正式に開く(ダブルクリックと同じ。連番行なら stack ごと)/ フォルダなら中へ |
+| `Enter` | 正式に開く(ダブルクリックと同じ。連番行なら stack ごと)/ フォルダなら中へ(`browse.folderClick` に関係なく) |
 | `→` `←` | `tree` 表示でカーソル下のフォルダを展開 / 畳む |
 | `Backspace` | 親フォルダへ |
 | `Ctrl+F` | 絞り込み欄にフォーカス |

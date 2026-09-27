@@ -201,7 +201,11 @@ static bool g_bundledSelftest = false;
 // esc, w<px>; comma / period (the preview scrub); altleft / altright (history);
 // img0 (select the first image); natorder (flip the NAME column between
 // natural and text order - relative, like flat / tree, and pinned back by
-// viewreset); click / ctrlclick / dbl (real mouse clicks on
+// viewreset); folderclick:0|1 (board row 136 - which click enters a folder in
+// the list: 0 = single, the default, 1 = double; ABSOLUTE, and pinned back to 0
+// by viewreset, because a script whose `click` on a folder is meant to navigate
+// must not depend on the value this machine's prefs happened to hold);
+// click / ctrlclick / dbl (real mouse clicks on
 // the cursor's row - a double-click only exists as clicks); clickoff:N /
 // dbloff:N (the same two, N rows BELOW the cursor - the only aim the keyboard
 // has not already previewed, and so the only one where click one pays for the
@@ -370,6 +374,28 @@ static std::string g_browseKeysActs =
     "home,down,chkatrow:digitset,imgmark,dbl,waitdir:digitset,chkimgmark,"
     "chkfwd:0,back,waitdir:rb,chkimgmark,"
     "home,down,down,click,waitdir:expset,chkfwd:0,back,waitdir:rb,"
+    // ---- board row 136: WHICH click enters is a PREFERENCE (browse.folderClick).
+    // The user's ruling (2026-08-04) is that the list has only a single click,
+    // so the gesture that carries "enter" is the user's to choose. The same two
+    // gestures are replayed at both values and the results must be OPPOSITE,
+    // which is the only shape that tells a working setting from a setting that
+    // is read and ignored:
+    //   "double" - the plain click does NOT navigate (the directory is still rb
+    //              and the cursor is still on the folder row, which is what a
+    //              row that merely got selected looks like), and the
+    //              double-click does. The click lands 40 px right of where dbl
+    //              lands, so the two cannot chain into one gesture whatever the
+    //              frame rate - the same property the tree toggles rely on.
+    //   "single" - the plain click enters, exactly as it does with no setting at
+    //              all, which is the half that says the default did not move.
+    // folderclick:0 at the end because viewreset is far above: the tree section
+    // below asserts click-expands, and a folder gesture left at "double" there
+    // would be a different run than the one that paragraph describes.
+    "folderclick:1,home,down,chkatrow:digitset,click,idle:40,"
+    "chkdir:rb,chkatrow:digitset,dbl,waitdir:digitset,chkdir:digitset,"
+    "back,waitdir:rb,"
+    "folderclick:0,home,down,chkatrow:digitset,click,waitdir:digitset,"
+    "chkdir:digitset,back,waitdir:rb,"
     // ...in a TREE a folder has TWO verbs, so both gestures are spoken for:
     // the name toggles it in place, a double-click goes to it. That is not the
     // ce02f12 latch this file used to forbid - THAT expanded on click one and
@@ -570,8 +596,8 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
         "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
-        "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
-        "                              60%% of physical RAM)\n"
+        "  --mem-budget <GB>           what the stack loader may hold: 0 = auto (the\n"
+        "                              default, 60%% of physical RAM) or 0.5 .. 4096\n"
         // %s, not a copy: this line said "(H,W,3|4)" while the refusal it is
         // describing said something else, which is exactly the drift issue #71
         // was. There is now one spelling and it lives in one place.
@@ -960,7 +986,25 @@ static void parseCli(int argc, char** argv) {
             app.remoteExe = next();
             settingsOriginCli(SK_peerExe, "--remote-exe");
         } else if (a == "--mem-budget") {          // GB the stack loader may use
-            app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
+            // The same domain measuring.memoryBudgetGB accepts, and for the same
+            // reason the file gives it (判断8, and #257's rule that a flag and a
+            // key must not mean different things for the same number): 0 is
+            // "work it out from this machine" and every other value is refused
+            // BY NAME rather than clamped. It used to clamp, which made 0 - the
+            // one way to say "automatic" - arrive as 0.5, so the flag could not
+            // express the key's own default.
+            const std::string mb = next();
+            const double gb = atof(mb.c_str());
+            if (memBudgetValid(gb)) {
+                app.memBudgetGB = (float)gb;
+                // ...and the ledger: this flag DECIDES measuring.memoryBudgetGB
+                // for this run, so the Preferences row says "command line
+                // (--mem-budget)" instead of showing a number nobody can place.
+                settingsOriginCli(SK_memBudget, "--mem-budget");
+            } else {
+                fprintf(stderr, "--mem-budget expects 0 (work it out from this "
+                                "machine) or 0.5 .. 4096; ignoring %s\n", mb.c_str());
+            }
         } else if (a == "--compare") {
             std::string v = next();
             int m = compareModeFromName(v);

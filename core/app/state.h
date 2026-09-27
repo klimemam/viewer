@@ -1901,6 +1901,18 @@ struct App {
     // starts from - the panel that changes it changes only itself, exactly as
     // rbFlat / rbTree do. There is no Preferences panel to put it in (#50).
     bool rbNatural = true;                                      // persisted
+    // Board row 136, ruled by the user on 2026-08-04: in the LIST view a folder
+    // row has only ONE gesture to give, so WHICH gesture enters it is a
+    // preference and not a fact.
+    //   0 = single - a plain click enters the folder. This is what the panel has
+    //       always done and it stays the default, so no hand changes on upgrade.
+    //   1 = double - a plain click only SELECTS the folder (cursor + anchor, the
+    //       same thing a file row's click does) and the double-click enters it.
+    // TREE mode is deliberately NOT governed by this: there a folder has two
+    // verbs (expand it where it is, or go to it and make it the listing), both
+    // gestures are already spoken for, and there is nothing left to choose.
+    // See rbListFolderEntersOnClick() below, which is the one reader.
+    int folderClick = 0;          // persisted ("folderclick", browse.folderClick)
     bool focusRemote = false;         // bring the ACTIVE Browse instance forward
     bool focusTemporal = false;       // ditto for Temporal (browser-fired stats)
     struct Msg { std::string text; bool err; };
@@ -2626,3 +2638,39 @@ inline bool g_forceAsyncScan = false;
 //        still finite. core/serve.cpp caps its own SCAN/GLOB walk at 32, so
 //        every depth this can ask for is one the peer will honour.
 inline int scanDepthBelow() { return std::clamp(app.folderScanDepth, 1, 16); }
+
+// ---- the memory budget's window, asked in ONE place -------------------------
+// measuring.memoryBudgetGB and --mem-budget are the same setting reached through
+// two doors, and until phase④ they did not agree about what a number MEANS: the
+// file refused anything outside 0 or 0.5..4096 by name (判断8) while the flag
+// CLAMPED, so `--mem-budget 0` - the one way to say "work it out from this
+// machine", and the key's own default - arrived as 0.5. #257 wrote the rule down
+// for uiScale ("the flag and the key cannot mean different things for the same
+// number"); this is that rule with one window instead of two literals.
+// 0 is not in the range and is valid: it is the way BACK to automatic.
+inline bool memBudgetValid(double gb) { return gb == 0 || (gb >= 0.5 && gb <= 4096); }
+
+// ---- board row 136: WHICH CLICK enters a folder, asked in ONE place ----------
+// The setting is browse.folderClick ("single" | "double"), and these two
+// predicates are the whole of what reads it - the panel asks them instead of
+// testing app.folderClick, for scanDepthBelow()'s reason: a second copy of the
+// question is a copy that drifts, and this one is asked from two places in the
+// same click handler (the single-click branch and the double-click gate) which
+// have to agree or a folder gets both verbs or neither.
+//
+// The RULE, stated once so the doc and the code cannot disagree:
+//   * LIST - one verb, so the setting picks the gesture that carries it.
+//     "single" (the default, today's behaviour) enters on a plain click and the
+//     row has no double-click verb at all; "double" hands the plain click to
+//     selection and enters on the double-click, which is exactly the contract a
+//     file row already has.
+//   * TREE - two verbs, both already spoken for (single = expand in place,
+//     double = go to it). The setting does not reach it, in either value.
+//   * ".." is single-click in both views and both values: it is the exit, not a
+//     folder row.
+inline bool rbListFolderEntersOnClick() { return app.folderClick == 0; }
+// ...and does a folder row in this view answer a DOUBLE click at all? Only when
+// the single click is not already the whole vocabulary.
+inline bool rbFolderTakesDoubleClick(bool tree) {
+    return tree || !rbListFolderEntersOnClick();
+}
