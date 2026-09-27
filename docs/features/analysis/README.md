@@ -10,4 +10,6 @@
 
 平坦画像仕様の検討経緯は
 [background/analysis/flat-field-stats.md](../../background/analysis/flat-field-stats.md)、
+測定カーネルがどこに何箇所あり、どの対が parity 試験で結ばれているかは
+[background/analysis/measurement-kernel-inventory.md](../../background/analysis/measurement-kernel-inventory.md)、
 未決事項と実装状況は [tasks.csv](../../tasks.csv) を参照します。

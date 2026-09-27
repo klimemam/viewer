@@ -583,7 +583,7 @@ generic から具体的な拒否 (名指し + 実際の代替手段) に変わ�
 
 **赤→緑** (`selftest.fmtgate` に F4d を足す):
 - 赤: `imagefile::peerRefusal("a.raw")` が `headerless` を含まない (今日の実測
-  は generic 文 — verify-matrix §9 の `[P]` のとおり)。
+  は generic 文 — `docs/verification/results/20260811-matrix.md` §9 の `[P]` 実測のとおり)。
 - 緑: `headerlessExts()` の**全要素**を歩き (反空虚: 要素数 ≥ 5 を併せて
   assert)、各 `x<ext>` について (i) `peerServes` = false のまま、
   (ii) `peerRefusal` が `headerless` と `File > Open` を含む、(iii) generic の

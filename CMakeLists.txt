@@ -906,12 +906,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   endif()
 endif()
 
-# Hermetic config dir. docs/verification/functional.md E-5: a scripted selftest that
+# Hermetic config dir. The defect recorded as E-5 in
+# docs/verification/results/20260803-functional.md: a scripted selftest that
 # does not blank io.IniFilename writes the OPERATOR'S real
 # %APPDATA%/viewer/layout.ini, and claimAutosaveSlot() drops a lock file there
 # for every run. Pointing the config dir into the build tree keeps `ctest` from
 # editing the developer's saved layout, and keeps a stale layout from deciding
-# where a scripted click lands.
+# where a scripted click lands. The standing rule this implements is
+# docs/verification/functional.md §2: CMake gives each test its own APPDATA /
+# HOME / TMP so no run shares the operator's state.
 #
 # This is the root only. Each selftest gets its OWN directory UNDER it, minted
 # by viewer_selftest() below - see the note there. What is left at this level is
@@ -1400,7 +1403,10 @@ viewer_selftest(rtemporal-png NOGL --rtemporal-selftest tools/testdata/media/png
 viewer_selftest(framestats  NOGL --stack always
                             --framestats-selftest tools/testdata/linset/80lx)
 viewer_selftest(export      NOGL --export-selftest tools/testdata/multi --stack always)
-# T12 lays the canvas out for real to read back the pane rectangles and badges.
+# T12 lays the canvas out for real to read back the pane rectangles and badges;
+# T14 goes one step further and RENDERS, then reads the framebuffer back the way
+# "Copy view (as displayed)" does (board 96) - the one assertion in this tree
+# that is made against drawn pixels rather than against arithmetic.
 viewer_selftest(tile        --tile-selftest tools/testdata/multi)
 viewer_selftest(derive      NOGL --derive-selftest tools/testdata)
 # The frame average is arithmetic over pixels, so none of it needs a context:
@@ -1428,8 +1434,12 @@ viewer_selftest(newwin      NOGL --newwin-selftest tools/testdata)
 # writes it now, so a sweep laid out as ONE .npy per level is covered in CI.
 viewer_selftest(sweepfile   NOGL --sweepfile-selftest tools/testdata/levelfiles)
 
-# The 23rd: which document holds which pixels (docs/verification/functional.md
-# D-1/D-2/D-7). multi/ because it is three stacks of five frames - enough
+# The 23rd: which document holds which pixels - the three observation gaps
+# recorded as D-1/D-2/D-7 in docs/verification/results/20260803-functional.md,
+# closed by this probe in
+# docs/verification/results/20260804-functional-probes.md. Its standing
+# contract is docs/verification/functional.md §5.
+# multi/ because it is three stacks of five frames - enough
 # documents for "N documents, N sources" to say something - and its parent
 # carries the .raw fixture the second decode path needs. NOGL: it dumps a
 # table and draws nothing, verified by running it both ways.

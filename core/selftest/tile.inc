@@ -489,7 +489,9 @@
                   "T12 narrow: the name elides from the front or drops, never overflows");
 
             // ---- T13: the footer strip, through the same real frames --------
-            // docs/verification/ui.md E3. Everything here goes straight to AddText
+            // E3 in docs/verification/results/20260803-ui.md; the probe's
+            // standing contract is docs/verification/ui.md §3.
+            // Everything here goes straight to AddText
             // and was kept nowhere, so the whole strip was untestable and the
             // row had to be moved out of the A section. g_footerProbe records
             // the strings as drawn, and these are the claims about them.
@@ -537,6 +539,304 @@
             }
             app.compareMode = App::CmpSplit;
             app.compareFollowFrame = saveFollow;
+        }
+
+        // ---- T14: "Copy view (as displayed)" - the framebuffer readback ------
+        // Board 96 (「項目18 表示どおりコピー」), Fable 2026-09-27. Two things
+        // are on trial and they are different in kind: WHICH PIXELS came back -
+        // the canvas rectangle, at framebuffer resolution, nothing else - and
+        // WHAT THE ANNOUNCEMENT SAID about them, because the facts that make the
+        // picture reproducible (zoom, filter, panes, overlays) are deliberately
+        // not drawn into it.
+        //
+        // This is the one case in this file that is NOT arithmetic. The frames
+        // above stop at ImGui::EndFrame and assert what drawCanvas wrote down;
+        // this one renders for real (ImGui::Render + RenderDrawData) and then
+        // reads the framebuffer, so the rectangle is checked against pixels: a
+        // capture offset by the ruler, or by a pane, or flipped, lands a known
+        // colour somewhere it is not.
+        //
+        // NOT verified here, and the reason is deliberate: the CLIPBOARD.
+        // g_copyViewProbeOnly keeps the buffer and leaves the clipboard alone,
+        // because a test has no business emptying the clipboard of the machine
+        // it runs on. clipboardPutImage past that point is the same call the
+        // dot-by-dot copy has made since it shipped.
+        {
+            if (!needWindow("--tile-selftest (T14, the framebuffer readback)")) return 1;
+            const int saveMode = app.compareMode;
+            const float saveZoom = app.view.zoom;
+            const ImVec2 saveCenter = app.view.center;
+            const bool saveGrid = app.showGrid, saveHl = app.highlight.on;
+            const bool saveProbe = g_copyViewProbeOnly;
+            const std::vector<App::Ann> saveAnns = app.anns;
+            const int saveSel = app.selectedAnn;
+            const std::vector<uint64_t> saveExtra = app.cmpExtra;
+            const uint64_t saveB = app.compareBUid;
+            ImGuiIO& t14io = ImGui::GetIO();
+            // A frame that is actually DRAWN, and then the same call the frame
+            // loop makes at the same point in it (core/main.cpp, right after
+            // RenderDrawData and before glfwSwapBuffers). Going through
+            // pumpCopyViewRequest rather than copyViewAsDisplayed is the point:
+            // the request-flag wiring is exercised, not written out twice.
+            auto shotFrame = [&]() {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                // Park the cursor off the canvas. The GLFW backend rewrites
+                // MousePos from the REAL cursor every frame (verify.inc:1300),
+                // and a cursor that happens to rest over the canvas draws the
+                // hovered-pixel outline at zoom >= 2 - orange, 1.5 px, exactly
+                // over whichever pixel this test was about to sample.
+                t14io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                ImGui::NewFrame();
+                ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(t14io.DisplaySize, ImGuiCond_Always);
+                ImGui::Begin("CopyViewProbe", nullptr,
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoDocking);
+                drawCanvas(ImGui::GetContentRegionAvail());
+                ImGui::End();
+                ImGui::Render();
+                const int fw = (int)lroundf(t14io.DisplaySize.x * t14io.DisplayFramebufferScale.x);
+                const int fh = (int)lroundf(t14io.DisplaySize.y * t14io.DisplayFramebufferScale.y);
+                glViewport(0, 0, fw, fh);
+                glClearColor(0, 0, 0, 1);
+                glClear(GL_COLOR_BUFFER_BIT);
+                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+                pumpCopyViewRequest();
+            };
+            // ...and this is the menu item: file the request, then let frames
+            // run. Two of them, because the request deliberately skips the frame
+            // it was made on (g_copyViewRequest) - on the real menu that frame
+            // still has the open popup lying across the canvas.
+            auto shot = [&]() { g_copyViewRequest = 2; shotFrame(); shotFrame(); };
+            g_copyViewProbeOnly = true;
+            app.compareMode = App::CmpOff;   // one picture: a second pane's badge
+            app.cmpExtra.clear();            // would sit on the corner sampled below
+            app.compareBUid = 0;
+            app.anns.clear(); app.selectedAnn = 0;
+            app.highlight.on = false;
+            app.showGrid = false;
+            selectImage(0);
+            ImageDoc* cv = cur();
+            // The lattice check below is only as strong as the fixture's SPREAD:
+            // multi's frames sit near 1000 DN and the load-time default maps a
+            // float image to 0..1, so every pixel renders as 255 and "the capture
+            // equals the render" would be white equals white. Fitting the range to
+            // this frame's own min..max makes the nine samples nine different
+            // bytes, which is what makes a one-pixel error detectable at all.
+            const bool saveLink = app.linkRange;
+            const float saveBlk = cv->black, saveWht = cv->white;
+            app.linkRange = false;
+            {
+                float lo = cv->px()[0], hi = lo;
+                for (size_t i = 1; i < (size_t)cv->w * cv->h; i++) {
+                    lo = std::min(lo, cv->px()[i]); hi = std::max(hi, cv->px()[i]);
+                }
+                cv->black = lo; cv->white = hi > lo ? hi : lo + 1.0f;
+                cv->texDirty = true;
+            }
+            app.view.zoom = 2.0f;
+            app.view.center = ImVec2(cv->w * 0.5f, cv->h * 0.5f);
+            app.fitRequested = false;        // a pending fit would rewrite the zoom
+            app.annRev++;                    // the cleared list, for anything caching on it
+            shotFrame();                     // settle the window, build the texture
+            shotFrame();
+            // The skipped frame, asserted rather than assumed: a capture on the
+            // click frame is a picture of the context menu, and the only way to
+            // see that this code waits is to look after exactly one frame.
+            g_copyViewW = 0; g_copyViewSaid.clear(); g_copyViewPixels.clear();
+            g_copyViewRequest = 2;
+            shotFrame();
+            check(g_copyViewW == 0 && g_copyViewPixels.empty(),
+                  "T14 the frame the menu was clicked on is not the one copied");
+            shotFrame();                     // ...this one is
+            check(g_copyViewW > 0, "T14 ...the next frame, with the menu gone, is");
+            const float sx = t14io.DisplayFramebufferScale.x > 0
+                           ? t14io.DisplayFramebufferScale.x : 1.0f;
+            const float sy = t14io.DisplayFramebufferScale.y > 0
+                           ? t14io.DisplayFramebufferScale.y : 1.0f;
+            const int wantW = (int)lroundf(g_canvasRect[2] * sx);
+            const int wantH = (int)lroundf(g_canvasRect[3] * sy);
+            fprintf(stderr, "tileselftest: T14 canvas %.1fx%.1f at (%.1f,%.1f), fb scale %.2fx%.2f "
+                            "-> captured %dx%d (want %dx%d), %zu byte(s)\n",
+                    g_canvasRect[2], g_canvasRect[3], g_canvasRect[0], g_canvasRect[1],
+                    sx, sy, g_copyViewW, g_copyViewH, wantW, wantH, g_copyViewPixels.size());
+            fprintf(stderr, "tileselftest: T14 said: '%s'\n", g_copyViewSaid.c_str());
+            check(g_copyViewW == wantW && g_copyViewH == wantH && wantW > 1 && wantH > 1,
+                  "T14 the capture is the canvas rect x the framebuffer scale");
+            check(g_copyViewPixels.size() == (size_t)g_copyViewW * g_copyViewH * 4,
+                  "T14 ...and the buffer is that many RGBA pixels");
+            // The two sample points. Both are KNOWN before the frame is drawn:
+            //   - the canvas corner is the flat plate drawCanvas fills the
+            //     rectangle with (IM_COL32(12,14,16,255)), and at zoom 2 an 80x64
+            //     fixture is 160x128 px in the middle of a canvas hundreds wide,
+            //     so the corner is plate and nothing else. It pins the OFFSET:
+            //     four pixels in from the ruler is the ruler, and from a panel
+            //     is the panel.
+            //   - the middle pixel of the image is renderDocRGBA's byte for that
+            //     pixel, because rebuildTexture uploads exactly that buffer and
+            //     GL_NEAREST at zoom 2 magnifies it without inventing anything.
+            //     It pins the ORIENTATION and the SCALE: the fixture is gaussian
+            //     noise, so a one-pixel error anywhere lands a different colour.
+            auto at = [&](int x, int y, int c) -> int {
+                if (x < 0 || y < 0 || x >= g_copyViewW || y >= g_copyViewH) return -1;
+                return g_copyViewPixels[((size_t)y * g_copyViewW + x) * 4 + c];
+            };
+            auto isPlate = [&](int x, int y) {
+                return at(x, y, 0) == 12 && at(x, y, 1) == 14 && at(x, y, 2) == 16 &&
+                       at(x, y, 3) == 255;
+            };
+            const int inset = (int)lroundf(4 * std::max(sx, sy));
+            const int rx = g_copyViewW - 1 - inset, ry = g_copyViewH - 1 - inset;
+            fprintf(stderr, "tileselftest: T14 plate at the four corners (%d,%d)/(%d,%d)/"
+                            "(%d,%d)/(%d,%d): %d%d%d%d (top-left reads %d,%d,%d,%d)\n",
+                    inset, inset, rx, inset, inset, ry, rx, ry,
+                    isPlate(inset, inset), isPlate(rx, inset), isPlate(inset, ry), isPlate(rx, ry),
+                    at(inset, inset, 0), at(inset, inset, 1),
+                    at(inset, inset, 2), at(inset, inset, 3));
+            // All four, not one: a capture one ruler too far left still has plate
+            // at its top-left, and a capture one row too short still has plate at
+            // its top. Four corners pin the offset AND the extent.
+            check(isPlate(inset, inset) && isPlate(rx, inset) &&
+                  isPlate(inset, ry) && isPlate(rx, ry),
+                  "T14 all four corners are the canvas plate, not a ruler or a panel");
+            {
+                // ...and the IMAGE, where drawCanvas put it. The bytes are
+                // renderDocRGBA's own, because rebuildTexture uploads exactly
+                // that buffer and GL_NEAREST at zoom 2 magnifies it without
+                // inventing anything - so this is the strongest statement
+                // available here: the readback is the render, at the position the
+                // shared map says, over a noise fixture where a one-pixel error
+                // lands a different colour.
+                std::vector<uint8_t> want;
+                renderDocRGBA(*cv, want);
+                const ImVec2 rp0(g_canvasRect[0], g_canvasRect[1]);
+                const ImVec2 rsz(g_canvasRect[2], g_canvasRect[3]);
+                auto capOf = [&](float ix, float iy) {
+                    ImVec2 sc = tileMap(rp0, rsz, app.view.center, app.view.zoom, ix, iy);
+                    return ImVec2((sc.x - g_canvasRect[0]) * sx, (sc.y - g_canvasRect[1]) * sy);
+                };
+                int hit = 0, miss = 0;
+                std::string line;
+                for (int gy = 1; gy <= 3; gy++) for (int gx = 1; gx <= 3; gx++) {
+                    const int ix = cv->w * gx / 4, iy = cv->h * gy / 4;
+                    ImVec2 q = capOf(ix + 0.5f, iy + 0.5f);
+                    const int qx = (int)floorf(q.x), qy = (int)floorf(q.y);
+                    const size_t o = ((size_t)iy * cv->w + ix) * 4;
+                    char b[96];
+                    snprintf(b, sizeof b, " (%d,%d)=%d/%d", ix, iy, at(qx, qy, 0), (int)want[o]);
+                    line += b;
+                    // Tolerance 1, not 0: the quad's edges need not land on integer
+                    // framebuffer pixels, so the sampled texel is the right one but
+                    // its neighbour is one unit away in principle. A WRONG
+                    // rectangle is not one unit away - it is a different colour.
+                    bool one = true;
+                    for (int c = 0; c < 3; c++)
+                        if (std::abs(at(qx, qy, c) - (int)want[o + c]) > 1) one = false;
+                    if (one) hit++; else miss++;
+                }
+                fprintf(stderr, "tileselftest: T14 image lattice (capture/renderDocRGBA):%s\n",
+                        line.c_str());
+                check(hit == 9 && miss == 0,
+                      "T14 nine image pixels read back as renderDocRGBA's own bytes");
+                // ...and that those nine bytes are not nine of the same byte. A
+                // uniform lattice would pass the check above against a uniform
+                // capture of anything at all, including a plate or a panel.
+                int distinct = 0;
+                for (int gy = 1; gy <= 3; gy++) for (int gx = 1; gx <= 3; gx++) {
+                    const size_t o = ((size_t)(cv->h * gy / 4) * cv->w + cv->w * gx / 4) * 4;
+                    bool seen = false;
+                    for (int hy = 1; hy <= gy; hy++) for (int hx = 1; hx <= 3; hx++) {
+                        if (hy == gy && hx >= gx) continue;
+                        const size_t p = ((size_t)(cv->h * hy / 4) * cv->w + cv->w * hx / 4) * 4;
+                        if (want[p] == want[o]) seen = true;
+                    }
+                    if (!seen) distinct++;
+                }
+                fprintf(stderr, "tileselftest: T14 the lattice carries %d distinct value(s)\n",
+                        distinct);
+                check(distinct >= 4, "T14 fixture: the lattice is not one flat value");
+                // The image's EDGE, from both sides, one pixel apart at the scale
+                // the view is drawn at. This is what says the zoom was baked in
+                // rather than ignored: at 1x the edge would be 80 px further in.
+                ImVec2 e0 = capOf(0, cv->h * 0.5f);
+                const int ex = (int)floorf(e0.x), ey = (int)floorf(e0.y);
+                fprintf(stderr, "tileselftest: T14 image left edge at capture x=%d: "
+                                "outside plate=%d, inside plate=%d\n",
+                        ex, isPlate(ex - 3, ey), isPlate(ex + 3, ey));
+                check(isPlate(ex - 3, ey) && !isPlate(ex + 3, ey),
+                      "T14 the image's left edge is where this zoom puts it");
+            }
+            // ---- and the sentence, which is where the facts live -------------
+            char zbuf[32]; snprintf(zbuf, sizeof zbuf, "zoom %.2fx", app.view.zoom);
+            check(g_copyViewSaid.find(zbuf) != std::string::npos,
+                  "T14 the announcement states the zoom it baked in");
+            check(g_copyViewSaid.find("copied view " + std::to_string(g_copyViewW) + "x" +
+                                      std::to_string(g_copyViewH)) != std::string::npos,
+                  "T14 ...and the size it actually copied");
+            check(g_copyViewSaid.find("nearest") != std::string::npos,
+                  "T14 ...and the interpolation (zoom 2 is nearest)");
+            check(g_copyViewSaid.find("overlays: none") != std::string::npos,
+                  "T14 ...and that nothing was over the image");
+            // An ARMED overlay that was not DRAWN must not be claimed: the grid
+            // is only drawn past 8x, so at 2x the sentence must stay silent
+            // about it. This is the rule that makes the sentence worth reading.
+            app.showGrid = true;
+            shot();
+            fprintf(stderr, "tileselftest: T14 grid on at zoom 2: '%s'\n", g_copyViewSaid.c_str());
+            check(g_copyViewSaid.find("grid") == std::string::npos,
+                  "T14 a grid that is on but below its zoom threshold is not claimed");
+            app.view.zoom = 16.0f;
+            shot();
+            fprintf(stderr, "tileselftest: T14 grid on at zoom 16: '%s'\n", g_copyViewSaid.c_str());
+            check(g_copyViewSaid.find("overlays: grid") != std::string::npos,
+                  "T14 ...and IS claimed once it is being drawn");
+            // A ROI is an overlay by name, and it is in the pixels either way.
+            app.view.zoom = 2.0f;
+            app.showGrid = false;
+            addAnn(0, 4, 4, 16, 16);
+            shot();
+            fprintf(stderr, "tileselftest: T14 with one ROI: '%s'\n", g_copyViewSaid.c_str());
+            check(g_copyViewSaid.find("overlays: ROI") != std::string::npos,
+                  "T14 a drawn ROI frame is named in the announcement");
+            // ---- both panes ARE what is displayed (board 96, item 2) ---------
+            // A split canvas holds two pictures and the copy takes the whole
+            // rectangle, so the sentence has to say so - a reader handed a
+            // two-pane image with no note cannot tell which half is which.
+            app.anns.clear(); app.selectedAnn = 0;
+            setCompareB(app.images[1].get());
+            app.compareMode = App::CmpSplit;
+            shot();
+            fprintf(stderr, "tileselftest: T14 split: '%s'\n", g_copyViewSaid.c_str());
+            check(g_copyViewSaid.find(" · A|B") != std::string::npos,
+                  "T14 a split canvas is copied whole and announced as A|B");
+            const int splitW = g_copyViewW;
+            app.compareMode = App::CmpOff;
+            shot();
+            fprintf(stderr, "tileselftest: T14 compare off: '%s' (%d px wide, split was %d)\n",
+                    g_copyViewSaid.c_str(), g_copyViewW, splitW);
+            check(g_copyViewSaid.find("A|B") == std::string::npos,
+                  "T14 one picture names no panes");
+            check(g_copyViewW == splitW,
+                  "T14 the rectangle is the canvas either way - panes do not resize it");
+            // Everything borrowed goes back: this home is SHARED with every
+            // other test in the run (docs/verification/functional.md E-5).
+            g_copyViewProbeOnly = saveProbe;
+            g_copyViewPixels.clear();
+            g_copyViewRequest = 0;
+            app.compareMode = saveMode;
+            app.cmpExtra = saveExtra;
+            app.compareBUid = saveB;
+            app.view.zoom = saveZoom;
+            app.view.center = saveCenter;
+            app.showGrid = saveGrid;
+            app.highlight.on = saveHl;
+            app.anns = saveAnns;
+            app.selectedAnn = saveSel;
+            app.annRev++;
+            cv->black = saveBlk; cv->white = saveWht; cv->texDirty = true;
+            app.linkRange = saveLink;
         }
 
         fprintf(stderr, "tileselftest: %s\n", ok ? "ok" : "FAILED");

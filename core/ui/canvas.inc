@@ -391,8 +391,10 @@ static std::string g_paneBadgeProbe;
 // g_paneBadgeProbe, and the same rule: it records the STRINGS that went to
 // AddText, not the numbers they were built from - the zoom readout has two
 // formats and the one it chose is the thing worth asserting, which a test
-// re-deriving "zoom * 100" would never see. (docs/verification/ui.md E3: the row was
-// moved out of the A section precisely because nothing here was observable.)
+// re-deriving "zoom * 100" would never see. (E3 in
+// docs/verification/results/20260803-ui.md: that run moved the row out of its
+// A section precisely because nothing here was observable.
+// docs/verification/ui.md §3 now carries the probe's contract.)
 static std::string g_footerProbe;
 static std::string elideFront(const std::string& s, size_t keep);   // fwd
 // The batch a document belongs to - the context line of the two-line identity
@@ -799,6 +801,25 @@ static void drawCanvas(ImVec2 avail) {
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("one image pixel per copied pixel, with the range,\n"
                                       "gamma and colormap you see. No resampling.");
+                // ...and the other half of the pair (board 96). It cannot act
+                // here: the picture it copies is the frame this menu is being
+                // drawn INTO - THIS popup included, which is why the request
+                // waits a frame (see g_copyViewRequest) - so all it can do is
+                // ask, and the frame loop reads the canvas back once the menu is
+                // gone. wakeFrames so the answering frame happens even if the
+                // click is the last input for a while.
+                if (ImGui::MenuItem("Copy view (as displayed)", nullptr, false, ci != nullptr)) {
+                    g_copyViewRequest = 2;
+                    app.wakeFrames = std::max(app.wakeFrames, 3);
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("the canvas exactly as it looks now: this zoom, this\n"
+                                      "interpolation, both panes, and the overlays on top\n"
+                                      "(ROI frames, pins, wipe line, grid).\n"
+                                      "The ZOOM IS BAKED IN - for a 1:1 copy whose pixels\n"
+                                      "are the image's pixels, use the item above. What makes\n"
+                                      "this one reproducible (zoom, filter, which overlays)\n"
+                                      "is said in the message, not drawn into the picture.");
                 if (ImGui::MenuItem("Save image as PNG...", nullptr, false, ci != nullptr)) {
                     if (!pfd::settings::available())
                         toast("no file-dialog backend found (install zenity or kdialog)", true);
@@ -953,6 +974,28 @@ static void drawCanvas(ImVec2 avail) {
     // differences become visible - a fixed divider cannot show them.
     bool flashB = imB && !flipMode && !ImGui::GetIO().WantTextInput && ImGui::IsKeyDown(ImGuiKey_B) &&
                   !ImGui::IsKeyDown(ImGuiKey_LeftShift) && !ImGui::IsKeyDown(ImGuiKey_RightShift);
+    // ---- what "Copy view (as displayed)" will read back -----------------------
+    // WHERE the canvas is, and WHAT is in it, recorded before a pixel of it is
+    // drawn. The readback happens after every panel in the app has drawn, by
+    // which time nothing else remembers this rectangle (core/app/export.inc,
+    // captureCanvasAsDisplayed); the frame number is what tells it apart from a
+    // stale rectangle left by a frame that drew no canvas at all. Same discipline
+    // as g_tilePanesDrawn and g_paneBadgeProbe: the frame writes down what it did.
+    g_canvasRect[0] = canvasP0.x; g_canvasRect[1] = canvasP0.y;
+    g_canvasRect[2] = canvasSize.x; g_canvasRect[3] = canvasSize.y;
+    g_canvasRectFrame = ImGui::GetFrameCount();
+    g_canvasPanes.clear();
+    if (im) {
+        // Empty for the ordinary single picture: "panes: A" on a canvas with one
+        // image in it is a word that carries nothing. Everything else is a
+        // composition, and a copy of it has to say which pictures it holds.
+        if (flashB)        g_canvasPanes = "B held";
+        else if (tiled)    { for (const TileSlot& t : slots)
+                                 g_canvasPanes += (g_canvasPanes.empty() ? "" : "|") + t.tag; }
+        else if (diffMode) g_canvasPanes = "A-B difference";
+        else if (flipMode) g_canvasPanes = app.flipShowB ? "B blink" : "A blink";
+        else if (split || wipe) g_canvasPanes = "A|B";
+    }
     if (im) {
         if (flipMode) {
             ImageDoc* d = app.flipShowB ? imB : im;

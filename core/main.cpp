@@ -1058,8 +1058,9 @@ int main(int argc, char** argv) {
         // `!g_browseKeys.empty()` instead, which is set BELOW this point and so
         // was always false here: every GUI selftest read and wrote a layout.ini,
         // and only the APPDATA that CMakeLists.txt pins kept ctest off the
-        // developer's own (docs/verification/ui.md measured the md5 changing on a run
-        // by hand). Closing that hole used to make selftest.browse-dbl fail
+        // developer's own (defect D-1 in
+        // docs/verification/results/20260803-ui.md measured the md5 changing on
+        // a run by hand). Closing that hole used to make selftest.browse-dbl fail
         // every time, because its scripted double-click was aimed at a panel
         // whose place came from the layout.ini an EARLIER test in the shared
         // home left behind. That defect is fixed where it belonged - the run
@@ -2101,6 +2102,15 @@ static bool g_watchSuppressed = false;
         glClearColor(cc.x, cc.y, cc.z, 1);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        // THE one moment the composed frame exists and can be read: the canvas,
+        // its overlays, every panel and the toast are drawn, and the swap below
+        // gives the buffer away. "Copy view (as displayed)" is filed as a request
+        // from inside a frame precisely because it cannot be answered from inside
+        // one (core/app/export.inc). Before the swap, not after: on a
+        // double-buffered context the buffer we just drew into is the BACK one,
+        // and after the swap glReadPixels reads whatever the driver handed back -
+        // undefined by the spec, and in practice the frame before last.
+        pumpCopyViewRequest();
         // Split the frame: our drawing versus getting it onto the screen. Over a
         // remote display the second number is the whole story (a full window per
         // frame across the link), and no amount of work on our side moves it.
@@ -2504,8 +2514,10 @@ static bool g_watchSuppressed = false;
             // phase's 60 s above. It had none: waitdir/waitimg bound each WAIT
             // at 60 s, and nothing bounds the run. Measured on this build, a
             // list with three impossible waits sits for 3m03s (60 s apiece);
-            // the stock list carries fifteen waits, so an abnormal run - A-16's
-            // shape, where a stale layout puts every scripted click somewhere
+            // the stock list carries fifteen waits, so an abnormal run - the
+            // shape of A-16 in
+            // docs/verification/results/20260803-functional.md, where a stale
+            // layout puts every scripted click somewhere
             // else and every wait therefore expires - waits about a quarter of
             // an hour and is then killed by ctest's own 900 s TIMEOUT, which
             // says only "Timeout" and names no action. This is eight times a
@@ -3363,7 +3375,9 @@ static bool g_watchSuppressed = false;
                         // dropping an ROI or leaving a comparison underneath -
                         // the exact failure the one-step-outward rule forbids,
                         // and the one thing this test could not see before
-                        // g_escProbe existed (docs/verification/ui.md E7).
+                        // g_escProbe existed (E7 in
+                        // docs/verification/results/20260803-ui.md; the
+                        // standing contract is docs/verification/ui.md §3).
                         int took = g_escProbeN - escProbeAtPress;
                         std::string chain = g_escProbe.size() > 60
                             ? g_escProbe.substr(g_escProbe.size() - 60) : g_escProbe;

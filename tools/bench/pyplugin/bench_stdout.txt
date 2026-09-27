@@ -1,0 +1,65 @@
+viewer python-plugin transport benchmark
+  python 3.11.0
+  numpy  1.26.4
+  frame  4000x3000 float32 = 48.0 MB
+  reps   15 (medians and full range reported)
+
+1. process spawn + trivial call (the per-call floor)
+  spawn python, print, exit                      32.41 ms  [30.63 .. 33.97]  n=7 
+  spawn + import numpy                          119.83 ms  [113.32 .. 156.19]  n=7 
+  spawn + numpy + json + shared_memory          120.76 ms  [120.46 .. 123.23]  n=7 
+  spawn + import torch                         1218.49 ms  [1209.84 .. 1230.78]  n=4 
+
+2. one 48 MB frame across a file boundary (adapter's transport)
+  np.savez 48 MB (write, page cache)             35.64 ms  [35.30 .. 36.35]  n=15 
+  np.load  48 MB (read, page cache)              30.82 ms  [30.35 .. 34.78]  n=15 
+  tofile   48 MB (write, page cache)             23.42 ms  [22.10 .. 27.10]  n=15 
+  write + fsync 48 MB (to the platter)           36.15 ms  [35.14 .. 37.70]  n=5 
+  fromfile 48 MB (read, page cache)              14.92 ms  [14.55 .. 15.59]  n=15 
+  memmap 48 MB + full mean()                     17.98 ms  [17.47 .. 18.40]  n=15 
+  np.savez_compressed 48 MB                    1452.31 ms  [1452.23 .. 1454.05]  n=3 
+  numpy copy of 48 MB (in-process)                7.90 ms  [7.77 .. 8.22]  n=15 
+
+3. persistent worker (spawn once, then call) - candidate A
+  worker spawn + first ping (once per session): 117.8 ms
+  round trip, no pixels (IPC floor)               0.03 ms  [0.03 .. 0.07]  n=150 
+  shm, frame already there, no real work          0.04 ms  [0.03 .. 0.13]  n=15 = pure call overhead
+  shm, host copies 48 MB in, no work              2.96 ms  [2.59 .. 3.65]  n=15 = copy + overhead
+  shm, no copy, mean+std (stats-shaped)          23.34 ms  [22.67 .. 25.32]  n=15 
+  shm, copy 48 MB in, mean+std                   26.22 ms  [25.34 .. 28.05]  n=15 
+  shm, no copy, 16x16 tile-std median            29.09 ms  [28.30 .. 30.15]  n=7 (noise-shaped)
+  pipe 48 MB in + mean+std                       38.63 ms  [38.27 .. 41.45]  n=7 
+  exception in the plugin -> 'ValueError: deliberate failure from the plugin' ; worker alive after: True
+
+4. the work itself, on a resident array (transport-free floor)
+  numpy mean+std+min+max                         28.18 ms  [27.27 .. 30.05]  n=15 
+  numpy mean+std+percentile(1,50,99)            152.96 ms  [151.49 .. 154.28]  n=7 
+  numpy 16x16 tile-std median                    29.57 ms  [28.62 .. 31.31]  n=7 
+  torch CPU mean+std (zero-copy view)             1.96 ms  [1.83 .. 2.30]  n=15 
+  torch.from_numpy (wrap, no copy)                0.00 ms  [0.00 .. 0.00]  n=150 
+  torch CUDA: NOT AVAILABLE on this machine (2.13.0+cpu) - device transfer UNMEASURED
+
+5. interactive: ROI sweep through a warm worker (frame in shm)
+  worker torch_init -> {'ok': 1, 'torch': '2.13.0+cpu', 'cuda': False}
+  stats      256x256              0.13 ms  [0.12 .. 0.15]  =  7806.4 /s
+  stats      512x512              0.53 ms  [0.50 .. 0.63]  =  1890.4 /s
+  stats      1024x1024            1.92 ms  [1.80 .. 2.32]  =   521.0 /s
+  stats      2048x2048            8.40 ms  [8.36 .. 8.62]  =   119.0 /s
+  stats      whole 4000x3000     24.94 ms  [23.22 .. 26.07]  =    40.1 /s
+  statspct   256x256              1.03 ms  [0.91 .. 1.11]  =   968.1 /s
+  statspct   512x512              4.59 ms  [4.36 .. 4.94]  =   218.0 /s
+  statspct   1024x1024           13.73 ms  [13.27 .. 14.27]  =    72.8 /s
+  statspct   2048x2048           57.96 ms  [56.84 .. 58.56]  =    17.3 /s
+  statspct   whole 4000x3000    153.80 ms  [152.38 .. 165.22]  =     6.5 /s
+  noise      256x256              0.18 ms  [0.14 .. 0.32]  =  5458.5 /s
+  noise      512x512              0.71 ms  [0.69 .. 1.02]  =  1411.2 /s
+  noise      1024x1024            2.71 ms  [2.59 .. 3.92]  =   369.5 /s
+  noise      2048x2048           10.64 ms  [10.31 .. 12.14]  =    94.0 /s
+  noise      whole 4000x3000     29.68 ms  [29.44 .. 31.20]  =    33.7 /s
+  torch      256x256              0.23 ms  [0.22 .. 0.29]  =  4291.9 /s
+  torch      512x512              0.25 ms  [0.23 .. 0.30]  =  4024.1 /s
+  torch      1024x1024            0.37 ms  [0.35 .. 0.53]  =  2727.8 /s
+  torch      2048x2048            0.88 ms  [0.66 .. 1.05]  =  1133.8 /s
+  torch      whole 4000x3000      2.37 ms  [2.26 .. 2.60]  =   421.7 /s
+
+wrote C:\Users\hish\Desktop\viewer-wt-pyplugin\tools\pyplugin-bench\bench_results.json

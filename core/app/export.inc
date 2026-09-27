@@ -5,12 +5,17 @@
 //   dot by dot  - one image pixel per output pixel, no resampling. What an
 //                 image-quality reader needs: the noise is the subject, and a
 //                 scaled screenshot invents and destroys exactly that.
-//   as displayed - the canvas as it sits, zoom and overlays included. Not here
-//                 yet (see docs/background/project/todo-open.md): it needs a framebuffer readback
-//                 after the frame is rendered, and this machine cannot verify
-//                 the result today.
-// Both go through renderDocRGBA, so what leaves the app is what the screen
-// showed - the same range, gamma, colormap and CFA colorize.
+//   as displayed - the canvas as it sits, zoom and overlays included. What a
+//                 reader needs when the SUBJECT is the view: a ROI frame around
+//                 the defect, a wipe at the boundary, the grid at 16x. Board 96,
+//                 Fable 2026-09-27: a framebuffer readback, and the zoom is NOT
+//                 normalised - the item above already covers the reproducible
+//                 1:1 case, so normalising here would leave nobody served.
+// The first two go through renderDocRGBA, so what leaves the app is what the
+// screen showed - the same range, gamma, colormap and CFA colorize. The third
+// cannot: renderDocRGBA maps ONE document and knows nothing about zoom, panes or
+// overlays, and the only thing that holds the whole composition is the
+// framebuffer. See copyViewAsDisplayed below for what that costs.
 
 // PNG via miniz, which is already linked for .npz. No new dependency.
 static std::vector<uint8_t> encodePng(const std::vector<uint8_t>& rgba, int w, int h) {
@@ -147,6 +152,209 @@ static void copyViewDotByDot() {
     toast("wrote " + path + " (path on the clipboard)" +
           (hlNote.empty() ? "" : "  -  " + hlNote));
 #endif
+}
+
+// ------------------------------------------------------- copy view AS DISPLAYED
+// Board 96 (「項目18 表示どおりコピー」), ruled by Fable 2026-09-27. The pixels
+// are the CANVAS RECTANGLE at screen resolution, at whatever zoom and
+// interpolation are set, with every overlay that was drawn on it - ROI frames,
+// pins, the wipe divider, the value highlight, the pixel grid. The zoom is baked
+// in and that is the point: "Copy (dot by dot)" above already answers "give me
+// the pixels", and a second item that also normalised would answer the same
+// question twice while nobody could copy what they were looking at.
+//
+// It therefore CANNOT be produced where it is asked for. renderDocRGBA maps one
+// document; the composition of two panes, a divider and four overlays exists
+// nowhere but the framebuffer, and it exists there for exactly one moment - after
+// ImGui_ImplOpenGL3_RenderDrawData has drawn the frame and before
+// glfwSwapBuffers hands it to the driver. So the menu item cannot answer: it
+// files a request, and the frame loop honours it at that moment (core/main.cpp,
+// beside the swap).
+//
+// A COUNTDOWN, not a bool, and this is the subtle part. The frame the menu item
+// is clicked on still has the open context menu in it: ImGui's MenuItem only
+// marks the popup closed, and ClosePopupToLevel does not withdraw a window that
+// has already been submitted (the same fact the comment above the annotation
+// items in canvas.inc turns on - "the rest of this body still runs"). Capturing
+// at the end of that frame would hand over a picture of the menu lying across
+// the canvas. So the request skips one frame: 2 = "not this frame", 1 = "this
+// one".
+static int g_copyViewRequest = 0;
+
+// The canvas rectangle drawn on the last frame, in ImGui coordinates, and the
+// frame number it was drawn on. drawCanvas writes both (core/ui/canvas.inc,
+// beside g_tileCanvasW): by readback time every other panel has drawn over the
+// layout, so this is the only record of WHERE the canvas was, and the frame
+// number is what distinguishes it from a stale rectangle left by a frame that
+// drew no canvas at all.
+static float g_canvasRect[4] = {};          // x, y, w, h  (ImGui coordinates)
+static int g_canvasRectFrame = -1;
+// Which panes that canvas held, as drawn: "A|B", "A|B|C|D", "A-B difference",
+// "B held", or empty when compare was off and there was one picture. The copy
+// takes the WHOLE canvas - both panes of a split ARE what is displayed - so the
+// announcement has to say how many pictures are in it.
+static std::string g_canvasPanes;
+
+// What the last capture was. Same reasoning as g_paneBadgeProbe: a readback
+// cannot be screenshotted on this machine either, so the frame writes down what
+// it took and --tile-selftest reads it back. The PIXELS are kept only when
+// asked - a canvas-sized RGBA buffer is megabytes and nothing but a test wants
+// one after the clipboard has it.
+static int g_copyViewW = 0, g_copyViewH = 0;
+static std::string g_copyViewSaid;
+static std::vector<uint8_t> g_copyViewPixels;
+static bool g_copyViewProbeOnly = false;    // keep the pixels, leave the clipboard alone
+
+// The readback. Every way it can fail is a sentence rather than a blank paste:
+// "nothing happened" and "you pasted an empty rectangle" look the same at the
+// other end, and only one of them is recoverable by the person holding it.
+static bool captureCanvasAsDisplayed(std::vector<uint8_t>& rgba, int& outW, int& outH,
+                                     std::string& why) {
+    if (!ImGui::GetCurrentContext() || g_canvasRectFrame != ImGui::GetFrameCount()) {
+        why = "the canvas was not drawn on this frame";
+        return false;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    // ImGui coordinates are LOGICAL; glReadPixels counts FRAMEBUFFER pixels. On a
+    // 200% Windows display or a Retina panel the two differ by
+    // DisplayFramebufferScale, and a readback that ignored it would copy the
+    // top-left quarter of the canvas and call it the canvas. (This is the same
+    // trap uiscale.inc is about, one layer down: there the app multiplies twice,
+    // here it would fail to multiply at all.)
+    const float sx = io.DisplayFramebufferScale.x > 0 ? io.DisplayFramebufferScale.x : 1.0f;
+    const float sy = io.DisplayFramebufferScale.y > 0 ? io.DisplayFramebufferScale.y : 1.0f;
+    const int fbW = (int)lroundf(io.DisplaySize.x * sx);
+    const int fbH = (int)lroundf(io.DisplaySize.y * sy);
+    const ImVec2 vp = ImGui::GetMainViewport()->Pos;   // (0,0) without multi-viewport
+    int px = (int)lroundf((g_canvasRect[0] - vp.x) * sx);
+    int py = (int)lroundf((g_canvasRect[1] - vp.y) * sy);
+    int cw = (int)lroundf(g_canvasRect[2] * sx);
+    int ch = (int)lroundf(g_canvasRect[3] * sy);
+    // Clamp into the framebuffer. A canvas can hang off a window being dragged
+    // smaller, and glReadPixels does not error on that - it leaves the pixels
+    // outside the buffer UNTOUCHED, i.e. it would hand over uninitialised heap.
+    if (px < 0) { cw += px; px = 0; }
+    if (py < 0) { ch += py; py = 0; }
+    cw = std::min(cw, fbW - px);
+    ch = std::min(ch, fbH - py);
+    if (fbW < 1 || fbH < 1 || cw < 1 || ch < 1) {
+        why = "the canvas is not on screen";
+        return false;
+    }
+    rgba.assign((size_t)cw * ch * 4, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    // Y flip on the way in: the framebuffer's origin is its BOTTOM-left corner,
+    // so the canvas's top edge is (fbH - bottom) rows up from it.
+    glReadPixels(px, fbH - (py + ch), cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    // ...and again on the way out: the rows arrive bottom-up, and every consumer
+    // from here on (encodePng, CF_DIB's own flip) is written for top-down RGBA.
+    std::vector<uint8_t> row((size_t)cw * 4);
+    for (int y = 0; y < ch / 2; y++) {
+        uint8_t* a = &rgba[(size_t)y * cw * 4];
+        uint8_t* b = &rgba[(size_t)(ch - 1 - y) * cw * 4];
+        memcpy(row.data(), a, row.size());
+        memcpy(a, b, row.size());
+        memcpy(b, row.data(), row.size());
+    }
+    // The window is cleared opaque and everything is drawn over that, so the
+    // alpha a readback carries is whatever the blends happened to leave - which
+    // in a paste target that honours alpha shows up as holes in a frame that had
+    // none. The screen was opaque; so is the copy.
+    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+    outW = cw; outH = ch;
+    return true;
+}
+
+// The facts that make a picture reproducible do NOT go into the pixels - they go
+// into the SENTENCE, which is exactly the acceptance exportHighlightNote already
+// made for the value highlight: a badge is chrome, not pixels, and a file
+// outlives any badge anyway. So zoom, interpolation, panes and overlays are
+// announced (toast + Messages log + stderr) and nothing is drawn into the frame.
+//
+// Every clause is what the frame ACTUALLY DREW, never what a preference permits.
+// `grid` appears only when the grid is on AND the zoom is past the 8x threshold
+// drawCanvas draws it at; an armed-but-invisible overlay in this sentence would
+// be a lie of exactly the kind the sentence exists to prevent.
+static std::string copyViewSaid(int w, int h) {
+    const ImageDoc* im = cur();
+    char head[128];
+    snprintf(head, sizeof head, "copied view %dx%d · zoom %.2fx", w, h, app.view.zoom);
+    std::string s = head;
+    // The filter drawCanvas sets on every document it draws (setFilter, on the
+    // zoom), read back off the document it drew rather than re-derived here.
+    if (im) s += im->texNearest ? " · nearest" : " · linear";
+    if (!g_canvasPanes.empty()) s += " · " + g_canvasPanes;
+    // A DECIMATED PREVIEW is not refused here, unlike the dot-by-dot copy and
+    // the PNG: those make a claim about the mapping ("one output pixel per source
+    // pixel") that a step-4 preview breaks by a factor of sixteen. This item
+    // claims only "what is on the screen", and the screen IS showing the preview.
+    // So the preview is copied and SAID, which is the whole shape of this feature.
+    if (im && im->src && im->src->remoteStep > 1)
+        s += " · preview (every " + std::to_string(im->src->remoteStep) + "th pixel)";
+    std::vector<std::string> ov;
+    bool roi = false, pin = false;
+    for (const auto& a : app.anns) {
+        if (!a.visible) continue;
+        if (a.type == 0) roi = true; else pin = true;
+    }
+    if (app.compareMode == App::CmpWipe && cmpB()) ov.push_back("wipe line");
+    if (roi) ov.push_back("ROI");
+    if (pin) ov.push_back("pins");
+    if (app.highlight.on) ov.push_back("value highlight");
+    if (app.showGrid && app.view.zoom >= 8.0f) ov.push_back("grid");
+    s += " · overlays: ";
+    if (ov.empty()) s += "none";
+    for (size_t i = 0; i < ov.size(); i++) s += (i ? ", " : "") + ov[i];
+    // ...and WHICH values are magenta, which only histHlRangeSaid can say.
+    const std::string hl = exportHighlightNote(im);
+    if (!hl.empty()) s += " · " + hl;
+    return s;
+}
+
+static void copyViewAsDisplayed() {
+    std::vector<uint8_t> rgba; int w = 0, h = 0; std::string why;
+    g_copyViewW = g_copyViewH = 0;
+    g_copyViewSaid.clear();
+    g_copyViewPixels.clear();
+    if (!captureCanvasAsDisplayed(rgba, w, h, why)) {
+        toast("copy view failed: " + why, true);
+        return;
+    }
+    g_copyViewW = w; g_copyViewH = h;
+    g_copyViewSaid = copyViewSaid(w, h);
+    fprintf(stderr, "export: %s\n", g_copyViewSaid.c_str());
+    if (g_copyViewProbeOnly) {     // the selftest: assert the capture, own no clipboard
+        g_copyViewPixels = rgba;
+        logMsg(g_copyViewSaid);
+        return;
+    }
+    std::vector<uint8_t> png = encodePng(rgba, w, h);
+#ifdef _WIN32
+    std::string err;
+    if (clipboardPutImage(rgba, w, h, png, err)) toast(g_copyViewSaid);
+    else toast("copy failed: " + err, true);
+#else
+    // Same fallback as the dot-by-dot copy: no image clipboard without a toolkit,
+    // so the PNG goes to a temp file and the PATH goes on the clipboard. One
+    // fixed name rather than the document's uid - the subject here is the VIEW,
+    // and a view is not a document.
+    std::string path = (std::filesystem::temp_directory_path() / "viewer-view.png").u8string();
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    f.write((const char*)png.data(), (std::streamsize)png.size());
+    f.close();
+    ImGui::SetClipboardText(path.c_str());
+    toast("wrote " + path + " (path on the clipboard) · " + g_copyViewSaid);
+#endif
+}
+
+// Called from the frame loop at the one moment the frame is readable. Here
+// rather than inline in main.cpp so that the selftest, which drives its own
+// frames, honours the request through the SAME code the loop does - the wiring
+// is then tested, not merely written twice.
+static void pumpCopyViewRequest() {
+    if (g_copyViewRequest <= 0) return;
+    if (--g_copyViewRequest > 0) return;   // the click frame still holds the menu
+    copyViewAsDisplayed();
 }
 
 // `uid` is the document the SAVE DIALOG was opened for, not whatever is current
