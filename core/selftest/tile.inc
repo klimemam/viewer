@@ -539,6 +539,115 @@
             app.compareFollowFrame = saveFollow;
         }
 
+        // ---- T14: where the FLOATING panels open on a first launch (board 258)
+        // The defect: main.cpp's DockBuilder branch placed "ROIs" and "Analysis"
+        // with the name-addressed ImGui::SetWindowPos, which goes through
+        // FindWindowByName - and neither window had ever been Begin'd when that
+        // line ran, so both calls returned having moved nothing and both panels
+        // opened at ImGui's default (60,60), overlapping (measured ROIs (60,60)
+        // 690x450 / Analysis (60,60) 630x390).
+        //
+        // WHY THE ARMING IS CALLED HERE RATHER THAN REACHED THROUGH THE APP: the
+        // DockBuilder branch lives inside the frame loop in main(), and a
+        // selftest returns from main() before that loop is entered. There is no
+        // fresh-layout path to drive from here at all. What IS reachable is the
+        // whole of the fix - floatPanelPlacement is pure, and floatPlaceApply
+        // plus a real Begin is exactly what the two panel sites do - so the work
+        // area is this test's own choice and every expected number below is
+        // arithmetic rather than a function of this machine's display.
+        {
+            const ImVec2 wp(0.0f, 26.0f), ws(1600.0f, 1000.0f);
+            auto overlap = [](const FloatPlace& a, const FloatPlace& b) {
+                return a.pos.x < b.pos.x + b.size.x && b.pos.x < a.pos.x + a.size.x &&
+                       a.pos.y < b.pos.y + b.size.y && b.pos.y < a.pos.y + a.size.y;
+            };
+            FloatPlace r, a2;
+            floatPanelPlacement(wp, ws, 1.0f, r, a2);
+            const float wantX = wp.x + ws.x * 0.34f;
+            fprintf(stderr, "tileselftest: T14 ROIs (%.0f,%.0f) %.0fx%.0f  Analysis "
+                            "(%.0f,%.0f) %.0fx%.0f  (work %.0fx%.0f at %.0f,%.0f, "
+                            "x=34%% is %.0f)\n",
+                    r.pos.x, r.pos.y, r.size.x, r.size.y,
+                    a2.pos.x, a2.pos.y, a2.size.x, a2.size.y,
+                    ws.x, ws.y, wp.x, wp.y, wantX);
+            check(r.armed && a2.armed, "T14 the layout reset arms both panels");
+            check(r.pos.x == wantX && a2.pos.x == wantX,
+                  "T14 both open at the intended x = 34% of the work width");
+            check(!overlap(r, a2), "T14 ...and they do not overlap");
+            check(r.pos.x >= wp.x && r.pos.y >= wp.y &&
+                  a2.pos.x >= wp.x && a2.pos.y >= wp.y,
+                  "T14 neither is placed above or left of the work area");
+            // ANTI-VACUOUS: the geometry this replaced - 8% and 42% of the work
+            // HEIGHT - overlaps at this very work size, so "they do not overlap"
+            // is a claim about the new arithmetic and not about the test.
+            {
+                FloatPlace o1, o2;
+                o1.pos = ImVec2(wantX, wp.y + ws.y * 0.08f);
+                o1.size = ImVec2(620, 360);
+                o2.pos = ImVec2(wantX, wp.y + ws.y * 0.42f);
+                o2.size = ImVec2(560, 420);
+                check(overlap(o1, o2),
+                      "T14 the OLD 8%/42% pair overlaps here - T14 is not vacuous");
+            }
+            // A short work area: the pair is lifted back inside it, and still
+            // must not overlap - the two are placed relative to each other, so
+            // no clamp can push one into the other.
+            {
+                FloatPlace s1, s2;
+                floatPanelPlacement(wp, ImVec2(1600.0f, 700.0f), 1.0f, s1, s2);
+                fprintf(stderr, "tileselftest: T14 short work area: ROIs y=%.0f "
+                                "Analysis y=%.0f (work y %.0f..%.0f)\n",
+                        s1.pos.y, s2.pos.y, wp.y, wp.y + 700.0f);
+                check(!overlap(s1, s2) && s1.pos.y >= wp.y && s2.pos.y >= wp.y,
+                      "T14 a short work area lifts the pair, never overlaps it");
+            }
+            // ...and at 150%, where the OLD geometry was worst.
+            {
+                FloatPlace h1, h2;
+                floatPanelPlacement(wp, ws, 1.5f, h1, h2);
+                check(!overlap(h1, h2) && h1.size.x == 620 * 1.5f,
+                      "T14 the UI scale scales the boxes and still separates them");
+            }
+
+            // The ONE SHOT, through real frames: armed, spent by the first Begin,
+            // and NOT re-applied afterwards - a placement that ran every frame
+            // would drag a window the user has since moved back under the cursor.
+            FloatPlace oneShot;
+            floatPanelPlacement(wp, ws, 1.0f, oneShot, a2);
+            ImVec2 got(0, 0), gotSize(0, 0), moved(0, 0);
+            auto placeFrame = [&](bool dragItAway) {
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                ImGui::NewFrame();
+                floatPlaceApply(oneShot);          // what the panel site does
+                ImGui::Begin("T14Float", nullptr, ImGuiWindowFlags_NoSavedSettings |
+                                                  ImGuiWindowFlags_NoDocking);
+                got = ImGui::GetWindowPos();
+                gotSize = ImGui::GetWindowSize();
+                ImGui::End();
+                // the user's own drag, after the placement: by name, which works
+                // NOW - the window exists, which is the whole of the defect
+                if (dragItAway) ImGui::SetWindowPos("T14Float", moved);
+                ImGui::EndFrame();
+            };
+            placeFrame(false);
+            fprintf(stderr, "tileselftest: T14 first frame put it at (%.0f,%.0f) "
+                            "%.0fx%.0f, armed=%d\n", got.x, got.y, gotSize.x,
+                    gotSize.y, oneShot.armed ? 1 : 0);
+            check(got.x == oneShot.pos.x && got.y == oneShot.pos.y,
+                  "T14 the first Begin puts the window where the reset asked");
+            check(gotSize.x == oneShot.size.x && gotSize.y == oneShot.size.y,
+                  "T14 ...at the size it asked for too");
+            check(!oneShot.armed, "T14 ...and the one-shot is spent");
+            moved = ImVec2(oneShot.pos.x + 200, oneShot.pos.y + 150);
+            placeFrame(true);                      // move it out from under
+            placeFrame(false);                     // ...and draw again
+            fprintf(stderr, "tileselftest: T14 after a drag to (%.0f,%.0f) it is at "
+                            "(%.0f,%.0f)\n", moved.x, moved.y, got.x, got.y);
+            check(got.x == moved.x && got.y == moved.y,
+                  "T14 a spent one-shot never drags the window back");
+        }
+
         fprintf(stderr, "tileselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
