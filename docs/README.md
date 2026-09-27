@@ -89,6 +89,10 @@
 - [background/analysis/flat-field-stats.md](background/analysis/flat-field-stats.md)
 - [background/media/media-support.md](background/media/media-support.md)
 
+再構成より後に追加した背景文書は次の1本です。
+
+- [background/analysis/measurement-kernel-inventory.md](background/analysis/measurement-kernel-inventory.md)
+
 ## 文書の更新規則
 
 1. 現行仕様は一か所だけに置きます。背景へ移した記述を現在形で複製しません。
