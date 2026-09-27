@@ -424,6 +424,10 @@ enum SKey {
     // keys, because the table's order is what the user reads and the enum's
     // order is only what the ledgers index by.
     SK_uiScale,
+    // Board row 136, phase④. Appended at the end for the reason above; its ROW
+    // sits with the other browse keys, in the place browse.folderActivate was
+    // holding open for it.
+    SK_folderClick,
     // The end marker, and it is not bookkeeping. The origin ledger and the
     // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
     // used to be SK_defaultUnit - the last id on the day they were written. Any
@@ -446,7 +450,15 @@ struct SKeyDef {
     SKey id;
     const char* path;
     SStatus status;
-    const char* note;        // SS_Later / SS_NotHere: the sentence the user gets
+    // SS_Later / SS_NotHere: the sentence that replaces the control, and the one
+    // the template prints instead of a value.
+    // SS_Read (phase④): the row's own supplementary sentence, for the handful of
+    // keys the design gave one (preferences-panel-design §3.2's 帰結 column - the
+    // F2/F7 notes, readers.editor's place in the $EDITOR chain, and the two keys
+    // whose 0 means something). It is drawn UNDER the control rather than in
+    // place of it, and the template still prints the value, so the two uses of
+    // this field never collide.
+    const char* note;
     const char* sample;      // SS_Read: a valid literal, for the schema walk
 };
 
@@ -475,10 +487,23 @@ static const SKeyDef SETTING_KEYS[] = {
 
     { SK_grouped,     "browse.grouped",          SS_Read, nullptr, "false" },
     { SK_tree,        "browse.tree",             SS_Read, nullptr, "true" },
-    { SK_naturalSort, "browse.naturalSort",      SS_Read, nullptr, "false" },
-    { SK_None,        "browse.folderActivate",   SS_Later,
-      "single/double click on a folder is fixed behaviour today (board row 136)"
-      " - there is no mechanism for this to switch yet", nullptr },
+    // F2's note, on the row: the order is also what a new Browse panel starts
+    // from, so changing it here changes the default and not the panel in front
+    // of you (state.h says the same where the field is declared).
+    { SK_naturalSort, "browse.naturalSort",      SS_Read,
+      "frame_2 before frame_10. This is the default a NEW Browse panel starts "
+      "from; the panel you are looking at keeps its own order until you change "
+      "it there.", "false" },
+    // Board row 136 (ruled 2026-08-04), phase④. This row was held open as
+    // browse.folderActivate while there was no mechanism; the mechanism is
+    // app.folderClick now, so the row is READ and the key is spelled after what
+    // the user chooses - WHICH CLICK - rather than after the verb.
+    { SK_folderClick, "browse.folderClick",      SS_Read,
+      "List view only. \"single\" (the default) enters a folder on a plain "
+      "click; \"double\" makes the plain click select it and the double-click "
+      "enter, the same contract a file row has. Tree view is unaffected: there a "
+      "click expands the folder where it is and the double-click goes to it.",
+      "\"double\"" },
     { SK_None,        "browse.sortColumn",       SS_Later,
       "the Browse sort column is not persisted anywhere yet "
       "(settings-inventory 3.7)", nullptr },
@@ -517,10 +542,21 @@ static const SKeyDef SETTING_KEYS[] = {
       "the other machine - a file on this one cannot reach it (judgment 18)", nullptr },
 
     { SK_pythonExe,   "readers.pythonExecutable",SS_Read, nullptr, "\"/usr/bin/python3\"" },
-    { SK_searchPath,  "readers.searchPath",      SS_Read, nullptr, "[\"/tmp/r\"]" },
-    { SK_editor,      "readers.editor",          SS_Read, nullptr, "\"micro\"" },
+    // F7's note: the ORDER is the setting as much as the paths are, because the
+    // first match is what decodes the pixels.
+    { SK_searchPath,  "readers.searchPath",      SS_Read,
+      "In order - the FIRST reader found is the one that runs, so which of two "
+      "readers decodes your pixels is decided here.", "[\"/tmp/r\"]" },
+    // 判断18, on the row: the chain is written down where the value is typed.
+    { SK_editor,      "readers.editor",          SS_Read,
+      "Used before $EDITOR and the OS default (a setting for THIS application "
+      "beats a variable every program shares). Empty = not set.", "\"micro\"" },
 
-    { SK_defaultUnit, "series.defaultUnit",      SS_Read, nullptr, "\"cd/m2\"" },
+    // "prefill only": what an axis prints comes from the series, and an empty
+    // box there stays empty.
+    { SK_defaultUnit, "series.defaultUnit",      SS_Read,
+      "The unit a NEWLY created series starts from. It is not the unit of any "
+      "measurement already made.", "\"cd/m2\"" },
 
     // 判断10/11: the measuring class gets its own section, carries no defaults
     // there, and the session beats it. None of that is built yet, so the key is
@@ -533,12 +569,22 @@ static const SKeyDef SETTING_KEYS[] = {
     // §8, 判断record 5). A measuring setting that changed a number and left no
     // trace on it is what M1 forbids; this one leaves the trace the canon
     // already required.
-    { SK_memBudget,   "measuring.memoryBudgetGB", SS_Read, nullptr, "8" },
+    { SK_memBudget,   "measuring.memoryBudgetGB", SS_Read,
+      "0 = work it out from the machine (60% of physical RAM, never less than "
+      "2 GB). Fewer frames fit in a smaller budget, and a short stack says \"n "
+      "of N\" wherever sigma_t is printed.", "8" },
     // 段2e (裁定 2026-08-13). Watch is loading-class: it decides whether a file
     // that moved on disk is noticed at all, which is a question about how this
     // build LOADS rather than about how it looks.
-    { SK_watchFiles,  "loading.watchFiles",       SS_Read, nullptr, "true" },
-    { SK_watchAuto,   "loading.watchAutoReload",  SS_Read, nullptr, "false" },
+    // The samples are the OPPOSITE of the defaults, which is the discipline every
+    // other row already followed and these two did not: `true` for a key whose
+    // default is true lands and changes nothing, so the schema walk fed them a
+    // value it could not tell from doing nothing. W6 is what noticed.
+    { SK_watchFiles,  "loading.watchFiles",       SS_Read, nullptr, "false" },
+    // The File menu's promise, on the row: every automatic reload leaves a line.
+    { SK_watchAuto,   "loading.watchAutoReload",  SS_Read,
+      "Needs watchFiles. Every automatic reload says what it did, on the stack's "
+      "row in Files and again in Messages - nothing here is silent.", "true" },
     // #204 (裁定 2026-08-17: "the depth is a setting, and its default is 6").
     // Loading-class for the watch keys' own reason: how far under a folder
     // "all stacks below" looks is a question about what this build LOADS, not
@@ -548,7 +594,10 @@ static const SKeyDef SETTING_KEYS[] = {
     // that was the outlier, and it only ever applied to one of the two doors.
     // The sample is deliberately NOT the default: 3 is the old local depth, so
     // the schema walk feeds this row a number that has to actually land.
-    { SK_scanDepth,   "loading.folderScanDepth",  SS_Read, nullptr, "3" },
+    { SK_scanDepth,   "loading.folderScanDepth",  SS_Read,
+      "Levels UNDER the folder that is opened, 1..16. The same depth is used by "
+      "the local walk and by the ask sent to a peer - it is the only depth "
+      "\"all stacks below\" has.", "3" },
 };
 static const size_t SETTING_KEY_COUNT = sizeof SETTING_KEYS / sizeof SETTING_KEYS[0];
 
@@ -565,6 +614,22 @@ static const size_t SETTING_SECTION_COUNT =
 // "clean start" question settled against layout.ini first (settings-inventory
 // 5.5). Registered as a section so its keys are not each called unknown.
 static bool sectionIsLater(const std::string& s) { return s == "panels"; }
+
+// ...and the SENTENCE that section gets, which is the design's 注1行
+// (preferences-panel-design §3.2's last row). The Preferences panel shows a
+// section with no rows only when it has one of these, so `panels` appears - in
+// the place the file would put it - saying why it is empty instead of being
+// silently absent. A function over SETTING_SECTIONS' own names and not a
+// parallel array: a second array is a second thing to keep in step, and W7
+// asserts that every name this answers for is one of the sections.
+static const char* settingSectionNote(const char* section) {
+    if (section && strcmp(section, "panels") == 0)
+        return "Which panels are open is still layout.ini's answer. Until it is "
+               "settled which of the two files owns a clean start "
+               "(settings-inventory 5.5, 10.7), keys written here are named as "
+               "\"not read yet\" rather than half-obeyed.";
+    return nullptr;
+}
 
 static size_t editDistance(const std::string& a, const std::string& b) {
     std::vector<size_t> prev(b.size() + 1), cur(b.size() + 1);
@@ -708,6 +773,12 @@ static std::string g_settingsToast;
 // remote.repoUrl (判断17): the build-time VIEWER_REPO_URL stays the default,
 // and a fork's user has no reason to rebuild to change where the peer comes
 // from. Empty = not set, which is 判断9 in one variable.
+//
+// phase④: it has a prefs.txt line now ("repourl"), kept in g_prefsBase because
+// this variable is the RESOLVED value and the two layers have to stay apart -
+// the same reason gamma has had a base since the session layer arrived. The
+// value read from prefs.txt is put here at the end of loadSettings*, where
+// "the file did not name it" resolves to "what prefs.txt held".
 static std::string g_settingsRepoUrl;
 static const char* repoUrlInUse() {
     return g_settingsRepoUrl.empty() ? VIEWER_REPO_URL : g_settingsRepoUrl.c_str();
@@ -1030,6 +1101,17 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
         case SK_grouped:     { bool b; if (A.wantBool(v, path, b)) A.setB(app.rbFlat, !b, path); break; }
         case SK_tree:        { bool b; if (A.wantBool(v, path, b)) A.setB(app.rbTree, b, path); break; }
         case SK_naturalSort: { bool b; if (A.wantBool(v, path, b)) A.setB(app.rbNatural, b, path); break; }
+        // Board row 136. An ENUM and not a bool, for browse.grouped's reason one
+        // step further on: "folderClick: true" says nothing, while the two words
+        // the user is choosing between are the two gestures themselves. A third
+        // word is refused BY NAME by wantEnum, which is what the row's combo is
+        // built from - so the control can never offer a value the file rejects.
+        case SK_folderClick: {
+            int idx = 0;
+            if (A.wantEnum(v, path, { "single", "double" }, idx))
+                A.setI(app.folderClick, idx, path);
+            break;
+        }
         case SK_stackPrompt: {
             int idx = 0;
             if (A.wantEnum(v, path, { "ask", "always", "never" }, idx))
@@ -1078,11 +1160,13 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
         case SK_memBudget: {
             double n = 0;
             if (!A.wantNum(v, path, n)) break;
-            // 0 = automatic; otherwise the same window the menu clamps to.
+            // 0 = automatic; otherwise the window memBudgetValid() defines, which
+            // is the SAME window --mem-budget uses (core/app/state.h - the flag
+            // used to clamp to its own pair of literals and could not say 0).
             // REFUSED rather than clamped, exactly as displayGamma is: a file
             // that asked for 0.1 GB meant something, and silently giving it 0.5
             // would answer a question it did not ask (判断8).
-            if (n != 0 && (n < 0.5 || n > 4096)) {
+            if (!memBudgetValid(n)) {
                 A.rangeErr(v, path, "0 (automatic) or 0.5 .. 4096");
                 break;
             }
@@ -1270,13 +1354,16 @@ static SettingsReport loadSettingsRead(const std::string& path) {
     std::string name = path;
     size_t slash = name.find_last_of("/\\");
     if (slash != std::string::npos) name = name.substr(slash + 1);
-    // The two values this file OWNS outright - they have no prefs.txt layer
-    // under them - are cleared first. Every app.* field is deliberately not:
-    // "absent" there means "keep what prefs gave", which is the whole shape of
-    // the layering. Here "absent" means empty, and a value left over from a
-    // previous read would be a setting you can enter and never leave.
-    g_settingsRepoUrl.clear();
-    g_settingsEditorCmd.clear();
+    // The two values with no App field of their own are reset first, to THE
+    // LAYER UNDER THEM. Every app.* field is deliberately not reset: "absent"
+    // there means "keep what prefs gave", which is the whole shape of the
+    // layering - and phase④ gave these two a prefs.txt line, so that is now
+    // exactly what "absent" means here too. (It used to mean empty, because
+    // there was nothing below; a value left over from a PREVIOUS read would
+    // still be a setting you can enter and never leave, which is why the reset
+    // itself stays.)
+    g_settingsRepoUrl = g_prefsBase.repoUrl;
+    g_settingsEditorCmd = g_prefsBase.editorCmd;
     // ...and the recipe library, for the same reason and one more. It has no
     // prefs.txt layer under it either, so "absent" here means "empty"; and a
     // recipe left over from a previous read would be a named recipe the user
@@ -1412,7 +1499,12 @@ struct PrefRow {
     SWidget widget = SW_None;
     std::string value;          // what the app holds now, as the panel prints it
     std::string badge;          // WHO decides it (§5.1)
-    const char* note = nullptr; // SS_Later / SS_NotHere: the sentence
+    // SS_Later / SS_NotHere: the sentence that REPLACES the control.
+    // SS_Read: the row's own sentence, drawn under the control (phase④).
+    const char* note = nullptr;
+    // ...and what the machine currently makes of a value that says "decide for
+    // me" (memoryBudgetGB's 0). Empty for every other row.
+    std::string effective;
 };
 
 // The widget a key takes. A switch rather than a column on SKeyDef: the kind is
@@ -1426,7 +1518,7 @@ static SWidget settingsWidgetFor(SKey id) {
         // the field is rbFlat, so a checkbox would be inverted against its own
         // name. Two words beat a negated tick.
         case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
-        case SK_grouped:
+        case SK_grouped: case SK_folderClick:
             return SW_Enum;
         case SK_gamma:
             return SW_Gamma;
@@ -1435,13 +1527,21 @@ static SWidget settingsWidgetFor(SKey id) {
         case SK_naturalSort: case SK_lowBandwidth:
         case SK_watchFiles: case SK_watchAuto:
             return SW_Bool;
-        case SK_accent: case SK_memBudget: case SK_scanDepth:
+        case SK_accent: case SK_scanDepth:
             return SW_Int;
         // #257. A multiplier, so a float box rather than the gamma control's
         // presets: there is no pair of blessed values here - what is right is
         // whatever this display and these eyes want - and 0 has to remain
         // typeable, because 0 is how the row is handed back to the machine.
-        case SK_uiScale:
+        //
+        // measuring.memoryBudgetGB joins it in phase④, and the correction is the
+        // same shape W2 made for browse.grouped: it was SW_Int (beside the accent)
+        // and had no int field, so the row drew NOTHING and the design's "編集可"
+        // was a claim the panel did not keep. It is a float because the applier
+        // accepts 0.5 - an InputInt cannot hold the smallest budget the file
+        // itself allows - and 0 has to stay typeable for uiScale's reason: 0 is
+        // how the budget is handed back to the machine.
+        case SK_uiScale: case SK_memBudget:
             return SW_Float;
         // series.defaultUnit is a free string, not an enumeration: the
         // applier accepts any name that fits (a lab measures in whatever it
@@ -1512,8 +1612,30 @@ static int* prefIntField(SKey id) {
 static float* prefFloatField(SKey id) {
     switch (id) {
         case SK_uiScale: return &app.uiScaleOverride;
+        // phase④: the field the design's 段2d row has been pointing at since it
+        // was opened. THE REQUEST, not seqMemBudget()'s answer - 0 means "work it
+        // out from the machine", and the resolved figure is printed beside the
+        // row (prefEffectiveNote) rather than written into the box, exactly as
+        // uiScale's 0 is left alone.
+        case SK_memBudget: return &app.memBudgetGB;
         default:         return nullptr;
     }
+}
+// What the machine currently makes of a key whose own value is "decide for me".
+// Two keys mean something by 0, and a row that shows 0 and nothing else leaves
+// the one number the user wants - how much RAM will actually be used - only in a
+// menu three levels down. Pure, so W8 asserts it without a window.
+static size_t seqMemBudget();                    // fwd: core/app/sequence.inc
+static std::string prefEffectiveNote(SKey id) {
+    if (id != SK_memBudget) return {};
+    char b[96];
+    const double gb = seqMemBudget() / 1073741824.0;
+    if (app.memBudgetGB > 0) {
+        snprintf(b, sizeof b, "in effect: %.1f GB", gb);
+        return b;
+    }
+    snprintf(b, sizeof b, "in effect: %.1f GB (worked out from this machine)", gb);
+    return b;
 }
 static std::string* prefTextField(SKey id) {
     switch (id) {
@@ -1553,6 +1675,13 @@ static void prefEnumChoices(SKey id, std::vector<const char*>& out, int& cur) {
             out = { "grouped", "flat" };
             cur = app.rbFlat ? 1 : 0;
             break;
+        // Board row 136, and the list is the applier's own vocabulary one more
+        // time: "single" is index 0 because it is the default and because 0 is
+        // what prefs.txt has always meant by the behaviour that shipped.
+        case SK_folderClick:
+            out = { "single", "double" };
+            cur = std::clamp(app.folderClick, 0, 1);
+            break;
         default: break;
     }
 }
@@ -1564,19 +1693,97 @@ static void prefEnumSet(SKey id, int idx) {
         case SK_stackPrompt: app.seqLoadMode = std::clamp(idx, 0, 2); break;
         case SK_policy: app.procPolicy = idx ? App::PolLocalFetch : App::PolAuto; break;
         case SK_grouped: app.rbFlat = idx != 0; break;
+        case SK_folderClick: app.folderClick = std::clamp(idx, 0, 1); break;
         default: break;
     }
 }
 
-// Update exactly one member of the lower prefs.txt layer after a GUI change.
-// The effective App fields may carry a session value, so capturing both fields
-// wholesale would accidentally make an untouched session neighbour permanent.
-static void prefsBaseUpdate(SKey id) {
+// ---- phase④: WHO OWNS EACH prefs.txt LINE, this run -------------------------
+// The GUI has changed this key in this run, so what prefs.txt records for it is
+// this machine's own answer and no longer whatever the lower layer held. One flag
+// per key, indexed by SKey for the reason SK_Count exists (D6): a ledger whose
+// bound is the last id somebody remembered silently drops every later key.
+static bool g_prefsGuiOwned[SK_Count];
+static void prefsGuiOwnedClear() { for (bool& b : g_prefsGuiOwned) b = false; }
+
+// ONE key's live App value, copied into a prefs record. The per-key knowledge
+// lives here, beside settingsCurrentValue() and the widget kinds, for 判断16's
+// reason - and it is a function OF THE RECORD rather than of g_prefsBase, because
+// prefsToWrite() below needs to fill a different one.
+static void prefsRecordFrom(PrefsBase& B, SKey id) {
     switch (id) {
-        case SK_gamma:     g_prefsBase.dispGamma = app.dispGamma; break;
-        case SK_pixelGrid: g_prefsBase.showGrid = app.showGrid; break;
-        default: break;
+        case SK_theme:       B.themeVariant = app.themeVariant; break;
+        case SK_accent:      B.themeAccent = app.themeAccent; break;
+        case SK_compact:     B.compactUi = app.compactUi; break;
+        case SK_titleBar:    B.frameMode = app.frameMode; break;
+        case SK_showFps:     B.showFps = app.showFps; break;
+        case SK_pixelGrid:   B.showGrid = app.showGrid; break;
+        case SK_gamma:       B.dispGamma = app.dispGamma; break;
+        case SK_uiScale:     B.uiScaleOverride = app.uiScaleOverride; break;
+        case SK_dragPans:    B.dragPans = app.dragPans; break;
+        case SK_wheelZoom:   B.wheelZoomPlain = app.wheelZoomPlain; break;
+        case SK_fitOnSwitch: B.fitOnSwitch = app.fitOnSwitch; break;
+        case SK_grouped:     B.rbFlat = app.rbFlat; break;
+        case SK_tree:        B.rbTree = app.rbTree; break;
+        case SK_naturalSort: B.rbNatural = app.rbNatural; break;
+        case SK_folderClick: B.folderClick = app.folderClick; break;
+        case SK_stackPrompt: B.seqLoadMode = app.seqLoadMode; break;
+        case SK_peerExe:     B.remoteExe = app.remoteExe; break;
+        case SK_policy:      B.procPolicy = app.procPolicy; break;
+        case SK_lowBandwidth:B.lowBandwidth = app.lowBandwidth; break;
+        case SK_repoUrl:     B.repoUrl = g_settingsRepoUrl; break;
+        case SK_pythonExe:   B.pythonExe = app.pythonExe; break;
+        case SK_searchPath:  B.readerPlaces = app.readerPlaces; break;
+        case SK_editor:      B.editorCmd = g_settingsEditorCmd; break;
+        case SK_defaultUnit: B.linUnit = app.lin.unit; break;
+        case SK_memBudget:   B.memBudgetGB = app.memBudgetGB; break;
+        case SK_watchFiles:  B.watchEnabled = app.watchEnabled; break;
+        case SK_watchAuto:   B.watchAutoReload = app.watchAutoReload; break;
+        case SK_scanDepth:   B.folderScanDepth = app.folderScanDepth; break;
+        // rawRecipes has no prefs.txt line - it is a settings.jsonc library and
+        // nothing else writes it - and the two non-keys are not keys. All three
+        // are listed so that the compiler, not a reader, notices the next key.
+        case SK_rawRecipes: case SK_None: case SK_Count: break;
     }
+}
+
+// Update exactly one member of the lower prefs.txt layer after a GUI change, and
+// record that this key is now this machine's own answer. The effective App fields
+// may carry a session value, or a settings.jsonc / CLI value, so capturing every
+// field wholesale would make an untouched neighbour of the changed key permanent
+// - which is the leak itself.
+static void prefsBaseUpdate(SKey id) {
+    if (id > SK_None && id < SK_Count) g_prefsGuiOwned[id] = true;
+    prefsRecordFrom(g_prefsBase, id);
+}
+
+// The record prefs.txt is written from. g_prefsBase is what the LOWER layer held;
+// a key takes its live App value only when nothing above prefs.txt is deciding
+// it, or when this run's GUI has changed it.
+//
+// The rule in one line: a key some layer ABOVE prefs.txt is deciding, and that no
+// hand has touched since, keeps the value prefs.txt already had. Without it,
+// saving ANY preference wrote the whole resolved state back - so a settings.jsonc
+// key or a one-off flag became this machine's permanent preference, outlived the
+// file or the flag that set it, and could not be told from a choice the user had
+// made (settings-inventory §11, "prefs 焼付き"; before phase④ only gamma and grid
+// were protected, and only after a session had been loaded).
+//
+// While the base has not been captured this is the identity: a windowless or
+// scripted run that pokes a field and saves still round-trips its own value.
+static PrefsBase prefsToWrite() {
+    PrefsBase P = g_prefsBase;
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++) {
+        const SKeyDef& d = SETTING_KEYS[k];
+        if (d.status != SS_Read || d.id <= SK_None || d.id >= SK_Count) continue;
+        const SetOrigin who = settingsOriginOf(d.id).who;
+        // Nobody above prefs.txt spoke for this key, so its live value can only
+        // have come from prefs.txt itself or from this session's own GUI - either
+        // way it is this machine's answer.
+        if (!g_prefsBaseActive || who == SetOrigin::None || g_prefsGuiOwned[d.id])
+            prefsRecordFrom(P, d.id);
+    }
+    return P;
 }
 
 // The side effect a change owes the rest of the program. The SAME helpers the
@@ -1614,6 +1821,13 @@ static void prefAfterChange(SKey id) {
                         " takes effect at the next start (the font is baked once, "
                         "while the window is being created).");
             break;
+        // phase④, and the same shape a third time: the box has no bounds, the
+        // applier's window is 0 or 0.5..4096, and 0 survives on purpose - it is
+        // how the budget is handed back to the machine.
+        case SK_memBudget:
+            if (app.memBudgetGB != 0)
+                app.memBudgetGB = std::clamp(app.memBudgetGB, 0.5f, 4096.0f);
+            break;
         case SK_titleBar:
             window_frame::setMode(app.frameMode == 1 ? window_frame::Integrated
                                                      : window_frame::System);
@@ -1625,6 +1839,49 @@ static void prefAfterChange(SKey id) {
     app.prefsDirty = true;             // prefs.txt is the GUI's only write target
 }
 
+// ---- back to the built-in default (preferences-panel-design §5.4) -----------
+// The other half of 判断9, which the panel was missing: "delete the key" is the
+// way back in settings.jsonc, and prefs.txt needed the same door. Written as a
+// switch beside settingsCurrentValue() rather than derived from a default-
+// constructed App, because the two have to agree and only one of them can be
+// read: W6 asserts the agreement for EVERY readable key - after a reset,
+// settingsCurrentValue() must be empty, which is this file's own definition of
+// "at the default". A key added to the table and forgotten here fails that line.
+static void prefResetToDefault(SKey id) {
+    switch (id) {
+        case SK_theme:       app.themeVariant = ui_theme::VariantDark; break;
+        case SK_accent:      app.themeAccent = 0; break;
+        case SK_compact:     app.compactUi = true; break;
+        case SK_titleBar:    app.frameMode = 1; break;
+        case SK_showFps:     app.showFps = false; break;
+        case SK_pixelGrid:   app.showGrid = false; break;
+        case SK_gamma:       app.dispGamma = 1.0f; break;
+        case SK_uiScale:     app.uiScaleOverride = 0.0f; break;
+        case SK_dragPans:    app.dragPans = false; break;
+        case SK_wheelZoom:   app.wheelZoomPlain = false; break;
+        case SK_fitOnSwitch: app.fitOnSwitch = false; break;
+        case SK_grouped:     app.rbFlat = false; break;
+        case SK_tree:        app.rbTree = false; break;
+        case SK_naturalSort: app.rbNatural = true; break;
+        case SK_folderClick: app.folderClick = 0; break;
+        case SK_stackPrompt: app.seqLoadMode = 0; break;
+        case SK_rawRecipes:  g_rawLibrary.clear(); break;
+        case SK_peerExe:     app.remoteExe.clear(); break;
+        case SK_policy:      app.procPolicy = App::PolAuto; break;
+        case SK_lowBandwidth:app.lowBandwidth = false; break;
+        case SK_repoUrl:     g_settingsRepoUrl.clear(); break;
+        case SK_pythonExe:   app.pythonExe.clear(); break;
+        case SK_searchPath:  app.readerPlaces.clear(); break;
+        case SK_editor:      g_settingsEditorCmd.clear(); break;
+        case SK_defaultUnit: snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx"); break;
+        case SK_memBudget:   app.memBudgetGB = 0; break;
+        case SK_watchFiles:  app.watchEnabled = true; break;
+        case SK_watchAuto:   app.watchAutoReload = false; break;
+        case SK_scanDepth:   app.folderScanDepth = 6; break;
+        case SK_None: case SK_Count: break;
+    }
+}
+
 // One path for every real gamma/grid GUI mutation (Preferences, Inspector,
 // menus, and the G shortcut). It updates the lower preference and side effects,
 // but deliberately does not replace a Session origin: the edited value remains
@@ -1633,6 +1890,73 @@ static void settingsDisplayGuiChanged(SKey id, const char* path) {
     if (id != SK_gamma && id != SK_pixelGrid) return;
     prefAfterChange(id);
     settingsWarnIfSticky(id, path);
+}
+
+// The Reset the panel's row menu offers (§5.4). Back to the built-in default,
+// then everything an ordinary change owes: the side effects, this machine's
+// preference, prefs.txt marked dirty - and the sticky warning, because resetting
+// a key settings.jsonc decides is exactly as temporary as changing it and the
+// operator has to learn that at the same moment rather than after a restart.
+static void settingsResetGui(SKey id, const char* path) {
+    prefResetToDefault(id);
+    prefAfterChange(id);
+    settingsWarnIfSticky(id, path);
+}
+
+// ---- phase④: the GUI's changes, NOTICED rather than reported ----------------
+// A setting can be changed from a dozen places - this panel, four submenus, the
+// Inspector, the G shortcut, the Browse header, the Readers and RAW recipe
+// panels - and every one of them owes the same three things: warn if the file
+// decides this key, record that the value is now this machine's own, and mark
+// prefs.txt dirty. Asking each call site to remember all three is asking for a
+// list that has to be complete, and a list that has to be complete is a list
+// that rots (#71; browse-topbar-design §10.8's "a second registration always
+// rots"). The evidence is in the tree: only eleven of the twenty-eight readable
+// keys were in the frame loop's hand-written change hash, so changing the memory
+// budget or the remote policy from the File menu did not even mark prefs dirty,
+// and no key outside Preferences and gamma/grid has ever warned that the change
+// springs back.
+//
+// So the change is NOTICED. One snapshot per readable key - as
+// settingsCurrentValue() renders it, which is the same medium the badge, the
+// template and Copy as JSONC use - compared once per frame. Nothing has to be
+// registered, and a key added to SETTING_KEYS is watched on the day it is added.
+//
+// What this deliberately does NOT do is re-run prefAfterChange(): the side
+// effects belong to whoever drew the control (the menu that flipped the title bar
+// has already told window_frame), and applying them a second time from here would
+// be a second application of the same change.
+static std::string g_prefsSeen[SK_Count];
+static bool g_prefsSeenInit = false;
+// "These keys moved, and NOT because a hand moved a control" - the startup layers
+// and a loaded .vsession. Without it, opening a document with a gamma in it would
+// be indistinguishable from turning the gamma knob.
+static void settingsResyncGuiSnapshot() {
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++) {
+        const SKeyDef& d = SETTING_KEYS[k];
+        if (d.status == SS_Read && d.id > SK_None && d.id < SK_Count)
+            g_prefsSeen[d.id] = settingsCurrentValue(d.id);
+    }
+    g_prefsSeenInit = true;
+}
+// Returns how many keys moved, so the caller can write prefs.txt once for the
+// frame rather than once per key. The first call only takes the snapshot: at that
+// point every value is a startup value and none of them is news.
+static int settingsPollGuiChanges() {
+    if (!g_prefsSeenInit) { settingsResyncGuiSnapshot(); return 0; }
+    int n = 0;
+    for (size_t k = 0; k < SETTING_KEY_COUNT; k++) {
+        const SKeyDef& d = SETTING_KEYS[k];
+        if (d.status != SS_Read || d.id <= SK_None || d.id >= SK_Count) continue;
+        std::string now = settingsCurrentValue(d.id);
+        if (now == g_prefsSeen[d.id]) continue;
+        g_prefsSeen[d.id] = std::move(now);
+        n++;
+        prefsBaseUpdate(d.id);                 // this machine's answer now
+        settingsWarnIfSticky(d.id, d.path);    // ...unless the file wins at the next start
+        app.prefsDirty = true;
+    }
+    return n;
 }
 
 // session.inc is included before this file and therefore cannot name SKey.
@@ -1706,6 +2030,7 @@ static std::vector<PrefRow> settingsPrefRows() {
             r.widget = settingsWidgetFor(d.id);
             r.value = settingsCurrentValue(d.id);
             r.badge = settingsBadgeFor(d.id);
+            r.effective = prefEffectiveNote(d.id);
         }
         rows.push_back(std::move(r));
     }
@@ -1729,6 +2054,10 @@ static std::string settingsCurrentValue(SKey id) {
         case SK_grouped: return app.rbFlat ? "false" : "";
         case SK_tree: return app.rbTree ? "true" : "";
         case SK_naturalSort: return app.rbNatural ? "" : "false";
+        // Board row 136. "single" is the default and therefore writes nothing:
+        // 判断9 keeps "chose single" and "never chose" apart for the day the
+        // default moves - which is the whole reason this is a key and not a bool.
+        case SK_folderClick: return app.folderClick == 1 ? "\"double\"" : "";
         // 0 is the default AND a meaningful value ("automatic"), so the empty
         // string here means "not set" exactly as it does everywhere else - the
         // two coincide, which is why the panel prints the RESOLVED figure

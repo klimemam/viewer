@@ -570,8 +570,8 @@ static void printUsage() {
         "  --quad-bayer                treat the CFA as Quad Bayer\n"
         "  --cfa <none|bayer|quad>     1ch files (.npy included) arrive mosaiced\n"
         "  --stack <mode>              numbered siblings: ask (default) | always | never\n"
-        "  --mem-budget <GB>           what the stack loader may hold (default: auto,\n"
-        "                              60%% of physical RAM)\n"
+        "  --mem-budget <GB>           what the stack loader may hold: 0 = auto (the\n"
+        "                              default, 60%% of physical RAM) or 0.5 .. 4096\n"
         // %s, not a copy: this line said "(H,W,3|4)" while the refusal it is
         // describing said something else, which is exactly the drift issue #71
         // was. There is now one spelling and it lives in one place.
@@ -960,7 +960,25 @@ static void parseCli(int argc, char** argv) {
             app.remoteExe = next();
             settingsOriginCli(SK_peerExe, "--remote-exe");
         } else if (a == "--mem-budget") {          // GB the stack loader may use
-            app.memBudgetGB = std::clamp((float)atof(next().c_str()), 0.5f, 4096.0f);
+            // The same domain measuring.memoryBudgetGB accepts, and for the same
+            // reason the file gives it (判断8, and #257's rule that a flag and a
+            // key must not mean different things for the same number): 0 is
+            // "work it out from this machine" and every other value is refused
+            // BY NAME rather than clamped. It used to clamp, which made 0 - the
+            // one way to say "automatic" - arrive as 0.5, so the flag could not
+            // express the key's own default.
+            const std::string mb = next();
+            const double gb = atof(mb.c_str());
+            if (memBudgetValid(gb)) {
+                app.memBudgetGB = (float)gb;
+                // ...and the ledger: this flag DECIDES measuring.memoryBudgetGB
+                // for this run, so the Preferences row says "command line
+                // (--mem-budget)" instead of showing a number nobody can place.
+                settingsOriginCli(SK_memBudget, "--mem-budget");
+            } else {
+                fprintf(stderr, "--mem-budget expects 0 (work it out from this "
+                                "machine) or 0.5 .. 4096; ignoring %s\n", mb.c_str());
+            }
         } else if (a == "--compare") {
             std::string v = next();
             int m = compareModeFromName(v);

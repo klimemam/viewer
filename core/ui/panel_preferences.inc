@@ -168,10 +168,11 @@ static void prefWidget(const PrefRow& r) {
             break;
         }
         case SW_Float: {
-            // The multiplier keys (#257 is the only one today). Committed on
-            // Enter or on leaving the box rather than per keystroke: typing
-            // "1.25" passes through 1 and 1.2, and each of those would be a
-            // toast and a prefs.txt write for a value nobody asked for.
+            // The keys whose value is a REAL number: the UI multiplier (#257) and
+            // the memory budget (phase④). Committed on Enter or on leaving the box
+            // rather than per keystroke: typing "1.25" passes through 1 and 1.2,
+            // and each of those would be a toast and a prefs.txt write for a value
+            // nobody asked for.
             float* v = prefFloatField(r.id);
             if (v && ImGui::InputFloat("##v", v, 0.0f, 0.0f, "%.2f",
                                        ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -182,6 +183,10 @@ static void prefWidget(const PrefRow& r) {
                 ImGui::SetTooltip("0 = work it out from the display.\n"
                                   "Otherwise 0.5 .. 4, applied at the next start.\n"
                                   "The startup line on stderr says what was decided.");
+            if (r.id == SK_memBudget && ImGui::IsItemHovered())
+                ImGui::SetTooltip("0 = work it out from this machine.\n"
+                                  "Otherwise 0.5 .. 4096 GB. Fewer frames fit in a\n"
+                                  "smaller budget, and a short stack says \"n of N\".");
             break;
         }
         case SW_Text: {
@@ -218,7 +223,46 @@ static void prefWidget(const PrefRow& r) {
         default:
             break;
     }
+    // What the machine currently makes of a value that says "decide for me".
+    // Under the control rather than inside it: 0 is the honest contents of the
+    // box (writing the resolved figure back would turn an automatic choice into
+    // a permanent one), and the resolved number is what the user came to see.
+    if (!r.effective.empty()) ImGui::TextDisabled("%s", r.effective.c_str());
     ImGui::PopID();
+}
+
+// The row's own right-click, on BOTH of its halves. "Copy as JSONC" is how a
+// change made here becomes permanent, since this panel writes prefs.txt and the
+// file is the user's to write (判断3); "Reset to default" is 判断9's way back,
+// which the panel was missing - deleting the key is the answer in the file and
+// there was no equivalent for a value prefs.txt had saved.
+//
+// It is submitted from the name cell as well as the value cell because the value
+// cell's last item is whatever the control happened to be: a checkbox is a few
+// pixels wide and a link row's summary is disabled text, so on those rows the
+// menu was effectively unreachable. The label is always there and always the same
+// size, so every row has one entrance that does not depend on its widget.
+static void prefRowMenu(const PrefRow& r, const char* popupId) {
+    if (r.status != SS_Read) return;
+    if (!ImGui::BeginPopupContextItem(popupId)) return;
+    ImGui::TextDisabled("%s", r.path);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Copy as JSONC")) {
+        ImGui::SetClipboardText(settingsKeyAsJsonc(r.id).c_str());
+        toast(std::string(r.path) + " copied as JSONC");
+    }
+    // Greyed at the default rather than hidden: "this is already the default" is
+    // an answer, and an item that comes and goes is one the user has to hunt for.
+    const bool atDefault = r.value.empty();
+    if (ImGui::MenuItem("Reset to default", nullptr, false, !atDefault)) {
+        settingsResetGui(r.id, r.path);
+        toast(std::string(r.path) + " is back to its built-in default");
+    }
+    if (atDefault && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Already at the built-in default, so nothing is written\n"
+                          "for it (an unset key and a key written at the default\n"
+                          "are different the day the default moves).");
+    ImGui::EndPopup();
 }
 
 static void drawPreferencesPanel() {
@@ -281,7 +325,28 @@ static void drawPreferencesPanel() {
         for (const PrefRow& r : rows)
             if (r.path && std::string(r.path).rfind(sec, 0) == 0 && matches(r))
                 mine.push_back(&r);
-        if (mine.empty()) continue;
+        // A section with no rows is normally not drawn - but one that carries a
+        // SENTENCE is (§3.2's 注1行). `panels` is the only one today: its keys are
+        // not read until layout.ini and prefs settle which file owns a clean
+        // start, and a section that is simply absent tells the reader nothing at
+        // all, while a section that says why is the same discipline as an
+        // SS_Later row. Filtered out with the rest when a filter is typed.
+        const char* secNote = settingSectionNote(SETTING_SECTIONS[s]);
+        if (mine.empty()) {
+            if (!secNote) continue;
+            std::string hay = std::string(SETTING_SECTIONS[s]) + " " + secNote;
+            std::string lo = hay, lf = f;
+            std::transform(lo.begin(), lo.end(), lo.begin(),
+                           [](unsigned char c) { return (char)tolower(c); });
+            std::transform(lf.begin(), lf.end(), lf.begin(),
+                           [](unsigned char c) { return (char)tolower(c); });
+            if (!f.empty() && lo.find(lf) == std::string::npos) continue;
+            ImGui::SeparatorText(SETTING_SECTIONS[s]);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", secNote);
+            ImGui::PopTextWrapPos();
+            continue;
+        }
         ImGui::SeparatorText(SETTING_SECTIONS[s]);
         if (!ImGui::BeginTable(SETTING_SECTIONS[s], 3,
                                ImGuiTableFlags_SizingStretchProp)) continue;
@@ -293,17 +358,24 @@ static void drawPreferencesPanel() {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(prefLabelOf(r->path).c_str());
             ImGui::TextDisabled("%s", r->path);
+            // The entrance every row has, whatever its control turned out to be.
+            // The id carries the PATH: an ImGui popup id is derived from the id
+            // stack, and a literal "name" would be the same id on every row of
+            // the table - so right-clicking one row would raise another's menu.
+            const std::string nameMenuId = std::string(r->path ? r->path : "") + "#name";
+            prefRowMenu(*r, nameMenuId.c_str());
             ImGui::TableNextColumn();
-            if (r->status == SS_Read) prefWidget(*r);
-            // The row's own right-click. "Copy as JSONC" is how a change made
-            // here becomes permanent, since this panel writes prefs.txt and the
-            // file is the user's to write (判断3).
-            if (r->status == SS_Read && ImGui::BeginPopupContextItem(r->path)) {
-                if (ImGui::MenuItem("Copy as JSONC")) {
-                    ImGui::SetClipboardText(settingsKeyAsJsonc(r->id).c_str());
-                    toast(std::string(r->path) + " copied as JSONC");
+            if (r->status == SS_Read) {
+                prefWidget(*r);
+                prefRowMenu(*r, r->path);
+                // The row's own sentence, for the keys the design gave one (§3.2's
+                // 帰結 column). Under the control, wrapped: it is the difference
+                // between "a setting exists" and "you can tell what it does".
+                if (r->note && *r->note) {
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextDisabled("%s", r->note);
+                    ImGui::PopTextWrapPos();
                 }
-                ImGui::EndPopup();
             }
             else ImGui::TextDisabled("%s", r->note ? r->note : "");
             ImGui::TableNextColumn();

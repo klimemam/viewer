@@ -64,7 +64,9 @@ UI を実フレーム経由で駆動できる入口は `--browse-keys-selftest <
 - キー: `down` `up` `left` `right` `enter` `home` `end` `back` `esc` `comma` `period`
 - マウス: `click` `ctrlclick` `dbl` `clickoff:N` `dbloff:N` `idle:N` `chevclick`
   `mback` `mfwd` `altleft` `altright` `fmenu` `rctx` `rctxcur` `ctxclick:LABEL`
-- 状態: `viewreset` `w<px>` `h<px>` `focus` `blur` `flat` `tree` `disc`。
+- 状態: `viewreset` `w<px>` `h<px>` `focus` `blur` `flat` `tree` `natorder`
+  `folderclick:0|1` `disc`。`viewreset` は flat / tree / natorder / folderclick を
+  絶対値で固定する (この機械の prefs が漏れると行番号ごと狂う)。
   撤去済みの drawer と同じく `more` action も存在しない
 - instance: `target:N` `newpanel` `reconnect` `closep` `hidep` `showp` `filt:S` `sessrt`
 - 待機: `waitimg:N` `waitdir:LEAF`
