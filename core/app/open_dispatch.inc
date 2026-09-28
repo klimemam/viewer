@@ -229,6 +229,36 @@ static std::string updateScript() {
     return s;
 }
 
+// Does the peer over there RUN, and if not, WHY NOT in one line.
+//
+// #268: the loader's own words name the version the binary wanted and never
+// the version the host has ("version `GLIBC_2.29' not found"), so a report
+// that quoted them cost a round trip to answer - and the next report would
+// have cost another one. The missing half is on the SERVER, where both are
+// readable, so the probe says it there: ONE sentence, and the same sentence
+// tools/binaries/update.sh prints, produced by the same expression.
+//
+// grep -a over the binary rather than objdump, for update.sh's reason: the
+// machine that needs this sentence is a compute box with no build environment,
+// which is exactly the machine with no binutils. `strings` is the fallback,
+// and sort's stderr is dropped so a macOS peer (no Mach-O GLIBC_ strings, no
+// sort -V) says nothing instead of something confusing.
+//
+// `orElse` is what the caller wants printed when the peer is not there at all
+// - the marker the NO_PEER / "does not run" branches below read.
+static std::string peerProbeScript(const std::string& orElse) {
+    return
+        "p=\"$HOME/.viewer/viewer-serve\"\n"
+        "if \"$p\" --version 2>&1; then :; else\n"
+        "  need=$({ LC_ALL=C grep -ao 'GLIBC_[0-9.]*' \"$p\" 2>/dev/null"
+        " || strings -a \"$p\" 2>/dev/null; }"
+        " | grep -o 'GLIBC_[0-9.]*' | sort -Vu 2>/dev/null | tail -1)\n"
+        "  [ -n \"$need\" ] && echo \"viewer-serve needs $need but this host has "
+        "$(ldd --version 2>&1 | head -1)\"\n"
+        "  " + (orElse.empty() ? std::string(":") : orElse) + "\n"
+        "fi\n";
+}
+
 // Install the peer, best method first. Returns a human-readable log either way.
 bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
     std::string out, err;
@@ -236,8 +266,7 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
     //    (--help must actually run: a peer that was copied but dies on a glibc
     //    mismatch reported only "connection lost" before this check existed)
     if (!remote::runSshScript(host, port,
-            "uname -s; uname -m\n"
-            "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || echo NO_PEER\n",
+            "uname -s; uname -m\n" + peerProbeScript("echo NO_PEER"),
             out, err, 20.0)) {
         log = "cannot reach " + host + ": " + err;
         return false;
@@ -282,9 +311,8 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                 // a newer distro dies on glibc with nothing but "connection
                 // lost" further down. Surface the loader's actual words.
                 std::string vout, verr3;
-                remote::runSshScript(host, port,
-                    "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || true\n",
-                    vout, verr3, 15.0);
+                remote::runSshScript(host, port, peerProbeScript(""),
+                                     vout, verr3, 15.0);
                 size_t vp2 = vout.find("viewer-serve protocol ");
                 if (vp2 == std::string::npos) {
                     log = "copied to " + host + ", but it does not run there:\n" + vout +

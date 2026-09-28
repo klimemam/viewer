@@ -60,6 +60,50 @@ running_pids() {                 # $1 = path to a binary
   fi
 }
 
+# Did the update leave behind a peer that can actually START here?
+#
+# #268 is the reason this exists, and the report was the whole of it: "remote
+# の update ができない。glibc で怒られます." The update had SUCCEEDED - git
+# replaced every file without complaint - and the binary it left could not run
+# on that host. Nothing anywhere said WHICH glibc the binary wanted or which
+# one the machine had, so the answer needed a round trip to ask, and the next
+# report would have needed another one.
+#
+# viewer-serve is the one that gets probed because it is the one that HAS a
+# flag for it: --version prints its protocol number and exits. `viewer` has no
+# such flag - running it to find out would try to open a window - so the GUI
+# binary's floor stays a documented number (docs/guides/startup.md) instead of
+# a measured one.
+#
+# grep -a over the binary rather than objdump, and strings only as a fallback:
+# the machine that needs this sentence is a compute box with no build
+# environment, which is exactly the machine with no binutils. The versioned
+# symbol names sit in .gnu.version_r as plain ASCII either way, and
+# `sort -Vu | tail -1` is the same expression the CI assertion runs on
+# objdump's output - so both halves of the project quote the same number.
+peer_glibc() {                   # $1 = an ELF binary; prints e.g. GLIBC_2.29
+  { LC_ALL=C grep -ao 'GLIBC_[0-9.]*' "$1" 2>/dev/null \
+    || strings -a "$1" 2>/dev/null; } \
+    | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+}
+
+peer_starts() {
+  [ "$DIR" = linux-x64 ] || return 0        # a glibc question; macOS has none
+  p="$DIR/viewer-serve"
+  [ -x "$p" ] || return 0
+  if "$p" --version >/dev/null 2>&1; then return 0; fi
+  need=$(peer_glibc "$p")
+  have=$(ldd --version 2>&1 | head -1)
+  [ -n "$have" ] || have="an unknown libc (no ldd on this host)"
+  if [ -n "$need" ]; then
+    echo "viewer-serve needs $need but this host has $have" >&2
+  else
+    echo "viewer-serve does not start on this host ($have):" >&2
+    "$p" --version 2>&1 | sed 's/^/  /' >&2
+  fi
+  echo "  the files ARE updated; this build cannot run here. Report that line." >&2
+}
+
 reset_to() {                     # $1 = ref to make the tree be
   # Only the binaries this reset actually REWRITES are worth asking about: a
   # viewer running out of a file the update does not touch is still the
@@ -70,14 +114,18 @@ reset_to() {                     # $1 = ref to make the tree be
            git diff --quiet "$1" -- "$b" 2>/dev/null || running_pids "$b"
          done | sort -un | tr '\n' ' ')
   git reset --hard "$1"
-  [ -n "$busy" ] || return 0
-  cat >&2 <<EOF
+  if [ -n "$busy" ]; then
+    cat >&2 <<EOF
 
 The files are updated, but a viewer started from this folder is still running
 (pid ${busy% }). Replacing a program's file does not change the program that
 is already running - it keeps the code it started with. Quit that window and
 start ./$DIR/$BIN again to be on the new build.
 EOF
+  fi
+  # ...and LAST, because it is the one line that says the update was not
+  # enough. Silent when the peer starts, which is every normal run.
+  peer_starts
 }
 
 case "$1" in

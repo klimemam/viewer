@@ -27,6 +27,26 @@ win64\viewer.exe
 
 中身: `win64/viewer.exe`(GUI)+ `win64/plugins/`、`linux-x64/viewer-serve`(サーバに置く方)ほか。
 
+### Linux 配布物が動く範囲(要求 glibc)
+
+ホストの glibc は `ldd --version` で分かります。**GUI と peer で floor が違います**:
+
+| 配布物 | 置く場所 | 要求 glibc | 動く distro |
+|---|---|---|---|
+| `linux-x64/viewer`(GUI) | 手元の Linux PC | **2.31** | Ubuntu 20.04 以降 / Debian 11 以降 / RHEL・Rocky 9 以降 |
+| `linux-x64/viewer-serve` + `linux-x64/plugins/`(peer) | データのあるサーバ | **2.17** | **CentOS 7・RHEL 7 以降** / Ubuntu 16.04 以降 / Debian 9 以降 |
+
+peer の方だけ古い distro まで下げてあるのは、**計算サーバは手元の PC より古い**からです。
+CI は peer(`viewer-serve` と `plugins/*.so`)を manylinux2014 コンテナ(CentOS 7)で、
+GUI を Ubuntu 20.04 コンテナで組み、それぞれの要求 glibc を毎回 assert しています。
+GUI は GLFW / X11 / Wayland のヘッダが要るので CentOS 7 では組めません。
+
+要求より古いホストに置くと `version 'GLIBC_2.29' not found` で起動しません。
+**どちらの版が足りないかは機械が言います** —— `./update.sh` は更新後に peer を起動して、
+失敗したら `viewer-serve needs GLIBC_2.29 but this host has ldd (GNU libc) 2.28` の
+1 行を出します(リモート接続時の自動導入も同じ 1 行を返します。
+[issue #268](https://github.com/klimemam/viewer/issues/268))。
+
 **毎回コマンドラインを開くのが面倒なら、次節でショートカットを作ってください**
 (`win64\install_shortcut.cmd` をダブルクリックするだけ)。
 
