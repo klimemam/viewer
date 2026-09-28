@@ -259,7 +259,7 @@ using WatchLister = std::function<bool(const App::WatchTarget& t,
 // constants rather than typed, so moving either one cannot silently leave the
 // peer polled at the local rate. 5 s and 15 s give 3.
 static int watchRemoteEvery() {
-    const double a = app.watchIntervalSec, b = app.watchRemoteIntervalSec;
+    const double a = watchPollSeconds(), b = app.watchRemoteIntervalSec;
     if (a <= 0.0 || b <= a) return 1;
     return (int)std::ceil(b / a - 1e-9);
 }
@@ -547,7 +547,12 @@ static void watchWorker() {
             glfwPostEmptyEvent();
         }
         std::unique_lock<std::mutex> lk(app.watchMtx);
-        app.watchCv.wait_for(lk, std::chrono::duration<double>(app.watchIntervalSec),
+        // The interval is READ HERE, every round (board row 297): it is the
+        // setting `watch.intervalSec` now, and a worker that had cached it at
+        // startup would need a restart to honour a change - which is the "I set
+        // it and nothing happened" the Preferences panel exists to end. The
+        // window is watchPollSeconds()'s, the one reader.
+        app.watchCv.wait_for(lk, std::chrono::duration<double>(watchPollSeconds()),
                              [] { return app.watchStop.load(); });
     }
 }

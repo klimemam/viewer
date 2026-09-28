@@ -1029,6 +1029,7 @@ struct PrefsBase {
     bool compactUi = true;
     bool dragPans = false, wheelZoomPlain = false, fitOnSwitch = false;
     bool watchEnabled = true, watchAutoReload = false;
+    int watchIntervalSec = 5;            // board row 297
     int seqLoadMode = 0;
     int folderScanDepth = 6;
     bool showFps = false;
@@ -1080,6 +1081,7 @@ static void capturePrefsBase() {
     g_prefsBase.fitOnSwitch = app.fitOnSwitch;
     g_prefsBase.watchEnabled = app.watchEnabled;
     g_prefsBase.watchAutoReload = app.watchAutoReload;
+    g_prefsBase.watchIntervalSec = app.watchIntervalSec;
     g_prefsBase.seqLoadMode = app.seqLoadMode;
     g_prefsBase.folderScanDepth = app.folderScanDepth;
     g_prefsBase.showFps = app.showFps;
@@ -1115,6 +1117,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "fitonswitch " << (P.fitOnSwitch ? 1 : 0) << "\n";
     f << "watchfiles " << (P.watchEnabled ? 1 : 0) << "\n";
     f << "watchauto " << (P.watchAutoReload ? 1 : 0) << "\n";
+    f << "watchinterval " << P.watchIntervalSec << "\n";
     f << "seqload " << P.seqLoadMode << "\n";
     f << "scandepth " << P.folderScanDepth << "\n";
     f << "showfps " << (P.showFps ? 1 : 0) << "\n";
@@ -1250,6 +1253,14 @@ static void loadPrefs() {
         // in-class default (OFF) is what an upgrading user gets - which is the
         // only answer: nobody has opted in to anything by upgrading.
         else if (key == "watchauto")   { ls >> v; app.watchAutoReload = v != 0; }
+        // Board row 297. Read RAW and NOT clamped here, for scandepth's reason
+        // below: watchPollSeconds() (core/app/state.h) is the one reader and the
+        // one place the window is enforced, so a prefs.txt somebody hand-edited
+        // to 0 is kept as 0 in the panel's own row - where it can be seen and
+        // corrected - while the worker still waits a sane interval. A prefs.txt
+        // written before this key existed has no such line, so an upgrading user
+        // gets the in-class default of 5, which is the interval that shipped.
+        else if (key == "watchinterval") { ls >> app.watchIntervalSec; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         // #204. Read RAW, and not clamped here on purpose: scanDepthBelow()
         // (core/app/state.h) is the one reader and the one place the window is

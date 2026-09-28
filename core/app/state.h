@@ -1811,8 +1811,20 @@ struct App {
     // (docs/features/settings/settings-inventory.md 9 is still open; this pre-empts nothing).
     bool watchAutoReload = false;
     // §2's interval, in seconds, as a value rather than a literal so
-    // --watch-selftest never has to live through one. prefs is §9's "later".
-    double watchIntervalSec = 5.0;
+    // --watch-selftest never has to live through one.
+    //
+    // §9's "prefs 化はユーザーが欲しがってから" is SPENT (board row 297): this is
+    // the setting `watch.intervalSec`, whole seconds, 1..3600, default 5 - the
+    // constant that shipped, so nobody's polling rate moves on upgrade. An int
+    // and not a double because that is what the value IS: a whole number of
+    // seconds, and the Preferences row is an InputInt over exactly the window
+    // the file accepts.
+    //
+    // READ LIVE, by the worker, at the head of every wait (watchWorker). A
+    // change therefore takes effect at the NEXT poll and never needs a restart -
+    // and the peer's interval follows it, because watchRemoteEvery() computes
+    // the ratio from these two rather than typing it.
+    int watchIntervalSec = 5;
     // ...and §2's OTHER interval: a peer is asked every 15 s, not every 5. The
     // worker's timer is the local one, so a remote target is polled every Nth
     // round with N computed from these two (watchRemoteEvery) rather than typed
@@ -2786,6 +2798,24 @@ inline int g_openPumps = 0;
 //        still finite. core/serve.cpp caps its own SCAN/GLOB walk at 32, so
 //        every depth this can ask for is one the peer will honour.
 inline int scanDepthBelow() { return std::clamp(app.folderScanDepth, 1, 16); }
+
+// ---- board row 297: the Watch polling interval, asked in ONE place -----------
+// The setting is watch.intervalSec (whole seconds, 1..3600, default 5 - the
+// constant that shipped). This is the only reader, and the clamp lives here for
+// scanDepthBelow()'s reason: settings.jsonc refuses a value outside the window by
+// name (判断8), but prefs.txt is plain text a user can edit and the Preferences
+// InputInt has no bounds of its own, so the number that reaches a `wait_for` has
+// to be sane whoever wrote it. 0 or a negative would turn the worker into a spin.
+//
+// It is READ LIVE, once per round, so a change takes effect at the next poll and
+// never needs a restart - and the peer's interval follows it, because
+// watchRemoteEvery() computes the ratio from this and watchRemoteIntervalSec
+// rather than typing it.
+//   1     - one second, faster than §2's "数秒〜十数秒" and still one listing.
+//   3600  - an hour: a poll a person could forget about, and finite.
+inline double watchPollSeconds() {
+    return (double)std::clamp(app.watchIntervalSec, 1, 3600);
+}
 
 // ---- the memory budget's window, asked in ONE place -------------------------
 // measuring.memoryBudgetGB and --mem-budget are the same setting reached through
