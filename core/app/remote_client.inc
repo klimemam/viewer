@@ -57,6 +57,86 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port 
 static std::string bootstrapScript();
 static std::string updateScript();
 
+// ---- where a remote open's milliseconds go, when asked (board 305) ----------
+// `VIEWER_TIME_OPEN=1` makes the remote door and the fetch landing print one
+// line per phase to stderr. OFF by default and the environment is read ONCE: the
+// thing this exists to explain is 344 ms of a window not answering, and an
+// instrument that cost a getenv per phase would be partly measuring itself.
+//
+// Printed rather than accumulated, because the question is "which phase of THIS
+// open" and it is asked of one open at a time, by hand, with
+// tools/measure/freeze_probe.ps1 watching the same process from outside. The two
+// instruments answer different halves: the probe says how long the window did
+// not answer, these lines say what it was doing.
+//
+// It is not a profiler and must not grow into one. Every line is a phase a
+// design decision could MOVE to another thread - that is the only reason a phase
+// is named here rather than left inside the function.
+//
+// WHAT IT ANSWERED (2026-09-28, board 305). 480 MB local:// .npy, (10,3000,4000)
+// f32, first view decimated to 1334x1000 at step 3 - 5.09 MB of pixels, 4.44 MB
+// on the wire. Median of 3 runs:
+//
+//   ensureUiSession   26-38 ms    spawn viewer-serve and CONNECT
+//   META round trip      32 ms
+//   TILE + to float  266-297 ms   <- 82% of it
+//   build the document  0.0 ms
+//   computeMinMax       1.2 ms    (over the decimated tile)
+//   register + select   0.0 ms
+//   stack + toast       0.2 ms
+//   TOTAL            330-374 ms
+//
+//   the LANDING (pumpRemoteFetch): 2.7-3.0 ms for the full-resolution swap,
+//   0.2 ms per sibling frame.
+//
+// So the suspicion the board carried - that the landing decodes on the UI thread
+// and wants OpenJob's split - is WRONG, by two orders of magnitude: rfWorker
+// already produces the pixels AND the range (minMaxOf, board 299), and the UI's
+// share of a landing is a move. The freeze is three SYNCHRONOUS ROUND TRIPS
+// taken on the UI thread, 99.6% of the total, and the client's own arithmetic in
+// this door is 1.4 ms of it. Moving those needs a Session of its own - a fifth
+// owner in docs/features/remote/remote.md's ownership table, because
+// app.uiSession may not be touched from another thread - which is a design, not
+// a refactor, and is why this change measures and stops.
+static bool timeOpenPhases() {
+    static const bool on = []() {
+        const char* e = std::getenv("VIEWER_TIME_OPEN");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+// NOTHING IS WRITTEN UNTIL THE END, and that is not tidiness - the first version
+// of this printed each line as the lap was taken and the four cheap phases of
+// openRemote all came out at 11.1-13.6 ms, suspiciously equal and suspiciously
+// unlike what they do. stderr is UNBUFFERED by C's own rules, so each fprintf was
+// one write() to the redirected file (~12 ms on this box) and every phase was
+// charged with the PREVIOUS phase's print. The instrument was measuring itself,
+// in the same shape freeze_probe.ps1 documents for Process.Responding. The lines
+// are collected and written once, after the measured region.
+struct OpenPhase {
+    const char* label;
+    double tStart = nowSec();
+    double tLap = tStart;
+    int n = 0;
+    struct Mark { const char* what; double ms; };
+    Mark marks[12];
+    explicit OpenPhase(const char* w) : label(w) {}
+    // The elapsed time since the last mark, recorded under the name of the phase
+    // that just ENDED, and the clock restarted.
+    void lap(const char* w) {
+        const double now = nowSec();
+        if (n < (int)(sizeof marks / sizeof *marks)) marks[n++] = { w, (now - tLap) * 1000.0 };
+        tLap = now;
+    }
+    ~OpenPhase() {
+        const double total = (nowSec() - tStart) * 1000.0;
+        if (!timeOpenPhases()) return;
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "time:   %-22s %8.1f ms\n", marks[i].what, marks[i].ms);
+        fprintf(stderr, "time: %-24s %8.1f ms  TOTAL\n", label, total);
+    }
+};
+
 #include "compare.inc"
 #include "export.inc"
 
@@ -281,6 +361,15 @@ static void pumpRemoteFetch() {
         std::lock_guard<std::mutex> lk(app.rfMtx);
         batch.swap(app.rfDone);
     }
+    // Board 305's question, asked of the landing: how much of a remote open's
+    // freeze is THIS - the UI thread turning what the worker fetched into
+    // documents. One line per thing landed and a TOTAL for the pump, because a
+    // stack arriving all at once is one frame of the UI's time and not ten
+    // separate ones. (The worker already produces the pixels and the range, so
+    // what is left here is moves and bookkeeping - which is what the numbers
+    // have to confirm rather than what anyone may assume.)
+    std::unique_ptr<OpenPhase> landT;
+    if (!batch.empty() && timeOpenPhases()) landT.reset(new OpenPhase("fetch landing"));
     for (auto& d : batch) {
         if (d.gen != app.rfGen) continue;   // outlived a Close All: drop entirely
         app.rfPending--;
@@ -397,6 +486,7 @@ static void pumpRemoteFetch() {
             if (!ranged) defaultRange(*doc);
             app.images.push_back(std::move(doc));  // quiet: never steals selection
             app.imagesRev++;
+            if (landT) landT->lap("land a stack frame");
             continue;
         }
         ImageDoc* im = nullptr;
@@ -466,6 +556,7 @@ static void pumpRemoteFetch() {
         app.imagesRev++;
         fprintf(stderr, "remote: full resolution %dx%d %dch for %s\n",
                 d.w, d.h, d.ch, im->name.c_str());
+        if (landT) landT->lap("swap to full res");
     }
 }
 
