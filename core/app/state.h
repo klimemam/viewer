@@ -848,6 +848,166 @@ struct OpenPre {
     bool decoded = false;              // `dec` is usable (false = bytes only)
 };
 
+// ---- what a session could NOT round-trip, said BY TYPE (board row 126) -------
+// A .vsession is a list of things to re-open, and a live session holds things
+// that cannot BE re-opened: pixels this program computed, a frame that is on
+// screen as a decimated tile, a series whose stack has been closed. Every one of
+// those was already known at the moment the writer skipped it or the reader gave
+// up on it - and every one of them said so somewhere else, in its own sentence:
+// four fprintf(stderr) lines inside writeSessionTo, two toasts at the end of
+// loadSession, and nothing at all that a CALLER could ask. "What did this save
+// lose?" had no answer with a type.
+//
+// The rule for what may be in this enum, and it is the whole of why the list is
+// this length: a kind is something the writer or the reader ACTUALLY DETECTS, at
+// the line where it decides not to carry it. Nothing is listed because it sounds
+// like a risk, and nothing is listed that only a human could notice.
+//
+// Kinds are per SIDE - a save cannot suffer LK_ImageNotRestored and a load
+// cannot suffer LK_ComputedPixels - but they share one enum and one report,
+// because "what did not survive" is one question asked at two moments, and two
+// enums would be two vocabularies for one taxonomy (the terminology.md rule:
+// one bucket per thing).
+enum LossKind {
+    // ---- the save side: what the file cannot carry ----
+    // The recipe travels, the pixels do not. A frame average / sum and a
+    // detrend product are RECOMPUTED on load from the stack they were folded
+    // from, so what comes back is today's arithmetic over today's disk - which
+    // is why §10.2's generation record rides along to say whether that was
+    // still the same picture. Counted even though it does come back: the PIXELS
+    // that were on screen are not in the file.
+    LK_ComputedPixels = 0,
+    // ...and the same recipe with its source stack CLOSED: there is nothing
+    // left to fold, so not even the derivation is written.
+    LK_ComputedGone,
+    // A document with no file at all behind it (a ROI montage): no recipe
+    // either, so the session cannot say anything about it but its number.
+    LK_NoFile,
+    // A remote document still showing its DECIMATED preview (remoteStep > 1).
+    // The line written is the source url + frame, and the load re-fetches - so
+    // the pixels that were on screen are not the pixels that come back, and a
+    // crop taken on them is deferred (LK_CropDeferred) rather than applied.
+    LK_RemotePreview,
+    // Pixels a reader produced (a `__pixels_N` member) on a machine that no
+    // longer remembers WHICH reader (the memo is a bounded LRU). #179 ruling C
+    // forbids running one from a session, so without the memo the file cannot
+    // even NAME what made these pixels.
+    LK_ReaderNoMemo,
+    // A series with nothing to restore it into (no batch), or one still in a
+    // form this format cannot spell (an unresolved picker sweep).
+    LK_SeriesUnwritable,
+    // ...and one MEMBER of an otherwise writable series whose frames are gone.
+    // A member is a hand-typed parameter value: losing one silently moves a
+    // point on the axis a fit is taken against.
+    LK_SeriesMember,
+    // An AnalysisSet with nothing to restore it into (no batch).
+    LK_SetUnwritable,
+    // ...and one ROLE binding whose target has no file to come back from. The
+    // role itself is still written, as `unbound` with the reason - the
+    // declaration is a record (reader-analysisset.md §5.1) - so what is lost is
+    // the BINDING, not the role.
+    LK_SetRoleUnbound,
+    // ---- the load side: what the restore did less than the file asked ----
+    // An `image` line that could not be opened at all.
+    LK_ImageNotRestored,
+    // ...and one that opened while the STACK around it could not be rebuilt: the
+    // picture is here, the stack is not. A different sentence, so a different
+    // kind - the file recorded many frames and one came back.
+    LK_StackNotRebuilt,
+    // A saved crop that could not be applied YET (the full-resolution frame is
+    // still in flight). Parked in App::restoreWait and applied when the frame
+    // lands, so this is a DEFERRAL and not a loss - it is in the taxonomy
+    // because it is the one thing a restore reports as incomplete and then
+    // completes, and a report that left it out would read clean while the crop
+    // was still missing from the screen.
+    LK_CropDeferred,
+    // A line the reader had to REFUSE: a malformed annotation, an unreadable
+    // per-frame axis, a qualifier whose subject is not here. Dropping those is
+    // right (an invented 0 on a plotted axis is worse than no axis); dropping
+    // them in silence is what this kind ends.
+    LK_LineRejected,
+    LK_Count
+};
+
+// One short noun phrase per kind, singular, for the one sentence a save or a
+// load gets to say. Kept beside the enum so a new kind cannot be added without
+// a name a person can read - the counts alone would be a worse report than the
+// four scattered stderr lines they replace.
+inline const char* lossKindText(LossKind k) {
+    switch (k) {
+        case LK_ComputedPixels:   return "computed frame (recipe saved, pixels recomputed)";
+        case LK_ComputedGone:     return "computed frame whose source stack is closed";
+        case LK_NoFile:           return "image with no file to reload it from";
+        case LK_RemotePreview:    return "remote preview (re-fetched on load)";
+        case LK_ReaderNoMemo:     return "reader-produced image this machine cannot name";
+        case LK_SeriesUnwritable: return "series that could not be saved";
+        case LK_SeriesMember:     return "series member that could not be saved";
+        case LK_SetUnwritable:    return "analysis set that could not be saved";
+        case LK_SetRoleUnbound:   return "role binding that could not be saved";
+        case LK_ImageNotRestored: return "image(s) could not be restored";
+        // browse selftest B-group reads this phrase out of the Messages log:
+        // it is the sentence #171 gave the defect it fixed, and the report
+        // inherits it rather than renaming it.
+        case LK_StackNotRebuilt:  return "stack(s) came back as a single frame";
+        case LK_CropDeferred:     return "saved crop waiting for the full frame";
+        case LK_LineRejected:     return "session line(s) refused as unreadable";
+        default:                  return "unnamed loss";
+    }
+}
+
+// The counts, and the first few NAMES per kind. A count on its own cannot be
+// acted on ("2 series members could not be saved" - which two?), and the full
+// list cannot go in a toast, so the report carries a bounded prefix and says
+// how many it is not showing.
+struct SessionReport {
+    static const size_t NAMES_MAX = 4;
+    int docs = 0;                       // image lines written, or documents open after a load
+    int count[LK_Count] = { 0 };
+    std::vector<std::string> names[LK_Count];
+    void note(LossKind k, const std::string& name = std::string()) {
+        if ((unsigned)k >= (unsigned)LK_Count) return;
+        count[k]++;
+        if (!name.empty() && names[k].size() < NAMES_MAX) names[k].push_back(name);
+    }
+    int lost() const {
+        int n = 0;
+        for (int i = 0; i < LK_Count; i++) n += count[i];
+        return n;
+    }
+    bool any(LossKind k) const { return (unsigned)k < (unsigned)LK_Count && count[k] > 0; }
+    // "2 not round-trippable: 1 computed frame (...), 1 remote preview (...)"
+    std::string summary(const char* headline) const {
+        const int n = lost();
+        if (n == 0) return {};
+        std::string s = std::to_string(n) + " " + headline + ":";
+        bool first = true;
+        for (int i = 0; i < LK_Count; i++) {
+            if (!count[i]) continue;
+            s += (first ? " " : ", ");
+            first = false;
+            s += std::to_string(count[i]) + " " + lossKindText((LossKind)i);
+        }
+        return s;
+    }
+    // ...and the same thing with the names under it, one kind per line, for the
+    // Messages panel and for stderr. A toast that names nothing is a toast
+    // nobody can act on, so the names are part of the message and not a detail
+    // kept for a log the user has to go and find.
+    std::string detail(const char* headline) const {
+        std::string s = summary(headline);
+        if (s.empty()) return s;
+        for (int i = 0; i < LK_Count; i++) {
+            if (!count[i] || names[i].empty()) continue;
+            s += "\n  " + std::string(lossKindText((LossKind)i)) + ":";
+            for (size_t j = 0; j < names[i].size(); j++)
+                s += (j ? ", " : " ") + names[i][j];
+            if ((int)names[i].size() < count[i])
+                s += ", ... (" + std::to_string(count[i] - (int)names[i].size()) + " more)";
+        }
+        return s;
+    }
+};
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;

@@ -759,6 +759,189 @@
                   "N11 no layout.ini is not a reason to create one");
         }
 
+        // N13: what a save and a load could NOT round-trip, said BY TYPE.
+        //
+        // Board row 126's other two halves (the atomic write above is the first).
+        // The counts existed - four fprintf(stderr) lines in writeSessionTo, two
+        // toasts at the end of loadSession - and nothing could be ASKED: the
+        // caller got a bool, the user got whichever sentence happened to fire,
+        // and neither said WHICH doc, series or line went. SessionReport is that
+        // question with a type; LossKind is the closed list of answers.
+        //
+        // Each kind below is produced for real rather than asserted about a
+        // branch nobody enters, and every assertion pairs with the clean case:
+        // a report that fires on a lossless save would be worse than no report.
+        {
+            auto drain = [&](double budget) {
+                double t0 = nowSec();
+                while (nowSec() - t0 < budget) {
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        app.seqRestore.empty() && app.pendingAvg.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            const std::string stkDir = g_newwinSelftest + "/multi/00";
+            const std::string head = stkDir + "/frame_000.npy";
+            const std::string sp = dir + "/report.vsession";
+
+            // (a) THE CLEAN CASE FIRST. One lone frame, nothing computed,
+            // nothing remote: the report has to be empty and the sentence has to
+            // be the plain one. Every check below is read against this.
+            closeAll();
+            check(loadNpy(head).empty(), "N13 a frame to save is open");
+            {
+                SessionReport rep;
+                size_t logBefore = app.msgLog.size();
+                saveSession(sp, false, &rep);
+                check(rep.lost() == 0 && rep.docs == 1,
+                      "N13 a lossless save reports 1 doc and no loss");
+                check(rep.summary("not round-trippable").empty(),
+                      "N13 ...and has no sentence to say about it");
+                bool plain = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("session saved:") != std::string::npos &&
+                        app.msgLog[i].text.find("1 doc(s)") != std::string::npos &&
+                        app.msgLog[i].text.find("not round-trippable") == std::string::npos &&
+                        !app.msgLog[i].err)
+                        plain = true;
+                check(plain, "N13 the toast says how many docs and claims no loss");
+            }
+
+            // (b) LK_ComputedPixels: a frame average. The RECIPE travels and the
+            // PIXELS do not - terminology.md's own rule for a computed frame -
+            // so this is a loss even though the picture comes back, and the
+            // report is the only place that has ever said so.
+            closeAll();
+            std::string pat0;
+            std::vector<std::string> sib0 = findSequenceSiblings(head, pat0);
+            check(sib0.size() >= 3, "N13 a folder stack of at least 3 frames is there");
+            check(loadNpy(head).empty(), "N13 the stack head opens");
+            startSequenceLoad(app.current, sib0, pat0);
+            drain(120.0);
+            int seq0 = cur() ? cur()->seqId : 0;
+            check(seq0 != 0 && framesOfSeq(seq0).size() == sib0.size(),
+                  "N13 the stack is whole before anything is folded from it");
+            requestStackAverage(seq0, FOLD_MEAN);
+            drain(120.0);
+            const ImageDoc* avg = nullptr;
+            for (const auto& d : app.images)
+                if (!d->avgOfPath.empty()) avg = d.get();
+            check(avg != nullptr, "N13 a frame average is open");
+            {
+                SessionReport rep;
+                saveSession(sp, true, &rep);
+                check(rep.count[LK_ComputedPixels] == 1 &&
+                      rep.count[LK_NoFile] == 0,
+                      "N13 a frame average is LK_ComputedPixels, not LK_NoFile");
+                check(avg && !rep.names[LK_ComputedPixels].empty() &&
+                      rep.names[LK_ComputedPixels][0] == avg->name,
+                      "N13 the report NAMES the average it counted");
+                check(rep.docs == 1,
+                      "N13 the stack is one doc in the report, like it is one line in the file");
+                check(rep.summary("not round-trippable")
+                          .find("1 computed frame") != std::string::npos,
+                      "N13 the sentence spells the kind out, not just a number");
+            }
+
+            // (c) LK_NoFile: a ROI montage. No file AND no recipe - the session
+            // cannot say anything about it but that it was there. A different
+            // kind from (b) on purpose: one comes back recomputed and one does
+            // not come back at all, and a taxonomy that merged them would be
+            // telling the user those are the same news.
+            {
+                App::Ann a;
+                a.type = 0; a.x = 0; a.y = 0;
+                a.w = std::min(8, cur()->w); a.h = std::min(8, cur()->h);
+                a.label = "ROI1"; a.id = app.nextAnnId++;
+                app.anns.push_back(a);
+                app.selectedAnn = a.id;
+                app.annRev++;
+                // montageROI wants the STACK current, not the average
+                for (int i = 0; i < (int)app.images.size(); i++)
+                    if (app.images[i]->seqId == seq0) { selectImage(i); break; }
+                std::string merr;
+                const bool made = montageROI(true, merr);
+                check(made, "N13 a ROI montage is made");
+                if (made) {
+                    std::string mn;
+                    for (const auto& d : app.images)
+                        if (d->src->path.empty() && d->avgOfPath.empty() && d->seqId == 0)
+                            mn = d->name;
+                    SessionReport rep;
+                    saveSession(sp, true, &rep);
+                    check(rep.count[LK_NoFile] == 1 &&
+                          rep.names[LK_NoFile].size() == 1 &&
+                          rep.names[LK_NoFile][0] == mn,
+                          "N13 a montage is LK_NoFile, named");
+                    check(rep.count[LK_ComputedPixels] == 1,
+                          "N13 ...and the average is still its own kind, counted once");
+                    const std::string sum = rep.summary("not round-trippable");
+                    check(sum.rfind("2 not round-trippable:", 0) == 0,
+                          ("N13 the sentence totals the kinds: " + sum).c_str());
+                }
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // (d) THE LOAD SIDE. A hand-written session with two defects the
+            // reader has always handled by DROPPING them: an image line whose
+            // file is not there, and an annotation with an impossible rectangle
+            // (the reader refuses it rather than reading out of bounds - right,
+            // and silent until now). The load must NAME both.
+            {
+                const std::string gone = dir + "/not-here.npy";
+                std::filesystem::remove(pathFromUtf8(gone), ec);
+                const std::string bad = dir + "/bad.vsession";
+                {
+                    std::ofstream bf(pathFromUtf8(bad), std::ios::binary);
+                    bf << "viewer-session 1\n"
+                       << "image 0 1 npy3 0 0 0 0 0 0 0 " << head << "\n"
+                       << "image 0 1 npy3 0 0 0 0 0 0 0 " << gone << "\n"
+                       << "ann 0 0 0 -5 4 0 1 0 0 0 0 ROI1\n";
+                }
+                SessionReport rep;
+                size_t logBefore = app.msgLog.size();
+                const std::string lerr = loadSession(bad, &rep);
+                check(lerr.empty(), "N13 a session with droppable lines still opens");
+                check(rep.count[LK_ImageNotRestored] == 1 &&
+                      !rep.names[LK_ImageNotRestored].empty() &&
+                      rep.names[LK_ImageNotRestored][0].find("not-here.npy") !=
+                          std::string::npos,
+                      "N13 a missing file is LK_ImageNotRestored, named");
+                check(rep.count[LK_LineRejected] == 1,
+                      "N13 a malformed ann line is LK_LineRejected");
+                check(app.anns.empty(), "N13 ...and that line really was refused");
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("not restored as saved") != std::string::npos &&
+                        app.msgLog[i].text.find("not-here.npy") != std::string::npos &&
+                        app.msgLog[i].err)
+                        said = true;
+                check(said, "N13 ONE message carries the kinds and the names");
+
+                // ANTI-VACUITY: the same reader, on the session it just wrote
+                // for a single readable frame, must report nothing at all.
+                closeAll();
+                check(loadNpy(head).empty(), "N13 one readable frame, again");
+                saveSession(sp, true);
+                SessionReport clean;
+                logBefore = app.msgLog.size();
+                const std::string lerr2 = loadSession(sp, &clean);
+                check(lerr2.empty() && clean.lost() == 0 && clean.docs == 1,
+                      "N13 a load that lost nothing reports nothing");
+                bool quiet = true;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("not restored as saved") != std::string::npos)
+                        quiet = false;
+                check(quiet, "N13 ...and says nothing, so the message means something");
+                std::filesystem::remove(pathFromUtf8(bad), ec);
+            }
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sp), ec);
+        }
+
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
         fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
         return ok ? 0 : 1;
