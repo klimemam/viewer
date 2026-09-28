@@ -2310,7 +2310,18 @@ struct App {
                         // the session's per-frame x axis, applied with the name
                         // once the stack exists (same window, same fix)
                         std::string axisName, axisUnit;
-                        std::vector<double> axisVals; };
+                        std::vector<double> axisVals;
+                        // docs/reference-design.md §5.2: `files` came from the
+                        // session's own `stackmember` lines, not from a sibling
+                        // scan - i.e. this stack's membership was an EXPLICIT
+                        // decision and must come back as itself. Carried here so
+                        // that a save taken INSIDE the drain window writes the
+                        // membership back instead of re-deriving it (the
+                        // seriesRestore precedent at App::seriesRestore: the
+                        // autosave and the crash snapshot are both live while a
+                        // restore is still queued, and a re-derivation there
+                        // would silently re-admit the frames the user excluded).
+                        bool explicitMembers = false; };
     std::vector<SeqRestore> seqRestore;
     // A session line that named something the doc had not finished BEING yet.
     //

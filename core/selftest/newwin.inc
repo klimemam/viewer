@@ -942,6 +942,189 @@
             std::filesystem::remove(pathFromUtf8(sp), ec);
         }
 
+        // N14: a stack whose membership was made EXPLICIT round-trips EXACTLY.
+        //
+        // docs/reference-design.md §5.1 recorded this as a known defect: the
+        // writer emitted no member list, so a hand-picked or derived stack was
+        // saved as one representative frame plus "seqload 1" - and the reader's
+        // seqload re-ran findSequenceSiblings over the whole FOLDER. The stack
+        // came back as every sibling in that folder wearing the explicit stack's
+        // name: the frames the user excluded were re-admitted, the one they added
+        // from elsewhere was dropped, and the next autosave froze that as truth.
+        // §5.2's `stackmember` is the fix; this is the pin.
+        //
+        // "Explicit" is not a new flag. SeqInfo::ruleDir/ruleHead already answers
+        // it, recorded at mint time by RUNNING the folder rule (watch-design §6):
+        // empty = findSequenceSiblings did not reproduce this list. So the test
+        // asserts both directions - an explicit membership stays explicit, an
+        // implicit one stays implicit - because a fix that froze every stack's
+        // membership would pass the first half and break folder Reload.
+        {
+            auto drain = [&](double budget) {
+                double t0 = nowSec();
+                while (nowSec() - t0 < budget) {
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        app.seqRestore.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            // THE membership as ONE string (--rwatch-selftest R22's discipline):
+            // a count is not a membership, so every assertion states the whole
+            // list with the index each member carries.
+            auto membersOf = [&](int sid) {
+                std::string t;
+                for (int idx : framesOfSeq(sid))
+                    t += (t.empty() ? "" : " ") +
+                         std::to_string(app.images[idx]->seqIndex) + ":" +
+                         baseName(app.images[idx]->src->path);
+                return t;
+            };
+            auto theStack = [&]() {
+                for (const auto& d : app.images) if (d->seqId != 0) return d->seqId;
+                return 0;
+            };
+
+            const std::string src = g_newwinSelftest + "/multi/00";
+            const std::string mdir = dir + "/memb", odir = dir + "/elsewhere";
+            std::filesystem::create_directories(pathFromUtf8(mdir), ec);
+            std::filesystem::create_directories(pathFromUtf8(odir), ec);
+            bool haveFix = true;
+            for (int i = 0; i < 5; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "/frame_00%d.npy", i);
+                char to[32];
+                snprintf(to, sizeof to, "/f_00%d.npy", i);
+                std::filesystem::copy_file(pathFromUtf8(src + nm), pathFromUtf8(mdir + to),
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) haveFix = false;
+            }
+            // The frame from ANOTHER folder - the "add" half of the edit. Its
+            // number is outside the group's run, so no sibling scan can invent it.
+            std::filesystem::copy_file(pathFromUtf8(src + "/frame_001.npy"),
+                                       pathFromUtf8(odir + "/f_009.npy"),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) haveFix = false;
+            check(haveFix, "N14 the fixtures are in place");
+
+            const std::string h0 = mdir + "/f_000.npy";
+            const std::string sp = dir + "/memb.vsession";
+
+            // (a) THE IMPLICIT CONTROL, first. The whole folder group, opened the
+            // way a folder open opens it: the rule IS this membership, so the
+            // session must NOT freeze it and the restored stack must still be
+            // implicit - otherwise Reload could never admit a frame that arrives.
+            if (haveFix) {
+                closeAll();
+                std::string pat;
+                std::vector<std::string> sib = findSequenceSiblings(h0, pat);
+                check(sib.size() == 5, "N14 the folder group is all five frames");
+                check(loadNpy(h0).empty(), "N14 the head of the implicit stack opens");
+                startSequenceLoad(app.current, sib, pat);
+                drain(120.0);
+                const int sid = theStack();
+                const App::SeqInfo* si = sid ? seqInfo(sid) : nullptr;
+                check(si && !si->ruleDir.empty(),
+                      "N14 a whole-folder stack records the rule: it is IMPLICIT");
+                const std::string before = membersOf(sid);
+                saveSession(sp, true);
+                std::string text;
+                readWholeFile(sp, text);
+                check(text.find("stackmember ") == std::string::npos,
+                      "N14 an implicit membership writes NO stackmember line");
+                closeAll();
+                check(loadSession(sp).empty(), "N14 the implicit session loads");
+                drain(120.0);
+                const int sid2 = theStack();
+                const App::SeqInfo* si2 = sid2 ? seqInfo(sid2) : nullptr;
+                check(membersOf(sid2) == before,
+                      "N14 the implicit membership comes back unchanged");
+                check(si2 && !si2->ruleDir.empty(),
+                      "N14 ...and stays IMPLICIT across the round trip");
+            }
+
+            // (b) THE EXPLICIT MEMBERSHIP. One frame removed (f_002) and one
+            // added from another folder (elsewhere/f_009) - the edit §5.1 is
+            // about. No folder listing can reproduce this list, which is exactly
+            // why recordRemoteRule's local twin leaves ruleDir empty for it.
+            std::string savedText;
+            std::string explicitBefore;
+            if (haveFix) {
+                std::vector<std::string> mine{ mdir + "/f_000.npy", mdir + "/f_001.npy",
+                                               mdir + "/f_003.npy", mdir + "/f_004.npy",
+                                               odir + "/f_009.npy" };
+                closeAll();
+                check(loadNpy(mine[0]).empty(), "N14 the head of the explicit stack opens");
+                startSequenceLoad(app.current, mine, "");
+                drain(120.0);
+                const int sid = theStack();
+                const App::SeqInfo* si = sid ? seqInfo(sid) : nullptr;
+                check(si && si->ruleDir.empty() && si->ruleHead.empty(),
+                      "N14 a hand-picked membership records NO rule: it is EXPLICIT");
+                explicitBefore = membersOf(sid);
+                check(explicitBefore == "0:f_000.npy 1:f_001.npy 2:f_003.npy "
+                                        "3:f_004.npy 4:f_009.npy",
+                      ("N14 the membership is the edited one: " + explicitBefore).c_str());
+                saveSession(sp, true);
+                readWholeFile(sp, savedText);
+                int lines = 0;
+                for (size_t at = savedText.find("stackmember ");
+                     at != std::string::npos; at = savedText.find("stackmember ", at + 1))
+                    lines++;
+                check(lines == 5, "N14 the save writes one stackmember line per member");
+                check(savedText.find("stackmember 4 " + odir + "/f_009.npy") !=
+                          std::string::npos,
+                      "N14 ...including the frame from the other folder, at its index");
+
+                closeAll();
+                check(loadSession(sp).empty(), "N14 the explicit session loads");
+                drain(120.0);
+                const int sid2 = theStack();
+                const App::SeqInfo* si2 = sid2 ? seqInfo(sid2) : nullptr;
+                check(membersOf(sid2) == explicitBefore,
+                      ("N14 the SAME members in the SAME order come back: " +
+                       membersOf(sid2)).c_str());
+                check(si2 && si2->ruleDir.empty() && si2->ruleHead.empty(),
+                      "N14 ...and the stack is still EXPLICIT, so no rule can re-admit f_002");
+            }
+
+            // (c) ANTI-VACUITY. Strip the stackmember lines out of that very
+            // file and the load must NOT reconstruct the membership - it falls
+            // back to the folder rescan, which is what every session written
+            // before this change contains. Without this half, (b) would pass on
+            // a reader that happened to guess right.
+            if (haveFix && !savedText.empty()) {
+                std::string stripped;
+                std::istringstream is(savedText);
+                std::string ln;
+                while (std::getline(is, ln)) {
+                    if (ln.rfind("stackmember ", 0) == 0) continue;
+                    stripped += ln;
+                    stripped += "\n";
+                }
+                const std::string np = dir + "/memb-norule.vsession";
+                {
+                    std::ofstream f(pathFromUtf8(np), std::ios::binary);
+                    f << stripped;
+                }
+                closeAll();
+                check(loadSession(np).empty(), "N14 the stripped session still loads");
+                drain(120.0);
+                const int sid3 = theStack();
+                const std::string got = membersOf(sid3);
+                check(got != explicitBefore,
+                      ("N14 with no stackmember line the membership is NOT reconstructed: " +
+                       got).c_str());
+                check(got.find("f_002.npy") != std::string::npos,
+                      "N14 ...it is the folder rescan, f_002 re-admitted (§5.1's defect)");
+                check(got.find("f_009.npy") == std::string::npos,
+                      "N14 ...and the frame from elsewhere is gone, as §5.1 said");
+                std::filesystem::remove(pathFromUtf8(np), ec);
+            }
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sp), ec);
+        }
+
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
         fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
         return ok ? 0 : 1;

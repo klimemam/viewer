@@ -276,7 +276,50 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
             // seqLoadingId is the durable marker: it stays on this stack until
             // the stack is closed or the next load starts - and by then the
             // siblings are integrated and !inFile carries the line instead.
-            if (!inFile || (app.seqLoadingId != 0 && d->seqId == app.seqLoadingId))
+            // ---- an EXPLICIT membership, written out (§5.2, board row 267) ----
+            // BEFORE seqload, deliberately: the reader acts on `seqload` the
+            // moment it reads it (it queues the rescan, or for a peer folder it
+            // attaches the stack there and then), so a member list arriving
+            // afterwards would have nothing left to change. `stackmember` is an
+            // additive key, so an older viewer skips these lines and restores
+            // exactly as it does today - the folder rescan, degraded but open,
+            // which is why `seqload 1` is still written below either way.
+            //
+            // WHICH stacks get them: the ones whose membership is a DECISION and
+            // not a rule. SeqInfo::ruleDir/ruleHead is that question already
+            // answered, at mint time, by RUNNING the rule (watch-design §6) -
+            // empty means findSequenceSiblings did not reproduce this member
+            // list, i.e. a derived subset, a hand-picked open, a stack spanning
+            // two folders. Without this block such a stack came back as "every
+            // sibling in the folder, wearing the derived stack's name" (§5.1's
+            // recorded defect): the frames the user excluded were re-admitted,
+            // and the next autosave froze that as the truth.
+            //
+            // LOCAL only. A peer folder stack's membership is re-derived from the
+            // peer's own grouper on restore (PR #117's accepted behaviour), and
+            // freezing a list of urls here would claim a membership the reader
+            // does not honour - a file that lies is worse than one that says
+            // less. Left as a caveat rather than half-done.
+            bool explicitMembers = false;
+            if (!inFile && !hasUrlScheme(d->src->path)) {
+                const App::SeqInfo* msq = seqInfo(d->seqId);
+                const std::vector<int> mfr = framesOfSeq(d->seqId);
+                // ruleDir empty = explicit. mfr.size() >= 2 is the same floor the
+                // reader applies (a one-member "stack" is not one), and it also
+                // keeps the mid-load window out: a stack whose siblings have not
+                // been integrated yet would freeze itself down to its head.
+                if (msq && msq->ruleDir.empty() && mfr.size() >= 2) {
+                    explicitMembers = true;
+                    for (int idx : mfr)            // framesOfSeq is in seqIndex order
+                        f << "stackmember " << app.images[idx]->seqIndex << " "
+                          << app.images[idx]->src->path << "\n";   // path last: spaces
+                }
+            }
+            // explicitMembers implies !inFile, so the member list always has a
+            // seqload after it to be consumed by. Stated rather than assumed,
+            // because a member list nothing consumes would be read by nobody.
+            if (!inFile || explicitMembers ||
+                (app.seqLoadingId != 0 && d->seqId == app.seqLoadingId))
                 f << "seqload 1\n";
             // AFTER seqload: for a folder stack the SeqInfo only exists once the
             // rescan ran, and a name applied before that lands on nothing. The
@@ -301,8 +344,23 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
             // a lone image - taking its series member down with it, because a
             // member resolves through a stack. "seqload 1" is exactly the
             // request that is still outstanding; ask for it again.
-            for (const auto& r : app.seqRestore)
-                if (r.uid == d->uid) { f << "seqload 1\n"; break; }
+            //
+            // ...and if the outstanding request carries an EXPLICIT membership,
+            // ask for THAT again and not for a rescan. Same window, same class
+            // of bug as the seriesRestore block further down: Ctrl+S, the 0.4 s
+            // crash snapshot, the debounced autosave and the autosave on quit
+            // are all live while a restore is still queued, and a save inside it
+            // that fell back to "seqload 1" alone would re-derive the membership
+            // from the folder next time - silently re-admitting the frames the
+            // user excluded, and freezing that as the truth.
+            for (const auto& r : app.seqRestore) {
+                if (r.uid != d->uid) continue;
+                if (r.explicitMembers)
+                    for (size_t k = 0; k < r.files.size(); k++)
+                        f << "stackmember " << k << " " << r.files[k] << "\n";
+                f << "seqload 1\n";
+                break;
+            }
         }
     }
     // ---- computed frames: the RECIPE, never the pixels ----------------------
@@ -2705,6 +2763,15 @@ static std::string loadSession(const std::string& path,
     app.selectedAnn = 0;
     app.annRev++;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
+    // The member list a `stackmember` block is accumulating for the NEXT
+    // `seqload` line (docs/reference-design.md §5.2, board row 267). Read
+    // BEFORE seqload, because seqload acts the moment it is read - it queues the
+    // rescan, or for a peer folder attaches the stack there and then - so a
+    // member list arriving after it would have nothing left to change.
+    // (seqIndex, path); sorted by seqIndex when it is consumed, so the order the
+    // stack comes back in is the order it was saved in and not the order the
+    // lines happen to sit in.
+    std::vector<std::pair<int, std::string>> pendingMembers;
     // ...and the other loss this file can suffer: the image line opened, but
     // the STACK around it could not be rebuilt, so what came back is one frame
     // where the session recorded many. Counted separately because it is a
@@ -3294,14 +3361,77 @@ static std::string loadSession(const std::string& path,
                 }
             }
         }
+        // ---- an EXPLICIT membership, read back (§5.2, board row 267) -------
+        // A stack whose membership was a DECISION (a derived subset, a
+        // hand-picked open, a stack spanning two folders) used to come back as
+        // "every sibling in the folder, wearing that stack's name": the writer
+        // recorded no member list, so the reader's only move was the rescan, and
+        // the frames the user excluded were re-admitted. These lines are that
+        // list. They must be followed by the `seqload` that consumes them; a
+        // block with no seqload after it is dropped by the reset at the end of
+        // the image line, which is the same rule `member` and `readerhint`
+        // already live by (one image line, one qualifier).
+        else if (key == "stackmember") {
+            int at = -1;
+            ls >> at;
+            std::string mp = restOfLine(ls);
+            if (at >= 0 && !mp.empty()) pendingMembers.emplace_back(at, mp);
+            else rep.note(LK_LineRejected, "stackmember");
+        }
         else if (key == "seqload") {   // applies to the image loaded just above
             int on = 0; ls >> on;
+            // Whatever `stackmember` block led up to this line, taken now: one
+            // seqload consumes one list, and a list left over must not drift
+            // onto the next stack (the `member` / `readerhint` rule).
+            std::vector<std::pair<int, std::string>> mine;
+            mine.swap(pendingMembers);
+            std::sort(mine.begin(), mine.end());   // by saved seqIndex
             // only if that image actually loaded, and not when it is already a
             // stack (an in-file frame axis) - that would split it in two
             if (on && lastImageOk && cur() && !cur()->src->path.empty() && cur()->seqId == 0) {
                 const std::string p = cur()->src->path;
                 const bool isRemote = hasUrlScheme(p);
-                if (isRemote) {
+                // An EXPLICIT membership: the file says which frames this stack
+                // is, so no rule is re-applied. Local only, because the writer
+                // only writes these for a local stack (a peer folder stack's
+                // membership is re-derived from the peer's own grouper, PR #117);
+                // a list that arrived for a remote stack is refused out loud
+                // rather than half-honoured.
+                std::vector<std::string> explicitFiles;
+                if (mine.size() >= 2) {
+                    if (isRemote) {
+                        rep.note(LK_LineRejected,
+                                 baseName(p) + ": an explicit membership on a remote "
+                                               "stack is not restored");
+                    } else {
+                        for (const auto& mm : mine) explicitFiles.push_back(mm.second);
+                        // The head this line opened has to BE one of them, or the
+                        // list is about some other stack and startSequenceLoad
+                        // would silently put the head at index 0.
+                        bool head = false;
+                        for (const std::string& ef : explicitFiles)
+                            if (ef == p) { head = true; break; }
+                        if (!head) {
+                            explicitFiles.clear();
+                            rep.note(LK_LineRejected,
+                                     baseName(p) + ": its stackmember list does not "
+                                                   "contain it");
+                        }
+                    }
+                } else if (mine.size() == 1) {
+                    // one member is not a stack; refusing it out loud beats
+                    // restoring a "stack" of one frame from a file that meant N
+                    rep.note(LK_LineRejected,
+                             baseName(p) + ": a one-member stackmember list");
+                }
+                if (!explicitFiles.empty()) {
+                    // No pattern: an explicit list has no folder rule to name it
+                    // by, and `seqname` (which the writer emits for every named
+                    // stack) carries the display name onto the queued entry the
+                    // way it already does for a rescan.
+                    app.seqRestore.push_back({ cur()->uid, std::move(explicitFiles),
+                                               std::string(), {}, {}, {}, {}, true });
+                } else if (isRemote) {
                     // A folder stack whose frames live on a peer. Its siblings
                     // are a LISTING, and findSequenceSiblings below walks THIS
                     // filesystem: handed a url it returns nothing, so this
@@ -3372,6 +3502,16 @@ static std::string loadSession(const std::string& path,
                                  if (w > 0 && h > 0) addAnn(0, x, y, w, h); }
         else if (key == "image") {
             settleCurrent();              // the previous image line is done
+            // A `stackmember` block belongs to the seqload of the image line it
+            // followed. Reaching the NEXT image line with one still in hand means
+            // no seqload consumed it, so it is dropped HERE rather than allowed
+            // to drift onto the next stack - and the drop is said, because a
+            // membership silently applied to the wrong stack is the defect this
+            // whole key exists to fix, pointed the other way.
+            if (!pendingMembers.empty()) {
+                rep.note(LK_LineRejected, "a stackmember block with no seqload after it");
+                pendingMembers.clear();
+            }
             lineOrd++;
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
