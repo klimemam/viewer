@@ -3080,15 +3080,13 @@
             const int probes0 = adapter::pythonProbes();
             const int starts0 = g_readerStarts, runs0 = g_adapterRuns;
             const std::thread::id uiThread = std::this_thread::get_id();
-            g_readerPythonThread.store(uiThread);   // so a door that never asked
-                                                    // cannot pass by leaving a
-                                                    // stale id from another test
+            // Both probes are planted with THIS thread's id, so a door that
+            // never asked at all cannot pass by leaving behind an id some
+            // earlier section wrote from a worker.
+            g_readerPythonThread.store(uiThread);
             startReader(origin, probeSpec);
             const bool async = g_readerStarts - starts0 == 1 && app.rdJob != nullptr &&
                                app.images.empty();
-            // ...and the probe has not been asked for on THIS thread on the way
-            // out of startReader, which is the thing that moved.
-            const bool nothingOnUi = adapter::pythonProbes() == probes0;
             // The frame loop, run by hand, so the ORDER §4.13 is about can be
             // checked on every pump rather than at the end: the panel must never
             // hold a byte the reader printed without the exact command above it.
@@ -3113,22 +3111,39 @@
                         std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 }
             }
+            // BOTH ids are read after the job has finished, and that is the whole
+            // of review P2-1. The first version of this asked
+            // `pythonProbes() == probes0` on the line after startReader returned,
+            // with nothing synchronising the two threads - so a job thread that
+            // reached its fetch_add first made the test FAIL while the product
+            // was behaving exactly as intended. A counter compared across a race
+            // is not a measurement of anything.
+            //
+            // What replaces it is a completed fact: adapter::lastProbeThread() is
+            // written where the probe is DECIDED (the branch that sets g_probed,
+            // i.e. the call that actually starts a Python), so it names where the
+            // 113 ms was spent rather than who asked most recently, and reading it
+            // after the job's `done` means there is nothing left to race with. It
+            // is also the stronger assertion: it still goes red if a synchronous
+            // findPython comes back to the UI thread, which is the regression
+            // dropping the counter comparison would have stopped detecting.
             const std::thread::id askedOn = g_readerPythonThread.load();
+            const std::thread::id probedOn = adapter::lastProbeThread();
             fprintf(stderr, "rreaderselftest:   R24 asks+%d probes+%d runs+%d "
-                            "sameThreadAsUi=%d async=%d cmd=%d out=%d order=%d "
-                            "%zu doc(s) ok=%d\n",
+                            "askedOnUi=%d probedOnUi=%d async=%d cmd=%d out=%d "
+                            "order=%d %zu doc(s) ok=%d\n",
                     g_readerPythonAsks - asks0, adapter::pythonProbes() - probes0,
-                    g_adapterRuns - runs0, (int)(askedOn == uiThread), (int)async,
+                    g_adapterRuns - runs0, (int)(askedOn == uiThread),
+                    (int)(probedOn == uiThread), (int)async,
                     (int)sawCmd, (int)sawOutput, (int)orderHeld, app.images.size(),
                     (int)app.readerLastOk);
-            check(async && nothingOnUi,
-                  "R24a a reader START returns with nothing read and no interpreter "
-                  "probed on this thread");
+            check(async,
+                  "R24a a reader START returns with nothing read");
             check(g_readerPythonAsks - asks0 == 1 && askedOn != uiThread,
                   "R24b the interpreter was looked for on the JOB's thread, not the UI's");
-            check(adapter::pythonProbes() - probes0 == 1,
-                  "R24c ...and that ask was the FIRST-CALL one: a Python really was "
-                  "started for it");
+            check(adapter::pythonProbes() - probes0 == 1 && probedOn != uiThread,
+                  "R24c ...and that ask was the FIRST-CALL one - a Python really was "
+                  "started - and THAT happened off this thread too");
             check(app.readerLastOk && app.images.size() == (size_t)S &&
                       g_adapterRuns - runs0 == 1,
                   "R24d ...and the open it belongs to finished, once");

@@ -3297,7 +3297,12 @@ static void drawReaderList() {
                             "%d of %d remembered (oldest is dropped first).",
                             (int)app.readerMemo.size(), (int)READER_MEMO_MAX);
         std::string why;
-        std::string py = adapter::findPython(app.pythonExe, why);
+        // ...IfKnown, because this row is drawn every frame the window is open
+        // and a reader job may be probing on its own thread right now (board
+        // 304). It probes itself when nobody else is - the row exists to answer
+        // "does my Python work" - but it never waits for another thread's, which
+        // would hold the frame for that probe's whole length.
+        std::string py = adapter::findPythonIfKnown(app.pythonExe, why);
         ImGui::TextDisabled("python: %s", py.empty() ? why.c_str() : py.c_str());
         // §4.13.2: the same list the refusal prints. "Where does it look?" is
         // asked here as often as "which file opens differently", and answering

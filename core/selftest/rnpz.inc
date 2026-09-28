@@ -2329,7 +2329,7 @@
             check(same,
                   "R28d ...and computeMinMax on the same pixels answers the same two "
                   "floats: one kernel, two threads");
-            // ...and the preview really did not know. If these agreed, R26b
+            // ...and the preview really did not know. If these agreed, R28b
             // would be green with the swap never having measured anything.
             check(d && pvMax != gotMax,
                   "R28e the preview's census could not have produced this answer "
@@ -2354,14 +2354,30 @@
             // it again to print the comparison would be reading freed memory -
             // and a use-after-free in the reporting half of a test is still a
             // use-after-free.
+            //
+            // AND THE PREVIEW'S ANSWER IS POISONED FIRST (review P3-8). These two
+            // fixtures are uniform, so the decimated preview's own computeMinMax
+            // already writes exactly the numbers the rule demands - 0..1 for an
+            // all-NaN array, 4.25..5.25 for a flat one - and a landing that
+            // measured nothing at all would leave them in place and pass. Writing
+            // an impossible range over them before the swap means what is read
+            // back can only have come from the landing.
             auto landed = [&](const std::string& url, float& lo, float& hi) {
                 closeAll();
                 const bool o = openRemote(url, false, 0);
+                if (!o || app.images.empty() || app.images[0]->src->remoteStep <= 1)
+                    return false;
+                app.images[0]->src->vmin = -9999.0f;
+                app.images[0]->src->vmax = 9999.0f;
+                app.images[0]->syncMirrors();
                 drainRemote(60.0);
                 const ImageDoc* d2 = cur();
-                if (!o || !d2 || d2->src->remoteStep != 1) return false;
+                if (!d2 || d2->src->remoteStep != 1) return false;
                 lo = d2->src->vmin;
                 hi = d2->src->vmax;
+                // ...and the doc's mirror of the source agrees, which is the half
+                // the panels actually read (syncMirrors in the swap path).
+                if (d2->vmin != lo || d2->vmax != hi) return false;
                 return true;
             };
             float nLo = 0, nHi = 0, fLo = 0, fHi = 0;
@@ -2372,8 +2388,9 @@
             fprintf(stderr, "rnpzselftest:   R28 all-NaN %.7g..%.7g  flat %.7g..%.7g\n",
                     (double)nLo, (double)nHi, (double)fLo, (double)fHi);
             check(nanOk && flatOk,
-                  "R28f the two degenerate guards hold on the landing path too "
-                  "(no finite sample -> 0..1, flat -> widened by one)");
+                  "R28f the LANDING writes the two degenerate guards, over a range "
+                  "no measurement could have produced (no finite sample -> 0..1, "
+                  "flat -> widened by one)");
             closeAll();
         }
 
@@ -2388,11 +2405,16 @@
         // applies it in the same frame the swap happens.
         //
         // browse.inc's restore-wait block asserts the DIMENSIONS that come back.
-        // What it does not assert is the phantom crop itself, which is the defect
-        // the refusal exists to prevent and the one a future "just apply it on
-        // the preview" would reintroduce while every dimension still looked
-        // right for one frame. So: srcW/srcH are the FULL source, and the crop
-        // rect is source-relative full-resolution coordinates end to end.
+        // What it does not assert is the phantom crop itself - and that is the
+        // damage the refusal exists to prevent, because it is the part that
+        // SURVIVES. A future "just apply it on the preview" is caught by the
+        // dimensions too (the swap replaces data/w/h wholesale, so R29b's 400x4
+        // would come back as the full 2000x8 and go red); what it leaves behind
+        // after that revert is srcW/srcH stamped with PREVIEW dimensions, and no
+        // later crop or uncrop can undo it - isCropped is true forever and the
+        // source can never be shared. R29c is the only line that sees it.
+        // So: srcW/srcH are the FULL source, and the crop rect is
+        // source-relative full-resolution coordinates end to end.
         {
             std::error_code sec;
             const std::string sess = root + "/crop-restore.vsession";

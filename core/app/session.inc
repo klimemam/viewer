@@ -1441,6 +1441,29 @@ static std::string runAdapterScript() {
     return {};
 }
 
+// THE COMMAND A READER RUN IS, and there is one place it is spelled (board 304
+// review P3-4). Three callers need it and they must all get the same words:
+// openWithReader's asynchronous door (which builds it on the job thread), its
+// synchronous door, and readerCommandLine - the picker's "this will run" line,
+// whose entire purpose is to be the command that then runs.
+//
+// It was three spellings before this, and the picker's was ALREADY WRONG: it
+// showed `py script spec src -o <cache>.npz`, from the days when the harness
+// wrote an npz, while what ran was `py -u script spec src --stream`. A display
+// that exists to prevent surprises was itself the surprise, in §4.13's own
+// words - "not a paraphrase - the thing that will be executed".
+//
+//   -u        unbuffered. Without it Python holds print() in a buffer until it
+//             exits, so a reader that reports its progress reports all of it at
+//             the end, which is the one moment the progress is worthless.
+//   --stream  the result comes back on stdout, framed, and the run captures
+//             stdout straight to the output path. No npz is written and none is
+//             read: the zip container cost 1.45 ms per MB of pixels for nothing.
+static std::vector<std::string> readerArgv(const std::string& py, const std::string& script,
+                                           const std::string& spec, const std::string& src) {
+    return { py, "-u", script, spec, src, "--stream" };
+}
+
 // ---- where readers are looked for (docs/features/adapters/input-adapters.md §4.13.2) ----------
 // The ruling on issue #51 (2026-08-10): 「reader のファイルもしくはフォルダを
 // 登録できるようにすればよいですかね.」 Before it the search path was ONE user
@@ -1964,13 +1987,9 @@ static std::string openWithReader(const std::string& src, const std::string& spe
             // wait is the probe's own, which is what the UI thread used to pay
             // with no Stop at all.
             if (j->cancel.load()) { j->done.store(true); return; }
-            // -u: unbuffered. Without it Python holds print() in a buffer until
-            // it exits, so a reader that reports its progress reports all of it
-            // at the end, which is the one moment the progress is worthless.
-            // --stream: the result comes back on stdout, framed, and the run
-            // captures stdout straight to `out`. No npz is written and none is
-            // read: the zip container cost 1.45 ms per MB of pixels for nothing.
-            j->argv = { py, "-u", j->script, j->spec, j->src, "--stream" };
+            // ONE spelling of the command, shared with the synchronous door and
+            // with the picker's "this will run" line (readerArgv).
+            j->argv = readerArgv(py, j->script, j->spec, j->src);
             // §4.13: THE EXACT COMMAND, RECORDED BEFORE IT RUNS. The record is
             // made on this thread, one statement before the spawn, and that
             // satisfies the rule - which is about ORDER ("before the run") and
@@ -1997,7 +2016,7 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     if (py.empty())
         return readerNoPythonText("", why,
                                   "set one in Settings, or install numpy for the one you have");
-    std::vector<std::string> argv = { py, "-u", script, spec, src, "--stream" };
+    std::vector<std::string> argv = readerArgv(py, script, spec, src);
     logMsg("reader: " + adapter::showCommand(argv));
     g_adapterRuns++;
     adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile, false);
@@ -2381,17 +2400,25 @@ static void readerConfirmed(const std::string& spec) {
 }
 static std::string readerCommandLine(const std::string& src, const std::string& spec) {
     std::string why;
-    std::string py = adapter::findPython(app.pythonExe, why);
+    // ...IfKnown: this is drawn EVERY FRAME while the picker is open, and the
+    // picker is open in the same window that has to keep answering while a
+    // reader runs (board 304). It still probes when nobody else is - §4.13's
+    // display must work before the first run of the process - but it will not
+    // wait behind a job thread's probe; it says so and asks again next frame.
+    std::string py = adapter::findPythonIfKnown(app.pythonExe, why);
     std::string script = runAdapterScript();
-    if (py.empty()) return "(no Python found: " + why + ")";
+    if (py.empty()) return "(" + why + ")";
     if (script.empty()) return "(run_adapter.py not found next to this build)";
     // The command shown must be the command run, so it carries the RESOLVED
     // reader (§4.13.2). A bare name here would show a line that is not what
     // starts, which is the one thing this display exists to prevent.
     ReaderLookup look = resolveReaderFile(spec);
     if (look.file.empty()) return "(no such reader - see the Reader panel)";
-    return adapter::showCommand({ py, script, look.file + ":" + readerFuncOf(spec),
-                                  src, "-o", "<cache>.npz" });
+    // ...and from the SAME builder the run uses, for the same reason one line up.
+    // This display used to spell its own argv and had drifted: it showed
+    // `-o <cache>.npz` when what runs is `-u ... --stream` (readerArgv).
+    return adapter::showCommand(
+        readerArgv(py, script, look.file + ":" + readerFuncOf(spec), src));
 }
 
 // ---- Open in new window (todo-open item 28) ---------------------------------

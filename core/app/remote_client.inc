@@ -64,10 +64,13 @@ static std::string updateScript();
 // instrument that cost a getenv per phase would be partly measuring itself.
 //
 // Printed rather than accumulated, because the question is "which phase of THIS
-// open" and it is asked of one open at a time, by hand, with
-// tools/measure/freeze_probe.ps1 watching the same process from outside. The two
-// instruments answer different halves: the probe says how long the window did
-// not answer, these lines say what it was doing.
+// open" and it is asked of one open at a time, by hand, with the WM_NULL freeze
+// probe watching the same process from outside. That probe needs a real window,
+// so it is not in this repository and not a selftest: it lives in
+// viewer_work/g232/tools/measure/freeze_probe.ps1, the same out-of-tree location
+// core/selftest/asyncopen.inc names, with its numbers in PR #234's, #266's and
+// #272's bodies. The two instruments answer different halves: the probe says how
+// long the window did not answer, these lines say what it was doing.
 //
 // It is not a profiler and must not grow into one. Every line is a phase a
 // design decision could MOVE to another thread - that is the only reason a phase
@@ -118,14 +121,23 @@ struct OpenPhase {
     double tStart = nowSec();
     double tLap = tStart;
     int n = 0;
+    int dropped = 0;           // ...and it SAYS how many, see below
     struct Mark { const char* what; double ms; };
     Mark marks[12];
     explicit OpenPhase(const char* w) : label(w) {}
     // The elapsed time since the last mark, recorded under the name of the phase
     // that just ENDED, and the clock restarted.
+    //
+    // The array is fixed and small because this runs inside the region it
+    // measures and must not allocate. A pump landing more frames than it holds -
+    // a stack of 13 arriving at once - therefore loses lines, so the count of
+    // what was lost is printed: a measurement that quietly shows 12 of 30 frames
+    // is worse than one that shows 12 and says 18 are missing. The cap stays; it
+    // is an instrument, and the TOTAL is still the whole pump.
     void lap(const char* w) {
         const double now = nowSec();
         if (n < (int)(sizeof marks / sizeof *marks)) marks[n++] = { w, (now - tLap) * 1000.0 };
+        else dropped++;
         tLap = now;
     }
     ~OpenPhase() {
@@ -133,6 +145,7 @@ struct OpenPhase {
         if (!timeOpenPhases()) return;
         for (int i = 0; i < n; i++)
             fprintf(stderr, "time:   %-22s %8.1f ms\n", marks[i].what, marks[i].ms);
+        if (dropped) fprintf(stderr, "time:   (+%d more, not recorded)\n", dropped);
         fprintf(stderr, "time: %-24s %8.1f ms  TOTAL\n", label, total);
     }
 };
