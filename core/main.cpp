@@ -1409,6 +1409,12 @@ int main(int argc, char** argv) {
     #include "selftest/precision.inc"
     #include "selftest/profile-noise.inc"
 
+    // The four sites that compute "sigma of the row / column means" (板 303).
+    // Directly after profile-noise.inc because one of the four IS
+    // computeProfileNoise and the fixtures are of the same kind - analytic, with
+    // the expected value a rational derived by hand.
+    #include "selftest/rowcolsigma.inc"
+
     #include "selftest/abstats.inc"
 
     #include "selftest/tile.inc"

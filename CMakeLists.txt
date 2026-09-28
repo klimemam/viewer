@@ -1421,6 +1421,12 @@ viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
 # is a number or the string a panel prints, so it gates on all three runners.
 viewer_selftest(precision   NOGL --precision-selftest tools/testdata)
 viewer_selftest(profile-noise NOGL --profile-noise-selftest)
+# The four sites that compute "sigma of the row / column means" (板 303), held
+# against each other on one analytic fixture. NOGL and fixture-free for
+# profile-noise's reasons - the documents are built in memory and every expected
+# value is a rational derived by hand - and it needs the shipped
+# uniformity/prnu-fpn dll, which startup loads before parseCli either way.
+viewer_selftest(rowcol-sigma NOGL --rowcol-sigma-selftest)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # (frame-lin retired with the §3.3 migration: the frame-axis linearity fit
