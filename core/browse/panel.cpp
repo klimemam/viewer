@@ -1520,6 +1520,42 @@ void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SetTooltip("this panel: refresh, how it lists, search the server");
     if (ImGui::BeginPopup("rbpanelmenu")) {
         if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
+        // watch-design §5's third item, and it sits HERE - next to Refresh - for
+        // the reason the design gives it: this panel re-lists its own folder
+        // every few seconds while it is drawn (§2's second row), and this is what
+        // is done about a listing that came back with something new in it. It is
+        // not a listing SHAPE, so it does not join the three radio pairs below;
+        // it is "what this panel does", which is what the top of this menu is.
+        //
+        // Off while Watch itself is off, and it SAYS so rather than sitting
+        // there looking armed: the poll is what opens anything, and there is no
+        // poll without Watch (rbPollDue's first line).
+        if (!app.watchEnabled) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Watch: open new stacks", nullptr, I.watchOpenNew)) {
+            I.watchOpenNew = !I.watchOpenNew;
+            // Thrown ON: the baseline is taken NOW, so the stacks already in
+            // this folder are SEEN and never opened (watch::newNames). Thrown
+            // OFF: it is forgotten, so turning it on again tomorrow takes
+            // tomorrow's baseline rather than measuring against a folder as it
+            // was before lunch.
+            if (I.watchOpenNew) rbOpenNewSeed(I);
+            else { I.openNewDir.clear(); I.openNewSeen.clear(); }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(
+                app.watchEnabled
+                    ? "OFF by default, and per panel.\n\n"
+                      "While it is on, a numbered stack that APPEARS in this folder\n"
+                      "is opened once, exactly as double-clicking its row would.\n"
+                      "The stacks already here when you switched it on are not\n"
+                      "opened, and a stack that GAINS a frame is not opened again -\n"
+                      "that is Reload's job (the amber line in Files).\n\n"
+                      "It follows the poll, so it stops while this panel is not\n"
+                      "being drawn."
+                    : "Needs File > Watch > \"Watch source files on disk\":\n"
+                      "nothing polls this folder while that is off, so there is\n"
+                      "nothing for this to notice.");
+        if (!app.watchEnabled) ImGui::EndDisabled();
         ImGui::Separator();
         // Radio pairs, not toggles: the state is visible without clicking.
         if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
@@ -2762,6 +2798,21 @@ void drawPanelRemote(App::BrowseInstance& I) {
         } else if (!B.searchRoot.empty()) {
             line += DOT;
             line += "search aimed at " + B.searchRoot;
+        }
+        // watch-design §5's third item, said ONCE and only while it is true. It
+        // earns a clause by the board's own rule for this line - "the bottom
+        // line says only what nothing else says": the toggle lives behind a
+        // click in the "..." menu, so while it is on, the fact that this panel
+        // will open a stack nobody asked for is stated NOWHERE ELSE on screen.
+        // The count is there because "3 opened" is what makes the claim checkable
+        // afterwards; it is left off at zero, like the selection count above.
+        if (I.watchOpenNew && app.watchEnabled) {
+            line += DOT;
+            line += "opening new stacks";
+            if (I.openNewOpened > 0) {
+                snprintf(cnt, sizeof cnt, " (%d so far)", I.openNewOpened);
+                line += cnt;
+            }
         }
         if (std::string pn = rbProtocolNote(B.peerVersion); !pn.empty()) {
             line += DOT;

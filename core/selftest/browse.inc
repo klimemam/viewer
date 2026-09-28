@@ -1849,6 +1849,87 @@
                         if (it->id == id) { app.seqs.erase(it); break; }
                 settle();
             }
+            {   // ---- B7: watch-design §5's third item - "open new stacks" ------
+                // The whole claim, in four turns of the same poll: OFF opens
+                // nothing, ON opens what ARRIVES (once), a group that GROWS is
+                // not an arrival, and OFF again is off again.
+                //
+                // Everything here rides the poll the five cases above already
+                // drive, because that is the design's own wording: a listing that
+                // nobody asked for is what may open something, and a navigation
+                // or an F5 - which the user DID ask for - must not.
+                auto pollAndWait = [&]() {
+                    const uint64_t rev0 = B.rev;
+                    clk += 100.0;
+                    I.polledAt = clk - 99.0;
+                    const bool issued = rbPollRound(I, clk, FR);
+                    double t0 = nowSec();
+                    while (nowSec() - t0 < 120.0) {
+                        pumpRemoteBrowse();
+                        if (B.rev != rev0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    return issued && B.rev != rev0;
+                };
+                auto writeSet = [&](const char* stem, int n, float base) {
+                    for (int i = 0; i < n; i++) {
+                        char nm[64];
+                        snprintf(nm, sizeof nm, "%s_%03d.npy", stem, i);
+                        writeNpy4(scratch + "/" + nm, base + (float)i);
+                    }
+                };
+                app.rbOpenQueue.clear();
+                I.openNewOpened = 0;
+                check(!I.watchOpenNew,
+                      "B7 (setup) the per-panel toggle is OFF, which is the default");
+                writeSet("ng", 4, 30.0f);              // a stack appears...
+                const bool got1 = pollAndWait();
+                check(got1 && app.rbOpenQueue.empty() && I.openNewOpened == 0 &&
+                      !rbGroupNames(B.entries).empty(),
+                      "B7b OFF: a numbered stack appears in the listing and nothing opens");
+                // ...and now ON. The baseline is taken at the switch, so what is
+                // ALREADY here is seen: "open new stacks" is about arrivals, and
+                // a switch that opened the folder would be a different feature.
+                I.watchOpenNew = true;
+                rbOpenNewSeed(I);
+                const std::vector<std::string> seen0 = I.openNewSeen;
+                check(seen0.size() == 4 && I.openNewDir == B.dir,
+                      "B7c ON: the four frames already here are SEEN, and the folder named");
+                // ANTI-VACUITY of B7b in the other direction: the same event,
+                // with only the switch different, DOES open something.
+                writeSet("mv", 3, 60.0f);
+                const bool got2 = pollAndWait();
+                bool three = app.rbOpenQueue.size() == 1 &&
+                             app.rbOpenQueue[0].files.size() == 3;
+                bool named = three && app.rbOpenQueue[0].host == B.host &&
+                             app.rbOpenQueue[0].files[0].find("mv_000.npy") !=
+                                 std::string::npos &&
+                             !app.rbOpenQueue[0].name.empty();
+                check(got2 && three && named && I.openNewOpened == 1 &&
+                      I.openNewSeen.size() == 7,
+                      "B7d ...and the stack that ARRIVED is queued once, with its 3 frames");
+                // A GROUP THAT GROWS IS NOT AN ARRIVAL (PR #160 owns that event).
+                // The listing really does change - a fourth member moves the
+                // group row's bytes and its member list - so this is a poll that
+                // APPLIED and still opened nothing, which is the only way to
+                // assert "not twice" without asserting on a dropped listing.
+                app.rbOpenQueue.clear();
+                writeNpy4(scratch + "/mv_003.npy", 63.0f);
+                const bool got3 = pollAndWait();
+                check(got3 && app.rbOpenQueue.empty() && I.openNewOpened == 1 &&
+                      I.openNewSeen.size() == 8,
+                      "B7e a stack that GAINS a frame is not opened again (that is Reload)");
+                // ...and OFF is off: another arrival, nothing queued.
+                I.watchOpenNew = false;
+                I.openNewDir.clear();
+                I.openNewSeen.clear();
+                writeSet("zz", 2, 90.0f);
+                const bool got4 = pollAndWait();
+                check(got4 && app.rbOpenQueue.empty() && I.openNewOpened == 1,
+                      "B7f OFF again: the next arrival is not opened either");
+                app.rbOpenQueue.clear();
+                settle();
+            }
             {   // ---- B8: board row 134 - a selection is N SINGLE OPENS ---------
                 // The ruling: Enter over a multi-selection opens EACH selected
                 // item exactly as a single open of that item would - so an item

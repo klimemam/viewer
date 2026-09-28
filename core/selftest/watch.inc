@@ -1227,6 +1227,9 @@
         //         not a frame that failed to read).
         //    W49  F UNCHANGED: a rewrite of the same shape says nothing about
         //         membership at all, which is the anti-vacuity of both.
+        //
+        //  (W50, after them, is §5's third item - a different section's decision,
+        //  with no filesystem either.)
         // ======================================================================
         {   // ---- W46: the sentences, and the decision, with no disk -----------
             check(watch::frameAxisText(4, 6, 6) ==
@@ -1386,6 +1389,28 @@
                       "W49 a rewrite of the SAME shape re-reads and rebuilds nothing");
             }
             closeAll();
+        }
+        {   // ---- W50: §5's third item - "Watch: open new stacks", as a DECISION
+            // The whole of what the Browse toggle decides, with no listing, no
+            // panel and no open in it: SEEN not opened, and the identity of a
+            // stack is its MEMBERS. The real thing - a poll that finds a stack
+            // and opens it - is --browse-selftest B7, because the poll and the
+            // listing live there.
+            check(!watch::unseenStack({ "a_0.npy", "a_1.npy" }, { "a_0.npy", "a_1.npy" }),
+                  "W50 what was already there is not news (the baseline opens nothing)");
+            check(watch::unseenStack({ "a_0.npy", "a_1.npy" }, { "b_0.npy", "b_1.npy" }),
+                  "W50b ...while a stack sharing not one name with it IS an arrival");
+            // THE CORRECTION the implementation forced: a group row is named with
+            // the EXTENT of its frame axis, so growth renames the stack and a
+            // name-keyed watcher opens it twice. Keyed on members, a stack that
+            // GAINS a frame shares three names with what is known and is not an
+            // arrival - which is §6's membership rebuild's event, not this one's.
+            check(!watch::unseenStack({ "a_0.npy", "a_1.npy", "a_2.npy" },
+                                      { "a_0.npy", "a_1.npy", "a_2.npy", "a_3.npy" }),
+                  "W50c a stack that GAINED a frame is not an arrival (one known name)");
+            check(watch::unseenStack({}, { "a_0.npy" }) &&
+                  !watch::unseenStack({ "a_0.npy" }, {}),
+                  "W50d an empty baseline is all news; an empty stack is not an arrival");
         }
 
         app.watchAutoReload = autoWas;   // see the note above the §9 section

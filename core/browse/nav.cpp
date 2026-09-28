@@ -338,6 +338,12 @@ static void pumpRemoteBrowseOne(App::BrowseInstance& I) {
             B.entries = std::move(r.entries);
             B.rev++;                  // ...and the cursor and ticks follow it
             I.pollsApplied++;
+            // §5's third item, and it is THE POLL's answer and nobody else's. A
+            // navigation and an F5 also replace this listing, and neither of them
+            // may open anything: the user asked to LOOK there. The poll is the
+            // one listing nobody asked for, which is exactly why a stack
+            // appearing out of it is the feature and not a surprise.
+            rbOpenNewStacks(I);
             continue;
         }
         if (r.kind == App::RbTreeList) {
@@ -559,6 +565,98 @@ bool rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame) {
     j.dir  = I.b.dir;
     rbEnqueue(I, std::move(j));
     return true;
+}
+
+// ---- watch-design §5, third item: "Watch: open new stacks" -------------------
+//
+// The STACKS a listing holds, by name. A group row is a stack and a plain file
+// row is not: "open new stacks" is the answer to 撮影しながら見る - a capture
+// writes a numbered sequence and the panel opens it when it appears - and a
+// switch that also opened every loose .png that landed in the folder would be a
+// different and much noisier promise. Directories are not stacks either.
+std::vector<std::string> rbGroupNames(const std::vector<remote::Entry>& ents) {
+    std::vector<std::string> out;
+    for (const remote::Entry& e : ents)
+        if (!e.dir && e.group) out.push_back(e.name);
+    return out;
+}
+
+// ...and every MEMBER name those stacks hold, which is what the baseline is made
+// of and what the decision is taken on. Not the group rows' names:
+// watch::unseenStack says why - a group row is named with the extent of its frame
+// axis, so a folder that gains a frame renames a stack that is already open.
+static std::vector<std::string> rbStackMembers(const std::vector<remote::Entry>& ents) {
+    std::vector<std::string> out;
+    for (const remote::Entry& e : ents)
+        if (!e.dir && e.group)
+            for (const std::string& m : e.members) out.push_back(m);
+    return out;
+}
+
+// Take the baseline and open NOTHING. Called when the toggle is thrown and on
+// the first poll after the panel has moved, which are the two moments "what was
+// already here" is decided - §1's first observation, one feature over.
+void rbOpenNewSeed(App::BrowseInstance& I) {
+    I.openNewDir = I.b.dir;
+    I.openNewSeen = rbStackMembers(I.b.entries);
+}
+
+// A POLL has replaced the listing: open the groups that are news. Returns how
+// many were queued, which is 0 for all of the ordinary reasons and is the
+// selftest's anti-vacuity term.
+//
+// Through app.rbOpenQueue, which is §5's own wording ("既存の rbOpenQueue 経路
+// で開く") and is the queue the folder scan already opens through: one stack at a
+// time, the next starting only when the fetcher is idle, so the memory budget is
+// applied against what the last one actually loaded. A capture folder can gain
+// three groups between two polls, and three simultaneous stack loads is how a
+// watched folder would exhaust the budget and report "n of N" for all three.
+//
+// A name is remembered the moment it is QUEUED, not when its frames land: the
+// next poll is three seconds away and the load can take longer than that, and a
+// stack opened twice is the one failure this feature could introduce that a
+// person would notice as "why are there six of these".
+int rbOpenNewStacks(App::BrowseInstance& I) {
+    if (!I.watchOpenNew) return 0;
+    if (I.openNewDir != I.b.dir) {   // moved: this listing IS the baseline
+        rbOpenNewSeed(I);
+        return 0;
+    }
+    int opened = 0;
+    for (const remote::Entry& e : I.b.entries) {
+        if (e.dir || !e.group || e.members.empty()) continue;
+        const bool fresh = watch::unseenStack(I.openNewSeen, e.members);
+        // SEEN either way, and before the open rather than after it: every member
+        // this listing showed is now known, so the frame that lands in this stack
+        // a second from now is growth and not an arrival. A name is remembered the
+        // moment it is QUEUED, not when its frames land - the next poll is three
+        // seconds away and a load can take longer than that, and a stack opened
+        // twice is the one failure here that a person notices as "why are there
+        // six of these".
+        for (const std::string& m : e.members)
+            if (!rbHas(I.openNewSeen, m)) I.openNewSeen.push_back(m);
+        if (!fresh) continue;
+        App::RemoteOpen ro;
+        ro.host = I.b.host;
+        ro.port = I.b.port;
+        for (const std::string& m : e.members)
+            ro.files.push_back(I.b.dir == "/" ? "/" + m : I.b.dir + "/" + m);
+        // The name a double-click on that very row would have opened it under -
+        // stackNameFor over the peer's own group text - so a stack that arrived
+        // by itself is indistinguishable from one somebody opened, which is the
+        // whole point of it being the same door.
+        ro.name = stackNameFor(I.b.dir, e.name);
+        app.rbOpenQueue.push_back(std::move(ro));
+        opened++;
+        I.openNewOpened++;
+    }
+    // SAID, once per round and only when something happened: a stack appearing
+    // on screen with nobody's click behind it needs a stated cause, and the
+    // toggle is in a menu the reader is not looking at.
+    if (opened)
+        g_browseHost.toast("Watch: opening " + std::to_string(opened) +
+                           " new stack(s) in " + I.b.dir, false);
+    return opened;
 }
 
 // ...and every instance, once per UI frame, beside pumpRemoteBrowse.

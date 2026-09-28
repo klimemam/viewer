@@ -48,6 +48,15 @@ bool   rbAnyPollDue(double now);               // the idle-skip chain's term
 // the same row with the same numbers.
 bool   rbSameListing(const std::vector<remote::Entry>& a,
                      const std::vector<remote::Entry>& b);
+// ---- watch-design §5, third item: "Watch: open new stacks" --------------------
+// The per-instance toggle's three moving parts, free for rbPollDue's reason: a
+// NOGL selftest drives the decision the poll drives. `rbGroupNames` is which
+// rows of a listing are STACKS, `rbOpenNewSeed` takes the baseline and opens
+// nothing, and `rbOpenNewStacks` is what a POLL's answer does about it (it
+// returns how many stacks it queued).
+std::vector<std::string> rbGroupNames(const std::vector<remote::Entry>& ents);
+void rbOpenNewSeed(App::BrowseInstance& I);
+int  rbOpenNewStacks(App::BrowseInstance& I);
 bool rbHas(const std::vector<std::string>& v, const std::string& s);
 void rbTreeExpand(App::BrowseInstance& I, const std::string& dir);
 void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir);

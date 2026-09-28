@@ -228,6 +228,24 @@ struct Instance {
     std::atomic<bool> pollPending{ false };
     int pollsIssued = 0;          // selftest probe: rounds that went out
     int pollsApplied = 0;         // ...and answers that replaced the listing
+    // ---- watch-design §5, third item: "Watch: open new stacks" --------------
+    // PER INSTANCE and default OFF, which is the design's own wording: one
+    // panel can be watching a capture folder fill while another is being used
+    // to look around, and a global switch would make the second one open
+    // everything the first one is waiting for. It is not persisted: "open a
+    // stack I have not asked for" is a thing you turn on for the session you
+    // are shooting in, and a preference that survived a restart would open
+    // stacks on the next one before the panel was even looked at.
+    bool watchOpenNew = false;
+    // The baseline, and WHICH FOLDER it is about. Taken when the toggle is
+    // thrown, and again on the first poll after the panel navigates - so the
+    // groups that were already there are SEEN, never opened (watch::newNames),
+    // and arriving somewhere new announces nothing exactly as §1's first
+    // observation does. Names, not indices or pointers: a re-listing replaces
+    // every entry, which is precisely when this is asked.
+    std::string openNewDir;
+    std::vector<std::string> openNewSeen;
+    int openNewOpened = 0;        // selftest probe: stacks this panel queued
     // ---- tree mode: this instance's expanded nodes and their children ---
     std::map<std::string, std::vector<remote::Entry>> treeCache;
     std::vector<std::string> expanded;     // absolute dirs currently open

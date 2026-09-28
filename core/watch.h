@@ -450,6 +450,42 @@ inline std::string frameAxisText(int before, int resident, int expected) {
            " frame(s)";
 }
 
+// ---- §5's third item: "Watch: open new stacks" -------------------------------
+//
+// Is this stack one the caller has NOT seen before? The whole of the decision,
+// with no filesystem, no listing type and no open in it: the caller hands in the
+// names it already knows about and the member names of one stack in the listing
+// it just read.
+//
+// SEEN, not OPENED. A stack that was already in the folder when the toggle went
+// ON is seen and is never opened - "open new stacks" is about what ARRIVES, and
+// a switch that opened the twelve stacks already sitting there would be a
+// different feature and a far more expensive one. The baseline is taken at the
+// moment the switch is thrown, exactly as §1 takes the watcher's, and like §1's
+// first observation it announces nothing and opens nothing.
+//
+// THE IDENTITY IS THE MEMBERS, and that is a correction the implementation
+// forced. The obvious key is the stack's own name, and it does not work: a group
+// row's name carries the EXTENT of its frame axis ("mv_000‥002.npy",
+// rp::patternWithExtent), so a folder that gains a frame RENAMES the stack that
+// is already open and a name-keyed watcher opens it a second time. Member names
+// do not move - a frame that appears is one more name beside the ones that were
+// there - so they are what is remembered.
+//
+// NOT ONE of them, rather than not all of them. A capture writing frame 4 into a
+// stack whose 0..3 are open shares three names with what is known, and a rule
+// asking "are they all new?" would call that an arrival. Asking "is any of them
+// known?" calls it the growth it is, which is §6's membership rebuild's event
+// (PR #160) and not this one's: two mechanisms claiming one event is how a stack
+// comes to be opened again every time a frame lands in it.
+inline bool unseenStack(const std::vector<std::string>& seen,
+                        const std::vector<std::string>& members) {
+    if (members.empty()) return false;        // nothing to open is not an arrival
+    for (const std::string& m : members)
+        if (std::find(seen.begin(), seen.end(), m) != seen.end()) return false;
+    return true;
+}
+
 // ---- §9: the line an AUTOMATIC reload leaves on the stack -------------------
 //
 // The same discipline as findingText and rebuildText - ONE spelling, read by the
