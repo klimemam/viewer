@@ -1,5 +1,16 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: ローダ
 // ---------------------------------------------------------------- npy loader
+// The element strides a .npy's declared order implies. ONE spelling, because two
+// readers of the frame axis is two answers to "how many frames are in this
+// file": the decoder below derives them here, and watchNpyFrames (watch.inc)
+// asks the same function to learn F from the HEADER alone when the file is
+// rewritten under a live stack (watch-design §12).
+static std::vector<int64_t> npyStridesOf(const std::vector<int64_t>& shape, bool fortran) {
+    std::vector<int64_t> strides(shape.size());
+    if (fortran) { int64_t s = 1; for (size_t i = 0; i < shape.size(); i++) { strides[i] = s; s *= shape[i]; } }
+    else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
+    return strides;
+}
 // returns error string, empty = ok
 // Pure decoder: no app state, no GL — safe to call from the sequence loader thread.
 // framesOut/frameStrideOut report a frame axis (F,H,W[,C]); frameIdx selects one.
@@ -91,9 +102,7 @@ static std::unique_ptr<ImageDoc> decodeNpyBuffer(const std::vector<uint8_t>& buf
     };
 
     // strides in elements
-    std::vector<int64_t> strides(shape.size());
-    if (fortran) { int64_t s = 1; for (size_t i = 0; i < shape.size(); i++) { strides[i] = s; s *= shape[i]; } }
-    else         { int64_t s = 1; for (int i = (int)shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= shape[i]; } }
+    const std::vector<int64_t> strides = npyStridesOf(shape, fortran);
 
     // Layout decision, in npyLayout so the .npz picker predicts with the same
     // rule (§3.1): rank and the LAST axis decide, the leading axis is never

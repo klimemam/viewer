@@ -423,6 +423,33 @@ inline std::string rebuildText(const Rebuild& r, int before, int resident, int e
            std::to_string(expected) + " frame(s), was " + std::to_string(before);
 }
 
+// ---- §12's OTHER membership: F frames inside ONE file -----------------------
+//
+// planRebuild answers "which FILES is this stack made of now?", and there is one
+// shape of stack it cannot be asked about at all: a frame-axis .npy, which is F
+// memberships of ONE path (planStackMembership refuses it by name - "which names
+// are members" is not a question about that stack's names). Its membership moved
+// all the same when the script that wrote it wrote six frames where it had
+// written four, and until this existed the Watch line said the file had changed
+// and the Reload behind it re-read four frames out of six for ever.
+//
+// So: the same statement, made about a COUNT rather than about names. The rule
+// it keeps is rebuildText's - BOTH numbers, always - because a rebuild that
+// moved the frame count and did not print the new one leaves a stack quietly
+// measuring a different set. `expected` is what the header declares now,
+// `resident` is what actually decoded (a grown file whose new frame will not
+// decode is n-of-N, §12.4, and not a failure), and `before` is what the stack
+// held when the Reload started. "" = the count did not move, and then this
+// whole mechanism has nothing to say and the ordinary re-read summary stands
+// alone.
+inline std::string frameAxisText(int before, int resident, int expected) {
+    if (before == expected && before == resident) return {};
+    return "membership rebuilt: the frame axis in this file holds " +
+           std::to_string(expected) + " frame(s), was " + std::to_string(before) +
+           " - " + std::to_string(resident) + " of " + std::to_string(expected) +
+           " frame(s)";
+}
+
 // ---- §9: the line an AUTOMATIC reload leaves on the stack -------------------
 //
 // The same discipline as findingText and rebuildText - ONE spelling, read by the
