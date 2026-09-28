@@ -241,8 +241,11 @@ if (g_anaValueSelftest) {
         check(R1.at("varlap") != RC.at("varlap") &&
               R1.at("tenengrad") != RC.at("tenengrad"),
               "G3 ...which is the anti-vacuity: each fixture zeroes what the other does not");
-        auto small = mk("av_tiny", 2, 9, 1);
-        const Res RS = run("sharpness/gradient", *small, nullptr);
+        // NOT `small`: MSVC's rpcndr.h has `#define small char`, so a local of
+        // that name is three compile errors on one runner and none on the other
+        // two (the same trap as #253 and #261).
+        auto tooSmall = mk("av_tiny", 2, 9, 1);
+        const Res RS = run("sharpness/gradient", *tooSmall, nullptr);
         check(RS.rc == 1 && RS.err == "sharpness: region too small (need >= 3x3)",
               "G4 under 3x3 it refuses in words rather than reporting 0");
     }
