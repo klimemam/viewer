@@ -904,6 +904,64 @@
             check(n2 && n2->src->rev > rev0 && n2->dataRev > drev0,
                   "R18c ...through reloadSource: the source and doc revisions moved");
         }
+        {   // ---- R23: ...and NOT on the UI thread (the 2026-09-28 report) -------
+            // §16.6 argued that a blocking META+TILE per member was the manual
+            // gesture's price and not the automatic one's. The answer taken in
+            // the end is that it is nobody's: the round trips run on the reload
+            // worker, over a Session that worker owns, and app.uiSession is not
+            // touched at all (state.h's "one Session, one owning thread"). Here
+            // the session is the TEST's - that is what the §16 resolver is for -
+            // and this thread is inside waitForReloadJob while the worker uses
+            // it, so it still has one toucher at a time.
+            const bool flag0 = g_forceAsyncOpen;
+            g_forceAsyncOpen = true;                 // the lid: see startStackReload
+            ImageDoc* d1 = memberDoc(pseq, 1);
+            const float was = d1 ? d1->px()[0] : -1.0f;
+            writeNpy2(stk + "/" + nm(1), 4, 4, 911.0f);
+            const bool took = startStackReload(pseq, false, peerOf);
+            const bool nothingYet = d1 && d1->px()[0] == was;
+            waitForReloadJob();
+            ImageDoc* n1 = memberDoc(pseq, 1);
+            fprintf(stderr, "rwatchselftest: R23 took=%d nothing-yet=%d px1=%g\n",
+                    (int)took, (int)nothingYet, n1 ? (double)n1->px()[0] : -1.0);
+            check(took && nothingYet,
+                  "R23 a peer stack's Reload starts a worker and returns having "
+                  "fetched nothing");
+            check(n1 && n1->px()[0] == 911.0f,
+                  "R23b ...and META+TILE lands the peer's new bytes all the same");
+            check(g_reloadDecodeThread != std::this_thread::get_id(),
+                  "R23c ...on a thread that is not this one");
+            // A DEAD LINK IS ASKED ONCE. A stack of forty peer frames must not
+            // spend forty connect timeouts discovering that the link is down,
+            // and it must not re-dial in between - so the resolver is called by
+            // the PLAN (one listing) and by the first item, and the remaining
+            // members are refused from the latch with no further request.
+            int calls = 0;
+            ReloadPeer counted = [&](const std::string&, int,
+                                     std::string& e) -> remote::Session* {
+                calls++;
+                e = "the peer did not answer";
+                return nullptr;
+            };
+            const bool took2 = startStackReload(pseq, false, counted);
+            waitForReloadJob();
+            fprintf(stderr, "rwatchselftest: R23d dead link: took=%d resolver calls=%d "
+                    "failed=%d\n", (int)took2, calls,
+                    seqInfo(pseq) ? seqInfo(pseq)->reloadFailed : -1);
+            check(took2 && calls == 2,
+                  "R23d a dead peer is asked ONCE by the plan and ONCE by the "
+                  "re-read, never per member");
+            check(seqInfo(pseq) && seqInfo(pseq)->reloadFailed == 4 &&
+                      seqInfo(pseq)->reloadOk == 0,
+                  "R23e ...and every member is refused, with nothing re-read");
+            // ...and the live link puts the stack back in one piece, so the cases
+            // after this one start from a stack of one moment (R19 asserts #56).
+            startStackReload(pseq, false, peerOf);
+            waitForReloadJob();
+            check(seqInfo(pseq) && seqInfo(pseq)->reloadFailed == 0,
+                  "R23f ...while the live link clears the mark again");
+            g_forceAsyncOpen = flag0;                // borrowed state, given back
+        }
         {   // ---- R19: NO ANSWER REBUILDS NOTHING -------------------------------
             // §13.4 made DETECTION fail towards silence. A rebuild has to fail
             // the same way and harder: an unreachable peer folded into an empty

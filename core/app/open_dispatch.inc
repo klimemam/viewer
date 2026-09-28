@@ -1798,11 +1798,25 @@ static std::string reloadStackTail(int seqId, const watch::Rebuild& plan, int ha
     // rather than by analogy: the stack really does hold frames of two moments,
     // so #56's mark has to be up. What differs is the WORD - `firstErr` says
     // "stopped after n of N" - because nothing about the files was wrong.
+    // A STOP's frames are NOT refusals, and they are not "of this moment"
+    // either: they are the frames nobody re-read. So the LATCH counts them -
+    // the stack really does hold two moments, which is the one thing #56's mark
+    // is about - while `failed` above stays the count of members that actually
+    // refused, because that is what the summary's first clause claims.
+    int latchFailed = t.failed, latchOk = t.ok;
+    std::string latchErr = t.firstErr;
+    if (t.stoppedAfter >= 0 && t.stoppedAfter < t.stoppedOf) {
+        latchFailed += t.stoppedOf - t.stoppedAfter;
+        if (latchErr.empty())
+            latchErr = "the reload was stopped, so " +
+                       std::to_string(t.stoppedOf - t.stoppedAfter) +
+                       " frame(s) were never re-read";
+    }
     if (App::SeqInfo* si = seqInfo(seqId)) {
-        si->reloadFailed = t.failed;
-        si->reloadOk = t.failed ? t.ok : 0;
-        si->reloadFirstErr = t.failed ? t.firstErr : std::string();
-        if (t.failed) {
+        si->reloadFailed = latchFailed;
+        si->reloadOk = latchFailed ? latchOk : 0;
+        si->reloadFirstErr = latchFailed ? latchErr : std::string();
+        if (latchFailed) {
             char ts[32] = "";
             time_t now = time(nullptr);
             if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
@@ -1837,8 +1851,8 @@ static std::string reloadStackTail(int seqId, const watch::Rebuild& plan, int ha
     // ...and the toast points at the mark it just left, because the mark is
     // the part that outlives the toast: a user who reads only this line must
     // still learn that the stack now carries the fact, and where.
-    if (t.failed)
-        msg += " - " + t.firstErr + " - this stack is marked " +
+    if (latchFailed)
+        msg += " - " + latchErr + " - this stack is marked " +
                SEQ_RELOAD_FAIL_TOKEN + " in Files until every frame re-reads";
     if (t.dims) {
         snprintf(buf, sizeof buf, " - %d changed dimensions (%s)", t.dims,

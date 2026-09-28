@@ -1311,11 +1311,21 @@ viewer_selftest(video       NOGL --video-selftest)
 # OFF for one case, so the anti-vacuity half - the same 100 MB fixture landing
 # immediately, with zero pumps - is measured in the same process.
 #
+# ...and the RELOAD worker (the 2026-09-28 report), in the same process and
+# under the same flag, as the R group. Its subject is the same four structures
+# with one addition the open does not have: a frame-axis stack is one
+# FrameSource per FRAME, so a three-frame single-file stack used to be THREE
+# whole-file reads and six decodes to land three frames, and `g_fileReads == 1`
+# is what holds that down. Its other inversion is Stop: a reload's Stop LEAVES
+# WHAT LANDED (a landed frame is a complete document of what the disk holds
+# now) and the stack then says it holds two moments.
+#
 # NOGL: counts, pixel values and registry lookups. It takes tools/testdata for
 # one fixture it does not write itself (media/stack3.tif, the multi-page TIFF -
 # a third decoder, neither .npy's nor a zip's) and writes the rest into its own
-# TMP, including a 100 MB .npy whose size is load-bearing: a worker that
-# finishes before anyone pumps would make the pump count claim vacuous.
+# TMP, including a 100 MB .npy and a 34 MB three-frame one whose sizes are
+# load-bearing: a worker that finishes before anyone pumps would make the pump
+# count claim vacuous.
 viewer_selftest(asyncopen   NOGL --asyncopen-selftest tools/testdata --async-open)
 # settings.jsonc (issue #50 stage 1, docs/features/settings/settings-inventory.md): the JSONC
 # dialect it accepts and the JSON5 forms it refuses, the load order
