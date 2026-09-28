@@ -181,8 +181,9 @@ jobs:
       # an Ubuntu 20.04 container (glibc 2.31) since PR #159 for exactly that
       # reason - and issue #241 is what the other half of that asymmetry cost:
       # the PEER started on the user's old compute box and the VIEWER that
-      # talks to it did not, because only the peer was ever rebuilt. The
-      # container now builds the whole tarball: viewer, viewer-serve, plugins.
+      # talks to it did not, because only the peer was ever rebuilt. Containers
+      # now build the whole tarball: viewer, viewer-serve, plugins - two of
+      # them, for the reason under "TWO CONTAINERS" below.
       #
       # WHY CMAKE AND NOT A g++ LINE. This step used to hand-write the peer's
       # compile - a list of core/*.cpp kept in step with CMakeLists.txt by hand.
@@ -207,16 +208,32 @@ jobs:
       # same reason. And the ceiling is ASSERTED below rather than printed,
       # which is the half that would have caught it either way.
       #
-      # 2.31 IS THE FLOOR THIS REACHES: Debian 11 and Ubuntu 20.04 (both 2.31),
-      # RHEL 9 (2.34), and everything above them. NOT RHEL 8, which ships 2.28 -
-      # the container's own libm already forces 2.29 on the peer (exp, log and
-      # pow gained a version there), so that was never within reach.
+      # TWO CONTAINERS, BECAUSE THE TWO HALVES LAND ON DIFFERENT MACHINES.
+      # This step used to build everything in ubuntu:20.04 and promise 2.31 -
+      # Debian 11, Ubuntu 20.04, RHEL 9 and up - and the comment here used to
+      # say that RHEL 8 (2.28) "was never within reach", because 20.04's own
+      # libm forces GLIBC_2.29 on anything that calls exp, log or pow. Issue
+      # #268 is the bill for that sentence: the VIEWER runs on the machine you
+      # sit at, which is a normal desktop, but the PEER runs on somebody's
+      # compute box, and a compute box is the oldest machine in the story.
+      # RHEL/Rocky/CentOS 8 and Debian 10 (2.28), Ubuntu 18.04 (2.27) and
+      # CentOS 7 (2.17) all took a peer they could not start, and the remote
+      # update reported it as "glibc".
       #
-      # IT COSTS A SECOND FULL BUILD of this tree, in series with the first. The
-      # first one is not redundant: it is the one the 34 selftests and the bench
-      # gate ran against, on the OS this project is developed on, and it stays
-      # for that. This one is the one that ships.
-      - name: Rebuild what ships for old glibc (Ubuntu 20.04 container)
+      # So the PEER SET - viewer-serve and plugins/*.so - is built in
+      # quay.io/pypa/manylinux2014_x86_64 (CentOS 7, glibc 2.17, devtoolset gcc
+      # 10 for C++17 and <filesystem>). That is possible for the peer and only
+      # for the peer: it links no GL, no X11 and no Wayland (see the
+      # viewer-serve block in CMakeLists.txt), so nothing about it needs the
+      # GUI development headers CentOS 7 has no modern versions of. The GUI
+      # `viewer` stays on the 20.04 path exactly as it was, at 2.31, and the
+      # assertion below is in two tiers for the same reason.
+      #
+      # IT COSTS TWO MORE FULL BUILDS of this tree, in series with the first.
+      # The first one is not redundant: it is the one the 34 selftests and the
+      # bench gate ran against, on the OS this project is developed on, and it
+      # stays for that. These two are the ones that ship.
+      - name: Rebuild what ships for old glibc (viewer in 20.04, peer in manylinux2014)
         if: runner.os == 'Linux'
         run: |
           # The compat build uses THE SAME SOURCES the cmake build above
@@ -328,44 +345,145 @@ jobs:
           # naming the commit it was built from, which is the one thing that
           # string is for.
           #
+          # ONE TARGET, not `all`: the peer and the plugins are built in the
+          # other container below, and naming targets also keeps the .exr
+          # fixture tool out of this build - it writes into the source tree,
+          # and these fixtures were already written by the runner build the
+          # selftests ran against.
+          cmake --build /tmp/compat -j"$(nproc)" --target viewer
+          # Over the runner's own, in place: from here down build/viewer IS the
+          # compat binary, so every check below and the tarball itself are about
+          # the thing that actually ships. The runner build has already done its
+          # job upstairs.
+          install -m755 /tmp/compat/viewer /src/build/
+          COMPAT
+
+          # THE PEER SET, on CentOS 7's glibc. Same sources, same pins, same two
+          # static compiler runtimes; a different container, five years further
+          # back. Everything this heredoc can assume is narrower than the one
+          # above, so it MEASURES rather than assumes: the compiler it found,
+          # the cmake it is about to run and whether <filesystem> needs its own
+          # archive are all printed or probed instead of written down.
+          docker run --rm -i -v "$PWD:/src" -w /src quay.io/pypa/manylinux2014_x86_64 bash -s <<'PEER'
+          set -euo pipefail
+          # devtoolset-10 is what makes a 2014 base image able to compile C++17,
+          # <filesystem> and all. The manylinux images put it on PATH already;
+          # the enable scripts are the fallback for the day that changes, and
+          # the version line below is the record of which one actually ran - a
+          # peer compiled by the wrong compiler is the thing this whole step
+          # exists to notice.
+          if ! command -v g++ >/dev/null 2>&1; then
+            for e in /opt/rh/devtoolset-*/enable /opt/rh/gcc-toolset-*/enable; do
+              if [ -f "$e" ]; then . "$e"; fi
+            done
+          fi
+          g++ --version | head -1
+          # git is for cmake/gitversion.cmake: without it every shipped peer
+          # would name its commit "unknown". The image has it; say so loudly
+          # rather than ship an anonymous binary if it ever does not.
+          command -v git >/dev/null 2>&1 \
+            || { echo "no git in the peer container: cmake/gitversion.cmake would stamp this binary 'unknown'"; exit 1; }
+          git config --global --add safe.directory /src
+          # THE ONE PACKAGE THIS CONTAINER NEEDS. CMakeLists.txt calls
+          # find_package(OpenGL REQUIRED) at the top, for every configure -
+          # including one that will only build a peer which links no GL at all.
+          # A header package settles it, and it is the whole of the GUI
+          # toolchain in here because GLFW's two platform halves are switched
+          # OFF below: GLFW 3.4 with no X11 and no Wayland configures against
+          # nothing, and CMakeLists.txt's own find_package(X11) is guarded by
+          # GLFW_BUILD_X11 and is therefore never reached either. CentOS 7 is
+          # past EOL, so its repositories are the vault the manylinux image is
+          # already pointed at - which is why this is one package and not a
+          # list.
+          yum install -y mesa-libGL-devel
+          # The SAME pinned Kitware tarball the 20.04 container uses, for the
+          # same reason and with a second one here: that tarball is built
+          # against glibc 2.17, which is exactly this container's glibc. The
+          # image ships a cmake of its own through pipx; this one is PINNED, so
+          # a cmake release cannot change what this step produces on a day
+          # nobody touched the repo.
+          curl -fsSL --retry 5 --retry-delay 5 \
+               https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz \
+            | tar xz -C /opt
+          export PATH=/opt/cmake-3.31.6-linux-x86_64/bin:$PATH
+          cmake --version | head -1
+          # std::filesystem is in libstdc++ proper from gcc 9.1, and in an
+          # archive of its own before that. gcc 10 therefore does NOT need
+          # -lstdc++fs where 20.04's gcc 9.4 does - so ask the compiler where
+          # the archive is instead of deciding here. -print-file-name echoes the
+          # name back unchanged when it cannot find the file, which is the
+          # documented way to test for one.
+          FSLIB=""
+          if [ "$(g++ -print-file-name=libstdc++fs.a)" != libstdc++fs.a ]; then FSLIB=-lstdc++fs; fi
+          echo "std::filesystem archive: ${FSLIB:-<in libstdc++>}"
+          cmake -S /src -B /tmp/peer -DCMAKE_BUILD_TYPE=Release \
+                -DGLFW_BUILD_X11=OFF -DGLFW_BUILD_WAYLAND=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+                -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc" \
+                -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc" \
+                -DCMAKE_CXX_STANDARD_LIBRARIES="$FSLIB" \
+                -DFETCHCONTENT_SOURCE_DIR_GLFW=/src/build/_deps/glfw-src \
+                -DFETCHCONTENT_SOURCE_DIR_IMGUI=/src/build/_deps/imgui-src \
+                -DFETCHCONTENT_SOURCE_DIR_MINIZ=/src/build/_deps/miniz-src \
+                -DFETCHCONTENT_SOURCE_DIR_PFD=/src/build/_deps/pfd-src \
+                -DFETCHCONTENT_SOURCE_DIR_IMATH=/src/build/_deps/imath-src \
+                -DFETCHCONTENT_SOURCE_DIR_OPENEXR=/src/build/_deps/openexr-src \
+                -DFETCHCONTENT_SOURCE_DIR_LIBRAW=/src/build/_deps/libraw-src \
+                >/dev/null
           # The plugin list is the .c files, exactly as the step this replaced
           # globbed them: one source, one MODULE, target name is the basename.
-          # Nothing here repeats CMakeLists.txt's list of them. Naming targets
-          # rather than building `all` also keeps the .exr fixture tool out of
-          # this build - it writes into the source tree, and these fixtures were
-          # already written by the runner build the selftests ran against.
-          targets="viewer viewer-serve"
+          # Nothing here repeats CMakeLists.txt's list of them. The plugins
+          # belong to the PEER set and not to the viewer's, even though the
+          # viewer dlopens them too: they are what server-side MEASURE loads
+          # (core/serve.cpp dlopens exactly ~/.viewer/plugins), so the machine
+          # they have to be loadable on is the old one. A 2.17 .so loads on a
+          # 2.39 desktop; the reverse is #268.
+          targets="viewer-serve"
           for f in plugins/*.c; do targets="$targets $(basename "${f%.c}")"; done
-          cmake --build /tmp/compat -j"$(nproc)" --target $targets
-          # Over the runner's own, in place: from here down build/viewer,
-          # build/viewer-serve and build/plugins ARE the compat binaries, so
-          # every check below and the tarball itself are about the thing that
-          # actually ships. The runner build has already done its job upstairs.
-          install -m755 /tmp/compat/viewer /tmp/compat/viewer-serve /src/build/
-          install -m755 /tmp/compat/plugins/*.so /src/build/plugins/
-          COMPAT
+          cmake --build /tmp/peer -j"$(nproc)" --target $targets
+          install -m755 /tmp/peer/viewer-serve /src/build/
+          install -m755 /tmp/peer/plugins/*.so /src/build/plugins/
+          PEER
           # THE CEILING IS ASSERTED, not printed for someone to notice. This is
           # the whole promise of the step - it is what "runs on an old distro"
           # MEANS - and a printed number is not a gate: the quote bug described
           # above shipped a runner-built binary past this very line for as long
-          # as it linked. ONE number for every shipped binary, and it is the
-          # PROMISE (the container's own glibc) rather than each binary's
-          # measured ceiling: inside a 2.31 container nothing can exceed 2.31
-          # anyway, so per-binary numbers would only drift apart and be updated
-          # for no reader's benefit. What this actually catches is a link that
-          # escaped the container - the runner's 24.04 puts GLIBC_2.34+ symbols
-          # in anything it touches.
+          # as it linked. The number is the PROMISE (the building container's own
+          # glibc) rather than each binary's measured ceiling: inside a 2.17
+          # container nothing can exceed 2.17 anyway, so per-binary numbers would
+          # only drift apart and be updated for no reader's benefit. What this
+          # actually catches is a link that escaped its container - the runner's
+          # 24.04 puts GLIBC_2.34+ symbols in anything it touches, and a peer
+          # built by the 20.04 half by accident lands at 2.29, which is #268.
+          #
+          # TWO NUMBERS, one per container, and the split is the point of this
+          # whole change. If a symbol ever forces the peer above 2.17, do not
+          # raise peer_max quietly: the usual suspects are
+          # __cxa_thread_atexit_impl@GLIBC_2.18 (a thread_local with a
+          # non-trivial destructor - static libstdc++ normally satisfies it
+          # internally, so check `objdump -T` for the symbol before believing
+          # it), memfd_create@2.27 and statx@2.28. Building against 2.17 headers
+          # means the last two cannot even be declared, so a 2.18+ ceiling is a
+          # real finding. Raise it to the MEASURED value and name the symbol
+          # here when it is genuinely unavoidable.
           #
           # The NEEDED list is the second half, and it is #241's other error
           # line: a binary that still names libstdc++.so.6 or libgcc_s.so.1 will
           # die with "GLIBCXX_3.4.32 not found" on a machine whose libstdc++ is
           # older, however old the glibc it was built against.
-          max=GLIBC_2.31
+          gui_max=GLIBC_2.31          # ubuntu:20.04  - Ubuntu 20.04, Debian 11, RHEL 9 and up
+          peer_max=GLIBC_2.17         # manylinux2014 - CentOS 7 / RHEL 7 and up
           fail=0
           for f in build/viewer build/viewer-serve build/plugins/*.so; do
+            # build/viewer is the only thing the 20.04 container still makes;
+            # everything else in this list is the peer set.
+            case "$f" in
+              build/viewer) max=$gui_max ;;
+              *)            max=$peer_max ;;
+            esac
             need="$(objdump -p "$f" | sed -n 's/^ *NEEDED *//p' | tr '\n' ' ')"
             ceil="$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
-            echo "$f: needs at most ${ceil:-<none>}  [ ${need}]"
+            echo "$f: needs at most ${ceil:-<none>} (promised <= $max)  [ ${need}]"
             case " $need " in
               *" libstdc++.so.6 "*|*" libgcc_s.so.1 "*)
                 echo "  ^ links a compiler runtime dynamically: -static-libstdc++ / -static-libgcc did not take"
