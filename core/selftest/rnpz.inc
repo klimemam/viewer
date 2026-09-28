@@ -2235,6 +2235,148 @@
             closeAll();
         }
 
+        // ---- the wide-frame fixture ---------------------------------------------
+        // ONE WIDE frame, 2000 px across. openRemote's first view is decimated
+        // (step = ceil(max(w,h)/1600) = 2), so this file arrives as a preview and
+        // the full resolution is swapped in later by pumpRemoteFetch - which is
+        // the only shape R28 below has anything to say about.
+        //
+        // The pixels are chosen so that the preview CANNOT know the answer. The
+        // peer's decimation samples x0, x0+step, ... (core/serve.cpp), so with
+        // step 2 it reads only EVEN columns; the extremes therefore sit on odd
+        // columns and odd rows, and the three non-finite samples sit among them.
+        // A test whose preview and full frame measured the same two numbers
+        // would pass without the swap having re-measured anything.
+        const int wideW = 2000, wideH = 8;
+        const float wideMax = 1000.0f, wideMin = -5.0f;
+        const std::string wide = root + "/wide.npy";
+        {
+            std::vector<float> px((size_t)wideW * wideH);
+            for (int y = 0; y < wideH; y++)
+                for (int x = 0; x < wideW; x++)
+                    px[(size_t)y * wideW + x] = (float)((x * 7 + y) % 251);
+            const float inf = std::numeric_limits<float>::infinity();
+            px[(size_t)0 * wideW + 3] = std::numeric_limits<float>::quiet_NaN();
+            px[(size_t)1 * wideW + 5] = inf;       // skipped: not finite
+            px[(size_t)2 * wideW + 7] = -inf;      // ...and so is this one
+            px[(size_t)3 * wideW + 1001] = wideMax;   // odd row, odd column
+            px[(size_t)5 * wideW + 1003] = wideMin;
+            npyWriteFile(wide, "<f4", { wideH, wideW }, px.data(), px.size() * sizeof(float));
+        }
+        // The one thing no test in this tree did: RE-MEASURE min/max from the
+        // pixels and compare the answer with the product's. Deliberately its own
+        // loop and not a call to the kernel - a reference that went through
+        // minMaxOf would move with it and could never go red (kernel inventory
+        // §4 P22: "there is not one test in the whole tree that recomputes
+        // min/max from the pixels and compares it with the product").
+        auto refMinMax = [](const std::vector<float>& px, float& lo, float& hi) {
+            double mn = 0, mx = 0;
+            bool any = false;
+            for (float v : px) {
+                if (!std::isfinite(v)) continue;
+                if (!any) { mn = mx = v; any = true; }
+                else { if (v < mn) mn = v; if (v > mx) mx = v; }
+            }
+            if (!any) { lo = 0; hi = 1; return; }
+            lo = (float)mn;
+            hi = (float)mx;
+            if (lo == hi) hi = lo + 1;
+        };
+
+        // ---- R28: min/max over the link is ONE kernel (board 299) --------------
+        // rfWorker measured the full-resolution frame with a COPY of
+        // computeMinMax's loop and its two degenerate guards - the only silent
+        // duplicate the kernel inventory found (§3 K10 #1/#2, §4 P22). It is one
+        // function now (minMaxOf), and this is what holds it there: the numbers
+        // the worker wrote onto the source are compared against an independent
+        // re-measurement AND against what the UI thread's own entry point says
+        // about the same pixels. Mutate minMaxOf and the second and third of
+        // those move together while the first does not - which is the
+        // calibration, and the reason the reference above is hand-written.
+        {
+            closeAll();
+            const bool opened = openRemote(urlOf(wide), false, 0);
+            const int stepAtOpen = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+            const float pvMin = app.images.empty() ? 0 : app.images[0]->src->vmin;
+            const float pvMax = app.images.empty() ? 0 : app.images[0]->src->vmax;
+            drainRemote(120.0);
+            ImageDoc* d = cur();
+            check(opened && stepAtOpen > 1 && d && d->src->remoteStep == 1 &&
+                      d->w == wideW && d->h == wideH,
+                  "R28a (setup) a wide remote frame arrives decimated and the full "
+                  "resolution lands");
+            float lo = 0, hi = 0;
+            if (d) refMinMax(d->src->data, lo, hi);
+            const float gotMin = d ? d->src->vmin : 0, gotMax = d ? d->src->vmax : 0;
+            fprintf(stderr, "rnpzselftest:   R28 preview %.7g..%.7g -> full %.7g..%.7g "
+                            "(recomputed %.7g..%.7g)\n",
+                    (double)pvMin, (double)pvMax, (double)gotMin, (double)gotMax,
+                    (double)lo, (double)hi);
+            check(d && gotMin == lo && gotMax == hi,
+                  "R28b the range the fetch worker wrote is the range the pixels have");
+            check(d && gotMax == wideMax && gotMin == wideMin,
+                  "R28c ...including the extremes only an odd column holds, and the "
+                  "three non-finite samples are not values");
+            // The UI thread's own entry point, over the pixels that are now
+            // resident: the same two floats, bit for bit, or the two halves of
+            // K10 have drifted - which is the whole of P22.
+            bool same = false;
+            if (d) {
+                computeMinMax(*d);
+                same = d->src->vmin == gotMin && d->src->vmax == gotMax &&
+                       d->vmin == gotMin && d->vmax == gotMax;
+            }
+            check(same,
+                  "R28d ...and computeMinMax on the same pixels answers the same two "
+                  "floats: one kernel, two threads");
+            // ...and the preview really did not know. If these agreed, R26b
+            // would be green with the swap never having measured anything.
+            check(d && pvMax != gotMax,
+                  "R28e the preview's census could not have produced this answer "
+                  "(anti-vacuity)");
+            // The degenerate guards, over the LINK rather than in a unit test:
+            // an array with no finite sample at all reads 0..1, and a flat one is
+            // widened by one so that black < white. They were written twice; a
+            // copy that dropped either would show up here and nowhere else.
+            const std::string allNan = root + "/allnan.npy";
+            const std::string flatf = root + "/flat.npy";
+            {
+                std::vector<float> nn((size_t)wideW * wideH,
+                                      std::numeric_limits<float>::quiet_NaN());
+                npyWriteFile(allNan, "<f4", { wideH, wideW }, nn.data(),
+                             nn.size() * sizeof(float));
+                std::vector<float> ff((size_t)wideW * wideH, 4.25f);
+                npyWriteFile(flatf, "<f4", { wideH, wideW }, ff.data(),
+                             ff.size() * sizeof(float));
+            }
+            // The numbers are copied OUT before the next closeAll: `cur()` is a
+            // borrowed pointer into app.images and closeAll frees it, so reading
+            // it again to print the comparison would be reading freed memory -
+            // and a use-after-free in the reporting half of a test is still a
+            // use-after-free.
+            auto landed = [&](const std::string& url, float& lo, float& hi) {
+                closeAll();
+                const bool o = openRemote(url, false, 0);
+                drainRemote(60.0);
+                const ImageDoc* d2 = cur();
+                if (!o || !d2 || d2->src->remoteStep != 1) return false;
+                lo = d2->src->vmin;
+                hi = d2->src->vmax;
+                return true;
+            };
+            float nLo = 0, nHi = 0, fLo = 0, fHi = 0;
+            const bool nanOk = landed(urlOf(allNan), nLo, nHi) &&
+                               nLo == 0.0f && nHi == 1.0f;
+            const bool flatOk = landed(urlOf(flatf), fLo, fHi) &&
+                                fLo == 4.25f && fHi == 5.25f;
+            fprintf(stderr, "rnpzselftest:   R28 all-NaN %.7g..%.7g  flat %.7g..%.7g\n",
+                    (double)nLo, (double)nHi, (double)fLo, (double)fHi);
+            check(nanOk && flatOk,
+                  "R28f the two degenerate guards hold on the landing path too "
+                  "(no finite sample -> 0..1, flat -> widened by one)");
+            closeAll();
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

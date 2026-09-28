@@ -148,12 +148,17 @@ static void rfWorker() {
                     d.err = err;
                 } else {
                     d.w = w; d.h = h; d.ch = ch;
-                    float mn = FLT_MAX, mx = -FLT_MAX;
-                    for (float v : d.data)
-                        if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
-                    if (mn > mx) { mn = 0; mx = 1; }
-                    if (mn == mx) mx = mn + 1;
-                    d.vmin = mn; d.vmax = mx;
+                    // K10, and the ONE implementation of it (board 299). These
+                    // five lines used to be a copy of computeMinMax's loop and
+                    // its two degenerate guards - the only SILENT duplicate the
+                    // kernel inventory found (§3 K10 #2, §4 P22). The copy
+                    // existed because there is no ImageDoc here yet, which is
+                    // precisely what minMaxOf does not need: the landing writes
+                    // these two numbers onto the source it swaps into
+                    // (pumpRemoteFetch), so the full frame's range is measured
+                    // off the UI thread and is the same number the UI thread
+                    // would have measured.
+                    minMaxOf(d.data, d.vmin, d.vmax);
                 }
             }
         }
