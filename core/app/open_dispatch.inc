@@ -165,7 +165,7 @@ static bool readWholeFile(const std::string& path, std::string& out) {
     return !out.empty();
 }
 
-static std::string bootstrapScript() {
+static std::string bootstrapScript(bool keepCurrentPeer) {
     // POSIX sh, delivered over stdin so no quoting layer can mangle it.
     // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
     // 判断17: the build-time VIEWER_REPO_URL is the DEFAULT, not the answer.
@@ -182,8 +182,28 @@ static std::string bootstrapScript() {
         "set -e\n"
         "d=$HOME/.viewer\n"
         "mkdir -p \"$d\"\n"
-        "if [ -x \"$d/viewer-serve\" ]; then echo VIEWER_SERVE_OK; exit 0; fi\n"
-        "if ! command -v git >/dev/null 2>&1; then\n"
+      + (keepCurrentPeer ? std::string(
+        // THE EARLY-OUT IS ABOUT A PEER THAT RUNS, not about a file that
+        // exists. This line used to be `[ -x "$d/viewer-serve" ]` and that
+        // was wrong in EVERY case that can reach this script: deployPeer only
+        // gets here after its OWN probe has already decided the peer is
+        // missing, dead or stale (see step 1), so an existence test answers
+        // "already installed" about the very binary that just failed to
+        // start. #268 is what that cost - `./update.sh` refreshed the
+        // binaries checkout but not ~/.viewer/viewer-serve, the viewer then
+        // found a file there, said VIEWER_SERVE_OK, and the user got an
+        // update that reported success and changed nothing.
+        //
+        // So: ask it, and believe it only if it answers with a protocol
+        // number at least as new as ours. `--version` prints
+        // "viewer-serve protocol N", hence the last word.
+        "if v=$(\"$d/viewer-serve\" --version 2>/dev/null); then\n"
+        "  n=${v##* }\n"
+        "  case \"$n\" in ''|*[!0-9]*) ;;\n"
+        "    *) [ \"$n\" -ge " + std::to_string((int)rp::VERSION) + " ] && { echo VIEWER_SERVE_OK; exit 0; } ;;\n"
+        "  esac\n"
+        "fi\n") : std::string())
+      + "if ! command -v git >/dev/null 2>&1; then\n"
         "  echo 'no git on the server: copy viewer-serve to ~/.viewer/ manually'; exit 1\n"
         "fi\n"
         // A private repo would sit forever on a credential prompt, and an
@@ -221,13 +241,15 @@ static std::string bootstrapScript() {
         "echo VIEWER_SERVE_OK\n";
 }
 
-// Update an already-installed peer (menu action): same script, forced refresh.
-static std::string updateScript() {
-    std::string s = bootstrapScript();
-    size_t p = s.find("if [ -x \"$d/viewer-serve\" ]");
-    if (p != std::string::npos) s.erase(p, s.find('\n', p) + 1 - p);   // skip the early-out
-    return s;
-}
+// Update an already-installed peer (menu action): the same script with the
+// early-out switched off.
+//
+// It used to DELETE that line from the finished script by searching for its
+// text - surgery that stops working SILENTLY the day the line is reworded, and
+// #268 is the rewording that would have done it (one `[ -x ]` test became a
+// four-line --version check). One parameter instead, so the two forms cannot
+// drift apart.
+static std::string updateScript() { return bootstrapScript(false); }
 
 // Does the peer over there RUN, and if not, WHY NOT in one line.
 //
@@ -381,7 +403,32 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
         log += (log.empty() ? "" : "\n") + o4;
         return false;
     }
-    log = "the server installed its own peer";
+    // PROVE it runs, exactly as the send-our-own path above does. This path had
+    // no such check: it cloned the binaries branch, saw its own `cp` succeed,
+    // printed VIEWER_SERVE_OK and reported an install - so a peer that cannot
+    // start on this host was installed and CALLED INSTALLED, and the only
+    // symptom left was "no answer from the remote viewer" at the next connect.
+    // Two ways to fail, and they are different sentences: it does not start
+    // (the loader's words, plus which glibc is missing), or it starts and is
+    // older than this viewer (the branch it cloned is behind). #268.
+    std::string vout5, verr5;
+    remote::runSshScript(host, port, peerProbeScript(""), vout5, verr5, 15.0);
+    size_t vp5 = vout5.find("viewer-serve protocol ");
+    if (vp5 == std::string::npos) {
+        log += (log.empty() ? "" : "\n") +
+               std::string("the server installed its own peer, but it does not run there:\n") +
+               vout5;
+        return false;
+    }
+    int gotProto = atoi(vout5.c_str() + vp5 + 22);
+    if (gotProto < (int)rp::VERSION) {
+        log += (log.empty() ? "" : "\n") + std::string("the server installed its own peer, but it "
+               "reports protocol ") + std::to_string(gotProto) + " (this viewer speaks " +
+               std::to_string((int)rp::VERSION) + ") - the `binaries` branch it cloned is "
+               "older than this viewer";
+        return false;
+    }
+    log = "the server installed its own peer (protocol " + std::to_string(gotProto) + ")";
     return true;
 }
 

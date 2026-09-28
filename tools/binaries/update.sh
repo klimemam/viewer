@@ -1,5 +1,7 @@
 #!/bin/sh
 #   ./update.sh                       - the published build, in place
+#   ./update.sh --peer                - ...and into ~/.viewer/, which is the
+#                                       peer the VIEWER actually starts
 #   ./update.sh --fetch binaries-pr64 - that branch's build, in place, git only
 #   ./update.sh --pr 64               - that pull request's build, into try/pr64/
 #   ./update.sh --commit a1b2c3       - that commit's build, into try/a1b2c3/
@@ -87,21 +89,70 @@ peer_glibc() {                   # $1 = an ELF binary; prints e.g. GLIBC_2.29
     | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
 }
 
-peer_starts() {
+peer_starts() {                  # $1 = path to a peer, $2 = what to call it
   [ "$DIR" = linux-x64 ] || return 0        # a glibc question; macOS has none
-  p="$DIR/viewer-serve"
-  [ -x "$p" ] || return 0
-  if "$p" --version >/dev/null 2>&1; then return 0; fi
-  need=$(peer_glibc "$p")
+  [ -x "$1" ] || return 0
+  if "$1" --version >/dev/null 2>&1; then return 0; fi
+  need=$(peer_glibc "$1")
   have=$(ldd --version 2>&1 | head -1)
   [ -n "$have" ] || have="an unknown libc (no ldd on this host)"
   if [ -n "$need" ]; then
-    echo "viewer-serve needs $need but this host has $have" >&2
+    echo "$2 needs $need but this host has $have" >&2
   else
-    echo "viewer-serve does not start on this host ($have):" >&2
-    "$p" --version 2>&1 | sed 's/^/  /' >&2
+    echo "$2 does not start on this host ($have):" >&2
+    "$1" --version 2>&1 | sed 's/^/  /' >&2
   fi
   echo "  the files ARE updated; this build cannot run here. Report that line." >&2
+}
+
+# THE PEER THE VIEWER STARTS IS ~/.viewer/viewer-serve, NEVER THIS CHECKOUT'S
+# COPY. core/app/remote_client.inc builds that path from REMOTE_HOME and
+# remote.cpp execs exactly it; this script updates the CHECKOUT. On the machine
+# that is both the data host and the place `update.sh` is run, those are two
+# different files, and nothing here ever touched the second one - so the update
+# genuinely succeeded, reported success, and the viewer went on starting the
+# same old binary. Together with the viewer's own bootstrap, which used to
+# early-out on the mere EXISTENCE of ~/.viewer/viewer-serve, that is #268: "the
+# remote update does not work" about an update that worked.
+install_peer() {
+  src="$DIR/viewer-serve"
+  [ -f "$src" ] || { echo "no $src in this checkout - nothing to install" >&2; return 1; }
+  d="$HOME/.viewer"
+  mkdir -p "$d"
+  # .new + mv, never a write in place. A live peer has its file MAPPED (the
+  # viewer keeps one per worker for the life of the app), and truncating it
+  # under the mapping is a SIGBUS in that process. Unlinking is free: the
+  # running peer keeps the inode, and therefore the code, it started with -
+  # the same reason bootstrapScript does .new + mv on the far side.
+  cp "$src" "$d/viewer-serve.new"
+  chmod +x "$d/viewer-serve.new"
+  mv "$d/viewer-serve.new" "$d/viewer-serve"
+  echo "~/.viewer/viewer-serve <- $src"
+  # The plugins travel with it: server-side MEASURE dlopens ~/.viewer/plugins,
+  # so a peer updated without them analyses with the old analyzers.
+  [ -d "$DIR/plugins" ] || return 0
+  mkdir -p "$d/plugins"
+  for f in "$DIR"/plugins/*; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    cp "$f" "$d/plugins/$b.new"
+    mv "$d/plugins/$b.new" "$d/plugins/$b"
+  done
+  echo "~/.viewer/plugins/   <- $DIR/plugins/"
+}
+
+# Say the above out loud when it matters, and only then: this folder's peer and
+# the one the viewer starts are different builds.
+peer_note() {
+  [ -f "$HOME/.viewer/viewer-serve" ] || return 0
+  [ -f "$DIR/viewer-serve" ] || return 0
+  if cmp -s "$DIR/viewer-serve" "$HOME/.viewer/viewer-serve"; then return 0; fi
+  cat >&2 <<EOF
+
+The viewer starts ~/.viewer/viewer-serve, not the copy in this folder, and that
+one is a DIFFERENT build from what this update just placed here. To refresh it:
+    ./update.sh --peer
+EOF
 }
 
 reset_to() {                     # $1 = ref to make the tree be
@@ -123,13 +174,25 @@ is already running - it keeps the code it started with. Quit that window and
 start ./$DIR/$BIN again to be on the new build.
 EOF
   fi
-  # ...and LAST, because it is the one line that says the update was not
-  # enough. Silent when the peer starts, which is every normal run.
-  peer_starts
+  # ...and LAST, because these are the lines that say the update was not
+  # enough. Both are silent on a normal run: the peer starts, and ~/.viewer
+  # either does not exist or already holds this same build.
+  peer_starts "$DIR/viewer-serve" "viewer-serve"
+  peer_note
 }
 
 case "$1" in
   "")   git fetch origin binaries && reset_to origin/binaries; exit 0 ;;
+  --peer)
+        # Installs what is IN THE TREE RIGHT NOW, and fetches nothing. That is
+        # what makes it composable: after the plain form the tree is the
+        # published build, and after `--fetch binaries-pr64` it is that branch's
+        # build - so `--peer` always means "the peer beside me becomes the peer
+        # the viewer starts", with no second rule about which build that is and
+        # nothing that can silently undo a --fetch.
+        install_peer
+        peer_starts "$HOME/.viewer/viewer-serve" "~/.viewer/viewer-serve"
+        exit 0 ;;
   --fetch)
         [ -n "$2" ] || { echo "--fetch needs a ref: ./update.sh --fetch binaries-pr64" >&2; exit 2; }
         # In place, like the plain form - this branch is disposable by design,
@@ -141,7 +204,10 @@ case "$1" in
         }
         reset_to FETCH_HEAD; exit 0 ;;
   --pr|--commit) ;;
-  *)    echo "usage: ./update.sh [--fetch REF | --pr N | --commit SHA]" >&2; exit 2 ;;
+  *)    echo "usage: ./update.sh [--peer | --fetch REF | --pr N | --commit SHA]" >&2
+        echo "  --peer  also install this folder's viewer-serve into ~/.viewer/" >&2
+        echo "          (that copy, not this one, is what the viewer starts)" >&2
+        exit 2 ;;
 esac
 
 [ -n "$2" ] || { echo "$1 needs a value: ./update.sh $1 <value>" >&2; exit 2; }

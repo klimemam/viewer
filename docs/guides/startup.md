@@ -47,6 +47,28 @@ GUI は GLFW / X11 / Wayland のヘッダが要るので CentOS 7 では組め�
 1 行を出します(リモート接続時の自動導入も同じ 1 行を返します。
 [issue #268](https://github.com/klimemam/viewer/issues/268))。
 
+### `./update.sh` が更新するのは**このフォルダ**で、`~/.viewer/` ではない
+
+**viewer が起動する peer は必ず `~/.viewer/viewer-serve` です。** このフォルダの
+`linux-x64/viewer-serve` ではありません。`./update.sh` はこの checkout を
+`git fetch` + `reset --hard` するだけなので、**データのあるホストが同時に
+`update.sh` を走らせるマシンでもある**とき、2 つは別のファイルとして食い違います ——
+update は成功し、viewer は古い peer を起動し続けます([#268](https://github.com/klimemam/viewer/issues/268))。
+
+```bash
+./update.sh          # このフォルダを最新にする
+./update.sh --peer   # ...を ~/.viewer/viewer-serve と ~/.viewer/plugins/ へ入れる
+```
+
+`--peer` は**いま手元の木にあるもの**を入れます(fetch はしません)。だから
+`./update.sh --fetch binaries-pr64 && ./update.sh --peer` でその branch の peer を
+試せます。差があるときは `./update.sh` が自分で `--peer` を促します。
+
+なお、**リモート越し(ssh)に使う場合はこの手順は要りません** —— viewer 側が
+`~/.viewer/viewer-serve` を `--version` で確かめ、古い/動かないなら置き換えます
+(`File > Update remote peer` でも明示的にできます)。`--peer` が要るのは
+「データのあるマシンで自分で peer を配る」ときです。
+
 **毎回コマンドラインを開くのが面倒なら、次節でショートカットを作ってください**
 (`win64\install_shortcut.cmd` をダブルクリックするだけ)。
 

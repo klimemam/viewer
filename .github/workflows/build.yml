@@ -138,6 +138,42 @@ jobs:
         # step and no setup. Every OS: the harness spawns a child process and
         # writes files, and that is exactly where platforms differ.
         run: python tools/import/test_adapters.py
+      # The scripts that ship on the `binaries` branch are the only part of this
+      # project that nothing compiled and nothing ran. tools/binaries/update.sh
+      # is POSIX sh delivered to a machine with no build environment, so a typo
+      # in it is discovered by the person who can least afford it - and #268
+      # was in part a missing FEATURE of that script (it refreshed the checkout
+      # and never ~/.viewer/viewer-serve, which is the peer the viewer starts).
+      #
+      # `sh -n` is the parse, and the usage path is the one behaviour that can
+      # be exercised with no network, no git remote and no side effects: an
+      # unrecognised flag prints usage and exits 2 before the script touches
+      # anything. Asserting --peer is IN that usage is what keeps the flag and
+      # the help from drifting apart.
+      - name: The shipped shell scripts parse, and offer --peer
+        if: runner.os == 'Linux'
+        run: |
+          for f in tools/binaries/update.sh tools/install_shortcut.sh; do
+            sh -n "$f" || { echo "$f does not parse as POSIX sh"; exit 1; }
+            echo "$f: parses"
+          done
+          out="$(sh tools/binaries/update.sh --not-a-flag 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *--peer*) ;;
+            *) echo "update.sh usage does not offer --peer: the flag and its help have drifted"; exit 1 ;;
+          esac
+          # ...and the flag is actually HANDLED, not just advertised. A case arm
+          # that fell through would land in the usage branch above and exit 2,
+          # which is the failure this catches. Run it where there is no peer to
+          # copy: it must refuse with a reason rather than exit 2.
+          out2="$(sh tools/binaries/update.sh --peer 2>&1 || true)"
+          echo "$out2"
+          case "$out2" in
+            *"nothing to install"*) ;;
+            *) echo "update.sh --peer did not reach install_peer"; exit 1 ;;
+          esac
+
       - name: Headless render + frame-time check
         if: runner.os == 'Linux'
         run: |

@@ -54,7 +54,9 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
 static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
-static std::string bootstrapScript();
+// keepCurrentPeer: leave an installed peer alone when it ANSWERS --version with
+// a protocol at least as new as ours. False is the forced form (updateScript).
+static std::string bootstrapScript(bool keepCurrentPeer = true);
 static std::string updateScript();
 
 #include "compare.inc"

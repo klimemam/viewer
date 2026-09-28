@@ -329,6 +329,41 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
     return startOn(host, 0, exe, err);
 }
 
+// WHY the peer said nothing. The protocol owns stdout, so spawn() leaves the
+// peer's stderr pointing at THIS process's stderr - which on a GUI build is a
+// console nobody is reading. That is how `version 'GLIBC_2.38' not found`
+// reached us as "no answer from the remote viewer (is it installed there?)",
+// and it is the whole reason #268 had to be diagnosed by hand.
+//
+// Draining that stderr through a pipe instead would mean nothing ever reads it
+// during a healthy session, and a peer that filled the pipe would block on its
+// own diagnostics - so the words are fetched on the FAILURE PATH only, with
+// one bounded ssh round trip. It costs nothing when a connect succeeds, and up
+// to `budget` seconds when one has already failed.
+//
+// The exe goes to the remote shell exactly as startOn passes it (unquoted, so
+// "~" is the remote HOME), and stderr is folded into stdout because the loader
+// writes there. First non-empty line only: the rest is usage text.
+static std::string peerStartError(const std::string& host, int port,
+                                  const std::string& exe) {
+    std::string out, e;
+    if (!runSshCommand(host, port, exe + " --version 2>&1 || true", "", out, e, 8.0))
+        return e;                      // could not even ask; that is the answer
+    size_t b = 0;
+    while (b < out.size()) {
+        size_t nl = out.find('\n', b);
+        std::string line = out.substr(b, nl == std::string::npos ? nl : nl - b);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        // A peer that answers is not the failure this is here to explain: say
+        // nothing rather than paste its version into an unrelated error.
+        if (line.compare(0, 22, "viewer-serve protocol ") == 0) return {};
+        if (!line.empty()) return line;
+        if (nl == std::string::npos) break;
+        b = nl + 1;
+    }
+    return {};
+}
+
 bool Session::startOn(const std::string& host, int port, const std::string& exe, std::string& err) {
     stop();
     host_ = host;
@@ -367,6 +402,13 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     uint32_t type = 0;
     if (!send(rp::MSG_HELLO, w.b, err) || !recv(type, reply, err)) {
         err = err.empty() ? "no answer from the remote viewer (is it installed there?)" : err;
+        // ...and what the peer ACTUALLY said, when there is a host to ask.
+        // A local peer (host empty) writes to this process's own stderr, which
+        // a developer running --serve can already see.
+        if (!host.empty()) {
+            std::string why = peerStartError(host, port, exe);
+            if (!why.empty()) err += "\n" + why;
+        }
         stop();
         return false;
     }

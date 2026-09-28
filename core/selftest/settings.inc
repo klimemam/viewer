@@ -474,6 +474,41 @@ static int settingsSelftest() {
         check(over.find(VIEWER_REPO_URL) == std::string::npos,
               "L7 ...and the built-in URL is no longer in it");
     }
+    {
+        // L8 (#268): WHAT THE BOOTSTRAP SCRIPT CALLS "already installed".
+        //
+        // It used to be `[ -x "$d/viewer-serve" ]` - a file EXISTS - and that
+        // answer was wrong in every case that can reach the script: deployPeer
+        // only runs it after its own probe has decided the peer is missing,
+        // dead or stale, so the early-out fired on exactly the binary that had
+        // just failed. The user's report was an update that said it succeeded
+        // and left the same broken peer running.
+        //
+        // Asserted on the SCRIPT for L7's reason: the script is where the
+        // decision is actually spent, and it is a string this process can read
+        // without an ssh connection to anywhere.
+        baseline();
+        const std::string s = bootstrapScript();
+        check(s.find("[ -x \"$d/viewer-serve\" ]") == std::string::npos,
+              "L8 a file that merely EXISTS is no longer an installed peer");
+        const std::string gate = " -ge " + std::to_string((int)rp::VERSION) + " ]";
+        check(s.find("--version") != std::string::npos && s.find(gate) != std::string::npos,
+              "L8 the installed peer is asked for its protocol, and compared with ours");
+        // The early-out must also be REACHABLE, or this test passes on a script
+        // that lost its fast path: a healthy current peer must still stop here
+        // rather than re-clone the binaries branch on every connect.
+        check(s.find("VIEWER_SERVE_OK; exit 0") != std::string::npos,
+              "L8 ...and a current peer still short-circuits the install");
+        // The forced form has no early-out AT ALL, and it is now a parameter
+        // rather than a line deleted from the finished text by search - the
+        // rewording above is exactly what would have broken that surgery.
+        const std::string u = updateScript();
+        check(u.find("VIEWER_SERVE_OK; exit 0") == std::string::npos,
+              "L8 the forced update keeps no early-out");
+        check(u.find("git clone") != std::string::npos &&
+              u.find("chmod +x \"$d/viewer-serve.new\"") != std::string::npos,
+              "L8 ...and is otherwise the same script (it still installs)");
+    }
 
     // ======================================================================
     //  R — THE REFUSALS
