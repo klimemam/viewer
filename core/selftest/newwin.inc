@@ -759,6 +759,372 @@
                   "N11 no layout.ini is not a reason to create one");
         }
 
+        // N13: what a save and a load could NOT round-trip, said BY TYPE.
+        //
+        // Board row 126's other two halves (the atomic write above is the first).
+        // The counts existed - four fprintf(stderr) lines in writeSessionTo, two
+        // toasts at the end of loadSession - and nothing could be ASKED: the
+        // caller got a bool, the user got whichever sentence happened to fire,
+        // and neither said WHICH doc, series or line went. SessionReport is that
+        // question with a type; LossKind is the closed list of answers.
+        //
+        // Each kind below is produced for real rather than asserted about a
+        // branch nobody enters, and every assertion pairs with the clean case:
+        // a report that fires on a lossless save would be worse than no report.
+        {
+            auto drain = [&](double budget) {
+                double t0 = nowSec();
+                while (nowSec() - t0 < budget) {
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        app.seqRestore.empty() && app.pendingAvg.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            const std::string stkDir = g_newwinSelftest + "/multi/00";
+            const std::string head = stkDir + "/frame_000.npy";
+            const std::string sp = dir + "/report.vsession";
+
+            // (a) THE CLEAN CASE FIRST. One lone frame, nothing computed,
+            // nothing remote: the report has to be empty and the sentence has to
+            // be the plain one. Every check below is read against this.
+            closeAll();
+            check(loadNpy(head).empty(), "N13 a frame to save is open");
+            {
+                SessionReport rep;
+                size_t logBefore = app.msgLog.size();
+                saveSession(sp, false, &rep);
+                check(rep.lost() == 0 && rep.docs == 1,
+                      "N13 a lossless save reports 1 doc and no loss");
+                check(rep.summary("not round-trippable").empty(),
+                      "N13 ...and has no sentence to say about it");
+                bool plain = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("session saved:") != std::string::npos &&
+                        app.msgLog[i].text.find("1 doc(s)") != std::string::npos &&
+                        app.msgLog[i].text.find("not round-trippable") == std::string::npos &&
+                        !app.msgLog[i].err)
+                        plain = true;
+                check(plain, "N13 the toast says how many docs and claims no loss");
+            }
+
+            // (b) LK_ComputedPixels: a frame average. The RECIPE travels and the
+            // PIXELS do not - terminology.md's own rule for a computed frame -
+            // so this is a loss even though the picture comes back, and the
+            // report is the only place that has ever said so.
+            closeAll();
+            std::string pat0;
+            std::vector<std::string> sib0 = findSequenceSiblings(head, pat0);
+            check(sib0.size() >= 3, "N13 a folder stack of at least 3 frames is there");
+            check(loadNpy(head).empty(), "N13 the stack head opens");
+            startSequenceLoad(app.current, sib0, pat0);
+            drain(120.0);
+            int seq0 = cur() ? cur()->seqId : 0;
+            check(seq0 != 0 && framesOfSeq(seq0).size() == sib0.size(),
+                  "N13 the stack is whole before anything is folded from it");
+            requestStackAverage(seq0, FOLD_MEAN);
+            drain(120.0);
+            const ImageDoc* avg = nullptr;
+            for (const auto& d : app.images)
+                if (!d->avgOfPath.empty()) avg = d.get();
+            check(avg != nullptr, "N13 a frame average is open");
+            {
+                SessionReport rep;
+                saveSession(sp, true, &rep);
+                check(rep.count[LK_ComputedPixels] == 1 &&
+                      rep.count[LK_NoFile] == 0,
+                      "N13 a frame average is LK_ComputedPixels, not LK_NoFile");
+                check(avg && !rep.names[LK_ComputedPixels].empty() &&
+                      rep.names[LK_ComputedPixels][0] == avg->name,
+                      "N13 the report NAMES the average it counted");
+                check(rep.docs == 1,
+                      "N13 the stack is one doc in the report, like it is one line in the file");
+                check(rep.summary("not round-trippable")
+                          .find("1 computed frame") != std::string::npos,
+                      "N13 the sentence spells the kind out, not just a number");
+            }
+
+            // (c) LK_NoFile: a ROI montage. No file AND no recipe - the session
+            // cannot say anything about it but that it was there. A different
+            // kind from (b) on purpose: one comes back recomputed and one does
+            // not come back at all, and a taxonomy that merged them would be
+            // telling the user those are the same news.
+            {
+                App::Ann a;
+                a.type = 0; a.x = 0; a.y = 0;
+                a.w = std::min(8, cur()->w); a.h = std::min(8, cur()->h);
+                a.label = "ROI1"; a.id = app.nextAnnId++;
+                app.anns.push_back(a);
+                app.selectedAnn = a.id;
+                app.annRev++;
+                // montageROI wants the STACK current, not the average
+                for (int i = 0; i < (int)app.images.size(); i++)
+                    if (app.images[i]->seqId == seq0) { selectImage(i); break; }
+                std::string merr;
+                const bool made = montageROI(true, merr);
+                check(made, "N13 a ROI montage is made");
+                if (made) {
+                    std::string mn;
+                    for (const auto& d : app.images)
+                        if (d->src->path.empty() && d->avgOfPath.empty() && d->seqId == 0)
+                            mn = d->name;
+                    SessionReport rep;
+                    saveSession(sp, true, &rep);
+                    check(rep.count[LK_NoFile] == 1 &&
+                          rep.names[LK_NoFile].size() == 1 &&
+                          rep.names[LK_NoFile][0] == mn,
+                          "N13 a montage is LK_NoFile, named");
+                    check(rep.count[LK_ComputedPixels] == 1,
+                          "N13 ...and the average is still its own kind, counted once");
+                    const std::string sum = rep.summary("not round-trippable");
+                    check(sum.rfind("2 not round-trippable:", 0) == 0,
+                          ("N13 the sentence totals the kinds: " + sum).c_str());
+                }
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // (d) THE LOAD SIDE. A hand-written session with two defects the
+            // reader has always handled by DROPPING them: an image line whose
+            // file is not there, and an annotation with an impossible rectangle
+            // (the reader refuses it rather than reading out of bounds - right,
+            // and silent until now). The load must NAME both.
+            {
+                const std::string gone = dir + "/not-here.npy";
+                std::filesystem::remove(pathFromUtf8(gone), ec);
+                const std::string bad = dir + "/bad.vsession";
+                {
+                    std::ofstream bf(pathFromUtf8(bad), std::ios::binary);
+                    bf << "viewer-session 1\n"
+                       << "image 0 1 npy3 0 0 0 0 0 0 0 " << head << "\n"
+                       << "image 0 1 npy3 0 0 0 0 0 0 0 " << gone << "\n"
+                       << "ann 0 0 0 -5 4 0 1 0 0 0 0 ROI1\n";
+                }
+                SessionReport rep;
+                size_t logBefore = app.msgLog.size();
+                const std::string lerr = loadSession(bad, &rep);
+                check(lerr.empty(), "N13 a session with droppable lines still opens");
+                check(rep.count[LK_ImageNotRestored] == 1 &&
+                      !rep.names[LK_ImageNotRestored].empty() &&
+                      rep.names[LK_ImageNotRestored][0].find("not-here.npy") !=
+                          std::string::npos,
+                      "N13 a missing file is LK_ImageNotRestored, named");
+                check(rep.count[LK_LineRejected] == 1,
+                      "N13 a malformed ann line is LK_LineRejected");
+                check(app.anns.empty(), "N13 ...and that line really was refused");
+                bool said = false;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("not restored as saved") != std::string::npos &&
+                        app.msgLog[i].text.find("not-here.npy") != std::string::npos &&
+                        app.msgLog[i].err)
+                        said = true;
+                check(said, "N13 ONE message carries the kinds and the names");
+
+                // ANTI-VACUITY: the same reader, on the session it just wrote
+                // for a single readable frame, must report nothing at all.
+                closeAll();
+                check(loadNpy(head).empty(), "N13 one readable frame, again");
+                saveSession(sp, true);
+                SessionReport clean;
+                logBefore = app.msgLog.size();
+                const std::string lerr2 = loadSession(sp, &clean);
+                check(lerr2.empty() && clean.lost() == 0 && clean.docs == 1,
+                      "N13 a load that lost nothing reports nothing");
+                bool quiet = true;
+                for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                    if (app.msgLog[i].text.find("not restored as saved") != std::string::npos)
+                        quiet = false;
+                check(quiet, "N13 ...and says nothing, so the message means something");
+                std::filesystem::remove(pathFromUtf8(bad), ec);
+            }
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sp), ec);
+        }
+
+        // N14: a stack whose membership was made EXPLICIT round-trips EXACTLY.
+        //
+        // docs/reference-design.md §5.1 recorded this as a known defect: the
+        // writer emitted no member list, so a hand-picked or derived stack was
+        // saved as one representative frame plus "seqload 1" - and the reader's
+        // seqload re-ran findSequenceSiblings over the whole FOLDER. The stack
+        // came back as every sibling in that folder wearing the explicit stack's
+        // name: the frames the user excluded were re-admitted, the one they added
+        // from elsewhere was dropped, and the next autosave froze that as truth.
+        // §5.2's `stackmember` is the fix; this is the pin.
+        //
+        // "Explicit" is not a new flag. SeqInfo::ruleDir/ruleHead already answers
+        // it, recorded at mint time by RUNNING the folder rule (watch-design §6):
+        // empty = findSequenceSiblings did not reproduce this list. So the test
+        // asserts both directions - an explicit membership stays explicit, an
+        // implicit one stays implicit - because a fix that froze every stack's
+        // membership would pass the first half and break folder Reload.
+        {
+            auto drain = [&](double budget) {
+                double t0 = nowSec();
+                while (nowSec() - t0 < budget) {
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        app.seqRestore.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            // THE membership as ONE string (--rwatch-selftest R22's discipline):
+            // a count is not a membership, so every assertion states the whole
+            // list with the index each member carries.
+            auto membersOf = [&](int sid) {
+                std::string t;
+                for (int idx : framesOfSeq(sid))
+                    t += (t.empty() ? "" : " ") +
+                         std::to_string(app.images[idx]->seqIndex) + ":" +
+                         baseName(app.images[idx]->src->path);
+                return t;
+            };
+            auto theStack = [&]() {
+                for (const auto& d : app.images) if (d->seqId != 0) return d->seqId;
+                return 0;
+            };
+
+            const std::string src = g_newwinSelftest + "/multi/00";
+            const std::string mdir = dir + "/memb", odir = dir + "/elsewhere";
+            std::filesystem::create_directories(pathFromUtf8(mdir), ec);
+            std::filesystem::create_directories(pathFromUtf8(odir), ec);
+            bool haveFix = true;
+            for (int i = 0; i < 5; i++) {
+                char nm[32];
+                snprintf(nm, sizeof nm, "/frame_00%d.npy", i);
+                char to[32];
+                snprintf(to, sizeof to, "/f_00%d.npy", i);
+                std::filesystem::copy_file(pathFromUtf8(src + nm), pathFromUtf8(mdir + to),
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) haveFix = false;
+            }
+            // The frame from ANOTHER folder - the "add" half of the edit. Its
+            // number is outside the group's run, so no sibling scan can invent it.
+            std::filesystem::copy_file(pathFromUtf8(src + "/frame_001.npy"),
+                                       pathFromUtf8(odir + "/f_009.npy"),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) haveFix = false;
+            check(haveFix, "N14 the fixtures are in place");
+
+            const std::string h0 = mdir + "/f_000.npy";
+            const std::string sp = dir + "/memb.vsession";
+
+            // (a) THE IMPLICIT CONTROL, first. The whole folder group, opened the
+            // way a folder open opens it: the rule IS this membership, so the
+            // session must NOT freeze it and the restored stack must still be
+            // implicit - otherwise Reload could never admit a frame that arrives.
+            if (haveFix) {
+                closeAll();
+                std::string pat;
+                std::vector<std::string> sib = findSequenceSiblings(h0, pat);
+                check(sib.size() == 5, "N14 the folder group is all five frames");
+                check(loadNpy(h0).empty(), "N14 the head of the implicit stack opens");
+                startSequenceLoad(app.current, sib, pat);
+                drain(120.0);
+                const int sid = theStack();
+                const App::SeqInfo* si = sid ? seqInfo(sid) : nullptr;
+                check(si && !si->ruleDir.empty(),
+                      "N14 a whole-folder stack records the rule: it is IMPLICIT");
+                const std::string before = membersOf(sid);
+                saveSession(sp, true);
+                std::string text;
+                readWholeFile(sp, text);
+                check(text.find("stackmember ") == std::string::npos,
+                      "N14 an implicit membership writes NO stackmember line");
+                closeAll();
+                check(loadSession(sp).empty(), "N14 the implicit session loads");
+                drain(120.0);
+                const int sid2 = theStack();
+                const App::SeqInfo* si2 = sid2 ? seqInfo(sid2) : nullptr;
+                check(membersOf(sid2) == before,
+                      "N14 the implicit membership comes back unchanged");
+                check(si2 && !si2->ruleDir.empty(),
+                      "N14 ...and stays IMPLICIT across the round trip");
+            }
+
+            // (b) THE EXPLICIT MEMBERSHIP. One frame removed (f_002) and one
+            // added from another folder (elsewhere/f_009) - the edit §5.1 is
+            // about. No folder listing can reproduce this list, which is exactly
+            // why recordRemoteRule's local twin leaves ruleDir empty for it.
+            std::string savedText;
+            std::string explicitBefore;
+            if (haveFix) {
+                std::vector<std::string> mine{ mdir + "/f_000.npy", mdir + "/f_001.npy",
+                                               mdir + "/f_003.npy", mdir + "/f_004.npy",
+                                               odir + "/f_009.npy" };
+                closeAll();
+                check(loadNpy(mine[0]).empty(), "N14 the head of the explicit stack opens");
+                startSequenceLoad(app.current, mine, "");
+                drain(120.0);
+                const int sid = theStack();
+                const App::SeqInfo* si = sid ? seqInfo(sid) : nullptr;
+                check(si && si->ruleDir.empty() && si->ruleHead.empty(),
+                      "N14 a hand-picked membership records NO rule: it is EXPLICIT");
+                explicitBefore = membersOf(sid);
+                check(explicitBefore == "0:f_000.npy 1:f_001.npy 2:f_003.npy "
+                                        "3:f_004.npy 4:f_009.npy",
+                      ("N14 the membership is the edited one: " + explicitBefore).c_str());
+                saveSession(sp, true);
+                readWholeFile(sp, savedText);
+                int lines = 0;
+                for (size_t at = savedText.find("stackmember ");
+                     at != std::string::npos; at = savedText.find("stackmember ", at + 1))
+                    lines++;
+                check(lines == 5, "N14 the save writes one stackmember line per member");
+                check(savedText.find("stackmember 4 " + odir + "/f_009.npy") !=
+                          std::string::npos,
+                      "N14 ...including the frame from the other folder, at its index");
+
+                closeAll();
+                check(loadSession(sp).empty(), "N14 the explicit session loads");
+                drain(120.0);
+                const int sid2 = theStack();
+                const App::SeqInfo* si2 = sid2 ? seqInfo(sid2) : nullptr;
+                check(membersOf(sid2) == explicitBefore,
+                      ("N14 the SAME members in the SAME order come back: " +
+                       membersOf(sid2)).c_str());
+                check(si2 && si2->ruleDir.empty() && si2->ruleHead.empty(),
+                      "N14 ...and the stack is still EXPLICIT, so no rule can re-admit f_002");
+            }
+
+            // (c) ANTI-VACUITY. Strip the stackmember lines out of that very
+            // file and the load must NOT reconstruct the membership - it falls
+            // back to the folder rescan, which is what every session written
+            // before this change contains. Without this half, (b) would pass on
+            // a reader that happened to guess right.
+            if (haveFix && !savedText.empty()) {
+                std::string stripped;
+                std::istringstream is(savedText);
+                std::string ln;
+                while (std::getline(is, ln)) {
+                    if (ln.rfind("stackmember ", 0) == 0) continue;
+                    stripped += ln;
+                    stripped += "\n";
+                }
+                const std::string np = dir + "/memb-norule.vsession";
+                {
+                    std::ofstream f(pathFromUtf8(np), std::ios::binary);
+                    f << stripped;
+                }
+                closeAll();
+                check(loadSession(np).empty(), "N14 the stripped session still loads");
+                drain(120.0);
+                const int sid3 = theStack();
+                const std::string got = membersOf(sid3);
+                check(got != explicitBefore,
+                      ("N14 with no stackmember line the membership is NOT reconstructed: " +
+                       got).c_str());
+                check(got.find("f_002.npy") != std::string::npos,
+                      "N14 ...it is the folder rescan, f_002 re-admitted (§5.1's defect)");
+                check(got.find("f_009.npy") == std::string::npos,
+                      "N14 ...and the frame from elsewhere is gone, as §5.1 said");
+                std::filesystem::remove(pathFromUtf8(np), ec);
+            }
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sp), ec);
+        }
+
         std::filesystem::remove_all(pathFromUtf8(dir), ec);
         fprintf(stderr, "newwinselftest: %s\n", ok ? "ALL PASS" : "FAILED");
         return ok ? 0 : 1;
