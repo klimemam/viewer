@@ -49,8 +49,19 @@ Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
 // wins when it is set. Probed by RUNNING it: on Windows the bare python3 on PATH
 // is a Microsoft Store stub that prints an advert and exits non-zero, and numpy
 // is what the harness actually needs, so importing it IS the probe.
+//
+// CALLABLE FROM ANY THREAD, and it has to be: the reader's job thread asks for
+// it (board 304 - the probe is 113 ms of starting a Python and it used to be
+// spent on the UI thread), while the reader picker and the Readers window still
+// ask for it to draw. The cache is locked, and the lock is held across a probe:
+// a second caller waits for the first one's answer rather than starting its own
+// Python, which costs it no more than doing the probe itself would have.
 std::string findPython(const std::string& configured, std::string& why);
 void forgetPython();                      // re-probe (the configured path changed)
+// How many times the probe actually RAN in this process. The cache's promise is
+// "once", and that is only testable by counting. Lock-free: a caller asking this
+// must not end up waiting behind the probe it is asking about.
+int pythonProbes();
 
 // readers.editor from settings.jsonc, or "" for not set. This TU is free of the
 // viewer's state by design, so the setting is pushed in rather than read out.

@@ -3027,6 +3027,154 @@
             closeAll();
         }
 
+        {   // ---- R24: the numpy probe is not on the UI thread (board 304) ------
+            //
+            // adapter::findPython's FIRST call in a process STARTS A PYTHON - it
+            // has to, because the question is "does numpy import", and on Windows
+            // the python3 on PATH is a Store stub that answers a lookup and fails
+            // a run. 113 ms measured on this box, and it was spent on the UI
+            // thread by the very open #232 stage 2 had just made asynchronous:
+            // the reader cache-MISS freeze was 143 ms median with 3 of 9 runs
+            // over the 150 ms target, worst 202, and those 113 ms are the whole
+            // difference between the runs that cleared it and the runs that did
+            // not.
+            //
+            // A headless selftest cannot watch a window fail to freeze. It can
+            // watch WHICH THREAD asked - the V25w/x pattern of core/selftest/
+            // verify.inc, one door along: the id is recorded where the ask
+            // happens and compared with this one. Equal ids would mean the move
+            // is decorative.
+            //
+            // Two counters, because "it moved thread" and "it was the expensive
+            // call" are different claims: g_readerPythonAsks counts asks through
+            // the reader door, adapter::pythonProbes() counts the asks that
+            // actually started an interpreter. The FIRST-CALL case is
+            // pythonProbes() moving by one; the promise that the second open does
+            // not start Python is it NOT moving, which R24e asserts on the same
+            // reader a pump later.
+            closeAll();
+            // A reader nothing has run yet, so the adapter cache cannot answer
+            // (the key covers the reader's text and mtime): a HIT returns before
+            // the interpreter is ever asked for, which would make every line
+            // below green while proving nothing. It PRINTS while it runs, and
+            // sleeps, so there is live output to be shown in the same window the
+            // order assertion is about.
+            const std::string rdProbe = root + "/probe_thread.py";
+            writeText(rdProbe,
+                      "import sys, time\n"
+                      "import numpy as np\n"
+                      "from viewer_import import Stack\n"
+                      "VERSION = 1\n"
+                      "def load(path):\n"
+                      "    print('probe: reading', file=sys.stderr, flush=True)\n"
+                      "    time.sleep(0.4)\n"
+                      "    a = np.load(path).reshape(3, 8, 6)\n"
+                      "    return Stack(np.ascontiguousarray(a), name='probe')\n");
+            const std::string probeSpec = rdProbe + ":load";
+            // THE FIRST CALL IN THE PROCESS, made to be first again: earlier
+            // sections of this very test have already probed, so without this the
+            // "first call" case is unreachable and R24c would be asserting
+            // nothing about the 113 ms.
+            adapter::forgetPython();
+            const int asks0 = g_readerPythonAsks;
+            const int probes0 = adapter::pythonProbes();
+            const int starts0 = g_readerStarts, runs0 = g_adapterRuns;
+            const std::thread::id uiThread = std::this_thread::get_id();
+            g_readerPythonThread.store(uiThread);   // so a door that never asked
+                                                    // cannot pass by leaving a
+                                                    // stale id from another test
+            startReader(origin, probeSpec);
+            const bool async = g_readerStarts - starts0 == 1 && app.rdJob != nullptr &&
+                               app.images.empty();
+            // ...and the probe has not been asked for on THIS thread on the way
+            // out of startReader, which is the thing that moved.
+            const bool nothingOnUi = adapter::pythonProbes() == probes0;
+            // The frame loop, run by hand, so the ORDER §4.13 is about can be
+            // checked on every pump rather than at the end: the panel must never
+            // hold a byte the reader printed without the exact command above it.
+            // Checked only while the job is alive - once it lands, readerFinish
+            // replaces the panel with the harness's summary, which is a different
+            // sentence with its own rules.
+            bool orderHeld = true, sawOutput = false, sawCmd = false;
+            const std::string runLine = "running " + baseName(rdProbe) + " ...\n";
+            while (app.rdJob || !app.rdQueue.empty()) {
+                pollReader();
+                if (app.rdJob) {
+                    const std::string o = app.readerLastOut;
+                    const bool hasCmd = o.find("--stream") != std::string::npos;
+                    if (hasCmd) sawCmd = true;
+                    if (!o.empty() && o != runLine) {
+                        if (o.find("probe: reading") != std::string::npos) {
+                            sawOutput = true;
+                            if (!hasCmd) orderHeld = false;   // output, no command
+                        }
+                    }
+                    if (!app.rdJob->done.load())
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+            const std::thread::id askedOn = g_readerPythonThread.load();
+            fprintf(stderr, "rreaderselftest:   R24 asks+%d probes+%d runs+%d "
+                            "sameThreadAsUi=%d async=%d cmd=%d out=%d order=%d "
+                            "%zu doc(s) ok=%d\n",
+                    g_readerPythonAsks - asks0, adapter::pythonProbes() - probes0,
+                    g_adapterRuns - runs0, (int)(askedOn == uiThread), (int)async,
+                    (int)sawCmd, (int)sawOutput, (int)orderHeld, app.images.size(),
+                    (int)app.readerLastOk);
+            check(async && nothingOnUi,
+                  "R24a a reader START returns with nothing read and no interpreter "
+                  "probed on this thread");
+            check(g_readerPythonAsks - asks0 == 1 && askedOn != uiThread,
+                  "R24b the interpreter was looked for on the JOB's thread, not the UI's");
+            check(adapter::pythonProbes() - probes0 == 1,
+                  "R24c ...and that ask was the FIRST-CALL one: a Python really was "
+                  "started for it");
+            check(app.readerLastOk && app.images.size() == (size_t)S &&
+                      g_adapterRuns - runs0 == 1,
+                  "R24d ...and the open it belongs to finished, once");
+            check(sawCmd && sawOutput && orderHeld,
+                  "R24e §4.13 holds with the record made on the job thread: the panel "
+                  "never showed a byte the reader printed without the exact command "
+                  "above it");
+            // ...and the command is in the durable record too, verbatim, which is
+            // the half of §4.13 that answers "what did it actually start?" after
+            // the fact.
+            bool logged = false;
+            for (const auto& m : app.msgLog)
+                if (m.text.rfind("reader: ", 0) == 0 &&
+                    m.text.find("--stream") != std::string::npos &&
+                    m.text.find(baseName(rdProbe)) != std::string::npos)
+                    logged = true;
+            check(logged,
+                  "R24f ...and the Messages log kept that exact command line");
+
+            // THE CACHE, one pump later: the promise of §7 stage 5 is that the
+            // second open does not start Python, and the probe moving threads must
+            // not have turned that into "it starts one somewhere else". Nothing
+            // asks - the hit returns before the interpreter is a question at all.
+            closeAll();
+            const int asks1 = g_readerPythonAsks;
+            const int probes1 = adapter::pythonProbes();
+            const int runs1 = g_adapterRuns;
+            startReader(origin, probeSpec);
+            const bool hitAsync = app.rdJob != nullptr && app.images.empty();
+            waitForReader();
+            fprintf(stderr, "rreaderselftest:   R24 second open: asks+%d probes+%d "
+                            "runs+%d hit=%d %zu doc(s)\n",
+                    g_readerPythonAsks - asks1, adapter::pythonProbes() - probes1,
+                    g_adapterRuns - runs1, (int)g_readerDecodeCacheHit,
+                    app.images.size());
+            check(g_adapterRuns - runs1 == 0 && g_readerDecodeCacheHit &&
+                      app.images.size() == (size_t)S,
+                  "R24g the second open reads the cache and does not re-run Python");
+            check(g_readerPythonAsks - asks1 == 0 &&
+                      adapter::pythonProbes() - probes1 == 0 && hitAsync,
+                  "R24h ...and does not even ask which Python: the cache answers "
+                  "before the question");
+            closeAll();
+            forgetReader(origin);          // the memo is shared prefs; leave none
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();

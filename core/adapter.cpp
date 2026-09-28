@@ -10,6 +10,8 @@
 #include <sstream>
 #include <filesystem>
 #include <atomic>
+#include <mutex>                     // the interpreter cache is asked from two
+                                     // threads now (findPython, board 304)
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -257,13 +259,38 @@ namespace {
 std::string g_python;              // "" = not probed, or probed and not found
 std::string g_pythonWhy;
 bool g_probed = false;
+// The answer is now asked for from TWO threads: the reader job's, which is where
+// the probe was moved so that the 113 ms of starting a Python is not spent on the
+// UI thread (board 304), and the UI's, which still asks for the picker's "this
+// will run" line and the Readers window's status row. Three unsynchronised
+// statics read and written from two threads is a data race whatever the timing,
+// so the cache takes a lock.
+//
+// The lock is held ACROSS the probe, on purpose. A caller that arrives while
+// another thread is probing waits for the answer instead of starting a second
+// Python to find out the same thing - and waiting for someone else's probe costs
+// exactly what doing your own probe costs, which is what the UI thread paid
+// unconditionally before this change. So no caller is worse off than it was.
+std::mutex g_pyMtx;
+// How many times the probe actually RAN. The cache's promise is that this is 1
+// per process, and a promise about a thing that does not happen twice can only be
+// tested by counting it. Atomic and read WITHOUT the lock: a test reading it must
+// not be able to block behind the very probe it is asking about.
+std::atomic<int> g_pythonProbes{ 0 };
 }
 
-void forgetPython() { g_probed = false; g_python.clear(); g_pythonWhy.clear(); }
+void forgetPython() {
+    std::lock_guard<std::mutex> lk(g_pyMtx);
+    g_probed = false; g_python.clear(); g_pythonWhy.clear();
+}
+
+int pythonProbes() { return g_pythonProbes.load(); }
 
 std::string findPython(const std::string& configured, std::string& why) {
+    std::lock_guard<std::mutex> lk(g_pyMtx);
     if (g_probed) { why = g_pythonWhy; return g_python; }
     g_probed = true;
+    g_pythonProbes.fetch_add(1);
     g_python.clear();
 
     std::vector<std::string> tried;
