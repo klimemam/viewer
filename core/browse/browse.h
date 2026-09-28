@@ -48,6 +48,15 @@ bool   rbAnyPollDue(double now);               // the idle-skip chain's term
 // the same row with the same numbers.
 bool   rbSameListing(const std::vector<remote::Entry>& a,
                      const std::vector<remote::Entry>& b);
+// ---- watch-design §5, third item: "Watch: open new stacks" --------------------
+// The per-instance toggle's three moving parts, free for rbPollDue's reason: a
+// NOGL selftest drives the decision the poll drives. `rbGroupNames` is which
+// rows of a listing are STACKS, `rbOpenNewSeed` takes the baseline and opens
+// nothing, and `rbOpenNewStacks` is what a POLL's answer does about it (it
+// returns how many stacks it queued).
+std::vector<std::string> rbGroupNames(const std::vector<remote::Entry>& ents);
+void rbOpenNewSeed(App::BrowseInstance& I);
+int  rbOpenNewStacks(App::BrowseInstance& I);
 bool rbHas(const std::vector<std::string>& v, const std::string& s);
 void rbTreeExpand(App::BrowseInstance& I, const std::string& dir);
 void rbTreeCollapse(App::BrowseInstance& I, const std::string& dir);
@@ -178,6 +187,19 @@ struct RbAvgStack {
 };
 std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
                                           const std::vector<char>& sel);
+
+// ---- board row 134: ONE single open, and a selection is N of them -------------
+// `rbReaderKey` is which string a reader memo for this row is filed under (§4.12
+// - a local row's bare path, a peer's row's url). `rbOpenItemRow` is the whole of
+// what a double-click on a row that is an ITEM does, with the navigation a folder
+// needs left to the panel; `rbOpenSelection` is Enter over a multi-selection and
+// calls it once per ticked row, in listing order, returning how many FOLDERS it
+// therefore could not open. Free so --browse-selftest drives the routing the
+// panel's key handler drives, rather than a second copy of it.
+std::string rbReaderKey(const App::RemoteBrowse& B, const RbRow& r);
+void rbOpenItemRow(const App::RemoteBrowse& B, const RbRow& r);
+int  rbOpenSelection(const App::RemoteBrowse& B, const std::vector<RbRow>& view,
+                     const std::vector<char>& sel);
 
 // deferred panel actions - see panel.cpp rbDefer for the ownership story. The
 // selftests queue through the same door the panel does, so the door is here.

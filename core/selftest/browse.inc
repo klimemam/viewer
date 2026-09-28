@@ -1849,6 +1849,154 @@
                         if (it->id == id) { app.seqs.erase(it); break; }
                 settle();
             }
+            {   // ---- B7: watch-design §5's third item - "open new stacks" ------
+                // The whole claim, in four turns of the same poll: OFF opens
+                // nothing, ON opens what ARRIVES (once), a group that GROWS is
+                // not an arrival, and OFF again is off again.
+                //
+                // Everything here rides the poll the five cases above already
+                // drive, because that is the design's own wording: a listing that
+                // nobody asked for is what may open something, and a navigation
+                // or an F5 - which the user DID ask for - must not.
+                auto pollAndWait = [&]() {
+                    const uint64_t rev0 = B.rev;
+                    clk += 100.0;
+                    I.polledAt = clk - 99.0;
+                    const bool issued = rbPollRound(I, clk, FR);
+                    double t0 = nowSec();
+                    while (nowSec() - t0 < 120.0) {
+                        pumpRemoteBrowse();
+                        if (B.rev != rev0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    return issued && B.rev != rev0;
+                };
+                auto writeSet = [&](const char* stem, int n, float base) {
+                    for (int i = 0; i < n; i++) {
+                        char nm[64];
+                        snprintf(nm, sizeof nm, "%s_%03d.npy", stem, i);
+                        writeNpy4(scratch + "/" + nm, base + (float)i);
+                    }
+                };
+                app.rbOpenQueue.clear();
+                I.openNewOpened = 0;
+                check(!I.watchOpenNew,
+                      "B7 (setup) the per-panel toggle is OFF, which is the default");
+                writeSet("ng", 4, 30.0f);              // a stack appears...
+                const bool got1 = pollAndWait();
+                check(got1 && app.rbOpenQueue.empty() && I.openNewOpened == 0 &&
+                      !rbGroupNames(B.entries).empty(),
+                      "B7b OFF: a numbered stack appears in the listing and nothing opens");
+                // ...and now ON. The baseline is taken at the switch, so what is
+                // ALREADY here is seen: "open new stacks" is about arrivals, and
+                // a switch that opened the folder would be a different feature.
+                I.watchOpenNew = true;
+                rbOpenNewSeed(I);
+                const std::vector<std::string> seen0 = I.openNewSeen;
+                check(seen0.size() == 4 && I.openNewDir == B.dir,
+                      "B7c ON: the four frames already here are SEEN, and the folder named");
+                // ANTI-VACUITY of B7b in the other direction: the same event,
+                // with only the switch different, DOES open something.
+                writeSet("mv", 3, 60.0f);
+                const bool got2 = pollAndWait();
+                bool three = app.rbOpenQueue.size() == 1 &&
+                             app.rbOpenQueue[0].files.size() == 3;
+                bool named = three && app.rbOpenQueue[0].host == B.host &&
+                             app.rbOpenQueue[0].files[0].find("mv_000.npy") !=
+                                 std::string::npos &&
+                             !app.rbOpenQueue[0].name.empty();
+                check(got2 && three && named && I.openNewOpened == 1 &&
+                      I.openNewSeen.size() == 7,
+                      "B7d ...and the stack that ARRIVED is queued once, with its 3 frames");
+                // A GROUP THAT GROWS IS NOT AN ARRIVAL (PR #160 owns that event).
+                // The listing really does change - a fourth member moves the
+                // group row's bytes and its member list - so this is a poll that
+                // APPLIED and still opened nothing, which is the only way to
+                // assert "not twice" without asserting on a dropped listing.
+                app.rbOpenQueue.clear();
+                writeNpy4(scratch + "/mv_003.npy", 63.0f);
+                const bool got3 = pollAndWait();
+                check(got3 && app.rbOpenQueue.empty() && I.openNewOpened == 1 &&
+                      I.openNewSeen.size() == 8,
+                      "B7e a stack that GAINS a frame is not opened again (that is Reload)");
+                // ...and OFF is off: another arrival, nothing queued.
+                I.watchOpenNew = false;
+                I.openNewDir.clear();
+                I.openNewSeen.clear();
+                writeSet("zz", 2, 90.0f);
+                const bool got4 = pollAndWait();
+                check(got4 && app.rbOpenQueue.empty() && I.openNewOpened == 1,
+                      "B7f OFF again: the next arrival is not opened either");
+                app.rbOpenQueue.clear();
+                settle();
+            }
+            {   // ---- B8: board row 134 - a selection is N SINGLE OPENS ---------
+                // The ruling: Enter over a multi-selection opens EACH selected
+                // item exactly as a single open of that item would - so an item
+                // with a reader memo (§4.12) goes through startReader and one
+                // without it goes through the ordinary door. Before it, this loop
+                // was a second transcription of the door and consulted no memo at
+                // all: a .npy somebody had bound a reader to came back as the
+                // origin's own array, under the reader's name.
+                //
+                // Not driven through browse-keys: the gesture is expressible
+                // there (ctrlclick / enter) but the MEMO is not - it would need
+                // an adapter on disk and a Python to run it inside a GL run. So
+                // the routing function is driven directly, which is what it was
+                // made free for.
+                //
+                // app.readerMemo IS THE USER'S PREFS and VIEWER_TEST_HOME is one
+                // directory shared by every selftest, so it is snapshotted and
+                // put back before anything can save it (aset.inc's discipline).
+                const std::vector<App::ReaderMemo> memoWas = app.readerMemo;
+                closeAll();
+                std::vector<RbRow> v = viewHere();
+                int iA = -1, iB = -1;
+                for (size_t i = 0; i < v.size(); i++) {
+                    if (v[i].up || v[i].ph || v[i].isDir() || v[i].isGroup()) continue;
+                    if (v[i].name() == "alpha.npy") iA = (int)i;
+                    if (v[i].name() == "bravo.npy") iB = (int)i;
+                }
+                std::vector<char> sel(v.size(), 0);
+                if (iA >= 0) sel[iA] = 1;
+                if (iB >= 0) sel[iB] = 1;
+                check(iA >= 0 && iB >= 0 && iA != iB,
+                      "B8 (setup) two plain .npy rows are ticked");
+                if (iA >= 0 && iB >= 0) {
+                    // The KEY is rbReaderKey's, which is the whole point of that
+                    // function existing: a local row is filed under its bare path
+                    // (startReader runs a reader where the file IS) and the picker
+                    // files it under the same string.
+                    const std::string keyA = rbReaderKey(B, v[iA]);
+                    check(keyA == v[iA].full() && keyA.rfind("local://", 0) != 0,
+                          "B8b a LOCAL row's memo is keyed by its bare path, not a url");
+                    app.readerMemo.clear();
+                    app.readerMemo.push_back({ keyA, "adapters/no_such_reader.py:load" });
+                    const int rs0 = g_readerStarts;
+                    const size_t n0 = app.images.size();
+                    const int skipped = rbOpenSelection(B, v, sel);
+                    // ONE reader run, for the ONE row that has a memo - and the
+                    // other row really opened, natively. "Nothing is silently
+                    // skipped" is the ruling's own clause and `skipped` is 0
+                    // because neither of these is a folder.
+                    check(skipped == 0 && g_readerStarts == rs0 + 1 &&
+                          app.images.size() == n0 + 1,
+                          "B8c both selected items open: the memo'd one via a ReaderJob");
+                    // ANTI-VACUITY: with no memo at all, the SAME two rows both
+                    // take the native door and no reader starts. Without this,
+                    // "it always starts a reader" passes B8c.
+                    closeAll();
+                    app.readerMemo.clear();
+                    const int rs1 = g_readerStarts;
+                    const size_t n1 = app.images.size();
+                    rbOpenSelection(B, v, sel);
+                    check(g_readerStarts == rs1 && app.images.size() == n1 + 2,
+                          "B8d ...and with no memo, both take the ordinary door instead");
+                }
+                app.readerMemo = memoWas;     // the user's prefs, as we found them
+                closeAll();
+                settle();
+            }
             I.cursor = -1;
             I.cursorKey.clear();
             I.sel.clear();

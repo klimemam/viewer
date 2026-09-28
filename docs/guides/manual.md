@@ -317,6 +317,20 @@ beta_48x16.bin: opened with "MyCam 32x24" (32x24 u16 gray) - this session's reci
   約束になります)。**`tree` 表示はこの設定に関係ありません**: そこはクリックが
   その場での展開、ダブルクリックが移動で、2つの動詞に2つのジェスチャが
   すでに割り当てられています。`..` はどちらの表示・どちらの値でも1クリックです。
+- **撮影しながら見る: 「Watch: open new stacks」** (`...` メニュー、既定 OFF、
+  **パネルごと**)。Browse は見えている間 3 秒ごとに今いるフォルダを読み直します
+  (`loading.watchFiles` が ON のとき)。このトグルを入れておくと、そのフォルダに
+  **新しく現れた連番**を、その行をダブルクリックしたのと同じように**1回だけ**
+  開きます。**入れた時点で既にあった stack は開きません**(基線はそこで取ります)し、
+  **既に開いている stack が1枚増えても開き直しません** —— それは Files の琥珀色の
+  行と [Reload] の仕事です。ON の間は下段の status 行が
+  `opening new stacks (N so far)` と言います。永続化しないので、次の起動では OFF です
+- **複数行を選んで Enter**(または Cmd/Ctrl+O)は、**選んだ各行を、その行を1つだけ
+  開いたときとまったく同じように**開きます —— stack 行は stack、ファイル行は
+  ファイル、**その path に Reader を割り当てたことがあれば、その Reader で**
+  (走っているものの後ろに並びます)。黙って飛ばすものはありません。フォルダの行だけは
+  開けないので、その数を1行で言います(選択に「行き先」は1つ決まらないからです)。
+  選択を**1つの stack にまとめて**開くのは右クリックの「Open N selected as stack」です
 
 **ベンダ RAW は「モザイクをそのまま」開きます。** カメラの `.NEF` や `.CR3` を
 開くと、**現像された写真ではなく、センサが数えた CFA モザイク**が 1ch の画像として
@@ -1305,6 +1319,14 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
   UI のプリセットですが、ファイルの値域をその2つに限定しません。0、負数、
   float へ変換したときに 0 や無限大になる値は、そのキーだけを拒否します
 
+- `watch.intervalSec` は**ディスク上の変化を見に行く間隔**(秒)。整数、**1..3600**、
+  既定 **5**(これまで定数だった値そのままなので、上げても polling は変わりません)。
+  範囲外はそのキーだけを行・列で断ります。**反映は次の poll で、再起動は要りません** ——
+  watcher が毎周この値を読みます。peer のフォルダはここから比で決まる間隔
+  (既定では 15 秒)で訊くので、この値を遅くすれば peer も遅くなり、
+  **local より速くなることはありません**。見に行くかどうか自体は
+  `loading.watchFiles`、見つけたら自動で読み直すかは `loading.watchAutoReload` です
+
 読むキーのうち `loading.rawRecipes` だけは**オブジェクトの配列**です(§2.2b)。
 1件が読めなくても**その1件だけ**を名指しで断り、残りのレシピは読み込みます。
 
@@ -1314,7 +1336,7 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
 
 ### 8b. Preferences パネル
 
-`File > Preferences...` は設定表35行を並べます。Read 29行には現在値と、
+`File > Preferences...` は設定表36行を並べます。Read 30行には現在値と、
 **どの層が決めたか** (`default` / `this machine` /
 `settings.jsonc:<line>` / `command line` / `session (.vsession)`) が出ます。session の
 出所は `.vsession` が復元する表示ガンマとピクセルグリッドの2行だけです。
@@ -1332,6 +1354,8 @@ Later 4行 / NotHere 2行は値の代わりに、その場で扱わない理由�
   (本当に戻すにはファイルのキーを消してください)
 - `measuring.memoryBudgetGB` は数値欄で、`0` = このマシンから決める。行の下に
   **実際に使う量**が出ます (`in effect: 38.3 GB (worked out from this machine)`)
+- `watch.intervalSec` は整数欄 (1..3600、既定 5)。**次の poll で効きます** ——
+  この行だけは「次回起動」ではありません
 - **Copy template** は現在値を含む全体雛形をコピーし、**Open settings.jsonc** は
   `readers.editor` → `$EDITOR` → `code -g` → OS 関連付けの順で外部エディタを開きます
 - Reader の登録場所は `readers.searchPath`。Preferences の **Open...** から Reader

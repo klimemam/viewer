@@ -53,6 +53,14 @@ struct BrowseHost {
     // chooses between this and the peer by whether the host is empty.
     void (*openFolder)(const std::string& path);
     void (*openReaderPicker)(const std::string& path, const std::string& why);
+    // §4.12 ASKED, not answered (board row 134). "Has this user already chosen a
+    // reader for this exact path?" - and if so it is started, queued behind a
+    // running one, and this returns true. The panel needs the question at ITS
+    // layer because the two doors behind it key the memo differently and one of
+    // them consults the peer's format table first, so a row over a
+    // multi-selection could not otherwise take the same door a single open of it
+    // takes. The decision of what a memo IS stays entirely on this side.
+    bool (*openViaReaderMemo)(const std::string& path);
     // File > Browse Folder (Local)...'s dialog, shared by the empty state's
     // button. Not one of S3's 55 marks, but the same class of call - a viewer
     // door the panel merely knocks on - so it goes through the same seam.

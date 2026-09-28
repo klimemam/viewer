@@ -168,11 +168,136 @@ std::string rbRowWhyNot(const std::string& host, const std::string& name) {
 // tooltip says and the same one openPath puts on the panel. An openable row has
 // none, so choosing a reader for a .npy opens the panel with nothing to
 // apologise for - which is the point of that half of the door.
-static void rbReaderDoor(const App::RemoteBrowse& B, const RbRow& r) {
+// WHICH STRING a reader memo for this row is filed under (§4.12). ONE spelling,
+// because three gestures ask it and they have to agree or a reader chosen by one
+// of them is invisible to the others: the door below files it, rbOpenItemRow
+// asks it before anything else, and board row 134's selection loop asks it once
+// per ticked row.
+//
+// The split is startReader's own (§4.13.1): a reader runs WHERE THE FILE IS, so
+// a local row is its bare path on this disk and a peer's row is its url. Handing
+// a peer's path over as if it were local names a file that does not exist here.
+std::string rbReaderKey(const App::RemoteBrowse& B, const RbRow& r) {
     const std::string full = r.full();
-    g_browseHost.openReaderPicker(B.host.empty() ? full
-                                                 : makeRemoteUrl(B.host, full, B.port),
-                                  rbRowWhyNot(B.host, r.name()));
+    return B.host.empty() ? full : makeRemoteUrl(B.host, full, B.port);
+}
+
+static void rbReaderDoor(const App::RemoteBrowse& B, const RbRow& r) {
+    g_browseHost.openReaderPicker(rbReaderKey(B, r), rbRowWhyNot(B.host, r.name()));
+}
+
+// THE SINGLE OPEN of one ITEM row - a stack row or a file row, never a folder
+// and never "..". Free, and that is board row 134's ruling made structural:
+// "Enter over a multi-selection opens EACH selected item exactly as a single
+// open of that item would", and the only way two paths cannot drift is for there
+// to be one of them. The double-click calls it through rbOpenRow (which adds the
+// navigation a folder row needs) and rbOpenSelection calls it once per tick.
+//
+// It reads no panel state at all - only the place, the row and the seam - which
+// is also why a NOGL selftest can drive it.
+void rbOpenItemRow(const App::RemoteBrowse& B, const RbRow& r) {
+    if (r.ph || r.up || r.isDir()) return;
+    // §4.12 FIRST, before the format table is consulted at all (board row 134).
+    // The memo is a RECORD OF A CHOICE - this user opened this path with this
+    // reader once - and the whole point of remembering one is that the choice is
+    // applied again ahead of everything else. openPath's second block and
+    // openRemoteMemoFirst already do exactly this for the two doors BEHIND this
+    // one; asking here as well is what makes the answer the same whichever
+    // vocabulary the row is in, which the layers below cannot promise (they key
+    // the memo differently, and one of them asks the peer's format table first).
+    //
+    // A remembered reader that cannot run SAYS SO and nothing falls through to
+    // the native path: "the reader you chose could not run" is the answer, and
+    // quietly handing back the origin's own array instead is the silence §4.12
+    // exists to prevent. Queued behind a running one, as startReader's queue
+    // already does - so a selection of five memo'd rows runs five readers in a
+    // row with the window answering between them.
+    if (g_browseHost.openViaReaderMemo(rbReaderKey(B, r))) return;
+    // #111: a row this panel cannot open says so rather than doing nothing.
+    // Silence was the old behaviour and it is unreadable - the row dims,
+    // the double-click lands, and the user is left deciding whether they
+    // missed. The sentence names the format and whose limit it is.
+    if (!rbRowOpenable(B.host, r.name())) {
+        g_browseHost.toast(r.name() + ": " + rbRowWhyNot(B.host, r.name()), true);
+        return;
+    }
+    if (r.isGroup()) {
+        g_browseHost.dropPreview();      // the poster frame did its job
+        std::vector<std::string> files;
+        for (const auto& m : r.e->members) files.push_back(r.join(m));
+        // the canon's `folder/pattern`, built from the SAME text the peer
+        // put in the group row (rp::patternWithExtent, shared verbatim)
+        g_browseHost.openRemoteStack(B.host, files,
+                                     stackNameFor(*r.dir, r.e->name), B.port, 0);
+        return;
+    }
+    // A single file: promote ITS preview when that is what the slot holds.
+    // The old form promoted whatever preview happened to be live - a stale
+    // slot made a double-click register a file nobody pointed at - and
+    // when none was live (a failed open, a slot emptied by a promote-on-
+    // measure) it did NOTHING at all, which is the other way a double-
+    // click "opened a frame or nothing" instead of what it was aimed at.
+    std::string u = makeRemoteUrl(B.host, r.full(), B.port);
+    ImageDoc* pv = nullptr;
+    for (const auto& di : app.images)
+        if (di->uid == app.previewUid && di->preview) pv = di.get();
+    if (pv && pv->src->remoteUrl == u) { g_browseHost.promotePreview(pv); return; }
+    for (int i = 0; i < (int)app.images.size(); i++)
+        if (app.images[i]->src->remoteUrl == u && !app.images[i]->preview) {
+            g_browseHost.selectImage(i); // already registered: show it
+            return;
+        }
+    // ...and the same question in the OTHER vocabulary (#111). A local
+    // picture is opened by openPath, so its document carries the plain path
+    // and no url at all - the loop above can never match one, and without
+    // this a second double-click on the same .png would open a second copy
+    // where a second double-click on a .npy shows the first. The panel must
+    // not behave differently per format at the same gesture.
+    if (B.host.empty() && !peerServesName(r.name())) {
+        const std::string p = r.full();
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[i]->src->remoteUrl.empty() &&
+                app.images[i]->src->path == p && !app.images[i]->preview) {
+                g_browseHost.selectImage(i);
+                return;
+            }
+    }
+    g_browseHost.dropPreview();          // a stale preview is not this row's
+    // A headerless file states no shape, so this gesture cannot be "open
+    // it" - it is "open it HOW". The viewer side answers that (a binding
+    // this session already made, or the dialog); the panel's job ends at
+    // handing over the url and the byte count it already has.
+    if (!B.host.empty() && rbNameIsHeaderless(r.name())) {
+        g_browseHost.openRemoteRaw(u, r.e ? r.e->size : 0);
+        return;
+    }
+    g_browseHost.openRemote(u, false, 0, 0);
+}
+
+// Board row 134: Enter (or Cmd/Ctrl+O) over a MULTI-SELECTION. Every ticked row
+// is opened, in the selection's own order - which is the listing's order, top to
+// bottom - through the one function above, so each item takes exactly the door a
+// single open of it takes. Before the ruling this loop was a second, shorter
+// transcription of that door: it went straight to openRemoteStack / openRemote
+// and therefore skipped a remembered reader, skipped the "this is already open"
+// answer and skipped the headerless question, for rows whose own double-click
+// honours all three.
+//
+// Returns how many ticked rows were NOT opened, which is exactly the FOLDERS:
+// a folder's single-open door is a navigation, and a selection cannot navigate
+// to three places. Nothing else is dropped - a row this panel cannot read has a
+// reason and rbOpenItemRow says it, by name, per row.
+int rbOpenSelection(const App::RemoteBrowse& B, const std::vector<RbRow>& view,
+                    const std::vector<char>& sel) {
+    int skipped = 0;
+    for (size_t i = 0; i < view.size() && i < sel.size(); i++) {
+        if (!sel[i]) continue;
+        const RbRow& r = view[i];
+        if (r.ph || r.up) continue;          // not items: a placeholder, the exit
+        if (r.isDir()) { skipped++; continue; }
+        rbOpenItemRow(B, r);
+    }
+    return skipped;
 }
 
 static void rbAddRows(const App::BrowseInstance& I,
@@ -1161,6 +1286,10 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // opens the whole stack; a folder is entered; a frame promotes the preview
     // it just made. A folder's first click was selection only (above), so
     // entering has nothing to take back - no expand happened, none is undone.
+    // The NAVIGATION half, which is this panel's and cannot be a free function
+    // (it needs the instance it is deferring into); everything a row that is an
+    // ITEM does is rbOpenItemRow's, shared verbatim with Enter over a selection
+    // (board row 134).
     auto rbOpenRow = [&](const RbRow& r) {
         if (r.ph) return;
         if (r.up) { rbGoParent(); return; }
@@ -1168,65 +1297,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
             rbGoTo(I, r.full());
             return;
         }
-        // #111: a row this panel cannot open says so rather than doing nothing.
-        // Silence was the old behaviour and it is unreadable - the row dims,
-        // the double-click lands, and the user is left deciding whether they
-        // missed. The sentence names the format and whose limit it is.
-        if (!rbRowOpenable(B.host, r.name())) {
-            g_browseHost.toast(r.name() + ": " + rbRowWhyNot(B.host, r.name()), true);
-            return;
-        }
-        if (r.isGroup()) {
-            g_browseHost.dropPreview();      // the poster frame did its job
-            std::vector<std::string> files;
-            for (const auto& m : r.e->members) files.push_back(r.join(m));
-            // the canon's `folder/pattern`, built from the SAME text the peer
-            // put in the group row (rp::patternWithExtent, shared verbatim)
-            g_browseHost.openRemoteStack(B.host, files,
-                                         stackNameFor(*r.dir, r.e->name), B.port, 0);
-            return;
-        }
-        // A single file: promote ITS preview when that is what the slot holds.
-        // The old form promoted whatever preview happened to be live - a stale
-        // slot made a double-click register a file nobody pointed at - and
-        // when none was live (a failed open, a slot emptied by a promote-on-
-        // measure) it did NOTHING at all, which is the other way a double-
-        // click "opened a frame or nothing" instead of what it was aimed at.
-        std::string u = makeRemoteUrl(B.host, r.full(), B.port);
-        ImageDoc* pv = nullptr;
-        for (const auto& di : app.images)
-            if (di->uid == app.previewUid && di->preview) pv = di.get();
-        if (pv && pv->src->remoteUrl == u) { g_browseHost.promotePreview(pv); return; }
-        for (int i = 0; i < (int)app.images.size(); i++)
-            if (app.images[i]->src->remoteUrl == u && !app.images[i]->preview) {
-                g_browseHost.selectImage(i); // already registered: show it
-                return;
-            }
-        // ...and the same question in the OTHER vocabulary (#111). A local
-        // picture is opened by openPath, so its document carries the plain path
-        // and no url at all - the loop above can never match one, and without
-        // this a second double-click on the same .png would open a second copy
-        // where a second double-click on a .npy shows the first. The panel must
-        // not behave differently per format at the same gesture.
-        if (B.host.empty() && !peerServesName(r.name())) {
-            const std::string p = r.full();
-            for (int i = 0; i < (int)app.images.size(); i++)
-                if (app.images[i]->src->remoteUrl.empty() &&
-                    app.images[i]->src->path == p && !app.images[i]->preview) {
-                    g_browseHost.selectImage(i);
-                    return;
-                }
-        }
-        g_browseHost.dropPreview();          // a stale preview is not this row's
-        // A headerless file states no shape, so this gesture cannot be "open
-        // it" - it is "open it HOW". The viewer side answers that (a binding
-        // this session already made, or the dialog); the panel's job ends at
-        // handing over the url and the byte count it already has.
-        if (!B.host.empty() && rbNameIsHeaderless(r.name())) {
-            g_browseHost.openRemoteRaw(u, r.e ? r.e->size : 0);
-            return;
-        }
-        g_browseHost.openRemote(u, false, 0, 0);
+        rbOpenItemRow(B, r);
     };
     // ---- row 2: the toolbar. Narrow the listing down, and say so when the
     // listing's shape is not the default. Everything else is in the "..." menu
@@ -1449,6 +1520,42 @@ void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::SetTooltip("this panel: refresh, how it lists, search the server");
     if (ImGui::BeginPopup("rbpanelmenu")) {
         if (ImGui::MenuItem("Refresh", "F5")) rbRefresh();
+        // watch-design §5's third item, and it sits HERE - next to Refresh - for
+        // the reason the design gives it: this panel re-lists its own folder
+        // every few seconds while it is drawn (§2's second row), and this is what
+        // is done about a listing that came back with something new in it. It is
+        // not a listing SHAPE, so it does not join the three radio pairs below;
+        // it is "what this panel does", which is what the top of this menu is.
+        //
+        // Off while Watch itself is off, and it SAYS so rather than sitting
+        // there looking armed: the poll is what opens anything, and there is no
+        // poll without Watch (rbPollDue's first line).
+        if (!app.watchEnabled) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Watch: open new stacks", nullptr, I.watchOpenNew)) {
+            I.watchOpenNew = !I.watchOpenNew;
+            // Thrown ON: the baseline is taken NOW, so the stacks already in
+            // this folder are SEEN and never opened (watch::newNames). Thrown
+            // OFF: it is forgotten, so turning it on again tomorrow takes
+            // tomorrow's baseline rather than measuring against a folder as it
+            // was before lunch.
+            if (I.watchOpenNew) rbOpenNewSeed(I);
+            else { I.openNewDir.clear(); I.openNewSeen.clear(); }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(
+                app.watchEnabled
+                    ? "OFF by default, and per panel.\n\n"
+                      "While it is on, a numbered stack that APPEARS in this folder\n"
+                      "is opened once, exactly as double-clicking its row would.\n"
+                      "The stacks already here when you switched it on are not\n"
+                      "opened, and a stack that GAINS a frame is not opened again -\n"
+                      "that is Reload's job (the amber line in Files).\n\n"
+                      "It follows the poll, so it stops while this panel is not\n"
+                      "being drawn."
+                    : "Needs File > Watch > \"Watch source files on disk\":\n"
+                      "nothing polls this folder while that is off, so there is\n"
+                      "nothing for this to notice.");
+        if (!app.watchEnabled) ImGui::EndDisabled();
         ImGui::Separator();
         // Radio pairs, not toggles: the state is visible without clicking.
         if (ImGui::MenuItem("Grouped (a numbered stack is one row)", nullptr, !I.flat)
@@ -1734,31 +1841,26 @@ void drawPanelRemote(App::BrowseInstance& I) {
                 // OTHER thing from the action row's "Open N selected as
                 // stack", which MERGES the selection into one stack; opening
                 // three checked groups used to open only the cursor's one.
-                g_browseHost.dropPreview();  // the posters did their job
-                int skipped = 0;
-                for (size_t i = 0; i < view.size() && i < rbSel.size(); i++) {
-                    if (!rbSel[i]) continue;
-                    const RbRow& r = view[i];
-                    if (r.ph || r.up || r.isDir() || !rbRowOpenable(B.host, r.name())) {
-                        skipped++;           // named below, never silent
-                        continue;
-                    }
-                    if (r.isGroup()) {
-                        std::vector<std::string> files;
-                        for (const auto& m : r.e->members) files.push_back(r.join(m));
-                        g_browseHost.openRemoteStack(B.host, files,
-                                        stackNameFor(*r.dir, r.e->name), B.port, 0);
-                    } else {
-                        g_browseHost.openRemote(makeRemoteUrl(B.host, r.full(), B.port),
-                                                false, 0, 0);
-                    }
-                }
-                // "not .npy" was the reason until #111 and is no longer the
-                // reason on a local listing, where the gate is the format table.
+                //
+                // Board row 134: through rbOpenSelection, which walks the ticks
+                // in listing order and hands each one to the SAME function the
+                // double-click hands one row to. It used to be a second, shorter
+                // transcription of that door here - and a shorter one skips
+                // things: a remembered reader (§4.12), the "this file is already
+                // open" answer, and the headerless question, all of which a
+                // single open of the very same row honours. The preview is not
+                // dropped up front for the same reason: a single open of the
+                // previewed row PROMOTES it, so dropping it first would make the
+                // selection's first item behave unlike its own double-click.
+                const int skipped = rbOpenSelection(B, view, rbSel);
+                // Folders, and only folders. Everything else that could not be
+                // opened has been named ROW BY ROW by the door itself, with its
+                // own reason - which is strictly more than this line ever said.
                 if (skipped)
                     g_browseHost.toast(std::to_string(skipped) +
-                                       " selected item(s) skipped (folders, or not "
-                                       "openable from this panel)", true);
+                                       " selected folder(s) not opened - a folder is a "
+                                       "place to go to, and a selection has no one place",
+                                       true);
                 rbSel.assign(view.size(), 0);          // the selection is consumed
             } else if (rbCursor >= 0 && rbCursor < (int)view.size()) {
                 rbOpenRow(view[rbCursor]);
@@ -2696,6 +2798,21 @@ void drawPanelRemote(App::BrowseInstance& I) {
         } else if (!B.searchRoot.empty()) {
             line += DOT;
             line += "search aimed at " + B.searchRoot;
+        }
+        // watch-design §5's third item, said ONCE and only while it is true. It
+        // earns a clause by the board's own rule for this line - "the bottom
+        // line says only what nothing else says": the toggle lives behind a
+        // click in the "..." menu, so while it is on, the fact that this panel
+        // will open a stack nobody asked for is stated NOWHERE ELSE on screen.
+        // The count is there because "3 opened" is what makes the claim checkable
+        // afterwards; it is left off at zero, like the selection count above.
+        if (I.watchOpenNew && app.watchEnabled) {
+            line += DOT;
+            line += "opening new stacks";
+            if (I.openNewOpened > 0) {
+                snprintf(cnt, sizeof cnt, " (%d so far)", I.openNewOpened);
+                line += cnt;
+            }
         }
         if (std::string pn = rbProtocolNote(B.peerVersion); !pn.empty()) {
             line += DOT;
