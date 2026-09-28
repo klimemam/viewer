@@ -2235,11 +2235,11 @@
             closeAll();
         }
 
-        // ---- the wide-frame fixture ---------------------------------------------
+        // ---- the fixture the last two sections share ---------------------------
         // ONE WIDE frame, 2000 px across. openRemote's first view is decimated
         // (step = ceil(max(w,h)/1600) = 2), so this file arrives as a preview and
         // the full resolution is swapped in later by pumpRemoteFetch - which is
-        // the only shape R28 below has anything to say about.
+        // the only shape either section below has anything to say about.
         //
         // The pixels are chosen so that the preview CANNOT know the answer. The
         // peer's decimation samples x0, x0+step, ... (core/serve.cpp), so with
@@ -2375,6 +2375,87 @@
                   "R28f the two degenerate guards hold on the landing path too "
                   "(no finite sample -> 0..1, flat -> widened by one)");
             closeAll();
+        }
+
+        // ---- R29: a saved crop on a remote preview lands with the full frame ---
+        // Board 172. cropInPlace refuses a decimated source BY NAME (39b6c0b):
+        // the full-resolution landing replaces data/w/h wholesale and knows
+        // nothing of crop bookkeeping, so a crop measured against the decimated
+        // grid would be reverted by the swap and leave srcW stamped with PREVIEW
+        // dimensions - a phantom crop (isCropped forever true) and an
+        // unshareable source. A restore therefore cannot apply the crop when it
+        // reads the line; it parks it (parkRestoreWait) and pumpRestoreWaits
+        // applies it in the same frame the swap happens.
+        //
+        // browse.inc's restore-wait block asserts the DIMENSIONS that come back.
+        // What it does not assert is the phantom crop itself, which is the defect
+        // the refusal exists to prevent and the one a future "just apply it on
+        // the preview" would reintroduce while every dimension still looked
+        // right for one frame. So: srcW/srcH are the FULL source, and the crop
+        // rect is source-relative full-resolution coordinates end to end.
+        {
+            std::error_code sec;
+            const std::string sess = root + "/crop-restore.vsession";
+            closeAll();
+            const bool opened = openRemote(urlOf(wide), false, 0);
+            // A MANUAL crop while the preview is up is refused, and that refusal
+            // is why there is no "which crop wins" rule to write: the user
+            // cannot get a manual crop in before the landing, so the parked one
+            // is never in competition with anything.
+            const bool refusedOnPreview = !app.images.empty() &&
+                                          !cropInPlace(*app.images[0], 10, 1, 40, 2);
+            const bool srcWClean = !app.images.empty() && app.images[0]->src->srcW == 0;
+            drainRemote(120.0);
+            ImageDoc* d = cur();
+            const bool cropped = d && cropInPlace(*d, 100, 2, 400, 4);
+            saveSession(sess, true);
+            closeAll();
+            const std::string lerr = loadSession(sess);
+            // The moment the crop line is read: the doc is the preview again, so
+            // the restore has to park rather than apply. Asserted, because a
+            // fixture that arrived at full resolution would make everything
+            // below green while proving nothing.
+            const int stepAtRestore = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+            const bool parked = !app.restoreWait.empty();
+            {   // the drain a frame loop does, in its order: the swap lands and
+                // the parked line is acted on in the SAME frame (core/main.cpp).
+                double t = nowSec();
+                while (nowSec() - t < 120.0) {
+                    pumpRemoteFetch();
+                    pumpRestoreWaits();
+                    pumpSequenceAndQueue();
+                    if (app.rfPending == 0 && app.restoreWait.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                pumpRemoteFetch();
+                pumpRestoreWaits();
+            }
+            ImageDoc* r = cur();
+            fprintf(stderr, "rnpzselftest:   R29 opened=%d refusedOnPreview=%d step %d at "
+                            "restore, parked=%d, err=\"%s\" -> %dx%d at (%d,%d) of "
+                            "%dx%d\n",
+                    opened ? 1 : 0, refusedOnPreview ? 1 : 0, stepAtRestore,
+                    parked ? 1 : 0, lerr.c_str(), r ? r->w : -1, r ? r->h : -1,
+                    r ? r->src->cropX : -1, r ? r->src->cropY : -1,
+                    r ? r->src->srcW : -1, r ? r->src->srcH : -1);
+            check(opened && refusedOnPreview && srcWClean && cropped && stepAtRestore > 1 &&
+                      parked,
+                  "R29a (setup) a crop is refused on the preview and leaves no trace, "
+                  "and the restore parks the saved one");
+            check(lerr.empty() && r && r->w == 400 && r->h == 4 &&
+                      r->src->cropX == 100 && r->src->cropY == 2,
+                  "R29b the saved rect is put back in full-resolution source "
+                  "coordinates once the frame lands");
+            check(r && r->src->srcW == wideW && r->src->srcH == wideH,
+                  "R29c ...and srcW/srcH are the FULL source, not the preview's: no "
+                  "phantom crop");
+            // The whole point of srcW being right: a crop that recorded preview
+            // dimensions is a source that can never be shared or uncropped.
+            check(r && isCropped(*r) && r->src->srcW > r->w,
+                  "R29d ...so the doc is cropped in the one way the rest of the "
+                  "program can read");
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sess), sec);
         }
 
         setEnv("VIEWER_SERVE_CACHE", "");
