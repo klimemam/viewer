@@ -2252,6 +2252,10 @@ static bool g_watchSuppressed = false;
                     rbAnyBusy() || app.mPending > 0 ||
                     app.rdJob != nullptr ||          // a reader is running
                     !app.rdQueue.empty() ||          // ...or is the next one waiting
+                    app.openJob != nullptr ||        // a file is being read (#232 s2)
+                    !app.openQueue.empty() ||
+                    app.reloadJob != nullptr ||      // ...or RE-read (2026-09-28)
+                    !app.reloadQueue.empty() ||
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without
@@ -2441,6 +2445,7 @@ static bool g_watchSuppressed = false;
         // finished carries uiFrame - 1 when rbPollDue is asked about it.
         app.uiFrame++;
         pumpOpenJob();                // land a single-file open the worker finished
+        pumpReloadJob();              // ...and ONE frame a reload worker re-read
         pumpSequenceAndQueue();       // integrate decoded frames, chain queued stacks
         pumpRemoteFetch();            // swap in full-resolution remote frames
         pumpRestoreWaits();           // session lines waiting for a remote arrival

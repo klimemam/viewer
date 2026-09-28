@@ -633,6 +633,44 @@ static std::string rawRecipeReinterpretCurrent(const RawRecipe& r) {
 // reverted by the swap and leave srcW stamped with preview dimensions: a
 // phantom crop (isCropped forever true), an unshareable source, and a session
 // line carrying garbage rectangles. Crop after the full frame lands.
+// ---- the PIXEL half of a crop, and nothing else -----------------------------
+// No lock, no registry, no SeqInfo, no app state: the rectangle clamped, the
+// rows copied, the mirrors and the measured range brought back into step. Pure
+// on a document nobody else can see, which is what lets a RELOAD's worker
+// re-apply a recorded crop to its fresh decode off the UI thread (see
+// reloadDecode) - a crop on a 480 MB frame is a second full pass over the
+// pixels, and the whole point of that worker is that no full pass runs here.
+//
+// The bookkeeping half stays in cropInPlace below, where it belongs: which
+// source is being re-scoped, whether it has to be cloned first, and which
+// stack's revision moves are all questions about SHARED state, and a document
+// the worker built is shared with nobody.
+static void cropPixels(ImageDoc& im, int x, int y, int w, int h,
+                       int* appliedX = nullptr, int* appliedY = nullptr) {
+    FrameSource& S = *im.src;
+    if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
+    x = std::clamp(x, 0, im.w - 1);
+    y = std::clamp(y, 0, im.h - 1);
+    if (im.cfa == 1) { x &= ~1; y &= ~1; }
+    if (im.cfa == 2) { x &= ~3; y &= ~3; }
+    w = std::clamp(w, 1, im.w - x);
+    h = std::clamp(h, 1, im.h - y);
+    std::vector<float> nd((size_t)w * h * im.ch);
+    for (int yy = 0; yy < h; yy++)
+        memcpy(&nd[(size_t)yy * w * im.ch],
+               &S.data[((size_t)(y + yy) * im.w + x) * im.ch],
+               (size_t)w * im.ch * sizeof(float));
+    S.data = std::move(nd);
+    S.w = w; S.h = h;
+    S.cropX += x; S.cropY += y;
+    im.syncMirrors();
+    im.dataRev++;
+    computeMinMax(im);
+    im.texDirty = true;
+    if (appliedX) *appliedX = x;
+    if (appliedY) *appliedY = y;
+}
+
 static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
                         int* appliedX = nullptr, int* appliedY = nullptr) {
     if (im.src->remoteStep > 1) return false;
@@ -660,24 +698,7 @@ static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
             im.src->regKey.clear();
         }
     }
-    FrameSource& S = *im.src;
-    if (S.srcW == 0) { S.srcW = S.w; S.srcH = S.h; }
-    x = std::clamp(x, 0, im.w - 1);
-    y = std::clamp(y, 0, im.h - 1);
-    if (im.cfa == 1) { x &= ~1; y &= ~1; }
-    if (im.cfa == 2) { x &= ~3; y &= ~3; }
-    w = std::clamp(w, 1, im.w - x);
-    h = std::clamp(h, 1, im.h - y);
-    std::vector<float> nd((size_t)w * h * im.ch);
-    for (int yy = 0; yy < h; yy++)
-        memcpy(&nd[(size_t)yy * w * im.ch],
-               &S.data[((size_t)(y + yy) * im.w + x) * im.ch],
-               (size_t)w * im.ch * sizeof(float));
-    S.data = std::move(nd);
-    S.w = w; S.h = h;
-    S.cropX += x; S.cropY += y;
-    im.syncMirrors();
-    im.dataRev++;
+    cropPixels(im, x, y, w, h, appliedX, appliedY);
     // dataRev is a MEMBERSHIP counter, and it unlatches every cache keyed on
     // uid+dataRev. The stack's measurements are not keyed that way: sigma_t is
     // computed over every member of the stack and keyed on
@@ -691,10 +712,6 @@ static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     // rather than a second answer to "have these pixels changed".
     if (im.seqId != 0)
         if (App::SeqInfo* si = seqInfo(im.seqId)) si->stackRev++;
-    computeMinMax(im);
-    im.texDirty = true;
-    if (appliedX) *appliedX = x;
-    if (appliedY) *appliedY = y;
     return true;
 }
 

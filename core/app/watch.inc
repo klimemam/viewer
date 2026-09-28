@@ -728,6 +728,14 @@ static const char* watchAutoBusy(int seqId) {
     // round of the poll interval at most.
     if (app.mPending > 0)  return "a measurement is in flight";
     if (app.rfPending > 0) return "a frame fetch is in flight";
+    // ...and A RELOAD ITSELF, which became a worker in the 2026-09-28 report.
+    // One at a time, for the reason there is one of anything here: two reloads
+    // landing into one source registry from two threads is what the single
+    // worker exists to prevent. Without this term the drain would ask for a
+    // second stack every frame while the first one was still re-reading, and
+    // the queue in front of the job would answer "already asked" - correct, but
+    // silently, where the line says WHY it is holding off.
+    if (app.reloadJob) return "a reload of another stack is still running";
     if (app.seqRunning || seqReadyPending() || !app.seqQueue.empty())
         return "frames are still loading";
     // A drag is a measurement being AIMED. temporal_model.inc already holds off
@@ -779,28 +787,37 @@ static bool watchAutoDue() {
 // automatic=false and §9's drain calls it with true. What differs is only what is
 // SAID afterwards - the operation is byte for byte the same one, which is the
 // point (rule 2 above).
-static void watchReloadNow(int seqId, bool automatic) {
+
+// ...and WHAT IS SAID once it has run, which is the half that differs between
+// the click and the automaton (rule 2: the operation is byte for byte the same
+// one). It is its own function because the reload no longer finishes inside the
+// call that started it - pumpReloadJob lands the last frame some frames later
+// and calls this - and a second copy of the record, the clearing and the toast
+// is the one place §9 could not afford one.
+static void watchReloadFinish(int seqId, bool automatic, const std::string& summary,
+                              int failed, uint64_t pinWas) {
     const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
-    // §12.5's other half: a pin on a frame that VANISHES is dropped by
-    // closeImages, exactly as closing that frame drops it. Sampled across the
-    // call, because the summary reloadStackFromDisk returns is about files and
-    // this is about a comparison that has just ended.
-    const uint64_t pinWas = app.compareBUid;
-    int failed = 0;
-    std::string msg = reloadStackFromDisk(seqId, &failed);
+    std::string msg = summary;
     const bool pinDropped = pinWas != 0 && app.compareBUid != pinWas;
+    char hm[16] = "";
     if (automatic) {
         char ts[32] = "";
         time_t now = time(nullptr);
-        if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%H:%M:%S", lt);
+        if (struct tm* lt = localtime(&now)) {
+            strftime(ts, sizeof ts, "%H:%M:%S", lt);
+            strftime(hm, sizeof hm, "%H:%M", lt);   // the ROW's token, to the minute
+        }
         msg = watch::autoReloadText(ts, msg, pinDropped);
     }
     if (App::SeqInfo* si = seqInfo(seqId)) {
         // The record, latched (rule 3). A manual reload CLEARS it: the user has
         // taken the wheel, and a note about what the program did behind them
-        // stops being the thing they need to read.
+        // stops being the thing they need to read. The clock is kept beside it
+        // rather than parsed back out of it - the stack row has room for
+        // "(auto-reloaded 14:07)" and not for the sentence.
         si->autoReloadNote = automatic ? msg : std::string();
-        // The Watch line (§5) said "the files behind these pixels have moved",
+        si->autoReloadWhen = automatic ? hm : std::string();
+        // The Watch mark (§5) said "the files behind these pixels have moved",
         // and the operation it offered has just run: drop it HERE rather than
         // waiting for the worker to notice, so the answer to a click is not two
         // polls late. The worker re-seeds from the fresh stat on its own round
@@ -816,6 +833,23 @@ static void watchReloadNow(int seqId, bool automatic) {
     // row and needs no label; this one arrives out of nowhere, and a toast that
     // does not say whose numbers just moved is not a notice.
     toast(automatic ? name + ": " + msg : msg, failed > 0);
+}
+
+static void watchReloadNow(int seqId, bool automatic) {
+    // THE WORKER FIRST (the 2026-09-28 report). startStackReload takes the
+    // whole gesture - the plan, the re-reads, the summary and watchReloadFinish
+    // above - and returns having read nothing; pumpReloadJob finishes it. False
+    // means it declined (a scripted run without --async-open), and then this is
+    // the synchronous door it always was.
+    if (startStackReload(seqId, automatic)) return;
+    // §12.5's other half: a pin on a frame that VANISHES is dropped by
+    // closeImages, exactly as closing that frame drops it. Sampled across the
+    // call, because the summary reloadStackFromDisk returns is about files and
+    // this is about a comparison that has just ended.
+    const uint64_t pinWas = app.compareBUid;
+    int failed = 0;
+    const std::string msg = reloadStackFromDisk(seqId, &failed);
+    watchReloadFinish(seqId, automatic, msg, failed, pinWas);
 }
 
 // The reload the LAST frame armed. Called at the head of pumpWatch and therefore

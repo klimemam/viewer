@@ -377,6 +377,32 @@ static void drawFileList() {
             ImGui::SetTooltip("stop as soon as the phase it is on finishes -\n"
                               "a stopped open leaves nothing behind");
     }
+    // A FILE IS BEING RE-READ (the 2026-09-28 report 「reload を押すと応答なしに
+    // なる」). The open row's vocabulary, one idea over: "this is busy with
+    // something long, and here is the Stop". What differs is the NUMBER - a
+    // reload has as many items as the stack has distinct sources, so it can give
+    // a true fraction where an open can only name a phase (openJobPhase says
+    // why) - and what Stop MEANS, which is the tooltip's whole subject.
+    if (app.reloadJob) {
+        ImGui::TextDisabled("%s", reloadJobRowText(*app.reloadJob).c_str());
+        if (!app.reloadQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d stack%s)", (int)app.reloadQueue.size(),
+                                app.reloadQueue.size() == 1 ? "" : "s");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##reload")) {
+            app.reloadJob->cancel.store(true);
+            app.reloadQueue.clear();     // Stop means stop - the open row's rule
+            toast("stopping...");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop after the frame it is on.\n\n"
+                              "The frames already re-read STAY re-read - they are\n"
+                              "what the disk holds now. So the stack is left holding\n"
+                              "two moments and says so on its row; reload it again\n"
+                              "to finish.");
+    }
     // A reader is running (issue #232). The Reader panel says this too, in more
     // detail and with what the reader has printed so far - but a MEMO REPLAY
     // opens no panel and produces no document until it is done, so without a
@@ -1578,56 +1604,23 @@ static void drawFileList() {
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
     if (pendingDeriveSeq) deriveModalOpen(pendingDeriveSeq);
-    if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size()) {
+    // ONE frame, re-read (reference-design §3.2). The whole of its sentence
+    // lives in reloadOneFrameText beside the walk it describes - the shared
+    // memberships, the stale reductions - because the asynchronous door's
+    // landing reaches the same sentence some frames later (pumpReloadJob), and
+    // a second wording of one event is the failure #71 is about.
+    //
+    // startFrameReload first, for the reason the stack's Reload takes the
+    // worker: a 480 MB frame is the same 0.45 s of a window answering nothing
+    // that issue #232 stage 2 moved off this thread for an OPEN of that very
+    // file. False = it declined (a scripted run), and then this is the
+    // synchronous door it always was.
+    if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size() &&
+        !startFrameReload(pendingReloadImg)) {
         ImageDoc* d = app.images[pendingReloadImg].get();
         std::string err, note;
-        if (reloadSource(d->src, err, &note)) {
-            std::string msg = "reloaded " + baseName(d->src->path) +
-                              (note.empty() ? "" : " - dimensions changed: " + note);
-            // the §3.2 walk refreshed EVERY membership of this source, not
-            // just this row: numbers moving in a stack the user never touched
-            // need a stated cause - the same clause reloadStackFromDisk earns
-            int sharedN = 0;
-            std::vector<std::string> sharedNames;
-            for (const auto& q : app.images)
-                if (q.get() != d && q->src == d->src) {
-                    sharedN++;
-                    std::string where = q->name;
-                    if (q->seqId != 0)
-                        if (const App::SeqInfo* si2 = seqInfo(q->seqId)) where = si2->name;
-                    if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
-                        sharedNames.end())
-                        sharedNames.push_back(where);
-                }
-            if (sharedN) {
-                char b2[192];
-                snprintf(b2, sizeof b2, " - also refreshed %d shared frame(s) in \"%s\"",
-                         sharedN, sharedNames[0].c_str());
-                msg += b2;
-                if (sharedNames.size() > 1)
-                    msg += " (+" + std::to_string((int)sharedNames.size() - 1) + " more)";
-            }
-            // the walk latched staleness on every reduced frame of every stack
-            // this source belongs to (§10.1) - the toast must say so too. The
-            // row is a loose frame, but a shared source can sit in stacks too,
-            // so the criterion is the walk's own: memberships of THIS source.
-            {
-                int staleAvg = 0;
-                for (const auto& q : app.images) {
-                    if (q->avgOfPath.empty() || !q->avgStale || !q->avgSeqId) continue;
-                    for (const auto& r : app.images)
-                        if (r->src == d->src && r->seqId == q->avgSeqId) {
-                            staleAvg++; break;
-                        }
-                }
-                if (staleAvg)
-                    msg += " - " + std::to_string(staleAvg) + " computed frame(s) now "
-                           "stale (right-click > Recompute from stack)";
-            }
-            toast(msg);
-        } else {
-            toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
-        }
+        if (reloadSource(d->src, err, &note)) toast(reloadOneFrameText(*d, note));
+        else toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
     }
     // ONE reload path (watch-design §9): this is watchAutoDrain's own call with
     // automatic=false. The toast, the clearing of the Watch line and the record

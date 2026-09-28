@@ -848,6 +848,50 @@ struct OpenPre {
     bool decoded = false;              // `dec` is usable (false = bytes only)
 };
 
+// ---- ...and the same split for a RELOAD (the 2026-09-28 report) -------------
+// A Reload re-reads the files behind pixels that are already on screen, and it
+// used to do all of it on the UI thread: stat, the whole file, a decode, a
+// SECOND decode for a frame-axis member, the crop and computeMinMax - per
+// resident FrameSource, with no yielding. A four-frame single-file stack was
+// therefore four whole-file reads and eight decodes of a window answering
+// nothing. Same shape as OpenPre above, and the same reason: the expensive
+// half is pure, so it is described by VALUES rather than by a second copy of
+// the walk.
+//
+// ReloadSpec is WHAT THESE PIXELS ARE, copied by value on the UI thread. The
+// worker must not read a live FrameSource: the reload walk and the registry
+// rewrite those very fields, so a worker reading `src->fileFrame` while
+// another landing moves it would decode a different frame than the one it was
+// asked for. Every field the decode consults is here and nothing else is.
+struct ReloadSpec {
+    std::string path;                  // the provenance, as the source records it
+    std::string remoteUrl;             // "" local, local://... this disk, ssh://... a peer
+    std::string member;                // .npz array / picture part
+    int fileFrame = 0;                 // which frame of a LOCAL multi-frame file
+    int remoteFrame = 0;               // ...and of a peer's
+    int remoteStep = 1;
+    int npyRead = 0;                   // §3.3's declared reading, replayed
+    int rawDtype = -1, rawInterp = 0, rawOffset = 0;
+    bool rawLE = true;
+    int w = 0, h = 0, ch = 0;          // what it is NOW - the dims note's left side
+    int srcW = 0, srcH = 0, cropX = 0, cropY = 0;   // the recorded crop rect
+    std::string dtype;
+};
+// ...and what the worker produced. The stat is taken BEFORE the bytes (§6.2)
+// and on the worker's own thread, so the tuple the landing re-keys to is the
+// stat of the generation whose bytes were actually read.
+struct ReloadPre {
+    FrameSource stat;
+    std::unique_ptr<ImageDoc> nd;      // the fresh decode, measured, cropped
+    std::string err;                   // ...or why there is none
+};
+// HOW the remote half of a reload reaches the peer. The decision record is at
+// §16 in open_dispatch.inc, where the resolver is used; the alias lives here
+// because App::ReloadJob below carries one (a worker resolves to its OWN
+// session - never app.uiSession, see the ownership note further down).
+using ReloadPeer = std::function<remote::Session*(const std::string& host, int port,
+                                                  std::string& errOut)>;
+
 struct App {
     std::vector<std::unique_ptr<ImageDoc>> images;
     int current = -1;
@@ -1346,6 +1390,13 @@ struct App {
         // every member from today's disk, so a carried-over note would describe
         // an event that has no bearing on the frames that came back.
         std::string autoReloadNote;
+        // ...and the CLOCK of it on its own, because the row has room for a
+        // token and not for a sentence (the 2026-09-28 report: the amber line
+        // folded into the stack row). "14:07" - the same wall clock the note
+        // above and SeqInfo::reloadWhen carry, kept apart from the note's prose
+        // so that seqAutoReloadMark does not have to parse it back out of one.
+        // Set and cleared with autoReloadNote, always together.
+        std::string autoReloadWhen;
         // Per-frame X axis for the Temporal chart: what frame i physically IS
         // (elapsed time, exposure, temperature). NAME + UNIT + one value per
         // frame - a bare list of numbers cannot label an axis, so all three
@@ -1460,6 +1511,7 @@ struct App {
                 s.watchFound = watch::Finding{};
                 s.watchToasted = false;
                 s.autoReloadNote.clear();
+                s.autoReloadWhen.clear();
                 s.refW = s.refH = s.refCh = 0;
                 s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
                 s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();
@@ -2567,6 +2619,79 @@ struct App {
         std::string onlyMember;
     };
     std::vector<OpenWait> openQueue;
+    // ---- a RELOAD, off the UI thread (the 2026-09-28 report) ---------------
+    // OpenJob's shape above, one stack at a time, and the differences are the
+    // three things a reload is that an open is not:
+    //
+    //   IT HAS N ITEMS. One per distinct resident FrameSource, and they land
+    //   ONE PER FRAME - a reload that swapped 120 frames in one landing would
+    //   have moved the freeze from the read to the swap. The row therefore
+    //   carries a true fraction ("3 / 12") where an open's carries a phase.
+    //
+    //   STOP LEAVES WHAT LANDED. The opposite of OpenJob's "stop leaves
+    //   nothing", and for a reason rather than by accident: a landed item is a
+    //   complete, valid document of what the disk holds now, and un-landing it
+    //   would mean re-reading the file it came from to get the OLD pixels back.
+    //   The summary says "stopped after n of N" and #56's mark says the stack
+    //   holds two generations, which is exactly true.
+    //
+    //   THE PEER IS THE WORKER's, not the UI's. app.uiSession belongs to the UI
+    //   thread and to nobody else (the ownership note above), so a job with
+    //   peer items dials a Session of its own - rfWorker's shape - and a link
+    //   that drops fails every remaining peer item WITHOUT re-dialing.
+    struct ReloadJob {
+        int seqId = 0;                 // the stack, or 0 for a one-frame reload
+        uint64_t oneUid = 0;           // ...and then WHICH frame (ImageDoc::uid)
+        bool automatic = false;        // watch-design §9's drain, not a click
+        std::string name;              // the stack's name when it started
+        struct Item {
+            std::shared_ptr<FrameSource> src;   // the source to swap into
+            ReloadSpec spec;                    // what it is, by value
+            ReloadPre pre;                      // what the worker made of it
+            bool landed = false;
+        };
+        std::vector<Item> items;
+        // Where each GROUP of items served by ONE read ends (an index one past
+        // its last item). The groups are laid out CONTIGUOUSLY and in item
+        // order, which is what makes `doneCount` below monotone for the
+        // landing: item k has been decoded exactly when doneCount > k.
+        std::vector<int> groupEnd;
+        // A selftest's resolver (--rwatch drives a local:// peer over a pipe),
+        // or empty for the program's own answer. Read by the worker, which
+        // wraps it: see reloadJobWorker.
+        ReloadPeer peer;
+        std::atomic<int> doneCount{ 0 };   // items the worker has finished
+        std::atomic<bool> cancel{ false };
+        std::atomic<bool> done{ false };
+        std::thread th;
+        double startedAt = 0;
+        // WHICH THREAD decoded. ReaderJob::decodeThread's probe and its reason:
+        // the only thing a headless selftest can assert about a freeze that is
+        // about to not happen.
+        std::thread::id decodeThread;
+        // ---- the UI thread's own tally, accumulated as the items land ------
+        int ok = 0, failed = 0, dims = 0, sharedN = 0, landedN = 0;
+        std::string firstErr, firstDims;
+        std::string oneNote;           // a one-frame job's dims note, bare
+        std::vector<std::string> sharedNames;
+        watch::Rebuild plan;           // §6's membership, decided at the start
+        int hadBefore = 0;
+        uint64_t pinWas = 0;           // §12.5: a compare pin sampled across it
+        // Quitting mid-reload. ~OpenJob's reason exactly: a joinable thread
+        // that is DESTROYED is std::terminate, and this object is owned by the
+        // global App.
+        ~ReloadJob() {
+            cancel.store(true);
+            if (th.joinable()) th.join();
+        }
+    };
+    std::unique_ptr<ReloadJob> reloadJob;
+    // A second request for the SAME stack while one runs is folded (OpenJob's
+    // rule); a request for a DIFFERENT one waits here. One at a time, because
+    // two reloads landing into one registry from two threads is the shape the
+    // one-worker rule exists to prevent.
+    struct ReloadWait { int seqId = 0; uint64_t oneUid = 0; bool automatic = false; };
+    std::vector<ReloadWait> reloadQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||
                videoDlg || folderDlg || rdOpenDlg || rdFolderDlg || rdNewDlg;
@@ -2763,6 +2888,18 @@ inline bool g_forceAsyncOpen = false;
 // where startOpenJob defines it (g_readerStarts' twin, one file over).
 inline int g_openStarts = 0;
 inline int g_openPumps = 0;
+// ...and the same two for a RELOAD (the 2026-09-28 report), for the same reason
+// and read by the same kind of test: which door the gesture took, and that the
+// frame loop came round while the files were being re-read. g_forceAsyncOpen is
+// the lid for both - one flag, because a run that asks for the open worker is
+// asking for "the path a person takes", and the reload worker is part of it.
+inline int g_reloadStarts = 0;
+inline int g_reloadPumps = 0;
+// WHICH THREAD the last reload decoded on, published by pumpReloadJob after it
+// has joined the worker (so the read is ordered by the join and not by hope).
+// ReaderJob::decodeThread's probe and its reason: it is the only thing a
+// headless selftest can assert about a freeze that is about to not happen.
+inline std::thread::id g_reloadDecodeThread;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)

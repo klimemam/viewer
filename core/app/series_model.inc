@@ -997,6 +997,14 @@ static void closeAll() {
     // the next pump gets to it (the join is that path's, on the held job).
     if (app.openJob) app.openJob->cancel.store(true);
     app.openQueue.clear();            // ...and the files waiting behind it
+    // ...and a RELOAD in flight (the 2026-09-28 report), for the same reason
+    // one line up: it is a thing that replaces pixels, and a stack it was
+    // half-way through would otherwise go on swapping frames into sources the
+    // close has already thrown away. Cancel, not join - pumpReloadJob reaps it,
+    // and what it has already landed stays landed (which is nothing at all
+    // after a close).
+    if (app.reloadJob) app.reloadJob->cancel.store(true);
+    app.reloadQueue.clear();
     app.seqLoadingId = 0;
     app.seqQueue.clear();
     app.seqRestore.clear();
