@@ -137,17 +137,28 @@
             check(line.size() == 5 && line[0] == want,
                   "F1 four resident rows, and the header names every ddof");
             if (line.size() == 5 && line[0].size() == 6) {
-                auto num = [&](int row, int col) { return atof(line[row][col].c_str()); };
+                // bounds-checked: a row the export truncated must read as "no
+                // number" rather than walking off the end of its vector
+                auto cell = [&](int row, int col) {
+                    if (row < 0 || (size_t)row >= line.size() ||
+                        col < 0 || (size_t)col >= line[row].size()) return std::string();
+                    return line[row][col];
+                };
+                auto num = [&](int row, int col) {
+                    const std::string s = cell(row, col);
+                    return s.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                     : atof(s.c_str());
+                };
                 const double SD = std::sqrt(105.0 / 4);           // 5.12347538
                 const double SC = std::sqrt(6.0), SR = std::sqrt(24.0);
                 bool means = true, sds = true, pcts = true, files = true;
                 for (int k = 0; k < 3; k++) {
                     const double m = 100.0 * (k + 1) + 10.5;
-                    means &= line[k + 1][0] == std::to_string(k) && num(k + 1, 2) == m;
+                    means &= cell(k + 1, 0) == std::to_string(k) && num(k + 1, 2) == m;
                     sds &= near9(num(k + 1, 3), SD);
                     pcts &= near9(num(k + 1, 4), SC / m * 100.0) &&
                             near9(num(k + 1, 5), SR / m * 100.0);
-                    files &= line[k + 1][1] == "synth" + std::to_string(k) + ".npy";
+                    files &= cell(k + 1, 1) == "synth" + std::to_string(k) + ".npy";
                 }
                 check(means, "F2 mean is 110.5 / 210.5 / 310.5 - exactly, to the printed digit");
                 check(sds, "F2 sigma is sqrt(105/4) = 5.12347538 on all three (ddof=0)");

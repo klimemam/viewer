@@ -156,7 +156,12 @@ if (g_anaValueSelftest) {
         // against a d of order 1: 1e-4 relative is the floor here, not a guess.
         check(rel(R.at("ch0.prnu_pct"), PRNU, 1e-4),
               "U1 prnu_pct = 100*sqrt((292/81)(1/20+9/16))/1032 = 0.143986663");
-        check(rel(R.at("ch0.shading_pct"), SHAD, 1e-6),
+        // 1e-5 and not 1e-6: the low band is stored as FLOAT, so lpMin and lpMax
+        // each carry up to half an ulp of ~1000 (3.1e-5 DN) and their difference
+        // up to one ulp. Measured residual is 6.2e-7, which is 40% of a 1e-6
+        // bound - too little room for a runner whose libm rounds the blur's
+        // divisions the other way.
+        check(rel(R.at("ch0.shading_pct"), SHAD, 1e-5),
               "U1 shading_pct = 100*(g(W-1-20/9)+h(H-1-20/9))/1032 = 5.34022394");
         check(rel(R.at("ch0.row_fpn_pct"), RFPN, 1e-4) &&
               rel(R.at("ch0.col_fpn_pct"), CFPN, 1e-4),
@@ -254,9 +259,18 @@ if (g_anaValueSelftest) {
     // iso12233/e-sfr  -  an IDEAL edge, whose MTF is a sinc.
     //
     // 96x64 f32, edge at 24 + 0.15y, and each pixel holds the FRACTION of
-    // itself the bright side covers (clamped 0..1): that is the exact integral
-    // of a step over a 1 px aperture, so the line spread function is a box of
-    // width exactly 1 px and
+    // itself the bright side covers (clamped 0..1) times 800, with a dark level
+    // of ZERO. The dark level is load-bearing and the reason is DEFECT(esfr-1)
+    // at the foot of this group: a non-zero one puts a false impulse of its own
+    // height into the LSF, because an empty leading bin is filled with 0 rather
+    // than with the dark level (analyzer_esfr.c:150-158). At dark 0 that step
+    // does not exist and the measurement follows the model below to 0.6% at
+    // every f up to 0.85; at dark 100 the same curve ripples -5.6% to -10.1%
+    // against it. This was measured by three independent Python ports of
+    // analyzer_esfr.c during review of PR #273.
+    //
+    // 0 + 800*t is the exact integral of a step over a 1 px aperture, so the
+    // line spread function is a box of width exactly 1 px and
     //     MTF(f) = |sinc(f)| = |sin(pi f)/(pi f)|      (0 at f = 1 cy/px)
     // The plugin measures the LSF as the difference of consecutive 4x bins,
     // which is a 0.25 px difference rather than a derivative, and normalizes by
@@ -272,19 +286,22 @@ if (g_anaValueSelftest) {
     //   sinc(0.5) = 2/pi = 0.63661977, sinc(0.125) = 0.97449594
     //   SFR_model(0.33) = 0.81182562     SFR_model(0.50) = 0.60456037
     //   its 0.5 crossing = 0.57694593    its 0.2 crossing = 0.80386988
-    // and |sinc(f)| ALONE is a hard UPPER bound on what the pipeline may report,
-    // because every remaining stage of it - the zero-order fill of an empty bin,
-    // the Hamming window, the per-line edge-position scatter - is a convolution,
-    // so it can only take magnitude away at a given f. A measured SFR ABOVE the
-    // ideal sinc is therefore a defect (a sharpening, an aliasing or a broken
-    // normalization) and not a tolerance question. Ideal roots:
+    // and |sinc(f)| is used below as a one-sided UPPER bound. NOT as a theorem:
+    // the Hamming window is a multiplication in space, so it is a CONVOLUTION in
+    // frequency and can move magnitude upward at a given f. What makes the bound
+    // safe HERE is the fixture: the window's half-width is pw*OS/2 = 192 bins =
+    // 48 px around the LSF centroid and the LSF is 1 px wide, so over the support
+    // that carries the energy the window is ~1 and contributes no lift. Read it
+    // as "on this fixture nothing may exceed the ideal sinc", which still catches
+    // a sharpening, an aliasing or a broken normalization; it is not a statement
+    // about the pipeline in general. Ideal roots:
     //   |sinc(f)| = 0.5 at f = 0.60335456 ; = 0.2 at f = 0.82624941
-    // The model is within ~1% of the measurement at every f up to Nyquist; the
-    // CROSSINGS carry more, because the curve's slope there is about 1.2 per
-    // cy/px, so a 1% vertical droop is a 2-5% horizontal shift. The asserts
-    // below are tight on the curve and banded on the crossings for that reason,
-    // and the band's width is the residual this pipeline's own documented
-    // simplifications cost - tighten it if it ever gains the sinc correction.
+    // With dark 0 the model is within 0.6% of the measurement at every f up to
+    // 0.85, and the two CROSSINGS land within about 0.25%, so the asserts below
+    // are 1% on the curve and 1% on the crossings. The residual is the binning
+    // and the per-line edge-position scatter, not the missing sinc correction -
+    // the sinc correction the file documents as absent would move the curve far
+    // more than this and is already accounted for in the sinc(f/4)^2 factor.
     // Two numbers need no model at all:
     //   edge_angle_deg = atan(0.15)*180/pi = 8.5307656  (+-2e-4: the per-line
     //     centroid of the SQUARED derivative has a subpixel-phase bias that is
@@ -294,14 +311,16 @@ if (g_anaValueSelftest) {
     // =====================================================================
     {
         const int W = 96, H = 64;
-        auto mkEdge = [&](const char* nm, int blur) {
+        // `dark` is a parameter and not a constant so that DEFECT(esfr-1) can
+        // run the SAME edge at 100 and print what it does to mtf50.
+        auto mkEdge = [&](const char* nm, int blur, double dark) {
             auto d = mk(nm, W, H, 1);
             for (int y = 0; y < H; y++) {
                 const double edge = 24.0 + 0.15 * y;
                 for (int x = 0; x < W; x++) {
                     double t = (double)x - edge + 0.5;      // coverage of pixel x
                     t = t < 0 ? 0 : (t > 1 ? 1 : t);
-                    d->px()[(size_t)y * W + x] = (float)(100.0 + 800.0 * t);
+                    d->px()[(size_t)y * W + x] = (float)(dark + 800.0 * t);
                 }
             }
             // ...and, for the second fixture, one 3-tap box across the edge:
@@ -324,9 +343,9 @@ if (g_anaValueSelftest) {
             return t == 0.0 ? 1.0 : std::sin(3.14159265358979323846 * t) /
                                     (3.14159265358979323846 * t);
         };
-        auto sharp = mkEdge("av_edge", 0);
+        auto sharp = mkEdge("av_edge", 0, 0.0);
         const Res E = run("iso12233/e-sfr", *sharp, nullptr);
-        auto soft = mkEdge("av_edge3", 1);
+        auto soft = mkEdge("av_edge3", 1, 0.0);
         const Res F = run("iso12233/e-sfr", *soft, nullptr);
         // the model, and the ideal sinc it can never exceed
         const double M33 = sinc(0.33) * sinc(0.0825) * sinc(0.0825);   // 0.81182562
@@ -340,6 +359,13 @@ if (g_anaValueSelftest) {
         fprintf(stderr, "anavalueselftest: e-sfr model f=0.33 %.12g f=0.50 %.12g "
                         "(ideal sinc 0.5 = %.12g); crossings 0.57694593 / 0.80386988, "
                         "ideal 0.60335456 / 0.82624941\n", M33, M50, IDEAL50);
+        if (E.sfrY.size() == 101)
+            fprintf(stderr, "anavalueselftest: e-sfr sharp vs model: f=0.33 %+.3f%% "
+                            "f=0.50 %+.3f%%  mtf50 %+.3f%%  mtf20 %+.3f%%\n",
+                    ((double)E.sfrY[33] / M33 - 1) * 100,
+                    (E.at("sfr@nyquist") / M50 - 1) * 100,
+                    (E.at("mtf50 (cy/px)") / 0.57694593 - 1) * 100,
+                    (E.at("mtf20 (cy/px)") / 0.80386988 - 1) * 100);
         if (E.sfrY.size() == 101 && F.sfrY.size() == 101)
             fprintf(stderr, "anavalueselftest: e-sfr curve f=0.33 sharp=%.6g blur=%.6g | "
                             "f=0.50 %.6g / %.6g | f=1.00 %.6g / %.6g | blur mtf50=%.6g\n",
@@ -357,33 +383,76 @@ if (g_anaValueSelftest) {
         // ---- the CURVE, against the model, tightly ----------------------
         check(E.sfrY.size() == 101 && rel((double)E.sfrY[33], M33, 0.01),
               "S1 SFR(0.33) = |sinc(.33)|*sinc(.0825)^2 = 0.81182562 within 1%");
-        check(rel(E.at("sfr@nyquist"), M50, 0.015),
+        check(E.rc == 0 && rel(E.at("sfr@nyquist"), M50, 0.015),
               "S1 sfr@nyquist = |sinc(.5)|*sinc(.125)^2 = 0.60456037 within 1.5%");
-        // ...and the ideal sinc as a one-sided bound, which is a theorem rather
-        // than a tolerance: no convolution can raise the magnitude at an f.
-        check(E.at("sfr@nyquist") < IDEAL50 && (double)E.sfrY[33] < sinc(0.33),
-              "S1 ...and both sit BELOW the ideal sinc, which no smoothing may exceed");
-        // ---- the crossings, banded between the model and the ideal ------
+        // ...and the ideal sinc as a one-sided bound - safe on THIS fixture
+        // because the Hamming window is ~1 over the 1 px the LSF occupies (see
+        // the header; it is not a theorem, the window convolves in frequency).
+        check(E.sfrY.size() == 101 && E.at("sfr@nyquist") < IDEAL50 &&
+              (double)E.sfrY[33] < sinc(0.33),
+              "S1 ...and both sit BELOW the ideal sinc (on this fixture, see header)");
+        // ---- the crossings, at 1% now that the dark level is 0 -----------
         check(E.at("mtf50 (cy/px)") <= 0.60335456 &&
-              rel(E.at("mtf50 (cy/px)"), 0.57694593, 0.06),
-              "S1 mtf50 in [0.542, 0.603]: the model's crossing, under the ideal's");
+              rel(E.at("mtf50 (cy/px)"), 0.57694593, 0.01),
+              "S1 mtf50 = 0.57694593 +-1%, and under the ideal 0.60335456");
         check(E.at("mtf20 (cy/px)") <= 0.82624941 &&
-              rel(E.at("mtf20 (cy/px)"), 0.80386988, 0.03),
-              "S1 mtf20 in [0.780, 0.826]: the same band at the 0.2 crossing");
+              rel(E.at("mtf20 (cy/px)"), 0.80386988, 0.01),
+              "S1 mtf20 = 0.80386988 +-1%, and under the ideal 0.82624941");
         // ---- the 3-tap blur, whose sinc(3f) NULL at 1/3 is the strongest
         // shape claim available here: one extra box in the fixture takes one
         // point of the curve from 0.81 to under 0.10, and no constant, no
         // mis-scaled normalization and no swapped axis does that.
         check(F.rc == 0 && F.sfrY.size() == 101 && (double)F.sfrY[33] < 0.10,
               "S2 a 3-tap box puts a null at 1/3 cy/px: SFR(0.33) drops under 0.10");
-        check(F.sfrY.size() == 101 && (double)E.sfrY[33] > 0.75,
+        check(E.sfrY.size() == 101 && (double)E.sfrY[33] > 0.75,
               "S2 ...where the sharp edge reads 0.81 - a 13x separation at ONE f");
-        check(F.at("mtf50 (cy/px)") > 0.15 && F.at("mtf50 (cy/px)") < 0.25,
+        check(F.rc == 0 && F.at("mtf50 (cy/px)") > 0.15 && F.at("mtf50 (cy/px)") < 0.25,
               "S2 ...and mtf50 falls to the 0.19228 that null forces");
         check(rel(F.at("edge_angle_deg"), E.at("edge_angle_deg"), 2e-3),
               "S2 ...while the edge is the SAME edge: the angle does not move");
+
+        // ---- DEFECT(esfr-1), found while reviewing this group --------------
+        // The SAME edge with a dark level of 100 instead of 0. Nothing about the
+        // scene changed - the rise is still 800 DN and the derivative, so the
+        // edge fit and the angle, is identical - but the analyzer fills an EMPTY
+        // leading 4x bin with 0 rather than with the dark level or the first
+        // value it has (analyzer_esfr.c:150-158, `lsf[i] = havePrev ? prev : 0`).
+        // The first non-empty bin is then a step of the whole dark level, which
+        // is a false impulse in the LSF at the ROI's left edge, and it ripples
+        // the whole curve: three independent Python ports of analyzer_esfr.c
+        // measured -5.6% to -10.1% against the model over f = 0.05..0.50, with
+        // the zero crossings of the ripple near f = 0.33 and f = 0.50 - which is
+        // exactly why the first draft of this group read as "within 1%" at the
+        // two frequencies it sampled and needed a +-6% band on the crossings.
+        //   NOT asserted, and analyzer_esfr.c NOT touched: fixing the fill is a
+        //   change to the computation, so it moves the declared version 1.0.0
+        //   and belongs on its own board row (Fable writes it). What this does is
+        //   print the size of it, every run, so the next reader of a report that
+        //   used a non-zero dark level knows the number is biased low.
+        {
+            auto pedestal = mkEdge("av_edge_dark100", 0, 100.0);
+            const Res P = run("iso12233/e-sfr", *pedestal, nullptr);
+            if (P.rc == 0 && P.sfrY.size() == 101)
+                fprintf(stderr, "anavalueselftest: S2 DEFECT(esfr-1): the same edge on a "
+                                "dark level of 100 reads mtf50 %.6g vs %.6g at dark 0 "
+                                "(%+.2f%%), SFR(0.33) %.6g vs %.6g (%+.2f%%) - an empty "
+                                "leading bin is filled with 0, not with the dark level, "
+                                "so the LSF gains a false impulse of the pedestal's "
+                                "height. Not asserted - reported for a ruling.\n",
+                        P.at("mtf50 (cy/px)"), E.at("mtf50 (cy/px)"),
+                        (P.at("mtf50 (cy/px)") / E.at("mtf50 (cy/px)") - 1) * 100,
+                        (double)P.sfrY[33], (double)E.sfrY[33],
+                        ((double)P.sfrY[33] / (double)E.sfrY[33] - 1) * 100);
+            // ...and the half that IS unaffected, which is what proves the
+            // diagnosis: a constant offset cannot change a difference, so the
+            // edge fit sees the same edge.
+            check(P.rc == 0 && rel(P.at("edge_angle_deg"), E.at("edge_angle_deg"), 1e-12) &&
+                  P.at("lines_used") == E.at("lines_used"),
+                  "S2 the pedestal moves the CURVE and not the edge fit (bit-identical angle)");
+        }
+
         // the two refusals, in words
-        auto bay = mkEdge("av_edge_cfa", 0);
+        auto bay = mkEdge("av_edge_cfa", 0, 0.0);
         bay->cfa = 1; bay->cfaPattern = 0;
         const Res B = run("iso12233/e-sfr", *bay, nullptr);
         check(B.rc == 1 && B.err == "e-sfr: CFA mosaic input - demosaic first",

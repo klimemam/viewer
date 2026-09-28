@@ -811,8 +811,15 @@ static int histHlSelftest() {
             fprintf(stderr, "histhlselftest: T16 mismatch badge '%s'\n", mbadge.c_str());
             check(has(mpanel, "A: 1 px"),
                   "T16 dimension mismatch: the pane that IS drawn answers for itself");
+            // What this actually fixes is narrower than "the mismatched B is
+            // excluded": Bbig has never been through renderDocRGBA at all, so it
+            // has no count to print and the line cannot appear whatever the
+            // mismatch rule is. The version that WOULD test the rule - paint
+            // Bbig in Split, then switch to Difference at a different size -
+            // fails, because it is DEFECT(2)'s twin on the panel. It belongs in
+            // the fixing PR, as an assert, and not here as a green half-claim.
             check(!has(mpanel, "B: "),
-                  "T16 ...and the B that cannot be differenced makes no claim");
+                  "T16 ...and a B that was never painted has no line to print");
             // ---- DEFECT 2, same predicate, the other surface ---------------
             // §9 asks that at a dimension mismatch the highlight "shows the same
             // A fallback as the canvas". The CANVAS falls back: diffMode is

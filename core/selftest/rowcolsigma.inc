@@ -61,17 +61,23 @@ if (g_rowColSigmaSelftest) {
         fprintf(stderr, "rowcolsigmaselftest: %-74s %s\n", what, cond ? "PASS" : "FAIL");
         if (!cond) ok = false;
     };
-    // Relative, and never on a quantity that is exactly 0 - those are compared
-    // with == below, because "collapsed to nothing" is the claim there.
+    // PURELY relative, and never on a quantity that is exactly 0 - those are
+    // compared with == below, because "collapsed to nothing" is the claim there.
+    // A max(1, |b|) floor was here first and it was wrong: it turns every
+    // expectation under 1 into an ABSOLUTE bound, so S4's variances (1.7e-8) and
+    // S1's col_fpn (0.045%) were being held eight and two orders looser than the
+    // number beside them said. The tolerances below mean what they say.
     auto near_ = [](double a, double b, double rel) {
-        return std::isfinite(a) && std::fabs(a - b) <= rel * std::max(1.0, std::fabs(b));
+        return std::isfinite(a) && std::fabs(a - b) <= rel * std::fabs(b);
     };
     // #2 is read back out of the EXPORT, where every number is %.9g - nine
     // significant digits is all there is, so its comparisons are relative to the
-    // value and never absolute. Using near_ on a 3.18e-6 percentage would pass
-    // whatever the export printed.
+    // value and never absolute. 1e-8 and not 1e-9: half of the ninth digit is
+    // 5e-9 of relative error when the leading digit is a 1, so anything tighter
+    // asserts the export's rounding rather than its arithmetic. This is the same
+    // bound and the same reasoning as core/selftest/framestats.inc.
     auto near9 = [](double a, double b) {
-        return std::isfinite(a) && std::fabs(a - b) <= 1e-9 * std::fabs(b);
+        return std::isfinite(a) && std::fabs(a - b) <= 1e-8 * std::fabs(b);
     };
 
     // ---- the four callers, each behind one lambda ---------------------------
@@ -107,9 +113,18 @@ if (g_rowColSigmaSelftest) {
         si.name = "rcs";
         app.seqs.push_back(si);
         d->seqId = si.id; d->seqIndex = 0;
+        // ONE exit that puts the borrowed state back, taken on the failure path
+        // as well - the home is shared, and a stack left in app.seqs by a test
+        // that gave up is a stack every later test has to cope with.
+        auto finish = [&](Row2 out) {
+            app.seqs.clear();
+            d->seqId = 0;
+            d->seqIndex = 0;
+            return out;
+        };
         ExportDoc doc('\t');
         const PerFrameBlock blk = exportPerFrameBlock(si.id, doc);
-        if (blk.rows != 1) return r;
+        if (blk.rows != 1) return finish(r);
         // split the two lines and pick the columns BY NAME: the header is the
         // documented way to read this file and a positional index here would
         // silently follow a column that moved
@@ -135,9 +150,7 @@ if (g_rowColSigmaSelftest) {
         r.colPct = at("sigma_col [%](ddof=1)");
         r.rowPct = at("sigma_row [%](ddof=1)");
         r.got = std::isfinite(r.mean);
-        app.seqs.clear();
-        d->seqId = -1;
-        return r;
+        return finish(r);
     };
     // #3: the decomposition, called directly. A and B are not fields of the
     // result - the published numbers are rowVariance = B - p/W and
@@ -302,12 +315,18 @@ if (g_rowColSigmaSelftest) {
         // high end. So sum(d^2) = 2*(100+36+9+1)*g^2/81 = 292*g^2/81 and
         //   fpn = sqrt(292/81 * g^2/(n-1))   with n = 17, so n-1 = 16.
         // row profile slope 4 -> sqrt(292)/9 ; column profile slope 1 -> /4 of
-        // that. Tolerance 1e-5 and not 1e-12 because m2 is stored as FLOAT: an
-        // ulp at ~1040 is 6.1e-5 and d is ~4.4, so the residual carries ~1e-5.
+        // that. Tolerance 1e-4 and not 1e-12 because m2 is stored as FLOAT: an
+        // ulp at ~1040 is 6.1e-5, so m2 carries up to 3.1e-5 of absolute error,
+        // and the SMALLEST |d| in the set is g/9 - 0.111 for the column profile,
+        // where that is 2.7e-4 relative. Propagated through sum(d^2) and the
+        // square root it is about 4e-5 on col_fpn (measured 2.5e-5) and four
+        // times less on row_fpn, whose slope is 4. One bound for both, set by the
+        // worse of the two. (anavalue.inc's U1 holds the same quantity at the
+        // same 1e-4 for the same reason.)
         const double FPN_ROW = std::sqrt(292.0) / 9 / M1 * 100.0;
         const double FPN_COL = std::sqrt(292.0) / 36 / M1 * 100.0;
         check(r4a.got && r4a.mean == M1, "S1 #4 the plugin's plane mean is 1040 exactly");
-        check(near_(r4a.rowFpn, FPN_ROW, 1e-5) && near_(r4a.colFpn, FPN_COL, 1e-5),
+        check(near_(r4a.rowFpn, FPN_ROW, 1e-4) && near_(r4a.colFpn, FPN_COL, 1e-4),
               "S1 #4 row_fpn_pct = 100*sqrt(292)/9/1040, col_fpn_pct = a quarter of it");
         check(near_(r4a.rowFpn / r4a.colFpn, 4.0, 1e-4),
               "S1 #4 ...so the ratio is exactly the slope ratio 4");
@@ -316,7 +335,7 @@ if (g_rowColSigmaSelftest) {
         // Same pixels, same words ("sigma of the row means"), and the numbers
         // are a factor of ~11 apart, because the plugin removed the ramp first.
         // 100*sqrt(408)/1040 = 1.9422 %, 100*sqrt(292)/9/1040 = 0.18256 %.
-        check(near_(P.vStat[0].pct / r4a.rowFpn, std::sqrt(B1) * 9 / std::sqrt(292.0), 1e-5),
+        check(near_(P.vStat[0].pct / r4a.rowFpn, std::sqrt(B1) * 9 / std::sqrt(292.0), 1e-4),
               "S1 #4 vs #1 differ by exactly the detrend: sqrt(408)*9/sqrt(292) = 10.64x");
     }
 
@@ -421,8 +440,8 @@ if (g_rowColSigmaSelftest) {
               "S3 #3 a pure ramp resolves no pixel noise: p clamps, so A and B print raw");
         // the sigmas agree, so the PERCENTAGES must differ by exactly the ratio
         // of the two denominators - the whole of P14, in one number
-        check(near_(R.hStat[0].pct / r2.colPct, 6117.5 / 6115.5, 1e-9) &&
-              near_(R.vStat[0].pct / r2.rowPct, 6117.5 / 6117.0, 1e-9),
+        check(near_(R.hStat[0].pct / r2.colPct, 6117.5 / 6115.5, 1e-8) &&
+              near_(R.vStat[0].pct / r2.rowPct, 6117.5 / 6117.0, 1e-8),
               "S3 #1 / #2 [%] = 6117.5/6115.5 and 6117.5/6117 - denominators only");
         check(R.hStat[0].pct != r2.colPct && R.vStat[0].pct != r2.rowPct,
               "S3 ...and they are NOT the same number here (anti-vacuity for S1)");
