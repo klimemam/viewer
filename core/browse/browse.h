@@ -179,6 +179,19 @@ struct RbAvgStack {
 std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
                                           const std::vector<char>& sel);
 
+// ---- board row 134: ONE single open, and a selection is N of them -------------
+// `rbReaderKey` is which string a reader memo for this row is filed under (§4.12
+// - a local row's bare path, a peer's row's url). `rbOpenItemRow` is the whole of
+// what a double-click on a row that is an ITEM does, with the navigation a folder
+// needs left to the panel; `rbOpenSelection` is Enter over a multi-selection and
+// calls it once per ticked row, in listing order, returning how many FOLDERS it
+// therefore could not open. Free so --browse-selftest drives the routing the
+// panel's key handler drives, rather than a second copy of it.
+std::string rbReaderKey(const App::RemoteBrowse& B, const RbRow& r);
+void rbOpenItemRow(const App::RemoteBrowse& B, const RbRow& r);
+int  rbOpenSelection(const App::RemoteBrowse& B, const std::vector<RbRow>& view,
+                     const std::vector<char>& sel);
+
 // deferred panel actions - see panel.cpp rbDefer for the ownership story. The
 // selftests queue through the same door the panel does, so the door is here.
 void rbDefer(std::function<void()> f);

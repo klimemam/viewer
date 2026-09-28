@@ -1849,6 +1849,73 @@
                         if (it->id == id) { app.seqs.erase(it); break; }
                 settle();
             }
+            {   // ---- B8: board row 134 - a selection is N SINGLE OPENS ---------
+                // The ruling: Enter over a multi-selection opens EACH selected
+                // item exactly as a single open of that item would - so an item
+                // with a reader memo (§4.12) goes through startReader and one
+                // without it goes through the ordinary door. Before it, this loop
+                // was a second transcription of the door and consulted no memo at
+                // all: a .npy somebody had bound a reader to came back as the
+                // origin's own array, under the reader's name.
+                //
+                // Not driven through browse-keys: the gesture is expressible
+                // there (ctrlclick / enter) but the MEMO is not - it would need
+                // an adapter on disk and a Python to run it inside a GL run. So
+                // the routing function is driven directly, which is what it was
+                // made free for.
+                //
+                // app.readerMemo IS THE USER'S PREFS and VIEWER_TEST_HOME is one
+                // directory shared by every selftest, so it is snapshotted and
+                // put back before anything can save it (aset.inc's discipline).
+                const std::vector<App::ReaderMemo> memoWas = app.readerMemo;
+                closeAll();
+                std::vector<RbRow> v = viewHere();
+                int iA = -1, iB = -1;
+                for (size_t i = 0; i < v.size(); i++) {
+                    if (v[i].up || v[i].ph || v[i].isDir() || v[i].isGroup()) continue;
+                    if (v[i].name() == "alpha.npy") iA = (int)i;
+                    if (v[i].name() == "bravo.npy") iB = (int)i;
+                }
+                std::vector<char> sel(v.size(), 0);
+                if (iA >= 0) sel[iA] = 1;
+                if (iB >= 0) sel[iB] = 1;
+                check(iA >= 0 && iB >= 0 && iA != iB,
+                      "B8 (setup) two plain .npy rows are ticked");
+                if (iA >= 0 && iB >= 0) {
+                    // The KEY is rbReaderKey's, which is the whole point of that
+                    // function existing: a local row is filed under its bare path
+                    // (startReader runs a reader where the file IS) and the picker
+                    // files it under the same string.
+                    const std::string keyA = rbReaderKey(B, v[iA]);
+                    check(keyA == v[iA].full() && keyA.rfind("local://", 0) != 0,
+                          "B8b a LOCAL row's memo is keyed by its bare path, not a url");
+                    app.readerMemo.clear();
+                    app.readerMemo.push_back({ keyA, "adapters/no_such_reader.py:load" });
+                    const int rs0 = g_readerStarts;
+                    const size_t n0 = app.images.size();
+                    const int skipped = rbOpenSelection(B, v, sel);
+                    // ONE reader run, for the ONE row that has a memo - and the
+                    // other row really opened, natively. "Nothing is silently
+                    // skipped" is the ruling's own clause and `skipped` is 0
+                    // because neither of these is a folder.
+                    check(skipped == 0 && g_readerStarts == rs0 + 1 &&
+                          app.images.size() == n0 + 1,
+                          "B8c both selected items open: the memo'd one via a ReaderJob");
+                    // ANTI-VACUITY: with no memo at all, the SAME two rows both
+                    // take the native door and no reader starts. Without this,
+                    // "it always starts a reader" passes B8c.
+                    closeAll();
+                    app.readerMemo.clear();
+                    const int rs1 = g_readerStarts;
+                    const size_t n1 = app.images.size();
+                    rbOpenSelection(B, v, sel);
+                    check(g_readerStarts == rs1 && app.images.size() == n1 + 2,
+                          "B8d ...and with no memo, both take the ordinary door instead");
+                }
+                app.readerMemo = memoWas;     // the user's prefs, as we found them
+                closeAll();
+                settle();
+            }
             I.cursor = -1;
             I.cursorKey.clear();
             I.sel.clear();
