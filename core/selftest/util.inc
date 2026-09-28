@@ -33,6 +33,36 @@ static bool needWindow(const char* what) {
     return false;
 }
 
+// ...and the OTHER half of the same question, which 板 304 is about: a test
+// whose GL group is ONE group of eight does not have to cost the other seven on
+// two of the three runners. docs/background/analysis/measurement-kernel-inventory.md
+// §4.3 counted what that was costing - --abstats-selftest's A1/A2/A3 (the
+// 4x256 histogram memcmp, mean/sd, and the per-plane sigma_t that is the ONLY
+// parity for that kernel) and --verify-selftest's V13 ran on one OS of three,
+// because each test also holds one group that lays out a real ImGui frame.
+//
+// So a test with a GL group is registered TWICE: once as it was, and once NOGL
+// with --nogl-groups-skipped, which is this flag. The pattern at the call site
+// is two lines and no re-indentation:
+//
+//     if (!glGroup("--x-selftest (the group's name)")) return 1;
+//     if (g_haveWindow) {
+//         ...the group...
+//     }
+//
+// It cannot silently skip: without the flag this is needWindow() exactly as
+// before, which prints the line to change in CMakeLists.txt and fails. The
+// SIBLING is the only run allowed to skip, and it says which group it skipped.
+static bool glGroup(const char* what) {
+    if (g_haveWindow) return true;
+    if (g_noglGroupsSkipped) {
+        fprintf(stderr, "%s: SKIPPED - no GL context, and this run is the NOGL "
+                        "sibling that exists to carry every other group.\n", what);
+        return true;
+    }
+    return needWindow(what);
+}
+
 // ---- fixtures no Python can be assumed for: .npy bytes, and an .npz ---------
 // Selftests build .npz fixtures BY HAND (the V25 rule: CI installs numpy and
 // nothing else, and a fixture that needs anything more is a fixture CI has

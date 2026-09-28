@@ -1415,6 +1415,11 @@ int main(int argc, char** argv) {
     // the expected value a rational derived by hand.
     #include "selftest/rowcolsigma.inc"
 
+    // The three shipped analyzers that had no value assertion at all (板 304).
+    // Beside rowcolsigma.inc because it is the same discipline on the other side
+    // of the ABI: analytic fixtures whose answer can be written down.
+    #include "selftest/anavalue.inc"
+
     #include "selftest/abstats.inc"
 
     #include "selftest/tile.inc"
