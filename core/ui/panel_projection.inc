@@ -247,7 +247,17 @@ static void drawPanelProjection() {
                                        IM_COL32(60, 180, 140, 220), IM_COL32(92, 155, 255, 220) };
     static const ImU32 RGB_COLS[3] = { IM_COL32(255, 92, 92, 210), IM_COL32(79, 221, 107, 210),
                                        IM_COL32(92, 155, 255, 210) };
-    const ImU32 ODD_COL = IM_COL32(185, 192, 200, 210);   // a series only one side has
+    // A series only ONE side has never gets a plane hue - a plane hue means
+    // "A's plane of this name", and lending it to a plane A does not have is
+    // the mixing the canon forbids. But ONE neutral colour for all of them is
+    // no better: with A mono (or RGB) and B a mosaic, B's R, Gr, Gb and B were
+    // four curves in one grey, overlaid and impossible to tell apart. Four
+    // neutral tones, separated by LUMINANCE rather than by hue so they still
+    // read as "not a plane colour", and named in the plane legend below.
+    static const ImU32 ODD_COLS[4] = { IM_COL32(232, 236, 241, 215),
+                                       IM_COL32(176, 184, 194, 212),
+                                       IM_COL32(126, 135, 147, 212),
+                                       IM_COL32(86, 94, 106, 220) };
     bool cfa = im->ch == 1 && im->cfa != 0;
     int plots = (app.showProjH ? 1 : 0) + (app.showProjV ? 1 : 0);
     if (!plots) { ImGui::TextDisabled("enable H or V"); return; }
@@ -380,6 +390,69 @@ static void drawPanelProjection() {
         statsH += ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
                                       ImGui::GetContentRegionAvail().x).y +
                   ImGui::GetStyle().ItemSpacing.y;
+    // WHERE side `si` keeps A's series of the same NAME, or -1 for a series only
+    // this side has. One spelling, because the stroke, the hover readout and the
+    // legend all have to agree about which curve is which plane - and a legend
+    // that names a different plane than the stroke drew is worse than none.
+    auto matchA = [&](size_t si, int s) {
+        return si == 0 ? s
+                       : abSeriesMatch(P.seriesNames, P.nSeries,
+                                       sides[si].S->seriesNames[s]);
+    };
+    // ...and the COLOUR rule, once, for the same reason. `a` is matchA's answer.
+    auto seriesInk = [&](size_t si, int s, int a, bool tint) -> ImU32 {
+        const bool mono = !cfa && P.nSeries == 1;
+        ImU32 col = a < 0 ? ODD_COLS[s & 3]
+                  : (cfa ? CFA_COLS[a]
+                         : (mono ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
+        // B on A's plot: keep the plane hue and lift it toward white, so R
+        // still reads as R and the pair still separates at a glance. A dash
+        // pattern did that job before and lost against a dense profile - the
+        // curve simply looked broken. The mono case has no hue to keep (A is
+        // already near-white), so B takes the blue the legend flies.
+        if (tint && a >= 0) col = mono ? AB_B_INK : abLiftInk(col, 0.45f);
+        // ...and past two sides the hue belongs to the LETTER: with one plane
+        // on the axis the plane is fixed and named on it, so nothing is lost,
+        // and the letter gains the colour it already wears everywhere else in
+        // the application.
+        if (bySlotInk) col = sides[si].ink;
+        return col;
+    };
+    // The PLANE legend for the sides on one plot. Four planes were overlaid in
+    // four hues with nothing on screen naming them: Gr and Gb are a light and a
+    // slightly darker green, and no reader can tell which curve is which - on
+    // the panel whose whole purpose with a mosaic is comparing the planes.
+    // Built from matchA and seriesInk, so it cannot name a colour the stroke
+    // did not use. Empty when the colour does NOT mean the plane (bySlotInk) or
+    // when only one plane is on the axis and the selector already names it.
+    auto planeLegend = [&](const std::vector<size_t>& which, bool tintOn) {
+        std::vector<SlotLegendEntry> pl;
+        if (bySlotInk) return pl;
+        std::vector<std::string> seen;
+        for (size_t si : which) {
+            const App::ProjState& S = *sides[si].S;
+            for (int s = 0; s < S.nSeries; s++) {
+                const int a = matchA(si, s);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                const char* nm = S.seriesNames[s];
+                if (!nm) continue;
+                // A plane both sides have is ONE entry - the hue says the
+                // plane, and both sides wear it (B lifted, which the side
+                // legend already accounts for). A plane only this side has
+                // wears its own neutral ink and carries the letter, because
+                // that ink means "this side's series" and nothing else.
+                std::string txt = a >= 0 ? std::string(nm)
+                                         : std::string(nm) + " (" + sides[si].name + " only)";
+                bool dup = false;
+                for (const std::string& t : seen) if (t == txt) dup = true;
+                if (dup) continue;
+                seen.push_back(txt);
+                pl.push_back({ txt, seriesInk(si, s, a, tintOn && si > 0) });
+            }
+        }
+        if (pl.size() < 2) pl.clear();   // one name is what the selector says
+        return pl;
+    };
     // One legend row under each overlaid plot, reserved before they are sized.
     // Two sides keep the fixed A/B row; three or more fly the wrapping N-slot
     // legend, because C/D/E push a single row off the panel - the histogram's
@@ -394,6 +467,14 @@ static void drawPanelProjection() {
                             sides[i].ink });
     float legendH = !leg.empty() ? slotLegendRow(leg, false)
                   : (Bim && !side ? abLegendH(aLabel, bLabel, bStale) : 0.0f);
+    {   // ...and the PLANE legend's row, which is a second row under each plot
+        // whenever the hues mean planes. Measured over the widest set a plot
+        // can carry - the overlay's - so a pane cannot be sized short of it.
+        std::vector<size_t> everySide;
+        for (size_t i = 0; i < nPlot; i++) everySide.push_back(i);
+        const std::vector<SlotLegendEntry> pl0 = planeLegend(everySide, nPlot > 1);
+        if (!pl0.empty()) legendH += slotLegendRow(pl0, false);
+    }
     float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     float each = std::max((avail - lineH * plots) / plots
@@ -419,7 +500,6 @@ static void drawPanelProjection() {
     auto stroke = [&](const PlotRect& pr, size_t si, bool horizontal,
                       bool tint, bool bars) {
         const App::ProjState& S = *sides[si].S;
-        const bool isB = si > 0;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const std::vector<float>* series = horizontal ? S.h : S.v;
         int origin = horizontal ? S.rx : S.ry;
@@ -429,25 +509,11 @@ static void drawPanelProjection() {
         for (int s = 0; s < S.nSeries; s++) {
             // colour follows A's series OF THE SAME NAME (R is always R); a
             // series only one side has gets a neutral stroke, never a plane hue
-            int a = isB ? abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s]) : s;
+            const int a = matchA(si, s);
             // the plane selector filters by A's plane index, so a series only
             // this side has is drawn only when every plane is on the axis
             if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-            const bool mono = !cfa && P.nSeries == 1;
-            ImU32 col = a < 0 ? ODD_COL
-                      : (cfa ? CFA_COLS[a]
-                             : (mono ? IM_COL32(215, 220, 225, 230) : RGB_COLS[a]));
-            // B on A's plot: keep the plane hue and lift it toward white, so R
-            // still reads as R and the pair still separates at a glance. A dash
-            // pattern did that job before and lost against a dense profile -
-            // the curve simply looked broken. The mono case has no hue to keep
-            // (A is already near-white), so B takes the blue the legend flies.
-            if (tint && a >= 0) col = mono ? AB_B_INK : abLiftInk(col, 0.45f);
-            // ...and past two sides the hue belongs to the LETTER: with one
-            // plane on the axis the plane is fixed and named on it, so nothing
-            // is lost, and the letter gains the colour it already wears
-            // everywhere else in the application.
-            if (bySlotInk) col = sides[si].ink;
+            const ImU32 col = seriesInk(si, s, a, tint);
             const std::vector<float>& d = series[s];
             ProjCurveProbe cp;
             cp.side = sides[si].name;
@@ -597,10 +663,66 @@ static void drawPanelProjection() {
         // give up the range bars, which N times over is noise. Alone in its own
         // pane a side is stroked exactly like A, bars and all.
         const bool overlaid = which.size() > 1;
+        const size_t probe0 = g_projCurveProbe.size();
         for (size_t si : which)
             stroke(pr, si, horizontal, overlaid && si > 0 && !bySlotInk, !overlaid);
         dl->PopClipRect();
         hoverReadout(pr, horizontal, which);
+        // ---- NEVER GO QUIET, about PLANES as well as about sides ----------
+        // This panel keeps that discipline for the letters - a slot the plots
+        // cannot carry is named under them in amber, which is the whole of the
+        // #60 fix - and kept none of it for the planes. A plane whose curve
+        // came out with fewer than two points was simply absent: no line, no
+        // word, and a full row of numbers for it in the table below. That is
+        // the same silence one level down, and it is what the 2026-09-29
+        // report was looking at.
+        //
+        // '@' rather than ':' between the plane and the side, for planerows'
+        // reason: a CFA plane is called "B" and so is a side. The axis is in
+        // the KEY, as it is for spreadH/spreadV, because a plot says this once
+        // per axis and a probe field is found by its first occurrence.
+        {
+            std::string drew, quiet;
+            for (size_t k = probe0; k < g_projCurveProbe.size(); k++) {
+                const ProjCurveProbe& c = g_projCurveProbe[k];
+                std::string& into = c.points >= 2 ? drew : quiet;
+                if (!into.empty()) into += ",";
+                into += c.plane + "@" + c.side;
+            }
+            g_projSideProbe += std::string(horizontal ? "drewH=" : "drewV=") + drew + ";";
+            if (!quiet.empty())
+                g_projSideProbe += std::string(horizontal ? "said-no-curve-planeH="
+                                                          : "said-no-curve-planeV=") +
+                                   quiet + ";";
+            if (!quiet.empty()) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(AB_AMBER,
+                                   "no curve for %s: fewer than two points on this axis "
+                                   "here - the region is %d %s wide and a mosaic plane "
+                                   "has its own share of that. Their numbers are in the "
+                                   "table below.",
+                                   quiet.c_str(),
+                                   horizontal ? P.rw : P.rh,
+                                   horizontal ? "column(s)" : "row(s)");
+                ImGui::PopTextWrapPos();
+            }
+        }
+        // ...and WHICH HUE IS WHICH PLANE. Four planes were overlaid in four
+        // hues with nothing naming them: Gr and Gb are two greens, and this is
+        // the panel whose purpose with a mosaic is to compare the planes.
+        {
+            const std::vector<SlotLegendEntry> pl = planeLegend(which, overlaid);
+            if (!pl.empty()) {
+                std::string names;
+                for (const SlotLegendEntry& e : pl) {
+                    if (!names.empty()) names += ",";
+                    names += e.text;
+                }
+                g_projSideProbe += std::string(horizontal ? "planelegH=" : "planelegV=") +
+                                   names + ";";
+                slotLegendRow(pl, true);
+            }
+        }
         // How flat is what I am looking at? Per SERIES, because the canon
         // forbids mixing CFA planes inside one statistic - four planes of a
         // mosaic have four answers and one pooled number would be the
