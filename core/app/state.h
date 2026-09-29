@@ -98,11 +98,17 @@
 inline int& pathFromUtf8BadCount() { static int n = 0; return n; }
 inline std::string& pathFromUtf8LastBad() { static std::string s; return s; }
 
-// UTF-8 in, UTF-8 out, with every ill-formed byte replaced by U+FFFD. Written
+// UTF-8 in, UTF-8 out, with every ill-formed BYTE replaced by U+FFFD. Written
 // by hand rather than through a codecvt because the point is to NEVER fail:
 // overlong forms, surrogates encoded as three bytes, code points above
-// U+10FFFF and truncated sequences are all ill-formed and all become one
-// U+FFFD, which is what the Unicode standard's own substitution rule says.
+// U+10FFFF and truncated sequences are all ill-formed.
+//
+// ONE U+FFFD PER BYTE, not one per ill-formed sequence. The Unicode standard
+// recommends the latter ("maximal subpart"), and this deliberately does not do
+// it: the substitution here exists so that a name which is not UTF-8 can be
+// REPORTED, and the count of replaced bytes is the number that goes in the
+// report. A three-byte truncated kanji therefore yields three U+FFFD and a
+// count of 3, which is what the selftest asserts.
 inline std::string utf8Sanitized(const std::string& s, int* replacedOut = nullptr) {
     std::string out;
     out.reserve(s.size());

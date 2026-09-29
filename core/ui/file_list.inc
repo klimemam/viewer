@@ -190,10 +190,23 @@ static ImFont* bakedFont() {
     ImFontAtlas* a = ImGui::GetIO().Fonts;
     return (a && a->Fonts.Size) ? a->Fonts[0] : nullptr;
 }
-static int undrawableCount(const std::string& utf8Name) {
+// THE THREE CAUSES ARE COUNTED SEPARATELY (review P2-6), because one number
+// forces one sentence and that sentence is false for two of the three. A
+// different font fixes `noGlyph` and cannot touch the other two: `tooHigh` is a
+// property of THIS BUILD (ImWchar is 16-bit here, so a code point above U+FFFF
+// cannot even be asked for, whatever font is installed), and `badBytes` is a
+// property of the FILENAME ON DISK. Telling somebody to change their font
+// because a file has an emoji in it is advice that cannot work.
+struct UndrawableTally {
+    int noGlyph = 0;        // in the ranges, the font does not have it
+    int tooHigh = 0;        // above U+FFFF: not representable in this build
+    int badBytes = 0;       // the name is not valid UTF-8
+    int total() const { return noGlyph + tooHigh + badBytes; }
+};
+static UndrawableTally undrawableTally(const std::string& utf8Name) {
+    UndrawableTally t;
     ImFont* f = bakedFont();
-    if (!f) return 0;                  // nothing baked: nothing to claim
-    int n = 0;
+    if (!f) return t;                  // nothing baked: nothing to claim
     const char* p = utf8Name.c_str();
     const char* e = p + utf8Name.size();
     while (p < e) {
@@ -218,25 +231,67 @@ static int undrawableCount(const std::string& utf8Name) {
             cp == (unsigned)IM_UNICODE_CODEPOINT_INVALID &&
             !(used == 3 && (unsigned char)p[0] == 0xEF &&
               (unsigned char)p[1] == 0xBF && (unsigned char)p[2] == 0xBD);
+        // WHICH substitution it was is decidable from the bytes alone, and the
+        // two mean different things: a well-formed 4-byte sequence is a real
+        // code point this build cannot represent, while anything else is a
+        // name that is not UTF-8. (ImTextCharFromUtf8 consumes 4 bytes for the
+        // first and 1 for the second, so `used` says which happened.)
+        if (substituted) {
+            if (used == 4) t.tooHigh++;
+            else           t.badBytes++;
+            p += used;
+            continue;
+        }
         p += used;
-        if (substituted) { n++; continue; }
-        if (cp > 0xFFFF) { n++; continue; }   // outside the BMP: not askable at all
-        if (!f->FindGlyphNoFallback((ImWchar)cp)) n++;
+        if (cp > 0xFFFF) { t.tooHigh++; continue; }   // ImWchar32 builds land here
+        if (!f->FindGlyphNoFallback((ImWchar)cp)) t.noGlyph++;
     }
-    return n;
+    return t;
 }
-// The sentence the count turns into. ONE function, so the tooltip and the
+static int undrawableCount(const std::string& utf8Name) {
+    return undrawableTally(utf8Name).total();
+}
+// The sentence the tally turns into. ONE function, so the tooltip and the
 // Messages line cannot drift into two different claims about one name.
-static std::string undrawableNote(const std::string& utf8Name) {
-    const int n = undrawableCount(utf8Name);
-    if (n <= 0) return {};
-    char b[320];
-    snprintf(b, sizeof b,
-             "%d character(s) of this name have no glyph in the font and draw "
-             "as '?' - two different files can look identical here. The name on "
-             "disk is untouched. \"appearance.fontPath\" (settings.jsonc) points "
-             "at another font; it takes effect at the next start.", n);
-    return b;
+//
+// Built cause by cause, and the WAY OUT is only offered for the cause it can
+// actually fix (review P2-6): "point appearance.fontPath at another font" is
+// true for a glyph the font is missing, and false for an emoji and for broken
+// bytes - no font on earth changes either of those. Cached because the atlas
+// cannot change after start-up and the Files panel asks this for every row on
+// every frame (review P3-11).
+static std::string undrawableNote(const std::string& text) {
+    static std::unordered_map<std::string, std::string> cache;
+    if (auto it = cache.find(text); it != cache.end()) return it->second;
+    const UndrawableTally t = undrawableTally(text);
+    std::string s;
+    if (t.total() > 0) {
+        char b[256];
+        std::string parts;
+        auto add = [&](int n, const char* what) {
+            if (n <= 0) return;
+            if (!parts.empty()) parts += ", ";
+            snprintf(b, sizeof b, "%d %s", n, what);
+            parts += b;
+        };
+        add(t.noGlyph,  "with no glyph in this font");
+        add(t.tooHigh,  "outside the range this build can draw at all "
+                        "(emoji and the rarer CJK extensions)");
+        add(t.badBytes, "whose bytes are not valid UTF-8");
+        snprintf(b, sizeof b, "%d character(s) here draw as '?' - %s. ",
+                 t.total(), parts.c_str());
+        s = b;
+        s += "Two different files can look identical like this. The name on "
+             "disk is untouched.";
+        // The only cause a font can fix.
+        if (t.noGlyph > 0)
+            s += " For the missing glyphs, \"appearance.fontPath\" "
+                 "(settings.jsonc) points at another font; it takes effect at "
+                 "the next start.";
+    }
+    if (cache.size() > 4096) cache.clear();
+    cache.emplace(text, s);
+    return s;
 }
 // ...and the Messages line, once per document.
 //
@@ -257,27 +312,106 @@ static std::string undrawableNote(const std::string& utf8Name) {
 // A 2000-frame stack would pay that 2000 times over for an answer that cannot
 // have changed. uid is the identity every loader assigns and is stable across a
 // reopen, which is exactly what "examined already" needs.
+// ONE LINE PER OPEN, not one per document (review P2-5).
+//
+// The per-document version was a defect, not a verbosity preference: a folder
+// of 400 numbered frames with a CJK name is ONE gesture that produced 400
+// identical-shaped lines, and app.msgLog is capped at 300 - so the log that
+// exists to diagnose this pushed out everything else in it, including the
+// start-up font messages that say WHICH font is in use. A diagnostic that
+// erases the diagnosis is worse than silence.
+//
+// The unit is the BATCH, because a batch is defined as one open action
+// ("ONE batch per OPEN ACTION" - see newBatch in compare.inc), so it is the
+// program's own name for the thing the user did. Within a batch, stacks are
+// reported by stack, which is what the Files panel actually draws.
+//
+// WHEN: on the first sweep where the batch has stopped growing. A stack pushes
+// members over many frames, so counting at the first sight of one would print
+// "1 frame" for a load that ends with 400. One frame of delay buys a count
+// that is true.
 static void undrawableReportNewDocs() {
     static uint64_t seenRev = (uint64_t)-1;
-    static std::unordered_map<uint64_t, char> seenUid;   // uid -> examined
-    static std::vector<std::string> said;                // name -> already said
+    static std::unordered_map<int, int> batchSize;    // batchId -> size last sweep
+    static std::unordered_map<int, char> batchSaid;   // batchId -> already reported
     if (app.imagesRev == seenRev) return;
     seenRev = app.imagesRev;
     if (!bakedFont()) return;
+
+    // Group this sweep's documents into ROWS as the Files panel groups them:
+    // one group per stack, one per loose document. `key` is what the panel's
+    // own identity is - a stack is its seqId, a loose file is its uid - so a
+    // 400-frame stack is one group and three files picked by hand are three.
+    struct Group {
+        std::string key, name;
+        int seqId = 0, members = 0, affected = 0;
+    };
+    std::unordered_map<int, std::vector<Group>> byBatch;   // batchId -> its rows
+    std::unordered_map<int, int> nowSize;
     for (const auto& d : app.images) {
-        if (d->name.empty()) continue;
-        if (d->uid && !seenUid.emplace(d->uid, 1).second) continue;
-        if (std::find(said.begin(), said.end(), d->name) != said.end()) continue;
-        const std::string note = undrawableNote(d->name);
-        if (note.empty()) continue;
-        said.push_back(d->name);
-        logMsg(d->name + ": " + note, true);
+        nowSize[d->batchId]++;
+        if (batchSaid.count(d->batchId)) continue;
+        // The name the PANEL DRAWS is the one that matters: a stack row draws
+        // the STACK's name, not its head frame's (review P2-7).
+        const App::SeqInfo* si = d->seqId ? seqInfo(d->seqId) : nullptr;
+        const std::string shown = si ? si->name : d->name;
+        if (shown.empty()) continue;
+        const std::string key = d->seqId ? ("s" + std::to_string(d->seqId))
+                                         : ("u" + std::to_string(d->uid));
+        std::vector<Group>& gs = byBatch[d->batchId];
+        Group* g = nullptr;
+        for (Group& q : gs) if (q.key == key) { g = &q; break; }
+        if (!g) { gs.push_back({ key, shown, d->seqId, 0, 0 }); g = &gs.back(); }
+        g->members++;
+        // A FRAME's own name, which is what that frame's tooltip will show.
+        // Counted separately from the row's name: the two are different
+        // strings and only one of them is on the row.
+        if (undrawableCount(d->name) > 0) g->affected++;
     }
-    // Both lists are per RUN. A session that opens and closes folders all day
-    // would otherwise grow them without bound, so they are capped the way
-    // msgLog is: the oldest half goes, and at worst a name is said twice.
-    if (said.size() > 512) said.erase(said.begin(), said.begin() + 256);
-    if (seenUid.size() > 200000) seenUid.clear();
+    for (auto& [batchId, gs] : byBatch) {
+        // Still growing? Wait one more sweep, so the count is the final one and
+        // not "1 frame" for a load that ends with 400.
+        const int was = batchSize.count(batchId) ? batchSize[batchId] : -1;
+        if (was != nowSize[batchId]) { batchSize[batchId] = nowSize[batchId]; continue; }
+        batchSaid[batchId] = 1;
+        // The rows worth a line at all.
+        std::vector<const Group*> hits;
+        for (const Group& g : gs)
+            if (!undrawableNote(g.name).empty() || g.affected > 0) hits.push_back(&g);
+        if (hits.empty()) continue;
+        // ...and an absolute bound on the lines one gesture can produce. A
+        // stack is already one line; this is for the case that is not a stack -
+        // a hundred loose files picked at once - so that the cap holds whatever
+        // the shape of the open was.
+        if (hits.size() > 5) {
+            char b[192];
+            snprintf(b, sizeof b, "%d of the %d item(s) just opened have "
+                                  "characters that draw as '?' - hover a row to "
+                                  "see which, and why.",
+                     (int)hits.size(), (int)gs.size());
+            logMsg(b, true);
+            continue;
+        }
+        for (const Group* g : hits) {
+            std::string line = g->name + ": ";
+            const std::string own = undrawableNote(g->name);
+            if (!own.empty()) line += own;
+            // The MEMBER clause, for a stack whose frames carry it too (or
+            // instead). Its own numbers, because they are about other strings.
+            if (g->seqId && g->affected > 0) {
+                char b[192];
+                snprintf(b, sizeof b, "%s%d of %d frame(s) in this stack have "
+                                      "such characters in their own names.",
+                         own.empty() ? "" : " Also: ", g->affected, g->members);
+                line += b;
+            }
+            logMsg(line, true);
+        }
+    }
+    // Per RUN, and bounded: a session that opens and closes folders all day
+    // would otherwise grow these without end, so they are capped the way
+    // msgLog is. At worst one open is reported twice.
+    if (batchSaid.size() > 4096) { batchSaid.clear(); batchSize.clear(); }
 }
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
 // `shared` = the row's frames whose source has another holder. Counterparts
@@ -1072,12 +1206,21 @@ static void drawFileList() {
                     lead = rn + "\n" + lead;
                 std::string tip = lead + "\n" + meta;
                 if (!share.empty()) tip += "\n\n" + share;
-                // §4.1 (板306 D): and if this name cannot be DRAWN, say so on
-                // the row that cannot draw it. Last, because it is a statement
-                // about the label above rather than about the pixels - and
+                // §4.1 (板306 D): and if this cannot be DRAWN, say so on the
+                // row that cannot draw it. Last, because it is a statement
+                // about the text above rather than about the pixels - and
                 // because the row it lands on is the one the reader is already
                 // trying to tell apart from its neighbour.
-                if (std::string ud = undrawableNote(d.name); !ud.empty())
+                //
+                // Computed over `tip` ITSELF, not over d.name, and that fixes
+                // two things the review found. A stack row DRAWS the stack's
+                // name while d.name is its head frame's (review P2-7), and the
+                // tooltip's first line is the whole PATH while only the leaf
+                // was being counted - so a directory component full of '?' was
+                // silent (review P3-12). The tooltip is the thing on screen, so
+                // the tooltip is what gets counted; every label, path and
+                // sentence in it is included exactly once.
+                if (std::string ud = undrawableNote(tip); !ud.empty())
                     tip += "\n\n" + ud;
                 g_filesRowTipProbe = tip;      // the value, not a second derivation
                 if (hov) ImGui::SetTooltip("%s", tip.c_str());
