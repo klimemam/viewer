@@ -141,7 +141,7 @@ static std::string g_filesRowTipProbe;
 static std::string g_filesBusyRowProbe;
 
 // §4: the share mark. U+29C9 (two joined squares) when the atlas has it - the
-// CJK fonts jpFontPath picks vary here - else the plain word, which is longer
+// CJK fonts jpFontChoice picks vary here - else the plain word, which is longer
 // but never a '?' box. Checked once: the font file does not change at runtime.
 static const char* shareGlyph() {
     static int have = -1;
