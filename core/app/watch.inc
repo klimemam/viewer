@@ -492,6 +492,12 @@ static void watchWorker() {
     // handshake every 15 s.
     remote::Session ses;
     ses.setAbort(&app.watchStop);      // a blocked read gives up when Quit asks
+    // ...and NO setExplainFailure here, deliberately. The words it fetches cost
+    // a second ssh handshake and this is the one caller that throws a failed
+    // connect away by design - §13.4's "no answer is not an empty directory",
+    // WatchLister returning false and the round doing nothing. Paying an extra
+    // ConnectTimeout every poll round for a sentence that is never displayed is
+    // the whole of what remote.h's second condition forbids.
     std::string sesHost = "\n";        // impossible: force the first connect
     int sesPort = -1;
     long long round = 0;

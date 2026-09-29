@@ -227,6 +227,21 @@ public:
     // NOT set on the workers: a legitimate MEASURE over a 300-frame aggregate
     // produces no bytes for minutes and is not a fault.
     void setIdleTimeout(double seconds) { idleTimeout_ = seconds; }
+    // OPT IN to the extra ssh round trip that fetches the peer's OWN words when
+    // a connect produced no answer at all (startOn, and peerStartError under
+    // it). Default OFF, and the default is the decision: that trip is a SECOND
+    // ssh handshake on a path that has already failed, so on an unreachable
+    // host it costs another ConnectTimeout - and it is spent on a thread.
+    //
+    // Two things a caller must be able to say YES to before turning it on:
+    //   IT RUNS ON A WORKER. app.uiSession is read on the UI thread with the
+    //   window not repainting, and one handshake is already the whole of what
+    //   an open may cost there (open_dispatch.inc, ensureUiSession).
+    //   THE WORDS ARE SHOWN. Watch drops a failed LIST on purpose (a dead link
+    //   is not an empty directory) and the Browse worker's connect failure is
+    //   replaced by deployPeer's own server-side probe, which says strictly
+    //   more - neither may pay for a sentence nobody reads.
+    void setExplainFailure(bool on) { explainFailure_ = on; }
 
     bool list(const std::string& path, std::vector<Entry>& out, std::string& err);
     // Walk the subtree under `root` server-side and return every stack below
@@ -364,6 +379,7 @@ private:
     int helloVersion_ = (int)rp::VERSION;
     int port_ = 0;
     bool serveReaders_ = true;
+    bool explainFailure_ = false;
     const std::atomic<bool>* abort_ = nullptr;
     double idleTimeout_ = 0;
     void* impl_ = nullptr;      // platform pipe/process handles
@@ -384,12 +400,20 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 // its combined output. `stdinData` is fed to it verbatim - a script for `sh`, or
 // the bytes of a file for `cat > path`. Returns false on spawn failure or when
 // timeoutSec elapses (a hung git clone must not wedge the caller forever).
+//
+// `abort` is the caller's stop flag, checked on the same 50 ms slice the read
+// loop already runs on, for Session::setAbort's reason one layer out: without
+// it a worker parked in a timeoutSec-long wait cannot be stopped, and Quit
+// waits out the whole budget with the dead window still on screen. When it
+// fires, `output` is CLEARED and false is returned - a partial answer to a
+// question nobody is waiting for is worse than no answer.
 bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
                    const std::string& stdinData, std::string& output, std::string& err,
-                   double timeoutSec = 60.0);
+                   double timeoutSec = 60.0, const std::atomic<bool>* abort = nullptr);
 // convenience: feed a script to `sh`
 bool runSshScript(const std::string& host, int port, const std::string& script,
-                  std::string& output, std::string& err, double timeoutSec = 60.0);
+                  std::string& output, std::string& err, double timeoutSec = 60.0,
+                  const std::atomic<bool>* abort = nullptr);
 
 // Accepted forms, in order of standards-conformance:
 //   ssh://user@host[:port]/abs/path   RFC 3986: after the colon comes a PORT,

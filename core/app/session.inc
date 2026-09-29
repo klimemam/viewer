@@ -2328,6 +2328,7 @@ static void startReader(const std::string& src, const std::string& spec,
         p->th = std::thread([p, exe]() {
             remote::Session s;
             s.setAbort(&p->cancel);
+            s.setExplainFailure(true);   // its own thread, and p->rerr is shown
             std::string serr;
             if (!s.startOn(p->host, p->port, exe, serr)) {
                 p->rok = false;

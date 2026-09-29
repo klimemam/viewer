@@ -177,6 +177,11 @@ static void ensureSession(remote::Session& ses, std::string& sesHost, int& sesPo
 static void rfWorker() {
     remote::Session ses;
     ses.setAbort(&app.rfStop);        // a blocked read gives up when Quit asks
+    // ...and a connect that got NO answer may spend one more ssh round trip
+    // asking the peer why. Allowed here and not on app.uiSession because this
+    // is a worker thread and because d.err below is SHOWN - the two conditions
+    // on remote.h's setExplainFailure.
+    ses.setExplainFailure(true);
     std::string sesHost = "\n";                  // impossible: force first connect
     int sesPort = -1;
     while (!app.rfStop) {
@@ -590,6 +595,7 @@ static void stopRemoteFetcher() {
 static void mWorker() {
     remote::Session ses;
     ses.setAbort(&app.mStop);         // a blocked read gives up when Quit asks
+    ses.setExplainFailure(true);      // rfWorker's reason: a worker, and d.err is shown
     std::string sesHost = "\n";
     int sesPort = -1;
     while (!app.mStop) {

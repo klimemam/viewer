@@ -436,7 +436,13 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
 // The UI thread's OWN connection to a host, used only by openRemote's meta+tile.
 // It deliberately does NOT install the peer: deployPeer is minutes of ssh and
 // the browse worker already owns that job (rbWorker's connect path). The most
-// this can cost the window is one ssh handshake, bounded by ConnectTimeout=10.
+// this can cost the window is one ssh handshake, bounded by ConnectTimeout=10 -
+// and that number is UNCHANGED by the peer diagnosis added for #268, because
+// this session never opts into it (remote.h, Session::setExplainFailure,
+// default false). Turning it on here would make an unreachable host cost two
+// handshakes plus the probe's own budget with the window not repainting, so
+// the sentence above is a constraint on this function and not a description:
+// whatever else ensureUiSession gains, it stays at one round trip.
 static bool ensureUiSession(const std::string& host, std::string& err, int port) {
     if (app.uiSession.alive() && app.uiSession.host() == host &&
         app.uiSession.port() == port)

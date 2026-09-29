@@ -36,6 +36,14 @@ struct Pipe {
     // Session::setAbort for why this is a flag and not a deadline.
     const std::atomic<bool>* abort = nullptr;
     double idleTimeout = 0;           // seconds with no bytes at all; 0 = never
+    // Did the far side produce A SINGLE BYTE on this pipe? The protocol layer
+    // cannot tell "the peer never started" from "the peer died mid-frame" any
+    // other way: send() and recv() word every transport failure "connection
+    // lost", so the one state worth a diagnosis (startOn) had no test at all.
+    // Counted here rather than from Session::rx_, which counts whole frames and
+    // is NOT reset by stop() - a reconnect on a Session that had received
+    // something would read as "it answered".
+    uint64_t bytesRead = 0;
 };
 
 static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err) {
@@ -165,6 +173,7 @@ static bool pipeRead(Pipe& p, void* buf, size_t n) {
         if (got <= 0) return false;
 #endif
         q += got; n -= (size_t)got;
+        p.bytesRead += (uint64_t)got;
         // progress resets the clock: a slow tile is not a dead link
         if (deadline > 0) deadline = nowSeconds() + p.idleTimeout;
     }
@@ -224,7 +233,7 @@ static double nowSeconds() {
 
 bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
                    const std::string& stdinData, std::string& output, std::string& err,
-                   double timeoutSec) {
+                   double timeoutSec, const std::atomic<bool>* abort) {
     Pipe p;
     std::vector<std::string> argv;
     if (host.empty()) {
@@ -246,8 +255,12 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
     output.clear();
     const double deadline = nowSeconds() + timeoutSec;
     char buf[4096];
-    bool timedOut = false;
+    bool timedOut = false, cancelled = false;
     for (;;) {
+        // The caller's stop flag, on the slice this loop already turns on. A
+        // worker that is being joined must not be held here for the rest of
+        // timeoutSec: see the note on the declaration.
+        if (abort && abort->load()) { cancelled = true; break; }
         if (nowSeconds() > deadline) { timedOut = true; break; }
 #if defined(_WIN32)
         // PeekNamedPipe first: ReadFile on a pipe blocks with no way out, and a
@@ -270,6 +283,11 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
         if (output.size() > (1u << 20)) break;   // no script needs a MB of output
     }
     pipeClose(p);
+    if (cancelled) {
+        output.clear();
+        err = "cancelled";
+        return false;
+    }
     if (timedOut) {
         err = "timed out after " + std::to_string((int)timeoutSec) + "s";
         return false;
@@ -279,8 +297,9 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
 }
 
 bool runSshScript(const std::string& host, int port, const std::string& script,
-                  std::string& output, std::string& err, double timeoutSec) {
-    return runSshCommand(host, port, "sh", script + "\n", output, err, timeoutSec);
+                  std::string& output, std::string& err, double timeoutSec,
+                  const std::atomic<bool>* abort) {
+    return runSshCommand(host, port, "sh", script + "\n", output, err, timeoutSec, abort);
 }
 
 // ---------------------------------------------------------------- payload codec
@@ -341,14 +360,25 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
 // one bounded ssh round trip. It costs nothing when a connect succeeds, and up
 // to `budget` seconds when one has already failed.
 //
+// WHO PAYS FOR IT IS THE CALLER'S DECISION (Session::setExplainFailure), and it
+// is off by default. This is a second ssh handshake, so on an unreachable host
+// it is another ConnectTimeout=10 on top of the one that just failed - which is
+// affordable on a worker whose result is shown and is not affordable on the UI
+// thread, where the window is not repainting.
+//
 // The exe goes to the remote shell exactly as startOn passes it (unquoted, so
 // "~" is the remote HOME), and stderr is folded into stdout because the loader
 // writes there. First non-empty line only: the rest is usage text.
 static std::string peerStartError(const std::string& host, int port,
-                                  const std::string& exe) {
+                                  const std::string& exe,
+                                  const std::atomic<bool>* abort) {
     std::string out, e;
-    if (!runSshCommand(host, port, exe + " --version 2>&1 || true", "", out, e, 8.0))
-        return e;                      // could not even ask; that is the answer
+    if (!runSshCommand(host, port, exe + " --version 2>&1 || true", "", out, e, 8.0, abort))
+        // Could not even ask. Say NOTHING: `e` holds OUR words for our own
+        // failure ("timed out after 8s", "cancelled"), and appending them to
+        // "no answer from the remote viewer" reads as the peer's answer -
+        // a sentence the user is told to report, about a probe that never ran.
+        return {};
     size_t b = 0;
     while (b < out.size()) {
         size_t nl = out.find('\n', b);
@@ -401,12 +431,24 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_HELLO, w.b, err) || !recv(type, reply, err)) {
-        err = err.empty() ? "no answer from the remote viewer (is it installed there?)" : err;
-        // ...and what the peer ACTUALLY said, when there is a host to ask.
-        // A local peer (host empty) writes to this process's own stderr, which
-        // a developer running --serve can already see.
-        if (!host.empty()) {
-            std::string why = peerStartError(host, port, exe);
+        // DID IT ANSWER AT ALL? send() and recv() call every transport failure
+        // "connection lost", which during the handshake is wrong twice over -
+        // nothing was ever connected, and the wording hides the one state the
+        // round trip below can explain. The pipe knows: not a byte arrived.
+        const bool noAnswer = (p->bytesRead == 0);
+        if (noAnswer || err.empty())
+            err = "no answer from the remote viewer (is it installed there?)";
+        // ...and what the peer ACTUALLY said - but only when all four hold:
+        //   the caller opted in (setExplainFailure: a worker that shows it),
+        //   there is a host to ask (a local peer writes to this process's own
+        //   stderr, which a developer running --serve can already see),
+        //   the peer said NOTHING (bytes on the wire are its answer, and a
+        //   half-frame is a different fault from a binary that cannot start),
+        //   and nobody has asked us to stop (Quit / a closed panel must not
+        //   wait out a second handshake).
+        const bool aborted = abort_ && abort_->load();
+        if (explainFailure_ && !host.empty() && noAnswer && !aborted) {
+            std::string why = peerStartError(host, port, exe, abort_);
             if (!why.empty()) err += "\n" + why;
         }
         stop();
