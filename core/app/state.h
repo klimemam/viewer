@@ -2711,6 +2711,36 @@ struct App {
         // it, so "x.dat via r.py:load: ..." is the sentence, and it must not
         // change just because the wait moved off the UI thread.
         std::string blame;
+        // ---- WHICH INTERPRETER, decided on this thread too (board 304) -------
+        // adapter::findPython's FIRST call in a process starts a Python to check
+        // that numpy imports - 113 ms measured on this box - and that call was
+        // on the UI thread. It is the whole of #232 stage 2's residual (1): the
+        // reader cache-MISS path's median freeze was 143 ms and 3 of 9 runs
+        // crossed the 150 ms target, worst 202, entirely because of where those
+        // 113 ms fell on the sampling grid. So the probe happens HERE.
+        //
+        // §4.13 says the exact command is recorded BEFORE it runs. It still is:
+        // `argv` is built on this thread and `argvReady` published before the
+        // child is spawned, and pollReader logs it and puts it above the live
+        // output the first time it sees the flag (the rule is "before the run",
+        // not "on the UI thread" - Fable, board 304).
+        std::string pythonExe;             // app.pythonExe, frozen at start: the
+                                           // UI thread edits the setting freely
+        std::string script;                // run_adapter.py, resolved before this
+        std::string pyWhy;                 // ...or why no interpreter was found
+        std::atomic<bool> noPython{ false };  // and there was none: pollReader says so
+        // argv is final and may be shown. Release/acquire against the spawn: any
+        // byte of the child's output implies the child started, which implies
+        // this store retired - so the command cannot appear AFTER the output it
+        // describes.
+        std::atomic<bool> argvReady{ false };
+        bool cmdShown = false;             // ...and the UI has said it once
+        std::string head;                  // the panel's fixed first lines (the
+                                           // running line, then the command)
+        std::thread::id probeThread;       // WHERE the probe ran. A selftest
+                                           // cannot watch a window fail to
+                                           // freeze; it can compare this with
+                                           // its own id (stage 2 design §4)
         // ---- ...and what it WROTE, read on this thread too (#232 stage 2) ----
         // Stage 1 moved the WAIT off the UI thread and measured 452 ms of window
         // still not answering at 480 MB, 746 ms at 768 MB - all of it

@@ -1563,6 +1563,29 @@ static std::string runAdapterScript() {
     return {};
 }
 
+// THE COMMAND A READER RUN IS, and there is one place it is spelled (board 304
+// review P3-4). Three callers need it and they must all get the same words:
+// openWithReader's asynchronous door (which builds it on the job thread), its
+// synchronous door, and readerCommandLine - the picker's "this will run" line,
+// whose entire purpose is to be the command that then runs.
+//
+// It was three spellings before this, and the picker's was ALREADY WRONG: it
+// showed `py script spec src -o <cache>.npz`, from the days when the harness
+// wrote an npz, while what ran was `py -u script spec src --stream`. A display
+// that exists to prevent surprises was itself the surprise, in §4.13's own
+// words - "not a paraphrase - the thing that will be executed".
+//
+//   -u        unbuffered. Without it Python holds print() in a buffer until it
+//             exits, so a reader that reports its progress reports all of it at
+//             the end, which is the one moment the progress is worthless.
+//   --stream  the result comes back on stdout, framed, and the run captures
+//             stdout straight to the output path. No npz is written and none is
+//             read: the zip container cost 1.45 ms per MB of pixels for nothing.
+static std::vector<std::string> readerArgv(const std::string& py, const std::string& script,
+                                           const std::string& spec, const std::string& src) {
+    return { py, "-u", script, spec, src, "--stream" };
+}
+
 // ---- where readers are looked for (docs/features/adapters/input-adapters.md §4.13.2) ----------
 // The ruling on issue #51 (2026-08-10): 「reader のファイルもしくはフォルダを
 // 登録できるようにすればよいですかね.」 Before it the search path was ONE user
@@ -1915,6 +1938,16 @@ static std::string readerFinish(const std::string& src, const std::string& spec,
 static std::atomic<std::thread::id> g_readerDecodeThread;
 static std::atomic<bool> g_readerDecodeCacheHit{ false };
 static std::atomic<int> g_readerDecodes{ 0 };
+// ...and the same two facts about WHERE THE INTERPRETER WAS LOOKED FOR (board
+// 304). Same shape and the same reason as the three above: the claim is "the
+// numpy probe is no longer on the UI thread", a headless test cannot watch a
+// window fail to freeze, and the only thing it can watch is which thread asked.
+// g_readerPythonAsks counts the ASKS through this door; adapter::pythonProbes()
+// counts the ones that actually started a Python, which is the 113 ms - the two
+// together are what tell "the first open probed, on the job's thread" from "the
+// second open asked a cache".
+static std::atomic<std::thread::id> g_readerPythonThread;
+static std::atomic<int> g_readerPythonAsks{ 0 };
 
 static void readerJobDecode(App::ReaderJob* j) {
     if (j->cancel.load()) return;
@@ -2012,22 +2045,6 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         std::filesystem::remove(pathFromUtf8(cached), ec);   // unreadable: earn it again
     }
 
-    // WHICH INTERPRETER, and it is asked AFTER the cache, not before (issue #232
-    // stage 2). adapter::findPython's first call in a process starts a Python to
-    // check that numpy imports - measured on this box at 113 ms, and it was
-    // being spent on the UI thread by every open that came through this door,
-    // INCLUDING the ones that then answered out of the cache and never started
-    // Python at all. §7 stage 5's promise is that "the second open does not
-    // start Python"; it was starting one to find out which one not to start.
-    // Nothing else moved: the reader is still located before Python is reached
-    // (§4.13.2, above), and the sentence a missing interpreter produces is
-    // unchanged - it simply arrives after a cache that could answer has.
-    std::string why;
-    std::string py = adapter::findPython(app.pythonExe, why);
-    if (py.empty())
-        return readerNoPythonText("", why,
-                                  "set one in Settings, or install numpy for the one you have");
-
     std::string out = cached;
     if (out.empty()) {
         std::filesystem::path t = std::filesystem::temp_directory_path(ec);
@@ -2036,19 +2053,6 @@ static std::string openWithReader(const std::string& src, const std::string& spe
                  (unsigned long long)adapterHash(src + spec));
         out = (t / nm).u8string();
     }
-    // -u: unbuffered. Without it Python holds print() in a buffer until it
-    // exits, so a reader that reports its progress reports all of it at the end,
-    // which is the one moment the progress is worthless.
-    // --stream: the result comes back on stdout, framed, and the run captures
-    // stdout straight to `out`. No npz is written and none is read: the zip
-    // container cost 1.45 ms per MB of pixels for nothing.
-    std::vector<std::string> argv = { py, "-u", script, spec, src, "--stream" };
-    // §4.13: the exact command, before it runs - every time, not only the first.
-    // The picker shows it in front of the user for a reader they have not used
-    // before; this is the durable record, so "what did it actually start?" is
-    // answerable after the fact as well as before it.
-    logMsg("reader: " + adapter::showCommand(argv));
-    g_adapterRuns++;
     std::error_code tec;
     std::filesystem::path td = std::filesystem::temp_directory_path(tec);
     char sn[64];
@@ -2062,16 +2066,60 @@ static std::string openWithReader(const std::string& src, const std::string& spe
     std::string errFile = (td / (std::string(sn) + ".err")).u8string();
     if (job) {
         // Asynchronous: the window keeps drawing and pollReader() picks this up.
-        // The wait AND THE READ are off-thread; what is left on the UI thread is
-        // the landing, which touches images and GL and nothing else (#232).
-        job->src = src; job->spec = spec; job->out = out; job->argv = argv;
+        // The wait, THE READ and now THE INTERPRETER SEARCH are off-thread; what
+        // is left on the UI thread is the landing, which touches images and GL
+        // and nothing else (#232 stage 2, board 304).
+        job->src = src; job->spec = spec; job->out = out;
         job->outFile = outFile; job->errFile = errFile;
+        job->script = script;
+        // WHICH PYTHON was configured, frozen NOW - the same discipline
+        // rfEnqueue uses for remoteExe. The UI thread owns app.pythonExe and
+        // Settings may rewrite it while this job runs; a job that read it from
+        // the thread would be reading a std::string being assigned.
+        job->pythonExe = app.pythonExe;
         job->startedAt = nowSec();
         job->srcMtime = originStat.mtime;  // identity before bytes, carried
         job->srcFsize = originStat.fsize;  // across the asynchronous run
         app.readerLastOut = "running " + baseName(readerFileOf(spec)) + " ...\n";
         App::ReaderJob* j = job;
         j->th = std::thread([j]() {
+            // WHICH INTERPRETER, and it is asked HERE (board 304). It is asked
+            // after the cache, not before (#232 stage 2): a hit answers without
+            // starting Python at all, and this door was starting one to find out
+            // which one not to start. Now it is also asked off the UI thread,
+            // because the first call in a process IS a Python start - 113 ms, and
+            // the reader-miss median freeze was 143 ms with 3 of 9 runs over the
+            // 150 ms target. The reader is still located BEFORE Python is reached
+            // (§4.13.2, further up, still on the UI thread), and the sentence a
+            // missing interpreter produces is unchanged: pollReader says it.
+            j->probeThread = std::this_thread::get_id();
+            g_readerPythonThread.store(j->probeThread);
+            g_readerPythonAsks.fetch_add(1);
+            std::string why;
+            const std::string py = adapter::findPython(j->pythonExe, why);
+            if (py.empty()) {
+                j->pyWhy = why;
+                j->noPython.store(true);
+                j->done.store(true);
+                return;
+            }
+            // A Stop pressed while the probe was running. findPython takes no
+            // cancel flag - it cannot, the answer is process-wide and cached -
+            // so the flag is read here instead, before anything is started. The
+            // wait is the probe's own, which is what the UI thread used to pay
+            // with no Stop at all.
+            if (j->cancel.load()) { j->done.store(true); return; }
+            // ONE spelling of the command, shared with the synchronous door and
+            // with the picker's "this will run" line (readerArgv).
+            j->argv = readerArgv(py, j->script, j->spec, j->src);
+            // §4.13: THE EXACT COMMAND, RECORDED BEFORE IT RUNS. The record is
+            // made on this thread, one statement before the spawn, and that
+            // satisfies the rule - which is about ORDER ("before the run") and
+            // not about which thread keeps the note (Fable, board 304). The UI
+            // half is pollReader: it logs this line and puts it above the live
+            // output the first time it sees the flag, so "what did it actually
+            // start?" is answerable while it is still running and after the fact.
+            j->argvReady.store(true);
             j->r = adapter::run(j->argv, 300000, &j->cancel, j->outFile, j->errFile, false);
             // ...and on, without handing the thread back: the stream the child
             // just wrote is read and decoded HERE, before the UI is told this
@@ -2081,6 +2129,18 @@ static std::string openWithReader(const std::string& src, const std::string& spe
         });
         return {};
     }
+    // THE SYNCHRONOUS DOOR - selftests and the command line, which have no frame
+    // to hold up. The probe stays on the calling thread here for exactly that
+    // reason, and the two halves still say the same sentences because the
+    // sentences live in one place (readerNoPythonText, readerFinish).
+    std::string why;
+    const std::string py = adapter::findPython(app.pythonExe, why);
+    if (py.empty())
+        return readerNoPythonText("", why,
+                                  "set one in Settings, or install numpy for the one you have");
+    std::vector<std::string> argv = readerArgv(py, script, spec, src);
+    logMsg("reader: " + adapter::showCommand(argv));
+    g_adapterRuns++;
     adapter::Run r = adapter::run(argv, 300000, nullptr, outFile, errFile, false);
     std::string fin = readerFinish(src, spec, out, argv, r, originStat);
     std::filesystem::remove(pathFromUtf8(errFile), tec);
@@ -2284,10 +2344,15 @@ static void startReader(const std::string& src, const std::string& spec,
     app.rdJob.reset(new App::ReaderJob());
     app.rdJob->blame = blame;
     std::string e = openWithReader(src, spec, true, app.rdJob.get());
-    // A failure before Python was reached finishes with no thread: there is
-    // nothing to wait for and nothing to stop. A CACHE HIT used to be in this
-    // sentence too and no longer is - it gets a thread of its own, because
-    // reading the .vstream is where its 592 ms went (issue #232 stage 2).
+    // A failure before the THREAD was reached finishes with no thread: there is
+    // nothing to wait for and nothing to stop. That is now only "no such reader"
+    // and "no adapter harness beside this build" - the two answers that come from
+    // looking, not from running. A CACHE HIT used to be in this sentence and no
+    // longer is (it gets a thread of its own, because reading the .vstream is
+    // where its 592 ms went, issue #232 stage 2); "no Python with numpy" left it
+    // too, for the same kind of reason - finding out costs 113 ms of starting a
+    // Python, so the finding out moved onto the thread and the refusal now
+    // arrives through pollReader (board 304).
     if (!app.rdJob->th.joinable()) {
         app.rdJob.reset();
         if (!e.empty()) toast(blame + e, true);
@@ -2330,18 +2395,55 @@ static void pollReader() {
         if (!e.empty()) toast(blame + e, true);
         return;
     }
+    // §4.13's UI half (board 304). The job thread built argv and published it
+    // one statement before spawning the child, so the first poll that sees the
+    // flag is the first moment this thread can say the line - and it says it
+    // BEFORE it shows a byte of what the child printed, because `head` goes in
+    // front of the tail below. Once: the Messages panel de-duplicates, but the
+    // count would not.
+    //
+    // THE RUN IS COUNTED HERE TOO, for the same reason it is said here: the
+    // number g_adapterRuns holds is "how many times Python was started for a
+    // load", the job thread knows that one statement earlier than this one, and
+    // an int written by the job thread and read by every selftest on this one
+    // would be a race for the sake of one frame's latency.
+    if (j->argvReady.load() && !j->cmdShown) {
+        j->cmdShown = true;
+        g_adapterRuns++;
+        const std::string cmd = adapter::showCommand(j->argv);
+        logMsg("reader: " + cmd);
+        j->head = "running " + baseName(readerFileOf(j->spec)) + " ...\n" + cmd + "\n";
+        app.readerLastOut = j->head;
+        j->shown = 0;                   // ...and the tail is re-shown under it
+    }
     if (!j->done.load()) {
         // errFile only: outFile is the payload, and tailing binary into a
         // text panel would show the pixels as mojibake.
         std::string live = readerTail(j->errFile);
         if (live.size() != j->shown) {
             j->shown = live.size();
-            app.readerLastOut = live.empty()
-                ? ("running " + baseName(readerFileOf(j->spec)) + " ...\n") : live;
+            app.readerLastOut = j->head.empty()
+                ? ("running " + baseName(readerFileOf(j->spec)) + " ...\n") : j->head;
+            app.readerLastOut += live;
         }
         return;
     }
     j->th.join();
+    // NO INTERPRETER. The same sentence the synchronous door returns, from the
+    // same helper - it simply arrives a pump later, because the probe that
+    // produces it is now the job thread's (board 304). The PANEL gets it as well
+    // as the toast: §4.13.0 is that the panel holds the whole of what happened,
+    // and this failure used to leave it empty because openWithReader returned
+    // before it set a word.
+    if (j->noPython.load() && !j->cancel.load()) {
+        const std::string s = readerNoPythonText(
+            "", j->pyWhy, "set one in Settings, or install numpy for the one you have");
+        const std::string blame = j->blame;
+        app.readerLastOut = s;
+        app.rdJob.reset();
+        toast(blame + s, true);
+        return;
+    }
     FrameSource jStat;                     // the stat openWithReader took at start
     jStat.mtime = j->srcMtime;
     jStat.fsize = j->srcFsize;
@@ -2420,17 +2522,25 @@ static void readerConfirmed(const std::string& spec) {
 }
 static std::string readerCommandLine(const std::string& src, const std::string& spec) {
     std::string why;
-    std::string py = adapter::findPython(app.pythonExe, why);
+    // ...IfKnown: this is drawn EVERY FRAME while the picker is open, and the
+    // picker is open in the same window that has to keep answering while a
+    // reader runs (board 304). It still probes when nobody else is - §4.13's
+    // display must work before the first run of the process - but it will not
+    // wait behind a job thread's probe; it says so and asks again next frame.
+    std::string py = adapter::findPythonIfKnown(app.pythonExe, why);
     std::string script = runAdapterScript();
-    if (py.empty()) return "(no Python found: " + why + ")";
+    if (py.empty()) return "(" + why + ")";
     if (script.empty()) return "(run_adapter.py not found next to this build)";
     // The command shown must be the command run, so it carries the RESOLVED
     // reader (§4.13.2). A bare name here would show a line that is not what
     // starts, which is the one thing this display exists to prevent.
     ReaderLookup look = resolveReaderFile(spec);
     if (look.file.empty()) return "(no such reader - see the Reader panel)";
-    return adapter::showCommand({ py, script, look.file + ":" + readerFuncOf(spec),
-                                  src, "-o", "<cache>.npz" });
+    // ...and from the SAME builder the run uses, for the same reason one line up.
+    // This display used to spell its own argv and had drifted: it showed
+    // `-o <cache>.npz` when what runs is `-u ... --stream` (readerArgv).
+    return adapter::showCommand(
+        readerArgv(py, script, look.file + ":" + readerFuncOf(spec), src));
 }
 
 // ---- Open in new window (todo-open item 28) ---------------------------------

@@ -10,6 +10,10 @@
 #include <sstream>
 #include <filesystem>
 #include <atomic>
+#include <mutex>                     // the interpreter cache is asked from two
+                                     // threads now (findPython, board 304)...
+#include <thread>                    // ...and WHICH one probed is a fact a
+                                     // selftest asserts on (lastProbeThread)
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -257,13 +261,54 @@ namespace {
 std::string g_python;              // "" = not probed, or probed and not found
 std::string g_pythonWhy;
 bool g_probed = false;
+// The answer is now asked for from TWO threads: the reader job's, which is where
+// the probe was moved so that the 113 ms of starting a Python is not spent on the
+// UI thread (board 304), and the UI's, which still asks for the picker's "this
+// will run" line and the Readers window's status row. Three unsynchronised
+// statics read and written from two threads is a data race whatever the timing,
+// so the cache takes a lock.
+//
+// The lock is held ACROSS the probe, on purpose. A caller that arrives while
+// another thread is probing waits for the answer instead of starting a second
+// Python to find out the same thing - and waiting for someone else's probe costs
+// exactly what doing your own probe costs, which is what the UI thread paid
+// unconditionally before this change. So no caller is worse off than it was.
+std::mutex g_pyMtx;
+// How many times the probe actually RAN. The cache's promise is that this is 1
+// per process, and a promise about a thing that does not happen twice can only be
+// tested by counting it. Atomic and read WITHOUT the lock: a test reading it must
+// not be able to block behind the very probe it is asking about.
+std::atomic<int> g_pythonProbes{ 0 };
+// ...and WHICH THREAD ran it. Recorded here rather than at the call site because
+// only here is it known that this call is the one that STARTS a Python - a caller
+// that got the cached answer has learned nothing about where the 113 ms was spent
+// (board 304 review P2-1). The test that asks "the probe is not on the UI thread"
+// compares this against its own id AFTER the job it started has finished, which is
+// a question about a completed fact and not about two counters racing.
+std::atomic<std::thread::id> g_probeThread;
 }
 
-void forgetPython() { g_probed = false; g_python.clear(); g_pythonWhy.clear(); }
+void forgetPython() {
+    std::lock_guard<std::mutex> lk(g_pyMtx);
+    g_probed = false; g_python.clear(); g_pythonWhy.clear();
+}
 
-std::string findPython(const std::string& configured, std::string& why) {
-    if (g_probed) { why = g_pythonWhy; return g_python; }
+int pythonProbes() { return g_pythonProbes.load(); }
+std::thread::id lastProbeThread() { return g_probeThread.load(); }
+
+// THE PROBE ITSELF. Separated out because two doors reach it - findPython, which
+// waits for the answer, and findPythonIfKnown, which only ever takes this road
+// when the lock was free - and a second copy of the candidate ORDER would be a
+// second answer to "which interpreter does this program use".
+//
+// g_pyMtx MUST BE HELD. It writes all four pieces of cache state, and it is held
+// across the child processes it starts on purpose (see adapter.h): whoever waits
+// for this waits for one Python, not for their own second one.
+namespace {
+std::string probeLocked(const std::string& configured, std::string& why) {
     g_probed = true;
+    g_pythonProbes.fetch_add(1);
+    g_probeThread.store(std::this_thread::get_id());
     g_python.clear();
 
     std::vector<std::string> tried;
@@ -306,6 +351,35 @@ std::string findPython(const std::string& configured, std::string& why) {
         g_pythonWhy += (i ? ", " : "") + tried[i];
     why = g_pythonWhy;
     return {};
+}
+}  // namespace
+
+std::string findPython(const std::string& configured, std::string& why) {
+    std::lock_guard<std::mutex> lk(g_pyMtx);
+    if (g_probed) { why = g_pythonWhy; return g_python; }
+    return probeLocked(configured, why);
+}
+
+std::string findPythonIfKnown(const std::string& configured, std::string& why) {
+    // try_lock, and failing to take it is an ANSWER rather than a wait: the only
+    // thing that holds this lock for any length of time is a probe, and a probe
+    // is up to 30 s per candidate. A per-frame caller that blocked on it would be
+    // the freeze board 304 removed, reappearing in the one window that is drawn
+    // while a reader runs.
+    std::unique_lock<std::mutex> lk(g_pyMtx, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        why = "checking which Python has numpy...";
+        return {};
+    }
+    // The lock WAS free, so this caller probes if nobody has yet - it does not
+    // refuse to answer a question no other thread is working on. That matters:
+    // the reader picker's "this will run" line is drawn BEFORE the first reader
+    // of the process runs (§4.13), so a form that never probed would leave that
+    // line permanently unable to name a command, which is the whole point of it.
+    // The cost is this caller's own probe, once, which is exactly what it paid
+    // before board 304 - the ruling was "no worse than it was", not "never".
+    if (g_probed) { why = g_pythonWhy; return g_python; }
+    return probeLocked(configured, why);
 }
 
 // settings.jsonc readers.editor. "" = the key is absent, which is what 判断9

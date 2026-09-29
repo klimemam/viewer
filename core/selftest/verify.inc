@@ -1256,7 +1256,12 @@
             }
         }
 
-        {   // ---- V19: the ROI table's LAYOUT, and its delete button ----------
+        // V19 is the ONE group in this file that needs a real ImGui frame, so
+        // selftest.verify-nogl runs every other group on every runner (板 304) -
+        // V13, which measures the same NaN fixture through both sigma_t
+        // implementations, is the one the kernel inventory came for.
+        if (!glGroup("--verify-selftest (the ROI row probe)")) return 1;
+        if (g_haveWindow) {   // ---- V19: the ROI table's LAYOUT, and its delete button --
             // The panel reaches its numbers through a hash cache, prints them
             // from inside a clipper, and puts its delete button in the last
             // column of a row whose label Selectable spans ALL columns. None of
@@ -1290,7 +1295,6 @@
                 return d;
             };
 
-            if (!needWindow("--verify-selftest (the ROI row probe)")) return 1;
             ImGuiIO& pio = ImGui::GetIO();
             int held = -1;
             auto roiFrame = [&](ImVec2 mouse, int btn) {

@@ -390,6 +390,37 @@ client/peer能力をgateする。protocol 14 seamはwireだけを模倣し、car
 `App::RemoteBrowse` の**ただの値**を読む。ホストあたり ssh チャネルは
 最大 4 本になるが、これは競合と UI フリーズの両方を同時に消す唯一の形。
 
+**表の2行目が、残っている UI フリーズそのものである** (実測 2026-09-28、板 305)。
+`VIEWER_TIME_OPEN=1` で `openRemote` が自分の各段を stderr に出す
+(`core/app/remote_client.inc` の `OpenPhase`)。480 MB の local:// .npy
+(`(10,3000,4000)` f32、初見は step 3 で 1334x1000 = 画素 5.09 MB・ワイヤ 4.44 MB)、
+3 回の中央値:
+
+| 段 | ms | どのスレッドに要るか |
+|---|---|---|
+| `ensureUiSession` (peer 起動 + CONNECT) | 26–38 | 移せる |
+| META 往復 | 32 | 移せる |
+| **TILE 往復 + float 化** | **266–297** | **移せる** |
+| document の組み立て | 0.0 | UI |
+| `computeMinMax`(間引きタイル上) | 1.2 | UI (安い) |
+| 登録 + 選択 | 0.0 | UI |
+| stack 化 + toast | 0.2 | UI |
+| **合計** | **330–374** | |
+
+そして**着地** (`pumpRemoteFetch`) は全解像度の差し替えが 2.7–3.0 ms、
+兄弟フレーム1枚 0.2 ms。**板 305 が疑っていた「着地の decode が UI スレッドに
+ある」は桁が2つ違って外れ**である —— `rfWorker` が画素と vmin/vmax の両方を既に
+作っており(`minMaxOf`、板 299)、UI の分担は move だけ。無応答の **99.6% は
+この扉が UI スレッドで取る3回の同期往復**で、扉の中の算術は 1.4 ms しかない。
+
+したがって直し方は「着地を worker へ」ではなく**上の表に5人目の所有者を足す**
+こと ——`app.uiSession` は他スレッドから触れないという同じ理由で、`openRemote` の
+META+TILE 用の Session が別に必要になる。これは refactor ではなく設計なので、
+実測だけを残して止めてある(【残課題・Fable 裁定待ち】)。設計が要る点は3つ:
+扉の戻り値(`bool` は「この扉が引き受けた」を今も意味できるか —— `OpenJob` は
+`g_openStarts` でそれを解いた)、preview の1枚差し替えと Browse の連打の関係、
+session 復元・CLI・selftest が使う同期経路をどう残すか。
+
 **次にやること**(優先順)。上の表で「実装済み」のものはここに書かない:
 
 1. 古い要求のキャンセル。まず `rp::Header` に要求 ID を足す(VERSION を上げる)ところから。

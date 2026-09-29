@@ -669,13 +669,36 @@ static AbRowItem abRowItem(const ImageDoc* pick) {
     return pick ? AbSetB : AbNone;
 }
 
-static void computeMinMax(ImageDoc& im) {
+// K10, and it is ONE function now (board 299,
+// docs/background/analysis/measurement-kernel-inventory.md §3 K10 / §4 P22).
+// The three conventions are the whole of the kernel and all three are decisions:
+// a non-finite sample is not a value and is skipped, an array with NO finite
+// sample at all reads 0..1 rather than FLT_MAX..-FLT_MAX, and a flat array is
+// widened by one so that black < white and the display has a range to map.
+//
+// FREE OF ImageDoc on purpose. rfWorker measures a full-resolution remote frame
+// on its own thread (core/app/remote_client.inc), where there are pixels and no
+// document yet - so it carried a copy of these five lines, and that copy was the
+// ONE silent duplicate the kernel inventory found: identical today, undeclared
+// on both sides, and "identical today" is exactly the shape every other
+// measurement pair in that document drifted through.
+//
+// A vector rather than a pointer+length: both callers hold one, and the loop
+// order is the caller's own order, so the answer is bit-identical to the two
+// loops this replaces rather than merely equal.
+static void minMaxOf(const std::vector<float>& px, float& vmin, float& vmax) {
     float mn = FLT_MAX, mx = -FLT_MAX;
-    for (float v : im.px()) {
+    for (float v : px) {
         if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
     }
     if (mn > mx) { mn = 0; mx = 1; }
     if (mn == mx) mx = mn + 1;
+    vmin = mn; vmax = mx;
+}
+
+static void computeMinMax(ImageDoc& im) {
+    float mn = 0, mx = 1;
+    minMaxOf(im.px(), mn, mx);
     im.src->vmin = mn; im.src->vmax = mx;   // the source's truth...
     im.vmin = mn; im.vmax = mx;             // ...and the doc's mirror of it
     // The cached "Auto %" answer was measured from the pixels this just
