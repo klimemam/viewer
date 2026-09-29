@@ -1094,6 +1094,35 @@ membership と departures) / ループ / `reloadStackTail` (arrivals、seqIndex
   Reload」は、その**1ファイル**をいまも UI スレッドで decode する。
   報告の原因だった F メンバーの再読みはその手前にいた部分で、そこが動いた。
 
+### 17.2b 実測 —— そして残った 1.5 秒は Reload のものではない
+
+測り方は #232 stage 2 と同じ道具 (`viewer_work/g232/tools/measure/freeze_probe.ps1`、
+WM_NULL の SendMessageTimeout + OS の `IsHungAppWindow`)、50 ms 刻み、warm
+cache、「無応答の最長」の中央値3回。**ジェスチャは本当に起こしている**:
+`loading.watchFiles` + `loading.watchAutoReload` を ON にした窓付き実行で、
+数秒後に横からファイルを叩き、§4 の2回読みが確定して `watchReloadNow(seq, true)`
+が走るのを測る (§9 rule 2 より、行の「Reload from disk」と同じ操作)。
+
+| ケース | before | after |
+| --- | --- | --- |
+| 480 MB `.npy` 1ファイル・10フレーム | 3003 ms | **0 ms** |
+| 480 MB × 4ファイルの folder stack | 5013 ms | 1508 ms |
+| 48 MB × 4ファイルの folder stack (対照) | 375 ms | **0 ms** |
+
+2行目に残った 1.5 秒は**この変更が動かしたものではない**。3行目が対照で、
+**ファイル数は同じまま1枚の画素数を 1/10 にすると 0 ms になる** ——
+つまり残差は「何ファイル読み直したか」ではなく「1枚が何画素か」に比例する。
+それは **GL テクスチャのアップロード** (20480×12288 の f32 = 約 1 GB) であり、
+同じ止まり方は**同じ frame を「開く」ときにも起きている**:
+before/after どちらの timeline にも、Reload の前の open の位置に
+`stall:1129` と `stall:499` が同じように出る。GL は UI スレッドのものなので
+ここでは触らない。**別課題**として置く。
+
+なお after の 0 ms が「何も起きていない」ではないことの陽性対照も取った:
+同じ実行でファイルを**切り詰める**と全メンバーが拒否され、#56 の印が
+ウィンドウタイトルに出る (`menus.inc`) —— `ctl.npy - viewer` が
+`ctl.npy  (reload failed) - viewer` に変わるのを外から読んで確認している。
+
 ### 17.3 §16.6 の再検討条件は、半分だけ満たされた
 
 §16.6 は「リモート Reload がメインループを止めない形になったとき、自動を
