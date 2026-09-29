@@ -675,7 +675,28 @@ static int asyncOpenSelftest(const std::string& root) {
         check(app.images[fr[1]]->src->data[0] == relPx(2, 1) &&
                   app.images[fr[0]]->src->data[0] == relPx(1, 0),
               "R5 ...and lands THAT frame's new bytes and nobody else's");
-    }
+
+        // ...and the ONE-FRAME door folds the way the stack's door does, for
+        // the same reason: the question is WHEN the read started, and that does
+        // not depend on how many items the job has (review P1-2's rule, applied
+        // consistently). Without this the branch would have no caller at all -
+        // which is the shape of review P2-8.
+        writeRel(3);
+        const int starts0 = g_reloadStarts;
+        startFrameReload(fr[1]);           // gesture 1: in flight
+        writeRel(4);                       // ...and the file moves again
+        startFrameReload(fr[1]);           // gesture 2: folded
+        const bool folded1 = app.reloadJob != nullptr &&
+                             g_reloadStarts - starts0 == 1 && app.reloadJob->again;
+        const bool drained2 = driveReload(16000, -1);
+        fprintf(stderr, "asyncopenselftest: R5 one-frame fold: folded=%d drained=%d "
+                        "starts+%d px1=%g\n", (int)folded1, (int)drained2,
+                g_reloadStarts - starts0, (double)app.images[fr[1]]->src->data[0]);
+        check(folded1 && drained2 && g_reloadStarts - starts0 == 2,
+              "R5b a repeat of ONE frame folds, is remembered, and runs once more");
+        check(app.images[fr[1]]->src->data[0] == relPx(4, 1),
+              "R5c ...and the re-run reads the generation that was on disk when the "
+              "repeat was asked for");    }
 
     // ---- R6: ONE AT A TIME, and what a repeat of the same stack means ------
     // Two different claims, and review P1-2 separated them. A second gesture

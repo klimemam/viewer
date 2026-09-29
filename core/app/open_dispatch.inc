@@ -2248,7 +2248,13 @@ static bool startFrameReload(int imgIdx) {
     if (imgIdx < 0 || imgIdx >= (int)app.images.size()) return false;
     const uint64_t uid = app.images[(size_t)imgIdx]->uid;
     if (app.reloadJob) {
-        if (app.reloadJob->oneUid == uid && !app.reloadJob->cancel.load()) return true;
+        // FOLDED, and not discarded - startStackReload's rule and its reason
+        // (review P1-2), which is about WHEN the read started and so says the
+        // same thing about one frame as about a stack.
+        if (app.reloadJob->oneUid == uid && !app.reloadJob->cancel.load()) {
+            app.reloadJob->again = true;
+            return true;
+        }
         for (const auto& w : app.reloadQueue)
             if (w.oneUid == uid) return true;
         app.reloadQueue.push_back({ 0, uid, false });
@@ -2380,6 +2386,32 @@ static void pumpReloadJob() {
         t.stoppedAfter = j->landedN;
         t.stoppedOf = (int)j->items.size();
     }
+    // ---- a gesture that arrived WHILE this job was reading (review P1-2) ----
+    // It was folded, which is not the same as answered: the read that just
+    // finished started before that request was made. So it goes to the FRONT of
+    // the queue and runs once more, through the one door that takes a fresh plan
+    // and a fresh stat (startNextQueuedReload -> startStackReload). A Stop is
+    // the exception and needs none: Stop means stop, and it has cleared the
+    // queue already.
+    //
+    // BEFORE the one-frame branch below, which returns: a re-run put after it
+    // would be reached by stacks only, and the rule is about WHEN the read
+    // started, which does not depend on how many items the job had.
+    //
+    // It cannot ping-pong. A gesture arriving while the re-run WAITS folds into
+    // the queue entry instead of setting this flag, so one flight can add at
+    // most one re-run.
+    if (j->again && !stop) {
+        if (j->oneUid != 0) {
+            bool alive = false;
+            for (const auto& q : app.images) if (q->uid == j->oneUid) alive = true;
+            if (alive)
+                app.reloadQueue.insert(app.reloadQueue.begin(), { 0, j->oneUid, false });
+        } else if (seqInfo(j->seqId)) {
+            app.reloadQueue.insert(app.reloadQueue.begin(),
+                                   { j->seqId, 0, j->againAutomatic });
+        }
+    }
     if (j->oneUid) {
         // ONE frame: no membership, no #56 latch (the mark is a STACK's), and
         // the single-frame sentence.
@@ -2408,9 +2440,6 @@ static void pumpReloadJob() {
     // It cannot ping-pong. A gesture arriving while the re-run WAITS folds into
     // the queue entry instead of setting this flag, so one flight can add at
     // most one re-run.
-    if (j->again && !stop && seqInfo(j->seqId))
-        app.reloadQueue.insert(app.reloadQueue.begin(),
-                               { j->seqId, 0, j->againAutomatic });
 }
 
 static void startNextQueuedReload() {
