@@ -2181,6 +2181,886 @@
             app.selectedAnn = saveAnn;
         }
 
+        // ==================================================================
+        // ---- C: THE PROJECTION PANEL'S CURVES ---------------------------
+        // User report 2026-09-29: 「Bayer で開いた場合に Projection がでないね」, and,
+        // asked what exactly was missing: 「パネルの枠と数表は出ていて、曲線だけが無い」.
+        // A frame, two axes, a full statistics table - and not one line on either plot.
+        //
+        // THE CAUSE, and it is why this group measures what it measures. A CFA profile
+        // puts a NaN wherever the plane has no sample, so an RGGB R profile is a
+        // sample, a hole, a sample. The stroke decimated by walking `stride`
+        // consecutive entries and breaking the line at any bucket that held nothing
+        // finite - correct for a real gap in the data, and fatal here the moment
+        // `stride` came out 1, because then every other bucket was one hole and the
+        // run was flushed before it ever held the two points a polyline needs. Not one
+        // segment was drawn. `stride` is 1 whenever the plot is at least as wide in
+        // pixels as the region is in columns, which is a small frame, a widened panel,
+        // and above all AN ROI - the situation the report was in.
+        //
+        // So the assertions here are about the PAINT: g_projCurveProbe records what the
+        // panel handed the draw list (points, separate strokes, and the column numbers
+        // the curve spans), the shape --verify-selftest V29 uses for the Files rows.
+        // A table of correct numbers over an empty plot is the defect, so a test that
+        // reads the cache cannot see it.
+        //
+        // THE DISTINCTION every group below is really about: a hole in the mosaic and a
+        // hole in the DATA are different facts. The first carries no information and
+        // must be walked past; the second is a column no finite pixel was found in and
+        // the curve must BREAK there, or the plot silently bridges missing data. C4 and
+        // C5 are that pair, asserted on one fixture each, and they are the reason the
+        // fix is a per-plane sample lattice rather than "skip every NaN".
+        //
+        // Windowless, on the --histhl-selftest pattern and for its reasons: the
+        // fixtures are analytic and built in memory, and every assertion is a count, a
+        // column number or a string, so it runs under the NOGL registrations of this
+        // test as well as the GL ones - on every runner in the matrix rather than on
+        // the one with a context. It opens no file and cannot be made to pass by a
+        // fixture drifting, which is also why it is the LAST group in this file: it
+        // closes the session to stand its own documents up, and every group above it
+        // needs the folder that was opened at the top.
+        //
+        // ONE SELFTEST HOME IS SHARED BY EVERY TEST. Everything this group borrows -
+        // projMode, projAllRow, projYMode, showProjH/V, histPlane, compareMode,
+        // selectedAnn, the annotations, the projection caches - is put back at the
+        // single exit below. Nothing here returns early for exactly that reason: a
+        // group that bailed out would leave a preference behind for every later test
+        // in the home, and for every later RUN of the suite.
+        {
+            // ---- everything borrowed, noted here and restored at the bottom --------
+            const int keepCurrent = app.current;
+            const size_t keepImages = app.images.size();
+            const int keepMode = app.projMode, keepYMode = app.projYMode;
+            const bool keepH = app.showProjH, keepV = app.showProjV;
+            const bool keepAllRow = app.projAllRow;
+            const int keepPlane = app.histPlane;
+            const int keepStatLayout = app.projStatLayout, keepStatOrder = app.projStatOrder;
+            const int keepDecimals = app.projDecimals;
+            const auto keepCompare = app.compareMode;
+            const int keepSel = app.selectedAnn;
+            const bool keepLink = app.linkRange;
+            const bool keepPrefsDirty = app.prefsDirty;
+
+            closeAll();
+            app.anns.clear(); app.nextAnnId = 1; app.selectedAnn = 0;   // whole image
+            app.cmpExtra.clear();
+            app.compareMode = App::CmpOff;          // one side: A, and nothing to tint
+            app.abStepBusyUntil = 0;
+            app.linkRange = false;
+            app.projMode = 0;                       // mean
+            app.projYMode = 0;                      // auto: the axis fits the data
+            app.showProjH = app.showProjV = true;
+            app.projAllRow = false;
+            app.projStatLayout = 1;                 // wide: the table's height is then
+            app.projStatOrder = 0;                  // the same whatever the panel width
+            app.projDecimals = -1;
+            app.histPlane = -1;                     // every plane on the axis
+            app.proj[0] = App::ProjState{};
+            app.proj[1] = App::ProjState{};
+            app.projExtra.clear();
+
+            // A synthetic frame. Every plane gets its own level AND its own slope along
+            // x, so a curve that is drawn is also recognisable - four flat lines at
+            // four levels would still be four curves, but nothing about them would say
+            // which sample landed where.
+            auto mkFrame = [&](const char* nm, int W, int H, int cfaKind, int chn) {
+                auto d = std::make_unique<ImageDoc>();
+                d->name = nm;
+                d->src->w = W; d->src->h = H; d->src->ch = chn;
+                d->src->dtype = "u16";
+                d->src->data.assign((size_t)W * H * chn, 0.0f);
+                d->uid = app.nextUid++;
+                d->cfa = cfaKind; d->cfaPattern = 0;      // RGGB (and quad RGGB at cfa 2)
+                d->syncMirrors();
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++)
+                        for (int c = 0; c < chn; c++) {
+                            const int pl = cfaKind ? cfaChannelAt(*d, x, y) : c;
+                            d->px()[((size_t)y * W + x) * chn + c] =
+                                (float)(500 + 400 * pl + (x % 89) + (y % 7));
+                        }
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                return d;
+            };
+            // ...installed as the one open document, with the projection caches cleared
+            // so nothing below can read a profile of the frame before it.
+            auto useOnly = [&](std::unique_ptr<ImageDoc> d) {
+                app.images.clear();
+                app.images.push_back(std::move(d));
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                return app.images[0].get();
+            };
+
+            // The Projection panel, drawn for real - histHlSelftest's frame, unchanged
+            // apart from the panel it calls and the mouse it can aim.
+            ImGuiIO& io = ImGui::GetIO();
+            auto projFrame = [&](float w, float h, ImVec2 mouse) {
+                for (int pass = 0; pass < 2; pass++) {   // the first frame sizes the window
+                    if (g_haveWindow) {
+                        ImGui_ImplOpenGL3_NewFrame();
+                        ImGui_ImplGlfw_NewFrame();
+                    } else {
+                        io.DisplaySize = ImVec2(1600, 1000);
+                        io.DisplayFramebufferScale = ImVec2(1, 1);
+                        io.DeltaTime = 1.0f / 60.0f;
+                        if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+                    }
+                    // after the backend, before NewFrame - the GLFW backend rewrites
+                    // MousePos from the OS cursor every frame (verify.inc V19). Off the
+                    // plot by default, or the operator's own cursor would decide
+                    // whether the hover readout ran.
+                    io.AddMousePosEvent(mouse.x, mouse.y);
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+                    ImGui::Begin("ProjCurveProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+                    drawPanelProjection();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            const ImVec2 NO_MOUSE(-FLT_MAX, -FLT_MAX);
+            auto draw = [&]() { projFrame(900.0f, 900.0f, NO_MOUSE); };
+
+            // The probe entry for one plane on one axis, or nullptr when the panel drew
+            // nothing about that plane at all - which is itself a distinct failure from
+            // "drew it with no points", and the checks below keep the two apart.
+            auto curve = [&](const char* plane, bool horiz) -> const ProjCurveProbe* {
+                for (const auto& c : g_projCurveProbe)
+                    if (c.plane == plane && c.horizontal == horiz) return &c;
+                return nullptr;
+            };
+            auto dump = [&](const char* tag) {
+                std::string s;
+                for (const auto& c : g_projCurveProbe) {
+                    char b[192];
+                    snprintf(b, sizeof b, "%s%s/%s pts=%d strokes=%d lattice=%d stride=%d x=%d..%d",
+                             s.empty() ? "" : " | ", c.plane.c_str(), c.horizontal ? "H" : "V",
+                             c.points, c.strokes, c.lattice, c.stride, c.xFirst, c.xLast);
+                    s += b;
+                }
+                fprintf(stderr, "abstatsselftest: %s %s\n", tag,
+                        s.empty() ? "(no curve entries at all)" : s.c_str());
+                fprintf(stderr, "abstatsselftest: %s sides '%s'\n", tag, g_projSideProbe.c_str());
+            };
+            auto field = [](const std::string& probe, const char* key) {
+                size_t k = probe.find(key);
+                if (k == std::string::npos) return std::string();
+                k += strlen(key);
+                size_t e = probe.find(';', k);
+                return probe.substr(k, e == std::string::npos ? e : e - k);
+            };
+            // Every plane of a CFA frame, on both axes, said the same thing about.
+            static const char* CFA4[4] = { "R", "Gr", "Gb", "B" };
+            auto eachPlane = [&](bool horiz, const std::function<void(const char*,
+                                                                      const ProjCurveProbe*)>& f) {
+                for (int i = 0; i < 4; i++) f(CFA4[i], curve(CFA4[i], horiz));
+            };
+
+            // ======================================================================
+            // C0 - A DENSE PROFILE IS UNCHANGED. First, and green from the start
+            // rather than red then green: every group after this one changes how the
+            // stroke WALKS, and a mono image has one sample per column, so it is the
+            // regression guard the rest of the file leans on. 16 columns, 16 points,
+            // one unbroken stroke, and the decimation off.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_mono", 16, 16, 0, 1));
+                draw();
+                dump("C0 mono 16x16");
+                const ProjCurveProbe* hh = curve("ch0", true);
+                const ProjCurveProbe* vv = curve("ch0", false);
+                check(d->cfa == 0 && app.proj[0].nSeries == 1,
+                      "C0 fixture: one plane, no mosaic");
+                check(hh && vv, "C0 the panel drew both profiles of it");
+                if (hh && vv) {
+                    check(hh->lattice == 16 && vv->lattice == 16,
+                          "C0 every column and every row is a sample position");
+                    check(hh->stride == 1 && vv->stride == 1,
+                          "C0 fixture: 16 samples into ~800 px, so no decimation");
+                    check(hh->points == 16 && hh->strokes == 1,
+                          "C0 the H profile is one unbroken 16-point curve");
+                    check(vv->points == 16 && vv->strokes == 1,
+                          "C0 ...and so is the V profile");
+                    check(hh->xFirst == 0 && hh->xLast == 15,
+                          "C0 ...spanning columns 0..15");
+                }
+            }
+
+            // ======================================================================
+            // C1 - THE REPORT. 8x8 RGGB, whole image, every plane on the axis. The
+            // plot is ~800 px wide and the image is 8 columns, so stride is 1 and this
+            // is exactly the shape that drew nothing: each of the four planes owns
+            // four of the eight positions, and before the fix NOT ONE of them got a
+            // polyline. rw / cell = 8 / 2 = 4 points per plane, per axis.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_rggb8", 8, 8, 1, 1));
+                draw();
+                dump("C1 RGGB 8x8");
+                check(d->cfa == 1 && app.proj[0].nSeries == 4 && app.proj[0].cell == 2,
+                      "C1 fixture: four planes on a 2x2 mosaic");
+                for (int axis = 0; axis < 2; axis++) {
+                    const bool horiz = axis == 0;
+                    eachPlane(horiz, [&](const char* nm, const ProjCurveProbe* c) {
+                        char what[128];
+                        snprintf(what, sizeof what, "C1 plane %s has a %s curve of 4 points",
+                                 nm, horiz ? "H" : "V");
+                        check(c && c->points == 4 && c->strokes == 1, what);
+                        snprintf(what, sizeof what, "C1 plane %s %s: 4 sample positions, stride 1",
+                                 nm, horiz ? "H" : "V");
+                        check(c && c->lattice == 4 && c->stride == 1, what);
+                    });
+                }
+                // ...and THE X AXIS IS NOT PACKED. Halving each plane into a dense
+                // array of its own would have drawn four curves too - and would have
+                // put Gr's first sample at column 0, on top of R's, so the four could
+                // no longer be read against each other and the hover's "column x" and
+                // the table's x would mean two different things.
+                const ProjCurveProbe* r = curve("R", true);
+                const ProjCurveProbe* gr = curve("Gr", true);
+                check(r && r->xFirst == 0 && r->xLast == 6,
+                      "C1 R's H curve spans columns 0..6 - the even columns, in place");
+                check(gr && gr->xFirst == 1 && gr->xLast == 7,
+                      "C1 Gr's spans 1..7: the two planes keep the IMAGE's x axis");
+                const ProjCurveProbe* gbv = curve("Gb", false);
+                check(gbv && gbv->xFirst == 1 && gbv->xLast == 7,
+                      "C1 ...and Gb's V curve spans rows 1..7, its own rows");
+            }
+
+            // ======================================================================
+            // C2 - DECIMATION IS STILL ON. The stroke runs every frame, and the whole
+            // reason it decimates is that 4000 samples into 400 px is 4000 line
+            // segments per series per frame. Walking each plane's own samples must not
+            // undo that: 4096 columns is 2048 samples per Bayer plane, and the stride
+            // is now taken over those 2048 rather than over the 4096 entries - which
+            // is the point, because a mosaic plane used to be decimated `cell` times
+            // harder than it needed to be and threw away half its resolution.
+            //
+            // The BOUND is stated the way the code computes it - nOwn / stride, with
+            // the stride an integer floor - and not as "one point per pixel column":
+            // 2048 samples over an ~880 px plot is a stride of 2 and therefore 1024
+            // points, which is more than the pixels. That overshoot of up to 2x is the
+            // floor division and is unchanged by this commit; the claim under test is
+            // that the count is a FRACTION OF THE SAMPLES and not all of them.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_rggb_wide", 4096, 8, 1, 1));
+                draw();
+                dump("C2 RGGB 4096x8");
+                const ProjCurveProbe* r = curve("R", true);
+                check(r != nullptr, "C2 the wide frame's R plane has an H curve");
+                if (r) {
+                    check(r->lattice == 2048, "C2 fixture: 2048 samples in the R plane");
+                    check(r->stride >= 2, "C2 the decimation is ON: stride is 2 or more");
+                    check(r->points == r->lattice / r->stride,
+                          "C2 the curve holds exactly lattice/stride points");
+                    check(r->points <= r->lattice / 2,
+                          "C2 ...so at most half the samples reach the draw list");
+                    check(r->points <= 2 * (int)(r->px1 - r->px0),
+                          "C2 ...and the integer stride overshoots the pixels by under 2x");
+                    check(r->strokes == 1, "C2 ...in one unbroken stroke");
+                    check(r->xFirst == 0 && r->xLast >= 4090,
+                          "C2 ...spanning the frame, in the image's own columns");
+                }
+            }
+
+            // ======================================================================
+            // C3 - QUAD BAYER, where a second spelling of the phase would be caught.
+            // At cfa == 2 the cell is 4 and a plane is TWO columns wide: cfaChannelAt
+            // reads (x >> 1) & 1, so RGGB's R owns columns 0, 1, 4, 5, 8, 9, ... and
+            // Gr owns 2, 3, 6, 7, ... An "even columns are R" formula - the obvious
+            // one, and the wrong one - would put R on 0, 2, 4 and lose half its
+            // samples while inventing the other half. 16 columns, 8 per plane.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_quad16", 16, 16, 2, 1));
+                draw();
+                dump("C3 quad Bayer 16x16");
+                check(app.proj[0].cell == 4 && app.proj[0].nSeries == 4,
+                      "C3 fixture: four planes on a 4x4 quad cell");
+                for (int axis = 0; axis < 2; axis++) {
+                    const bool horiz = axis == 0;
+                    eachPlane(horiz, [&](const char* nm, const ProjCurveProbe* c) {
+                        char what[128];
+                        snprintf(what, sizeof what,
+                                 "C3 quad plane %s has an %s curve of 8 points", nm,
+                                 horiz ? "H" : "V");
+                        check(c && c->points == 8 && c->strokes == 1 && c->lattice == 8, what);
+                    });
+                }
+                const ProjCurveProbe* r = curve("R", true);
+                const ProjCurveProbe* gr = curve("Gr", true);
+                check(r && r->xFirst == 0 && r->xLast == 13,
+                      "C3 R's columns are 0,1,4,5,...,12,13 - a plane two columns wide");
+                check(gr && gr->xFirst == 2 && gr->xLast == 15,
+                      "C3 Gr's start at 2, which an even/odd phase would get backwards");
+            }
+
+            // ======================================================================
+            // C4 - A REAL GAP STILL BREAKS THE LINE (mono). Column 8 holds no finite
+            // pixel at all, so the H profile has a NaN there that is a fact about the
+            // DATA. The curve must break: two strokes, 15 points. The V profile of the
+            // same frame must NOT break - every row still has 15 finite columns - so
+            // the break is where the data is missing and nowhere else.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_gap_mono", 16, 16, 0, 1));
+                for (int y = 0; y < 16; y++)
+                    d->px()[(size_t)y * 16 + 8] = std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C4 mono with column 8 missing");
+                const ProjCurveProbe* hh = curve("ch0", true);
+                const ProjCurveProbe* vv = curve("ch0", false);
+                check(hh && hh->strokes == 2 && hh->points == 15,
+                      "C4 the H curve BREAKS at the missing column: 2 strokes, 15 points");
+                check(hh && hh->lattice == 16,
+                      "C4 ...and column 8 is still a sample POSITION - the data is what is gone");
+                check(vv && vv->strokes == 1 && vv->points == 16,
+                      "C4 the V curve is whole: no row lost its samples");
+            }
+
+            // ======================================================================
+            // C5 - ...AND ON A MOSAIC PLANE, which is the proof that the two kinds of
+            // hole are told apart. 16x16 RGGB with column 4 missing. Column 4 is even,
+            // so it is on the lattice of R and of Gb and of neither Gr nor B: R and Gb
+            // must break there (2 strokes, 7 of their 8 points) and Gr and B must not
+            // (1 stroke, 8 points). An implementation that skipped every NaN would
+            // draw all four whole and bridge the missing column in silence; the one
+            // that broke at every NaN drew none of them at all.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_gap_rggb", 16, 16, 1, 1));
+                for (int y = 0; y < 16; y++)
+                    d->px()[(size_t)y * 16 + 4] = std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C5 RGGB with column 4 missing");
+                for (const char* nm : { "R", "Gb" }) {
+                    const ProjCurveProbe* c = curve(nm, true);
+                    char what[128];
+                    snprintf(what, sizeof what,
+                             "C5 plane %s owns column 4 and BREAKS there: 2 strokes, 7 points", nm);
+                    check(c && c->strokes == 2 && c->points == 7 && c->lattice == 8, what);
+                }
+                for (const char* nm : { "Gr", "B" }) {
+                    const ProjCurveProbe* c = curve(nm, true);
+                    char what[128];
+                    snprintf(what, sizeof what,
+                             "C5 plane %s is not on column 4 and stays whole: 8 points", nm);
+                    check(c && c->strokes == 1 && c->points == 8 && c->lattice == 8, what);
+                }
+                eachPlane(false, [&](const char* nm, const ProjCurveProbe* c) {
+                    char what[128];
+                    snprintf(what, sizeof what, "C5 plane %s's V curve is whole: no row is gone", nm);
+                    check(c && c->strokes == 1 && c->points == 8, what);
+                });
+            }
+
+            // ======================================================================
+            // C6 - THE ROI, which is the report's own situation: an ROI shrinks rw, so
+            // stride falls to 1 on any frame however large. Eight columns of a 4096
+            // wide mosaic, taken at an EVEN origin and then at an ODD one - because the
+            // phase is a property of the absolute column, and a lattice spelled as
+            // "even indices" would be right at 1000 and wrong at 1001.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_roi", 4096, 16, 1, 1));
+                auto roi = [&](int x0) {
+                    app.anns.clear();
+                    App::Ann a;
+                    a.id = app.nextAnnId++;
+                    a.type = 0;
+                    a.x = x0; a.y = 0; a.w = 8; a.h = 8;
+                    a.label = "pcroi";
+                    app.anns.push_back(a);
+                    app.selectedAnn = a.id;
+                    app.annRev++;
+                    app.proj[0] = App::ProjState{};
+                    draw();
+                };
+                roi(1000);
+                dump("C6 ROI at x=1000 (even)");
+                check(app.proj[0].roiUsed && app.proj[0].rx == 1000 && app.proj[0].rw == 8,
+                      "C6 fixture: the ROI really is 8 columns from x=1000");
+                eachPlane(true, [&](const char* nm, const ProjCurveProbe* c) {
+                    char what[128];
+                    snprintf(what, sizeof what, "C6 plane %s has an H curve inside the ROI", nm);
+                    check(c && c->points == 4 && c->strokes == 1 && c->stride == 1, what);
+                });
+                const ProjCurveProbe* r = curve("R", true);
+                check(r && r->xFirst == 1000 && r->xLast == 1006,
+                      "C6 R's curve is at columns 1000..1006 of the IMAGE, not 0..6");
+                // ...and the spread line under the plot, which is measured over the
+                // VISIBLE x range. That range is column numbers while the profile is
+                // indexed from 0, so at an ROI origin of 1000 every sample fell outside
+                // the window and the line said nothing at all.
+                check(field(g_projSideProbe, "spreadH=") == "4",
+                      "C6 all four planes get a spread line under the H plot");
+                check(field(g_projSideProbe, "spreadV=") == "4",
+                      "C6 ...and under the V plot");
+
+                roi(1001);
+                dump("C6b ROI at x=1001 (odd)");
+                const ProjCurveProbe* r2 = curve("R", true);
+                const ProjCurveProbe* gr2 = curve("Gr", true);
+                check(r2 && r2->points == 4 && r2->xFirst == 1002 && r2->xLast == 1008,
+                      "C6b at an ODD origin R starts at column 1002: the phase follows the image");
+                check(gr2 && gr2->points == 4 && gr2->xFirst == 1001,
+                      "C6b ...and Gr starts at 1001, the first column of the ROI");
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // ======================================================================
+            // C7 - THE HOVER READOUT, ABOUT THE CELL. "There is a spike - which
+            // column is it?" is what it is for, and on a mosaic two of the four
+            // planes have no sample at any given column. Naming one column and
+            // then saying nothing about half the planes is the worst of the
+            // three available answers, on the panel whose purpose with a mosaic
+            // is comparing the planes at one PLACE. So with a mosaic on the plot
+            // the reading is about the cell: the heading is "column x 2-3" and
+            // all four planes get a line, each with the column its own sample
+            // came from.
+            //
+            // Aimed at column 3 of an 8x8 RGGB - an odd column, so Gr and B
+            // have their samples there and R and Gb have theirs at column 2.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_hover", 8, 8, 1, 1));
+                draw();
+                const ProjCurveProbe* r = curve("R", true);
+                check(r != nullptr, "C7 fixture: the H plot was laid out");
+                if (r) {
+                    // the plot's own mapping, from the rect and the axis it recorded
+                    const float t = (3.0f - r->xmin) / std::max(r->xmax - r->xmin, 1e-6f);
+                    const ImVec2 aim(r->px0 + t * (r->px1 - r->px0),
+                                     (r->py0 + r->py1) * 0.5f);
+                    projFrame(900.0f, 900.0f, aim);
+                    fprintf(stderr, "abstatsselftest: C7 hover '%s'\n",
+                            g_projHoverProbe.c_str());
+                    const std::string t2 = g_projHoverProbe;
+                    auto has = [&](const char* sub) { return t2.find(sub) != std::string::npos; };
+                    check(has("column x 2-3") && has("one mosaic cell"),
+                          "C7 the heading names the CELL, and says that is what it is");
+                    check(has("\nR: ") && has("\nGr: ") && has("\nGb: ") && has("\nB: "),
+                          "C7 ...and all FOUR planes get a line, not the two on column 3");
+                    check(has("at column 2") && has("at column 3"),
+                          "C7 ...each saying which column its own sample came from");
+                    check(!has("no sample") && !has("no data"),
+                          "C7 ...and none of them has to refuse: every plane is in the cell");
+                }
+            }
+
+            // ======================================================================
+            // C7b - quad Bayer, where a cell is FOUR columns and a plane owns
+            // two of them. The line quoted is the one nearest the cursor, so
+            // the answer is still "the sample under your pointer" and the
+            // heading still names what the four values have in common.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_hover_quad", 16, 16, 2, 1));
+                draw();
+                const ProjCurveProbe* r = curve("R", true);
+                check(r != nullptr, "C7b fixture: the quad H plot was laid out");
+                if (r) {
+                    const float t = (5.0f - r->xmin) / std::max(r->xmax - r->xmin, 1e-6f);
+                    projFrame(900.0f, 900.0f,
+                              ImVec2(r->px0 + t * (r->px1 - r->px0),
+                                     (r->py0 + r->py1) * 0.5f));
+                    fprintf(stderr, "abstatsselftest: C7b hover '%s'\n",
+                            g_projHoverProbe.c_str());
+                    const std::string t3 = g_projHoverProbe;
+                    check(t3.find("column x 4-7") != std::string::npos,
+                          "C7b a quad cell is four columns wide, and the heading says so");
+                    check(t3.find("\nR: ") != std::string::npos &&
+                          t3.find("\nGr: ") != std::string::npos &&
+                          t3.find("\nGb: ") != std::string::npos &&
+                          t3.find("\nB: ") != std::string::npos,
+                          "C7b ...and all four planes are in it");
+                    check(t3.find("at column 5") != std::string::npos,
+                          "C7b ...R quoting column 5, the one under the cursor of its two");
+                    check(t3.find("no sample") == std::string::npos,
+                          "C7b ...and nothing refuses");
+                }
+            }
+
+            // ======================================================================
+            // C8 - ...and on a plain image the heading is still ONE column, and
+            // a hole in the data is called "no data". Two different facts about
+            // a missing value - the mosaic's lattice and a column no finite
+            // pixel was found in - and two different words for them.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_hover_gap", 16, 16, 0, 1));
+                for (int y = 0; y < 16; y++)
+                    d->px()[(size_t)y * 16 + 8] = std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                const ProjCurveProbe* c = curve("ch0", true);
+                check(c != nullptr, "C8 fixture: the H plot was laid out");
+                if (c) {
+                    const float t = (8.0f - c->xmin) / std::max(c->xmax - c->xmin, 1e-6f);
+                    projFrame(900.0f, 900.0f,
+                              ImVec2(c->px0 + t * (c->px1 - c->px0), (c->py0 + c->py1) * 0.5f));
+                    fprintf(stderr, "abstatsselftest: C8 hover '%s'\n",
+                            g_projHoverProbe.c_str());
+                    check(g_projHoverProbe.find("column x 8") != std::string::npos &&
+                          g_projHoverProbe.find("mosaic cell") == std::string::npos,
+                          "C8 a plain image's heading is one column, with no cell in it");
+                    check(g_projHoverProbe.find("no data (no finite pixel in column 8)") !=
+                              std::string::npos,
+                          "C8 ...and a missing MEASUREMENT is 'no data', naming the column");
+                    check(g_projHoverProbe.find("no sample") == std::string::npos,
+                          "C8 ...never 'no sample', which would blame a mosaic it has not got");
+                }
+            }
+
+            // ======================================================================
+            // C9 - the plane selector still narrows the plot to one plane, and the one
+            // it names is the one that gets the curve. The filter runs before the walk,
+            // so this is the assert that the walk did not start ignoring it.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_one_plane", 8, 8, 1, 1));
+                app.histPlane = 3;                       // B
+                draw();
+                dump("C9 plane=B only");
+                check(g_projCurveProbe.size() == 2,
+                      "C9 one plane on the axis is two curves - H and V - and no more");
+                const ProjCurveProbe* b = curve("B", true);
+                check(b && b->points == 4, "C9 ...and the one drawn is B, with its four points");
+                check(curve("R", true) == nullptr, "C9 R is filtered out, not drawn empty");
+                app.histPlane = -1;
+            }
+
+            // ======================================================================
+            // C13 - THE AUTO VALUE AXIS FOLLOWS THE PLANE SELECTOR. A colour
+            // filter array is what puts the planes at DIFFERENT LEVELS, so an
+            // axis taken over all four is three levels taller than the plane
+            // being read - and a lens-shading tilt of a few percent inside one
+            // plane is then a flat line. The fixture's levels are 500 + 400*p
+            // plus a 0..87 ramp along x, so all four planes span ~500..1787 and
+            // R alone spans ~500..590 (the +y term adds 0..6 to a column mean).
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_yaxis", 64, 8, 1, 1));
+                app.histPlane = -1;
+                draw();
+                const std::string yAll = field(g_projSideProbe, "y=");
+                app.histPlane = 0;                    // R only
+                draw();
+                const std::string yR = field(g_projSideProbe, "y=");
+                fprintf(stderr, "abstatsselftest: C13 axis all planes '%s' / R only '%s'\n",
+                        yAll.c_str(), yR.c_str());
+                auto span = [](const std::string& f) {
+                    const size_t d = f.find("..");
+                    if (d == std::string::npos) return 0.0;
+                    return atof(f.c_str() + d + 2) - atof(f.c_str());
+                };
+                check(span(yAll) > 1000.0,
+                      "C13 fixture: the four planes really are a thousand DN apart");
+                check(span(yR) > 0.0 && span(yR) < 200.0,
+                      "C13 one plane on the axis gets an axis that fits ONE plane");
+                check(span(yR) < span(yAll) / 4.0,
+                      "C13 ...which is the whole point: the shape is no longer flattened");
+                app.histPlane = -1;
+            }
+
+            // ======================================================================
+            // C14 - THE TABLE'S HEIGHT BUDGET IS THE ROW WALK. A is a mosaic
+            // (R, Gr, Gb, B) and B was never told it is one (ch0), so in "ch,
+            // then side" the row axis is five plane NAMES times two sides = ten
+            // rows. The budget summed the sides' plane counts instead - 4 + 1 -
+            // and reserved five, so half the table hung below the visible panel
+            // on the very pair the "-" rows exist to make readable.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_rows_A", 16, 16, 1, 1));
+                app.images.push_back(mkFrame("pc_rows_B", 16, 16, 0, 1));
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                const int keepOrder2 = app.projStatOrder;
+                app.projStatOrder = 1;                 // "ch, then side"
+                draw();
+                const std::string rows = field(g_projSideProbe, "planerows=");
+                const std::string budget = field(g_projSideProbe, "statrows=");
+                fprintf(stderr, "abstatsselftest: C14 rows '%s' budget '%s'\n",
+                        rows.c_str(), budget.c_str());
+                check(rows == "R@A,R@B-,Gr@A,Gr@B-,Gb@A,Gb@B-,B@A,B@B-,ch0@A-,ch0@B",
+                      "C14 fixture: five plane names across two sides is ten rows");
+                check(budget == "10",
+                      "C14 ...and the height budget is those ten, not the 4+1 the sum gave");
+                app.projStatOrder = keepOrder2;
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C11 - A PLANE WITH NO CURVE IS NAMED. This panel keeps that
+            // discipline for the LETTERS - a slot the plots cannot carry is
+            // named under them in amber, which is the whole of the #60 fix -
+            // and kept none of it for the planes. Two columns of a mosaic give
+            // every plane ONE sample, a line needs two, and before this the
+            // plots were empty, nothing said so, and the table below still
+            // gave all four planes a full row of numbers. The same silence one
+            // level down.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_silent", 4096, 16, 1, 1));
+                app.anns.clear();
+                App::Ann a2;
+                a2.id = app.nextAnnId++;
+                a2.type = 0;
+                a2.x = 100; a2.y = 0; a2.w = 2; a2.h = 16;
+                a2.label = "pcthin";
+                app.anns.push_back(a2);
+                app.selectedAnn = a2.id;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C11 a 2-column ROI on a mosaic");
+                check(app.proj[0].rw == 2, "C11 fixture: the ROI is two columns wide");
+                eachPlane(true, [&](const char* nm, const ProjCurveProbe* c) {
+                    char what[128];
+                    snprintf(what, sizeof what,
+                             "C11 plane %s really has one sample and no curve", nm);
+                    check(c && c->lattice == 1 && c->points == 0, what);
+                });
+                check(field(g_projSideProbe, "drewH=").empty(),
+                      "C11 the panel drew no H curve at all");
+                check(field(g_projSideProbe, "said-no-curve-planeH=") ==
+                          "R@A,Gr@A,Gb@A,B@A",
+                      "C11 ...and names every plane it left off, BY PLANE and side");
+                // ANTI-VACUOUS: the V axis of the same frame is 16 rows, so
+                // every plane has 8 of them and is drawn. A probe that said
+                // "no curve" unconditionally would pass the check above.
+                check(field(g_projSideProbe, "drewV=") == "R@A,Gr@A,Gb@A,B@A" &&
+                      field(g_projSideProbe, "said-no-curve-planeV=").empty(),
+                      "C11 the V axis of the same ROI has all four, and says so");
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // ======================================================================
+            // C12 - WHICH HUE IS WHICH PLANE. Four planes were overlaid in four
+            // hues - Gr and Gb being two greens - with nothing on screen naming
+            // them, on the panel whose purpose with a mosaic is comparing the
+            // planes. One name is not a legend, so a mono image gets none: the
+            // plane selector already says which plane a single curve is.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_legend", 8, 8, 1, 1));
+                draw();
+                fprintf(stderr, "abstatsselftest: C12 sides '%s'\n",
+                        g_projSideProbe.c_str());
+                check(field(g_projSideProbe, "planelegH=") == "R,Gr,Gb,B",
+                      "C12 the plane legend names all four mosaic planes, in order");
+                check(field(g_projSideProbe, "planelegV=") == "R,Gr,Gb,B",
+                      "C12 ...under both plots");
+                app.histPlane = 3;
+                draw();
+                check(field(g_projSideProbe, "planelegH=").empty(),
+                      "C12 one plane on the axis needs no legend - the selector names it");
+                app.histPlane = -1;
+                useOnly(mkFrame("pc_legend_mono", 8, 8, 0, 1));
+                draw();
+                check(field(g_projSideProbe, "planelegH=").empty(),
+                      "C12 ...and a mono image has no planes to tell apart");
+            }
+
+            // ======================================================================
+            // C10 - THE POOLED ROW IS SLOT 4. The spread lines walked `k < nSeries +
+            // allRow`, which on a 3-channel image with "all" ticked is 0..3 - and slot
+            // 3 is not the pooled row, it is "ch3", a vector the pass never filled and
+            // that a previously open mosaic may have left data in. So the "all" line
+            // never appeared and a stale plane could appear under its name. Four lines:
+            // ch0, ch1, ch2, all. (The same count/slot confusion the projection pass
+            // carries a paragraph about; it survived here because on a 4-plane mosaic
+            // the count is accidentally right.)
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_rgb", 16, 16, 0, 3));
+                app.projAllRow = true;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C10 RGB 16x16 with the pooled row on");
+                check(app.proj[0].nSeries == 3 && app.proj[0].allRow,
+                      "C10 fixture: three channels plus the pooled row");
+                check(field(g_projSideProbe, "spreadH=") == "4",
+                      "C10 four spread lines: the three channels AND the pooled row");
+                check(g_projCurveProbe.size() == 6,
+                      "C10 ...while the pooled row is still not a CURVE: three planes, two axes");
+                app.projAllRow = false;
+            }
+
+            // ======================================================================
+            // C15 - A MOSAIC PREVIEW HAS NO PROFILE, AND SAYS SO. A decimated
+            // remote preview carries every Nth row and column of the sensor, so
+            // the mosaic phase is not preserved: cfaChannelAt over preview
+            // coordinates names a plane the pixel is not from, and every plane's
+            // curve was another plane's values under this plane's name. Four
+            // wrong curves and four wrong columns of numbers, with nothing on
+            // screen distinguishing them from the real thing.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_preview", 16, 16, 1, 1));
+                d->src->remoteStep = 2;               // a preview, as the loader marks one
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C15 a mosaic preview");
+                check(!app.proj[0].unavail.empty(),
+                      "C15 the profile is refused, with a reason");
+                check(app.proj[0].unavail.find("full-resolution remote pixels required") == 0,
+                      "C15 ...in computeProfileNoise's words for the same cause");
+                check(field(g_projSideProbe, "unavail=") == "A",
+                      "C15 ...and the panel says it, about A, rather than drawing");
+                check(g_projCurveProbe.empty(),
+                      "C15 no curve is drawn: there is no honest one to draw");
+                check(app.proj[0].h[0].empty() && app.proj[0].hStat[0].valid == false,
+                      "C15 ...and no numbers either, which is the half that was wrong");
+                // ANTI-VACUOUS: the same frame at full resolution has all four.
+                d->src->remoteStep = 1;
+                app.proj[0] = App::ProjState{};
+                draw();
+                check(app.proj[0].unavail.empty() && curve("R", true) &&
+                      curve("R", true)->points == 8,
+                      "C15 the full-resolution frame draws its four planes as before");
+            }
+
+            // ======================================================================
+            // C16 - THE POOLED ROW'S SIGMA IS NOT COLUMN FPN ON A MOSAIC.
+            // Pooling the planes puts their LEVEL DIFFERENCE into every column
+            // mean, so the sigma of those means is a comb with the mosaic's
+            // period - large, and the most quotable wrong number on the panel.
+            // The pooled PROFILE is a dense mean level and stays; the sigma of
+            // it goes.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_pooled", 16, 16, 1, 1));
+                app.projAllRow = true;
+                app.proj[0] = App::ProjState{};
+                draw();
+                const App::ProjState& PP = app.proj[0];
+                fprintf(stderr, "abstatsselftest: C16 pooled: profile %zu long, fStat %d, "
+                                "hStat %d, vStat %d\n",
+                        PP.h[4].size(), PP.fStat[4].valid ? 1 : 0,
+                        PP.hStat[4].valid ? 1 : 0, PP.vStat[4].valid ? 1 : 0);
+                check(PP.allRow && PP.h[4].size() == 16,
+                      "C16 fixture: the pooled row is filled, and it is dense");
+                check(!PP.hStat[4].valid && !PP.vStat[4].valid,
+                      "C16 its sigma of the row/column means is unavailable: pooled planes");
+                check(PP.fStat[4].valid && PP.fStat[4].mean > 0,
+                      "C16 ...while the pooled REGION mean and sigma are over pixels and stand");
+                // ANTI-VACUOUS: on a 3-channel image the pooled row is still a
+                // pooled row, but the planes are not a mosaic's and there is no
+                // period in the pooling, so the profile sigma is a real one.
+                useOnly(mkFrame("pc_pooled_rgb", 16, 16, 0, 3));
+                app.proj[0] = App::ProjState{};
+                draw();
+                check(app.proj[0].hStat[4].valid && app.proj[0].vStat[4].valid,
+                      "C16 a non-mosaic pooled row keeps its profile sigma");
+                app.projAllRow = false;
+            }
+
+            // ======================================================================
+            // C17 - ONE SAMPLE IS NOT A SIGMA OF ZERO. A 2-column ROI gives a
+            // Bayer plane ONE column mean, the ddof=1 variance of one sample is
+            // 0 by construction, and `valid` published that exact zero - which
+            // reads as a perfectly uniform sensor rather than as "there is
+            // nothing here to measure".
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_one_sample", 4096, 16, 1, 1));
+                auto roiW = [&](int w) {
+                    app.anns.clear();
+                    App::Ann a3;
+                    a3.id = app.nextAnnId++;
+                    a3.type = 0;
+                    a3.x = 200; a3.y = 0; a3.w = w; a3.h = 16;
+                    a3.label = "pcone";
+                    app.anns.push_back(a3);
+                    app.selectedAnn = a3.id;
+                    app.annRev++;
+                    app.proj[0] = App::ProjState{};
+                    draw();
+                };
+                roiW(2);
+                fprintf(stderr, "abstatsselftest: C17 2-wide ROI: hStat valid=%d sd=%.17g\n",
+                        app.proj[0].hStat[0].valid ? 1 : 0, app.proj[0].hStat[0].sd);
+                check(app.proj[0].h[0].size() == 2,
+                      "C17 fixture: the R plane has one column mean in a 2-column ROI");
+                check(!app.proj[0].hStat[0].valid,
+                      "C17 one sample publishes no sigma_col at all");
+                // ANTI-VACUOUS: four columns is two samples, which IS a spread.
+                roiW(4);
+                fprintf(stderr, "abstatsselftest: C17 4-wide ROI: hStat valid=%d sd=%.17g\n",
+                        app.proj[0].hStat[0].valid ? 1 : 0, app.proj[0].hStat[0].sd);
+                check(app.proj[0].hStat[0].valid && app.proj[0].hStat[0].sd > 0,
+                      "C17 two samples do, and it is not zero");
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // ---- everything borrowed, put back ------------------------------------
+            app.anns.clear();
+            app.nextAnnId = 1;
+            app.selectedAnn = keepSel;
+            app.annRev++;
+            app.images.clear();
+            app.current = -1;
+            // The caches are NOT put back as they were found: a ProjState holds an
+            // ImageDoc*, closeAll() destroyed the documents it pointed at, and handing
+            // a dangling pointer back would be worse than the empty cache an empty
+            // session is entitled to. Cleared, which is what closeAll leaves anyway.
+            app.proj[0] = App::ProjState{};
+            app.proj[1] = App::ProjState{};
+            app.projExtra.clear();
+            app.projMode = keepMode;
+            app.projYMode = keepYMode;
+            app.showProjH = keepH;
+            app.showProjV = keepV;
+            app.projAllRow = keepAllRow;
+            app.projStatLayout = keepStatLayout;
+            app.projStatOrder = keepStatOrder;
+            app.projDecimals = keepDecimals;
+            app.histPlane = keepPlane;
+            app.compareMode = keepCompare;
+            app.linkRange = keepLink;
+            app.prefsDirty = keepPrefsDirty;
+            // The document list this test emptied cannot be handed back - closeAll()
+            // took it - so what is restored is the INDEX being out of range in the same
+            // way an empty session leaves it, and the count is reported rather than
+            // faked. Nothing runs after this in the process.
+            if (keepImages || keepCurrent >= 0)
+                fprintf(stderr, "abstatsselftest: entered with %zu document(s), current %d; "
+                                "the session was closed for the fixtures and is not restored\n",
+                        keepImages, keepCurrent);
+            g_projCurveProbe.clear();
+            g_projHoverProbe.clear();
+
+        }
         fprintf(stderr, "abstatsselftest: %s\n", ok ? "ok" : "FAILED");
         stopSequenceLoader();
         stopRemoteFetcher();
