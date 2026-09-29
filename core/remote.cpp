@@ -584,7 +584,7 @@ bool Session::list(const std::string& path, std::vector<Entry>& out, std::string
     uint32_t type = 0;
     if (!send(rp::MSG_LIST, w.b, err) || !recv(type, reply, err)) return false;
     if (type != rp::MSG_OK) { R r(reply); r.str(err); return false; }
-    return parseListPayload(reply, peerVersion_, out, err);
+    return parseListPayload(reply, effectiveVersion(), out, err);
 }
 
 bool Session::scan(const std::string& root, int depth, int maxGroups,
@@ -614,7 +614,7 @@ bool Session::scan(const std::string& root, int depth, int maxGroups,
     out.clear();
     for (uint32_t i = 0; i < n; i++) {
         ScanGroup g;
-        if (!r.str(g.dir) || !parseEntryV3(r, g.entry, peerVersion_)) {
+        if (!r.str(g.dir) || !parseEntryV3(r, g.entry, effectiveVersion())) {
             err = "bad SCAN reply";
             return false;
         }

@@ -6,6 +6,7 @@
 // network, and no credentials of our own - ssh owns the authentication. Passing
 // an empty host starts a local peer instead, which is how this is tested.
 #pragma once
+#include <algorithm>          // std::min - effectiveVersion()
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -386,6 +387,14 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int helloVersion_ = (int)rp::VERSION;
+    // The protocol actually IN FORCE for a field the peer gates on the CLIENT's
+    // number - the LIST group row's member sizes are the one such field
+    // (protocol 16). It is the smaller of the two numbers, not peerVersion_
+    // alone: a client that announced less than it can parse would read a field
+    // the peer correctly did not send. Only setHelloVersionForTest can make
+    // those two disagree today, and a seam that can desynchronise a parser is
+    // not a seam worth leaving armed.
+    int effectiveVersion() const { return std::min(peerVersion_, helloVersion_); }
     int port_ = 0;
     bool serveReaders_ = true;
     bool explainFailure_ = false;

@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>              // remoteRawSameSize's group dedupe
 #include <atomic>
 #include <cctype>
 #include <cfloat>
