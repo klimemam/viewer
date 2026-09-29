@@ -411,8 +411,32 @@ static int cjkFontSelftest() {
               "C4 ...and so does a code point above the BMP, which no range reaches");
         check(undrawableCount(plain) == 0,
               "C4 ...and a name the atlas can draw counts 0");
-        check(undrawableCount(broken) >= 1,
-              "C4 ...and bytes that are not UTF-8 count too (they arrive as U+FFFD)");
+        check(undrawableCount(broken) == 2,
+              "C4 ...and each byte that is not UTF-8 counts (two here)");
+        // THE CASE THE UBUNTU RUNNER CAUGHT, and it is the reason the two
+        // assertions above are worth their own lines. ImGui decodes all three
+        // of "not UTF-8", "truncated" and "above U+FFFF" to U+FFFD, and
+        // GetGlyphRangesJapanese itself ASKS for U+FFFD - so on a machine whose
+        // font HAS that glyph (DejaVu Sans does; Meiryo and YaHei do not) an
+        // atlas lookup alone answers "nothing wrong with this name" for an
+        // emoji. undrawableCount therefore looks at the BYTES: a genuine U+FFFD
+        // in a name is exactly EF BF BD and is drawn faithfully; anything else
+        // that came out as U+FFFD was substituted and the character is lost.
+        {
+            ImFont* ff = bakedFont();
+            const bool atlasHasFffd =
+                ff && ff->FindGlyphNoFallback((ImWchar)0xFFFD) != nullptr;
+            say(std::string("the atlas ") + (atlasHasFffd ? "HAS" : "does not have") +
+                " a glyph for U+FFFD, which is what decides whether an atlas "
+                "lookup alone could tell a substitution from a real one");
+            // A name that really contains U+FFFD draws as itself where the font
+            // has it - so it is NOT counted, and that is the same call that
+            // must still count the emoji. One pair, both directions.
+            check(undrawableCount("\xEF\xBF\xBD" ".npy") == (atlasHasFffd ? 0 : 1),
+                  "C4 a REAL U+FFFD is judged by the glyph, not by the byte pattern");
+            check(undrawableCount(emoji) == 1 && undrawableCount(broken) == 2,
+                  "C4 ...while a SUBSTITUTED one is counted either way");
+        }
         check(!undrawableNote(thai).empty() && undrawableNote(plain).empty(),
               "C4 the sentence is there for the first and absent for the second");
         // It asks the ATLAS, like shareGlyph(), and not the range table: a name

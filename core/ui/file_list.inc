@@ -199,11 +199,27 @@ static int undrawableCount(const std::string& utf8Name) {
     while (p < e) {
         unsigned int cp = 0;
         const int used = ImTextCharFromUtf8(&cp, p, e);
-        if (used <= 0) break;
+        if (used <= 0) break;                 // only at a NUL or the end
+        // A DECODE THAT FAILED is a lost character EVEN WHERE THE FONT HAS A
+        // GLYPH for what came out of it, and this is the case the Ubuntu runner
+        // caught. ImTextCharFromUtf8 answers U+FFFD REPLACEMENT CHARACTER for
+        // three different inputs - bytes that are not UTF-8, a truncated
+        // sequence, and any code point above U+FFFF (this build's ImWchar is
+        // 16-bit, so an emoji cannot be represented at all) - and ImGui's own
+        // GetGlyphRangesJapanese ASKS for U+FFFD ("0xFFFD, 0xFFFD // Invalid"),
+        // so a font that has the glyph draws a diamond and the atlas lookup
+        // below would answer "nothing wrong with this name". DejaVu Sans has
+        // it; Meiryo and YaHei do not - which is why this was invisible here
+        // and a failure there.
+        //
+        // What separates a substitution from a name that really does contain
+        // U+FFFD is the BYTES: the genuine article is exactly EF BF BD.
+        const bool substituted =
+            cp == (unsigned)IM_UNICODE_CODEPOINT_INVALID &&
+            !(used == 3 && (unsigned char)p[0] == 0xEF &&
+              (unsigned char)p[1] == 0xBF && (unsigned char)p[2] == 0xBD);
         p += used;
-        // Bytes that are not UTF-8 come back as U+FFFD, which no candidate
-        // font has either - so they are counted, which is right: a name with
-        // broken bytes in it is a name that will not draw.
+        if (substituted) { n++; continue; }
         if (cp > 0xFFFF) { n++; continue; }   // outside the BMP: not askable at all
         if (!f->FindGlyphNoFallback((ImWchar)cp)) n++;
     }
