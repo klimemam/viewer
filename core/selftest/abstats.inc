@@ -2816,6 +2816,41 @@
             }
 
             // ======================================================================
+            // C14b - A SERIES ONLY ONE SIDE HAS IS STILL FOUR DIFFERENT CURVES.
+            // A plane hue means "A's plane of this name", so it cannot be lent
+            // to a plane A has not got - but the one neutral ink that rule left
+            // behind put B's R, Gr, Gb and B on the plot in a single grey,
+            // overlaid and impossible to tell apart. Four neutral tones,
+            // separated by luminance so they still read as "not a plane
+            // colour", and each one NAMED with the letter it belongs to.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_odd_A", 16, 16, 0, 1));   // mono
+                app.images.push_back(mkFrame("pc_odd_B", 16, 16, 1, 1));   // mosaic
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                draw();
+                dump("C14b A mono against a mosaic B");
+                check(field(g_projSideProbe, "planelegH=") ==
+                          "ch0,R (B only),Gr (B only),Gb (B only),B (B only)",
+                      "C14b every series B alone has is named, with the letter");
+                // ANTI-VACUOUS: they are four DIFFERENT curves on the plot, so
+                // the legend is naming four things that can be told apart.
+                check(curve("R", true) && curve("Gr", true) &&
+                      curve("Gb", true) && curve("B", true) &&
+                      curve("R", true)->points == 8,
+                      "C14b ...and all four are really drawn, 8 points each");
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
             // C11 - A PLANE WITH NO CURVE IS NAMED. This panel keeps that
             // discipline for the LETTERS - a slot the plots cannot carry is
             // named under them in amber, which is the whole of the #60 fix -
