@@ -1951,6 +1951,26 @@ struct App {
                         std::string name; int batchId = 0; int port = 0;
                         int token = 0; };
     std::vector<RemoteOpen> rbOpenQueue;
+    // ...and the Open at the FRONT of that queue when it is a HEADERLESS folder
+    // whose recipe is still being asked for (protocol 11, stage 4). It has to
+    // live here rather than beside openRemoteStack because pumpRemoteOpenQueue
+    // (core/browse/nav.cpp, a different translation unit) must not start the
+    // NEXT queued stack while this one is waiting: that would raise a second
+    // RAW dialog over the first and orphan this request, which is the shape of
+    // failure startNextQueuedGroup's `|| rawDlg.open` guard already prevents
+    // for a local folder queue.
+    //
+    // `alive` is the whole predicate: one Open waits at a time, because one
+    // modal is up at a time. The dialog's Load resumes it
+    // (resumeRemoteRawStack) and its Cancel drops it, saying how many frames
+    // did not open.
+    struct PendingRemoteRawStack {
+        bool alive = false;
+        std::string host, name;
+        std::vector<std::string> files;
+        int port = 0, token = 0;
+    };
+    PendingRemoteRawStack remoteRawStack;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
     // one session.

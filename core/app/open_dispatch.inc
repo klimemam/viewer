@@ -4282,21 +4282,15 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
 
 // ---- A REMOTE FOLDER OF HEADERLESS FILES, OPENED AS ONE STACK --------------
 //
-// The parked Open. A headerless folder cannot be opened in one call the way an
-// .npy folder can: the recipe may have to be ASKED for, the dialog is modal and
-// answered frames later, and the answer belongs to THIS Open and no other
-// (sequence.inc's g_folderRecipe/openId discipline, "The recipe belongs to the
-// OPEN that answered for it"). So the request waits here while the dialog is up,
-// and the dialog's Load resumes it - the same shape rawDlg.forQueue already has
-// for a local folder, kept separate because the two queues are different things
-// and a shared slot would let one Open's Cancel drop the other's stacks.
-struct PendingRemoteRawStack {
-    bool alive = false;
-    std::string host, name;
-    std::vector<std::string> files;
-    int port = 0, token = 0;
-};
-static PendingRemoteRawStack g_remoteRawStack;
+// The parked Open lives in App::remoteRawStack (see the note there): a
+// headerless folder cannot be opened in one call the way an .npy folder can -
+// the recipe may have to be ASKED for, the dialog is modal and answered frames
+// later, and the answer belongs to THIS Open and no other (sequence.inc's
+// g_folderRecipe/openId discipline, "The recipe belongs to the OPEN that
+// answered for it"). So the request waits there while the dialog is up, and the
+// dialog's Load resumes it - the same shape rawDlg.forQueue has for a local
+// folder queue, kept in its own slot because the two queues are different
+// things and a shared one would let one Open's Cancel drop the other's stacks.
 
 // Is every member the same number of bytes as the head? A headerless file does
 // not defend itself - 108 bytes and 110 bytes both decode as 8x6 u16 with 12 B
@@ -4434,8 +4428,8 @@ static void openRemoteStackWith(const std::string& host, const std::vector<std::
 // byte count - so what is left is the members, which is exactly what the
 // forQueue branch beside it does for a local folder.
 static void resumeRemoteRawStack() {
-    PendingRemoteRawStack p = g_remoteRawStack;      // by value: attach may re-enter
-    g_remoteRawStack = PendingRemoteRawStack();
+    App::PendingRemoteRawStack p = app.remoteRawStack;      // by value: attach may re-enter
+    app.remoteRawStack = App::PendingRemoteRawStack();
     if (!p.alive || app.images.empty()) return;
     ImageDoc* first = app.images.back().get();
     if (first->seqId != 0) {
@@ -4450,9 +4444,9 @@ static void resumeRemoteRawStack() {
 // ...and its Cancel. A folder's worth of stacks dropped in silence is what
 // drawRawModal's forQueue branch learned not to do.
 static void dropRemoteRawStack() {
-    if (!g_remoteRawStack.alive) return;
-    const size_t n = g_remoteRawStack.files.size();
-    g_remoteRawStack = PendingRemoteRawStack();
+    if (!app.remoteRawStack.alive) return;
+    const size_t n = app.remoteRawStack.files.size();
+    app.remoteRawStack = App::PendingRemoteRawStack();
     toast("cancelled: " + std::to_string(n) + " frame(s) not opened", true);
 }
 
@@ -4488,16 +4482,24 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                 toast(rawRecipeAppliedLine(*r, baseName(files[0]), (size_t)sz));
             return;
         }
-        // Nothing bound: ask, and park the Open until the answer arrives.
+        // Nothing bound: ask, and park the Open until the answer arrives. One
+        // at a time - pumpRemoteOpenQueue holds the queue while this slot is
+        // live, and anything that reaches here anyway (a second group row is
+        // not one of them: the modal has the input) is told so rather than
+        // silently taking the slot from the Open that is already waiting.
+        if (app.remoteRawStack.alive) {
+            toast("a geometry is already being asked for; answer that first", true);
+            return;
+        }
         openRawDialogFor(makeRemoteUrl(host, files[0], port), sz);
         if (!rawDlg.open) return;                 // openRawDialogFor said why
         rawDlg.forRemoteStack = true;
-        g_remoteRawStack.alive = true;
-        g_remoteRawStack.host = host;
-        g_remoteRawStack.files = files;
-        g_remoteRawStack.name = name;
-        g_remoteRawStack.port = port;
-        g_remoteRawStack.token = token;
+        app.remoteRawStack.alive = true;
+        app.remoteRawStack.host = host;
+        app.remoteRawStack.files = files;
+        app.remoteRawStack.name = name;
+        app.remoteRawStack.port = port;
+        app.remoteRawStack.token = token;
         return;
     }
     openRemoteStackWith(host, files, name, port, token, nullptr);

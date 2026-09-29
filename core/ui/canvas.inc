@@ -32,7 +32,7 @@ static void drawRawModal() {
     if (rawDlg.forRemoteStack)
         ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
                            "these settings apply to all %d frame(s) of this stack",
-                           (int)g_remoteRawStack.files.size());
+                           (int)app.remoteRawStack.files.size());
     // The library, at the moment it is useful (#166). It fills the fields in and
     // stops there: Load is where the choice is made, so a mis-click is one
     // combo away from being undone and nothing has been decoded yet.
