@@ -657,6 +657,12 @@ static inline uint32_t rawInterpCh(uint32_t interp) {   // gray rgb bgr rgba bgr
 // swapped order in the document, so a peer that did not swap would give one
 // file two colours depending on which end opened it (#148, one step down).
 static inline bool rawInterpSwapsRB(uint32_t interp) { return interp == 2 || interp == 4; }
+// Which MOSAIC a 1-channel interpretation names: 0 plain gray, 1 Bayer, 2
+// quad-Bayer - the ImageDoc::cfa vocabulary. Here rather than in the client's
+// own tables because the INDICES are frozen here (a session file and the wire
+// both carry them), and because two places deciding "is index 6 mosaiced" is
+// how a stack came to demosaic its head frame and not its siblings.
+static inline int rawInterpCfa(uint32_t interp) { return interp == 6 ? 2 : interp == 5 ? 1 : 0; }
 static const uint32_t RAW_MAX_DIM = 32768;
 // MeasureReqHead::flags bit0: a RawWire follows the ROI array. A bit rather
 // than "read it if bytes remain", because MEASURE already has op-dependent

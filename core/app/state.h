@@ -479,6 +479,36 @@ inline std::string srcIdentityKey(const FrameSource& s) {
     return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" +
            std::to_string(s.member.size()) + ":" + s.member + t;
 }
+// The recipe a source already carries, in the shape the WIRE takes (protocol
+// 11). ONE spelling, right beside the identity key that is built from the same
+// six fields, because everything that asks the peer again for the SAME pixels
+// has to send the six numbers the open sent: the full-resolution swap after a
+// decimated first view, a sibling frame joining the stack, a Reload, a server
+// MEASURE. A follow-up that dropped them does not get "no picture" - it gets
+// the peer's refusal, and the stack silently loses a frame it already showed.
+//
+// srcW/srcH and not w/h: those two are what is on SCREEN (a crop re-scopes
+// them), and the declaration is about the file. A crop does not travel
+// (remote-headerless-design.md 3.2) - it is re-applied to what comes back.
+//
+// Returns false when this source is not a headerless read at all, which is the
+// only honest answer for one: there is no recipe to reconstruct.
+inline bool rawWireOf(int dtype, int interp, int w, int h, int offset, bool le,
+                      rp::RawWire& out) {
+    if (dtype < 0) return false;
+    out = rp::RawWire{};
+    out.dtype = (uint32_t)dtype;
+    out.interp = (uint32_t)interp;
+    out.w = (uint32_t)std::max(1, w);
+    out.h = (uint32_t)std::max(1, h);
+    out.offset = (uint32_t)std::max(0, offset);
+    out.flags = le ? rp::RW_LITTLE_ENDIAN : 0u;
+    return true;
+}
+inline bool rawWireOfSource(const FrameSource& s, rp::RawWire& out) {
+    return rawWireOf(s.rawDtype, s.rawInterp, s.srcW > 0 ? s.srcW : s.w,
+                     s.srcH > 0 ? s.srcH : s.h, s.rawOffset, s.rawLE, out);
+}
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
 // fetch are not the frame; no identity or no disk baseline means no tuple.
@@ -2330,6 +2360,15 @@ struct App {
         int node = 0, keyKind = 0, keyedRead = 0;
         bool keyRequires15 = false;
         uint64_t materializedRunId = 0;
+        // ...and the DECLARED GEOMETRY, for a headerless stack (protocol 11).
+        // It travels for npyRead's reason exactly: a sibling frame that dropped
+        // the recipe is not this stack read again, it is a refusal - so the
+        // stack would show its head and then lose every other frame, which is
+        // what happened between #188 and this. Carried on the job and not read
+        // off the head document on the worker, because the documents live on
+        // the UI thread (MJob's hasRecipe says the same thing for MEASURE).
+        bool hasRecipe = false;
+        rp::RawWire recipe{};
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -2351,6 +2390,12 @@ struct App {
         int node = 0, keyKind = 0, keyedRead = 0; // + its wire axes (see RFetchJob)
         bool keyRequires15 = false;
         uint64_t materializedRunId = 0;
+        // The recipe the frame was fetched under, back from the job. It is put
+        // on the minted source for the OPEN's own reason: srcIdentityKey's raw
+        // branch keys on exactly these fields, so a sibling that landed without
+        // them would offer to share pixels with an .npy tuple.
+        bool hasRecipe = false;
+        rp::RawWire recipe{};
         // ...and what float32 cost THESE samples, measured on the worker where
         // the peer's exact bytes still existed. It cannot be recomputed on the
         // UI thread - by then the only copy is the float one.

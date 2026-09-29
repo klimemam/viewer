@@ -216,6 +216,7 @@ static void rfWorker() {
         d.keyRequires15 = job.keyRequires15;
         d.materializedRunId = job.materializedRunId;
         d.member = job.member;
+        d.hasRecipe = job.hasRecipe; d.recipe = job.recipe;
         std::string host, rpath, err;
         int port = 0;
         if (!remote::parseUrl(job.url, host, rpath, &port)) {
@@ -242,9 +243,15 @@ static void rfWorker() {
                 // plain remote .npy has no such split: its full fetch must use
                 // the same npyRead as its preview (issue #124).
                 const int wireRead = job.key.empty() ? job.npyRead : job.keyedRead;
+                // ...and the DECLARED GEOMETRY, when the stack is headerless
+                // (protocol 11). Sent for npyRead's reason one line up: there
+                // is no other source of a shape for these bytes, so a fetch
+                // without it is refused rather than guessed at - which is how a
+                // remote raw stack came to show its head frame and nothing else.
+                const rp::RawWire* rwp = job.hasRecipe ? &job.recipe : nullptr;
                 if (!ses.tile(rpath, job.frame, 0, 0, 1 << 30, 1 << 30, 1,
                               d.data, w, h, ch, d.dtype, err, wireRead, &d.f32loss,
-                              nullptr, job.key.empty() ? nullptr : &kr)) {
+                              rwp, job.key.empty() ? nullptr : &kr)) {
                     d.err = err;
                 } else {
                     d.w = w; d.h = h; d.ch = ch;
@@ -326,6 +333,19 @@ static void rfInheritRead(App::RFetchJob& j, const ImageDoc* head) {
     j.member = head->src->member;
 }
 
+// ...and the DECLARATION, for a headerless stack (protocol 11). Its own
+// function rather than a line in rfInheritRead, because the two answer
+// different questions and one of them can be absent: rfInheritRead is asked of
+// every stack, and this is asked of the stacks whose shape came from a person.
+// docs/features/remote/remote-headerless-design.md 6.3 named it (rfInheritRecipe,
+// "the same shape as rfInheritRead") and stage 4 shipped without it - so a
+// remote raw folder showed its head frame and lost every sibling to the peer's
+// own refusal, one line per frame in the stack note.
+static void rfInheritRecipe(App::RFetchJob& j, const ImageDoc* head) {
+    if (!head || !head->src) return;
+    j.hasRecipe = rawWireOfSource(*head->src, j.recipe);
+}
+
 static void requestFullRemote(const ImageDoc* d, bool low = false) {
     if (d->src->remoteUrl.empty() || d->src->remoteStep <= 1) return;
     {
@@ -362,6 +382,12 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     j.keyRequires15 = d->src->remoteKeyRequires15;
     j.materializedRunId = d->materializedRunId;
     j.member = d->src->member;
+    // ...and the recipe the PREVIEW was made under (protocol 11). The full
+    // frame is the same bytes read the same way at step 1, so it carries the
+    // same six numbers - without them a 4096x3000 raw opened at 1/3 and then
+    // never refined, because the follow-up was refused and the decimated doc
+    // stayed on screen as if it were the frame.
+    j.hasRecipe = rawWireOfSource(*d->src, j.recipe);
     // the full frame REPLACES the decimated one, so only the growth is new
     {
         size_t have = d->px().size() * sizeof(float);
@@ -479,6 +505,21 @@ static void pumpRemoteFetch() {
             S.remoteKeyLayout = d.keyLayout;
             S.remoteKeyRequires15 = d.keyRequires15;
             S.member = d.member;      // identity: a member is part of the tuple
+            // ...and the recipe, for identity's sake and M1's: the note already
+            // travelled verbatim from the head (above), so the sentence that
+            // declares the read is on this frame too - what was missing was the
+            // SOURCE fields srcIdentityKey's raw branch is built from.
+            if (d.hasRecipe) {
+                S.rawDtype = (int)d.recipe.dtype;
+                S.rawInterp = (int)d.recipe.interp;
+                S.rawOffset = (int)d.recipe.offset;
+                S.rawLE = (d.recipe.flags & rp::RW_LITTLE_ENDIAN) != 0;
+                S.srcW = (int)d.recipe.w; S.srcH = (int)d.recipe.h;
+                // the 1ch families are mosaiced, and the head says so: a stack
+                // whose frames disagreed about CFA would demosaic frame 1 and
+                // not frame 2 (openRemote makes the same call from the wire)
+                doc->cfa = rp::rawInterpCfa(d.recipe.interp);
+            }
             S.dtype = d.dtype;
             S.w = d.w; S.h = d.h; S.ch = d.ch;
             S.data = std::move(d.data);
