@@ -298,16 +298,41 @@ static int cjkFontSelftest() {
                 "pan-CJK - and C3's per-glyph half needs two files.");
             check(g_fontAtlasCost.faces <= 1 || g_fontChoice.path.empty(),
                   "C3 with no second face the atlas carries one face");
-            // The one thing that is pure here: a face is never merged onto
-            // itself, whatever the candidate list happens to contain.
-            for (const std::string& cand : jpFontCandidates())
-                if (cjkMergeFontPath(cand) == cand)
-                    check(false, "C3 a font must not be merged onto itself: " + cand);
+            // ...and the two PURE claims, which used to be written so that they
+            // could only ever fail and never report (review P3-17): a loop of
+            // `if (bad) check(false)` prints nothing at all when it is happy,
+            // so a reader could not tell it had run. Counted and asserted.
+            int selfMerged = 0;
+            std::string selfName;
+            std::vector<std::string> everything = jpFontCandidates();
+            for (const std::string& m : cjkMergeCandidates()) everything.push_back(m);
+            for (const std::string& cand : everything)
+                if (cjkMergeFontPath(cand) == cand) { selfMerged++; selfName = cand; }
+            check(selfMerged == 0,
+                  "C3 no font is ever merged onto itself (" +
+                  std::to_string((int)everything.size()) + " path(s) checked" +
+                  (selfName.empty() ? "" : ", first offender " + selfName) + ")");
+            // A Chinese face IS in the primary search now (review P2-8), so on
+            // a machine with one face it is either because the platform needs
+            // none or because none is installed - never because the list forgot
+            // to look. That is the thing worth pinning here.
+            check(cjkMergeFontPath(g_fontChoice.path).empty(),
+                  "C3 ...and the one-face state really is 'no second file "
+                  "available', not 'never asked'");
         } else {
+            // AT THE SIZE START-UP USED (review P2-10). These were 17.0f
+            // flat, so a run with --ui-scale 2 baked the probes at 17 px while
+            // the real atlas was at 34, every metric differed for a reason that
+            // is not the subject, and the order assertions failed on a
+            // perfectly correct merge.
+            const float px = 17.0f * (g_fontAtlasCost.fontScale > 0.0f
+                                          ? g_fontAtlasCost.fontScale : 1.0f);
+            say("probe atlases baked at " + fmtExact(px) + " px, which is what "
+                "start-up used");
             ImFontAtlas one, two;
-            ImFont* f1 = one.AddFontFromFileTTF(g_fontChoice.path.c_str(), 17.0f,
+            ImFont* f1 = one.AddFontFromFileTTF(g_fontChoice.path.c_str(), px,
                                                 nullptr, ranges.Data);
-            ImFont* f2 = two.AddFontFromFileTTF(g_fontMergePath.c_str(), 17.0f,
+            ImFont* f2 = two.AddFontFromFileTTF(g_fontMergePath.c_str(), px,
                                                 nullptr, ranges.Data);
             if (f1) one.Build();
             if (f2) two.Build();
@@ -463,50 +488,93 @@ static int cjkFontSelftest() {
               "C4 ...and the sentence never re-prints the name, escaped or not");
         check(note.find("appearance.fontPath") != std::string::npos,
               "C4 ...and it names the way out");
-        // The Messages door (板306 D), driven off app.imagesRev rather than off
-        // any one of the six places that push a document. Borrowed state is
-        // given back below: this suite shares one home with every other test.
+        // ---- the Messages door (板306 D), ONE LINE PER OPEN ----------------
+        // Driven off app.imagesRev rather than off any one of the six places
+        // that push a document, and grouped by BATCH because a batch is the
+        // program's own name for one open action. Borrowed state is given back
+        // at the end: this suite shares one home with every other test.
+        //
+        // A sweep does not report a batch that is still GROWING - one more
+        // sweep at the same size is what says the load has landed - so every
+        // case below sweeps twice, which is also what the frame loop does.
         const size_t logWas = app.msgLog.size();
         const uint64_t revWas = app.imagesRev;
-        {
+        auto sweep = [&]() { app.imagesRev++; undrawableReportNewDocs(); };
+        auto mkDoc = [&](const std::string& nm, int batchId, int seqId) {
             auto d = std::make_unique<ImageDoc>();
-            d->name = thai;
+            d->name = nm;
             d->src->w = 4; d->src->h = 4; d->src->ch = 1;
             d->src->dtype = "u16";
             d->uid = app.nextUid++;
+            d->batchId = batchId;
+            d->seqId = seqId;
             app.images.push_back(std::move(d));
-            app.imagesRev++;
-            undrawableReportNewDocs();
-            bool said = false;
-            for (size_t k = logWas; k < app.msgLog.size(); k++)
-                if (app.msgLog[k].text.find("no glyph in the font") != std::string::npos)
-                    said = true;
-            check(said, "C4 opening such a file leaves ONE line in Messages");
-            // ...and not a second one on the next sweep: a name is a property
-            // of the file, so repeating it would be noise about a fact that has
-            // not changed.
+        };
+        auto linesSince = [&](size_t from) {
+            std::vector<std::string> v;
+            for (size_t k = from; k < app.msgLog.size(); k++) v.push_back(app.msgLog[k].text);
+            return v;
+        };
+        {
+            mkDoc(thai, 101, 0);
+            sweep();                       // records the size, says nothing yet
+            sweep();                       // settled: now it reports
+            const std::vector<std::string> got = linesSince(logWas);
+            for (const std::string& l : got) say("msg: " + l);
+            check(got.size() == 1 && got[0].find("draw as '?'") != std::string::npos,
+                  "C4 one open of one such file leaves exactly ONE line");
+            // ...and not again. THE TRAP THIS AVOIDS (review P2-11): logMsg
+            // suppresses a line identical to the one before it, so an assertion
+            // that only swept again would pass even with the de-duplication
+            // removed. A DIFFERENT line goes in between, so the suppression
+            // under test is this function's and not logMsg's.
+            logMsg("cjkfont selftest marker", false);
             const size_t after = app.msgLog.size();
-            app.imagesRev++;
-            undrawableReportNewDocs();
+            sweep(); sweep();
             check(app.msgLog.size() == after,
-                  "C4 ...and not again for the same document");
-            // ...and not for a DIFFERENT document carrying the same name
-            // either. Two assertions rather than one because two mechanisms
-            // are doing the work: documents are examined once by uid (so a
-            // loading stack does not pay for a re-scan per frame), and the
-            // SENTENCE is kept once per name. Only this case reaches the second.
-            auto d2 = std::make_unique<ImageDoc>();
-            d2->name = thai;
-            d2->src->w = 4; d2->src->h = 4; d2->src->ch = 1;
-            d2->src->dtype = "u16";
-            d2->uid = app.nextUid++;
-            app.images.push_back(std::move(d2));
-            app.imagesRev++;
-            undrawableReportNewDocs();
-            check(app.msgLog.size() == after,
-                  "C4 ...nor for another document with the same name");
+                  "C4 ...and never again for that open (asserted past logMsg's "
+                  "own duplicate suppression)");
+        }
+        // ---- A STACK IS ONE LINE, NOT ONE PER FRAME (review P2-5) ----------
+        // THE DEFECT THIS REPLACES: a folder of 400 numbered frames is one
+        // gesture, and the per-document version wrote 400 lines into an
+        // app.msgLog capped at 300 - so the log that exists to diagnose this
+        // pushed out everything else in it, the start-up font messages
+        // included. Measured here with 40 members, which is already more than
+        // a tenth of the cap.
+        {
+            const size_t before = app.msgLog.size();
+            App::SeqInfo si;
+            si.id = app.nextSeqId++;
+            si.name = thai;                // the STACK's name is undrawable
+            app.seqs.push_back(si);
+            for (int k = 0; k < 40; k++)
+                mkDoc("frame_" + std::to_string(k) + ".npy", 102, si.id);
+            sweep(); sweep();
+            const std::vector<std::string> got = linesSince(before);
+            for (const std::string& l : got) say("msg: " + l);
+            check(got.size() == 1,
+                  "C4 a 40-frame stack leaves ONE line, not 40");
+            check(!got.empty() && got[0].find(thai) != std::string::npos,
+                  "C4 ...and it is the STACK's name, which is what the row draws");
+            // ...and when the FRAMES are the undrawable ones, the line says how
+            // many - that is the number that tells the user whether two ROWS or
+            // two FRAMES are the ambiguous pair.
+            const size_t before2 = app.msgLog.size();
+            App::SeqInfo si2;
+            si2.id = app.nextSeqId++;
+            si2.name = "plain_stack";      // the stack's own name is fine
+            app.seqs.push_back(si2);
+            for (int k = 0; k < 6; k++)
+                mkDoc(k < 2 ? thai : ("ok_" + std::to_string(k) + ".npy"), 103, si2.id);
+            sweep(); sweep();
+            const std::vector<std::string> got2 = linesSince(before2);
+            for (const std::string& l : got2) say("msg: " + l);
+            check(got2.size() == 1 && got2[0].find("2 of 6 frame(s)") != std::string::npos,
+                  "C4 ...and a stack whose FRAMES carry it says 2 of 6");
         }
         app.images.clear();
+        app.seqs.clear();
         app.imagesRev = revWas;
         app.msgLog.resize(logWas);
     }
@@ -515,19 +583,48 @@ static int cjkFontSelftest() {
     //  C5 - THE SEARCH, THE OVERRIDE, AND A REFUSAL THAT CAN BE ACTED ON
     // ======================================================================
     {
-        // The override wins, and it is what `how` says. Pointed at a file that
-        // certainly exists on every runner - this binary.
-        const std::string self = plugin_host::exeDir() + "/viewer";
-        std::string real = self;
+        // Its own directory, for --settings-selftest's recorded reason: the
+        // fixtures here are FONT files and a settings.jsonc, and anything
+        // written into the shared VIEWER_TEST_HOME is read by every test that
+        // runs after it and by every later run of the suite.
+        std::error_code ec0;
+        const std::filesystem::path root0 =
+            std::filesystem::temp_directory_path(ec0) / "viewer_cjkfont_fonts";
+        std::filesystem::remove_all(root0, ec0);
+        std::filesystem::create_directories(root0, ec0);
+        // ---- THE OVERRIDE IS CONSULTED BEFORE THE CANDIDATES ---------------
+        // This used to hand jpFontChoice the viewer BINARY and assert that it
+        // was accepted, which pinned the P1 defect as the specification: a
+        // file that is not a font was "usable", and a start-up that took it
+        // died with SIGSEGV inside ImFontAtlas::Build(). The intent was only
+        // ever "the override is looked at first", so that is what is asserted,
+        // with a REAL font - and the strongest form available: a font that is
+        // NOT the one the search would have picked on its own must win.
         std::error_code ec;
-        if (!std::filesystem::is_regular_file(pathFromUtf8(real), ec)) real = self + ".exe";
-        if (std::filesystem::is_regular_file(pathFromUtf8(real), ec)) {
-            const FontChoice c = jpFontChoice(real);
-            check(c.path == real && std::string(c.how) == "appearance.fontPath",
-                  "C5 the override is taken first, and says it was");
+        std::vector<std::string> realFonts;
+        for (const std::string& cand : jpFontCandidates())
+            if (jpFontChoice(cand).path == cand) realFonts.push_back(cand);
+        const std::string wouldPick = jpFontChoice(std::string()).path;
+        say("usable candidates on this machine: " + std::to_string(realFonts.size()) +
+            "; the search on its own picks " +
+            (wouldPick.empty() ? std::string("(nothing)") : wouldPick));
+        if (realFonts.size() >= 2) {
+            // The LAST usable candidate: the search alone would never return
+            // it, so taking it proves precedence rather than coincidence.
+            const std::string other = realFonts.back();
+            const FontChoice c = jpFontChoice(other);
+            check(c.path == other && std::string(c.how) == "appearance.fontPath" &&
+                  other != wouldPick,
+                  "C5 the override beats the candidate the search would pick");
+        } else if (realFonts.size() == 1) {
+            const FontChoice c = jpFontChoice(realFonts[0]);
+            check(c.path == realFonts[0] &&
+                  std::string(c.how) == "appearance.fontPath",
+                  "C5 the override is consulted first (one usable font here, so "
+                  "precedence over a SECOND one cannot be shown)");
         } else {
-            say("could not find this binary to use as an existing-file override; "
-                "C5's positive half is skipped and the negative half below ran.");
+            say("no usable font in the candidate list on this machine, so C5's "
+                "positive half cannot run - the negatives below did.");
         }
         // ...and when it misses it is still NAMED, so the refusal says "you
         // asked for this and it is not there" instead of listing four paths the
@@ -537,6 +634,107 @@ static int cjkFontSelftest() {
         check(!miss.tried.empty() && miss.tried[0] == nope,
               "C5 an override that misses is the first path in the record");
         check(miss.path != nope, "C5 ...and is not used");
+        // ---- A FILE THAT IS NOT A FONT (review P1) -------------------------
+        // THE ONE THAT CRASHED. AddFontFromFileTTF only reads bytes, so it
+        // returns non-null for a text file and the `if (!jp)` fallback never
+        // runs; the process then dies inside Build(), before openCrashFile()
+        // and the SIGSEGV handler exist, so there is not even a record.
+        // Measured before this was fixed: `viewer --no-window` exited 139 with
+        // nothing printed after the "ui scale:" line.
+        {
+            const std::string txt = (root0 / "not-a-font.txt").u8string();
+            {
+                std::ofstream f(pathFromUtf8(txt), std::ios::binary);
+                const std::string pad(400, 'x');   // over the >100 byte assert
+                f << "this is not a font\n" << pad;
+            }
+            check(!looksLikeSfnt(txt),
+                  "C5 a text file is not accepted as a font");
+            const FontChoice c = jpFontChoice(txt);
+            check(c.path != txt, "C5 ...so the override does not take it");
+            bool named = false;
+            for (const std::string& t : c.tried)
+                if (t.find("not-a-font.txt") != std::string::npos &&
+                    t.find("is not a font") != std::string::npos) named = true;
+            check(named,
+                  "C5 ...and the record says WHY, not just that it was tried");
+            // ...and the search still ends somewhere usable rather than being
+            // poisoned by the bad override.
+            check(c.path == wouldPick,
+                  "C5 ...and the search carries on to what it would have picked");
+            // A file with a CORRECT signature that stb_truetype cannot parse is
+            // a DIFFERENT failure and the signature check cannot see it: this
+            // is a well-formed sfnt header declaring zero tables, so
+            // stbtt_InitFont finds no cmap/head/hhea/hmtx and Build() returns
+            // false. That is the case CFF2 variable fonts hit for real, and it
+            // is why looksLikeSfnt() alone does not close the hole.
+            const std::string stub = (root0 / "signed-but-empty.ttf").u8string();
+            {
+                std::ofstream f(pathFromUtf8(stub), std::ios::binary);
+                const unsigned char hdr[12] = { 0x00,0x01,0x00,0x00, 0,0, 0,0, 0,0, 0,0 };
+                f.write((const char*)hdr, 12);
+                const std::string pad(400, '\0');
+                f.write(pad.data(), (std::streamsize)pad.size());
+            }
+            check(looksLikeSfnt(stub),
+                  "C5 a correct sfnt signature IS accepted by the signature check");
+            ImFontAtlas probe;
+            ImVector<ImWchar> r2;
+            cjkFontRanges(&probe, r2);
+            const bool added = probe.AddFontFromFileTTF(stub.c_str(), 17.0f,
+                                                        nullptr, r2.Data) != nullptr;
+            check(added,
+                  "C5 ...and ImGui ACCEPTS it, which is why the size check is "
+                  "not the guard either");
+            check(added && !probe.Build(),
+                  "C5 ...while Build() returns false - the signal start-up now "
+                  "acts on instead of discarding");
+            probe.Clear();
+            // The sentence that failure produces names the file and says what
+            // the user is looking at instead.
+            FontChoice bad;
+            bad.path = stub; bad.how = "appearance.fontPath";
+            const std::string unread = cjkFontUnreadableText(bad);
+            say("unreadable: " + unread);
+            check(unread.find(stub) != std::string::npos &&
+                  unread.find("built-in font") != std::string::npos &&
+                  unread.find("appearance.fontPath") != std::string::npos,
+                  "C5 ...and the message names the file, the fallback and the way out");
+        }
+        // ---- the Chinese face taken as PRIMARY (review P2-8) ---------------
+        // The merge candidates were only ever reachable as the SECOND face, so
+        // an English Windows with no Japanese pack had YaHei installed, unused,
+        // and not even listed in the refusal. It is taken now, and it is said.
+        {
+            bool inPrimary = false;
+            for (const std::string& m : cjkMergeCandidates()) {
+                const FontChoice c = jpFontChoice(std::string());
+                for (const std::string& t : c.tried) if (t == m) inPrimary = true;
+                // Only reachable when no Japanese face exists, which is not
+                // this machine - so what is asserted is the LIST, not the pick.
+                (void)c;
+            }
+            const std::vector<std::string> mc = cjkMergeCandidates();
+            say("Chinese faces this platform knows: " + std::to_string(mc.size()) +
+                (inPrimary ? " (reached as primary here)" : " (not reached here: a "
+                 "Japanese face was found first, which is the ordinary case)"));
+            FontChoice cn;
+            cn.path = mc.empty() ? "/some/Chinese.ttc" : mc[0];
+            cn.how = "Chinese face (no Japanese face on this machine)";
+            const std::string fb = cjkFontChineseFallbackText(cn);
+            say("chinese-fallback: " + fb);
+            check(fb.find(cn.path) != std::string::npos &&
+                  fb.find("Chinese glyph shapes") != std::string::npos &&
+                  fb.find("appearance.fontPath") != std::string::npos,
+                  "C5 the Chinese-primary sentence names the font and what it costs");
+            // ...and it is a DIFFERENT sentence from the other three, or the
+            // four failures would be one message wearing four hats.
+            FontChoice any; any.path = "/x.ttc"; any.how = "built-in candidate";
+            check(cjkFontMissingText(any) != cjkFontNoGlyphsText(any) &&
+                  cjkFontNoGlyphsText(any) != cjkFontUnreadableText(any) &&
+                  cjkFontUnreadableText(any) != cjkFontChineseFallbackText(any),
+                  "C5 ...and the four font failures are four different sentences");
+        }
         // The refusal carries every path that was looked at. Built from a
         // synthetic choice so the assertion does not depend on which paths
         // happen to exist here.
@@ -566,6 +764,7 @@ static int cjkFontSelftest() {
         // the refusal above would have nothing to print.
         check(jpFontCandidates().size() >= 3,
               "C5 this platform has a candidate list to look through");
+        std::filesystem::remove_all(root0, ec0);    // the fixtures are this test's
     }
 
     // ---- the settings key ---------------------------------------------------

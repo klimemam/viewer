@@ -84,7 +84,18 @@ static std::string fcMatchJpFont() {
 #if defined(_WIN32)
     return {};
 #else
-    FILE* p = popen("fc-match -f %{file} sans:lang=ja 2>/dev/null", "r");
+    // TIMED OUT (review P3-5). On a machine whose fontconfig cache is cold,
+    // fc-match scans every font on the disk and can take many seconds - and
+    // this runs while the window is being created, so the whole of that is a
+    // start-up with nothing on screen. `timeout` is coreutils and is not on
+    // every machine (macOS has none by default), so it is used only when it is
+    // there; without it the behaviour is exactly what it was.
+    // `if/else`, not `timeout ... || fc-match ...`: with the `||` a run that
+    // actually TIMED OUT (exit 124) would fall through to the untimed call and
+    // wait all over again, which is the opposite of the point.
+    FILE* p = popen("if command -v timeout >/dev/null 2>&1; then "
+                    "timeout 5 fc-match -f %{file} sans:lang=ja; else "
+                    "fc-match -f %{file} sans:lang=ja; fi 2>/dev/null", "r");
     if (!p) return {};
     char buf[1024] = { 0 };
     const size_t got = fread(buf, 1, sizeof buf - 1, p);
@@ -98,25 +109,84 @@ static std::string fcMatchJpFont() {
 #endif
 }
 
+// ---- IS THIS FILE A FONT? (review P1) --------------------------------------
+// "It exists and is a regular file" was the whole test, and it is not enough in
+// a way that takes the program out before it can say anything.
+//
+// MEASURED: point appearance.fontPath at a 175-byte text file and this build
+// exits 139 - SIGSEGV - having printed nothing after the "ui scale:" line.
+// AddFontFromFileTTF does not parse anything, it only reads the bytes, so it
+// returns NON-NULL and the `if (!jp)` fallback never runs. The break is inside
+// Build(): stbtt_GetFontOffsetForIndex answers -1, and with NDEBUG (a default
+// cmake build of this project sets no CMAKE_BUILD_TYPE, so the release
+// packages are where this bites) that -1 reaches stbtt_InitFont, whose
+// stbtt__find_table takes a stbtt_uint32 offset - so it reads at data + 4 GB.
+// All of this happens BEFORE openCrashFile() and the SIGSEGV handler are
+// installed, so there is no crash record either.
+//
+// And the value is reachable by hand: the Preferences box commits on every
+// keystroke and prefs.txt keeps it, so a user could put this machine into a
+// state where the application does not start and the only way back is to edit
+// a settings file - with the application that does not start.
+//
+// So the signature is checked. Four bytes, which is all an sfnt wrapper needs
+// to identify itself. This does NOT prove the font can be parsed - see the
+// Build() check in fontAtlasBake(), which is the other half of the same hole.
+static bool looksLikeSfnt(const std::string& p) {
+    std::ifstream f(pathFromUtf8(p), std::ios::binary);
+    if (!f) return false;
+    unsigned char b[4] = { 0, 0, 0, 0 };
+    f.read((char*)b, 4);
+    if (f.gcount() != 4) return false;
+    const uint32_t tag = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+    return tag == 0x00010000u ||     // TrueType outlines
+           tag == 0x74727565u ||     // 'true' - Apple's TrueType
+           tag == 0x4F54544Fu ||     // 'OTTO' - CFF outlines
+           tag == 0x74746366u ||     // 'ttcf' - a TrueType collection (.ttc)
+           tag == 0x74797031u;       // 'typ1' - a Type 1 housed in an sfnt
+}
+
 // `want` is the user's override (appearance.fontPath / prefs.txt `fontPath`),
 // empty when they have not set one. It is tried FIRST and it is not silently
 // dropped when it misses: it lands in `tried` like everything else, so the
 // refusal says "you asked for this and it is not there" rather than listing
-// four paths the user never mentioned.
+// four paths the user never mentioned - and a path that is there but is not a
+// font says THAT, which is a different sentence and a different mistake.
+static std::vector<std::string> cjkMergeCandidates();   // fwd: the Chinese faces
 static FontChoice jpFontChoice(const std::string& want) {
     FontChoice c;
     std::error_code ec;
-    auto usable = [&](const std::string& p) {
-        return !p.empty() && std::filesystem::is_regular_file(pathFromUtf8(p), ec);
-    };
-    if (!want.empty()) {
-        c.tried.push_back(want);
-        if (usable(want)) { c.path = want; c.how = "appearance.fontPath"; return c; }
-    }
-    for (const std::string& p : jpFontCandidates()) {
+    // Each attempt records WHY it failed, because "not found" and "found, not a
+    // font" send the user to two different places.
+    auto tryPath = [&](const std::string& p, const char* how) {
+        if (p.empty()) return false;
+        if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) {
+            c.tried.push_back(p);
+            return false;
+        }
+        if (!looksLikeSfnt(p)) {
+            c.tried.push_back(p + " (exists, but is not a font: no sfnt signature)");
+            return false;
+        }
         c.tried.push_back(p);
-        if (usable(p)) { c.path = p; c.how = "built-in candidate"; return c; }
-    }
+        c.path = p; c.how = how;
+        return true;
+    };
+    if (tryPath(want, "appearance.fontPath")) return c;
+    for (const std::string& p : jpFontCandidates())
+        if (tryPath(p, "built-in candidate")) return c;
+    // ---- the CHINESE faces, as a PRIMARY (review P2-8) ---------------------
+    // They were only ever reachable as the second face, so the machine this PR
+    // itself describes - an English Windows with no Japanese language pack -
+    // had Microsoft YaHei sitting there and drew nothing at all, and the
+    // refusal did not even list it. A Chinese face draws kana and the shared
+    // ideographs perfectly well; what it gets wrong is the VARIANT of some
+    // Japanese glyphs. That is much better than '?' for everything and much
+    // worse than being told about it - so it is taken, and it is NAMED
+    // (cjkFontChineseFallbackText, raised at start-up).
+    for (const std::string& p : cjkMergeCandidates())
+        if (tryPath(p, "Chinese face (no Japanese face on this machine)")) return c;
     if (std::string fc = fcMatchJpFont(); !fc.empty()) {
         c.tried.push_back("fc-match sans:lang=ja -> " + fc);
         c.path = fc; c.how = "fc-match";
@@ -128,26 +198,27 @@ static FontChoice jpFontChoice(const std::string& want) {
     return c;
 }
 
-// The SECOND face, merged on top of the first (板306 B). Windows only, and the
-// reason is a measurement rather than a preference: the cmap tables in
-// C:\Windows\Fonts say Meiryo holds 1819 of the 2500 common simplified-Chinese
-// characters (72.8%), and 测 (U+6D4B) and 试 (U+8BD5) - the two characters in
-// the word "test" - are in NONE of Meiryo, Yu Gothic, MS Gothic or
-// NotoSansJP-VF. Microsoft YaHei is the only font on a stock Windows that has
-// all 2500, so on Windows the simplified characters can only come from a second
-// file.
+// The CHINESE faces this platform is expected to have (板306 B). Named as a
+// list of its own because it has two uses now: the second face of the merge,
+// and - when no Japanese face is on the machine at all - the primary
+// (jpFontChoice, review P2-8).
+//
+// The reason a second file is needed on Windows is a measurement rather than a
+// preference: the cmap tables in C:\Windows\Fonts say Meiryo holds 1819 of the
+// 2500 common simplified-Chinese characters (72.8%), and 测 (U+6D4B) and 试
+// (U+8BD5) - the two characters in the word "test" - are in NONE of Meiryo, Yu
+// Gothic, MS Gothic or NotoSansJP-VF. Of the fonts on a stock Windows, the ones
+// that carry the whole 2500 are the CHINESE faces listed here; the Japanese
+// ones do not, which is the whole point.
 //
 // macOS has the same shape of gap for the same reason - Hiragino Kaku Gothic is
 // a Japanese face - and the same answer: Hiragino Sans GB (or PingFang SC) is
-// the Chinese face that ships with the system. Note that Hiragino Sans GB is
-// ALSO the third candidate in the primary list, which is what `primary` guards
-// against: a machine that had no Japanese face and fell through to it must not
-// then merge it onto itself.
+// the Chinese face that ships with the system.
 //
 // Linux needs no second file: Noto Sans CJK is one pan-CJK font, and even the
 // language-specific NotoSansCJK-JP-Regular.otf carries the whole ideograph set
 // (the JP/SC/TC builds differ in which VARIANT is default, not in coverage).
-static std::string cjkMergeFontPath(const std::string& primary) {
+static std::vector<std::string> cjkMergeCandidates() {
     static const char* merges[] = {
 #if defined(_WIN32)
         "C:\\Windows\\Fonts\\msyh.ttc",     // Microsoft YaHei
@@ -156,15 +227,24 @@ static std::string cjkMergeFontPath(const std::string& primary) {
 #elif defined(__APPLE__)
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/PingFang.ttc",
-#else
-        nullptr,
 #endif
+        nullptr,                            // so the array is never empty
     };
+    std::vector<std::string> out;
+    for (const char* m : merges)
+        if (m) out.push_back(m);
+    return out;
+}
+
+// ...and which one to MERGE on top of `primary`. `primary` is the face already
+// added, so a machine that had no Japanese face and fell through to a Chinese
+// one (above) does not then merge it onto itself.
+static std::string cjkMergeFontPath(const std::string& primary) {
     std::error_code ec;
-    for (const char* m : merges) {
-        if (!m) continue;
+    for (const std::string& m : cjkMergeCandidates()) {
         if (primary == m) continue;
-        if (std::filesystem::is_regular_file(pathFromUtf8(m), ec)) return m;
+        if (std::filesystem::is_regular_file(pathFromUtf8(m), ec) && looksLikeSfnt(m))
+            return m;
     }
     return {};
 }
@@ -250,10 +330,13 @@ std::string baseName(const std::string& p) {
 // A path on its way to the SCREEN. The bundled CJK font draws U+005C as the yen
 // sign - the JIS legacy - so a Windows path renders "C:(yen)Users(yen)hish".
 // Every candidate font does it (Meiryo, Yu Gothic, MS Gothic, Noto CJK JP), so
-// this is not one font's bug to route around, and there is no second font in
-// the atlas to fall back to: the CJK face IS the app's font, one base, no
-// merge. Dropping U+005C from its ranges would leave the glyph missing, not
-// borrowed - a '?' where the separator should be.
+// this is not one font's bug to route around. There IS a second face in the
+// atlas now (板306 B merges a Chinese font on Windows and macOS), and it does
+// not help here for two reasons: the merge is first-come-first-served, so
+// U+005C is claimed by the Japanese face before the second one is consulted,
+// and the Chinese faces draw the same JIS-legacy yen sign anyway. Dropping
+// U+005C from the ranges would leave the glyph missing rather than borrowed -
+// a '?' where the separator should be.
 //
 // So the separator is shown, not the codepoint. The app already normalises to
 // '/' everywhere it compares or joins paths (openPickerWith does it per file,
@@ -391,11 +474,16 @@ static void selftestSetEnv(const char* name, const char* value) {
 // while U+2014 next to it was missing. (U+29C9 stays an AddChar - it is in
 // Miscellaneous Technical, outside both blocks.)
 //
-// WHAT IS DELIBERATELY NOT HERE: Hangul. Measured on this machine, adding
-// GetGlyphRangesKorean takes the atlas from 3612 to 16185 glyphs - 4.5x - and
-// the texture from 1024x1024 to 2048x4096, i.e. 33.6 MB of RGBA and a startup
-// several times longer, for a script nobody has reported. It is a separate row
-// on the board, not a line here.
+// WHAT IS DELIBERATELY NOT HERE: Hangul, and the measurement is worth stating
+// exactly because the obvious version of it is wrong. Adding
+// GetGlyphRangesKorean takes the REQUESTED set from 5075 to 16298 code points -
+// 3.2x - while on this machine the glyphs baked do not move at all, staying at
+// 4963: neither Meiryo nor Microsoft YaHei has a Hangul glyph, so Windows would
+// pay the whole request and get nothing back. The atlas that really grows is
+// the one on a machine whose font HAS the syllables - Noto Sans CJK on Linux -
+// where 11k+ more glyphs have to be rasterised at start-up and the texture
+// grows with them. Either way it is cost for a script nobody has reported, so
+// it is a separate row on the board and not a line here.
 static void cjkFontRanges(ImFontAtlas* atlas, ImVector<ImWchar>& out) {
     ImFontGlyphRangesBuilder b;
     b.AddRanges(atlas->GetGlyphRangesJapanese());
@@ -457,6 +545,10 @@ struct FontAtlasCost {
     int faces = 0;              // 1, or 2 where a second face was merged on
     double buildMs = 0;
     float fontScale = 0;
+    // review P1: the chosen font had a correct sfnt signature and stb_truetype
+    // still could not parse it (CFF2 is the case with a name). The numbers
+    // above are then the BUILT-IN font's, because that is what got baked.
+    bool buildFailed = false;
 };
 static FontAtlasCost g_fontAtlasCost;
 
@@ -484,18 +576,61 @@ static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale) {
     for (int k = 0; k + 1 < ranges.Size && ranges[k]; k += 2)
         c.wantedCodepoints += (int)ranges[k + 1] - (int)ranges[k] + 1;
     const double t0 = nowSec();
-    a->Build();
+    // ---- THE RETURN VALUE IS THE OTHER HALF OF THE HOLE (review P1) --------
+    // Build() can FAIL, and it used to be discarded. It returns false whenever
+    // stb_truetype cannot parse a file that nevertheless has a correct sfnt
+    // signature, and the signature check in looksLikeSfnt() cannot see that:
+    // the case with a name is CFF2, the outline format of the current variable
+    // Noto CJK builds. An 'OTTO' file whose outlines live in a `CFF2` table has
+    // neither `glyf` nor `CFF `, stbtt_InitFont returns 0, and ImGui's own
+    // IM_ASSERT for it is compiled out of a release build - so the atlas came
+    // back EMPTY and every character in the program drew as nothing, with the
+    // failure reported nowhere.
+    //
+    // A failed Build also leaves the atlas half-initialised, so recovery is
+    // Clear() and start again from the built-in font - which has no CJK but
+    // does have ASCII, and an application that draws its own menus is one the
+    // user can use to fix this. The font that failed is NAMED: see
+    // cjkFontUnreadableText(), which is what start-up puts on screen.
+    const bool built = a->Build();
+    c.buildFailed = !built;
+    if (!built) {
+        fprintf(stderr, "font atlas: FAILED to build from %s - falling back to "
+                        "the built-in font (no CJK)\n",
+                g_fontChoice.path.empty() ? "(no font)" : g_fontChoice.path.c_str());
+        a->Clear();
+        // Clear() took the merged face with it, so the record has to stop
+        // claiming one - the line below prints this, and a log that said
+        // "+ msyh.ttc" after falling back to the built-in font would send the
+        // next reader looking for a merge that is not there.
+        g_fontMergePath.clear();
+        ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
+        a->AddFontDefault(&cfg);
+        if (!a->Build()) {
+            // The built-in font is compiled into the binary, so this cannot be
+            // a missing file. Saying so beats an empty atlas nobody can explain.
+            fprintf(stderr, "font atlas: the BUILT-IN font did not build either "
+                            "- text will not draw\n");
+        }
+    }
     c.buildMs = (nowSec() - t0) * 1000.0;
     for (ImFont* f : a->Fonts) c.bakedGlyphs += f->Glyphs.Size;
     c.texW = a->TexWidth; c.texH = a->TexHeight;
     c.faces = a->ConfigData.Size;
     g_fontAtlasCost = c;
+    // ...and WHICH FONT, on the same line (review P3-7). The merge has exactly
+    // one silent failure mode - the wrong face first - and this is the only
+    // place a log from a user's machine could ever show which files were in it.
     fprintf(stderr, "font atlas: %d glyph(s) of %d requested codepoint(s), "
                     "%dx%d px (%.1f MB RGBA), %d face(s), built in %.0f ms "
-                    "(font scale %.2f, kana %s)\n",
+                    "(font scale %.2f, kana %s) from %s [%s]%s%s\n",
             c.bakedGlyphs, c.wantedCodepoints, c.texW, c.texH,
             c.texW * (double)c.texH * 4.0 / 1048576.0, c.faces, c.buildMs,
-            fontScale, fontAtlasHasCjk() ? "present" : "MISSING");
+            fontScale, fontAtlasHasCjk() ? "present" : "MISSING",
+            g_fontChoice.path.empty() ? "(built-in font)" : g_fontChoice.path.c_str(),
+            g_fontChoice.how,
+            g_fontMergePath.empty() ? "" : " + ",
+            g_fontMergePath.empty() ? "" : g_fontMergePath.c_str());
 }
 
 // The refusal, with the paths in it (板306 C). "CJK font not found" was the
@@ -523,4 +658,36 @@ static std::string cjkFontNoGlyphsText(const FontChoice& c) {
            "those filenames will draw as '?': " + c.path + " (chosen by " +
            c.how + "). Set \"appearance.fontPath\" in settings.jsonc (or "
            "`fontPath` in prefs.txt) to a CJK font and restart.";
+}
+
+// ...and the THIRD failure (review P1 / P2-9), which is not "no font" and is
+// not "a font with no CJK": the file IS a font by its signature and
+// stb_truetype could not parse it. CFF2 - the outline format of the current
+// variable Noto CJK builds - is the case with a name. The whole atlas fails in
+// that case, so what the user is looking at is the built-in font: ASCII only,
+// no CJK, and every non-Latin character gone. Naming the file is the entire
+// value of this message, because nothing else on screen can point at it.
+static std::string cjkFontUnreadableText(const FontChoice& c) {
+    return "this font could not be read (the file is a font, but not in a "
+           "format this build can parse - a CFF2 variable font is the usual "
+           "case): " + (c.path.empty() ? std::string("(none)") : c.path) +
+           " (chosen by " + c.how + "). The built-in font is in use instead, so "
+           "only Latin text will draw. Point \"appearance.fontPath\" in "
+           "settings.jsonc (or `fontPath` in prefs.txt) at a .ttc/.ttf and "
+           "restart.";
+}
+
+// ...and the sentence for a machine with NO Japanese face, where a Chinese one
+// was taken as the primary (review P2-8). Not a refusal - the names will draw -
+// but it must not be silent: 板306 B exists precisely to keep Japanese glyphs
+// in a Japanese face, and this is the one path where that cannot be done.
+// Saying it is the difference between a known compromise and a typeface that
+// changed for reasons nobody can find.
+static std::string cjkFontChineseFallbackText(const FontChoice& c) {
+    return "no Japanese font was found on this machine, so " + c.path +
+           " - a Chinese face - is being used for everything. Japanese text "
+           "will draw in Chinese glyph shapes (the characters are right; some "
+           "of the forms are not). Point \"appearance.fontPath\" in "
+           "settings.jsonc (or `fontPath` in prefs.txt) at a Japanese font and "
+           "restart.";
 }

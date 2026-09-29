@@ -1253,13 +1253,32 @@ int main(int argc, char** argv) {
         io.Fonts->AddFontDefault(&cfg);
     }
     fontAtlasBake(fontRanges, fontScale);
-    // The refusals, AFTER the bake, because only the built atlas can tell the
-    // two apart: "no font at all" and "a font with no CJK in it" look the same
-    // from the candidate list and are different things to say. fc-match answers
-    // sans:lang=ja with DejaVu Sans on a machine that has no Japanese font, so
-    // the second case is not hypothetical - it is what the fallback produces.
-    if (!jp)                     toast(cjkFontMissingText(g_fontChoice), true);
-    else if (!fontAtlasHasCjk()) toast(cjkFontNoGlyphsText(g_fontChoice), true);
+    // ---- FOUR different things can have gone wrong, and they are four
+    // different sentences (review P1 / P2-8 / P2-9). AFTER the bake, because
+    // only the built atlas can tell some of them apart.
+    //
+    //  1. Nothing was found at all              -> the list of paths looked at.
+    //  2. A file WAS chosen and would not load  -> which file. (This used to
+    //     say "no CJK font found", which sent the reader to look for a font
+    //     they already had.)
+    //  3. It loaded and stb_truetype could not parse it -> which file, and that
+    //     only Latin will draw. CFF2 is the case with a name.
+    //  4. It parsed and simply has no CJK       -> which file. fc-match answers
+    //     sans:lang=ja with DejaVu Sans on a machine with no Japanese font, so
+    //     this is what the fallback actually produces on the Ubuntu runner.
+    if (!jp) {
+        if (g_fontChoice.path.empty()) toast(cjkFontMissingText(g_fontChoice), true);
+        else                           toast(cjkFontUnreadableText(g_fontChoice), true);
+    } else if (g_fontAtlasCost.buildFailed) {
+        toast(cjkFontUnreadableText(g_fontChoice), true);
+    } else if (!fontAtlasHasCjk()) {
+        toast(cjkFontNoGlyphsText(g_fontChoice), true);
+    } else if (strcmp(g_fontChoice.how, "Chinese face (no Japanese face on this machine)") == 0) {
+        // Not an error: the names DRAW. But 板306 B exists to keep Japanese
+        // glyphs in a Japanese face, and this is the one path where that is
+        // impossible - so it is said rather than left to be discovered.
+        toast(cjkFontChineseFallbackText(g_fontChoice), true);
+    }
     // ...and the settings file's refusal, held since loadSettings() because
     // that ran before there was a context to draw a toast in (see the function).
     // After the font toast, so that "your settings file would not parse" is the
