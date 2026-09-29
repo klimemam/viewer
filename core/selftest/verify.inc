@@ -3246,6 +3246,133 @@
                   "V28 the refusal names every mode, canonical spelling, no aliases");
         }
 
+        // ---- V29: WATCH's FINDING DOES NOT ADD A ROW ---------------------------
+        // The 2026-09-28 report, second half: 「reload で行が増えるのは嫌、もう少し
+        // 控えめな表示で知らせたい」. §5 used to draw the finding as an amber LINE
+        // under the stack's row, with a [Reload] beside it, and a second amber
+        // line under that when an automatic reload had run - so a poll that
+        // found a changed file inserted a row and every stack below it jumped,
+        // mid-read, because of something that happened on disk.
+        //
+        // The fix's claim is that NOTHING IS ADDED, and the only honest way to
+        // assert that is to measure the block: g_filesStackRowProbe records how
+        // many pixels one stack's rows occupied, so a line that comes back
+        // changes the number whatever the line says. The same probe carries the
+        // row's drawn LABEL (cut at "##" the way ImGui cuts it), which is where
+        // the finding went - #56's `rmark` is asserted the same way one report
+        // over.
+        //
+        // No poll, no worker and no filesystem: the finding is written onto the
+        // SeqInfo directly, which is exactly what watchIntegrate does with what
+        // a poll returned (--watch-selftest W18 owns the poll half). What is
+        // under test here is the DRAWING.
+        reload();
+        {
+            if (!needWindow("--verify-selftest (the Files row probe)")) return 1;
+            auto filesFrame = [&]() {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(520.0f, 700.0f), ImGuiCond_Always);
+                    ImGui::Begin("FilesRowProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawFileList();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            const int rs = app.seqs.empty() ? 0 : app.seqs[0].id;
+            auto rowOf = [&](int sid) -> const FilesStackRowProbe* {
+                for (const auto& r : g_filesStackRowProbe) if (r.seqId == sid) return &r;
+                return nullptr;
+            };
+            filesFrame();
+            const FilesStackRowProbe* r0 = rowOf(rs);
+            const float h0 = r0 ? r0->h : -1.0f;
+            const std::string lab0 = r0 ? r0->label : std::string();
+            check(rs != 0 && r0 && h0 > 0 && lab0.find("(changed") == std::string::npos,
+                  "V29 (setup) a quiet stack draws its rows and says nothing about disk");
+
+            // A CONFIRMED LOCAL FINDING, as watchIntegrate lands one.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->watchFound = watch::Finding{};
+                si->watchFound.changed = 1;
+                si->watchFound.firstChanged = "a_000.npy";
+                si->watchToasted = true;
+            }
+            check(seqWatchNote(rs) == "1 file(s) changed on disk (a_000.npy)",
+                  "V29b (setup) ...and the sentence §5 has always drawn is unchanged");
+            filesFrame();
+            const FilesStackRowProbe* r1 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 quiet h=%.1f \"%s\" -> finding h=%.1f "
+                            "\"%s\"\n", (double)h0, lab0.c_str(),
+                    r1 ? (double)r1->h : -1.0, r1 ? r1->label.c_str() : "");
+            check(r1 && r1->h == h0,
+                  "V29c a finding adds NO row: the stack's block is exactly as tall");
+            check(r1 && r1->label.find("(changed on disk)") != std::string::npos,
+                  "V29d ...it is a token on the row's own label instead");
+            // The SENTENCE is still reachable, in the two places a row keeps one.
+            const std::string tip = seqWatchTooltip(rs);
+            fprintf(stderr, "verifyselftest: V29 tooltip: %s\n", tip.c_str());
+            check(tip.find("1 file(s) changed on disk (a_000.npy)") != std::string::npos &&
+                      tip.find("right-click > Reload from disk") != std::string::npos,
+                  "V29e ...and the row's tooltip and menu carry the whole finding, with "
+                  "the gesture");
+
+            // ...and with §9's note ON TOP of it, which used to be the SECOND
+            // amber line. Still one block of the same height.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->autoReloadNote = "auto-reloaded 14:07:09 - reloaded 5 frame(s), 0 failed";
+                si->autoReloadWhen = "14:07";
+            }
+            filesFrame();
+            const FilesStackRowProbe* r2 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 + auto-reload note: h=%.1f \"%s\"\n",
+                    r2 ? (double)r2->h : -1.0, r2 ? r2->label.c_str() : "");
+            check(r2 && r2->h == h0,
+                  "V29f an automatic reload's note adds no row either");
+            check(r2 && r2->label.find("(auto-reloaded 14:07)") != std::string::npos,
+                  "V29g ...it is a second token, with the clock on it");
+            check(seqWatchTooltip(rs).find("auto-reloaded 14:07:09") != std::string::npos,
+                  "V29h ...and the sentence it is short for is in the tooltip");
+
+            // #56's token WINS: a stack of two generations is something already
+            // wrong with the numbers, and only one clause can come first.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->reloadFailed = 1;
+                si->reloadOk = 4;
+                si->reloadFirstErr = "a_003.npy: cannot read file";
+                si->reloadWhen = "2026-09-28 14:09:00";
+            }
+            filesFrame();
+            const FilesStackRowProbe* r3 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 + reload failure: h=%.1f \"%s\"\n",
+                    r3 ? (double)r3->h : -1.0, r3 ? r3->label.c_str() : "");
+            check(r3 && r3->h == h0 &&
+                      r3->label.find("(reload failed)") != std::string::npos &&
+                      r3->label.find("(changed on disk)") == std::string::npos,
+                  "V29i (reload failed) wins the row when both are true, still no row "
+                  "added");
+            check(seqReloadNote(rs).find("(reload failed)") == 0 &&
+                      !seqWatchTooltip(rs).empty(),
+                  "V29j ...and BOTH sentences are still reachable from the row");
+
+            // Borrowed state, given back: this stack is the next block's too.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->watchFound = watch::Finding{};
+                si->watchToasted = false;
+                si->autoReloadNote.clear();
+                si->autoReloadWhen.clear();
+                si->reloadFailed = si->reloadOk = 0;
+                si->reloadFirstErr.clear();
+                si->reloadWhen.clear();
+            }
+        }
+
         // ---- V26: the Messages panel past its own cap -------------------------
         // msgLog holds 300 and then drops from the front, so its SIZE is 300 for
         // message 300 and for message 3000 alike. The panel used to key its

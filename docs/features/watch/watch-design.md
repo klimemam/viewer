@@ -1,10 +1,16 @@
 # Watch 設計 — 元ファイルの変化を検知し、通知し、再読込する (項目20)
 
-> **現行状態 (2026-08-18):** ローカル／remote の変化検知と通知、手動 Reload、
+> **現行状態 (2026-09-29):** ローカル／remote の変化検知と通知、手動 Reload、
 > ローカル stack の opt-in Auto-reload、remote の手動 membership 再構築まで実装済み。
 > 意図して残る境界は「Watch: open new stacks」と remote Auto-reload の明示拒否である。
-> §11〜§16 は、実装時に設計を訂正した経緯を残す実装記録である。それ以前の「未着手」は後続節に
+> §11〜§17 は、実装時に設計を訂正した経緯を残す実装記録である。それ以前の「未着手」は後続節に
 > よって上書きされる。現行の受入れは `selftest.watch` / `selftest.rwatch` が担う。
+>
+> **§17 (2026-09-28 のユーザー報告2件) が §5 と §16.6 を訂正している。**
+> 通知面はもう「ヘッダ行直下の琥珀の1行 + [Reload]」ではなく**stack 行そのものの印**
+> (§5 は書き換え済み)、Reload はもう UI スレッドで走らない (§17)。
+> §13.6 / §15.7 / §16.6 の本文に残る「琥珀の行」「[Reload] ボタン」「UI スレッドが
+> 読み切るまで再描画しない」は、**その判断が下された時点の記録**としてそのまま置いてある。
 
 docs/reference-design.md の上に組む (前提: FrameSource、reload の walk =
 同書 §3.2、ステージ5 の手動 Reload)。意味論は確定済み (項目20、ユーザー決定
@@ -102,13 +108,55 @@ stack が3本開いていても LIST は1発)。
 
 ## 5. 通知面 — どこで言うか
 
-- **開いている stack**: Files のその stack のヘッダ行直下に琥珀の1行 +
-  [Reload] ボタン。文はローカル「3 file(s) changed on disk」/ リモート
-  「source changed on <host> (N files → M files / bytes / mtime のうち
-  言える事実)」/ 消えたものがあれば「2 file(s) no longer exist」。
-  この行は**消えない** (トーストは消える — `seqNote` の先例 5657-5659:
-  「A toast expires; "60 of 300" must not」)。加えて初回検知時にトースト1発。
+- **開いている stack**: **その stack の行そのもの**が通知面。行は増えない
+  (2026-09-28 のユーザー報告「reload で行が増えるのは嫌、もう少し控えめな
+  表示で知らせたい」)。内訳:
+  - 行ラベルに**印**が1つ付く (`seqWatchMark`) — `(changed on disk)` /
+    `(files gone)` / `(files appeared)` / リモートは `(changed on <host>)`。
+    節が複数ある finding でも印は1つだけで、順序は「先に手を打つべきもの」:
+    画素が動いた > ファイルが消えた > ファイルが現れた。#56 の
+    `(reload failed)` と両方立つときは **`(reload failed)` が勝つ**
+    (片方は「これから直すこと」、もう片方は「いま画面の数値が間違っている」)。
+  - 行の左端に**琥珀の縦バー** (draw-list、widget ではない — 行が最後の
+    item のままでないと右クリックメニューが別物に付く)。色は「一覧を全部
+    読まなくても見つかる」ための元の琥珀のまま。
+  - **文**は行が文を持つ2箇所に置く: 行の**ツールチップ**と**右クリック
+    メニュー**の `TextDisabled` 1行。文自体は変わっていない —
+    ローカル「3 file(s) changed on disk」/ リモート「source changed on
+    <host> (N file(s); a peer listing cannot say which)」/ 消えたものが
+    あれば「2 file(s) no longer exist」(`watch::findingText`)。
+    ツールチップは最後に**行う操作**で終わる: `right-click > Reload from disk`。
+  - **ボタンは置かない**。Reload は行の右クリックメニューの
+    「Reload from disk」— stack に対してできることは全部そこにある。行の下に
+    現れて消えるボタンは breadcrumb-as-buttons の失敗の再演。
+  加えて初回検知時にトースト1発 (Messages に残る) — これが唯一の一時通知。
   状態は `SeqInfo` に持つ (`WatchState`: 基線、candidate、確定した変化の要約)。
+- **印が消える条件は3つだけ**、そしてそれ以外では消えない (トーストは消える
+  — `seqNote` の先例 5657-5659: 「A toast expires; "60 of 300" must not」):
+  1. その stack の **Reload** — `watchReloadFinish` が `watchFound` を落とす。
+     クリックへの答えを2 poll 待たせないため、worker の気付きを待たずここで
+     落とす。
+  2. **worker が空の finding を post した** — ファイルが戻された、あるいは
+     Reload が1つ以上のメンバーを読み直したので (`reloadLand` が
+     `watchTargetsDirty` を立てる) 基線が再 seed された。
+  3. **close / reseat** (`SeqTable::reseat_`)。
+  そして**拒否があった Reload の後に何が見えるか**は、上の優先順位から
+  機械的に出る (実装の都合ではなく、これがそのまま規則):
+  - 拒否されたメンバーの基線は動いていないので、worker は次の round で
+    **同じ finding を返す** — 全メンバー拒否でも一部拒否でも。一部拒否なら
+    読めた分の基線は進むので finding は縮んで返る。
+  - しかし `reloadFailed > 0` の間、行の**印は `(reload failed)`** であって
+    Watch の印ではない (#56 が勝つ)。つまり「印が戻ってくる」ようには見えない。
+    消えたのは finding ではなく、行に出す1語の枠を #56 に譲っただけで、
+    **ツールチップとメニューには両方ある**。
+  - 行の**左端の琥珀バーは出たまま** (バーは `seqWatchMark` が空でないかだけを
+    見る)。だから「赤い枠 + 琥珀のバー」= 「世代が混ざっていて、かつディスクは
+    まだ動いている」が一目で読める。これを両方消すのは、全フレームが読めた
+    Reload 1回だけ。
+- **自動 Reload (§9) の記録**も行の印: `(auto-reloaded HH:MM)`
+  (`seqAutoReloadMark`)。文は `SeqInfo::autoReloadNote` のままで、行の
+  ツールチップとメニューに出る。消すのはメニューの
+  「Clear auto-reload note」(以前は琥珀行の上の小さな `x`)。
 - **Browse インスタンス**: 通知ではなく**listing がそのまま新しくなる**
   (ポーリング = refresh。listing は測定結果ではないので、個別通知を出さず
   更新してよい — rev 機構が選択の誤爆を防いでいる)。
@@ -646,13 +694,17 @@ n/N (§12.4)、**再構築は stack を空にしない** (§12.5)。自動用に
 差し替えること**がこの段が持ち込みうる唯一の「後から画面を見ても分からない」
 故障なので、決めて書く:
 
-- **待つ** (`watchAutoBusy`)。中断もせず、並走もしない。琥珀の行は
-  出たまま、Files には「auto-reload is waiting: <理由>」が付き、
-  仕事が終わった後のフレームで実行される。
+- **待つ** (`watchAutoBusy`)。中断もせず、並走もしない。行の印は
+  出たまま、行のツールチップとメニューに「auto-reload is waiting: <理由>」が
+  付き、仕事が終わった後のフレームで実行される (§5 の折り畳み後: 以前は
+  琥珀の行の右に出ていた)。
 - 待つ対象: この stack の server σ_t (A/B 両方)、この stack の frame
   average 待ち、この stack へのローダ、measure ワーカーの在庫 (`mPending`)、
   full-res fetch (`rfPending`)、ROI/注釈のドラッグ (`annBusy` ——
-  temporal_model.inc が既に同じ理由で自分の再計算を止めている先例)。
+  temporal_model.inc が既に同じ理由で自分の再計算を止めている先例)、
+  そして **`app.reloadJob` —— Reload 自身** (§17 で worker になった。
+  同時に走るのは1本だけで、理由はここに何かが1本しかない理由と同じ:
+  2スレッドから1つの source registry に着地させないため)。
 - **待って安全な理由**: 上のどれもメインループの `busy`/`working` 項であり、
   仕事が終わるフレームは必ず起きる。だから覚えておく必要が無く、
   忘れることもできない。
@@ -695,8 +747,8 @@ n/N (§12.4)、**再構築は stack を空にしない** (§12.5)。自動用に
   `n of N`。
 
 「後から数字が動いたことに気付く」経路は結果として4本ある:
-Files のこの琥珀行 / Messages の同じ文 / Files 行の `n of N` /
-`(reload failed)` マーク。
+Files 行の `(auto-reloaded HH:MM)` 印 (とそのツールチップ／メニューの文) /
+Messages の同じ文 / Files 行の `n of N` / `(reload failed)` マーク。
 
 ### 15.7 リモートには**届かない**、と画面と本書が言う
 
@@ -970,3 +1022,117 @@ over the link - Reload it by hand`。
 項目20 の残りは **§5 の「Watch: open new stacks」** (#47 の Browse 設計待ち)
 のみ。§16.6 が書いた「リモート Reload の非同期化 → 自動をリンクへ」は
 項目20 ではなく、その判断が要るときに別項目として起こす。
+
+## 17. 2026-09-28 のユーザー報告2件 —— Reload を UI スレッドから外し、§5 を行へ折り畳む
+
+報告は2つ。同じ操作についての、別々の不満である。
+
+- 「reload を押すと応答なしになる」
+- 「reload で行が増えるのは嫌、もう少し控えめな表示で知らせたい」
+
+### 17.1 応答なし —— 真因は「1 stack = F 回のファイル読み」
+
+Reload の全ジェスチャ (§5 の行のボタン、行の右クリック > Reload from disk、
+frame メニューの Reload、§9 の `watchAutoDrain`) が `reloadSource` を
+**UI スレッドで直列に**走らせていた。1 source ぶんの中身は stat → ファイル
+全読み → decode → (frame 軸メンバーなら**自分のフレームをもう1回** decode)
+→ `cropInPlace` → `computeMinMax`。そして **frame 軸の単一ファイル stack は
+1フレーム = 1 FrameSource** なので、`reloadStackFromDisk` はその全部を
+**メンバーごとに繰り返す**。480 MB の .npy を4フレームで開いた stack の
+Reload は、**ファイル全読み4回と decode 8回**、その間ずっと再描画なし。
+
+これは issue #232 stage 2 が open について直した病理 (V22f) そのもので、
+reload には手が入っていなかった。
+
+### 17.2 直し方 —— #266 の形をそのまま使う
+
+新しい機構は作らない。`App::ReloadJob` は `App::OpenJob` の形
+(1本だけ、前に queue、cancel フラグ、経過秒がそのまま進捗)。
+
+    reloadSpecOf       これらの画素が「何であるか」を UI スレッドで値コピー。
+                       worker は生きた FrameSource を読んではいけない ——
+                       walk と registry がまさにそのフィールドを書き換える。
+    reloadDecodeGroup  stat / bytes / decode / crop / 測定。純粋。**1回の
+                       読みで足りる membership の GROUP** を取る: 同じ
+                       (file, member, npyRead) は 1 stat + 1 read + 1 decode。
+                       `npyDecodeFrames` / `picDecodeAll` に `wanted` フレーム
+                       集合を足したので、120 フレーム配列の3フレーム部分 stack は
+                       3つしか decode せず、frame 7 のために frame 0 を
+                       decode することもなくなった (枚数はヘッダから取る)。
+    reloadLand         dims note / 新 registry key / `g_srcRegMtx` 下の swap /
+                       Watch 基線の再 seed / §3.2 の walk。全部が共有状態なので
+                       全部が UI スレッド。
+    reloadSource       **シグネチャは不変、同期の扉のまま** (capture → decode
+                       → land)。既存の呼び手と `core/selftest/reload.inc` は
+                       1行も変わらない。`openLocalLand(pre == nullptr)` の先例。
+
+`reloadStackFromDisk` も同じ形に3分割した: `reloadStackPlan` (§6 の
+membership と departures) / ループ / `reloadStackTail` (arrivals、seqIndex
+振り直し、#56 の latch、要約文)。**両方の扉が1つの plan、1つの要約、
+1組の §12/§13 判断を通る** —— §15.1 が禁じた「2本目の reload 経路」に
+ならないのはこのためである。
+
+この feature 固有の決定は4つ:
+
+- **着地は1フレームに1件**。12フレームを1回の着地で入れ替えたら、freeze が
+  読みから swap へ移るだけ (着地ごとに `app.images` を歩き、source を key に
+  持つキャッシュを全部外し、texture を dirty にする)。だから Files の行は
+  open の「phase」ではなく**本当の分数** `reloading <stack>: 3 / 12` を出す。
+- **Stop は着地した分を残す** —— OpenJob の「Stop は何も残さない」の逆で、
+  これは理由がある: 着地したフレームは**いまディスクにあるものの完全な
+  ドキュメント**であり、取り消すには古い画素を取りに元ファイルをもう一度
+  読むことになる。残るのは「2つの時点が混ざった stack」で、それはまさに
+  #56 の印が言うことなので、印を立てて要約は `stopped after n of N` と言う。
+- **peer は worker 自身の Session** (`rfWorker` の形)。`app.uiSession` は UI
+  スレッドのもので他の誰のものでもない (state.h の所有権注記)。1回だけ
+  dial し、リンクが落ちたら**掛け直さない** —— latch は1つで、
+  handed-in resolver 側にも効く。常駐40枚の peer stack が40回の接続
+  タイムアウトでリンクの死を発見する、ということが起きない。
+- **§6 の arrivals は動かさない**、そしてそれを隠さずに書く。参加する
+  frame は**参照フレームの現在の形**に対して測るのが §6 で、その形は
+  最後の item が着地するまで存在しない。だから「ファイルが増えたフォルダの
+  Reload」は、その**1ファイル**をいまも UI スレッドで decode する。
+  報告の原因だった F メンバーの再読みはその手前にいた部分で、そこが動いた。
+
+### 17.3 §16.6 の再検討条件は、半分だけ満たされた
+
+§16.6 は「リモート Reload がメインループを止めない形になったとき、自動を
+リンクへ渡す項は落とせる」と書き、しかもその形を「`reloadStackFromDisk` が
+2本になるから §16 の範囲ではない」と断っていた。**2本にはならなかった**
+(§17.2 の3分割) ので、止めない形はできた。
+
+それでも `watchAutoRefusal` の peer 項は**残す**。§16.6 の理由は2つあり、
+尽きたのは片方だけである:
+
+- **尽きた**: 「UI スレッドが読み切るまで再描画しない」。もう誰のスレッドも
+  読み切らない (`--rwatch-selftest` R23 が、peer stack の Reload が別スレッドで
+  走ることを実測で押さえている)。
+- **尽きていない**: 「往復40回とフォルダ1つ分の画素を、**誰もクリックせずに**、
+  peer のフォルダが落ち着くたびに繰り返しうる」。これは帯域と peer の負荷の
+  話で、スレッドの話ではない。
+
+したがって項を落とすかどうかは**別の判断**であり、この変更には含めない。
+画面の文もそのまま:
+`- auto-reload cannot: these frames come back over the link - Reload it by hand`。
+
+### 17.4 §5 を行へ折り畳む —— 「行が増えるのは嫌」
+
+§5 は書き換え済み。ここには**なぜ**だけを残す。3つの帰結があり、ユーザーが
+名指したのは1つ目である。
+
+- **一覧が動いた**。変化を見つけた poll が行を1つ挿し、Auto-reload ON なら
+  2つ挿す。だからディスクで起きたことのせいで、読んでいる途中に下の stack が
+  全部飛ぶ。読んでいるものを並べ替える通知は、何と書いてあろうと控えめでは
+  ない。
+- **同じことを2回言っていた**。stack にはもう行があり、その行は #56 が
+  教えた印をすでに載せている。
+- **ボタンが3つ目の Reload だった**。「Reload from disk」は行の右クリック
+  メニューにあり、stack に対してできることは全部そこにある。行の下に出たり
+  消えたりするボタンは breadcrumb-as-buttons の失敗の再演である。
+
+受入れは**描いたものを測る**形にした (`g_filesStackRowProbe`):
+`--verify-selftest` V29 は 1 stack のブロックの**高さ (px)** を記録し、
+finding を載せても、§9 の note を載せても、#56 の失敗を載せても
+**高さが変わらない** ことを assert する。行を戻す退行は、その行に何と
+書いてあっても数値を動かす。印そのものは `--watch-selftest` W18d-g / W20c-d と
+`--rwatch-selftest` R6f-g が文字列で押さえる (`findingText` の規律を1段上へ)。

@@ -315,11 +315,13 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Re-read the folders behind the open stacks every few\n"
                               "seconds and SAY when a file has changed, appeared or\n"
-                              "gone - under the stack's row in Files, in amber, with a\n"
-                              "Reload beside it.\n\n"
+                              "gone - as a token on that stack's own row in Files\n"
+                              "((changed on disk)) with an amber bar down its edge.\n"
+                              "The row's tooltip and its right-click menu say the\n"
+                              "whole finding; nothing is added to the list.\n\n"
                               "By itself this changes nothing: what is on screen is what\n"
-                              "was measured until you press that Reload, or until you\n"
-                              "switch the item below on.");
+                              "was measured until you right-click > Reload from disk,\n"
+                              "or until you switch the item below on.");
         // ---- §9: the narrower switch, and the ONLY one that acts -------------
         // Default OFF and deliberately not the same item: what is above notices,
         // this acts. Under it in the menu because it is under it in fact - with
@@ -331,8 +333,9 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "OFF by default. With it on, a stack whose files have settled at a\n"
-                "new state is re-read WITHOUT a click - the same Reload the amber\n"
-                "line offers, run for you one frame after the line appears.\n\n"
+                "new state is re-read WITHOUT a click - the same Reload from disk\n"
+                "the row's menu offers, run for you one frame after the finding\n"
+                "appears on the row.\n\n"
                 "What it does not do:\n"
                 "  - it never touches a stack whose pixels are the peer's (re-open\n"
                 "    the folder from Browse for those);\n"
@@ -340,9 +343,10 @@ static void drawMenuBar(GLFWwindow* win) {
                 "    rather than moving the pixels under the answer;\n"
                 "  - after a reload that refuses a member it stops for that stack\n"
                 "    and leaves it to you.\n\n"
-                "Every automatic reload leaves a line on the stack in Files saying\n"
-                "what it did and when, and the same sentence in Messages. Nothing\n"
-                "here expires.");
+                "Every automatic reload leaves an (auto-reloaded HH:MM) token on the\n"
+                "stack's row in Files - its tooltip and its menu say what it did -\n"
+                "and the same sentence in Messages. Nothing here expires; the row's\n"
+                "menu has \"Clear auto-reload note\" when you have read it.");
         ImGui::Separator();
 #if defined(__APPLE__)
         if (ImGui::MenuItem("Quit", "Cmd+Q")) glfwSetWindowShouldClose(win, 1);

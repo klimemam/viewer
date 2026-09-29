@@ -396,6 +396,25 @@
             App::SeqInfo* si = seqInfo(seq);
             check(si && si->watchToasted && si->watchFound.changed == 1,
                   "W18c ...and the one toast (§5) has fired, once");
+            // ---- W18d-g: §5 FOLDED - the row is the notification -------------
+            // The 2026-09-28 report 「reload で行が増えるのは嫌」. The sentence
+            // above is unchanged and is still what everything is built from;
+            // what changed is WHERE it is drawn. These are the two new guard
+            // strings (seqWatchNote's discipline: the panel draws exactly this
+            // and this test asserts exactly this), and --verify-selftest V29 is
+            // the other half - it measures the drawn block and holds down that
+            // no row was added.
+            check(seqWatchMark(seq) == "  (changed on disk)",
+                  "W18d the stack ROW's token, beside #56's, not a line of its own");
+            const std::string tip = seqWatchTooltip(seq);
+            fprintf(stderr, "watchselftest: W18 tooltip: %s\n", tip.c_str());
+            check(tip.find("1 file(s) changed on disk (w_002.npy)") != std::string::npos,
+                  "W18e ...and the row's tooltip carries the WHOLE finding");
+            check(tip.find("right-click > Reload from disk") != std::string::npos,
+                  "W18f ...ending with the gesture, now that no button sits under "
+                  "the row");
+            check(seqAutoReloadMark(seq).empty(),
+                  "W18g ...and nothing automatic has run, so there is no second token");
         }
         {   // ---- W19: Reload clears it, and the worker agrees on its own --------
             // The pixels are re-read, so reloadSource re-stats the file and
@@ -426,6 +445,15 @@
                     "1 file(s) appeared in the folder (w_005.npy), "
                     "1 file(s) no longer exist (w_004.npy)",
                   "W20b the second poll names both, in one line");
+            // ONE clause on the row, by precedence, and the tooltip keeps both:
+            // a token that grew to three clauses would be the amber line again,
+            // in a narrower column. A file that is GONE changes what the stack
+            // IS, so it comes before one that appeared and may not even join it.
+            check(seqWatchMark(seq) == "  (files gone)",
+                  "W20c the ROW's token states the one that matters most of the two");
+            check(seqWatchTooltip(seq).find("1 file(s) appeared in the folder "
+                                            "(w_005.npy)") != std::string::npos,
+                  "W20d ...while the tooltip still names both");
         }
         {   // ---- W21: mtime BACKWARDS on the real filesystem ---------------------
             // The same bytes with an older timestamp: a restore from backup. The

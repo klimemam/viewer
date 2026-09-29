@@ -904,6 +904,95 @@ static std::string seqWatchNote(int seqId) {
     return watch::findingText(si->watchFound);
 }
 
+// ---- §5, folded: THE ROW IS THE NOTIFICATION ---------------------------------
+// The second 2026-09-28 report: 「reload で行が増えるのは嫌、もう少し控えめな表示
+// で知らせたい」. §5 used to put the sentence above on its own AMBER LINE under
+// the stack's header, with a [Reload] button beside it and, with Auto-reload on,
+// a second line under that. Three consequences, and the user named the first:
+//
+//   THE LIST MOVED. A poll that found a changed file inserted a row, and with
+//   Auto-reload on it inserted two - so every stack below jumped, mid-read,
+//   because of something that happened on disk. A notification that rearranges
+//   what you are reading is not subtle, whatever it says.
+//
+//   IT SAID THE SAME THING TWICE. The stack already had a row, and that row
+//   already carries the marks this feature's sibling (#56) taught it to carry.
+//
+//   AND THE BUTTON WAS A THIRD WAY TO RELOAD. "Reload from disk" is in the
+//   row's own right-click menu, where every other thing you can do to a stack
+//   is, and a button that appears and disappears under a row is the
+//   breadcrumb-as-buttons failure again.
+//
+// So the finding goes ON the row, as a token beside #56's: the row that was
+// already there says one more thing about itself, nothing moves, and the SENTENCE
+// lives in the two places a row keeps a sentence - its tooltip and its menu.
+//
+// These three functions are THE guard for all of it, findingText's discipline
+// one layer up: the panel draws exactly these strings and --watch-selftest
+// asserts exactly these strings, so there is no second opinion to drift.
+// seqWatchNote / watchActionText / watchAutoNote above are untouched - they are
+// still what the sentence is BUILT from.
+
+// The TOKEN: a word, for the one surface that has room for a word. "" = this
+// stack has nothing to say. Leading spaces like (reload failed)'s, so it sits
+// off the name.
+//
+// ONE clause, by precedence, and the tooltip carries the rest: a token that
+// grew to three clauses would be the amber line again, in a narrower column.
+// The order is what a reader has to act on first - pixels that have moved make
+// every number on screen stale, a file that is gone changes what the stack IS,
+// and a file that appeared may not even join it (§11.4).
+static std::string seqWatchMark(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || !si->watchFound.any()) return {};
+    const watch::Finding& f = si->watchFound;
+    // The PEER's own clause first, because it is the one that names a machine:
+    // an aggregated listing cannot say WHICH member moved (Finding::srcMoved),
+    // so the token says where rather than how many.
+    if (f.srcMoved) return "  (changed on " + (f.host.empty() ? "the peer" : f.host) + ")";
+    if (f.changed)  return "  (changed on disk)";
+    if (f.vanished) return "  (files gone)";
+    if (f.appeared) return "  (files appeared)";
+    return {};
+}
+
+// ...and what an AUTOMATIC reload already DID, as a token. §9's rule 3 is
+// "louder, never quieter", and this is the part of it that has to outlive the
+// toast: the only durable answer to "these numbers are not the ones I was
+// reading a minute ago". The clock is SeqInfo::autoReloadWhen, kept beside the
+// note rather than parsed back out of it.
+static std::string seqAutoReloadMark(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || si->autoReloadNote.empty()) return {};
+    return si->autoReloadWhen.empty() ? std::string("  (auto-reloaded)")
+                                      : "  (auto-reloaded " + si->autoReloadWhen + ")";
+}
+
+// The SENTENCE, for the two surfaces that have room for one: the row's tooltip
+// and its right-click menu. The whole finding, then what the program is about
+// to do or cannot do about it, then what an automatic reload already did - the
+// three strings §5 used to draw on two lines, in that order, and then the
+// gesture that acts on it. "" = nothing to say.
+static std::string seqWatchTooltip(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return {};
+    std::string s = seqWatchNote(seqId);
+    if (!s.empty()) {
+        // What to DO about it. watchAutoNote when §9 has something to say
+        // (it is about this program's next move), watchActionText otherwise -
+        // the same fork the amber line made, asked of the STACK rather than of
+        // the finding's origin (§16).
+        const std::string an = watchAutoNote(seqId);
+        s += an.empty() ? std::string(watchActionText(seqId)) : an;
+        // ...and where the gesture IS, now that there is no button under the
+        // row. The menu is where every other thing you can do to a stack lives.
+        if (watchReloadOffered(seqId)) s += "\nright-click > Reload from disk";
+    }
+    if (!si->autoReloadNote.empty())
+        s += (s.empty() ? "" : "\n") + si->autoReloadNote;
+    return s;
+}
+
 // What a finding DOES once it reaches the UI thread: the summary lands on the
 // stack, and the one toast fires. Split out of pumpWatch so --watch-selftest can
 // drive the poll itself and still go through the one function that puts a

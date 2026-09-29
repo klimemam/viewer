@@ -301,6 +301,17 @@
             // would be a claim the group row never made.
             check(seqWatchNote(seq).find("changed on disk") == std::string::npos,
                   "R6d ...and it is NOT the local sentence, which counts files");
+            // §5 FOLDED (the 2026-09-28 report): the ROW's token for a peer's
+            // finding names the MACHINE rather than a count, for the honesty
+            // constraint above - an aggregated listing cannot say which member
+            // moved, so the one word it has room for is where.
+            fprintf(stderr, "rwatchselftest: R6 row token: \"%s\"\n",
+                    seqWatchMark(seq).c_str());
+            check(seqWatchMark(seq) == "  (changed on this machine)",
+                  "R6f the ROW's token names the peer, never a file count");
+            check(seqWatchTooltip(seq).find("a peer listing cannot say which") !=
+                      std::string::npos,
+                  "R6g ...and the tooltip keeps the whole hedge with it");
             const bool s3 = poll();
             check(!s3 && seqWatchNote(seq) ==
                     "source changed on this machine "
