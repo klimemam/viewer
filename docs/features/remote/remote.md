@@ -335,8 +335,10 @@ viewer ssh://user@host/data/run42
   毎回 assert します。GUI の `viewer` は GLFW / X11 / Wayland のヘッダが要るので Ubuntu 20.04
   コンテナのまま(2.31 = Ubuntu 20.04 / Debian 11 / RHEL 9 以降)です。
   古すぎるホストでは自動導入が
-  `viewer-serve needs GLIBC_2.29 but this host has ldd (GNU libc) 2.28` の **1 行**を返します
-  —— 足りない版とホストの版の両方を、ホスト名を聞き返さずに言うためです
+  `viewer-serve needs GLIBC_2.17 but this host has ldd (GNU libc) 2.12` の **1 行**を返します
+  —— 足りない版とホストの版の両方を、ホスト名を聞き返さずに言うためです。
+  この行は **glibc が本当の原因のときだけ**で、`$HOME` が `noexec` / mode 644 / 別 arch /
+  途中で切れたファイルのときはローダ自身の言葉をそのまま返します
   ([issue #268](https://github.com/klimemam/viewer/issues/268)、
   [startup §0](../../guides/startup.md#linux-配布物が動く範囲要求-glibc))。
 - `~/.ssh/config` の Host エイリアスがそのまま使えます(`ssh://dev-box/data/run42`)。

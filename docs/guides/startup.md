@@ -41,11 +41,22 @@ CI は peer(`viewer-serve` と `plugins/*.so`)を manylinux2014 コンテナ(Cen
 GUI を Ubuntu 20.04 コンテナで組み、それぞれの要求 glibc を毎回 assert しています。
 GUI は GLFW / X11 / Wayland のヘッダが要るので CentOS 7 では組めません。
 
-要求より古いホストに置くと `version 'GLIBC_2.29' not found` で起動しません。
-**どちらの版が足りないかは機械が言います** —— `./update.sh` は更新後に peer を起動して、
-失敗したら `viewer-serve needs GLIBC_2.29 but this host has ldd (GNU libc) 2.28` の
-1 行を出します(リモート接続時の自動導入も同じ 1 行を返します。
-[issue #268](https://github.com/klimemam/viewer/issues/268))。
+要求より古いホストに置くと `version 'GLIBC_2.17' not found` で起動しません(peer の場合。
+GUI なら `GLIBC_2.31`)。**どちらの版が足りないかは機械が言います** —— `./update.sh` は
+更新後に peer を起動して、失敗したらこの 3 行を出します(リモート接続時の自動導入も
+同じ 1 行目を返します。[issue #268](https://github.com/klimemam/viewer/issues/268)):
+
+```
+~/.viewer/viewer-serve needs GLIBC_2.17 but this host has ldd (GNU libc) 2.12
+  /home/u/.viewer/viewer-serve: /lib64/libm.so.6: version `GLIBC_2.17' not found
+  the files ARE updated; this build cannot run here. Report that line.
+```
+
+この **`needs ...` の行は glibc が本当の原因のときだけ**出ます。起動しない理由が
+別にあるとき —— `$HOME` が `noexec`、mode 644、別 arch のバイナリ(x86_64 のビルドを
+aarch64 のホストに置いた)、途中で切れたファイル —— は版数の話にすり替えず、
+ローダ自身の言葉と `this build is for x86_64, this host is aarch64` のような
+事実をそのまま出します。**報告は出た行をそのまま貼ってください。**
 
 ### `./update.sh` が更新するのは**このフォルダ**で、`~/.viewer/` ではない
 
@@ -60,9 +71,21 @@ update は成功し、viewer は古い peer を起動し続けます([#268](http
 ./update.sh --peer   # ...を ~/.viewer/viewer-serve と ~/.viewer/plugins/ へ入れる
 ```
 
-`--peer` は**いま手元の木にあるもの**を入れます(fetch はしません)。だから
-`./update.sh --fetch binaries-pr64 && ./update.sh --peer` でその branch の peer を
+`--peer` は**いま手元の木にあるもの**を入れます(fetch はしません)。つまり
+`./update.sh` の**あとに走らせる 2 回目**で、`./update.sh` に足すフラグではありません。
+だから `./update.sh --fetch binaries-pr64 && ./update.sh --peer` でその branch の peer を
 試せます。差があるときは `./update.sh` が自分で `--peer` を促します。
+
+`~/.viewer/plugins/` は**出荷セットに揃えます** —— いまのビルドに無い `.so` は
+消し、消したものを 1 行ずつ名指しします。peer は `~/.viewer/plugins` の `.so` を
+**全部** `dlopen` するので、古い版が 1 つ残っているだけで「peer は起動するのに
+サーバ側の解析だけが落ちる」になります(実例: 以前の `analyzer_stats.so` が
+`GLIBC_2.29` を要求していた)。
+
+入れ替えたあと**再起動や再ビルドは要りません**が、**すでに接続している viewer は
+自分が起動した peer を持ち続けます** —— 接続ごとに `~/.viewer/viewer-serve` を 1 回
+exec し、リンクが生きている間そのプロセスを保持するからです。新しい peer が使われるのは
+**次の接続**から(Browse の Disconnect、`File > Update remote peer`、または viewer の再起動)。
 
 なお、**リモート越し(ssh)に使う場合はこの手順は要りません** —— viewer 側が
 `~/.viewer/viewer-serve` を `--version` で確かめ、古い/動かないなら置き換えます
