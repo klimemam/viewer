@@ -427,6 +427,638 @@ static int asyncOpenSelftest(const std::string& root) {
         app.pendingViewZoom = app.pendingViewCenter = false;
     }
 
+
+    // ========================================================================
+    //  R: the RELOAD worker (the 2026-09-28 report)
+    //  ========================================================================
+    //
+    // Same four things the A group holds down for the open, and the same thing
+    // it cannot do: a headless process has no window, so nothing here watches
+    // one fail to stop answering (that is freeze_probe.ps1's, and its numbers
+    // are in this change's PR body). What it CAN hold down:
+    //
+    //   (a) the RE-READ is one read. A frame-axis stack is one FrameSource per
+    //       frame, and the old walk asked each of them to read the file for
+    //       itself - three whole-file reads and six decodes to land three
+    //       frames. g_fileReads is the counter; `reads == 1` is the assertion,
+    //       and it is V22f's own pattern one gesture over.
+    //   (b) the gesture RETURNS with nothing read, and the frame loop comes
+    //       round WHILE the reading happens.
+    //   (c) the decode ran on ANOTHER THREAD. The one direct statement a
+    //       headless test can make about the freeze.
+    //   (d) STOP LEAVES WHAT LANDED - the opposite of the open's (d), and the
+    //       stack then says it holds two moments (#56's mark).
+    //
+    // ...and the anti-vacuity case, which is the same one A5 is: the identical
+    // gesture with the scripted default back in place lands immediately and
+    // pumps zero times.
+    //
+    // The fixture is its own file rather than big.npy: what is under test is a
+    // stack of THREE memberships of ONE file, which is the shape the report is
+    // about, and it has to be big enough that the worker is still working when
+    // the pump comes round.
+    const int64_t RF = 3, RH = 1400, RW = 4000;   // 3 * 1400 * 4000 * 2 = 33.6 MB
+    const std::string rel = dir + "/rel.npy";
+    // `frames` is a parameter because watch-design §12's frame-axis membership is
+    // about the count the HEADER declares: R9/R9e rewrite the same file with a
+    // different F and ask what the stack does about it.
+    auto writeRelF = [&](int gen, int64_t frames) {
+        uint8_t nothing = 0;
+        std::vector<uint8_t> hdr = selftestNpyBytes("<u2", { frames, RH, RW }, &nothing, 0);
+        std::ofstream f(pathFromUtf8(rel), std::ios::binary);
+        f.write((const char*)hdr.data(), (std::streamsize)hdr.size());
+        std::vector<uint16_t> row((size_t)RW);
+        for (int64_t fr = 0; fr < frames; fr++)
+            for (int64_t y = 0; y < RH; y++) {
+                for (int64_t x = 0; x < RW; x++)
+                    row[(size_t)x] = (uint16_t)((gen * 1000 + fr * 100 + y + x) & 0xffff);
+                f.write((const char*)row.data(), (std::streamsize)(RW * 2));
+            }
+    };
+    auto writeRel = [&](int gen) { writeRelF(gen, RF); };
+    // sample (0,0) of frame fr in generation `gen`, derived from the generator
+    // above rather than read back off a decode
+    auto relPx = [&](int gen, int fr) { return (float)(gen * 1000 + fr * 100); };
+    // A reload's own pump, bounded exactly as `drive` is and for the same
+    // reason: a worker that never finishes must fail this test rather than hang
+    // the suite. `stopAfter` >= 0 presses the Files row's Stop as soon as that
+    // many items have landed.
+    auto driveReload = [&](int maxIters, int stopAfter) -> bool {
+        int it = 0;
+        while ((app.reloadJob || !app.reloadQueue.empty()) && it++ < maxIters) {
+            if (stopAfter >= 0 && app.reloadJob && app.reloadJob->landedN >= stopAfter)
+                app.reloadJob->cancel.store(true);
+            pumpReloadJob();
+            if (app.reloadJob && !app.reloadJob->done.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return !app.reloadJob && app.reloadQueue.empty();
+    };
+    // The three frames' current sample (0,0), in stack order.
+    auto relSamples = [&](int seq) {
+        std::vector<float> v;
+        for (int idx : framesOfSeq(seq)) v.push_back(app.images[idx]->src->data[0]);
+        return v;
+    };
+
+    // ---- R1: the gesture returns having read nothing ------------------------
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        const std::vector<float> was = relSamples(seq);
+        check(seq != 0 && app.images.size() == (size_t)RF &&
+                  was.size() == (size_t)RF && was[0] == relPx(1, 0) &&
+                  was[2] == relPx(1, 2),
+              "R1 (setup) a three-frame single-file stack, each frame its own");
+        // three memberships, three DISTINCT sources of one file: the shape the
+        // report is about, and the reason the old walk read the file three times
+        bool distinct = true;
+        const std::vector<int> fr = framesOfSeq(seq);
+        for (size_t a = 0; a < fr.size(); a++)
+            for (size_t b = a + 1; b < fr.size(); b++)
+                if (app.images[fr[a]]->src == app.images[fr[b]]->src) distinct = false;
+        check(distinct, "R1 ...and they are three sources of ONE file, not one shared");
+
+        writeRel(2);                       // the file is rewritten under the stack
+        const long long reads0 = g_fileReads;
+        const int starts0 = g_reloadStarts, pumps0 = g_reloadPumps;
+        watchReloadNow(seq, false);        // the Files row's own call
+        const bool started = g_reloadStarts - starts0 == 1 && app.reloadJob != nullptr &&
+                             app.reloadJob->landedN == 0 &&
+                             relSamples(seq) == was;
+        const std::string row = app.reloadJob ? reloadJobRowText(*app.reloadJob)
+                                              : std::string();
+        fprintf(stderr, "asyncopenselftest: R1 after the gesture: starts+%d job=%d "
+                        "landed=%d row=\"%s\"\n", g_reloadStarts - starts0,
+                (int)(app.reloadJob != nullptr),
+                app.reloadJob ? app.reloadJob->landedN : -1, row.c_str());
+        check(started, "R1 the gesture STARTS the reload and returns: not a pixel has "
+                       "moved yet");
+        check(row.find("reloading") == 0 && row.find(" / 3") != std::string::npos,
+              "R1 ...and the row says reloading n / 3, a true fraction");
+
+        // ---- R2: the loop runs while the re-reading happens ----------------
+        const bool drained = driveReload(8000, -1);
+        const long long reads = g_fileReads - reads0;
+        const int pumped = g_reloadPumps - pumps0;
+        const std::vector<float> now = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R2 drained=%d reads=%lld pumps-during=%d "
+                        "px=%g/%g/%g\n", (int)drained, reads, pumped,
+                now.size() > 0 ? (double)now[0] : -1.0,
+                now.size() > 1 ? (double)now[1] : -1.0,
+                now.size() > 2 ? (double)now[2] : -1.0);
+        check(drained, "R2 the job finishes and the pump lands it");
+        check(pumped >= 2, "R2 ...and the frame loop came round at least twice WHILE "
+                           "it was working");
+        // (a), and it is the half of the report the freeze measurement cannot see
+        check(reads == 1, "R2 THREE memberships of one file are ONE read of it");
+        // (c)
+        check(g_reloadDecodeThread != std::this_thread::get_id(),
+              "R2 ...and the decode did not run on this thread");
+        check(now.size() == (size_t)RF && now[0] == relPx(2, 0) &&
+                  now[1] == relPx(2, 1) && now[2] == relPx(2, 2),
+              "R2 every frame holds the file's NEW bytes, each its own frame");
+        // the landing's own half: the revision every cache is keyed on moved,
+        // and the stack is of one moment (no #56 mark)
+        bool revved = true;
+        for (int idx : framesOfSeq(seq))
+            if (app.images[idx]->src->rev == 0) revved = false;
+        check(revved && !*seqReloadMark(seq) && seqInfo(seq) &&
+                  seqInfo(seq)->reloadFailed == 0,
+              "R2 ...the source revisions moved and the stack is of ONE moment");
+        // and the registry moved with the bytes (§6.2's re-key): every frame is
+        // findable under the file's CURRENT stat
+        bool reg = true;
+        for (int f = 0; f < (int)RF; f++) reg = reg && inRegistry(rel, f, std::string());
+        check(reg, "R2 ...and each frame is in the registry under the NEW tuple");
+    }
+
+    // ---- R3: Stop leaves what landed ---------------------------------------
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeRel(2);
+        watchReloadNow(seq, false);
+        const bool up = app.reloadJob != nullptr;
+        const bool drained = driveReload(8000, 1);   // Stop once ONE item has landed
+        const std::vector<float> now = relSamples(seq);
+        int fresh = 0;
+        for (int f = 0; f < (int)RF && f < (int)now.size(); f++)
+            if (now[(size_t)f] == relPx(2, f)) fresh++;
+        const App::SeqInfo* si = seqInfo(seq);
+        fprintf(stderr, "asyncopenselftest: R3 stop: up=%d drained=%d fresh=%d/%d "
+                        "docs=%zu mark=\"%s\" err=\"%s\"\n", (int)up, (int)drained,
+                fresh, (int)RF, app.images.size(), seqReloadMark(seq),
+                si ? si->reloadFirstErr.c_str() : "");
+        check(up && drained && app.images.size() == (size_t)RF,
+              "R3 Stop: the job goes away and every frame is still a frame");
+        check(fresh == 1, "R3 ...ONE frame landed and stayed landed - a stop is not "
+                          "an undo");
+        check(*seqReloadMark(seq) && si && si->reloadFailed == (int)RF - 1 &&
+                  si->reloadOk == 1,
+              "R3 ...and the stack says it holds two moments (#56's mark)");
+        check(si && si->reloadFirstErr.find("stopped") != std::string::npos,
+              "R3 ...for the reason it actually has: it was stopped, nothing refused");
+        // no partial document: every frame's mirrors agree with its source, and
+        // the un-landed ones still hold generation 1 rather than half of 2
+        bool sane = true;
+        for (int idx : framesOfSeq(seq)) {
+            const ImageDoc& d = *app.images[idx];
+            if (d.w != d.src->w || d.h != d.src->h || d.ch != d.src->ch) sane = false;
+            if ((int)d.src->data.size() != d.w * d.h * d.ch) sane = false;
+        }
+        check(sane, "R3 ...and no frame is half-swapped");
+    }
+
+    // ---- R4: the anti-vacuity case ------------------------------------------
+    // The same gesture on the same fixture with the scripted default back in
+    // place. R1-R3 would all pass on a build that had never moved the read off
+    // this thread, if watchReloadNow simply did it and returned - so the
+    // difference has to be shown, in this process, on this fixture.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeRel(2);
+        g_forceAsyncOpen = false;
+        const int starts0 = g_reloadStarts, pumps0 = g_reloadPumps;
+        watchReloadNow(seq, false);
+        const std::vector<float> now = relSamples(seq);
+        const bool immediate = app.reloadJob == nullptr &&
+                               g_reloadStarts == starts0 &&
+                               now.size() == (size_t)RF && now[2] == relPx(2, 2);
+        pumpReloadJob();                   // the loop's call, with nothing to land
+        fprintf(stderr, "asyncopenselftest: R4 scripted default: starts+%d job=%d "
+                        "px2=%g pumps+%d\n", g_reloadStarts - starts0,
+                (int)(app.reloadJob != nullptr),
+                now.size() > 2 ? (double)now[2] : -1.0, g_reloadPumps - pumps0);
+        check(immediate, "R4 the scripted DEFAULT still reloads synchronously: the new "
+                         "pixels are there on the line after the gesture");
+        check(g_reloadPumps - pumps0 == 0,
+              "R4 ...and no pump was needed, which is what makes R1-R3 a difference");
+        g_forceAsyncOpen = true;
+    }
+
+    // ---- R5: ONE frame takes the worker too ---------------------------------
+    // The frame menu's Reload, and the Files row's. Its cost is the SAME cost -
+    // a 480 MB frame is one whole-file read and one decode, which is what #232
+    // stage 2 moved off this thread for an open of that very file - so it goes
+    // through the same job, with one item and no membership.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const std::vector<int> fr = framesOfSeq(app.images.empty() ? 0
+                                                                   : app.images[0]->seqId);
+        writeRel(2);
+        const long long reads0 = g_fileReads;
+        const bool took = fr.size() > 1 && startFrameReload(fr[1]);
+        const bool nothingYet = app.images[fr[1]]->src->data[0] == relPx(1, 1);
+        const bool drained = driveReload(8000, -1);
+        fprintf(stderr, "asyncopenselftest: R5 one frame: took=%d nothing-yet=%d "
+                        "drained=%d reads=%lld px1=%g px0=%g\n", (int)took,
+                (int)nothingYet, (int)drained, g_fileReads - reads0,
+                (double)app.images[fr[1]]->src->data[0],
+                (double)app.images[fr[0]]->src->data[0]);
+        check(took && nothingYet && drained,
+              "R5 a single frame's Reload starts a worker and returns having read "
+              "nothing");
+        check(app.images[fr[1]]->src->data[0] == relPx(2, 1) &&
+                  app.images[fr[0]]->src->data[0] == relPx(1, 0),
+              "R5 ...and lands THAT frame's new bytes and nobody else's");
+
+        // ...and the ONE-FRAME door folds the way the stack's door does, for
+        // the same reason: the question is WHEN the read started, and that does
+        // not depend on how many items the job has (review P1-2's rule, applied
+        // consistently). Without this the branch would have no caller at all -
+        // which is the shape of review P2-8.
+        writeRel(3);
+        const int starts0 = g_reloadStarts;
+        startFrameReload(fr[1]);           // gesture 1: in flight
+        writeRel(4);                       // ...and the file moves again
+        startFrameReload(fr[1]);           // gesture 2: folded
+        const bool folded1 = app.reloadJob != nullptr &&
+                             g_reloadStarts - starts0 == 1 && app.reloadJob->again;
+        const bool drained2 = driveReload(16000, -1);
+        fprintf(stderr, "asyncopenselftest: R5 one-frame fold: folded=%d drained=%d "
+                        "starts+%d px1=%g\n", (int)folded1, (int)drained2,
+                g_reloadStarts - starts0, (double)app.images[fr[1]]->src->data[0]);
+        check(folded1 && drained2 && g_reloadStarts - starts0 == 2,
+              "R5b a repeat of ONE frame folds, is remembered, and runs once more");
+        check(app.images[fr[1]]->src->data[0] == relPx(4, 1),
+              "R5c ...and the re-run reads the generation that was on disk when the "
+              "repeat was asked for");
+    }
+
+    // ---- R6: ONE AT A TIME, and what a repeat of the same stack means ------
+    // Two different claims, and review P1-2 separated them. A second gesture
+    // for a stack already reloading starts NO SECOND CONCURRENT job - that is
+    // the one-worker rule, and it is what the queue and the fold are for - but
+    // it is not DISCARDED either: the read in flight began before the request
+    // was made, so it cannot be an answer to it, and the stack runs once more
+    // when that job lands. So three gestures over two stacks are one job plus
+    // one queued plus one re-run = THREE flights, never three at once.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seqA = app.images.empty() ? 0 : app.images[0]->seqId;
+        const size_t nA = app.images.size();
+        openPath(big);                     // a second stack, of another file
+        drive(8000);
+        int seqB = 0;
+        for (size_t i = nA; i < app.images.size(); i++)
+            if (app.images[i]->seqId != seqA) { seqB = app.images[i]->seqId; break; }
+        writeRel(2);
+        const int starts0 = g_reloadStarts;
+        watchReloadNow(seqA, false);
+        watchReloadNow(seqB, false);
+        watchReloadNow(seqA, false);       // asked for twice, mid-flight
+        const bool queued = app.reloadJob != nullptr && app.reloadQueue.size() == 1 &&
+                            g_reloadStarts - starts0 == 1;
+        const bool again = app.reloadJob && app.reloadJob->again;
+        fprintf(stderr, "asyncopenselftest: R6 three gestures -> starts+%d job=%d "
+                        "queued=%zu again=%d\n", g_reloadStarts - starts0,
+                (int)(app.reloadJob != nullptr), app.reloadQueue.size(), (int)again);
+        check(seqB != 0 && queued,
+              "R6 ONE job at a time: a second stack waits, a repeat starts nothing");
+        check(again,
+              "R6b ...and the repeat is REMEMBERED rather than dropped - the job in "
+              "flight did not read it");
+        const bool drained = driveReload(16000, -1);
+        fprintf(stderr, "asyncopenselftest: R6 drained=%d starts+%d\n", (int)drained,
+                g_reloadStarts - starts0);
+        check(drained && g_reloadStarts - starts0 == 3,
+              "R6c ...so draining gives THREE flights: the first, the queued stack, "
+              "and the repeat re-run with a new plan");
+    }
+
+    // ---- R7: closeAll stops the reload too ----------------------------------
+    // closeAll's rule, one worker over: "stop everything that produces images",
+    // and a reload is a thing that REPLACES them. Without this a stack half-way
+    // through re-reading would go on swapping frames into sources the close has
+    // already thrown away.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeRel(2);
+        watchReloadNow(seq, false);
+        const bool up = app.reloadJob != nullptr;
+        closeAll();                        // ...as File > Close All and loadSession do
+        const bool cancelled = app.reloadJob && app.reloadJob->cancel.load();
+        const bool queueGone = app.reloadQueue.empty();
+        const bool drained = driveReload(8000, -1);
+        fprintf(stderr, "asyncopenselftest: R7 closeAll: up=%d cancelled=%d "
+                        "queue-empty=%d drained=%d %zu doc(s)\n", (int)up,
+                (int)cancelled, (int)queueGone, (int)drained, app.images.size());
+        check(up && cancelled && queueGone && drained && app.images.empty(),
+              "R7 closeAll cancels the reload in flight and nothing lands after it");
+    }
+
+    // ---- R8: the door with no frame loop ------------------------------------
+    // waitForReloadJob, waitForOpenJob's twin and A11's reason: it puts back
+    // ONLY the waiting, so a caller that uses it is driving the path the window
+    // drives.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeRel(2);
+        watchReloadNow(seq, false);
+        const bool up = app.reloadJob != nullptr;
+        waitForReloadJob();
+        const std::vector<float> now = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R8 waitForReloadJob: up=%d job=%d px=%g\n",
+                (int)up, (int)(app.reloadJob != nullptr),
+                now.empty() ? -1.0 : (double)now[0]);
+        check(up && app.reloadJob == nullptr && app.reloadQueue.empty() &&
+                  now.size() == (size_t)RF && now[0] == relPx(2, 0),
+              "R8 waitForReloadJob drives a started reload to the end with no frame "
+              "loop");
+    }
+
+    // ---- R9: §12's frame-axis plan survives the worker ----------------------
+    // The merge of two changes that landed the same week (board 222 and this
+    // one), and the one place they touch: watch-design §12's frame-axis
+    // rebuild decides its plan BEFORE a byte is re-read and applies its
+    // ARRIVALS after, and those two moments used to be two halves of one call.
+    // They are not any more, so the plan travels on App::ReloadJob::axis. If it
+    // did not, a .npy whose script wrote five frames where it had written three
+    // would come back as three, silently, with two frames of the capture
+    // outside the measurement - which is exactly the defect board 222 fixed for
+    // the synchronous door.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        check(seq != 0 && framesOfSeq(seq).size() == (size_t)RF,
+              "R9 (setup) a three-frame single-file stack");
+        writeRelF(3, 5);                   // the same file, FIVE frames now
+        watchReloadNow(seq, false);
+        const bool took = app.reloadJob != nullptr;
+        const bool drained = driveReload(16000, -1);
+        const std::vector<float> now = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R9 grew 3 -> 5: took=%d drained=%d "
+                        "frames=%zu px=%g/%g/%g/%g/%g\n", (int)took, (int)drained,
+                now.size(),
+                now.size() > 0 ? (double)now[0] : -1.0,
+                now.size() > 1 ? (double)now[1] : -1.0,
+                now.size() > 2 ? (double)now[2] : -1.0,
+                now.size() > 3 ? (double)now[3] : -1.0,
+                now.size() > 4 ? (double)now[4] : -1.0);
+        check(took && drained && now.size() == 5,
+              "R9 the frame-axis plan crosses the worker: F 3 -> 5 lands FIVE frames");
+        bool own = now.size() == 5;
+        for (int f = 0; f < 5 && own; f++) own = now[(size_t)f] == relPx(3, f);
+        check(own, "R9b ...each one the FILE's own frame, in the file's order");
+        // ...and the other direction, whose departures are applied BEFORE the
+        // job starts (so the items are built from what is left).
+        writeRel(2);                       // back to three frames
+        watchReloadNow(seq, false);
+        const bool drained2 = driveReload(16000, -1);
+        const std::vector<float> back = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R9 shrank 5 -> 3: drained=%d frames=%zu "
+                        "mark=\"%s\"\n", (int)drained2, back.size(), seqReloadMark(seq));
+        check(drained2 && back.size() == (size_t)RF && back[0] == relPx(2, 0) &&
+                  back[2] == relPx(2, 2),
+              "R9c F 5 -> 3: the tail leaves and the survivors hold their own bytes");
+        check(!*seqReloadMark(seq),
+              "R9d ...and a frame that is GONE is not a frame that failed to read");
+    }
+
+    // ---- R9e: a SECOND gesture while one is in flight ----------------------
+    // Review P1-2, written fail-first. The frame-axis plan used to be taken at
+    // the GESTURE (watchReloadNow) and handed to startStackReload - and a
+    // gesture for a stack that is ALREADY reloading is folded into the job in
+    // flight, which threw the plan away. So the shrink side applied its
+    // departures and then never ran the arrivals or the bookkeeping, and the
+    // grow side asked for six frames and got four: exactly the defect board 222
+    // fixed for the synchronous door, back through the folding path.
+    //
+    // It is reachable by hand: the "Reload from disk" MenuItem is enabled on
+    // `anyLocal` alone and never asks whether a reload is running, so the second
+    // press during a twelve-frame reload is one click. R6 does not see it (it
+    // never changes a frame count) and R9 does not (it never folds).
+    //
+    // THE RULING (P1-2): the plan and its departures belong to the job that
+    // does the READING, so they are taken where the job is created; and a folded
+    // gesture is not discarded - the job re-runs once it has landed, with a NEW
+    // plan and a NEW stat. "Your request was already read" is only true when the
+    // read STARTED AFTER the request, so when it did not, running again is the
+    // only correct answer.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        check(seq != 0 && framesOfSeq(seq).size() == (size_t)RF,
+              "R9e (setup) a three-frame single-file stack");
+        // ---- the GROW side, folded ------------------------------------------
+        watchReloadNow(seq, false);                  // gesture 1: job in flight
+        const bool flying = app.reloadJob != nullptr;
+        writeRelF(3, 5);                             // ...and NOW F becomes 5
+        const int starts0 = g_reloadStarts;
+        watchReloadNow(seq, false);                  // gesture 2: folded
+        const bool folded = app.reloadJob != nullptr &&
+                            g_reloadStarts == starts0 && app.reloadQueue.empty();
+        const bool drained = driveReload(24000, -1);
+        std::vector<float> now = relSamples(seq);
+        const App::SeqInfo* si = seqInfo(seq);
+        fprintf(stderr, "asyncopenselftest: R9e grow folded: flying=%d folded=%d "
+                        "drained=%d frames=%zu expected=%d starts+%d\n",
+                (int)flying, (int)folded, (int)drained, now.size(),
+                si ? si->expectedFrames : -1, g_reloadStarts - starts0);
+        check(flying && folded && drained,
+              "R9e a second gesture for a stack already reloading is folded in");
+        check(now.size() == 5,
+              "R9e2 ...and it is NOT thrown away: F 3 -> 5 still lands FIVE frames");
+        bool own = now.size() == 5;
+        for (int f = 0; f < 5 && own; f++) own = now[(size_t)f] == relPx(3, f);
+        check(own, "R9e3 ...each one the FILE's own frame, from the CURRENT generation");
+        check(si && si->expectedFrames == 5,
+              "R9e4 ...and the stack's own count says five, not the count it had");
+
+        // ---- the SHRINK side, folded ----------------------------------------
+        // The half R9 does not cover at all. Its departures are the dangerous
+        // ones: applied at the gesture, they used to leave the stack shorter
+        // with nothing re-issuing seqIndex, expectedFrames or the stack name.
+        const uint64_t avgRev0 = seqInfo(seq) ? (uint64_t)seqInfo(seq)->stackRev : 0;
+        watchReloadNow(seq, false);
+        const bool flying2 = app.reloadJob != nullptr;
+        writeRelF(4, 2);                             // F 5 -> 2, mid-flight
+        watchReloadNow(seq, false);                  // folded again
+        const bool drained2 = driveReload(24000, -1);
+        now = relSamples(seq);
+        si = seqInfo(seq);
+        fprintf(stderr, "asyncopenselftest: R9e shrink folded: flying=%d drained=%d "
+                        "frames=%zu expected=%d stackRev %llu -> %llu mark=\"%s\"\n",
+                (int)flying2, (int)drained2, now.size(), si ? si->expectedFrames : -1,
+                (unsigned long long)avgRev0,
+                (unsigned long long)(si ? (uint64_t)si->stackRev : 0),
+                seqReloadMark(seq));
+        check(flying2 && drained2 && now.size() == 2,
+              "R9e5 F 5 -> 2 through a FOLDED gesture: the tail leaves");
+        check(now.size() == 2 && now[0] == relPx(4, 0) && now[1] == relPx(4, 1),
+              "R9e6 ...and the survivors hold the CURRENT generation's bytes");
+        check(si && si->expectedFrames == 2,
+              "R9e7 ...and the bookkeeping ran: the stack's own count says two");
+        // The member LIST moved, so everything keyed on the stack AS A SET has
+        // to have moved with it - sigma_t of two frames is not sigma_t of five.
+        check(si && (uint64_t)si->stackRev > avgRev0,
+              "R9e8 ...and the stack's data revision moved, so its numbers unlatch");
+        check(!*seqReloadMark(seq),
+              "R9e9 ...and a frame that is GONE is not a frame that failed to read");
+    }
+
+    // ---- R10: the AUTOMATIC door through the worker, and what it blocks -----
+    // Review P2-8. Two things had no caller in the whole suite:
+    //
+    //   watchAutoBusy's newest term (app.reloadJob). --watch and --rwatch are
+    //   NOGL runs without --async-open, so startStackReload always declines
+    //   there and no reload is ever in flight while they ask; the R group had
+    //   never asked at all. The term is what stops §9's drain from queueing a
+    //   second stack every frame while the first is still re-reading, and it is
+    //   what makes the Files line SAY why it is holding off rather than just
+    //   being silent.
+    //
+    //   ...and `automatic = true` reaching the worker at all. Every R case above
+    //   presses the row's own Reload. §9's drain is the caller with nobody's
+    //   click behind it, so it is the one whose record has to be there
+    //   afterwards - and the record is now a token on the row
+    //   (seqAutoReloadMark), which means the whole of §9 rule 3 travels through
+    //   this path.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seqA = app.images.empty() ? 0 : app.images[0]->seqId;
+        const size_t nA = app.images.size();
+        openPath(big);                     // a second stack, of another file
+        drive(8000);
+        int seqB = 0;
+        for (size_t i = nA; i < app.images.size(); i++)
+            if (app.images[i]->seqId != seqA) { seqB = app.images[i]->seqId; break; }
+        // Borrowed prefs - this process's config home is shared with every other
+        // selftest, so the two watch keys are given back at the end of the block.
+        const bool wasOn = app.watchEnabled, wasAuto = app.watchAutoReload;
+        app.watchEnabled = true;
+        app.watchAutoReload = true;
+        // seqB armed: a confirmed finding, as watchIntegrate lands one.
+        if (App::SeqInfo* si = seqInfo(seqB)) {
+            si->watchFound = watch::Finding{};
+            si->watchFound.changed = 1;
+            si->watchFound.firstChanged = "big.npy";
+            si->watchToasted = true;
+        }
+        // ANTI-VACUITY FIRST: with nothing in flight the drain IS due, or the
+        // assertion below is about an unarmed stack and says nothing.
+        const bool dueIdle = watchAutoDue();
+        const char* busyIdle = watchAutoBusy(seqB);
+        writeRel(2);
+        watchReloadNow(seqA, false);       // ...and now one is in flight
+        const bool flying = app.reloadJob != nullptr;
+        const char* busyFly = watchAutoBusy(seqB);
+        const bool dueFly = watchAutoDue();
+        fprintf(stderr, "asyncopenselftest: R10 armed: due-idle=%d busy-idle=\"%s\" -> "
+                        "flying=%d busy=\"%s\" due=%d\n", (int)dueIdle,
+                busyIdle ? busyIdle : "", (int)flying, busyFly ? busyFly : "",
+                (int)dueFly);
+        check(seqB != 0 && dueIdle && !busyIdle,
+              "R10 (anti-vacuity) an armed stack with nothing in flight IS due");
+        check(flying && busyFly &&
+                  std::string(busyFly).find("reload") != std::string::npos,
+              "R10b a reload in flight makes every armed stack WAIT, and says so");
+        check(!dueFly,
+              "R10c ...so the idle-skip chain does not spin while one runs");
+        const bool drained = driveReload(16000, -1);
+        check(drained && !watchAutoBusy(seqB),
+              "R10d ...and the wait ends when the job lands");
+
+        // ---- R10e: automatic = true, all the way through the worker ---------
+        writeRel(3);
+        watchReloadNow(seqA, true);        // §9's drain's own call
+        const bool tookAuto = app.reloadJob != nullptr && app.reloadJob->automatic;
+        const bool drained2 = driveReload(16000, -1);
+        const App::SeqInfo* sa = seqInfo(seqA);
+        const std::string mark = seqAutoReloadMark(seqA);
+        fprintf(stderr, "asyncopenselftest: R10e automatic: took=%d drained=%d "
+                        "note=\"%s\" when=\"%s\" mark=\"%s\"\n", (int)tookAuto,
+                (int)drained2, sa ? sa->autoReloadNote.c_str() : "",
+                sa ? sa->autoReloadWhen.c_str() : "", mark.c_str());
+        check(tookAuto && drained2 && relSamples(seqA)[0] == relPx(3, 0),
+              "R10e §9's drain takes the worker too, and its frames land");
+        check(sa && !sa->autoReloadNote.empty() &&
+                  sa->autoReloadNote.rfind("auto-reloaded ", 0) == 0,
+              "R10f ...and the record §9 rule 3 owes is latched on the stack");
+        // ...and the TOKEN the row now carries, built by the real path rather
+        // than by a test writing autoReloadWhen by hand (review P2-9). The
+        // clock itself is the wall clock, so what is pinned is the shape.
+        check(sa && sa->autoReloadWhen.size() == 5 && sa->autoReloadWhen[2] == ':' &&
+                  mark == "  (auto-reloaded " + sa->autoReloadWhen + ")",
+              "R10g ...and the row's token is that record's clock, to the minute");
+        // state.h declares the pair as an invariant: set and cleared together.
+        check(sa && !sa->autoReloadWhen.empty() == !sa->autoReloadNote.empty(),
+              "R10h ...the note and its clock are set together, as state.h says");
+
+        if (App::SeqInfo* si = seqInfo(seqB)) {
+            si->watchFound = watch::Finding{};
+            si->watchToasted = false;
+        }
+        app.watchEnabled = wasOn;          // borrowed prefs, given back
+        app.watchAutoReload = wasAuto;
+    }
+
+    // ---- R11: Stop before ANY frame landed ----------------------------------
+    // The ruling that goes with R3: the behaviour does not change - the stack
+    // really is not of one moment and #56's mark is right to be up - but what
+    // it SAYS when n is zero was nowhere pinned, so a later reader could not
+    // tell the sentence from a bug. seqReloadNote has two halves and this is
+    // the one that says nothing was replaced at all.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        const std::vector<float> was = relSamples(seq);
+        writeRel(2);
+        watchReloadNow(seq, false);
+        const bool drained = driveReload(16000, 0);   // Stop before item 1 lands
+        const std::vector<float> now = relSamples(seq);
+        const App::SeqInfo* si = seqInfo(seq);
+        const std::string note = seqReloadNote(seq);
+        fprintf(stderr, "asyncopenselftest: R11 stop-at-zero: drained=%d ok=%d "
+                        "failed=%d note=\"%s\"\n", (int)drained,
+                si ? si->reloadOk : -1, si ? si->reloadFailed : -1, note.c_str());
+        check(drained && now == was,
+              "R11 Stop before the first landing leaves every frame exactly as it was");
+        check(si && si->reloadOk == 0 && si->reloadFailed == (int)RF,
+              "R11b ...and the latch counts all three as not re-read, none re-read");
+        check(note.find("no frame could be re-read") != std::string::npos &&
+                  note.find("stopped") != std::string::npos,
+              "R11c ...and the sentence says BOTH: nothing was replaced, and it was "
+              "stopped rather than refused");
+    }
+
     closeAll();
     g_forceAsyncOpen = flagOnEntry;        // borrowed state, given back
     if (!shared.intact("asyncopenselftest")) ok = false;

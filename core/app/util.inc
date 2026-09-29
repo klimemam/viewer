@@ -39,9 +39,55 @@ static double nowSec() {
     static const auto t0 = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+// ---- is a RELOAD of these pixels IN FLIGHT? (the 2026-09-28 report) --------
+// nullptr = no. A sentence = yes, and the sentence is what to refuse with.
+//
+// THE RULING (review, 2026-09-29): while a reload of a stack is in flight, an
+// in-place pixel operation on that stack is REFUSED. Crop and "restore full"
+// rewrite a source's pixels and its crop bookkeeping; a detrend reads every
+// member to compute a product. Run either one beside a reload and the answer is
+// built from two generations of the file, mixed frame by frame according to how
+// far the worker happened to have got - a number that would look perfectly
+// ordinary afterwards and could never be traced.
+//
+// REFUSING AT THE GESTURE, not at the landing. The alternative - accept the
+// crop and drop it when the reload lands - throws away work the user asked for,
+// invisibly, which is the worse failure of the two. cropInPlace already refuses
+// by name for the same shape of reason (a decimated remote tile whose
+// full-resolution fetch is still coming), and this is that precedent with a
+// different thing in flight.
+//
+// The sentence names the Files row's Stop, because that is the control that
+// makes the wait end, and it is the same vocabulary the row itself uses.
+static const char* reloadInFlightFor(int seqId, uint64_t uid) {
+    if (!app.reloadJob || app.reloadJob->cancel.load()) return nullptr;
+    const App::ReloadJob& j = *app.reloadJob;
+    if (j.oneUid != 0) {
+        if (uid != 0 && j.oneUid == uid)
+            return "this frame is being re-read - wait for it, or press Stop on "
+                   "the Files row";
+        // ...and a STACK is asked about too, because a one-frame reload of one
+        // of its members is still a reload of pixels a detrend would read
+        // (review): the job names a document, so the stack it belongs to is
+        // found through that document rather than carried on the job.
+        if (seqId != 0)
+            for (const auto& q : app.images)
+                if (q->uid == j.oneUid && q->seqId == seqId)
+                    return "a frame of this stack is being re-read - wait for it, "
+                           "or press Stop on the Files row";
+        return nullptr;
+    }
+    if (seqId != 0 && j.seqId == seqId)
+        return "this stack is being re-read - wait for it, or press Stop on the "
+               "Files row";
+    return nullptr;
+}
+
 // Whole-file reads, counted so a selftest can assert that opening one file
 // reads it ONCE. loadNpy used to read a 252 MB stack 120 times and nothing
 // noticed, because "it works, slowly" looks exactly like "it works".
+// (--asyncopen-selftest R2 is the same assertion for a RELOAD: three
+// memberships of one file are one read of it.)
 static long long g_fileReads = 0;
 
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {

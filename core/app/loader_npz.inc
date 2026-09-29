@@ -300,6 +300,10 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
                                                 int frameIdx, int& framesOut,
                                                 int64_t& frameStrideOut,
                                                 int npyRead = 0 /*NR_NATIVE*/);   // defined below
+// C-order or Fortran-order strides in ELEMENTS. Defined in loader_npy_raw.inc,
+// which is included after this file; npyDecodeFrames' `wanted` branch needs the
+// same answer decodeNpyBuffer computes, and one spelling is the point.
+static std::vector<int64_t> npyStridesOf(const std::vector<int64_t>& shape, bool fortran);
 
 // The DECODE half of loadNpyBuffer, and not one line of it touches app state.
 // Every frame of one .npy buffer, turned into a document and MEASURED - which
@@ -314,11 +318,63 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
 // a frame is not a frame. A cancelled decode returns an error rather than a
 // short stack, because a stopped open must land NOTHING - "n of N" is for a
 // file that could not be read, not for a user who said stop.
+//
+// `wanted` names WHICH frames the caller has a use for, and it exists for the
+// RELOAD walk (the 2026-09-28 report): a stack that is three frames of a
+// 120-frame array must not decode 120 of them, and a single frame-axis
+// membership must not decode frame 0 on the way to frame 7. Null = all of
+// them, which is the OPEN's own answer and every existing caller's. Two things
+// differ inside the branch, and both follow from the caller being different:
+//   * the frame COUNT comes from the header rather than from frame 0's decode,
+//     because the decode of a frame nobody asked for is the cost being removed;
+//   * a frame that will not decode does NOT end the walk. An open turns the
+//     first failure into "n of N" and stops, because a stack is a prefix; a
+//     reload is asked about each membership separately and each one is owed its
+//     own refusal.
 static std::string npyDecodeFrames(const std::vector<uint8_t>& buf, const std::string& path,
                                    const std::string& displayName, int npyRead,
                                    OpenDecoded& out,
-                                   const std::atomic<bool>* cancel = nullptr) {
+                                   const std::atomic<bool>* cancel = nullptr,
+                                   const std::vector<int>* wanted = nullptr) {
     std::string err;
+    if (wanted) {
+        // How many frames THIS reading makes of this buffer, with no pixels
+        // decoded: npyPeekHeader and npyLayout, the same two functions
+        // decodeNpyBuffer consults for the same question, so the count cannot
+        // disagree with the one a decode would have reported.
+        NpyHead Hd;
+        if (!npyPeekHeader(buf, Hd, err)) return err.empty() ? "decode failed" : err;
+        // npyStridesOf, not a third copy of the arithmetic (review P3-15): the
+        // comment above rests on "the same two functions decodeNpyBuffer
+        // consults", and consulting them with strides computed somewhere else
+        // is exactly the way that claim would stop being true.
+        const std::vector<int64_t> strides = npyStridesOf(Hd.shape, Hd.fortran);
+        int64_t F = 1, sf = 0, H = 1, W = 1, C = 1, sh = 0, sw = 0, sc = 0;
+        std::string note, lerr;
+        if (!npyLayout(Hd.shape, strides, npyRead, F, sf, H, W, C, sh, sw, sc, note, lerr))
+            return lerr.empty() ? "decode failed" : lerr;
+        out.frames = (int)F;
+        out.docs.resize((size_t)F);
+        out.errs.resize((size_t)F);
+        for (int f : *wanted) {
+            if (f < 0 || f >= (int)F) continue;   // out of range is the CALLER's
+                                                  // refusal to word: it knows
+                                                  // which membership asked
+            if (out.docs[(size_t)f]) continue;    // asked for twice
+            if (cancel && cancel->load()) return "stopped";
+            std::string e2;
+            int fr = 1;
+            int64_t fs = 0;
+            auto doc = decodeNpyBuffer(buf, path, displayName, e2, f, fr, fs, npyRead);
+            if (!doc) {
+                out.errs[(size_t)f] = e2.empty() ? std::string("decode failed") : e2;
+                continue;
+            }
+            computeMinMax(*doc);                  // off the UI thread, as above
+            out.docs[(size_t)f] = std::move(doc);
+        }
+        return {};
+    }
     int frames = 1;
     int64_t fstride = 0;
     auto first = decodeNpyBuffer(buf, path, displayName, err, 0, frames, fstride, npyRead);
@@ -2592,9 +2648,16 @@ static std::unique_ptr<ImageDoc> imageDocFromPicture(imagefile::Image& img,
 // (the note above says why), and what is skipped is only turning the parts
 // nobody asked for into documents - which is exactly what the lazy `build` this
 // replaced skipped.
+// `wanted` names which PAGES the caller has a use for, npyDecodeFrames' own
+// parameter and its own reason (the reload walk): the container still decodes
+// whole - the note above says why - but a three-page subset of a 100-page TIFF
+// builds three documents and measures three, not a hundred. Null = all of them,
+// which is every open. `members` is filled for EVERY page either way: which
+// parts the file holds is what a refusal by name has to be true about.
 static std::string picDecodeAll(const std::string& path, const std::vector<uint8_t>& buf,
                                 const FrameSource& stat, const std::string& onlyMember,
-                                OpenDecoded& out, const std::atomic<bool>* cancel = nullptr) {
+                                OpenDecoded& out, const std::atomic<bool>* cancel = nullptr,
+                                const std::vector<int>* wanted = nullptr) {
     std::vector<imagefile::Image> imgs;
     std::string err;
     if (!imagefile::decode(path, buf, imgs, err)) return err;
@@ -2607,6 +2670,13 @@ static std::string picDecodeAll(const std::string& path, const std::vector<uint8
     for (size_t i = 0; i < imgs.size(); i++) {
         out.members[i] = imgs[i].member;
         if (out.named && !onlyMember.empty() && imgs[i].member != onlyMember) continue;
+        // ...and a page nobody asked for. AFTER the member filter, so the two
+        // ways of naming a part of a file (by name, by position) keep answering
+        // in that order - a NAMED part is found by its name and its `wanted`
+        // index is the page the landing will record for it, which is 0.
+        if (wanted && std::find(wanted->begin(), wanted->end(), (int)i) == wanted->end() &&
+            !(out.named && !onlyMember.empty()))
+            continue;
         if (cancel && cancel->load()) return "stopped";
         // page: 0 for every NAMED part (they are parts of one page, and
         // FrameSource::fileFrame is the registry's frame index), the index

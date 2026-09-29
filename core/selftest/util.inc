@@ -34,12 +34,13 @@ static bool needWindow(const char* what) {
 }
 
 // ...and the OTHER half of the same question, which 板 304 is about: a test
-// whose GL group is ONE group of eight does not have to cost the other seven on
+// whose GL groups are one or two of eight does not have to cost the rest on
 // two of the three runners. docs/background/analysis/measurement-kernel-inventory.md
 // §4.3 counted what that was costing - --abstats-selftest's A1/A2/A3 (the
 // 4x256 histogram memcmp, mean/sd, and the per-plane sigma_t that is the ONLY
 // parity for that kernel) and --verify-selftest's V13 ran on one OS of three,
-// because each test also holds one group that lays out a real ImGui frame.
+// because each test also holds a group that lays out a real ImGui frame (V19
+// was verify's only one until 2026-09-28's V29; each takes its own gate).
 //
 // So a test with a GL group is registered TWICE: once as it was, and once NOGL
 // with --nogl-groups-skipped, which is this flag. The pattern at the call site

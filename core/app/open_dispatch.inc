@@ -534,12 +534,18 @@ static bool ensureUiSession(const std::string& host, std::string& err, int port)
 //   an empty directory, and the rebuild has to fail towards doing NOTHING.
 //
 // Empty = the program's own answer: app.uiSession, the connection the open used,
-// read on the thread that owns it (§3's "one Session, one owning thread"). The
-// window does not repaint while it reads, exactly as an open does not - see
-// UiThreadStall, and §16.6 for why that is the manual gesture's price and not
-// the automatic one's.
-using ReloadPeer = std::function<remote::Session*(const std::string& host, int port,
-                                                  std::string& errOut)>;
+// read on the thread that owns it (§3's "one Session, one owning thread").
+//
+// ...and that last sentence is now exactly why the RELOAD WORKER hands one in
+// (the 2026-09-28 report). A reload no longer runs on the UI thread, and
+// app.uiSession belongs to the UI thread and to nobody else, so
+// reloadJobWorker's resolver answers with a Session of its OWN - dialled once,
+// never re-dialled after the link drops. The empty case therefore stopped being
+// "what a reload does" and became "what a reload does when something is
+// deliberately driving it synchronously" (a scripted run, --reload-selftest).
+//
+// The ALIAS lives in state.h, beside App::ReloadJob, which carries one. The
+// decision record stays here, where the resolver is used.
 static remote::Session* reloadPeerFor(const ReloadPeer& how, const std::string& host,
                                       int port, std::string& errOut) {
     if (how) return how(host, port, errOut);
@@ -827,9 +833,8 @@ static bool invalidateStackDerived(int sid) {
 // pixels stay, never a half-swap.
 //
 // A PEER's pixels are NOT on that list (watch-design §16): the walk has the
-// peer's own "stat it and read it again" - META then TILE, on the connection
-// the open used - so a remote-backed source reloads, and fails only when the
-// link does.
+// peer's own "stat it and read it again" - META then TILE, over a link of its
+// own - so a remote-backed source reloads, and fails only when the link does.
 //
 // WHICH DECODER re-reads the file is decided by what the PIXELS are, in that
 // order, and never by the file name alone: a reader/container member first (it
@@ -843,18 +848,129 @@ static bool invalidateStackDerived(int sid) {
 // rect is clamped if the file shrank. CFA re-snapping is not attempted: the
 // recorded rect was snapped when the crop was made, and the mosaic is a
 // per-membership interpretation the source cannot see.
-static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& errOut,
-                         std::string* noteOut = nullptr,
-                         const ReloadPeer& peer = ReloadPeer()) {
-    if (!src) { errOut = "no source"; return false; }
-    // local:// is LOCAL: a Browse-panel local open carries the on-disk path
-    // inside its url - the pixels are on this disk and reload reads that file,
-    // which is strictly more than a peer can tell us about it (§13.7). A real
-    // remote scheme goes through the peer's door, the FIRST of the four below.
-    const std::string onDisk = localDiskPathOfUrl(src->remoteUrl);
-    const bool peerUrl = isPeerUrl(src->remoteUrl);
-    const std::string fpath = peerUrl || src->remoteUrl.empty() ? src->path : onDisk;
-    if (fpath.empty()) { errOut = "no file behind these pixels"; return false; }
+//
+// ...and it is SPLIT IN TWO, for the reason the whole of it used to be on the
+// UI thread (the 2026-09-28 report 「reload を押すと応答なしになる」):
+//
+//   reloadDecodeGroup  the stat, the bytes, the decode, the crop and the
+//                      measurement. Pure - no app.images, no publication, no
+//                      GL - and therefore a worker's. It takes a GROUP of
+//                      memberships served by ONE read, which is the second
+//                      half of the same report: a frame-axis stack is one
+//                      FrameSource per frame, so the old walk read a 480 MB
+//                      file four times over and decoded eight frames to land
+//                      four (V22f's pathology, fixed for the open in #232
+//                      stage 2 and not for the reload).
+//   reloadLand         the dims note, the new registry key, the swap under
+//                      g_srcRegMtx, Watch's re-seed and the invalidation walk.
+//                      Every one of those touches shared state, so every one
+//                      of them is the UI thread's, and together they are what
+//                      the old function did in its last hundred lines.
+//
+// reloadSource below is still THE DOOR and still synchronous: capture, decode,
+// land. Every existing caller and all of core/selftest/reload.inc therefore go
+// on passing unchanged, and the asynchronous door (startStackReload) is built
+// out of the same three calls in the same order. openLocalLand with a null
+// OpenPre is the precedent.
+
+// WHAT these pixels are, by value, taken on the UI thread. See ReloadSpec.
+static ReloadSpec reloadSpecOf(const FrameSource& s) {
+    ReloadSpec r;
+    r.path = s.path;
+    r.remoteUrl = s.remoteUrl;
+    r.member = s.member;
+    r.fileFrame = s.fileFrame;
+    r.remoteFrame = s.remoteFrame;
+    r.remoteStep = s.remoteStep;
+    r.npyRead = s.npyRead;
+    r.rawDtype = s.rawDtype; r.rawInterp = s.rawInterp;
+    r.rawOffset = s.rawOffset; r.rawLE = s.rawLE;
+    r.w = s.w; r.h = s.h; r.ch = s.ch;
+    r.srcW = s.srcW; r.srcH = s.srcH; r.cropX = s.cropX; r.cropY = s.cropY;
+    r.dtype = s.dtype;
+    return r;
+}
+
+// The FILE behind a spec. local:// is LOCAL - a Browse-panel local open carries
+// the on-disk path inside its url, and the pixels are on this disk, which is
+// strictly more than a peer can tell us about them (§13.7). A real remote
+// scheme keeps its url and goes through the peer's door.
+static std::string reloadSpecFile(const ReloadSpec& s) {
+    const std::string onDisk = localDiskPathOfUrl(s.remoteUrl);
+    return isPeerUrl(s.remoteUrl) || s.remoteUrl.empty() ? s.path : onDisk;
+}
+
+// Can one stat + one read + one decode serve this membership ALONGSIDE others?
+// "" = no, this one is read on its own. The key is the READ's identity and
+// nothing else: the file, the array or part inside it, and the §3.3 reading the
+// pixels were born under (a second reading of one file is a second decode of
+// the same bytes, so it is a second group and not a second read).
+//
+// The three doors that answer "" do so because there is nothing to share:
+// a container/reader member is refused outright, a raw recipe is one file and
+// one frame by construction, and a PEER's frame is its own META+TILE round
+// trip - one file on the other machine is not one transfer.
+static std::string reloadReadKey(const ReloadSpec& s) {
+    if (s.member.rfind("__pixels_", 0) == 0) return {};
+    if (isPeerUrl(s.remoteUrl)) return {};
+    if (s.rawDtype >= 0) return {};
+    const std::string f = reloadSpecFile(s);
+    if (f.empty()) return {};
+    return f + "\n" + s.member + "\n" + std::to_string(s.npyRead);
+}
+
+// Which frame of the file a spec IS, for the grouping above: two memberships of
+// one group must not both be handed the same decode (a crop split one source
+// into two, and the second would find the document already moved out). They go
+// in separate groups instead, which costs one extra read in a case a stack has
+// to have been cropped member-by-member to reach, and costs nothing at all in
+// the case this whole change is about.
+static int reloadPickIndex(const ReloadSpec& s) { return s.fileFrame; }
+
+// ---- the DECODE half, for a group of memberships served by ONE read ---------
+// `specs` all share reloadReadKey() and pick distinct frames, or there is
+// exactly one of them (the ungroupable doors and the synchronous door). `pres`
+// is parallel to it and is what the landing will be handed; a refusal is
+// written into pre.err and the other specs of the group are unaffected.
+//
+// `cancel` is looked at between ITEMS and inside the decode loop, never inside
+// one frame. `peer` resolves the link for the peer door - the worker's own
+// Session, or the program's (§16).
+static void reloadDecodeGroup(const std::vector<const ReloadSpec*>& specs,
+                              const std::vector<ReloadPre*>& pres,
+                              const std::atomic<bool>* cancel,
+                              const ReloadPeer& peer) {
+    if (specs.empty()) return;
+    const ReloadSpec& s0 = *specs.front();
+    const std::string fpath = reloadSpecFile(s0);
+    auto refuseAll = [&](const std::string& why) {
+        for (ReloadPre* p : pres) p->err = why;
+    };
+    // The crop a membership recorded, re-applied to ITS fresh decode. The crop
+    // is part of what these pixels ARE (§2.1 keeps it on the source), the rect
+    // is clamped if the file shrank, and the CFA snap is not re-attempted: the
+    // rect was snapped when the crop was made, and the mosaic is a
+    // per-membership interpretation the source cannot see. cropPixels, not
+    // cropInPlace: nd is private to this thread, so there is no source to
+    // clone, no registry slot to vacate and no stack revision to move - and no
+    // lock to take on a worker (see cropPixels).
+    auto recrop = [](const ReloadSpec& s, ImageDoc& nd) {
+        // cropInPlace's OWN refusal, and it has to be the same predicate rather
+        // than a second opinion (review P2-3). A source still showing a
+        // DECIMATED remote tile refuses a crop by name: the full-resolution
+        // fetch is in flight and its landing replaces data/w/h wholesale,
+        // knowing nothing of crop bookkeeping - so a rect applied to the
+        // preview grid is silently reverted by that swap and leaves srcW
+        // stamped with preview dimensions. That is a phantom crop (isCropped
+        // forever true), an unshareable source, and a session line carrying
+        // garbage rectangles, and #272's R29 pins its absence. Dropping the
+        // guard while extracting cropPixels would have re-created it on the one
+        // path that re-applies a RECORDED rect.
+        if (s.remoteStep > 1) return;
+        if (s.srcW > 0 && (s.cropX != 0 || s.cropY != 0 || s.w != s.srcW || s.h != s.srcH))
+            cropPixels(nd, s.cropX, s.cropY, s.w, s.h);
+    };
+    if (fpath.empty()) { refuseAll("no file behind these pixels"); return; }
     // Container/reader members (__pixels_*) rebuild as a UNIT: one __viewer
     // line restores the whole tree, and a reader file re-runs its adapter.
     // A per-member reload is not wired - and without this refusal a reader's
@@ -866,13 +982,11 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     // called: a reader's origin may perfectly well be named .tif, and reading
     // it as a TIFF would silently replace a reader's output with a decode of
     // the file it was run on.
-    if (src->member.rfind("__pixels_", 0) == 0) {
-        errOut = "container/reader members reload by re-opening the file";
-        return false;
+    if (s0.member.rfind("__pixels_", 0) == 0) {
+        refuseAll("container/reader members reload by re-opening the file");
+        return;
     }
-    std::unique_ptr<ImageDoc> nd;
-    std::string err;
-    if (peerUrl) {
+    if (isPeerUrl(s0.remoteUrl)) {
         // ---- §16: THE PEER's door - "stat it and read it again", over a link --
         //
         // The local doors below all say the same thing twice: statSourceFile
@@ -884,82 +998,105 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         //
         // Nothing about WHICH pixels these are is re-chosen: the frame index,
         // the §3.3 reading declaration and the decimation step are replayed off
-        // the source. A reload is "the same frame, new values" over the link
+        // the spec. A reload is "the same frame, new values" over the link
         // exactly as it is off the disk, and re-deriving any of the three would
         // make it "a different frame, silently".
         //
-        // It BLOCKS this thread, as an open of the same frame does (openRemote's
-        // UiThreadStall). That is the price of a manual gesture and it is stated
-        // where the gesture is; §16.6 is why it is not also the price of an
-        // automatic one.
+        // It no longer blocks the UI thread. It blocks the RELOAD WORKER, on
+        // that worker's own Session, and that is what the whole of this file's
+        // reload half was re-shaped for: openRemote's UiThreadStall was the
+        // price of a manual gesture, and §16.6 argued it was not the automatic
+        // one's - the answer taken in the end is that it is nobody's.
+        ReloadPre& pre = *pres.front();
+        const ReloadSpec& s = s0;
         std::string host, rpath;
         int port = 0;
-        if (!remote::parseUrl(src->remoteUrl, host, rpath, &port)) {
-            errOut = "not a remote url: " + src->remoteUrl;
-            return false;
+        if (!remote::parseUrl(s.remoteUrl, host, rpath, &port)) {
+            pre.err = "not a remote url: " + s.remoteUrl;
+            return;
         }
-        remote::Session* ses = reloadPeerFor(peer, host, port, errOut);
+        remote::Session* ses = reloadPeerFor(peer, host, port, pre.err);
         if (!ses) {
-            if (errOut.empty()) errOut = "the peer did not answer";
-            return false;
+            if (pre.err.empty()) pre.err = "the peer did not answer";
+            return;
         }
         remote::Meta m;
-        if (!ses->meta(rpath, m, errOut, src->npyRead)) return false;
-        if (src->remoteFrame >= (int)m.frames) {
+        if (!ses->meta(rpath, m, pre.err, s.npyRead)) return;
+        if (s.remoteFrame >= (int)m.frames) {
             // The same sentence and the same reasoning as the .npy frame axis
             // below: there is no "same frame" left to give new values to.
-            errOut = "file now has " + std::to_string(m.frames) + " frame(s); frame " +
-                     std::to_string(src->remoteFrame) + " no longer exists";
-            return false;
+            pre.err = "file now has " + std::to_string(m.frames) + " frame(s); frame " +
+                      std::to_string(s.remoteFrame) + " no longer exists";
+            return;
         }
-        const int step = std::max(1, src->remoteStep);
+        const int step = std::max(1, s.remoteStep);
         std::vector<float> px;
         int tw = 0, th = 0, tch = 0;
         std::string dt;
         rp::F32Loss tloss;
-        if (!ses->tile(rpath, src->remoteFrame, 0, 0, m.w, m.h, step,
-                       px, tw, th, tch, dt, errOut, src->npyRead, &tloss))
-            return false;
+        if (!ses->tile(rpath, s.remoteFrame, 0, 0, m.w, m.h, step,
+                       px, tw, th, tch, dt, pre.err, s.npyRead, &tloss))
+            return;
         if (tw < 1 || th < 1 || tch < 1 || tch > 4) {
-            errOut = "the peer returned a degenerate frame";
-            return false;
+            pre.err = "the peer returned a degenerate frame";
+            return;
         }
-        nd = std::make_unique<ImageDoc>();
-        FrameSource& P = *nd->src;
-        P.path = src->path;                    // the url IS the provenance here
-        P.remoteUrl = src->remoteUrl;
-        P.remoteFrame = src->remoteFrame;
+        pre.nd = std::make_unique<ImageDoc>();
+        FrameSource& P = *pre.nd->src;
+        P.path = s.path;                       // the url IS the provenance here
+        P.remoteUrl = s.remoteUrl;
+        P.remoteFrame = s.remoteFrame;
         P.remoteStep = step;
         P.npyShape = m.shape;                  // the PEER's disk, as it declares
                                                // it now (§3.3, the same field the
                                                // local branch takes off the file)
-        P.npyRead = src->npyRead;              // ...replayed, never re-chosen
+        P.npyRead = s.npyRead;                 // ...replayed, never re-chosen
         P.remoteProto = ses->peerVersion();
         P.dtype = dt;
         P.w = tw; P.h = th; P.ch = tch;
         P.data = std::move(px);
         P.f32loss = tloss;                     // measured on THESE samples
-        nd->syncMirrors();
-        // a crop made after the open re-scoped this frame; the reload keeps that
-        // scope, exactly as the two branches below do
-        if (src->srcW > 0 &&
-            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW ||
-             src->h != src->srcH))
-            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
-    } else if (src->rawDtype >= 0) {
+        pre.nd->syncMirrors();
+        recrop(s, *pre.nd);
+        computeMinMax(*pre.nd);                // off the UI thread, as the open
+        return;                                // measures its frames off it
+    }
+    if (s0.rawDtype >= 0) {
+        ReloadPre& pre = *pres.front();
+        const ReloadSpec& s = s0;
         RawDialog d;                       // the recipe, replayed against the file
         d.path = fpath;
-        d.dtype = src->rawDtype; d.interp = src->rawInterp;
-        d.offset = src->rawOffset; d.littleEndian = src->rawLE;
-        d.w = src->srcW > 0 ? src->srcW : src->w;
-        d.h = src->srcH > 0 ? src->srcH : src->h;
-        if (src->cropX != 0 || src->cropY != 0 || src->w != d.w || src->h != d.h) {
+        d.dtype = s.rawDtype; d.interp = s.rawInterp;
+        d.offset = s.rawOffset; d.littleEndian = s.rawLE;
+        d.w = s.srcW > 0 ? s.srcW : s.w;
+        d.h = s.srcH > 0 ? s.srcH : s.h;
+        if (s.cropX != 0 || s.cropY != 0 || s.w != d.w || s.h != d.h) {
             d.cropOn = true;
-            d.cropX = src->cropX; d.cropY = src->cropY;
-            d.cropW = src->w; d.cropH = src->h;
+            d.cropX = s.cropX; d.cropY = s.cropY;
+            d.cropW = s.w; d.cropH = s.h;
         }
-        nd = decodeRawFrame(d, err);       // stats BEFORE reading, like every loader
-    } else if (const imagefile::Backend* fmt = imagefile::forPath(fpath)) {
+        std::string err;
+        pre.nd = decodeRawFrame(d, err);   // stats BEFORE reading, like every loader
+        if (!pre.nd) { pre.err = err.empty() ? "decode failed" : err; return; }
+        computeMinMax(*pre.nd);
+        return;
+    }
+    // ---- the two LOCAL file doors, and the ONE read they share ---------------
+    // identity BEFORE the bytes: an overwrite completing during this read binds
+    // the OLD tuple to the OLD pixels - the safe direction. Once per GROUP,
+    // which is once per file: a stat per membership of one file would be four
+    // readings of one generation and would let two of them disagree.
+    FrameSource st;
+    st.path = fpath;
+    statSourceFile(st);                    // local:// too: its embedded path IS
+                                           // this disk, and the reloaded tuple
+                                           // must move with it (an unmoved key
+                                           // would let a later open adopt
+                                           // pre-reload pixels)
+    std::vector<uint8_t> bytes;
+    if (!readFileBytes(fpath, bytes)) { refuseAll("cannot read file"); return; }
+    if (cancel && cancel->load()) { refuseAll("stopped"); return; }
+    if (const imagefile::Backend* fmt = imagefile::forPath(fpath)) {
         // A PICTURE FILE, back through the same seam it was opened through
         // (core/imagefile.h). The extension only chooses this door - what
         // decodes is decided by the bytes, exactly as on the way in, so a file
@@ -971,109 +1108,140 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
         // and srcIdentityKey keys it by the recipe for the same reason. The
         // extension does not get to overrule a reading the user declared.
         //
-        // The whole file is decoded to recover one picture, which is what the
-        // open door already does and says so (loadImageFile) - and what the
-        // .npy frame-axis branch below has always done. Reloading a 100-frame
-        // y4m frame by frame therefore reads it 100 times; that is the
-        // frame-axis cost this walk has carried since it was written, not a
-        // new one, and it is per-SOURCE, so reloadStackFromDisk pays it once
-        // per distinct source rather than once per membership.
-        FrameSource st;                    // identity BEFORE the bytes
-        st.path = fpath;
-        statSourceFile(st);
-        std::vector<uint8_t> bytes;
-        if (!readFileBytes(fpath, bytes)) { errOut = "cannot read file"; return false; }
-        std::vector<imagefile::Image> imgs;
-        if (!imagefile::decode(fpath, bytes, imgs, err)) { errOut = err; return false; }
-        // Which picture of the file these pixels ARE - the provenance the open
-        // recorded, replayed, never re-chosen. The two kinds are the two the
-        // seam already distinguishes (core/imagefile.h): a NAMED part is found
-        // by its name, an unnamed one by its position.
-        imagefile::Image* pick = nullptr;
-        if (!src->member.empty()) {
-            for (auto& g : imgs) if (g.member == src->member) { pick = &g; break; }
-            if (!pick) {          // ...and a part that is gone is refused BY NAME,
-                                  // the way a vanished .npz member is
-                errOut = std::string(fmt->partWord ? fmt->partWord : "part") + " \"" +
-                         src->member + "\" is no longer in the file";
-                return false;
-            }
-        } else {
-            if (src->fileFrame >= (int)imgs.size()) {
-                // the same sentence, and the same reasoning, as the .npy frame
-                // axis: there is no "same frame" left to give new values to
-                errOut = "file now has " + std::to_string(imgs.size()) + " frame(s); frame " +
-                         std::to_string(src->fileFrame) + " no longer exists";
-                return false;
-            }
-            pick = &imgs[(size_t)src->fileFrame];
-        }
-        nd = imageDocFromPicture(*pick, fpath, src->fileFrame, baseName(fpath), st);
-        // a crop made after load re-scoped this frame; the reload keeps that
-        // scope, exactly as the .npy branch does
-        if (nd && src->srcW > 0 &&
-            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW || src->h != src->srcH))
-            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
-    } else {
-        // identity BEFORE the bytes: an overwrite completing during this read
-        // binds the OLD tuple to the OLD pixels - the safe direction.
-        FrameSource st;
-        st.path = fpath;
-        statSourceFile(st);                // local:// too: its embedded path IS this
-                                           // disk, and the reloaded tuple must move
-                                           // with it (an unmoved key would let a
-                                           // later open adopt pre-reload pixels)
-        std::vector<uint8_t> npy;          // the .npy bytes, plain or extracted
-        if (!src->member.empty()) {
-            std::vector<uint8_t> zip;
-            if (!readFileBytes(fpath, zip)) { errOut = "cannot read file"; return false; }
-            std::vector<NpzEntry> entries;
-            if (!npzList(zip, entries, err)) { errOut = err; return false; }
-            bool found = false;
-            for (const auto& e : entries)
-                if (e.name == src->member + ".npy") {
-                    if (!npzExtract(zip, e, npy, err)) { errOut = err; return false; }
-                    found = true;
-                    break;
+        // The whole file still decodes to recover one picture - the container
+        // is one object and picDecodeAll says why - but it decodes ONCE for
+        // every membership of it, which is what a frame-axis stack of a
+        // 100-page TIFF used to pay a hundred times over.
+        std::vector<int> wanted;
+        for (const ReloadSpec* s : specs) wanted.push_back(reloadPickIndex(*s));
+        OpenDecoded dec;
+        std::string err;
+        err = picDecodeAll(fpath, bytes, st, s0.member, dec, cancel, &wanted);
+        if (!err.empty()) { refuseAll(err); return; }
+        for (size_t i = 0; i < specs.size(); i++) {
+            const ReloadSpec& s = *specs[i];
+            ReloadPre& pre = *pres[i];
+            // Which picture of the file these pixels ARE - the provenance the
+            // open recorded, replayed, never re-chosen. The two kinds are the
+            // two the seam already distinguishes (core/imagefile.h): a NAMED
+            // part is found by its name, an unnamed one by its position.
+            size_t pick = (size_t)-1;
+            if (!s.member.empty()) {
+                for (size_t k = 0; k < dec.members.size(); k++)
+                    if (dec.members[k] == s.member) { pick = k; break; }
+                if (pick == (size_t)-1) {   // ...and a part that is gone is
+                                            // refused BY NAME, the way a
+                                            // vanished .npz member is
+                    pre.err = std::string(fmt->partWord ? fmt->partWord : "part") +
+                              " \"" + s.member + "\" is no longer in the file";
+                    continue;
                 }
-            if (!found) {
-                errOut = "array \"" + src->member + "\" is no longer in the file";
-                return false;
+            } else {
+                if (s.fileFrame >= (int)dec.members.size()) {
+                    // the same sentence, and the same reasoning, as the .npy
+                    // frame axis: there is no "same frame" left to give new
+                    // values to
+                    pre.err = "file now has " + std::to_string(dec.members.size()) +
+                              " frame(s); frame " + std::to_string(s.fileFrame) +
+                              " no longer exists";
+                    continue;
+                }
+                pick = (size_t)s.fileFrame;
             }
-        } else if (!readFileBytes(fpath, npy)) {
-            errOut = "cannot read file";
-            return false;
-        }
-        int frames = 1;
-        int64_t fs = 0;
-        // re-decode under the RECORDED reading declaration (npyRead, §3.3),
-        // never a guess made today: these pixels were born under that
-        // declaration, and `frames` below is the file's frame count under it -
-        // so the refusal message states a true count. (A declaration the new
-        // shape cannot mean falls back to native and SAYS so - npyLayout.)
-        nd = decodeNpyBuffer(npy, fpath, "", err, 0, frames, fs, src->npyRead);
-        if (nd && src->fileFrame > 0) {    // frame-axis member: decode ITS frame
-            if (src->fileFrame >= frames) {
-                errOut = "file now has " + std::to_string(frames) + " frame(s); frame " +
-                         std::to_string(src->fileFrame) + " no longer exists";
-                return false;
+            if (!dec.docs[pick]) {
+                pre.err = pick < dec.errs.size() && !dec.errs[pick].empty()
+                              ? dec.errs[pick] : std::string("decode failed");
+                continue;
             }
-            nd = decodeNpyBuffer(npy, fpath, "", err, src->fileFrame, frames, fs,
-                                 src->npyRead);
+            pre.nd = std::move(dec.docs[pick]);
+            recrop(s, *pre.nd);
         }
-        if (nd) { nd->src->mtime = st.mtime; nd->src->fsize = st.fsize; }
-        // a crop made after load re-scoped this frame; the reload keeps that scope
-        if (nd && src->srcW > 0 &&
-            (src->cropX != 0 || src->cropY != 0 || src->w != src->srcW || src->h != src->srcH))
-            cropInPlace(*nd, src->cropX, src->cropY, src->w, src->h);
+        return;
     }
-    if (!nd) { errOut = err.empty() ? "decode failed" : err; return false; }
-    computeMinMax(*nd);
+    // .npy, plain or inside a container. The bytes of the ARRAY are extracted
+    // once for the group, for the read's own reason: a stack of four
+    // memberships of one .npz member used to inflate that member four times.
+    std::vector<uint8_t> npy;
+    if (!s0.member.empty()) {
+        std::vector<NpzEntry> entries;
+        std::string err;
+        if (!npzList(bytes, entries, err)) { refuseAll(err); return; }
+        bool found = false;
+        for (const auto& e : entries)
+            if (e.name == s0.member + ".npy") {
+                if (!npzExtract(bytes, e, npy, err)) { refuseAll(err); return; }
+                found = true;
+                break;
+            }
+        if (!found) {
+            refuseAll("array \"" + s0.member + "\" is no longer in the file");
+            return;
+        }
+    } else {
+        npy = std::move(bytes);
+    }
+    if (cancel && cancel->load()) { refuseAll("stopped"); return; }
+    // re-decode under the RECORDED reading declaration (npyRead, §3.3), never a
+    // guess made today: these pixels were born under that declaration, and the
+    // frame count npyDecodeFrames reports is the file's count UNDER it - so the
+    // refusal below states a true count. (A declaration the new shape cannot
+    // mean falls back to native and SAYS so - npyLayout.)
+    //
+    // `wanted` is the other half of the report: the frames this group's
+    // memberships actually are, and nothing else. Frame 0 is no longer decoded
+    // on the way to frame 7 (npyDecodeFrames takes the count off the header),
+    // and a three-frame subset of a 120-frame array decodes three.
+    std::vector<int> wanted;
+    for (const ReloadSpec* s : specs) wanted.push_back(reloadPickIndex(*s));
+    OpenDecoded dec;
+    {
+        std::string err = npyDecodeFrames(npy, fpath, "", s0.npyRead, dec, cancel, &wanted);
+        if (!err.empty()) { refuseAll(err); return; }
+    }
+    for (size_t i = 0; i < specs.size(); i++) {
+        const ReloadSpec& s = *specs[i];
+        ReloadPre& pre = *pres[i];
+        if (s.fileFrame >= dec.frames) {
+            pre.err = "file now has " + std::to_string(dec.frames) + " frame(s); frame " +
+                      std::to_string(s.fileFrame) + " no longer exists";
+            continue;
+        }
+        if (!dec.docs[(size_t)s.fileFrame]) {
+            pre.err = !dec.errs[(size_t)s.fileFrame].empty()
+                          ? dec.errs[(size_t)s.fileFrame] : std::string("decode failed");
+            continue;
+        }
+        pre.nd = std::move(dec.docs[(size_t)s.fileFrame]);
+        pre.nd->src->mtime = st.mtime;     // the Watch baseline, off the ONE stat
+        pre.nd->src->fsize = st.fsize;
+        recrop(s, *pre.nd);
+    }
+}
+
+// One membership, on its own. The group of one, so there is no second copy of
+// any decision above.
+static void reloadDecode(const ReloadSpec& spec, ReloadPre& pre,
+                         const std::atomic<bool>* cancel = nullptr,
+                         const ReloadPeer& peer = ReloadPeer()) {
+    reloadDecodeGroup({ &spec }, { &pre }, cancel, peer);
+}
+
+// ---- the LANDING half, and everything in it needs THIS thread ---------------
+// The dims note, the new registry key, the swap under g_srcRegMtx, Watch's
+// re-seed and the §3.2 invalidation walk. Nothing here reads a byte of the
+// file: `pre` already holds a measured, cropped document, or the reason there
+// is none.
+static bool reloadLand(const std::shared_ptr<FrameSource>& src, const ReloadSpec& spec,
+                       ReloadPre& pre, std::string& errOut, std::string* noteOut) {
+    if (!src) { errOut = "no source"; return false; }
+    if (!pre.nd) { errOut = pre.err.empty() ? "decode failed" : pre.err; return false; }
+    std::unique_ptr<ImageDoc> nd = std::move(pre.nd);
     const FrameSource& N = *nd->src;
-    if (noteOut && (N.w != src->w || N.h != src->h || N.ch != src->ch || N.dtype != src->dtype)) {
+    if (noteOut && (N.w != spec.w || N.h != spec.h || N.ch != spec.ch ||
+                    N.dtype != spec.dtype)) {
         char b[96];
-        snprintf(b, sizeof b, "%dx%d %dch %s -> %dx%d %dch %s", src->w, src->h, src->ch,
-                 src->dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
+        snprintf(b, sizeof b, "%dx%d %dch %s -> %dx%d %dch %s", spec.w, spec.h, spec.ch,
+                 spec.dtype.c_str(), N.w, N.h, N.ch, N.dtype.c_str());
         *noteOut = b;
     }
     // The new key BEFORE the lock (it canonicalizes the path: filesystem IO -
@@ -1101,9 +1269,10 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     }
     {   // the swap, in ONE hold of g_srcRegMtx: the worker reads a shared
         // source only inside that lock (find + syncMirrors in one section), so
-        // no thread can see a half-swapped source. nd is PRIVATE here - its
-        // cropInPlace above took and released the lock on the fresh decode -
-        // so this scope acquires exactly one lock (see the note at g_srcRegMtx).
+        // no thread can see a half-swapped source. nd is PRIVATE here - the
+        // crop it may have had was applied by cropPixels, which takes no lock
+        // at all - so this scope acquires exactly one lock (see the note at
+        // g_srcRegMtx).
         std::lock_guard<std::mutex> lk(g_srcRegMtx);
         // re-key: the tuple embeds mtime/fsize, so the reloaded source MOVES to
         // its new tuple's slot - a re-open of the changed file finds and shares
@@ -1141,7 +1310,7 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
                                       // bytes.
     }
     // Watch's baseline just moved: these pixels ARE what the disk holds again,
-    // and the amber line that said otherwise has to stop being true. The watcher
+    // and the mark that said otherwise has to stop being true. The watcher
     // learns it from the republished seed (App::watchTargetsDirty), not from a
     // message - which is why the flag is set HERE, in the one place a source's
     // mtime/fsize is ever rewritten, and not at each of the callers.
@@ -1161,6 +1330,20 @@ static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& e
     for (int sid : seqIds) linHit |= invalidateStackDerived(sid);
     if (linHit) linFitStale();
     return true;
+}
+
+// THE DOOR, and it is the three calls above in their order. Synchronous, and
+// that is what keeps every existing caller - the frame menu's single reload,
+// reloadStackFromDisk's own loop, all of core/selftest/reload.inc - compiling
+// and passing unchanged.
+static bool reloadSource(const std::shared_ptr<FrameSource>& src, std::string& errOut,
+                         std::string* noteOut = nullptr,
+                         const ReloadPeer& peer = ReloadPeer()) {
+    if (!src) { errOut = "no source"; return false; }
+    const ReloadSpec spec = reloadSpecOf(*src);
+    ReloadPre pre;
+    reloadDecode(spec, pre, nullptr, peer);
+    return reloadLand(src, spec, pre, errOut, noteOut);
 }
 
 // ---- §6: the membership a Reload rebuilds -----------------------------------
@@ -1576,23 +1759,31 @@ static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
 // memberships OUTSIDE this stack that the walk refreshed through shared
 // sources - numbers moving in a stack the user never touched need a stated
 // cause.
-static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
-                                       const ReloadPeer& peer = ReloadPeer()) {
-    std::vector<const FrameSource*> done;
-    int ok = 0, failed = 0, dims = 0, sharedN = 0;
-    std::string firstErr, firstDims;
-    std::vector<std::string> sharedNames;  // distinct holders, first one is named
-    // ---- §6 step 1-2a: the member list, BEFORE a byte is read ---------------
-    // The departures happen first, and that is not an implementation detail: a
-    // member whose file is GONE would otherwise reach reloadSource, be refused
-    // ("cannot read file"), and be counted as a REFUSAL - which would mark the
-    // stack as holding frames of two moments (#56) when what actually happened
-    // is that it now holds four frames of one moment. A frame that is gone is
-    // not a frame that failed to read, and the difference is the whole of what
-    // the mark means.
-    const int hadBefore = (int)framesOfSeq(seqId).size();
+//
+// ...and it too is in three parts now, for the reason reloadSource is in two:
+// the middle part is N file reads and N decodes, and neither the plan in front
+// of it nor the arithmetic behind it costs anything at all. The asynchronous
+// door below (startStackReload) is these same three parts with a worker in the
+// middle, so there is one plan, one summary and one set of §12/§13 decisions.
+
+// ---- §6 step 1-2a: the member list, BEFORE a byte is read -------------------
+// The departures happen first, and that is not an implementation detail: a
+// member whose file is GONE would otherwise reach reloadSource, be refused
+// ("cannot read file"), and be counted as a REFUSAL - which would mark the
+// stack as holding frames of two moments (#56) when what actually happened is
+// that it now holds four frames of one moment. A frame that is gone is not a
+// frame that failed to read, and the difference is the whole of what the mark
+// means.
+//
+// It stays on the UI THread in both doors, and that is a decision about cost:
+// locally it is one directory_iterator, and over a link it is ONE listing - the
+// per-member META+TILE that follows is where a remote reload spends its
+// seconds, and that is what moved. closeImages is not movable at all.
+static void reloadStackPlan(int seqId, const ReloadPeer& peer,
+                            watch::Rebuild& planOut, int& hadBeforeOut) {
+    hadBeforeOut = (int)framesOfSeq(seqId).size();
     watch::Rebuild plan = planStackMembership(seqId, peer);
-    if ((int)plan.dropped.size() >= hadBefore) plan = watch::Rebuild{};
+    if ((int)plan.dropped.size() >= hadBeforeOut) plan = watch::Rebuild{};
                                           // ...and a rebuild NEVER empties a
                                           // stack. "Every file is gone" is not
                                           // something a click on Reload may
@@ -1610,41 +1801,47 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
         // pruning this stack's frames need is the pruning any close does.
         closeImages(gone);
     }
-    for (int idx : framesOfSeq(seqId)) {
-        const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
-        if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
-        done.push_back(s.get());
-        std::string err, note;
-        if (reloadSource(s, err, &note, peer)) {
-            ok++;
-            if (!note.empty()) {
-                dims++;
-                if (firstDims.empty())
-                    firstDims = (s->path.empty() ? app.images[idx]->name
-                                                 : baseName(s->path)) + ": " + note;
-            }
-            // the walk just refreshed every membership of this source OUTSIDE
-            // this stack too (other stacks, loose frames)
-            for (const auto& d2 : app.images)
-                if (d2->src == s && d2->seqId != seqId) {
-                    sharedN++;
-                    std::string where = d2->name;
-                    if (d2->seqId != 0)
-                        if (const App::SeqInfo* si2 = seqInfo(d2->seqId)) where = si2->name;
-                    if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
-                        sharedNames.end())
-                        sharedNames.push_back(where);
-                }
-        } else {
-            failed++;
-            if (firstErr.empty())
-                firstErr = (s->path.empty() ? app.images[idx]->name
-                                            : baseName(s->path)) + ": " + err;
+    planOut = std::move(plan);
+}
+
+// The walk just refreshed every membership of this source OUTSIDE this stack
+// too (other stacks, loose frames): numbers moving in a stack the user never
+// touched need a stated cause, so the summary earns a clause and this is what
+// counts it. Called once per LANDED item, by both doors.
+static void reloadSharedTally(const std::shared_ptr<FrameSource>& s, int seqId,
+                              int& sharedN, std::vector<std::string>& sharedNames) {
+    for (const auto& d2 : app.images)
+        if (d2->src == s && d2->seqId != seqId) {
+            sharedN++;
+            std::string where = d2->name;
+            if (d2->seqId != 0)
+                if (const App::SeqInfo* si2 = seqInfo(d2->seqId)) where = si2->name;
+            if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
+                sharedNames.end())
+                sharedNames.push_back(where);
         }
-    }
+}
+
+// What one attempt's numbers ADD UP TO: the arrivals, the renumbering, #56's
+// latch and the sentence. `stopped` is the asynchronous door's own term - a
+// Stop that left n of N frames re-read - and it is said rather than counted as
+// a refusal, because nothing refused.
+struct ReloadTally {
+    int ok = 0, failed = 0, dims = 0, sharedN = 0;
+    std::string firstErr, firstDims;
+    std::vector<std::string> sharedNames;
+    int stoppedAfter = -1;            // -1 = ran to the end
+    int stoppedOf = 0;
+};
+static std::string reloadStackTail(int seqId, const watch::Rebuild& plan, int hadBefore,
+                                   const ReloadTally& t, int* failedOut,
+                                   const ReloadPeer& peer) {
     // ---- §6 step 2b-3: the arrivals, then the numbers -----------------------
     // AFTER the re-read, so a joining frame is measured against the reference
-    // frame's CURRENT shape rather than the shape it had a moment ago.
+    // frame's CURRENT shape rather than the shape it had a moment ago. That
+    // ordering is also why this half stays on the UI thread in the
+    // asynchronous door: the shape it measures against does not exist until
+    // the last item has landed.
     int joinFailed = 0;
     std::string firstJoinErr;
     if (!plan.added.empty()) {
@@ -1726,7 +1923,7 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
         // ...and the watcher's target list is now a different set of files.
         app.watchTargetsDirty = true;
     }
-    if (failedOut) *failedOut = failed;
+    if (failedOut) *failedOut = t.failed;
     // ---- #56: what this attempt LEAVES ON the stack ------------------------
     // The summary below is a toast, and a toast scrolls away. A reload that
     // refused a member left frames of two moments under one name, and every
@@ -1737,14 +1934,33 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
     // And the clean run is the one thing that CLEARS it: every member re-read
     // in one attempt is a stack of one moment again. Not a redraw, not a
     // single-frame reload - the operation that failed is the operation that
-    // un-says it. The pointer is taken after the last reloadSource: nothing in
-    // the walk adds or removes a stack, but seqInfo()'s rule is that the
-    // pointer is not held ACROSS anything, so it is not.
+    // un-says it. The pointer is taken after the last landing: nothing in the
+    // walk adds or removes a stack, but seqInfo()'s rule is that the pointer is
+    // not held ACROSS anything, so it is not.
+    //
+    // A STOP is on the same side of this as a refusal, and for the same reason
+    // rather than by analogy: the stack really does hold frames of two moments,
+    // so #56's mark has to be up. What differs is the WORD - `firstErr` says
+    // "stopped after n of N" - because nothing about the files was wrong.
+    // A STOP's frames are NOT refusals, and they are not "of this moment"
+    // either: they are the frames nobody re-read. So the LATCH counts them -
+    // the stack really does hold two moments, which is the one thing #56's mark
+    // is about - while `failed` above stays the count of members that actually
+    // refused, because that is what the summary's first clause claims.
+    int latchFailed = t.failed, latchOk = t.ok;
+    std::string latchErr = t.firstErr;
+    if (t.stoppedAfter >= 0 && t.stoppedAfter < t.stoppedOf) {
+        latchFailed += t.stoppedOf - t.stoppedAfter;
+        if (latchErr.empty())
+            latchErr = "the reload was stopped, so " +
+                       std::to_string(t.stoppedOf - t.stoppedAfter) +
+                       " frame(s) were never re-read";
+    }
     if (App::SeqInfo* si = seqInfo(seqId)) {
-        si->reloadFailed = failed;
-        si->reloadOk = failed ? ok : 0;
-        si->reloadFirstErr = failed ? firstErr : std::string();
-        if (failed) {
+        si->reloadFailed = latchFailed;
+        si->reloadOk = latchFailed ? latchOk : 0;
+        si->reloadFirstErr = latchFailed ? latchErr : std::string();
+        if (latchFailed) {
             char ts[32] = "";
             time_t now = time(nullptr);
             if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", lt);
@@ -1754,8 +1970,12 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
         }
     }
     char buf[256];
-    snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed", ok, failed);
+    snprintf(buf, sizeof buf, "reloaded %d frame(s), %d failed", t.ok, t.failed);
     std::string msg = buf;
+    if (t.stoppedAfter >= 0) {
+        snprintf(buf, sizeof buf, " - stopped after %d of %d", t.stoppedAfter, t.stoppedOf);
+        msg += buf;
+    }
     // §6: the member list moved, so the summary says so, with the names and
     // with both counts. A stack that quietly measures a different set of frames
     // than it did a second ago is the failure this sentence exists to prevent -
@@ -1775,19 +1995,20 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
     // ...and the toast points at the mark it just left, because the mark is
     // the part that outlives the toast: a user who reads only this line must
     // still learn that the stack now carries the fact, and where.
-    if (failed)
-        msg += " - " + firstErr + " - this stack is marked " +
+    if (latchFailed)
+        msg += " - " + latchErr + " - this stack is marked " +
                SEQ_RELOAD_FAIL_TOKEN + " in Files until every frame re-reads";
-    if (dims) {
-        snprintf(buf, sizeof buf, " - %d changed dimensions (%s)", dims, firstDims.c_str());
+    if (t.dims) {
+        snprintf(buf, sizeof buf, " - %d changed dimensions (%s)", t.dims,
+                 t.firstDims.c_str());
         msg += buf;
     }
-    if (sharedN) {
+    if (t.sharedN) {
         snprintf(buf, sizeof buf, " - also refreshed %d shared frame(s) in \"%s\"",
-                 sharedN, sharedNames.empty() ? "" : sharedNames[0].c_str());
+                 t.sharedN, t.sharedNames.empty() ? "" : t.sharedNames[0].c_str());
         msg += buf;
-        if (sharedNames.size() > 1) {
-            snprintf(buf, sizeof buf, " (+%d more)", (int)sharedNames.size() - 1);
+        if (t.sharedNames.size() > 1) {
+            snprintf(buf, sizeof buf, " (+%d more)", (int)t.sharedNames.size() - 1);
             msg += buf;
         }
     }
@@ -1803,6 +2024,598 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
         msg += buf;
     }
     return msg;
+}
+
+static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
+                                       const ReloadPeer& peer = ReloadPeer()) {
+    std::vector<const FrameSource*> done;
+    ReloadTally t;
+    int hadBefore = 0;
+    watch::Rebuild plan;
+    reloadStackPlan(seqId, peer, plan, hadBefore);
+    for (int idx : framesOfSeq(seqId)) {
+        const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
+        if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
+        done.push_back(s.get());
+        std::string err, note;
+        if (reloadSource(s, err, &note, peer)) {
+            t.ok++;
+            if (!note.empty()) {
+                t.dims++;
+                if (t.firstDims.empty())
+                    t.firstDims = (s->path.empty() ? app.images[idx]->name
+                                                   : baseName(s->path)) + ": " + note;
+            }
+            reloadSharedTally(s, seqId, t.sharedN, t.sharedNames);
+        } else {
+            t.failed++;
+            if (t.firstErr.empty())
+                t.firstErr = (s->path.empty() ? app.images[idx]->name
+                                              : baseName(s->path)) + ": " + err;
+        }
+    }
+    return reloadStackTail(seqId, plan, hadBefore, t, failedOut, peer);
+}
+
+// ============================================================================
+//  THE RELOAD, OFF THE UI THREAD (the 2026-09-28 report)
+//  ============================================================================
+//
+// 「reload を押すと応答なしになる」. Measured on this repo before the change:
+// with the freeze probe and the automatic Reload driving the gesture (median of
+// 3, longest unresponsive; the table and the method are in watch-design §18.2b):
+//
+//   480 MB .npy, ONE file, TEN frames    3003 ms -> 0 ms
+//   480 MB x 4 files, folder stack       5013 ms -> 1508 ms
+//   48 MB x 4 files, folder stack         375 ms -> 0 ms   (the control)
+//
+// The ten-frame row is this walk's own pathology: a frame-axis stack is one
+// FrameSource per frame, so the old walk asked each of them to read the whole
+// file for itself - TEN whole-file reads and twenty decodes to land ten frames.
+// That is #232 stage 2's pathology exactly, fixed for the open and not for the
+// reload. (What is left on row 2 is not a read at all - see §18.2b: it is the
+// GL upload of a ~1 GB frame, and it is the same before and after.)
+//
+// NO NEW MACHINERY. App::ReloadJob is App::OpenJob's shape (one at a time, a
+// queue in front of it, a cancel flag, a start time that IS the progress), the
+// split between decode and landing is reloadDecodeGroup/reloadLand above, the
+// plan and the summary are reloadStackPlan/reloadStackTail above, and the row it
+// draws is the row the open, the reader, the stack loader and the video export
+// already draw.
+//
+// FOUR THINGS ARE THE RELOAD's OWN, and each is a decision rather than a detail:
+//
+//   IT LANDS ONE ITEM PER FRAME. A reload that swapped twelve frames in one
+//   landing would have moved the freeze from the read to the swap - each
+//   landing walks app.images, unlatches every cache keyed on the source and
+//   marks a texture dirty. So the progress row carries a true fraction
+//   ("3 / 12") where an open's carries a phase, and the window answers between
+//   every frame of the stack. The worker runs ahead of the landing, so on real
+//   data the cost is the decode and this costs nothing; on a stack of tiny
+//   files it is one frame of the loop per member, which is a slower reload of
+//   something that was never the complaint.
+//
+//   STOP LEAVES WHAT LANDED. The opposite of OpenJob's "Stop leaves nothing",
+//   and for a reason rather than by accident: a landed frame is a complete,
+//   valid document of what the disk holds now, and un-landing it would mean
+//   re-reading the file to get the OLD pixels back. What a stop leaves is a
+//   stack of two moments, which is precisely the state #56's mark exists for,
+//   so the mark goes up and the summary says "stopped after n of N".
+//
+//   THE PEER IS THE WORKER's. app.uiSession belongs to the UI thread and to
+//   nobody else (state.h's ownership note), so a job with peer items dials a
+//   Session of its own - rfWorker's shape - and a link that drops fails every
+//   remaining peer item WITHOUT re-dialling. §16.6 argued that the stall was
+//   the manual gesture's price and not the automatic one's; the answer taken in
+//   the end is that it is nobody's.
+//
+//   THE MEMBERSHIP REBUILD STAYS HERE. Both ends of it: the plan, because
+//   locally it is one directory listing and remotely it is ONE request (the
+//   per-member transfer is what moved), and closeImages, which is not movable.
+//   The ARRIVALS stay too, and that one is forced: §6 measures a joining frame
+//   against the reference frame's CURRENT shape, and that shape does not exist
+//   until the last item has landed. A Reload of a folder that gained a file
+//   therefore still decodes that ONE file on this thread. Stated rather than
+//   hidden; the F-member re-read it used to sit behind is what the report was
+//   about.
+
+// A landed or refused item, as the summary names it: the file's base name, or
+// the document's own name when there is no file behind it (a computed frame).
+static std::string reloadItemName(const App::ReloadJob::Item& it) {
+    if (!it.spec.path.empty()) return baseName(it.spec.path);
+    for (const auto& d : app.images)
+        if (d->src == it.src) return d->name;
+    return std::string("this frame");
+}
+
+// What the Files row says while a reload runs. A true fraction and the seconds,
+// and no phase: every item goes through the same three steps, so naming them
+// would say the same word twelve times over. (openJobPhase is the twin, and its
+// note says why an OPEN has no fraction to give.)
+static std::string reloadJobRowText(const App::ReloadJob& j) {
+    char b[160];
+    snprintf(b, sizeof b, "reloading %s: %d / %d  %.1f s",
+             j.name.empty() ? "frame" : j.name.c_str(), j.landedN, (int)j.items.size(),
+             nowSec() - j.startedAt);
+    return b;
+}
+
+// Everything the worker does, and nothing else. Every call in here is pure or
+// is already called from the sequence loader's thread for the same reason.
+static void reloadJobWorker(App::ReloadJob* j) {
+    j->decodeThread = std::this_thread::get_id();
+    // ---- the peer, dialled ONCE, and never again once it is gone -----------
+    // A function-local Session, rfWorker's shape and its reason: a 300 s round
+    // trip must not hold the UI's frame, and two threads framing requests into
+    // one ssh stdin desynchronise the stream permanently. `cancel` is its abort,
+    // so a Stop reaches a blocked read.
+    //
+    // A resolver a CALLER handed in wins (§16): --rwatch-selftest drives a real
+    // local:// peer over a pipe and reaches it with an empty host, which no url
+    // can spell. The test thread is inside waitForReloadJob while this runs, so
+    // that session still has exactly one thread touching it at a time.
+    remote::Session ses;
+    ses.setAbort(&j->cancel);
+    ses.setIdleTimeout(30.0);
+    bool dialled = false, dead = false;
+    std::string deadErr;
+    ReloadPeer own = [&](const std::string& host, int port,
+                         std::string& errOut) -> remote::Session* {
+        // ONE LATCH, whichever side answers. A link that is down is down for
+        // every remaining item of this job, and the alternative is a stack of
+        // forty peer frames spending forty connect timeouts discovering it one
+        // at a time - with a Stop button that cannot be pressed any faster than
+        // the frame loop, which is the very thing this worker exists for.
+        if (dead) { errOut = deadErr; return nullptr; }
+        auto die = [&](const std::string& why) -> remote::Session* {
+            dead = true;
+            deadErr = why.empty() ? std::string("the peer did not answer") : why;
+            errOut = deadErr;
+            return nullptr;
+        };
+        if (j->peer) {
+            remote::Session* s = j->peer(host, port, errOut);
+            return s ? s : die(errOut);
+        }
+        if (!dialled) {
+            dialled = true;
+            // the peer is the same binary, resolved exactly as ensureUiSession
+            // resolves it - one spelling of "which program answers on the other
+            // side", or a reload would reach a different peer than the open did
+            // - but off the values FROZEN at the start of the job (review P1-1).
+            // app.remoteExe and app.exePath are std::strings the UI thread
+            // writes (settings.inc SK_peerExe, session.inc's `remoteexe` line),
+            // so reading them here is a data race on a std::string and not
+            // merely a stale read. rfEnqueue freezes for exactly this reason and
+            // says so. With this, the worker touches NO app state at all, which
+            // is the whole discipline.
+            const std::string exe =
+                (host.empty() && j->remoteExe.empty())
+                    ? j->exePath
+                    : (j->remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
+                                            : j->remoteExe);
+            std::string err;
+            if (!ses.startOn(host, port, exe, err)) return die(err);
+        }
+        // The link went down under an earlier item: same latch, different
+        // sentence, because "it never answered" and "it stopped answering" are
+        // two different things to read on a row.
+        if (!ses.alive()) return die("the connection to the peer was lost");
+        return &ses;
+    };
+    // The groups were laid out by startStackReload, contiguously and in item
+    // order, so `doneCount` is monotone in the order the landing lands: item k
+    // is decoded when doneCount > k, whichever group it was in.
+    size_t from = 0;
+    for (int end : j->groupEnd) {
+        if (j->cancel.load()) break;       // between GROUPS, never inside one:
+                                           // half a file read is not a read
+        std::vector<const ReloadSpec*> specs;
+        std::vector<ReloadPre*> pres;
+        for (size_t i = from; i < (size_t)end; i++) {
+            specs.push_back(&j->items[i].spec);
+            pres.push_back(&j->items[i].pre);
+        }
+        reloadDecodeGroup(specs, pres, &j->cancel, own);
+        j->doneCount.store(end);
+        from = (size_t)end;
+    }
+    j->done.store(true);
+}
+
+// Build the items of a job out of the stack's distinct resident sources, group
+// them so one file is read once, and lay the groups out contiguously. Returns
+// how many items there are; 0 means there is nothing to reload.
+static size_t reloadJobItemsForStack(App::ReloadJob* j, int seqId) {
+    std::vector<const FrameSource*> done;
+    for (int idx : framesOfSeq(seqId)) {
+        const std::shared_ptr<FrameSource>& s = app.images[idx]->src;
+        if (std::find(done.begin(), done.end(), s.get()) != done.end()) continue;
+        done.push_back(s.get());
+        App::ReloadJob::Item it;
+        it.src = s;
+        it.spec = reloadSpecOf(*s);
+        j->items.push_back(std::move(it));
+    }
+    // ---- the grouping, and it is the second half of the report --------------
+    // Memberships served by ONE read go together, and two memberships that want
+    // the SAME frame of one file do not (reloadPickIndex says why). The groups
+    // are laid out contiguously in item order so that the worker's progress
+    // counter is monotone for the landing.
+    std::vector<App::ReloadJob::Item> ordered;
+    std::vector<int> ends;
+    std::vector<bool> taken(j->items.size(), false);
+    for (size_t i = 0; i < j->items.size(); i++) {
+        if (taken[i]) continue;
+        const std::string key = reloadReadKey(j->items[i].spec);
+        std::vector<int> picks;
+        taken[i] = true;
+        picks.push_back(reloadPickIndex(j->items[i].spec));
+        ordered.push_back(std::move(j->items[i]));
+        if (!key.empty())
+            for (size_t k = i + 1; k < j->items.size(); k++) {
+                if (taken[k] || reloadReadKey(j->items[k].spec) != key) continue;
+                const int pick = reloadPickIndex(j->items[k].spec);
+                if (std::find(picks.begin(), picks.end(), pick) != picks.end()) continue;
+                taken[k] = true;
+                picks.push_back(pick);
+                ordered.push_back(std::move(j->items[k]));
+            }
+        ends.push_back((int)ordered.size());
+    }
+    j->items = std::move(ordered);
+    j->groupEnd = std::move(ends);
+    return j->items.size();
+}
+
+static bool startReloadJob(App::ReloadJob* j);
+// watch-design 12's frame-axis membership, defined in watch.inc (included after
+// this file). Declared here because THE PLAN BELONGS TO THE JOB that does the
+// reading (review P1-2), so it is taken - and its departures applied - inside
+// startStackReload below rather than at the gesture.
+static WatchAxisPlan watchFrameAxisPlan(int seqId);
+static void watchFrameAxisDrop(int seqId, int keep);
+// ...and the SYNCHRONOUS door's whole gesture, also watch.inc's: the plan, the
+// re-read and the sentence, in that order. One spelling, so the queue's
+// fall-back below cannot drift from watchReloadNow's own body.
+static void reloadStackSync(int seqId, bool automatic);
+// ...and what a finished stack reload SAYS about the finding it just answered
+// (watch-design §9's record and its one toast), watch.inc's too: ONE
+// post-processing, so a click and the automaton cannot come to do two different
+// things.
+static void watchReloadFinish(int seqId, bool automatic, const std::string& msg,
+                              int failed, uint64_t pinWas, const WatchAxisPlan& ax);
+
+// Start a stack's reload without waiting for it. Returns whether the
+// asynchronous door took it - false means the caller must do the reload itself,
+// here and now (reloadStackFromDisk).
+static bool startStackReload(int seqId, bool automatic,
+                             const ReloadPeer& peer = ReloadPeer()) {
+    // THE SYNCHRONOUS DOOR, and it is wide for startOpenJob's reason exactly:
+    // --reload-selftest, --watch-selftest and --rwatch-selftest all call
+    // reloadStackFromDisk (or watchReloadNow) and assert on app.images on the
+    // line after it. --async-open is the lid, so the path a person takes is not
+    // the one path the suite never runs.
+    if (g_scriptedRun && !g_forceAsyncOpen) return false;
+    if (!seqInfo(seqId)) return false;
+    // Already reloading. The SAME stack is folded in - a double-click on
+    // Reload, or §9's drain firing while the click's job runs, is one reload -
+    // and a different stack waits. Never folded into a job that has been
+    // STOPPED (startOpenJob's review P2-4): that job will land nothing more, so
+    // answering "already reloading" about it would silently do nothing.
+    if (app.reloadJob) {
+        // FOLDED, and folding is NOT discarding (review P1-2). This request has
+        // not been read: the job in flight started before the request was made,
+        // so it cannot be an answer to it. `again` runs the stack once more when
+        // this job has landed, with a NEW plan and a NEW stat - which is the
+        // only statement that is actually true. (Overwriting the RUNNING job's
+        // plan is not available: its decode began on the old member list, so a
+        // grow would claim frames nobody read.)
+        if (app.reloadJob->seqId == seqId && !app.reloadJob->cancel.load()) {
+            App::ReloadJob* run = app.reloadJob.get();
+            run->againAutomatic = run->again ? (run->againAutomatic && automatic)
+                                             : automatic;
+            run->again = true;
+            return true;
+        }
+        for (auto& w : app.reloadQueue)
+            if (w.seqId == seqId) {          // a request already WAITING needs no
+                w.automatic = w.automatic && automatic;   // second entry, but a
+                return true;                 // CLICK deserves a click's sentence
+            }
+        app.reloadQueue.push_back({ seqId, 0, automatic });
+        return true;
+    }
+    std::unique_ptr<App::ReloadJob> j(new App::ReloadJob());
+    j->seqId = seqId;
+    j->automatic = automatic;
+    j->peer = peer;
+    // ...and HOW the peer is invoked, frozen now (review P1-1, rfEnqueue's rule)
+    j->remoteExe = app.remoteExe;
+    j->exePath = app.exePath;
+    if (const App::SeqInfo* si = seqInfo(seqId)) j->name = si->name;
+    // §12.5's other half, sampled ACROSS the whole reload: a pin on a frame
+    // that VANISHES is dropped by closeImages, and the summary is about files.
+    j->pinWas = app.compareBUid;
+    // ---- watch-design §12's frame-axis plan, taken HERE (review P1-2) --------
+    // Not at the gesture. A gesture folded into a running job does no reading,
+    // so a plan taken there applied its departures against a stack whose
+    // re-read was somebody else's and then lost its arrivals with the fold -
+    // board 222's own defect, back through the folding path
+    // (--asyncopen-selftest R9e). Taken where the READ begins, that path is
+    // structurally gone: no job, no plan, no departures.
+    //
+    // The departures go FIRST, in §6's order and for §6's reason: a frame the file
+    // no longer holds must not reach reloadSource and be counted as a refusal.
+    // The arrivals are watchReloadFinish's, when this job lands. `pinWas` above
+    // is sampled before them because they are a closeImages.
+    j->axis = watchFrameAxisPlan(seqId);
+    if (j->axis.moved() && j->axis.want < j->axis.have)
+        watchFrameAxisDrop(seqId, j->axis.want);
+    reloadStackPlan(seqId, j->peer, j->plan, j->hadBefore);
+    if (!reloadJobItemsForStack(j.get(), seqId)) {
+        // Nothing resident to re-read - a stack every member of which just
+        // departed, which reloadStackPlan refuses to let happen, or one that
+        // was emptied under us. The gesture still owes its WHOLE answer, and
+        // that includes §12's arrivals and §5's clearing, so it goes through
+        // watchReloadFinish rather than toasting on its own.
+        ReloadTally t;
+        int failed = 0;
+        const std::string msg = reloadStackTail(seqId, j->plan, j->hadBefore, t,
+                                                &failed, j->peer);
+        watchReloadFinish(seqId, automatic, msg, failed, j->pinWas, j->axis);
+        return true;
+    }
+    app.reloadJob = std::move(j);
+    return startReloadJob(app.reloadJob.get());
+}
+
+// ...and ONE frame, from the frame menu or the Files row's own Reload. The same
+// job with one item and no stack: the membership rebuild has no subject, and the
+// summary is the single-frame one (reloadOneFrameText). It is here rather than
+// left synchronous because the cost is the SAME cost: one whole-file read and
+// one decode, which is what #232 stage 2 measured at 451 ms for an OPEN of a
+// 480 MB .npy and moved off this thread for that reason.
+static bool startFrameReload(int imgIdx) {
+    if (g_scriptedRun && !g_forceAsyncOpen) return false;
+    if (imgIdx < 0 || imgIdx >= (int)app.images.size()) return false;
+    const uint64_t uid = app.images[(size_t)imgIdx]->uid;
+    if (app.reloadJob) {
+        // FOLDED, and not discarded - startStackReload's rule and its reason
+        // (review P1-2), which is about WHEN the read started and so says the
+        // same thing about one frame as about a stack.
+        if (app.reloadJob->oneUid == uid && !app.reloadJob->cancel.load()) {
+            app.reloadJob->again = true;
+            return true;
+        }
+        for (const auto& w : app.reloadQueue)
+            if (w.oneUid == uid) return true;
+        app.reloadQueue.push_back({ 0, uid, false });
+        return true;
+    }
+    std::unique_ptr<App::ReloadJob> j(new App::ReloadJob());
+    j->oneUid = uid;
+    j->remoteExe = app.remoteExe;      // frozen, for startStackReload's reason
+    j->exePath = app.exePath;
+    j->name = app.images[(size_t)imgIdx]->name;
+    App::ReloadJob::Item it;
+    it.src = app.images[(size_t)imgIdx]->src;
+    it.spec = reloadSpecOf(*it.src);
+    j->items.push_back(std::move(it));
+    j->groupEnd.push_back(1);
+    app.reloadJob = std::move(j);
+    return startReloadJob(app.reloadJob.get());
+}
+
+static bool startReloadJob(App::ReloadJob* j) {
+    g_reloadStarts++;
+    j->startedAt = nowSec();
+    j->th = std::thread(reloadJobWorker, j);
+    return true;
+}
+
+// The single-frame summary, and the ONE place its sentences live: the
+// synchronous door in the Files panel and the job's landing both reach it, so
+// the wording cannot differ by which thread read the file. (openLocalLand's
+// discipline, one feature over.)
+static std::string reloadOneFrameText(const ImageDoc& d, const std::string& note) {
+    const std::shared_ptr<FrameSource>& src = d.src;
+    std::string msg = "reloaded " + (src->path.empty() ? d.name : baseName(src->path)) +
+                      (note.empty() ? "" : " - dimensions changed: " + note);
+    // the §3.2 walk refreshed EVERY membership of this source, not just this
+    // row: numbers moving in a stack the user never touched need a stated cause
+    // - the same clause reloadStackFromDisk earns
+    int sharedN = 0;
+    std::vector<std::string> sharedNames;
+    for (const auto& q : app.images)
+        if (q.get() != &d && q->src == src) {
+            sharedN++;
+            std::string where = q->name;
+            if (q->seqId != 0)
+                if (const App::SeqInfo* si2 = seqInfo(q->seqId)) where = si2->name;
+            if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
+                sharedNames.end())
+                sharedNames.push_back(where);
+        }
+    if (sharedN) {
+        char b2[192];
+        snprintf(b2, sizeof b2, " - also refreshed %d shared frame(s) in \"%s\"",
+                 sharedN, sharedNames[0].c_str());
+        msg += b2;
+        if (sharedNames.size() > 1)
+            msg += " (+" + std::to_string((int)sharedNames.size() - 1) + " more)";
+    }
+    // the walk latched staleness on every reduced frame of every stack this
+    // source belongs to (§10.1) - the toast must say so too. The row is a loose
+    // frame, but a shared source can sit in stacks too, so the criterion is the
+    // walk's own: memberships of THIS source.
+    int staleAvg = 0;
+    for (const auto& q : app.images) {
+        if (q->avgOfPath.empty() || !q->avgStale || !q->avgSeqId) continue;
+        for (const auto& r : app.images)
+            if (r->src == src && r->seqId == q->avgSeqId) { staleAvg++; break; }
+    }
+    if (staleAvg)
+        msg += " - " + std::to_string(staleAvg) + " computed frame(s) now stale "
+               "(right-click > Recompute from stack)";
+    return msg;
+}
+
+
+static void startNextQueuedReload();
+
+// Called once per frame. Lands at most ONE item - see the note at the top of
+// this block - and finishes the job when the worker has stopped and there is
+// nothing left to land.
+static void pumpReloadJob() {
+    if (!app.reloadJob) { startNextQueuedReload(); return; }
+    App::ReloadJob* j = app.reloadJob.get();
+    // The stack went away under us (Close stack, closeAll, a session restore).
+    // Treated exactly as a Stop: nothing more lands, and what landed stays.
+    //
+    // ...and it CANCELS the worker too (review P3-11). Without that, closing a
+    // stack half-way through its reload left the worker reading and decoding
+    // nine more frames for a stack that no longer exists, with the Files row
+    // still saying "reloading 3 / 10" and the next stack in the queue waiting
+    // behind work nobody will take. closeAll already does this; Close stack
+    // reaches the same state by a different door and owes the same answer.
+    // ...and a ONE-FRAME job's subject is a document, not a stack, so it is
+    // asked about by uid (review): with `seqId != 0` alone a frame closed under
+    // its own reload went on being read for nobody, which is the very thing
+    // this term exists to stop.
+    bool gone = false;
+    if (j->seqId != 0) {
+        gone = !seqInfo(j->seqId);
+    } else if (j->oneUid != 0) {
+        gone = true;
+        for (const auto& q : app.images) if (q->uid == j->oneUid) gone = false;
+    }
+    if (gone && !j->cancel.load()) j->cancel.store(true);
+    const bool stop = j->cancel.load() || gone;
+    if (!stop && j->landedN < j->doneCount.load()) {
+        App::ReloadJob::Item& it = j->items[(size_t)j->landedN];
+        std::string err, note;
+        const std::string who = reloadItemName(it);
+        if (reloadLand(it.src, it.spec, it.pre, err, &note)) {
+            j->ok++;
+            if (!note.empty()) {
+                j->dims++;
+                if (j->firstDims.empty()) j->firstDims = who + ": " + note;
+            }
+            if (!note.empty()) j->oneNote = note;
+            reloadSharedTally(it.src, j->seqId, j->sharedN, j->sharedNames);
+            it.landed = true;
+        } else {
+            j->failed++;
+            if (j->firstErr.empty()) j->firstErr = who + ": " + err;
+        }
+        j->landedN++;
+    }
+    if (!j->done.load()) { g_reloadPumps++; return; }
+    if (!stop && j->landedN < j->doneCount.load()) return;   // one a frame, still
+    // ---- the job is over ---------------------------------------------------
+    j->th.join();
+    g_reloadDecodeThread = j->decodeThread;   // ordered by the join above
+    // Taken out of App before anything is said. The tail decodes a joining
+    // member, fires a toast and may reach seqInfo again, and everything that
+    // asks "is a reload running?" must see the truth, which is no.
+    std::unique_ptr<App::ReloadJob> held = std::move(app.reloadJob);
+    j = held.get();
+    ReloadTally t;
+    t.ok = j->ok; t.failed = j->failed; t.dims = j->dims; t.sharedN = j->sharedN;
+    t.firstErr = j->firstErr; t.firstDims = j->firstDims;
+    t.sharedNames = j->sharedNames;
+    if (stop && j->landedN < (int)j->items.size()) {
+        t.stoppedAfter = j->landedN;
+        t.stoppedOf = (int)j->items.size();
+    }
+    // ---- a gesture that arrived WHILE this job was reading (review P1-2) ----
+    // It was folded, which is not the same as answered: the read that just
+    // finished started before that request was made. So it goes to the FRONT of
+    // the queue and runs once more, through the one door that takes a fresh plan
+    // and a fresh stat (startNextQueuedReload -> startStackReload). A Stop is
+    // the exception and needs none: Stop means stop, and it has cleared the
+    // queue already.
+    //
+    // BEFORE the one-frame branch below, which returns: a re-run put after it
+    // would be reached by stacks only, and the rule is about WHEN the read
+    // started, which does not depend on how many items the job had.
+    //
+    // It is BOUNDED, with one frame's exception worth stating. A gesture that
+    // arrives while the re-run WAITS folds into the queue entry, so one flight
+    // adds at most one re-run - except in the single frame between this landing
+    // and the next pump's startNextQueuedReload, where the queue entry exists
+    // but no job does, so a gesture there starts a job of its own and the
+    // re-run then folds into IT. One extra flight, once, on a one-frame window.
+    // Accepted (review): it is finite, it re-reads the file the user asked
+    // about, and the alternative is a second piece of bookkeeping about which
+    // request is whose.
+    if (j->again && !stop) {
+        if (j->oneUid != 0) {
+            bool alive = false;
+            for (const auto& q : app.images) if (q->uid == j->oneUid) alive = true;
+            if (alive)
+                app.reloadQueue.insert(app.reloadQueue.begin(), { 0, j->oneUid, false });
+        } else if (seqInfo(j->seqId)) {
+            app.reloadQueue.insert(app.reloadQueue.begin(),
+                                   { j->seqId, 0, j->againAutomatic });
+        }
+    }
+    if (j->oneUid) {
+        // ONE frame: no membership, no #56 latch (the mark is a STACK's), and
+        // the single-frame sentence.
+        ImageDoc* d = nullptr;
+        for (const auto& q : app.images)
+            if (q->uid == j->oneUid) { d = q.get(); break; }
+        if (t.failed)                    toast("reload failed - " + t.firstErr, true);
+        else if (t.stoppedAfter >= 0)    toast("stopped: " + j->name);
+        else if (d && !j->items.empty() && j->items[0].landed)
+            toast(reloadOneFrameText(*d, j->oneNote));
+        return;
+    }
+    if (!seqInfo(j->seqId)) return;      // the stack is gone; nothing to say it to
+    int failed = 0;
+    const std::string msg = reloadStackTail(j->seqId, j->plan, j->hadBefore, t, &failed,
+                                            j->peer);
+    watchReloadFinish(j->seqId, j->automatic, msg, failed, j->pinWas, j->axis);
+}
+
+static void startNextQueuedReload() {
+    if (app.reloadJob || app.reloadQueue.empty()) return;
+    const App::ReloadWait w = app.reloadQueue.front();
+    app.reloadQueue.erase(app.reloadQueue.begin());
+    // The fall-back matters for startNextQueuedOpen's reason: a queue can
+    // outlive the flag that filled it, and a queued reload that quietly
+    // disappeared is the failure the queue exists to prevent.
+    if (w.oneUid) {
+        for (int i = 0; i < (int)app.images.size(); i++)
+            if (app.images[(size_t)i]->uid == w.oneUid) {
+                if (!startFrameReload(i)) {
+                    std::string err, note;
+                    ImageDoc* d = app.images[(size_t)i].get();
+                    if (reloadSource(d->src, err, &note))
+                        toast(reloadOneFrameText(*d, note));
+                    else
+                        toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
+                }
+                return;
+            }
+        return;                          // the frame closed while it waited
+    }
+    if (!seqInfo(w.seqId)) return;
+    if (!startStackReload(w.seqId, w.automatic)) reloadStackSync(w.seqId, w.automatic);
+}
+
+// Drive a started reload to the end on THIS thread. waitForOpenJob's twin and
+// its reason: a run with no frame loop - a selftest, or a scripted gesture -
+// would otherwise leave the job hanging and the files un-re-read. The waiting is
+// the ONLY thing this puts back.
+static void waitForReloadJob() {
+    while (app.reloadJob || !app.reloadQueue.empty()) {
+        pumpReloadJob();
+        if (app.reloadJob && !app.reloadJob->done.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 // Temporal stats for ONE stack that is NOT opened: fired from the browser's

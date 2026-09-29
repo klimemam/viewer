@@ -322,7 +322,8 @@ ddof=1 の2式を ddof=0 に反転して **42 テスト全 PASS**。その後
   無し」を失敗に変える。**つまりこの2本は3 OS のうち1つでしか効いていない。**
 
 **板 302/303 (PR #273) で閉じた。** GL が要るのは `abstats` では T / S4-S6 / N の
-3群、`verify` では V19 の1群だけだったので、**GL 行はそのまま残したまま `-nogl`
+3群、`verify` では V19 の1群だけだったので (PR #275 で V29 が加わり2群。
+それぞれが自分の `glGroup()` の門を持つので、増やす代価は1行)、**GL 行はそのまま残したまま `-nogl`
 兄弟を並べて登録**する形にした (`abstats-nogl` / `verify-nogl` /
 `abstats-cfa-bayer-nogl`)。土台は `glGroup()` (`core/selftest/util.inc`) と
 `--nogl-groups-skipped` で、旗が無ければ従来の `needWindow()` そのままなので

@@ -1256,10 +1256,11 @@
             }
         }
 
-        // V19 is the ONE group in this file that needs a real ImGui frame, so
-        // selftest.verify-nogl runs every other group on every runner (板 304) -
-        // V13, which measures the same NaN fixture through both sigma_t
-        // implementations, is the one the kernel inventory came for.
+        // V19 and V29 are the two groups in this file that need a real ImGui
+        // frame, so selftest.verify-nogl runs every other group on every runner
+        // (板 304) - V13, which measures the same NaN fixture through both
+        // sigma_t implementations, is the one the kernel inventory came for.
+        // Each takes its own glGroup() gate; neither can silently skip.
         if (!glGroup("--verify-selftest (the ROI row probe)")) return 1;
         if (g_haveWindow) {   // ---- V19: the ROI table's LAYOUT, and its delete button --
             // The panel reaches its numbers through a hash cache, prints them
@@ -3250,6 +3251,225 @@
                   "V28 the refusal names every mode, canonical spelling, no aliases");
         }
 
+        // ---- V29: WATCH's FINDING DOES NOT ADD A ROW ---------------------------
+        // The 2026-09-28 report, second half: 「reload で行が増えるのは嫌、もう少し
+        // 控えめな表示で知らせたい」. §5 used to draw the finding as an amber LINE
+        // under the stack's row, with a [Reload] beside it, and a second amber
+        // line under that when an automatic reload had run - so a poll that
+        // found a changed file inserted a row and every stack below it jumped,
+        // mid-read, because of something that happened on disk.
+        //
+        // The fix's claim is that NOTHING IS ADDED, and the only honest way to
+        // assert that is to measure the block: g_filesStackRowProbe records how
+        // many pixels one stack's rows occupied, so a line that comes back
+        // changes the number whatever the line says. The same probe carries the
+        // row's drawn LABEL (cut at "##" the way ImGui cuts it), whether the
+        // amber BAR was drawn, and the tooltip string the row itself built -
+        // #56's `rmark` is asserted the same way one report over.
+        //
+        // No poll, no worker and no filesystem for the first four states: the
+        // finding is written onto the SeqInfo directly, which is exactly what
+        // watchIntegrate does with what a poll returned (--watch-selftest W18
+        // owns the poll half). The FIFTH state does start a real reload, because
+        // "the progress row is inside the row" is the part of the report that
+        // only a running reload can be asked about.
+        //
+        // The SECOND group in this file that needs a real ImGui frame (板 304's
+        // NOGL sibling carries every other group), so it takes glGroup's gate in
+        // the form docs/background/analysis/measurement-kernel-inventory.md §4.3
+        // sets as the standard for a GL-mixed test.
+        reload();
+        if (!glGroup("--verify-selftest (the Files stack row probe)")) return 1;
+        if (g_haveWindow) {
+            auto filesFrame = [&]() {
+                for (int pass = 0; pass < 2; pass++) {
+                    ImGui_ImplOpenGL3_NewFrame();
+                    ImGui_ImplGlfw_NewFrame();
+                    ImGui::NewFrame();
+                    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(ImVec2(520.0f, 700.0f), ImGuiCond_Always);
+                    ImGui::Begin("FilesRowProbe", nullptr,
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoTitleBar |
+                                 ImGuiWindowFlags_NoDocking);
+                    drawFileList();
+                    ImGui::End();
+                    ImGui::EndFrame();
+                }
+            };
+            const int rs = app.seqs.empty() ? 0 : app.seqs[0].id;
+            auto rowOf = [&](int sid) -> const FilesStackRowProbe* {
+                for (const auto& r : g_filesStackRowProbe) if (r.seqId == sid) return &r;
+                return nullptr;
+            };
+            filesFrame();
+            const FilesStackRowProbe* r0 = rowOf(rs);
+            const float h0 = r0 ? r0->h : -1.0f;
+            const std::string lab0 = r0 ? r0->label : std::string();
+            check(rs != 0 && r0 && h0 > 0 && lab0.find("(changed") == std::string::npos &&
+                      !r0->bar,
+                  "V29 (setup) a quiet stack draws its rows, no token and no bar");
+
+            // A CONFIRMED LOCAL FINDING, as watchIntegrate lands one.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->watchFound = watch::Finding{};
+                si->watchFound.changed = 1;
+                si->watchFound.firstChanged = "a_000.npy";
+                si->watchToasted = true;
+            }
+            check(seqWatchNote(rs) == "1 file(s) changed on disk (a_000.npy)",
+                  "V29b (setup) ...and the sentence §5 has always drawn is unchanged");
+            filesFrame();
+            const FilesStackRowProbe* r1 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 quiet h=%.1f \"%s\" -> finding h=%.1f "
+                            "\"%s\" bar=%d\n", (double)h0, lab0.c_str(),
+                    r1 ? (double)r1->h : -1.0, r1 ? r1->label.c_str() : "",
+                    r1 ? (int)r1->bar : -1);
+            check(r1 && r1->h == h0,
+                  "V29c a finding adds NO row: the stack's block is exactly as tall");
+            check(r1 && r1->label.find("(changed on disk)") != std::string::npos,
+                  "V29d ...it is a token on the row's own label instead");
+            // ...and the colour that makes it findable without reading every
+            // row. §5 states the bar as a RULE, so it is measured (review P2-6).
+            check(r1 && r1->bar,
+                  "V29d2 ...with the amber bar down the row's own left edge");
+            // The SENTENCE is still reachable, in the two places a row keeps
+            // one - and it is read off what the ROW BUILT, not off a second call
+            // the test makes for itself (review P3-19).
+            fprintf(stderr, "verifyselftest: V29 row tooltip: %s\n",
+                    r1 ? r1->tip.c_str() : "");
+            check(r1 && r1->tip.find("1 file(s) changed on disk (a_000.npy)") !=
+                      std::string::npos &&
+                      r1->tip.find("right-click > Reload from disk") != std::string::npos,
+                  "V29e ...and the tooltip the ROW DREW carries the whole finding, "
+                  "with the gesture");
+            // ...while the MENU's copy does NOT point at itself (review P2-4).
+            const std::string menu = seqWatchMenuText(rs);
+            fprintf(stderr, "verifyselftest: V29 menu text: %s\n", menu.c_str());
+            check(menu.find("1 file(s) changed on disk (a_000.npy)") != std::string::npos &&
+                      menu.find("right-click") == std::string::npos,
+                  "V29e2 ...and the MENU's line is the same finding with no "
+                  "right-click instruction in an already-open menu");
+
+            // ...and with §9's note ON TOP of it, which used to be the SECOND
+            // amber line. Still one block of the same height.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->autoReloadNote = "auto-reloaded 14:07:09 - reloaded 5 frame(s), 0 failed";
+                si->autoReloadWhen = "14:07";
+            }
+            filesFrame();
+            const FilesStackRowProbe* r2 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 + auto-reload note: h=%.1f \"%s\" "
+                            "bar=%d\n", r2 ? (double)r2->h : -1.0,
+                    r2 ? r2->label.c_str() : "", r2 ? (int)r2->bar : -1);
+            check(r2 && r2->h == h0,
+                  "V29f an automatic reload's note adds no row either");
+            check(r2 && r2->label.find("(auto-reloaded 14:07)") != std::string::npos,
+                  "V29g ...it is a second token, with the clock on it");
+            check(r2 && r2->tip.find("auto-reloaded 14:07:09") != std::string::npos,
+                  "V29h ...and the sentence it is short for is in the tooltip");
+
+            // #56's token WINS: a stack of two generations is something already
+            // wrong with the numbers, and only one clause can come first.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->reloadFailed = 1;
+                si->reloadOk = 4;
+                si->reloadFirstErr = "a_003.npy: cannot read file";
+                si->reloadWhen = "2026-09-28 14:09:00";
+            }
+            filesFrame();
+            const FilesStackRowProbe* r3 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29 + reload failure: h=%.1f \"%s\" bar=%d\n",
+                    r3 ? (double)r3->h : -1.0, r3 ? r3->label.c_str() : "",
+                    r3 ? (int)r3->bar : -1);
+            check(r3 && r3->h == h0 &&
+                      r3->label.find("(reload failed)") != std::string::npos &&
+                      r3->label.find("(changed on disk)") == std::string::npos,
+                  "V29i (reload failed) wins the row when both are true, still no row "
+                  "added");
+            // ...and the BAR stays, which is the rule §5 states in as many
+            // words: a red outline plus an amber bar reads as "the generations
+            // are mixed AND the disk is still moving", and only one Reload in
+            // which every frame reads clears both.
+            check(r3 && r3->bar,
+                  "V29i2 ...and the amber bar stays: the disk is still moving");
+            check(seqReloadNote(rs).find("(reload failed)") == 0 &&
+                      r3 && r3->tip.find("changed on disk") != std::string::npos,
+                  "V29j ...and BOTH sentences are still reachable from the row");
+
+            // Borrowed state, given back before the fifth state starts a real
+            // reload: this stack is the next block's too.
+            if (App::SeqInfo* si = seqInfo(rs)) {
+                si->watchFound = watch::Finding{};
+                si->watchToasted = false;
+                si->autoReloadNote.clear();
+                si->autoReloadWhen.clear();
+                si->reloadFailed = si->reloadOk = 0;
+                si->reloadFirstErr.clear();
+                si->reloadWhen.clear();
+            }
+
+            // ---- V29k: THE FIFTH STATE - a reload IN FLIGHT -----------------
+            // The other half of the same order (review P2-7). "reloading
+            // <stack>: 3 / 12 · 1.2 s [Stop]" appears WITHOUT A CLICK when
+            // Auto-reload is on, so if it were a row of its own it would be the
+            // very thing the user asked us to stop doing - and it is the one
+            // state the four above cannot reach, because it needs a worker.
+            const bool flag0 = g_forceAsyncOpen;
+            g_forceAsyncOpen = true;           // the lid: see startStackReload
+            watchReloadNow(rs, false);
+            const bool flying = app.reloadJob != nullptr;
+            filesFrame();
+            const FilesStackRowProbe* r4 = rowOf(rs);
+            // ...as the panel DREW it (review, item 5): calling
+            // reloadJobRowText here would assert the function, which is the
+            // shape P3-19 already corrected once for the row tooltip.
+            const std::string rowText = g_filesBusyRowProbe;
+            fprintf(stderr, "verifyselftest: V29k in flight: flying=%d h=%.1f "
+                            "row=\"%s\"\n", (int)flying, r4 ? (double)r4->h : -1.0,
+                    rowText.c_str());
+            check(flying && r4 && r4->h == h0,
+                  "V29k a reload IN FLIGHT adds no row to the stack either");
+            check(rowText.rfind("reloading", 0) == 0 &&
+                      rowText.find(" / ") != std::string::npos,
+                  "V29k2 ...and the progress it shows is a true fraction, in the "
+                  "panel's own busy row");
+            // ...and the ruling that goes with it: an in-place pixel operation
+            // on a stack being re-read is REFUSED, at the gesture, in the Files
+            // row's own vocabulary.
+            const char* busy = reloadInFlightFor(rs, 0);
+            fprintf(stderr, "verifyselftest: V29k refusal: \"%s\"\n", busy ? busy : "");
+            check(busy && std::string(busy).find("being re-read") != std::string::npos &&
+                      std::string(busy).find("Stop") != std::string::npos,
+                  "V29k3 ...and crop / detrend are refused meanwhile, naming the Stop "
+                  "that ends the wait");
+            waitForReloadJob();
+            filesFrame();
+            const FilesStackRowProbe* r5 = rowOf(rs);
+            fprintf(stderr, "verifyselftest: V29k landed: h=%.1f \"%s\"\n",
+                    r5 ? (double)r5->h : -1.0, r5 ? r5->label.c_str() : "");
+            check(r5 && r5->h == h0 && app.reloadJob == nullptr &&
+                      !reloadInFlightFor(rs, 0),
+                  "V29k4 ...and the row goes back to exactly its own height when it "
+                  "lands");
+            // ...and the busy row is GONE from the panel, which is the other half
+            // of "nothing was added": a row that stayed would be exactly the
+            // thing the report is about.
+            check(g_filesBusyRowProbe.empty(),
+                  "V29k5 ...and the busy row is gone with it");
+            // THE BAR, in the fourth of the four states (review, item 4). A
+            // clean reload re-seeds Watch's baseline, so the finding - and with
+            // it the amber bar - has stopped being true. §5 states that as the
+            // one thing that clears it.
+            fprintf(stderr, "verifyselftest: V29k6 after a clean reload: bar=%d "
+                            "label=\"%s\"\n", r5 ? (int)r5->bar : -1,
+                    r5 ? r5->label.c_str() : "");
+            check(r5 && !r5->bar &&
+                      r5->label.find("(changed") == std::string::npos,
+                  "V29k6 ...and a reload in which every frame read clears the token "
+                  "AND the bar");
+            g_forceAsyncOpen = flag0;          // borrowed state, given back
+        }
         // ---- V26: the Messages panel past its own cap -------------------------
         // msgLog holds 300 and then drops from the front, so its SIZE is 300 for
         // message 300 and for message 3000 alike. The panel used to key its

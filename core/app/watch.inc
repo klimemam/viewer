@@ -673,14 +673,12 @@ static int watchNpyFrames(const std::string& path, int npyRead) {
 // Is this stack F frames of ONE file, and how many does that file declare now?
 // `applies == false` means it is some other shape of stack and this whole
 // mechanism stays out of the way.
-struct WatchAxisPlan {
-    bool applies = false;
-    std::string path;
-    int npyRead = 0;
-    int have = 0;                // frames the stack holds now
-    int want = 0;                // frames the header declares now
-    bool moved() const { return applies && want != have; }
-};
+//
+// The TYPE lives in state.h, beside App::ReloadJob, which carries one: since
+// the 2026-09-28 change the re-read happens on a worker, so the plan's two
+// halves (drop before, grow after) are no longer two halves of one call and the
+// plan has to travel with the job. The decision record stays here, where the
+// plan is taken.
 
 // Every refusal below fails towards CHANGING NOTHING, and each is the frame-axis
 // spelling of a refusal §6 already takes:
@@ -824,18 +822,22 @@ static void watchFrameAxisGrow(int seqId, const WatchAxisPlan& p) {
 //   was that §6's rebuild could not reach a peer's stack at all, so an automatic
 //   reload would have refused every member and latched #56 onto a stack where
 //   nothing failed. That is spent: the rebuild reaches it, watchReloadOffered
-//   says yes, and the button below the amber line works.
+//   says yes, and the "Reload from disk" the row's menu offers works.
 //
 //   What has NOT changed is what the act COSTS, and that is the whole of the
 //   argument now. A local reload is N file reads on a disk that answers or
 //   errors in milliseconds. A remote one is META + TILE per member on a link
-//   that can drop, read to completion on the UI thread with nothing repainting
-//   (openRemote's UiThreadStall says so in as many words) - so a stack of forty
-//   resident frames is forty round trips and a folder's worth of pixels, with
+//   that can drop - so a stack of forty resident frames is forty round trips
+//   and a folder's worth of pixels, with
 //   nobody's click behind it, repeatable every time the peer's folder settles.
 //   Waiting it out is not available either: watchAutoBusy waits for work the
 //   frame loop is already keeping frames coming for, and a blocked ssh read is
 //   the opposite of that.
+//
+//   (§18 moved the READ off the UI thread, so the "nothing repaints" half of
+//   this argument is spent - see §18.3. The bandwidth and the peer's load are
+//   not, which is why the term stays and why dropping it is a separate
+//   judgment.)
 //
 //   So: the gesture reaches the peer, the AUTOMATON does not. That is one term
 //   in this predicate rather than a second copy of §12/§13's rules - what runs
@@ -867,8 +869,8 @@ static const char* watchAutoRefusal(int seqId) {
 // Is something IN FLIGHT that this reload must not run underneath? nullptr = no.
 //
 // THE DECISION (§15): an automatic reload WAITS. It does not cancel the work and
-// it does not run beside it - the finding stays on the row, the amber line stays
-// up, and the reload happens on a later frame. Silently swapping the pixels
+// it does not run beside it - the finding stays on the row, its token stays up,
+// and the reload happens on a later frame. Silently swapping the pixels
 // under a running measurement is the one failure this stage could introduce that
 // no later reading of the screen would ever reveal, because the number would
 // look perfectly ordinary.
@@ -905,6 +907,17 @@ static const char* watchAutoBusy(int seqId) {
     // round of the poll interval at most.
     if (app.mPending > 0)  return "a measurement is in flight";
     if (app.rfPending > 0) return "a frame fetch is in flight";
+    // ...and A RELOAD ITSELF, which became a worker in the 2026-09-28 report.
+    // One at a time, for the reason there is one of anything here: two reloads
+    // landing into one source registry from two threads is what the single
+    // worker exists to prevent. Without this term the drain would ask for a
+    // second stack every frame while the first one was still re-reading, and
+    // the queue in front of the job would answer "already asked" - correct, but
+    // silently, where the line says WHY it is holding off.
+    if (app.reloadJob)
+        return app.reloadJob->seqId == seqId
+                   ? "this stack's own reload is still running"
+                   : "a reload of another stack is still running";
     if (app.seqRunning || seqReadyPending() || !app.seqQueue.empty())
         return "frames are still loading";
     // A drag is a measurement being AIMED. temporal_model.inc already holds off
@@ -956,22 +969,27 @@ static bool watchAutoDue() {
 // automatic=false and §9's drain calls it with true. What differs is only what is
 // SAID afterwards - the operation is byte for byte the same one, which is the
 // point (rule 2 above).
-static void watchReloadNow(int seqId, bool automatic) {
+
+// ...and WHAT IS SAID once it has run, which is the half that differs between
+// the click and the automaton (rule 2: the operation is byte for byte the same
+// one). It is its own function because the reload no longer finishes inside the
+// call that started it - pumpReloadJob lands the last frame some frames later
+// and calls this - and a second copy of the record, the clearing and the toast
+// is the one place §9 could not afford one.
+static void watchReloadFinish(int seqId, bool automatic, const std::string& summary,
+                              int failed, uint64_t pinWas, const WatchAxisPlan& ax) {
     const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
-    // §12.5's other half: a pin on a frame that VANISHES is dropped by
-    // closeImages, exactly as closing that frame drops it. Sampled across the
-    // call, because the summary reloadStackFromDisk returns is about files and
-    // this is about a comparison that has just ended.
-    const uint64_t pinWas = app.compareBUid;
-    // §12's frame-axis half, DECIDED before a byte is re-read and applied around
-    // the walk in §6's own order: the departures first (a frame the file no
-    // longer holds must not reach reloadSource and be counted as a refusal), the
-    // arrivals after. `applies` is false for every other shape of stack, and
-    // then these three lines are one predicate and nothing else.
-    const WatchAxisPlan ax = watchFrameAxisPlan(seqId);
-    if (ax.moved() && ax.want < ax.have) watchFrameAxisDrop(seqId, ax.want);
-    int failed = 0;
-    std::string msg = reloadStackFromDisk(seqId, &failed);
+    std::string msg = summary;
+    // §12's frame-axis half, SECOND HALF (board row 222). The plan was decided
+    // and its departures applied BEFORE a byte was re-read - in startStackReload
+    // for the worker's door and in reloadStackSync for the synchronous one, at
+    // the point the read begins either way (review P1-2) - and the arrivals
+    // belong after, in §6's own order.
+    // The plan is HANDED to this function rather than re-taken here for the
+    // reason the whole of the 2026-09-28 change is about: the re-read happens on
+    // a worker now, so "before" and "after" are no longer two halves of one
+    // call, and re-asking watchFrameAxisPlan here would answer about the stack
+    // the reload has already rebuilt (want == have, nothing moved).
     if (ax.moved()) {
         if (ax.want > ax.have) watchFrameAxisGrow(seqId, ax);
         const int resident = (int)framesOfSeq(seqId).size();
@@ -1001,18 +1019,25 @@ static void watchReloadNow(int seqId, bool automatic) {
         if (!ft.empty()) msg += " - " + ft;
     }
     const bool pinDropped = pinWas != 0 && app.compareBUid != pinWas;
+    char hm[16] = "";
     if (automatic) {
         char ts[32] = "";
         time_t now = time(nullptr);
-        if (struct tm* lt = localtime(&now)) strftime(ts, sizeof ts, "%H:%M:%S", lt);
+        if (struct tm* lt = localtime(&now)) {
+            strftime(ts, sizeof ts, "%H:%M:%S", lt);
+            strftime(hm, sizeof hm, "%H:%M", lt);   // the ROW's token, to the minute
+        }
         msg = watch::autoReloadText(ts, msg, pinDropped);
     }
     if (App::SeqInfo* si = seqInfo(seqId)) {
         // The record, latched (rule 3). A manual reload CLEARS it: the user has
         // taken the wheel, and a note about what the program did behind them
-        // stops being the thing they need to read.
+        // stops being the thing they need to read. The clock is kept beside it
+        // rather than parsed back out of it - the stack row has room for
+        // "(auto-reloaded 14:07)" and not for the sentence.
         si->autoReloadNote = automatic ? msg : std::string();
-        // The Watch line (§5) said "the files behind these pixels have moved",
+        si->autoReloadWhen = automatic ? hm : std::string();
+        // The Watch mark (§5) said "the files behind these pixels have moved",
         // and the operation it offered has just run: drop it HERE rather than
         // waiting for the worker to notice, so the answer to a click is not two
         // polls late. The worker re-seeds from the fresh stat on its own round
@@ -1028,6 +1053,47 @@ static void watchReloadNow(int seqId, bool automatic) {
     // row and needs no label; this one arrives out of nowhere, and a toast that
     // does not say whose numbers just moved is not a notice.
     toast(automatic ? name + ": " + msg : msg, failed > 0);
+}
+
+// THE SYNCHRONOUS DOOR's whole gesture, in one place: §12's frame-axis plan and
+// its departures, the re-read, then the sentence. It is a function rather than
+// three lines inside watchReloadNow because the reload QUEUE has to fall back to
+// exactly this when the asynchronous door declines (startNextQueuedReload), and
+// two spellings of "what a Reload is" is the one thing §15.1 forbids.
+//
+// The plan is taken HERE and nowhere earlier, for review P1-2's reason: it
+// belongs to the attempt that does the READING. On this door the two are the
+// same moment; on the worker's door startStackReload takes it at the same point
+// in the same order.
+static void reloadStackSync(int seqId, bool automatic) {
+    // §12's frame-axis DEPARTURES first, in §6's order and for §6's reason: a
+    // frame the file no longer holds must not reach reloadSource and be counted
+    // as a refusal. `applies` is false for every other shape of stack, and then
+    // these two lines are one predicate and nothing else.
+    const WatchAxisPlan ax = watchFrameAxisPlan(seqId);
+    // §12.5's other half, sampled BEFORE them (they are a closeImages): a pin
+    // on a frame that VANISHES is dropped by closeImages, exactly as closing
+    // that frame drops it.
+    const uint64_t pinWas = app.compareBUid;
+    if (ax.moved() && ax.want < ax.have) watchFrameAxisDrop(seqId, ax.want);
+    int failed = 0;
+    const std::string msg = reloadStackFromDisk(seqId, &failed);
+    watchReloadFinish(seqId, automatic, msg, failed, pinWas, ax);
+}
+
+static void watchReloadNow(int seqId, bool automatic) {
+    // THE WORKER FIRST (the 2026-09-28 report). startStackReload takes the whole
+    // gesture - §12's frame-axis plan, the membership plan, the re-reads, the
+    // summary and watchReloadFinish above - and returns having read nothing;
+    // pumpReloadJob finishes it. Nothing is decided here, and that is review
+    // P1-2's ruling: a gesture that is FOLDED into a running job does no
+    // reading, so a plan taken on this line would apply its departures against
+    // a re-read that is somebody else's and then be thrown away with the fold.
+    //
+    // False means the asynchronous door declined (a scripted run without
+    // --async-open), and then this is the synchronous door it always was.
+    if (startStackReload(seqId, automatic)) return;
+    reloadStackSync(seqId, automatic);
 }
 
 // The reload the LAST frame armed. Called at the head of pumpWatch and therefore
@@ -1080,6 +1146,146 @@ static std::string seqWatchNote(int seqId) {
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) return {};
     return watch::findingText(si->watchFound);
+}
+
+// ---- §5, folded: THE ROW IS THE NOTIFICATION ---------------------------------
+// The second 2026-09-28 report: 「reload で行が増えるのは嫌、もう少し控えめな表示
+// で知らせたい」. §5 used to put the sentence above on its own AMBER LINE under
+// the stack's header, with a [Reload] button beside it and, with Auto-reload on,
+// a second line under that. Three consequences, and the user named the first:
+//
+//   THE LIST MOVED. A poll that found a changed file inserted a row, and with
+//   Auto-reload on it inserted two - so every stack below jumped, mid-read,
+//   because of something that happened on disk. A notification that rearranges
+//   what you are reading is not subtle, whatever it says.
+//
+//   IT SAID THE SAME THING TWICE. The stack already had a row, and that row
+//   already carries the marks this feature's sibling (#56) taught it to carry.
+//
+//   AND THE BUTTON WAS A THIRD WAY TO RELOAD. "Reload from disk" is in the
+//   row's own right-click menu, where every other thing you can do to a stack
+//   is, and a button that appears and disappears under a row is the
+//   breadcrumb-as-buttons failure again.
+//
+// So the finding goes ON the row, as a token beside #56's: the row that was
+// already there says one more thing about itself, nothing moves, and the SENTENCE
+// lives in the two places a row keeps a sentence - its tooltip and its menu.
+//
+// These three functions are THE guard for all of it, findingText's discipline
+// one layer up: the panel draws exactly these strings and --watch-selftest
+// asserts exactly these strings, so there is no second opinion to drift.
+// seqWatchNote / watchActionText / watchAutoNote above are untouched - they are
+// still what the sentence is BUILT from.
+
+// The TOKEN: a word, for the one surface that has room for a word. "" = this
+// stack has nothing to say. Leading spaces like (reload failed)'s, so it sits
+// off the name.
+//
+// ONE clause, by precedence, and the tooltip carries the rest: a token that
+// grew to three clauses would be the amber line again, in a narrower column.
+// The order is what a reader has to act on first - pixels that have moved make
+// every number on screen stale, a file that is gone changes what the stack IS,
+// and a file that appeared may not even join it (§11.4).
+static std::string seqWatchMark(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || !si->watchFound.any()) return {};
+    const watch::Finding& f = si->watchFound;
+    // The PEER's own clause first, because it is the one that names a machine:
+    // an aggregated listing cannot say WHICH member moved (Finding::srcMoved),
+    // so the token says where rather than how many.
+    if (f.srcMoved) return "  (changed on " + (f.host.empty() ? "the peer" : f.host) + ")";
+    if (f.changed)  return "  (changed on disk)";
+    if (f.vanished) return "  (files gone)";
+    if (f.appeared) return "  (files appeared)";
+    return {};
+}
+
+// ...and what an AUTOMATIC reload already DID, as a token. §9's rule 3 is
+// "louder, never quieter", and this is the part of it that has to outlive the
+// toast: the only durable answer to "these numbers are not the ones I was
+// reading a minute ago". The clock is SeqInfo::autoReloadWhen, kept beside the
+// note rather than parsed back out of it.
+static std::string seqAutoReloadMark(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si || si->autoReloadNote.empty()) return {};
+    return si->autoReloadWhen.empty() ? std::string("  (auto-reloaded)")
+                                      : "  (auto-reloaded " + si->autoReloadWhen + ")";
+}
+
+// The SENTENCE, for the two surfaces that have room for one: the row's tooltip
+// and its right-click menu. The whole finding, then what the program is about
+// to do or cannot do about it, then what an automatic reload already did - the
+// three strings §5 used to draw on two lines, in that order, and then the
+// gesture that acts on it. "" = nothing to say.
+// `withGesture` is the difference between the two surfaces that draw this, and
+// it is a difference of PLACE rather than of length (review P2-4). The ROW's
+// tooltip has to say where the gesture is, because the row carries no button any
+// more. The RIGHT-CLICK MENU must not: it is already open, "Reload from disk" is
+// the item directly under this line, and a popup that says "right-click >
+// Reload from disk" is pointing at itself.
+static std::string seqWatchTooltip(int seqId, bool withGesture = true) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return {};
+    std::string s = seqWatchNote(seqId);
+    if (!s.empty()) {
+        // What to DO about it. watchAutoNote when §9 has something to say
+        // (it is about this program's next move), watchActionText otherwise -
+        // the same fork the amber line made, asked of the STACK rather than of
+        // the finding's origin (§16).
+        const std::string an = watchAutoNote(seqId);
+        s += an.empty() ? std::string(watchActionText(seqId)) : an;
+        // ...and where the gesture IS, now that there is no button under the
+        // row. The menu is where every other thing you can do to a stack lives.
+        if (withGesture && watchReloadOffered(seqId))
+            s += "\nright-click > Reload from disk";
+    }
+    if (!si->autoReloadNote.empty())
+        s += (s.empty() ? "" : "\n") + si->autoReloadNote;
+    return s;
+}
+// ...and the one the MENU draws: the same finding with no gesture line, because
+// the gesture is the item below it.
+static std::string seqWatchMenuText(int seqId) { return seqWatchTooltip(seqId, false); }
+
+// ---- §6 / §11.4: WHAT RELOAD WILL AND WILL NOT DO, where the click is ----
+// The four sentences the old amber line's [Reload] carried in its hover, put
+// back on the menu item that replaced it (review P2-5). They went off the screen
+// entirely when the button did, and they are the only place the program answers
+// the question a finding raises: "a file appeared - does it join THIS stack?"
+//
+// Re-reading the frames this stack HAS is reference-design §3.2; rebuilding
+// WHICH files are its members is watch-design §6, and the second half is NOT
+// the same for every stack - only a stack whose membership IS its folder's
+// sibling rule takes a file that appeared (§11.4). A stack that will not is
+// told so here rather than left to infer it from a frame count that did not
+// move. Without this, a 3-of-5 hand-picked stack says "(files appeared)", is
+// reloaded, does not grow, and nothing anywhere says why.
+//
+// ONE place, and --watch-selftest asserts these strings (findingText's
+// discipline). The fork is §11.4's own: SeqInfo::ruleHead is empty exactly
+// when the membership was CHOSEN rather than derived from the folder.
+static std::string reloadGestureTip(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return {};
+    std::string tip = watchIsPeerStack(*si)
+        ? std::string("Re-fetch every frame of this stack from the peer, and\n"
+                      "rebuild which files are its members from the peer's own\n"
+                      "listing. Numbers computed from the old pixels are dropped.")
+        : std::string("Re-read every frame of this stack from disk, and rebuild\n"
+                      "which files are its members.\n"
+                      "Numbers computed from the old pixels are dropped.");
+    if (si->watchFound.vanished)
+        tip += "\n\nA file that is gone LEAVES this stack - it is not a\n"
+               "frame that failed to read - and n of N says the new numbers.";
+    if (si->watchFound.appeared)
+        tip += si->ruleHead.empty()
+            ? "\n\nA file that appeared is NOT added: this stack's members\n"
+              "were chosen (a derived subset, a hand-picked open), and\n"
+              "that choice is never re-applied. Open the folder again\n"
+              "for a stack of everything in it."
+            : "\n\nA file that appeared JOINS this stack, numbered where\n"
+              "its name puts it - the order the open used.";
+    return tip;
 }
 
 // What a finding DOES once it reaches the UI thread: the summary lands on the

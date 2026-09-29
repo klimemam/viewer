@@ -106,6 +106,40 @@ static bool filesRowBelongsToSeries(const ImageDoc& head) {
 // letters are asserted as state (--abstats-selftest S4), like g_tilePanesDrawn.
 static std::string g_filesBadgeProbe;
 
+// ---- WHAT ONE STACK's BLOCK DREW, and HOW TALL it was -----------------------
+// The 2026-09-28 report 「reload で行が増えるのは嫌」: Watch's finding used to be
+// drawn as an extra amber LINE under the stack's row, and a second one under
+// that when an automatic reload had run - so a poll moved every stack below.
+// The claim of the fix is that nothing is added, and the only honest way to
+// assert "nothing is added" is to measure the block: `h` is the pixels this
+// stack occupied, so a finding that puts a line back CHANGES it whatever the
+// line says. `label` is what the row said, "##" and up cut off the way ImGui
+// cuts it, so the TOKEN is asserted as drawn text rather than as a string a
+// test built for itself. g_filesBadgeProbe's shape and its reason (the panel is
+// OpenGL this machine cannot screenshot); --verify-selftest V26 reads it.
+// `bar` is the amber left-edge bar, and it is in the probe for the reason the
+// height is (review P2-6): watch-design §5 states the bar's behaviour as a
+// RULE - "a red outline plus an amber bar = the generations are mixed AND the
+// disk is still moving, and only one Reload in which every frame reads clears
+// both" - and a rule nothing asserts is a rule that drifts. A colour is also
+// the one thing a probe can see that a reader of the label cannot.
+struct FilesStackRowProbe {
+    int seqId = 0;
+    std::string label;
+    std::string tip;                   // what the row's tooltip was BUILT from
+    float h = 0;
+    bool bar = false;
+};
+static std::vector<FilesStackRowProbe> g_filesStackRowProbe;
+// ...and the last row's tooltip text, set by rowWithMeta as it builds one. The
+// stack row reads it back into its own probe entry (review P3-19).
+static std::string g_filesRowTipProbe;
+// ...and the panel's BUSY row while a reload is in flight ("reloading <stack>:
+// 3 / 12 - 1.2 s"), recorded where it is drawn for the same reason. "" = no
+// reload was running on the last draw, which is itself what V29 asserts once
+// the job has landed.
+static std::string g_filesBusyRowProbe;
+
 // §4: the share mark. U+29C9 (two joined squares) when the atlas has it - the
 // CJK fonts jpFontPath picks vary here - else the plain word, which is longer
 // but never a '?' box. Checked once: the font file does not change at runtime.
@@ -314,6 +348,8 @@ static std::string g_filesPinProbe;
 
 static void drawFileList() {
     g_filesBadgeProbe.clear();
+    g_filesStackRowProbe.clear();
+    g_filesBusyRowProbe.clear();
     // No Open / Close buttons here (2026-08-03). Browse is how a file is found
     // and opened, and it reaches remote machines as well, which the OS dialog
     // never did. Close was the worse of the two: it silently escalated from the
@@ -376,6 +412,36 @@ static void drawFileList() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("stop as soon as the phase it is on finishes -\n"
                               "a stopped open leaves nothing behind");
+    }
+    // A FILE IS BEING RE-READ (the 2026-09-28 report 「reload を押すと応答なしに
+    // なる」). The open row's vocabulary, one idea over: "this is busy with
+    // something long, and here is the Stop". What differs is the NUMBER - a
+    // reload has as many items as the stack has distinct sources, so it can give
+    // a true fraction where an open can only name a phase (openJobPhase says
+    // why) - and what Stop MEANS, which is the tooltip's whole subject.
+    if (app.reloadJob) {
+        // ...recorded as drawn, for the row tooltip's reason (review, item 5):
+        // a test that called reloadJobRowText for itself would assert the
+        // function and not the panel.
+        g_filesBusyRowProbe = reloadJobRowText(*app.reloadJob);
+        ImGui::TextDisabled("%s", g_filesBusyRowProbe.c_str());
+        if (!app.reloadQueue.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(+%d stack%s)", (int)app.reloadQueue.size(),
+                                app.reloadQueue.size() == 1 ? "" : "s");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop##reload")) {
+            app.reloadJob->cancel.store(true);
+            app.reloadQueue.clear();     // Stop means stop - the open row's rule
+            toast("stopping...");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop after the frame it is on.\n\n"
+                              "The frames already re-read STAY re-read - they are\n"
+                              "what the disk holds now. So the stack is left holding\n"
+                              "two moments and says so on its row; reload it again\n"
+                              "to finish.");
     }
     // A reader is running (issue #232). The Reader panel says this too, in more
     // detail and with what the reader has printed so far - but a MEMO REPLAY
@@ -829,7 +895,16 @@ static void drawFileList() {
             // confused with. Its provenance note takes the path's place, which
             // is what the note is for. The share sentence (§4) follows either
             // lead: whose pixels these also are is true of computed frames too.
-            if (hov) {
+            // THE TOOLTIP, built whether or not the mouse is over this row.
+            //
+            // Built unconditionally, and recorded as the ONE string SetTooltip
+            // is handed (review P3-19, and its second pass): a probe that
+            // re-derives the text is a probe about the deriving, so a row that
+            // stopped calling seqWatchTooltip would have gone on passing. A
+            // probe that needs the mouse in the right place is a probe about
+            // the mouse. So the row composes it once, the probe is that value,
+            // and the hover only decides whether to SHOW it.
+            {
                 std::string lead = d.src->path.empty() && !d.note.empty()
                                  ? d.note : dispPath(d.src->path);
                 // the generation statements, where the provenance is read
@@ -855,12 +930,22 @@ static void drawFileList() {
                 // reduced frame belongs to no stack and a stack head is never
                 // a reduced frame. The order is stated anyway, because "it
                 // cannot happen" is not a thing a reader can see here.)
+                // ...and WATCH's finding, folded off its own amber line and onto
+                // this row (watch-design §5, the 2026-09-28 report 「reload で行
+                // が増えるのは嫌」). The row's token is a word; this is the
+                // sentence it is short for, and it ends with the gesture that
+                // acts on it, because there is no longer a button under the row
+                // to point at. Under the #56 note for that note's own reason: a
+                // stack of two generations is already wrong, and this is
+                // something to do about the disk.
+                if (std::string wt = seqWatchTooltip(d.seqId); !wt.empty())
+                    lead = wt + "\n" + lead;
                 if (std::string rn = seqReloadNote(d.seqId); !rn.empty())
                     lead = rn + "\n" + lead;
-                if (share.empty())
-                    ImGui::SetTooltip("%s\n%s", lead.c_str(), meta);
-                else
-                    ImGui::SetTooltip("%s\n%s\n\n%s", lead.c_str(), meta, share.c_str());
+                std::string tip = lead + "\n" + meta;
+                if (!share.empty()) tip += "\n\n" + share;
+                g_filesRowTipProbe = tip;      // the value, not a second derivation
+                if (hov) ImGui::SetTooltip("%s", tip.c_str());
             }
             return clicked;
         };
@@ -1001,6 +1086,7 @@ static void drawFileList() {
           for (int k = 0; k < (int)stack.size(); k++)
               if (stack[k] == app.current) { pos = k; active = true; }
           ImGui::PushID(head.seqId);
+          const float probeY0 = ImGui::GetCursorPos().y;
           // Every letter this stack holds, in A-then-B-then-slot order - the
           // order the letters read everywhere else. B is a FRAME, and so is a
           // slot's pin: the stack is where they LIVE, so the stack row
@@ -1027,6 +1113,19 @@ static void drawFileList() {
           // own, and the outline is what makes it findable across a full
           // panel. Both, or neither is worth having.
           const char* rmark = seqReloadMark(head.seqId);
+          // ...and Watch's, folded onto the same row (docs/features/watch/
+          // watch-design.md §5, the 2026-09-28 report 「reload で行が増えるのは
+          // 嫌」). It used to be an amber LINE under this row - two lines with
+          // Auto-reload on - so a poll that found a changed file moved every
+          // stack below it. The row that is already here says it instead.
+          //
+          // #56's token WINS when both are true, and that is a reading-order
+          // decision rather than a space one: "the disk moved" is something to
+          // act on, "this stack's frames are of two moments" is something
+          // already wrong with the numbers on screen, and only one of them can
+          // come first. The tooltip and the menu carry both.
+          const std::string wmark = (*rmark ? std::string() : seqWatchMark(head.seqId)) +
+                                    seqAutoReloadMark(head.seqId);
           if (mem) {
               // Reading order: [n], then the condition, then the file name.
               //
@@ -1051,11 +1150,19 @@ static void drawFileList() {
               // ImGui cuts a label at the FIRST "##", so a stack the user
               // renames to "a##b" renders as "a" in either shape of row.
               std::string lead = filesSeriesMemberLead(*ser, *mem, memIdx, sname);
-              snprintf(lb, sizeof lb, "%*s%s%s##m%d", (int)(badge.size() * 2), "",
-                       lead.c_str(), rmark, head.seqId);
+              snprintf(lb, sizeof lb, "%*s%s%s%s##m%d", (int)(badge.size() * 2), "",
+                       lead.c_str(), rmark, wmark.c_str(), head.seqId);
           } else {
-              snprintf(lb, sizeof lb, "%*s%s%s", (int)std::max<size_t>(badge.size() * 2, 2),
-                       "", sname, rmark);
+              // "##s<seqId>" is the row's ID, and it is here for review P3-18's
+              // reason: without it the row's ID was its whole LABEL, so a mark
+              // appearing or disappearing - which now happens on a Watch poll,
+              // with nobody touching anything - reset this row's widget state
+              // under the reader. The series-member row above has carried an
+              // explicit ID since it was written; this one needed the same, and
+              // ImGui cuts a label at the first "##" so nothing is drawn twice.
+              snprintf(lb, sizeof lb, "%*s%s%s%s##s%d",
+                       (int)std::max<size_t>(badge.size() * 2, 2),
+                       "", sname, rmark, wmark.c_str(), head.seqId);
           }
           char frames[64];
           {   // "8f" for an 8-of-300 stack states nothing; say the ratio while
@@ -1087,7 +1194,9 @@ static void drawFileList() {
               if (!b2.empty()) share += (share.empty() ? "" : "\n") + b2;
           }
           ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
+          g_filesRowTipProbe.clear();
           bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn, share);
+          const std::string probeTip = g_filesRowTipProbe;
           ImGui::PopStyleColor();
           // #56, the user's own proposal: the red outline. Drawn straight onto
           // the row rather than as another item, exactly as the compare letters
@@ -1099,6 +1208,20 @@ static void drawFileList() {
               ImGui::GetWindowDrawList()->AddRect(a0, a1, RELOAD_FAIL_RED32,
                                                  2.0f * app.uiScale, 0,
                                                  std::max(1.0f, 1.5f * app.uiScale));
+          }
+          // ...and Watch's own colour, kept: the amber that used to be a whole
+          // line is a BAR down the row's left edge. A token alone is findable
+          // only by reading every row, which is what the colour was for; a
+          // second full outline beside #56's red one would be two frames
+          // fighting over one rectangle. Draw-list and not a widget, for the
+          // red outline's reason exactly - the row must stay the LAST item or
+          // the right-click below opens over the wrong thing.
+          const bool amberBar = !seqWatchMark(head.seqId).empty();
+          if (amberBar) {
+              ImVec2 a0 = ImGui::GetItemRectMin(), a1 = ImGui::GetItemRectMax();
+              const float wbar = std::max(2.0f, 2.5f * app.uiScale);
+              ImGui::GetWindowDrawList()->AddRectFilled(
+                  a0, ImVec2(a0.x + wbar, a1.y), WATCH_AMBER32, 1.0f * app.uiScale);
           }
           if (stackHit) {
               selectImage(stack[pos]);
@@ -1137,6 +1260,21 @@ static void drawFileList() {
             // numbered siblings from the head file (item 28)
             if (ImGui::MenuItem("Open in new window"))
                 openInNewWindow(app.images[stack.front()].get());
+            // ---- Watch's finding, where the gesture that answers it is ------
+            // (watch-design §5, the 2026-09-28 report.) A LINE, not a button:
+            // "Reload from disk" is directly under it and is the button, and a
+            // second one would be a second way to do one thing. TextDisabled
+            // for the same reason the amber line was never a control - it is a
+            // statement about the disk, and the row above already carries the
+            // token that says so at a glance.
+            // seqWatchMenuText, not seqWatchTooltip: this popup is already
+            // open and "Reload from disk" is the item below, so the tooltip's
+            // closing "right-click > Reload from disk" would be the menu
+            // pointing at itself (review P2-4).
+            if (std::string wt = seqWatchMenuText(si->id); !wt.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", wt.c_str());
+            }
             {   // manual reload (reference-design §3.2 / §8 row 5): every
                 // member's file re-read, pixels swapped in place. ONE member
                 // the walk can serve is enough to offer the item - the summary
@@ -1152,9 +1290,33 @@ static void drawFileList() {
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
                     pendingReloadSeq = si->id;
+                // WHAT IT WILL AND WILL NOT DO, stated where the click is. This
+                // hover is where the old amber line's [Reload] carried §6 /
+                // §11.4's answer to "a file appeared - does it join THIS
+                // stack?", and folding the line onto the row took it off the
+                // screen altogether (review P2-5). reloadGestureTip is the one
+                // place those sentences live; --watch-selftest asserts them.
+                if (anyLocal && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", reloadGestureTip(si->id).c_str());
                 if (!anyLocal && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("%s", why.c_str());
             }
+            // §9: and the one thing the auto-reload note needed a control for.
+            // It used to be a little `x` on the amber line under the row; the
+            // line is gone, so the act of clearing it lives where every other
+            // thing you can do to this stack lives. Only when there is one -
+            // an item that is greyed out more often than not is noise.
+            if (!si->autoReloadNote.empty() &&
+                ImGui::MenuItem("Clear auto-reload note")) {
+                pendingAckAutoSeq = si->id;
+            }
+            if (!si->autoReloadNote.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Clear the (auto-reloaded) token from this stack's row.\n\n"
+                    "The reload it describes is not undone and is not forgotten:\n"
+                    "the same sentence is in Messages, the frame count is on the\n"
+                    "row, and a reload that refused a member leaves its own mark\n"
+                    "there.");
             // The series (系列) this stack is in, or could be. Multi-select is
             // a later phase; until then this menu is how a stack joins a sweep
             // without going through the Linearity panel.
@@ -1324,120 +1486,39 @@ static void drawFileList() {
               !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
               ImGui::IsKeyPressed(ImGuiKey_F2, false))
               ImGui::OpenPopup("seqctx");
-          // ---- Watch (docs/features/watch/watch-design.md §5) --------------------------------
-          // The stack's files moved on disk. Amber, directly under the header
-          // row, and it does NOT expire: the toast that fired once already has,
-          // and "3 file(s) changed on disk" is the kind of fact seqNote's
-          // comment is about ("A toast expires; '60 of 300' must not").
+          // ---- Watch: WHERE the finding went (docs/features/watch/watch-design.md §5)
+          // It used to be drawn HERE: an amber line under this row with the
+          // finding on it and a [Reload] beside it, and a second amber line
+          // under that when an automatic reload had run. Both are gone (the
+          // 2026-09-28 report 「reload で行が増えるのは嫌、もう少し控えめな表示で
+          // 知らせたい」): the finding is a TOKEN on the row's own label and
+          // an amber bar down its left edge, the sentence is in the row's
+          // tooltip and in its right-click menu, and the little `x` that
+          // cleared the auto-reload note is a menu item. Nothing is inserted,
+          // so a poll no longer moves every stack below this one.
           //
-          // AFTER the context menu on purpose, and this is not cosmetic:
-          // BeginPopupContextItem binds to the LAST item drawn, so a widget
-          // between the row and it would give the stack's right-click menu to
-          // this line. Same reason the #56 outline is a draw-list rectangle.
-          //
-          // It says what is on disk, never what these pixels are: the frames in
-          // memory are exactly what they were, which is why the sentence is
-          // about FILES and the button is the way to act on it.
-          if (const App::SeqInfo* wsi = seqInfo(head.seqId)) {
-              std::string wn = seqWatchNote(head.seqId);
-              if (!wn.empty()) {
-                  ImGui::Indent(ImGui::GetFontSize());
-                  ImGui::PushStyleColor(ImGuiCol_Text, WATCH_AMBER32);
-                  ImGui::TextUnformatted(wn.c_str());
-                  ImGui::PopStyleColor();
-                  ImGui::SameLine();
-                  // A stack no member of which the reload walk can serve gets no
-                  // button here, and this is not a styling choice: an offered
-                  // [Reload] would refuse every member and latch the (reload
-                  // failed) mark of issue #56 onto a stack where nothing failed.
-                  // ONE predicate (watchReloadOffered), asked here, by the
-                  // sentence beside it and by --rwatch-selftest. A PEER's stack
-                  // is no longer one of them - watch-design §16 gave the walk the
-                  // peer's own "stat it and read it again", so the button below
-                  // re-fetches those frames over the link.
-                  if (!watchReloadOffered(wsi->id)) {
-                      ImGui::TextDisabled("%s", watchActionText(wsi->id));
-                      if (ImGui::IsItemHovered())
-                          ImGui::SetTooltip("%s",
-                              "These pixels rebuild as a unit - a container or\n"
-                              "reader member has no per-member re-read. Open the\n"
-                              "file again for what it holds now.");
-                  } else {
-                  if (ImGui::SmallButton("Reload##watch")) pendingReloadSeq = wsi->id;
-                  // What Reload will and will not do, stated where the click is.
-                  // Re-reading the frames this stack HAS is reference-design
-                  // §3.2; rebuilding WHICH files are its members is watch-design
-                  // §6, and the second half is not the same for every stack -
-                  // only a stack whose membership IS its folder's sibling rule
-                  // takes a file that appeared (§11.4). A stack that will not is
-                  // told so here rather than left to infer it from a frame count
-                  // that did not move.
-                  if (ImGui::IsItemHovered()) {
-                      std::string tip =
-                          watchIsPeerStack(*wsi)
-                              ? std::string(
-                                    "Re-fetch every frame of this stack from the peer,\n"
-                                    "and rebuild which files are its members from the\n"
-                                    "peer's own listing. The window does not repaint\n"
-                                    "while it reads. Numbers computed from the old\n"
-                                    "pixels are dropped.")
-                              : std::string(
-                                    "Re-read every frame of this stack from disk,\n"
-                                    "and rebuild which files are its members.\n"
-                                    "Numbers computed from the old pixels are dropped.");
-                      if (wsi->watchFound.vanished)
-                          tip += "\n\nA file that is gone LEAVES this stack - it is not a\n"
-                                 "frame that failed to read - and n of N says the new "
-                                 "numbers.";
-                      if (wsi->watchFound.appeared)
-                          tip += wsi->ruleHead.empty()
-                              ? "\n\nA file that appeared is NOT added: this stack's members\n"
-                                "were chosen (a derived subset, a hand-picked open), and\n"
-                                "that choice is never re-applied. Open the folder again\n"
-                                "for a stack of everything in it."
-                              : "\n\nA file that appeared JOINS this stack, numbered where\n"
-                                "its name puts it - the order the open used.";
-                      ImGui::SetTooltip("%s", tip.c_str());
-                  }
-                  }
-                  // ---- §9: ...and what the PROGRAM is about to do about it ---
-                  // Only when Auto-reload is on, and then always: "reloading
-                  // automatically", or the reason it is holding off. A stack
-                  // that is armed and silent for four seconds while a
-                  // measurement finishes must not look like a stack the feature
-                  // has forgotten.
-                  if (std::string an = watchAutoNote(wsi->id); !an.empty()) {
-                      ImGui::SameLine();
-                      ImGui::TextDisabled("%s", an.c_str());
-                  }
-                  ImGui::Unindent(ImGui::GetFontSize());
-              }
-              // ---- §9: what an AUTOMATIC reload already DID to this stack ----
-              // Amber, latched, and it outlives the finding that caused it -
-              // which is the whole point. The manual case needs no such line
-              // (the click is its own notice, and the toast is a receipt); this
-              // one is the only durable answer to "these numbers are not the
-              // ones I was reading a minute ago".
-              if (!wsi->autoReloadNote.empty()) {
-                  ImGui::Indent(ImGui::GetFontSize());
-                  ImGui::PushStyleColor(ImGuiCol_Text, WATCH_AMBER32);
-                  ImGui::TextUnformatted(wsi->autoReloadNote.c_str());
-                  ImGui::PopStyleColor();
-                  ImGui::SameLine();
-                  if (ImGui::SmallButton("x##autoack")) pendingAckAutoSeq = wsi->id;
-                  if (ImGui::IsItemHovered())
-                      ImGui::SetTooltip(
-                          "Clear this line.\n\n"
-                          "The reload it describes is not undone and is not "
-                          "forgotten:\nthe same sentence is in Messages, the frame "
-                          "count is on\nthe row above, and a reload that refused a "
-                          "member leaves\nits own mark there.");
-                  ImGui::Unindent(ImGui::GetFontSize());
-              }
-          }
+          // (seqWatchMark / seqAutoReloadMark / seqWatchTooltip in watch.inc
+          // are the three strings; this row draws the first two above and the
+          // menu above draws the third.)
           // No frame slider here: it used to appear under the active row, and a
           // row that grows on selection makes the whole list jump - the scrub bar
           // lives at the bottom of the Image View now, where the frames are.
+          {   // ...and what this block drew, for the test that holds the line
+              // above to account (see FilesStackRowProbe)
+              FilesStackRowProbe pr;
+              pr.seqId = head.seqId;
+              const char* pl = lb;
+              while (*pl == ' ') pl++;
+              pr.label = pl;
+              const size_t cut = pr.label.find("##");
+              if (cut != std::string::npos) pr.label.resize(cut);
+              pr.h = ImGui::GetCursorPos().y - probeY0;
+              pr.bar = amberBar;
+              pr.tip = probeTip;         // what the tooltip was built from, as
+                                         // DRAWN rather than as re-derived by a
+                                         // test (review P3-19)
+              g_filesStackRowProbe.push_back(std::move(pr));
+          }
           ImGui::PopID();
         };
         // ---- the batch's series come FIRST, each with its members inside -----
@@ -1578,56 +1659,23 @@ static void drawFileList() {
     if (pendingMoveTarget && pendingMoveSeq) moveStackToBatch(pendingMoveSeq, pendingMoveTarget);
     if (pendingMoveTarget && pendingMoveImg >= 0) moveImageToBatch(pendingMoveImg, pendingMoveTarget);
     if (pendingDeriveSeq) deriveModalOpen(pendingDeriveSeq);
-    if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size()) {
+    // ONE frame, re-read (reference-design §3.2). The whole of its sentence
+    // lives in reloadOneFrameText beside the walk it describes - the shared
+    // memberships, the stale reductions - because the asynchronous door's
+    // landing reaches the same sentence some frames later (pumpReloadJob), and
+    // a second wording of one event is the failure #71 is about.
+    //
+    // startFrameReload first, for the reason the stack's Reload takes the
+    // worker: a 480 MB frame is the same 0.45 s of a window answering nothing
+    // that issue #232 stage 2 moved off this thread for an OPEN of that very
+    // file. False = it declined (a scripted run), and then this is the
+    // synchronous door it always was.
+    if (pendingReloadImg >= 0 && pendingReloadImg < (int)app.images.size() &&
+        !startFrameReload(pendingReloadImg)) {
         ImageDoc* d = app.images[pendingReloadImg].get();
         std::string err, note;
-        if (reloadSource(d->src, err, &note)) {
-            std::string msg = "reloaded " + baseName(d->src->path) +
-                              (note.empty() ? "" : " - dimensions changed: " + note);
-            // the §3.2 walk refreshed EVERY membership of this source, not
-            // just this row: numbers moving in a stack the user never touched
-            // need a stated cause - the same clause reloadStackFromDisk earns
-            int sharedN = 0;
-            std::vector<std::string> sharedNames;
-            for (const auto& q : app.images)
-                if (q.get() != d && q->src == d->src) {
-                    sharedN++;
-                    std::string where = q->name;
-                    if (q->seqId != 0)
-                        if (const App::SeqInfo* si2 = seqInfo(q->seqId)) where = si2->name;
-                    if (std::find(sharedNames.begin(), sharedNames.end(), where) ==
-                        sharedNames.end())
-                        sharedNames.push_back(where);
-                }
-            if (sharedN) {
-                char b2[192];
-                snprintf(b2, sizeof b2, " - also refreshed %d shared frame(s) in \"%s\"",
-                         sharedN, sharedNames[0].c_str());
-                msg += b2;
-                if (sharedNames.size() > 1)
-                    msg += " (+" + std::to_string((int)sharedNames.size() - 1) + " more)";
-            }
-            // the walk latched staleness on every reduced frame of every stack
-            // this source belongs to (§10.1) - the toast must say so too. The
-            // row is a loose frame, but a shared source can sit in stacks too,
-            // so the criterion is the walk's own: memberships of THIS source.
-            {
-                int staleAvg = 0;
-                for (const auto& q : app.images) {
-                    if (q->avgOfPath.empty() || !q->avgStale || !q->avgSeqId) continue;
-                    for (const auto& r : app.images)
-                        if (r->src == d->src && r->seqId == q->avgSeqId) {
-                            staleAvg++; break;
-                        }
-                }
-                if (staleAvg)
-                    msg += " - " + std::to_string(staleAvg) + " computed frame(s) now "
-                           "stale (right-click > Recompute from stack)";
-            }
-            toast(msg);
-        } else {
-            toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
-        }
+        if (reloadSource(d->src, err, &note)) toast(reloadOneFrameText(*d, note));
+        else toast("reload failed - " + baseName(d->src->path) + ": " + err, true);
     }
     // ONE reload path (watch-design §9): this is watchAutoDrain's own call with
     // automatic=false. The toast, the clearing of the Watch line and the record
@@ -1636,7 +1684,13 @@ static void drawFileList() {
     // to, because the second one is the one nobody watches.
     if (pendingReloadSeq) watchReloadNow(pendingReloadSeq, false);
     if (pendingAckAutoSeq) {
-        if (App::SeqInfo* si = seqInfo(pendingAckAutoSeq)) si->autoReloadNote.clear();
+        // BOTH, always together - state.h declares that as the invariant of the
+        // pair, and clearing only the note left autoReloadWhen holding a clock
+        // for a note nobody can read (review P3-13).
+        if (App::SeqInfo* si = seqInfo(pendingAckAutoSeq)) {
+            si->autoReloadNote.clear();
+            si->autoReloadWhen.clear();
+        }
     }
     if (pendingRecomputeImg >= 0 && pendingRecomputeImg < (int)app.images.size()) {
         std::string err;   // success toasts inside (the reduction's own voice)
@@ -1646,8 +1700,17 @@ static void drawFileList() {
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);
     if (pendingDetrendSeq) {
-        std::string err;   // the success toast is the product's own voice
-        if (!detrendStackProduct(pendingDetrendSeq, pendingDetrendSpec, err)) toast(err, true);
+        // A detrend READS every member to compute its product, so a reload in
+        // flight would fold two generations of the file into one shading
+        // estimate (reloadInFlightFor says why, and says it in the Files row's
+        // own vocabulary).
+        if (const char* busy = reloadInFlightFor(pendingDetrendSeq, 0)) {
+            toast(busy, true);
+        } else {
+            std::string err;   // the success toast is the product's own voice
+            if (!detrendStackProduct(pendingDetrendSeq, pendingDetrendSpec, err))
+                toast(err, true);
+        }
     }
     if (pendingCloseSet) closeAnalysisSet(pendingCloseSet);
     if (pendingSetRename) {
