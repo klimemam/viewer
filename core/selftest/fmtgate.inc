@@ -2012,6 +2012,85 @@
                     }
                     selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
                 }
+
+                // ---- P9b: a peer that predates the MEMBER SIZES -------------
+                // "A refusal nobody runs is a refusal that rots" (the note over
+                // servedVersion, and the reason this seam exists). The check that
+                // decides whether a headerless FOLDER may be opened at all is
+                // `min == max` over the group row's members, and that pair of
+                // numbers arrived in protocol 16 - so a v15 peer cannot answer the
+                // question, and the answer to "cannot answer" is not "probably
+                // fine": a folder read under one recipe when the members disagree
+                // is a plausible picture of the wrong bytes.
+                //
+                // The three members here are EQUAL, deliberately. The refusal must
+                // therefore blame the PEER and not the files - it is the one thing
+                // that can go wrong in a sentence about a check that could not be
+                // made - and the single-file door over the same peer must still
+                // work, because one file needs no cross-member check.
+                {
+                    std::filesystem::path g15dir = rdir / "v15grp";
+                    std::filesystem::remove_all(g15dir, rec);
+                    std::filesystem::create_directories(g15dir, rec);
+                    std::vector<std::string> g15names;
+                    for (int k = 0; k < 3; k++) {
+                        std::vector<uint16_t> v((size_t)RW_W * RW_H, (uint16_t)(k + 1));
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "v_%03d.raw", k + 1);
+                        std::ofstream vf(pathFromUtf8((g15dir / nm).u8string()),
+                                         std::ios::binary);
+                        const std::vector<uint8_t> junk(HDR, 0xA5);
+                        vf.write((const char*)junk.data(), HDR);
+                        vf.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                        vf.close();
+                        g15names.push_back(nm);
+                    }
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", "15");
+                    remote::Session old15;
+                    std::string eo15;
+                    if (!old15.start("", exe, eo15)) {
+                        fprintf(stderr, "fmtgateselftest:   P9b old peer: %s\n", eo15.c_str());
+                        check(false, "P9b the protocol-15 peer starts");
+                    } else {
+                        std::vector<remote::Entry> e15;
+                        std::string le15;
+                        const bool l15 = old15.list(g15dir.u8string(), e15, le15);
+                        const remote::Entry* g15 = nullptr;
+                        for (const remote::Entry& e : e15) if (e.group) g15 = &e;
+                        uint64_t sz15 = 0;
+                        std::string why15;
+                        const bool ok15 = remoteRawSameSize(old15, old15.peerVersion(),
+                                                            g15dir.u8string(), g15names,
+                                                            sz15, why15);
+                        fprintf(stderr, "fmtgateselftest:   P9b peer speaks %d, list=%d "
+                                        "group=%d hasSizes=%d checked=%d\n"
+                                        "fmtgateselftest:   P9b refusal: \"%s\"\n",
+                                old15.peerVersion(), l15 ? 1 : 0, g15 ? 1 : 0,
+                                g15 && g15->hasMemberSizes ? 1 : 0, ok15 ? 1 : 0,
+                                why15.c_str());
+                        check(old15.peerVersion() == 15,
+                              "P9b the second peer really speaks 15");
+                        check(l15 && g15 && g15->members.size() == 3,
+                              "P9b ...and still folds the family into a group row");
+                        check(g15 && !g15->hasMemberSizes,
+                              "P9b ...without the member sizes, which is the point");
+                        check(!ok15 && has(why15, "protocol 15") &&
+                              has(why15, "each member") && has(why15, "update viewer-serve"),
+                              "P9b so a headerless FOLDER is refused by name and by number");
+                        check(!has(why15, "not all one size"),
+                              "P9b ...and not blamed on the files, which ARE all one size");
+                        remote::Meta m15{};
+                        std::string e15b;
+                        const bool got15 = old15.meta(rpath, m15, e15b, 0, &rw);
+                        fprintf(stderr, "fmtgateselftest:   P9b single file over v15: "
+                                        "meta=%d %dx%d %s\n",
+                                got15 ? 1 : 0, m15.w, m15.h, e15b.c_str());
+                        check(got15 && m15.w == RW_W && m15.h == RW_H,
+                              "P9b ...while a SINGLE headerless file still opens over it");
+                        old15.stop();
+                    }
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+                }
                 std::filesystem::remove_all(rdir, rec);
             }
             S.stop();
