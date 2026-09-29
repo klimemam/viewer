@@ -739,6 +739,13 @@ static void cropCurrentToSelectedRoi() {
     ImageDoc* im = cur();
     App::Ann* sel = findAnn(app.selectedAnn);
     if (!im || !sel || sel->type != 0) return;
+    // ...and not while a reload of these pixels is in flight (reloadInFlightFor
+    // says why). Refused HERE rather than dropped at the landing: the crop is
+    // work the user asked for.
+    if (const char* busy = reloadInFlightFor(im->seqId, im->uid)) {
+        toast(busy, true);
+        return;
+    }
     int ax = 0, ay = 0;
     if (!cropInPlace(*im, sel->x, sel->y, sel->w, sel->h, &ax, &ay)) {
         toast("still fetching the full frame - crop after it lands", true);
@@ -753,6 +760,10 @@ static void cropCurrentToSelectedRoi() {
 static void restoreFull() {
     ImageDoc* im = cur();
     if (!im || !isCropped(*im)) return;
+    if (const char* busy = reloadInFlightFor(im->seqId, im->uid)) {
+        toast(busy, true);             // cropCurrentToSelectedRoi's refusal: this
+        return;                        // re-decodes and replaces in place too
+    }
     int sx = im->src->cropX, sy = im->src->cropY;
     int idx = app.current;
     float ob = im->black, ow = im->white;

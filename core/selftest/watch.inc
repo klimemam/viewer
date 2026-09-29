@@ -392,7 +392,7 @@
             check(integrate(),
                   "W18 a queued finding makes watchFindingsPending() true (§3's line)");
             check(seqWatchNote(seq) == "1 file(s) changed on disk (w_002.npy)",
-                  "W18b the Files panel's amber line says exactly that");
+                  "W18b the ONE sentence the panel draws says exactly that");
             App::SeqInfo* si = seqInfo(seq);
             check(si && si->watchToasted && si->watchFound.changed == 1,
                   "W18c ...and the one toast (§5) has fired, once");
@@ -427,7 +427,7 @@
                 si->watchToasted = false;
             }
             check(failed == 0 && seqWatchNote(seq).empty(),
-                  "W19 after Reload the line is gone (the pixels are today's)");
+                  "W19 after Reload the finding is gone (the pixels are today's)");
             bool spokeEver = false;
             for (int k = 0; k < 3; k++) spokeEver |= poll();
             check(!spokeEver && seqWatchNote(seq).empty(),
@@ -454,6 +454,41 @@
             check(seqWatchTooltip(seq).find("1 file(s) appeared in the folder "
                                             "(w_005.npy)") != std::string::npos,
                   "W20d ...while the tooltip still names both");
+            // ---- W20e-h: §6 / §11.4's OWN answer, where the click is --------
+            // "A file appeared - does it join THIS stack?" is the question a
+            // finding raises and the only place the program answers it is the
+            // hover on the gesture. It used to be the amber line's [Reload]
+            // button; folding the line onto the row took it off the screen
+            // altogether until review P2-5 put it on the menu item. ONE place
+            // (reloadGestureTip), and these are its strings.
+            const std::string gt = reloadGestureTip(seq);
+            fprintf(stderr, "watchselftest: W20 gesture tip:\n%s\n", gt.c_str());
+            check(gt.find("Re-read every frame of this stack from disk") !=
+                      std::string::npos &&
+                  gt.find("Numbers computed from the old pixels are dropped.") !=
+                      std::string::npos,
+                  "W20e the gesture says what it does to the frames, and to the numbers");
+            check(gt.find("A file that is gone LEAVES this stack - it is not a") !=
+                      std::string::npos,
+                  "W20f ...and that a gone file is not a frame that failed to read");
+            // THE FORK, both ways, because it is the half that is not the same
+            // for every stack. ruleHead is set exactly when the membership came
+            // from the folder's sibling rule.
+            const std::string hadRule = seqInfo(seq) ? seqInfo(seq)->ruleHead
+                                                     : std::string();
+            check(!hadRule.empty(), "W20g (setup) this stack's members ARE its folder's "
+                                    "rule");
+            check(gt.find("A file that appeared JOINS this stack, numbered where") !=
+                      std::string::npos,
+                  "W20g2 ...so it is told that a file which appeared JOINS it");
+            if (App::SeqInfo* si = seqInfo(seq)) si->ruleHead.clear();
+            const std::string gt2 = reloadGestureTip(seq);
+            check(gt2.find("A file that appeared is NOT added: this stack's members") !=
+                      std::string::npos &&
+                  gt2.find("Open the folder again") != std::string::npos,
+                  "W20h ...while a stack whose members were CHOSEN is told the "
+                  "opposite, and where to go instead");
+            if (App::SeqInfo* si = seqInfo(seq)) si->ruleHead = hadRule;
         }
         {   // ---- W21: mtime BACKWARDS on the real filesystem ---------------------
             // The same bytes with an older timestamp: a restore from backup. The
@@ -1061,7 +1096,7 @@
             autWrite(2, 42.0f);                    // 202 -> 42 on disk, same size
             aSettle();
             check(seqWatchNote(as) == "1 file(s) changed on disk (a_002.npy)",
-                  "W39b (setup) the amber line says the file moved, as it always did");
+                  "W39b (setup) the finding says the file moved, as it always did");
             const int rev0 = seqInfo(as) ? seqInfo(as)->stackRev : -1;
             // BEFORE the drains, or this asserts nothing: with the switch on, the
             // drains would have reloaded the stack and cleared the finding, and
@@ -1090,7 +1125,7 @@
             check(pxOf(2) == 42.0f && seqInfo(as) && seqInfo(as)->stackRev > rev0,
                   "W40b ...and one drain re-read it: the frame holds the disk's pixels");
             check(seqWatchNote(as).empty() && !watchAutoDue(),
-                  "W40c ...and the line is gone, because it has stopped being true");
+                  "W40c ...and the finding is gone, because it has stopped being true");
         }
         {   // ---- W41/W42: SAY on one frame, ACT on the next - and say what it did
             // The membership moves as well as the pixels, which is the case that
@@ -1132,7 +1167,20 @@
                   app.msgLog.back().text.find(seqInfo(as)->name) == 0,
                   "W42b ...and the same sentence is in Messages, named by stack");
             check(seqWatchNote(as).empty() && !seqInfo(as)->autoReloadNote.empty(),
-                  "W42c the amber finding goes; the record of what was done stays");
+                  "W42c the finding goes; the record of what was done stays");
+            // ...and the TOKEN the row carries for it, off the clock the real
+            // watchReloadFinish just wrote rather than one a test placed by
+            // hand (review P2-9). The wall clock is the wall clock, so what is
+            // pinned is the shape and the pairing: state.h declares
+            // autoReloadWhen and autoReloadNote set and cleared TOGETHER.
+            const std::string when = seqInfo(as)->autoReloadWhen;
+            fprintf(stderr, "watchselftest: W42 row token: \"%s\" (when \"%s\")\n",
+                    seqAutoReloadMark(as).c_str(), when.c_str());
+            check(when.size() == 5 && when[2] == ':' &&
+                  seqAutoReloadMark(as) == "  (auto-reloaded " + when + ")",
+                  "W42d ...and the row's token is that record's own clock, to the minute");
+            check(note.find("auto-reloaded " + when) == 0,
+                  "W42e ...the same clock the sentence opens with, not a second reading");
         }
         {   // ---- W43: work in flight - a measurement is not swapped underneath --
             // The decision (§15): an automatic reload WAITS. It does not cancel

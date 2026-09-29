@@ -822,6 +822,18 @@ static void reloadDecodeGroup(const std::vector<const ReloadSpec*>& specs,
     // clone, no registry slot to vacate and no stack revision to move - and no
     // lock to take on a worker (see cropPixels).
     auto recrop = [](const ReloadSpec& s, ImageDoc& nd) {
+        // cropInPlace's OWN refusal, and it has to be the same predicate rather
+        // than a second opinion (review P2-3). A source still showing a
+        // DECIMATED remote tile refuses a crop by name: the full-resolution
+        // fetch is in flight and its landing replaces data/w/h wholesale,
+        // knowing nothing of crop bookkeeping - so a rect applied to the
+        // preview grid is silently reverted by that swap and leaves srcW
+        // stamped with preview dimensions. That is a phantom crop (isCropped
+        // forever true), an unshareable source, and a session line carrying
+        // garbage rectangles, and #272's R29 pins its absence. Dropping the
+        // guard while extracting cropPixels would have re-created it on the one
+        // path that re-applies a RECORDED rect.
+        if (s.remoteStep > 1) return;
         if (s.srcW > 0 && (s.cropX != 0 || s.cropY != 0 || s.w != s.srcW || s.h != s.srcH))
             cropPixels(nd, s.cropX, s.cropY, s.w, s.h);
     };
@@ -948,7 +960,6 @@ static void reloadDecodeGroup(const std::vector<const ReloadSpec*>& specs,
                                            // must move with it (an unmoved key
                                            // would let a later open adopt
                                            // pre-reload pixels)
-    for (ReloadPre* p : pres) p->stat = st;
     std::vector<uint8_t> bytes;
     if (!readFileBytes(fpath, bytes)) { refuseAll("cannot read file"); return; }
     if (cancel && cancel->load()) { refuseAll("stopped"); return; }
@@ -1918,11 +1929,19 @@ static std::string reloadStackFromDisk(int seqId, int* failedOut = nullptr,
 //  ============================================================================
 //
 // 「reload を押すと応答なしになる」. Measured on this repo before the change:
-// a 480 MB single-frame .npy reload was 0.45 s of a window answering nothing,
-// and a four-frame stack of the same file was 1.8 s - four whole-file reads and
-// eight decodes, because a frame-axis stack is one FrameSource per frame and
-// the old walk asked each of them to read the file for itself. That is #232
-// stage 2's pathology exactly, fixed for the open and not for the reload.
+// with the freeze probe and the automatic Reload driving the gesture (median of
+// 3, longest unresponsive; the table and the method are in watch-design §18.2b):
+//
+//   480 MB .npy, ONE file, TEN frames    3003 ms -> 0 ms
+//   480 MB x 4 files, folder stack       5013 ms -> 1508 ms
+//   48 MB x 4 files, folder stack         375 ms -> 0 ms   (the control)
+//
+// The ten-frame row is this walk's own pathology: a frame-axis stack is one
+// FrameSource per frame, so the old walk asked each of them to read the whole
+// file for itself - TEN whole-file reads and twenty decodes to land ten frames.
+// That is #232 stage 2's pathology exactly, fixed for the open and not for the
+// reload. (What is left on row 2 is not a read at all - see §18.2b: it is the
+// GL upload of a ~1 GB frame, and it is the same before and after.)
 //
 // NO NEW MACHINERY. App::ReloadJob is App::OpenJob's shape (one at a time, a
 // queue in front of it, a cancel flag, a start time that IS the progress), the
@@ -2030,11 +2049,18 @@ static void reloadJobWorker(App::ReloadJob* j) {
             // the peer is the same binary, resolved exactly as ensureUiSession
             // resolves it - one spelling of "which program answers on the other
             // side", or a reload would reach a different peer than the open did
+            // - but off the values FROZEN at the start of the job (review P1-1).
+            // app.remoteExe and app.exePath are std::strings the UI thread
+            // writes (settings.inc SK_peerExe, session.inc's `remoteexe` line),
+            // so reading them here is a data race on a std::string and not
+            // merely a stale read. rfEnqueue freezes for exactly this reason and
+            // says so. With this, the worker touches NO app state at all, which
+            // is the whole discipline.
             const std::string exe =
-                (host.empty() && app.remoteExe.empty())
-                    ? app.exePath
-                    : (app.remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
-                                             : app.remoteExe);
+                (host.empty() && j->remoteExe.empty())
+                    ? j->exePath
+                    : (j->remoteExe.empty() ? std::string(REMOTE_HOME) + "/viewer-serve"
+                                            : j->remoteExe);
             std::string err;
             if (!ses.startOn(host, port, exe, err)) return die(err);
         }
@@ -2110,13 +2136,28 @@ static size_t reloadJobItemsForStack(App::ReloadJob* j, int seqId) {
 }
 
 static bool startReloadJob(App::ReloadJob* j);
+// watch-design 12's frame-axis membership, defined in watch.inc (included after
+// this file). Declared here because THE PLAN BELONGS TO THE JOB that does the
+// reading (review P1-2), so it is taken - and its departures applied - inside
+// startStackReload below rather than at the gesture.
+static WatchAxisPlan watchFrameAxisPlan(int seqId);
+static void watchFrameAxisDrop(int seqId, int keep);
+// ...and the SYNCHRONOUS door's whole gesture, also watch.inc's: the plan, the
+// re-read and the sentence, in that order. One spelling, so the queue's
+// fall-back below cannot drift from watchReloadNow's own body.
+static void reloadStackSync(int seqId, bool automatic);
+// ...and what a finished stack reload SAYS about the finding it just answered
+// (watch-design §9's record and its one toast), watch.inc's too: ONE
+// post-processing, so a click and the automaton cannot come to do two different
+// things.
+static void watchReloadFinish(int seqId, bool automatic, const std::string& msg,
+                              int failed, uint64_t pinWas, const WatchAxisPlan& ax);
 
 // Start a stack's reload without waiting for it. Returns whether the
 // asynchronous door took it - false means the caller must do the reload itself,
 // here and now (reloadStackFromDisk).
 static bool startStackReload(int seqId, bool automatic,
-                             const ReloadPeer& peer = ReloadPeer(),
-                             const WatchAxisPlan& axis = WatchAxisPlan()) {
+                             const ReloadPeer& peer = ReloadPeer()) {
     // THE SYNCHRONOUS DOOR, and it is wide for startOpenJob's reason exactly:
     // --reload-selftest, --watch-selftest and --rwatch-selftest all call
     // reloadStackFromDisk (or watchReloadNow) and assert on app.images on the
@@ -2130,31 +2171,66 @@ static bool startStackReload(int seqId, bool automatic,
     // STOPPED (startOpenJob's review P2-4): that job will land nothing more, so
     // answering "already reloading" about it would silently do nothing.
     if (app.reloadJob) {
-        if (app.reloadJob->seqId == seqId && !app.reloadJob->cancel.load()) return true;
-        for (const auto& w : app.reloadQueue)
-            if (w.seqId == seqId) return true;
-        app.reloadQueue.push_back({ seqId, 0, automatic, axis });
+        // FOLDED, and folding is NOT discarding (review P1-2). This request has
+        // not been read: the job in flight started before the request was made,
+        // so it cannot be an answer to it. `again` runs the stack once more when
+        // this job has landed, with a NEW plan and a NEW stat - which is the
+        // only statement that is actually true. (Overwriting the RUNNING job's
+        // plan is not available: its decode began on the old member list, so a
+        // grow would claim frames nobody read.)
+        if (app.reloadJob->seqId == seqId && !app.reloadJob->cancel.load()) {
+            App::ReloadJob* run = app.reloadJob.get();
+            run->againAutomatic = run->again ? (run->againAutomatic && automatic)
+                                             : automatic;
+            run->again = true;
+            return true;
+        }
+        for (auto& w : app.reloadQueue)
+            if (w.seqId == seqId) {          // a request already WAITING needs no
+                w.automatic = w.automatic && automatic;   // second entry, but a
+                return true;                 // CLICK deserves a click's sentence
+            }
+        app.reloadQueue.push_back({ seqId, 0, automatic });
         return true;
     }
     std::unique_ptr<App::ReloadJob> j(new App::ReloadJob());
     j->seqId = seqId;
     j->automatic = automatic;
     j->peer = peer;
-    j->axis = axis;                    // watch-design §12's frame-axis plan, if
-                                       // this gesture took one (watchReloadNow)
+    // ...and HOW the peer is invoked, frozen now (review P1-1, rfEnqueue's rule)
+    j->remoteExe = app.remoteExe;
+    j->exePath = app.exePath;
     if (const App::SeqInfo* si = seqInfo(seqId)) j->name = si->name;
     // §12.5's other half, sampled ACROSS the whole reload: a pin on a frame
     // that VANISHES is dropped by closeImages, and the summary is about files.
     j->pinWas = app.compareBUid;
+    // ---- watch-design §12's frame-axis plan, taken HERE (review P1-2) --------
+    // Not at the gesture. A gesture folded into a running job does no reading,
+    // so a plan taken there applied its departures against a stack whose
+    // re-read was somebody else's and then lost its arrivals with the fold -
+    // board 222's own defect, back through the folding path
+    // (--asyncopen-selftest R9e). Taken where the READ begins, that path is
+    // structurally gone: no job, no plan, no departures.
+    //
+    // The departures go FIRST, in §6's order and for §6's reason: a frame the file
+    // no longer holds must not reach reloadSource and be counted as a refusal.
+    // The arrivals are watchReloadFinish's, when this job lands. `pinWas` above
+    // is sampled before them because they are a closeImages.
+    j->axis = watchFrameAxisPlan(seqId);
+    if (j->axis.moved() && j->axis.want < j->axis.have)
+        watchFrameAxisDrop(seqId, j->axis.want);
     reloadStackPlan(seqId, j->peer, j->plan, j->hadBefore);
     if (!reloadJobItemsForStack(j.get(), seqId)) {
         // Nothing resident to re-read - a stack every member of which just
         // departed, which reloadStackPlan refuses to let happen, or one that
-        // was emptied under us. The tail still owes its sentence.
+        // was emptied under us. The gesture still owes its WHOLE answer, and
+        // that includes §12's arrivals and §5's clearing, so it goes through
+        // watchReloadFinish rather than toasting on its own.
         ReloadTally t;
+        int failed = 0;
         const std::string msg = reloadStackTail(seqId, j->plan, j->hadBefore, t,
-                                                nullptr, j->peer);
-        toast(automatic ? j->name + ": " + msg : msg);
+                                                &failed, j->peer);
+        watchReloadFinish(seqId, automatic, msg, failed, j->pinWas, j->axis);
         return true;
     }
     app.reloadJob = std::move(j);
@@ -2164,9 +2240,9 @@ static bool startStackReload(int seqId, bool automatic,
 // ...and ONE frame, from the frame menu or the Files row's own Reload. The same
 // job with one item and no stack: the membership rebuild has no subject, and the
 // summary is the single-frame one (reloadOneFrameText). It is here rather than
-// left synchronous because the cost is the same cost: a 480 MB frame is 0.45 s
-// of a window answering nothing, which is the number #232 stage 2 moved off this
-// thread for an open of the very same file.
+// left synchronous because the cost is the SAME cost: one whole-file read and
+// one decode, which is what #232 stage 2 measured at 451 ms for an OPEN of a
+// 480 MB .npy and moved off this thread for that reason.
 static bool startFrameReload(int imgIdx) {
     if (g_scriptedRun && !g_forceAsyncOpen) return false;
     if (imgIdx < 0 || imgIdx >= (int)app.images.size()) return false;
@@ -2180,6 +2256,8 @@ static bool startFrameReload(int imgIdx) {
     }
     std::unique_ptr<App::ReloadJob> j(new App::ReloadJob());
     j->oneUid = uid;
+    j->remoteExe = app.remoteExe;      // frozen, for startStackReload's reason
+    j->exePath = app.exePath;
     j->name = app.images[(size_t)imgIdx]->name;
     App::ReloadJob::Item it;
     it.src = app.images[(size_t)imgIdx]->src;
@@ -2244,12 +2322,6 @@ static std::string reloadOneFrameText(const ImageDoc& d, const std::string& note
     return msg;
 }
 
-// ...and what a finished stack reload DOES about the finding it just answered
-// (watch-design §9's record and its one toast). Defined in watch.inc, which is
-// included after this file: ONE post-processing, so a click and the automaton
-// cannot come to do two different things.
-static void watchReloadFinish(int seqId, bool automatic, const std::string& msg,
-                              int failed, uint64_t pinWas, const WatchAxisPlan& ax);
 
 static void startNextQueuedReload();
 
@@ -2261,7 +2333,16 @@ static void pumpReloadJob() {
     App::ReloadJob* j = app.reloadJob.get();
     // The stack went away under us (Close stack, closeAll, a session restore).
     // Treated exactly as a Stop: nothing more lands, and what landed stays.
-    const bool stop = j->cancel.load() || (j->seqId != 0 && !seqInfo(j->seqId));
+    //
+    // ...and it CANCELS the worker too (review P3-11). Without that, closing a
+    // stack half-way through its reload left the worker reading and decoding
+    // nine more frames for a stack that no longer exists, with the Files row
+    // still saying "reloading 3 / 10" and the next stack in the queue waiting
+    // behind work nobody will take. closeAll already does this; Close stack
+    // reaches the same state by a different door and owes the same answer.
+    const bool gone = j->seqId != 0 && !seqInfo(j->seqId);
+    if (gone && !j->cancel.load()) j->cancel.store(true);
+    const bool stop = j->cancel.load() || gone;
     if (!stop && j->landedN < j->doneCount.load()) {
         App::ReloadJob::Item& it = j->items[(size_t)j->landedN];
         std::string err, note;
@@ -2316,6 +2397,20 @@ static void pumpReloadJob() {
     const std::string msg = reloadStackTail(j->seqId, j->plan, j->hadBefore, t, &failed,
                                             j->peer);
     watchReloadFinish(j->seqId, j->automatic, msg, failed, j->pinWas, j->axis);
+    // ---- and a gesture that arrived WHILE this job was reading (P1-2) -------
+    // It was folded, which is not the same as answered: the read that just
+    // finished started before that request was made. So it goes to the FRONT of
+    // the queue and runs once more, through the one door that takes a fresh plan
+    // and a fresh stat (startNextQueuedReload -> startStackReload). A Stop is
+    // the exception and needs none: Stop means stop, and it has cleared the
+    // queue already.
+    //
+    // It cannot ping-pong. A gesture arriving while the re-run WAITS folds into
+    // the queue entry instead of setting this flag, so one flight can add at
+    // most one re-run.
+    if (j->again && !stop && seqInfo(j->seqId))
+        app.reloadQueue.insert(app.reloadQueue.begin(),
+                               { j->seqId, 0, j->againAutomatic });
 }
 
 static void startNextQueuedReload() {
@@ -2341,11 +2436,7 @@ static void startNextQueuedReload() {
         return;                          // the frame closed while it waited
     }
     if (!seqInfo(w.seqId)) return;
-    if (!startStackReload(w.seqId, w.automatic, ReloadPeer(), w.axis)) {
-        int failed = 0;
-        const std::string msg = reloadStackFromDisk(w.seqId, &failed);
-        watchReloadFinish(w.seqId, w.automatic, msg, failed, app.compareBUid, w.axis);
-    }
+    if (!startStackReload(w.seqId, w.automatic)) reloadStackSync(w.seqId, w.automatic);
 }
 
 // Drive a started reload to the end on THIS thread. waitForOpenJob's twin and

@@ -1959,11 +1959,15 @@ static const char* AB_STALE_TOKEN = "[stale]";
 static const ImVec4 RELOAD_FAIL_RED(0.92f, 0.36f, 0.33f, 1.0f);
 static const ImU32  RELOAD_FAIL_RED32 = IM_COL32(235, 92, 84, 255);
 
-// ...and AMBER, one step down from it (docs/features/watch/watch-design.md §5: 「琥珀の1行」).
+// ...and AMBER, one step down from it (docs/features/watch/watch-design.md §5).
 // The two say different things and must not wear one colour: red is "what is on
 // screen is wrong", amber is "what is on screen is fine, and the FILES behind it
-// have moved". Nothing about the pixels in memory is in doubt when this shows -
-// which is exactly why it has a button and the red one has none.
+// have moved". Nothing about the pixels in memory is in doubt when this shows.
+//
+// Since the 2026-09-28 report it inks the BAR down a stack row's left edge, not
+// a line of its own under that row - §5 says why the line went. The red one is
+// an outline round the whole row, so the two can be true at once and read as
+// two things: "the generations are mixed" AND "the disk is still moving".
 static const ImU32  WATCH_AMBER32 = IM_COL32(235, 175, 70, 255);
 
 // What A or B is CALLED, everywhere the two are set against each other.

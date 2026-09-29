@@ -117,8 +117,23 @@ static std::string g_filesBadgeProbe;
 // cuts it, so the TOKEN is asserted as drawn text rather than as a string a
 // test built for itself. g_filesBadgeProbe's shape and its reason (the panel is
 // OpenGL this machine cannot screenshot); --verify-selftest V26 reads it.
-struct FilesStackRowProbe { int seqId = 0; std::string label; float h = 0; };
+// `bar` is the amber left-edge bar, and it is in the probe for the reason the
+// height is (review P2-6): watch-design §5 states the bar's behaviour as a
+// RULE - "a red outline plus an amber bar = the generations are mixed AND the
+// disk is still moving, and only one Reload in which every frame reads clears
+// both" - and a rule nothing asserts is a rule that drifts. A colour is also
+// the one thing a probe can see that a reader of the label cannot.
+struct FilesStackRowProbe {
+    int seqId = 0;
+    std::string label;
+    std::string tip;                   // what the row's tooltip was BUILT from
+    float h = 0;
+    bool bar = false;
+};
 static std::vector<FilesStackRowProbe> g_filesStackRowProbe;
+// ...and the last row's tooltip text, set by rowWithMeta as it builds one. The
+// stack row reads it back into its own probe entry (review P3-19).
+static std::string g_filesRowTipProbe;
 
 // §4: the share mark. U+29C9 (two joined squares) when the atlas has it - the
 // CJK fonts jpFontPath picks vary here - else the plain word, which is longer
@@ -870,6 +885,20 @@ static void drawFileList() {
             // confused with. Its provenance note takes the path's place, which
             // is what the note is for. The share sentence (§4) follows either
             // lead: whose pixels these also are is true of computed frames too.
+            // What this row's tooltip WOULD say, recorded whether or not the
+            // mouse is over it (review P3-19): a test that read
+            // seqWatchTooltip() for itself was asserting a function rather than
+            // a panel, and a row that stopped calling it would have passed.
+            // Built outside the `hov` gate for exactly that reason - a probe
+            // that needs the mouse in the right place is a probe about the
+            // mouse.
+            if (d.seqId != 0) {
+                g_filesRowTipProbe = seqWatchTooltip(d.seqId);
+                const std::string rn0 = seqReloadNote(d.seqId);
+                if (!rn0.empty())
+                    g_filesRowTipProbe = rn0 +
+                        (g_filesRowTipProbe.empty() ? "" : "\n") + g_filesRowTipProbe;
+            }
             if (hov) {
                 std::string lead = d.src->path.empty() && !d.note.empty()
                                  ? d.note : dispPath(d.src->path);
@@ -1119,8 +1148,16 @@ static void drawFileList() {
               snprintf(lb, sizeof lb, "%*s%s%s%s##m%d", (int)(badge.size() * 2), "",
                        lead.c_str(), rmark, wmark.c_str(), head.seqId);
           } else {
-              snprintf(lb, sizeof lb, "%*s%s%s%s", (int)std::max<size_t>(badge.size() * 2, 2),
-                       "", sname, rmark, wmark.c_str());
+              // "##s<seqId>" is the row's ID, and it is here for review P3-18's
+              // reason: without it the row's ID was its whole LABEL, so a mark
+              // appearing or disappearing - which now happens on a Watch poll,
+              // with nobody touching anything - reset this row's widget state
+              // under the reader. The series-member row above has carried an
+              // explicit ID since it was written; this one needed the same, and
+              // ImGui cuts a label at the first "##" so nothing is drawn twice.
+              snprintf(lb, sizeof lb, "%*s%s%s%s##s%d",
+                       (int)std::max<size_t>(badge.size() * 2, 2),
+                       "", sname, rmark, wmark.c_str(), head.seqId);
           }
           char frames[64];
           {   // "8f" for an 8-of-300 stack states nothing; say the ratio while
@@ -1152,7 +1189,9 @@ static void drawFileList() {
               if (!b2.empty()) share += (share.empty() ? "" : "\n") + b2;
           }
           ImGui::PushStyleColor(ImGuiCol_Text, inkOf(ui_theme::LayerStack));
+          g_filesRowTipProbe.clear();
           bool stackHit = rowWithMeta(head, lb, active, frames, badge, !cmpOn, share);
+          const std::string probeTip = g_filesRowTipProbe;
           ImGui::PopStyleColor();
           // #56, the user's own proposal: the red outline. Drawn straight onto
           // the row rather than as another item, exactly as the compare letters
@@ -1172,7 +1211,8 @@ static void drawFileList() {
           // fighting over one rectangle. Draw-list and not a widget, for the
           // red outline's reason exactly - the row must stay the LAST item or
           // the right-click below opens over the wrong thing.
-          if (!seqWatchMark(head.seqId).empty()) {
+          const bool amberBar = !seqWatchMark(head.seqId).empty();
+          if (amberBar) {
               ImVec2 a0 = ImGui::GetItemRectMin(), a1 = ImGui::GetItemRectMax();
               const float wbar = std::max(2.0f, 2.5f * app.uiScale);
               ImGui::GetWindowDrawList()->AddRectFilled(
@@ -1222,7 +1262,11 @@ static void drawFileList() {
             // for the same reason the amber line was never a control - it is a
             // statement about the disk, and the row above already carries the
             // token that says so at a glance.
-            if (std::string wt = seqWatchTooltip(si->id); !wt.empty()) {
+            // seqWatchMenuText, not seqWatchTooltip: this popup is already
+            // open and "Reload from disk" is the item below, so the tooltip's
+            // closing "right-click > Reload from disk" would be the menu
+            // pointing at itself (review P2-4).
+            if (std::string wt = seqWatchMenuText(si->id); !wt.empty()) {
                 ImGui::Separator();
                 ImGui::TextDisabled("%s", wt.c_str());
             }
@@ -1241,6 +1285,14 @@ static void drawFileList() {
                 }
                 if (ImGui::MenuItem("Reload from disk", nullptr, false, anyLocal))
                     pendingReloadSeq = si->id;
+                // WHAT IT WILL AND WILL NOT DO, stated where the click is. This
+                // hover is where the old amber line's [Reload] carried §6 /
+                // §11.4's answer to "a file appeared - does it join THIS
+                // stack?", and folding the line onto the row took it off the
+                // screen altogether (review P2-5). reloadGestureTip is the one
+                // place those sentences live; --watch-selftest asserts them.
+                if (anyLocal && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", reloadGestureTip(si->id).c_str());
                 if (!anyLocal && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("%s", why.c_str());
             }
@@ -1456,6 +1508,10 @@ static void drawFileList() {
               const size_t cut = pr.label.find("##");
               if (cut != std::string::npos) pr.label.resize(cut);
               pr.h = ImGui::GetCursorPos().y - probeY0;
+              pr.bar = amberBar;
+              pr.tip = probeTip;         // what the tooltip was built from, as
+                                         // DRAWN rather than as re-derived by a
+                                         // test (review P3-19)
               g_filesStackRowProbe.push_back(std::move(pr));
           }
           ImGui::PopID();
@@ -1623,7 +1679,13 @@ static void drawFileList() {
     // to, because the second one is the one nobody watches.
     if (pendingReloadSeq) watchReloadNow(pendingReloadSeq, false);
     if (pendingAckAutoSeq) {
-        if (App::SeqInfo* si = seqInfo(pendingAckAutoSeq)) si->autoReloadNote.clear();
+        // BOTH, always together - state.h declares that as the invariant of the
+        // pair, and clearing only the note left autoReloadWhen holding a clock
+        // for a note nobody can read (review P3-13).
+        if (App::SeqInfo* si = seqInfo(pendingAckAutoSeq)) {
+            si->autoReloadNote.clear();
+            si->autoReloadWhen.clear();
+        }
     }
     if (pendingRecomputeImg >= 0 && pendingRecomputeImg < (int)app.images.size()) {
         std::string err;   // success toasts inside (the reduction's own voice)
@@ -1633,8 +1695,17 @@ static void drawFileList() {
     if (pendingAvgSeq) requestStackAverage(pendingAvgSeq);
     if (pendingSumSeq) requestStackAverage(pendingSumSeq, FOLD_SUM);
     if (pendingDetrendSeq) {
-        std::string err;   // the success toast is the product's own voice
-        if (!detrendStackProduct(pendingDetrendSeq, pendingDetrendSpec, err)) toast(err, true);
+        // A detrend READS every member to compute its product, so a reload in
+        // flight would fold two generations of the file into one shading
+        // estimate (reloadInFlightFor says why, and says it in the Files row's
+        // own vocabulary).
+        if (const char* busy = reloadInFlightFor(pendingDetrendSeq, 0)) {
+            toast(busy, true);
+        } else {
+            std::string err;   // the success toast is the product's own voice
+            if (!detrendStackProduct(pendingDetrendSeq, pendingDetrendSpec, err))
+                toast(err, true);
+        }
     }
     if (pendingCloseSet) closeAnalysisSet(pendingCloseSet);
     if (pendingSetRename) {

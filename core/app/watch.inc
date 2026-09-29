@@ -1040,30 +1040,45 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
     toast(automatic ? name + ": " + msg : msg, failed > 0);
 }
 
-static void watchReloadNow(int seqId, bool automatic) {
-    // §12's frame-axis half, FIRST HALF (board row 222): decided before a byte
-    // is re-read, and its DEPARTURES applied before the walk - a frame the file
-    // no longer holds must not reach reloadSource and be counted as a refusal.
-    // `applies` is false for every other shape of stack, and then these two
-    // lines are one predicate and nothing else. The plan then travels with the
-    // reload (App::ReloadJob::axis) to watchReloadFinish above, which applies
-    // the arrivals.
+// THE SYNCHRONOUS DOOR's whole gesture, in one place: §12's frame-axis plan and
+// its departures, the re-read, then the sentence. It is a function rather than
+// three lines inside watchReloadNow because the reload QUEUE has to fall back to
+// exactly this when the asynchronous door declines (startNextQueuedReload), and
+// two spellings of "what a Reload is" is the one thing §15.1 forbids.
+//
+// The plan is taken HERE and nowhere earlier, for review P1-2's reason: it
+// belongs to the attempt that does the READING. On this door the two are the
+// same moment; on the worker's door startStackReload takes it at the same point
+// in the same order.
+static void reloadStackSync(int seqId, bool automatic) {
+    // §12's frame-axis DEPARTURES first, in §6's order and for §6's reason: a
+    // frame the file no longer holds must not reach reloadSource and be counted
+    // as a refusal. `applies` is false for every other shape of stack, and then
+    // these two lines are one predicate and nothing else.
     const WatchAxisPlan ax = watchFrameAxisPlan(seqId);
-    if (ax.moved() && ax.want < ax.have) watchFrameAxisDrop(seqId, ax.want);
-    // THE WORKER NEXT (the 2026-09-28 report). startStackReload takes the rest
-    // of the gesture - the membership plan, the re-reads, the summary and
-    // watchReloadFinish above - and returns having read nothing; pumpReloadJob
-    // finishes it. False means it declined (a scripted run without
-    // --async-open), and then this is the synchronous door it always was.
-    if (startStackReload(seqId, automatic, ReloadPeer(), ax)) return;
-    // §12.5's other half: a pin on a frame that VANISHES is dropped by
-    // closeImages, exactly as closing that frame drops it. Sampled across the
-    // call, because the summary reloadStackFromDisk returns is about files and
-    // this is about a comparison that has just ended.
+    // §12.5's other half, sampled BEFORE them (they are a closeImages): a pin
+    // on a frame that VANISHES is dropped by closeImages, exactly as closing
+    // that frame drops it.
     const uint64_t pinWas = app.compareBUid;
+    if (ax.moved() && ax.want < ax.have) watchFrameAxisDrop(seqId, ax.want);
     int failed = 0;
     const std::string msg = reloadStackFromDisk(seqId, &failed);
     watchReloadFinish(seqId, automatic, msg, failed, pinWas, ax);
+}
+
+static void watchReloadNow(int seqId, bool automatic) {
+    // THE WORKER FIRST (the 2026-09-28 report). startStackReload takes the whole
+    // gesture - §12's frame-axis plan, the membership plan, the re-reads, the
+    // summary and watchReloadFinish above - and returns having read nothing;
+    // pumpReloadJob finishes it. Nothing is decided here, and that is review
+    // P1-2's ruling: a gesture that is FOLDED into a running job does no
+    // reading, so a plan taken on this line would apply its departures against
+    // a re-read that is somebody else's and then be thrown away with the fold.
+    //
+    // False means the asynchronous door declined (a scripted run without
+    // --async-open), and then this is the synchronous door it always was.
+    if (startStackReload(seqId, automatic)) return;
+    reloadStackSync(seqId, automatic);
 }
 
 // The reload the LAST frame armed. Called at the head of pumpWatch and therefore
@@ -1187,7 +1202,13 @@ static std::string seqAutoReloadMark(int seqId) {
 // to do or cannot do about it, then what an automatic reload already did - the
 // three strings §5 used to draw on two lines, in that order, and then the
 // gesture that acts on it. "" = nothing to say.
-static std::string seqWatchTooltip(int seqId) {
+// `withGesture` is the difference between the two surfaces that draw this, and
+// it is a difference of PLACE rather than of length (review P2-4). The ROW's
+// tooltip has to say where the gesture is, because the row carries no button any
+// more. The RIGHT-CLICK MENU must not: it is already open, "Reload from disk" is
+// the item directly under this line, and a popup that says "right-click >
+// Reload from disk" is pointing at itself.
+static std::string seqWatchTooltip(int seqId, bool withGesture = true) {
     const App::SeqInfo* si = seqInfo(seqId);
     if (!si) return {};
     std::string s = seqWatchNote(seqId);
@@ -1200,11 +1221,56 @@ static std::string seqWatchTooltip(int seqId) {
         s += an.empty() ? std::string(watchActionText(seqId)) : an;
         // ...and where the gesture IS, now that there is no button under the
         // row. The menu is where every other thing you can do to a stack lives.
-        if (watchReloadOffered(seqId)) s += "\nright-click > Reload from disk";
+        if (withGesture && watchReloadOffered(seqId))
+            s += "\nright-click > Reload from disk";
     }
     if (!si->autoReloadNote.empty())
         s += (s.empty() ? "" : "\n") + si->autoReloadNote;
     return s;
+}
+// ...and the one the MENU draws: the same finding with no gesture line, because
+// the gesture is the item below it.
+static std::string seqWatchMenuText(int seqId) { return seqWatchTooltip(seqId, false); }
+
+// ---- §6 / §11.4: WHAT RELOAD WILL AND WILL NOT DO, where the click is ----
+// The four sentences the old amber line's [Reload] carried in its hover, put
+// back on the menu item that replaced it (review P2-5). They went off the screen
+// entirely when the button did, and they are the only place the program answers
+// the question a finding raises: "a file appeared - does it join THIS stack?"
+//
+// Re-reading the frames this stack HAS is reference-design §3.2; rebuilding
+// WHICH files are its members is watch-design §6, and the second half is NOT
+// the same for every stack - only a stack whose membership IS its folder's
+// sibling rule takes a file that appeared (§11.4). A stack that will not is
+// told so here rather than left to infer it from a frame count that did not
+// move. Without this, a 3-of-5 hand-picked stack says "(files appeared)", is
+// reloaded, does not grow, and nothing anywhere says why.
+//
+// ONE place, and --watch-selftest asserts these strings (findingText's
+// discipline). The fork is §11.4's own: SeqInfo::ruleHead is empty exactly
+// when the membership was CHOSEN rather than derived from the folder.
+static std::string reloadGestureTip(int seqId) {
+    const App::SeqInfo* si = seqInfo(seqId);
+    if (!si) return {};
+    std::string tip = watchIsPeerStack(*si)
+        ? std::string("Re-fetch every frame of this stack from the peer, and\n"
+                      "rebuild which files are its members from the peer's own\n"
+                      "listing. Numbers computed from the old pixels are dropped.")
+        : std::string("Re-read every frame of this stack from disk, and rebuild\n"
+                      "which files are its members.\n"
+                      "Numbers computed from the old pixels are dropped.");
+    if (si->watchFound.vanished)
+        tip += "\n\nA file that is gone LEAVES this stack - it is not a\n"
+               "frame that failed to read - and n of N says the new numbers.";
+    if (si->watchFound.appeared)
+        tip += si->ruleHead.empty()
+            ? "\n\nA file that appeared is NOT added: this stack's members\n"
+              "were chosen (a derived subset, a hand-picked open), and\n"
+              "that choice is never re-applied. Open the folder again\n"
+              "for a stack of everything in it."
+            : "\n\nA file that appeared JOINS this stack, numbered where\n"
+              "its name puts it - the order the open used.";
+    return tip;
 }
 
 // What a finding DOES once it reaches the UI thread: the summary lands on the

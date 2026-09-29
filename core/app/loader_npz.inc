@@ -300,6 +300,10 @@ static std::unique_ptr<ImageDoc> decodeNpyFrame(const std::string& path, std::st
                                                 int frameIdx, int& framesOut,
                                                 int64_t& frameStrideOut,
                                                 int npyRead = 0 /*NR_NATIVE*/);   // defined below
+// C-order or Fortran-order strides in ELEMENTS. Defined in loader_npy_raw.inc,
+// which is included after this file; npyDecodeFrames' `wanted` branch needs the
+// same answer decodeNpyBuffer computes, and one spelling is the point.
+static std::vector<int64_t> npyStridesOf(const std::vector<int64_t>& shape, bool fortran);
 
 // The DECODE half of loadNpyBuffer, and not one line of it touches app state.
 // Every frame of one .npy buffer, turned into a document and MEASURED - which
@@ -340,9 +344,11 @@ static std::string npyDecodeFrames(const std::vector<uint8_t>& buf, const std::s
         // disagree with the one a decode would have reported.
         NpyHead Hd;
         if (!npyPeekHeader(buf, Hd, err)) return err.empty() ? "decode failed" : err;
-        std::vector<int64_t> strides(Hd.shape.size());
-        if (Hd.fortran) { int64_t s = 1; for (size_t i = 0; i < Hd.shape.size(); i++) { strides[i] = s; s *= Hd.shape[i]; } }
-        else            { int64_t s = 1; for (int i = (int)Hd.shape.size() - 1; i >= 0; i--) { strides[i] = s; s *= Hd.shape[i]; } }
+        // npyStridesOf, not a third copy of the arithmetic (review P3-15): the
+        // comment above rests on "the same two functions decodeNpyBuffer
+        // consults", and consulting them with strides computed somewhere else
+        // is exactly the way that claim would stop being true.
+        const std::vector<int64_t> strides = npyStridesOf(Hd.shape, Hd.fortran);
         int64_t F = 1, sf = 0, H = 1, W = 1, C = 1, sh = 0, sw = 0, sc = 0;
         std::string note, lerr;
         if (!npyLayout(Hd.shape, strides, npyRead, F, sf, H, W, C, sh, sw, sc, note, lerr))

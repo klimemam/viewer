@@ -315,8 +315,8 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Re-read the folders behind the open stacks every few\n"
                               "seconds and SAY when a file has changed, appeared or\n"
-                              "gone - as a token on that stack's own row in Files\n"
-                              "((changed on disk)) with an amber bar down its edge.\n"
+                              "gone - as a token on that stack's own row in Files -\n"
+                              "(changed on disk) - with an amber bar down its edge.\n"
                               "The row's tooltip and its right-click menu say the\n"
                               "whole finding; nothing is added to the list.\n\n"
                               "By itself this changes nothing: what is on screen is what\n"

@@ -852,11 +852,12 @@ struct OpenPre {
 // A Reload re-reads the files behind pixels that are already on screen, and it
 // used to do all of it on the UI thread: stat, the whole file, a decode, a
 // SECOND decode for a frame-axis member, the crop and computeMinMax - per
-// resident FrameSource, with no yielding. A four-frame single-file stack was
-// therefore four whole-file reads and eight decodes of a window answering
-// nothing. Same shape as OpenPre above, and the same reason: the expensive
-// half is pure, so it is described by VALUES rather than by a second copy of
-// the walk.
+// resident FrameSource, with no yielding. A TEN-frame single-file stack was
+// therefore ten whole-file reads and twenty decodes of a window answering
+// nothing - measured at 3003 ms for a 480 MB .npy (watch-design §18.2b has the
+// table). Same shape as OpenPre above, and the same reason: the expensive half
+// is pure, so it is described by VALUES rather than by a second copy of the
+// walk.
 //
 // ReloadSpec is WHAT THESE PIXELS ARE, copied by value on the UI thread. The
 // worker must not read a live FrameSource: the reload walk and the registry
@@ -877,11 +878,17 @@ struct ReloadSpec {
     int srcW = 0, srcH = 0, cropX = 0, cropY = 0;   // the recorded crop rect
     std::string dtype;
 };
-// ...and what the worker produced. The stat is taken BEFORE the bytes (§6.2)
-// and on the worker's own thread, so the tuple the landing re-keys to is the
-// stat of the generation whose bytes were actually read.
+// ...and what the worker produced: one measured, cropped document, or the
+// reason there is none.
+//
+// There is deliberately NO pre-stat field here, unlike OpenPre above (review
+// P3-14). The stat IS taken before the bytes and on the worker's own thread -
+// §6.2, and reloadDecodeGroup does it once per FILE rather than once per
+// membership - but what it is for is the mtime/fsize written onto the fresh
+// document there and then, and the landing re-keys off THAT. A second copy on
+// the way out would be a field written by one thread, read by nobody, and free
+// to disagree with the document beside it.
 struct ReloadPre {
-    FrameSource stat;
     std::unique_ptr<ImageDoc> nd;      // the fresh decode, measured, cropped
     std::string err;                   // ...or why there is none
 };
@@ -2885,6 +2892,29 @@ struct App {
         // or empty for the program's own answer. Read by the worker, which
         // wraps it: see reloadJobWorker.
         ReloadPeer peer;
+        // WHICH PROGRAM answers on the other side, FROZEN at the start -
+        // rfEnqueue's rule and its reason, said there as "the UI thread edits
+        // remoteExe freely". Both of these are std::strings the UI thread
+        // writes (settings.inc's SK_peerExe, session.inc's `remoteexe` line),
+        // so a worker reading app.remoteExe is a data race on a std::string
+        // and not merely a stale read. The two INPUTS are frozen rather than
+        // the resolved answer because the answer depends on the HOST, which is
+        // the resolver's own argument (ensureUiSession's one expression); the
+        // freeze is the same freeze either way and this one needs no assumption
+        // about a job being one peer.
+        std::string remoteExe, exePath;
+        // A gesture that arrived WHILE this job was reading. It is folded - one
+        // reload of one stack at a time - but folding is not discarding: "your
+        // request has already been read" is only true when the read STARTED
+        // AFTER the request, and here it did not. So the job re-runs once it
+        // has landed, with a NEW plan and a NEW stat, which is the only answer
+        // that is actually true. (Overwriting the RUNNING job's plan is not
+        // available: its decode began on the old member list, so a grow would
+        // then claim frames nobody read.)
+        bool again = false;
+        bool againAutomatic = false;   // ...and only automatic if EVERY folded
+                                       // request was: a click deserves a click's
+                                       // sentence
         std::atomic<int> doneCount{ 0 };   // items the worker has finished
         std::atomic<bool> cancel{ false };
         std::atomic<bool> done{ false };
@@ -2901,9 +2931,13 @@ struct App {
         std::vector<std::string> sharedNames;
         watch::Rebuild plan;           // §6's membership, decided at the start
         int hadBefore = 0;
-        // ...and watch-design §12's frame-axis plan, decided by watchReloadNow
-        // before the job started (its departures are already applied) and
-        // handed to watchReloadFinish when the job ends, which applies the
+        // ...and watch-design §12's frame-axis plan. Taken by startStackReload
+        // AT THE MOMENT THIS JOB IS CREATED - never at the gesture (review
+        // P1-2): a gesture that is folded into a running job does no reading, so
+        // a plan taken there would apply its departures against a stack whose
+        // re-read is somebody else's and then lose its arrivals with the fold.
+        // Its departures are applied there too, immediately after it is taken,
+        // and watchReloadFinish is handed it when the job ends and applies the
         // arrivals. Default-constructed = not that shape of stack.
         WatchAxisPlan axis;
         uint64_t pinWas = 0;           // §12.5: a compare pin sampled across it
@@ -2920,12 +2954,12 @@ struct App {
     // rule); a request for a DIFFERENT one waits here. One at a time, because
     // two reloads landing into one registry from two threads is the shape the
     // one-worker rule exists to prevent.
-    struct ReloadWait {
-        int seqId = 0;
-        uint64_t oneUid = 0;
-        bool automatic = false;
-        WatchAxisPlan axis;            // carried, for ReloadJob::axis's reason
-    };
+    // No frame-axis plan here, and that is the point of review P1-2: a plan
+    // taken when the gesture was made is stale by the time the job starts, and
+    // its departures would have been applied against a stack the reload has not
+    // read yet. The plan belongs to the job that does the READING, so it is
+    // taken in startStackReload - see the note at ReloadJob::axis.
+    struct ReloadWait { int seqId = 0; uint64_t oneUid = 0; bool automatic = false; };
     std::vector<ReloadWait> reloadQueue;
     bool anyFileDialog() const {      // see the note on csvDlg
         return openDlg || saveDlg || csvDlg || texportDlg || roiExportDlg || pngDlg ||

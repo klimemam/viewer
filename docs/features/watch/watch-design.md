@@ -136,6 +136,17 @@ stack が3本開いていても LIST は1発)。
   - **ボタンは置かない**。Reload は行の右クリックメニューの
     「Reload from disk」— stack に対してできることは全部そこにある。行の下に
     現れて消えるボタンは breadcrumb-as-buttons の失敗の再演。
+  - ただし **ツールチップとメニューは同じ文ではない** (レビュー P2-4)。
+    行のツールチップは最後に `right-click > Reload from disk` と言うが、
+    **メニュー側はその行を落とす** (`seqWatchMenuText`) —— すでに開いている
+    popup の中で自分を指す指示になるため。
+  - **「現れたファイルはこの stack に入るのか」(§6 / §11.4) は、有効な
+    「Reload from disk」の hover にある** (`reloadGestureTip`)。旧い琥珀行の
+    [Reload] の hover が唯一のその面で、行へ折り畳んだときに一度画面から
+    消えていた (レビュー P2-5)。分岐は `SeqInfo::ruleHead` の有無で、手選び /
+    派生の stack には「入らない、フォルダを開き直せ」と言う。これが無いと
+    3-of-5 の手選び stack で「(files appeared)」と出て Reload しても枚数が
+    動かない理由がどこにも無い状態が残る。
   加えて初回検知時にトースト1発 (Messages に残る) — これが唯一の一時通知。
   状態は `SeqInfo` に持つ (`WatchState`: 基線、candidate、確定した変化の要約)。
 - **印が消える条件は3つだけ**、そしてそれ以外では消えない (トーストは消える
@@ -1160,8 +1171,10 @@ frame メニューの Reload、§9 の `watchAutoDrain`) が `reloadSource` を
 全読み → decode → (frame 軸メンバーなら**自分のフレームをもう1回** decode)
 → `cropInPlace` → `computeMinMax`。そして **frame 軸の単一ファイル stack は
 1フレーム = 1 FrameSource** なので、`reloadStackFromDisk` はその全部を
-**メンバーごとに繰り返す**。480 MB の .npy を4フレームで開いた stack の
-Reload は、**ファイル全読み4回と decode 8回**、その間ずっと再描画なし。
+**メンバーごとに繰り返す**。480 MB の .npy を10フレームで開いた stack の
+Reload は、**ファイル全読み10回と decode 20回**、その間ずっと再描画なしで
+**実測 3003 ms**。构成も数値も §18.2b の表の1行目と同じものを使っています
+—— 「実測」と書いて表に無い数字を出していたのがレビューで指摘された点です。
 
 これは issue #232 stage 2 が open について直した病理 (V22f) そのもので、
 reload には手が入っていなかった。
@@ -1287,3 +1300,48 @@ finding を載せても、§9 の note を載せても、#56 の失敗を載せ�
 **高さが変わらない** ことを assert する。行を戻す退行は、その行に何と
 書いてあっても数値を動かす。印そのものは `--watch-selftest` W18d-g / W20c-d と
 `--rwatch-selftest` R6f-g が文字列で押さえる (`findingText` の規律を1段上へ)。
+
+### 18.5 レビューで入った裁定 (2026-09-29、4観点 x 反証3名)
+
+実装の形が決まったものだけを残す。
+
+**(a) フォールドは黄って捨てない。** 同じ stack への2回目のジェスチャは
+飛行中の job にフォールドされる (1 stack 1本)。しかしその読みは要求より
+**前に始まっている**ので、要求に対する答えになっていない。「あなたの要求は
+既に読まれた」と言えるのは、その読みが要求より**後に**始まったときだけ。
+だから `App::ReloadJob::again` を立て、着地後に**新しい plan と新しい stat で**
+もう 1 回走らせる。飛行中 job の plan を上書きする案は採らない —— decode は
+既に古いメンバー列で始まっているので、grow が「読まれていない画素」を
+主張することになる。
+
+**(b) §12 の frame 軸 plan は「読みを行う job のもの」。** ジェスチャの場所ではなく
+`startStackReload` の中で取る。departures の適用も同じ場所。これで「フォールド
+されたジェスチャが drop だけ適用して arrivals と帳簿を失う」経路が**構造的に**
+消える (job がなければ plan も drop もない)。queue 項も plan を持ち運ばない ——
+持っていたところで job 開始時には古い。fail-first で赤を見てから直した:
+`--asyncopen-selftest` **R9e** (飛行中に F を 3→、5→2 へ書き換えてから2回目を打つ)。
+
+**(c) 飛行中の in-place 画素操作は断る。** reload が飛行中の stack への
+crop / restore full / detrend は**ジェスチャの時点で**断る
+(`reloadInFlightFor`)。理由は Files 行の Stop と同じ語彙で言う:
+「this stack is being re-read - wait for it, or press Stop on the Files row」。
+「着地で refuse する」案は、ユーザーが頑んだ作業を見えない形で捨てるので
+採らない。`cropInPlace` が decimated な remote tile を名指しで断るのと同じ形です。
+
+**(d) Stop が1フレームも着地していないときの文を固定した。** 挙動は変えない
+(世代が混じっているのは事実なので #56 の印は正しい) が、n=0 のときに
+`seqReloadNote` が「何も差し替えられていない」側の文を出すことを assert した
+(R11)。
+
+**(e) worker は app を一切読まない。** `app.remoteExe` / `app.exePath` は UI
+スレッドが書く std::string なので、worker からの直読みは古い値ではなく
+**data race** 。rfEnqueue が「起動時に凍結する」と書いているのと同じ形で、
+job 生成時に凍結する。凍結するのは**2つの入力**であって解決済みの答えではない:
+答えは host に依存し (ensureUiSession の 1 式)、host は resolver の引数だからです。
+
+**(f) 琥珀のバーも行の高さも律になった。** `g_filesStackRowProbe` に `bar` と
+`tip` (行が実際に組んだツールチップ) を追加し、V29 は**5状態**で高さと
+バーを assert する。第5状態は**reload 飛行中** —— 「reloading <stack>: 3 / 12」は
+自動 Reload ではクリック無しに出るので、これが行だったら発注そのものを
+裏切ることになる。V29 は GL を要するので #273 の NOGL 兄弟では `glGroup()` で
+skip される (V19 と同じ形、§4.3 の標準)。
