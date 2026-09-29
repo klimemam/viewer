@@ -968,6 +968,72 @@
                           "F4h ...with every member's pixels the local decoder's, bit for bit");
                 }
 
+                // ---- (5b) ...and the same folder with NOTHING bound ---------
+                // The first-time path, which is the one a new operator takes:
+                // the Open is PARKED, the dialog comes up on the head member
+                // with the byte count the folder listing gave, and the answer
+                // opens all three. Driven the way drawRawModal's Load drives it
+                // (rawDialogAccept then resumeRemoteRawStack) because the modal
+                // itself needs ImGui and this test never draws - the same reason
+                // --rawrecipe-selftest drives rawDialogAccept rather than the
+                // button.
+                {
+                    g_rawSizeRecipe.clear();          // nothing is bound now
+                    closeAll();
+                    rawDlg.open = false;
+                    rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.toast.clear();
+                    const int r5b = g_rawDialogsRaised;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    const bool parked = rawDlg.open && rawDlg.forRemoteStack &&
+                                        app.remoteRawStack.alive &&
+                                        app.remoteRawStack.files.size() == 3 &&
+                                        rawDlg.fileSize == (size_t)WANT &&
+                                        g_rawDialogsRaised == r5b + 1;
+                    fprintf(stderr, "fmtgateselftest:   F4h unbound stack: asks=%d "
+                                    "parked=%d files=%zu size=%zu (want %llu) docs=%zu\n",
+                            g_rawDialogsRaised - r5b, app.remoteRawStack.alive ? 1 : 0,
+                            app.remoteRawStack.files.size(), rawDlg.fileSize,
+                            (unsigned long long)WANT, app.images.size());
+                    check(parked && app.images.empty(),
+                          "F4h an unbound headerless folder PARKS the Open and asks once");
+                    // the modal's Load, in two calls
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    const std::string serr = rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    double tw2 = nowSec();
+                    while (nowSec() - tw2 < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int rec2 = 0;
+                    for (const auto& d4 : app.images)
+                        if (d4->src->rawDtype == RD_U16 && d4->src->srcW == DW &&
+                            d4->src->srcH == DH && d4->src->rawOffset == DHDR) rec2++;
+                    fprintf(stderr, "fmtgateselftest:   F4h resumed: err=\"%s\" docs=%zu "
+                                    "seqs=%zu withRecipe=%d slot-cleared=%d\n",
+                            serr.c_str(), app.images.size(), app.seqs.size(), rec2,
+                            app.remoteRawStack.alive ? 0 : 1);
+                    check(serr.empty() && app.images.size() == 3 && app.seqs.size() == 1 &&
+                          rec2 == 3,
+                          "F4h ...and one answer opens all three members with it");
+                    check(!app.remoteRawStack.alive,
+                          "F4h ...and the parked slot is released, so the queue moves on");
+                    // ...and the answer BOUND the size, which is what makes (5)
+                    // above ask nothing - the two halves of #166's rule, over a
+                    // link, asserted together.
+                    check(rawRecipeForSize((size_t)WANT) != nullptr,
+                          "F4h ...and the answer bound the byte count for this session");
+                }
+
                 // ---- (6) a MEMBER OF ANOTHER SIZE is refused, by name -------
                 // A headerless file does not defend itself: 108 bytes and 110
                 // bytes both decode as 8x6 u16 with 12 B skipped, and the
