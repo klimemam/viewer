@@ -2893,8 +2893,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SetCursorPosX(lineX0 + avail - markW + gap);
             ImGui::TextDisabled("%s", markShown.c_str());
             if (ImGui::IsItemHovered()) {
-                // §19's clause 2 (what the feature IS). Every number in here is
-                // read off the
+                // §19's clauses 2 and 3. Every number in here is read off the
                 // constants (browseWatchInterval), so moving one moves this
                 // tooltip with it - the panel must not carry a second opinion
                 // about its own interval.
@@ -2912,6 +2911,13 @@ void drawPanelRemote(App::BrowseInstance& I) {
                     "This interval is the Browse panel's own (%s here, %s for a\n"
                     "peer). The setting watch.intervalSec is the OTHER half - how\n"
                     "often the files behind the stacks you have OPEN are looked at.\n\n"
+                    "And those two halves do different things, which is the usual\n"
+                    "surprise: a listing here is REPLACED for you, but an open\n"
+                    "stack whose files changed only SAYS so on its row in Files\n"
+                    "until you right-click > Reload from disk - unless\n"
+                    "File > \"Auto-reload a stack when its files change\" is on,\n"
+                    "and that one is OFF by default. So \"the folder updated but my\n"
+                    "image did not\" is both of them working as asked.\n\n"
                     "The switch for all of it is File > \"Watch source files on\n"
                     "disk\" (Preferences, and loading.watchFiles in settings.jsonc,\n"
                     "set the same one).",
