@@ -359,8 +359,23 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                 // a newer distro dies on glibc with nothing but "connection
                 // lost" further down. Surface the loader's actual words.
                 std::string vout, verr3;
-                remote::runSshScript(host, port, peerProbeScript(""),
-                                     vout, verr3, 15.0);
+                // The RETURN VALUE, not just the text. When the probe times out
+                // or the link drops, `vout` is empty and the sentence below
+                // read "but it does not run there:" with nothing after the
+                // colon - an accusation against a peer that was never asked.
+                // "we could not check" and "we checked and it is broken" are
+                // different facts and the install must not report the second
+                // when it means the first.
+                const bool asked = remote::runSshScript(host, port, peerProbeScript(""),
+                                                        vout, verr3, 15.0);
+                if (!asked) {
+                    log = "copied to " + host + ", but the check that it RUNS there did "
+                          "not come back (" + (verr3.empty() ? "no reason given" : verr3) +
+                          ") - the peer may well be fine; nothing here can say so. "
+                          "Try again, or run ~/.viewer/viewer-serve --version over ssh "
+                          "by hand.";
+                    return false;
+                }
                 size_t vp2 = vout.find("viewer-serve protocol ");
                 if (vp2 == std::string::npos) {
                     log = "copied to " + host + ", but it does not run there:\n" + vout +
@@ -438,7 +453,18 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
     // (the loader's words, plus which glibc is missing), or it starts and is
     // older than this viewer (the branch it cloned is behind). #268.
     std::string vout5, verr5;
-    remote::runSshScript(host, port, peerProbeScript(""), vout5, verr5, 15.0);
+    // ...and the return value here for the same reason as in step 2: a probe
+    // that never landed leaves vout5 empty, and "it does not run there:" with
+    // an empty line under it blames the peer for our own timeout.
+    if (!remote::runSshScript(host, port, peerProbeScript(""), vout5, verr5, 15.0)) {
+        log += (log.empty() ? "" : "\n") +
+               std::string("the server installed its own peer, but the check that it "
+               "RUNS there did not come back (") +
+               (verr5.empty() ? "no reason given" : verr5) + ") - nothing here can say "
+               "whether the install worked. Try again, or run "
+               "~/.viewer/viewer-serve --version over ssh by hand.";
+        return false;
+    }
     size_t vp5 = vout5.find("viewer-serve protocol ");
     if (vp5 == std::string::npos) {
         log += (log.empty() ? "" : "\n") +

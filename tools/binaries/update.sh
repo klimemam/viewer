@@ -1,7 +1,11 @@
 #!/bin/sh
 #   ./update.sh                       - the published build, in place
-#   ./update.sh --peer                - ...and into ~/.viewer/, which is the
-#                                       peer the VIEWER actually starts
+#   ./update.sh --peer                - what is in this folder NOW into
+#                                       ~/.viewer/, which is the peer the
+#                                       VIEWER actually starts. It FETCHES
+#                                       NOTHING, so it is a second run after
+#                                       one of the forms above, never a flag
+#                                       that adds a step to them.
 #   ./update.sh --fetch binaries-pr64 - that branch's build, in place, git only
 #   ./update.sh --pr 64               - that pull request's build, into try/pr64/
 #   ./update.sh --commit a1b2c3       - that commit's build, into try/a1b2c3/
@@ -182,6 +186,22 @@ install_peer() {
     mv "$d/plugins/$b.new" "$d/plugins/$b"
   done
   echo "~/.viewer/plugins/   <- $DIR/plugins/"
+  # ...and whatever is no longer shipped GOES. This is not tidiness: the peer
+  # dlopens every .so it finds in ~/.viewer/plugins, so one left behind by an
+  # older release is loaded by the new peer. That is #268 one level down, and
+  # analyzer_stats.so is the recorded case - the copy published before this
+  # branch required GLIBC_2.29, so a 2.17 peer would start on CentOS 7 and
+  # server-side MEASURE would still die on the stale analyzer. The viewer's own
+  # bootstrap has always done `rm -rf "$d/plugins"` for exactly this reason;
+  # --peer merged into the directory instead. Named out loud, one per line,
+  # because a file disappearing silently is how the next puzzle starts.
+  for f in "$d"/plugins/*; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    if [ -e "$DIR/plugins/$b" ]; then continue; fi
+    rm -f "$f"
+    echo "~/.viewer/plugins/$b  removed (not in this build)"
+  done
 }
 
 # Say the above out loud when it matters, and only then: this folder's peer and
@@ -195,6 +215,12 @@ peer_note() {
 The viewer starts ~/.viewer/viewer-serve, not the copy in this folder, and that
 one is a DIFFERENT build from what this update just placed here. To refresh it:
     ./update.sh --peer
+
+Nothing needs rebuilding or reinstalling afterwards, but a viewer that is
+ALREADY CONNECTED keeps the peer it started: each connection execs
+~/.viewer/viewer-serve once and holds that process for as long as the link is
+up. The new peer is what the NEXT connection gets - reconnect (Browse's
+Disconnect, or File > Update remote peer) or restart the viewer.
 EOF
 }
 
@@ -248,8 +274,9 @@ case "$1" in
         reset_to FETCH_HEAD; exit 0 ;;
   --pr|--commit) ;;
   *)    echo "usage: ./update.sh [--peer | --fetch REF | --pr N | --commit SHA]" >&2
-        echo "  --peer  also install this folder's viewer-serve into ~/.viewer/" >&2
+        echo "  --peer  install THIS FOLDER'S viewer-serve + plugins into ~/.viewer/" >&2
         echo "          (that copy, not this one, is what the viewer starts)" >&2
+        echo "          it fetches nothing: run ./update.sh first, then --peer" >&2
         exit 2 ;;
 esac
 
