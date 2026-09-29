@@ -2866,13 +2866,17 @@ static bool remoteRawFileSize(const std::string& host, const std::string& rpath,
     if (!ensureUiSession(host, err, port)) return false;
     std::vector<remote::Entry> es;
     if (!app.uiSession.list(rpath, es, err)) return false;
-    // handleList returns the one entry for a path that is not a directory. A
-    // NAME that is not there comes back as "no such path" above; a name that
-    // came back as something else (a directory, or a listing of several) is not
-    // a file whose bytes can be counted, and saying so beats guessing.
+    // handleList returns the one entry for a path that is not a directory. The
+    // NAME has to match: this count is about to key #166's size binding, and a
+    // binding is the one thing in this viewer that decodes pixels a particular
+    // way without being asked on the spot - a number taken from the wrong entry
+    // could match a recipe the operator chose for some OTHER file of that size
+    // and open this one as a plausible picture of the wrong bytes. A path that
+    // is not there comes back as "no such path" from the call above; anything
+    // else that does not name this file is said rather than guessed at.
     const std::string leaf = baseName(rpath);
     for (const remote::Entry& e : es)
-        if (!e.dir && !e.group && (e.name == leaf || es.size() == 1)) { out = e.size; return true; }
+        if (!e.dir && !e.group && e.name == leaf) { out = e.size; return true; }
     err = "the peer's listing does not name " + leaf + " as a file";
     return false;
 }
