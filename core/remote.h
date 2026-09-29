@@ -30,6 +30,15 @@ struct Entry {
     bool group = false;                // synthetic row for a numbered sequence
     uint32_t frames = 0;               // member count when group
     std::vector<std::string> members;  // member file names (no directory part)
+    // Protocol 16, group rows only: the smallest and largest member, in bytes.
+    // `size` is their SUM and cannot answer "are they all one shape" - the sum
+    // of 108/110/106 is the sum of 108/108/108 - and for a HEADERLESS folder
+    // that question decides whether the bytes may be read at all (the geometry
+    // comes from a recipe, so a member of another length reads as another
+    // picture). hasMemberSizes is false from a pre-16 peer, which is not an
+    // "unknown" the client may round to yes: it refuses the open and says so.
+    bool hasMemberSizes = false;
+    uint64_t minMemberSize = 0, maxMemberSize = 0;
 };
 
 // LIST reply payload -> entries, in the shape `peerVersion` promises. Split out

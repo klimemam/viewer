@@ -200,7 +200,7 @@
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "R1a the peer speaks the protocol this build does (15)");
+                  "R1a the peer speaks the protocol this build does");
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);
@@ -1349,11 +1349,11 @@
             remote::ReaderRun ocRun;
             std::string ocErr;
             const bool ocSent = oldClient.readerRun(origin, "load", tf, ocRun, ocErr);
-            check(oldClient.peerVersion() == 15 && ocSent &&
+            check(oldClient.peerVersion() == (int)rp::VERSION && ocSent &&
                       ocRun.outcome == rp::RO_UNREADABLE && ocRun.key.empty() &&
                       ocRun.header.empty() &&
                       ocRun.err == rp::typedAxesClientTooOldText(14, "Reader CHW"),
-                  "R21m a v15 peer refuses named typed output before issuing it to a v14 client");
+                  "R21m a current peer refuses named typed output before issuing it to a v14 client");
             remote::ReaderRun still;
             std::string stillErr;
             const bool stillSent = seed.readerRun(origin, "load", tf, still, stillErr);

@@ -417,6 +417,11 @@ bool peerServesDeclared(const std::string& path) {
     return peerServes(path) || isHeaderless(path) || isNpz(path);
 }
 
+std::string headerlessLead(const std::string& path) {
+    return "a headerless " + lowerExt(path) + " carries no header to state its shape, "
+           "and this request carried no recipe";
+}
+
 std::string peerRefusal(const std::string& path, RefusedBy by) {
     if (peerServes(path)) return {};
     // Named, reasoned, way out attached - docs/features/adapters/input-adapters.md §3.2's three
@@ -485,15 +490,21 @@ std::string peerRefusal(const std::string& path, RefusedBy by) {
     // two ends cannot come to describe one fact two ways (#148's rule, applied
     // to a refusal).
     if (isHeaderless(path)) {
-        const std::string lead = "a headerless " + lowerExt(path) + " carries no "
-            "header to state its shape, and this request carried no recipe";
+        const std::string lead = headerlessLead(path);
         // THE PEER noticed. The recipe is the client's to send and protocol 11
-        // is what sends it, so the only thing anybody can act on is the build at
-        // the other end of the link - said the way pictureTooOldText says it:
-        // which side, and what it needs to speak.
+        // is what sends it, so the only thing anybody can act on is the viewer
+        // that sent this request.
+        //
+        // "the other end" was wrong, and wrong in the direction that matters:
+        // this sentence travels BACK over the link and is read by the person
+        // sitting at the client, for whom the other end is the peer - the one
+        // machine that is not the problem (review #10). The peer cannot name a
+        // number either, because it does not know what the client speaks; it
+        // knows only that this request had no recipe in it. So it names the
+        // build the reader is actually running and stops there.
         if (by == RefusedBy::Peer)
             return lead + "\n  a protocol-11 client sends one with every request "
-                          "- update the viewer at the other end";
+                          "- update the viewer you are running";
         // THIS BUILD noticed, which means the request came off a road that does
         // not ask: the command line, a session line with no geometry, a scripted
         // run. Every INTERACTIVE door asks now (openRemoteRawDeclared in

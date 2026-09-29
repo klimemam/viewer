@@ -1218,6 +1218,13 @@ struct SeqGroup {
     std::string pattern;                // frame_###.npy - display name
     std::vector<std::string> names;     // member file names, numeric order
     uint64_t bytes = 0;                 // sum over members
+    // ...and the two numbers the sum cannot reconstruct (protocol 16). A
+    // headerless folder may only be opened as one stack when every member is
+    // the same length, and the sum of 108/110/106 is the sum of 108/108/108 -
+    // so the client needs the extremes, and needs them in the SAME round trip
+    // (a LIST per member is a round trip per frame). min/max rather than one
+    // "uniform" bit because the client's refusal quotes the real numbers.
+    uint64_t minBytes = 0, maxBytes = 0;
     int64_t mtime = 0;                  // newest member
     std::filesystem::path first;        // header peek target
 };
@@ -1329,11 +1336,16 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
         } else {
             g.pattern = fallbackPattern;      // degenerate bucket: stage-1 view
         }
+        bool first = true;
         for (size_t i : mem) {
             g.names.push_back(files[i].first);
             used[i] = 1;
             std::error_code ec;
-            g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, ec);
+            const uint64_t sz = (uint64_t)std::filesystem::file_size(files[i].second, ec);
+            g.bytes += sz;
+            g.minBytes = first ? sz : std::min(g.minBytes, sz);
+            g.maxBytes = first ? sz : std::max(g.maxBytes, sz);
+            first = false;
             g.mtime = std::max(g.mtime, unixMtime(files[i].second));
         }
         // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
@@ -1454,6 +1466,16 @@ static void putGroupEntryV3(Buf& out, const SeqGroup& g, int& peekBudget) {
     }
     out.putU32((uint32_t)g.names.size());
     for (const auto& nm : g.names) out.putStr(nm);
+    // Protocol 16, appended after the names so a pre-16 client's reply is byte
+    // for byte what it was. Gated on BOTH numbers, as the reader door is: the
+    // client must be able to parse it, and a peer told to behave as an older
+    // one (VIEWER_SERVE_PROTOCOL) must not send a field that number predates.
+    if (servedVersion() >= 16 && g_clientVersion >= 16) {
+        out.putU32((uint32_t)(g.minBytes & 0xFFFFFFFFu));
+        out.putU32((uint32_t)(g.minBytes >> 32));
+        out.putU32((uint32_t)(g.maxBytes & 0xFFFFFFFFu));
+        out.putU32((uint32_t)(g.maxBytes >> 32));
+    }
 }
 
 static void handleList(Buf& in) {

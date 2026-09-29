@@ -256,7 +256,17 @@ static const uint32_t MAGIC = 0x56525031;   // "VRP1"
 // requests retain their earlier wire. One narrow exception is an empty-layout
 // typed Stack(F,H,W) whose W <= 4: the old native guess calls it an HWC Frame,
 // so its layer declaration also requires 15.
-static const uint32_t VERSION = 15;
+// 16: a LIST group row carries the MIN and MAX byte count over its members,
+// appended after the member names. It exists because the client cannot ask "is
+// every member of this folder the same number of bytes" any other way in one
+// round trip, and for a HEADERLESS folder that question decides whether the
+// bytes may be read at all: the shape comes from a recipe, so two members of
+// different lengths read as two different pictures with nothing to notice it.
+// The sum alone could not answer it - 108/110/106 sums exactly as 108/108/108
+// does - and per-member LIST calls are one round trip per frame. min == max is
+// the whole check, and min/max rather than a single "uniform" bit so the
+// REFUSAL can quote the two real numbers.
+static const uint32_t VERSION = 16;
 
 enum MsgType : uint32_t {
     MSG_HELLO      = 1,   // -> (version)                  <- (version, server id)
@@ -417,6 +427,9 @@ enum ReqTrailer : uint32_t {
 //   flags & LE_META : [u32 dtype][u32 ndim][u32 dims[4]] declaration order,
 //                     0-padded  [u32 fortran]           (.npy header peek)
 //   flags & LE_GROUP: [u32 frameCount][frameCount * str memberName]
+//                    ...and since protocol 16, to a client that speaks it:
+//                    [u64 minMemberBytes][u64 maxMemberBytes]. Appended at
+//                    the END, so a pre-16 client's reply is byte-identical.
 // mtime is unix seconds (64-bit as lo/hi like the size: 2038 is within the
 // service life of a lab tool). A group entry's size is the sum over members,
 // its mtime the newest member, its META fields those of the first frame.
@@ -638,6 +651,27 @@ struct RawWire {
     uint32_t flags;             // bit0: little-endian. Rest 0 - room to append.
 };
 static const uint32_t RW_LITTLE_ENDIAN = 1u;
+// bits 1-2: which CFA phase a 1-channel MOSAIC interpretation is in - the index
+// into the client's CFA_PATTERNS (RGGB/BGGR/GRBG/GBRG). It rides in the flags
+// word that was declared "reserved, 0" for exactly this kind of append, so
+// RawWire is the same 24 bytes it has always been and no version moves.
+//
+// THE PEER NEVER READS IT, and that is the point: RGGB and BGGR do not change
+// one sample, only the label on the plane (docs/features/remote/remote-headerless-design.md
+// 3.2), so the peer has nothing to do with it and openRaw ignores these bits as
+// every pre-16 peer already did. What it IS for is the CLIENT: demosaic happens
+// here, and the recipe is the one channel that already reaches every follow-up
+// request for the same pixels - a sibling frame, the full-resolution swap, a
+// Watch arrival. Carrying the phase in it means the pattern the operator picked
+// lands on every frame of the stack without a second field on four structs.
+static const uint32_t RW_CFA_SHIFT = 1u;
+static const uint32_t RW_CFA_MASK  = 6u;     // bits 1-2
+static inline uint32_t rawWireCfaFlags(int pattern) {
+    return ((uint32_t)(pattern & 3) << RW_CFA_SHIFT) & RW_CFA_MASK;
+}
+static inline int rawWireCfaPattern(uint32_t flags) {
+    return (int)((flags & RW_CFA_MASK) >> RW_CFA_SHIFT);
+}
 // What those two indices MEAN in bytes and channels. Here rather than only in
 // core/app/loader_npy_raw.inc because the peer has to size the same read and
 // does not compile that file - the RawWire note's "one definition" applies to

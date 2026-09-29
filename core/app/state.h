@@ -493,8 +493,18 @@ inline std::string srcIdentityKey(const FrameSource& s) {
 //
 // Returns false when this source is not a headerless read at all, which is the
 // only honest answer for one: there is no recipe to reconstruct.
+//
+// `cfaPattern` is the CFA PHASE (RGGB/BGGR/GRBG/GBRG), and it is here rather
+// than beside it because the peer never reads it: the phase relabels planes and
+// changes no sample, so it is the CLIENT's to apply, and the recipe is the one
+// channel that already reaches every follow-up request for the same pixels.
+// Without it a remote Bayer frame demosaiced as RGGB whatever the operator
+// picked, and a saved session came back a different colour - which is the same
+// class of defect as a changed number (docs/features/settings/settings-inventory.md 4.1).
+// It lives in the flags word that was declared "reserved, 0" for this kind of
+// append, so RawWire is the same 24 bytes and no protocol version moves.
 inline bool rawWireOf(int dtype, int interp, int w, int h, int offset, bool le,
-                      rp::RawWire& out) {
+                      int cfaPattern, rp::RawWire& out) {
     if (dtype < 0) return false;
     out = rp::RawWire{};
     out.dtype = (uint32_t)dtype;
@@ -502,12 +512,16 @@ inline bool rawWireOf(int dtype, int interp, int w, int h, int offset, bool le,
     out.w = (uint32_t)std::max(1, w);
     out.h = (uint32_t)std::max(1, h);
     out.offset = (uint32_t)std::max(0, offset);
-    out.flags = le ? rp::RW_LITTLE_ENDIAN : 0u;
+    out.flags = (le ? rp::RW_LITTLE_ENDIAN : 0u) | rp::rawWireCfaFlags(cfaPattern);
     return true;
 }
-inline bool rawWireOfSource(const FrameSource& s, rp::RawWire& out) {
+// The source half. It takes the phase as an ARGUMENT because a FrameSource does
+// not hold one: the phase is an ImageDoc field (it is display, not identity -
+// remote-headerless-design.md 3.2 keeps it out of srcIdentityKey deliberately),
+// so the caller passes the doc's, and every caller here has a doc.
+inline bool rawWireOfSource(const FrameSource& s, int cfaPattern, rp::RawWire& out) {
     return rawWireOf(s.rawDtype, s.rawInterp, s.srcW > 0 ? s.srcW : s.w,
-                     s.srcH > 0 ? s.srcH : s.h, s.rawOffset, s.rawLE, out);
+                     s.srcH > 0 ? s.srcH : s.h, s.rawOffset, s.rawLE, cfaPattern, out);
 }
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
@@ -1969,6 +1983,7 @@ struct App {
         std::string host, name;
         std::vector<std::string> files;
         int port = 0, token = 0;
+        int batchId = 0;               // the Open that asked owns the frames
     };
     PendingRemoteRawStack remoteRawStack;
     // Places: starred host+path urls, and the last ~10 visited (most recent

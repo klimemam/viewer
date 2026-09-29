@@ -501,7 +501,7 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
 }
 
 // One v3 entry (shared by the LIST and SCAN replies).
-static bool parseEntryV3(R& r, Entry& e) {
+static bool parseEntryV3(R& r, Entry& e, int peerVersion) {
     uint32_t d = 0, lo = 0, hi = 0, mlo = 0, mhi = 0;
     if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi) ||
         !r.u32(mlo) || !r.u32(mhi))
@@ -537,6 +537,19 @@ static bool parseEntryV3(R& r, Entry& e) {
         e.members.resize(cnt);
         for (auto& m : e.members)
             if (!r.str(m)) return false;
+        // Protocol 16, appended after the names: the smallest and largest
+        // member. Read from the PEER's number rather than by "are there bytes
+        // left", because this is the last field of an entry and the next
+        // entry's name would parse as a length - the same reason the v2/v3
+        // split above is a version test and not a length test.
+        if (peerVersion >= 16) {
+            uint32_t mnlo = 0, mnhi = 0, mxlo = 0, mxhi = 0;
+            if (!r.u32(mnlo) || !r.u32(mnhi) || !r.u32(mxlo) || !r.u32(mxhi))
+                return false;
+            e.minMemberSize = ((uint64_t)mnhi << 32) | mnlo;
+            e.maxMemberSize = ((uint64_t)mxhi << 32) | mxlo;
+            e.hasMemberSizes = true;
+        }
     }
     return true;
 }
@@ -556,7 +569,7 @@ bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
             }
             e.dir = d != 0;
             e.size = ((uint64_t)hi << 32) | lo;
-        } else if (!parseEntryV3(r, e)) {
+        } else if (!parseEntryV3(r, e, peerVersion)) {
             err = "bad LIST reply";
             return false;
         }
@@ -601,7 +614,7 @@ bool Session::scan(const std::string& root, int depth, int maxGroups,
     out.clear();
     for (uint32_t i = 0; i < n; i++) {
         ScanGroup g;
-        if (!r.str(g.dir) || !parseEntryV3(r, g.entry)) {
+        if (!r.str(g.dir) || !parseEntryV3(r, g.entry, peerVersion_)) {
             err = "bad SCAN reply";
             return false;
         }

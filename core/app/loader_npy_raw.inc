@@ -227,7 +227,7 @@ static RawDialog g_folderRecipe;
 // published by drawRawModal each frame: ImGui::IsPopupOpen(name) needs a live
 // frame, and --browse-keys-selftest's action list runs between frames
 static bool g_rawPopupAlive = false;
-static void openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
+static bool openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
 
 // The whole recipe, as the sentence that travels with the numbers it produced.
 //
@@ -293,7 +293,7 @@ static rp::RawWire rawWireFrom(const RawDialog& d) {
     // hold an out-of-range index - a source was written from a wire that was
     // already checked.
     rawWireOf(std::clamp(d.dtype, 0, RD_COUNT - 1), std::clamp(d.interp, 0, RI_COUNT - 1),
-              d.w, d.h, d.offset, d.littleEndian, w);
+              d.w, d.h, d.offset, d.littleEndian, d.cfaPattern, w);
     return w;
 }
 

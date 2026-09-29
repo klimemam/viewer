@@ -174,8 +174,10 @@ bool peerServes(const std::string& path);
 //
 // One enum rather than two functions, so the two sentences are built in one
 // place and cannot drift into two spellings of one fact (#148's rule applied
-// to a refusal). imagefile.cpp is the ONLY translation unit both binaries
-// compile, which is why it holds both.
+// to a refusal). imagefile.cpp holds both because it is a translation unit
+// BOTH BINARIES COMPILE - not the only one (remote.cpp and plugin_host.cpp are
+// too), but the one that already owns what a format is, which is the same
+// reason 4.2 moved the headerless extension table here.
 enum class RefusedBy { Client, Peer };
 
 // Why the peer will not serve it, as a sentence; "" when it will. The reason a
@@ -183,6 +185,15 @@ enum class RefusedBy { Client, Peer };
 // vendor RAW is READ on this machine - so the sentence is built where the
 // column that knows lives, in the register of docs/features/adapters/input-adapters.md §3.2.
 std::string peerRefusal(const std::string& path, RefusedBy by = RefusedBy::Client);
+
+// The NAMING half of a headerless refusal, on its own - "a headerless .raw
+// carries no header to state its shape, and this request carried no recipe".
+// Published because there is a THIRD road that has to say it and cannot use
+// either sentence above: the command line, whose way out is its own flags
+// (core/app/cli.inc). Three ways out, one lead-in, built here - which is the
+// whole rule this enum exists to keep (#148 applied to a refusal, and the
+// review found cli.inc had quietly grown a second spelling of it).
+std::string headerlessLead(const std::string& path);
 
 // Which format the NAME claims (extension, lower-cased). Null = not one of ours,
 // and the caller falls through to whatever it did before. This is dispatch, not

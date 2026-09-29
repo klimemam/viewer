@@ -343,7 +343,7 @@ static void rfInheritRead(App::RFetchJob& j, const ImageDoc* head) {
 // own refusal, one line per frame in the stack note.
 static void rfInheritRecipe(App::RFetchJob& j, const ImageDoc* head) {
     if (!head || !head->src) return;
-    j.hasRecipe = rawWireOfSource(*head->src, j.recipe);
+    j.hasRecipe = rawWireOfSource(*head->src, head->cfaPattern, j.recipe);
 }
 
 static void requestFullRemote(const ImageDoc* d, bool low = false) {
@@ -387,7 +387,7 @@ static void requestFullRemote(const ImageDoc* d, bool low = false) {
     // same six numbers - without them a 4096x3000 raw opened at 1/3 and then
     // never refined, because the follow-up was refused and the decimated doc
     // stayed on screen as if it were the frame.
-    j.hasRecipe = rawWireOfSource(*d->src, j.recipe);
+    j.hasRecipe = rawWireOfSource(*d->src, d->cfaPattern, j.recipe);
     // the full frame REPLACES the decimated one, so only the growth is new
     {
         size_t have = d->px().size() * sizeof(float);
@@ -519,6 +519,11 @@ static void pumpRemoteFetch() {
                 // whose frames disagreed about CFA would demosaic frame 1 and
                 // not frame 2 (openRemote makes the same call from the wire)
                 doc->cfa = rp::rawInterpCfa(d.recipe.interp);
+                // ...and the PHASE the head was demosaiced in. It rides in the
+                // recipe's flags, so a sibling cannot come back in another one:
+                // a stack whose frames disagreed about RGGB vs BGGR would show
+                // two colours for one folder as the user stepped it.
+                doc->cfaPattern = rp::rawWireCfaPattern(d.recipe.flags);
             }
             S.dtype = d.dtype;
             S.w = d.w; S.h = d.h; S.ch = d.ch;

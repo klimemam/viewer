@@ -1106,11 +1106,14 @@ static void parseCli(int argc, char** argv) {
             // revisit key for this row, now met.
             if (!special && isUrl && !rawReady && !rawSizeGiven &&
                 imagefile::isHeaderless(a) && isPeerUrl(a)) {
-                fprintf(stderr, "%s: a headerless file carries no header to state its "
-                        "shape, and this command line stated none\n"
+                // The lead-in comes from imagefile (one spelling for all three
+                // roads); only the WAY OUT is this one's, and for a command
+                // line the way out is a flag.
+                fprintf(stderr, "%s: %s\n"
                         "  state the geometry with --raw-size WxH (and --raw-dtype / "
                         "--raw-interp when it is not u8 gray), or open it from the "
-                        "Browse panel - that door asks\n", a.c_str());
+                        "Browse panel - that door asks\n",
+                        a.c_str(), imagefile::headerlessLead(a).c_str());
             } else if (!special && (rawReady || rawSizeGiven) && isUrl) {
                 // A headerless file on a PEER, declared on the command line.
                 // The same six numbers the local branch below would decode

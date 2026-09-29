@@ -3677,7 +3677,16 @@ static std::string loadSession(const std::string& path,
                 // fails, so a saved remote raw doc could not come back).
                 // 9 wrote this dispatch down and stage 4 shipped without it.
                 // M2 holds either way: the session wins, no dialog, no binding.
-                if (isPeerUrl(d.path)) {
+                //
+                // hasUrlScheme, NOT isPeerUrl (review #7): a local:// raw doc
+                // is a url too - the peer that served it ran on this machine -
+                // and decodeRawFrame cannot open a path spelled "local://..."
+                // any more than one spelled "ssh://...", so that line came
+                // back as "cannot open" for every session that held one.
+                // openRemote's own #111 block decides which reader a local://
+                // url belongs to; this door's job is only to stop handing a url
+                // to the local decoder.
+                if (hasUrlScheme(d.path)) {
                     const rp::RawWire rw = rawWireFrom(d);
                     if (openRemote(d.path, false, 0, NR_NATIVE, &rw)) {
                         // the crop the line recorded is re-applied to what came
