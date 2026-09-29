@@ -89,19 +89,62 @@ peer_glibc() {                   # $1 = an ELF binary; prints e.g. GLIBC_2.29
     | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
 }
 
+# This host's libc in one line, or an honest shrug. `ldd --version 2>&1` was
+# read straight into the sentence before, so a host with no ldd at all (musl,
+# a stripped container) said "...but this host has sh: ldd: not found" - the
+# 2>&1 makes the shell's complaint LOOK like an answer, so the emptiness test
+# guarding it could never fire. Ask whether the tool exists instead.
+host_libc() {
+  command -v ldd >/dev/null 2>&1 || { echo "an unknown libc (no ldd on this host)"; return 0; }
+  v=$(ldd --version 2>&1 | sed -n '/./{p;q;}')
+  [ -n "$v" ] || v="an unknown libc (ldd said nothing)"
+  echo "$v"
+}
+
+# WHY the peer does not start - and the diagnosis is chosen from WHAT HAPPENED,
+# never assumed.
+#
+# This function used to reach for peer_glibc the moment `--version` failed, so
+# every other way a file fails to execute was reported as a glibc mismatch: a
+# $HOME mounted noexec, mode 644 after a copy that dropped the bit, an x86_64
+# build on an aarch64 box (Exec format error), a download that stopped halfway.
+# All four printed "needs GLIBC_2.17 but this host has 2.35" - a sentence that
+# is FALSE about a host whose glibc is newer than required - and the loader's
+# own words, the only thing in the room that knew, were thrown away. docs call
+# this line the machine's answer and tell the user to report it, so a wrong one
+# does not merely confuse: it redirects the next bug report.
+#
+# So: capture the failure text first, print it always, and add the glibc
+# sentence only when the text is actually about glibc. Same gate as the viewer's
+# own probe (core/app/open_dispatch.inc, peerProbeScript), for the reason both
+# quote the same peer_glibc expression - two diagnoses of one failure must not
+# disagree.
 peer_starts() {                  # $1 = path to a peer, $2 = what to call it
   [ "$DIR" = linux-x64 ] || return 0        # a glibc question; macOS has none
-  [ -x "$1" ] || return 0
-  if "$1" --version >/dev/null 2>&1; then return 0; fi
-  need=$(peer_glibc "$1")
-  have=$(ldd --version 2>&1 | head -1)
-  [ -n "$have" ] || have="an unknown libc (no ldd on this host)"
-  if [ -n "$need" ]; then
-    echo "$2 needs $need but this host has $have" >&2
+  # -e, not -x: a peer that is PRESENT and not executable is exactly one of the
+  # failures this is here to name (the viewer cannot start it either), and the
+  # old -x test returned silently OK on it.
+  [ -e "$1" ] || return 0                   # nothing to start is not a failed start
+  if why=$("$1" --version 2>&1); then return 0; fi
+  why=$(printf '%s\n' "$why" | sed -n '/./{s/^[[:space:]]*//;p;q;}')
+  [ -n "$why" ] || why='(it printed nothing)'
+  # The published tree has ONE Linux build and it is x86_64; the `case` above
+  # sends every non-Darwin uname to linux-x64, aarch64 included. That fallback
+  # stays (a new port would otherwise need two edits) but the DIAGNOSIS stops
+  # lying here: on the wrong machine the glibc number is irrelevant.
+  arch=$(uname -m 2>/dev/null) || arch=''
+  if [ -n "$arch" ] && [ "$arch" != x86_64 ] && [ "$arch" != amd64 ]; then
+    echo "$2: this build is for x86_64, this host is $arch" >&2
   else
-    echo "$2 does not start on this host ($have):" >&2
-    "$1" --version 2>&1 | sed 's/^/  /' >&2
+    case "$why" in
+      *GLIBC_*)
+        need=$(peer_glibc "$1")
+        echo "$2 needs ${need:-a newer glibc} but this host has $(host_libc)" >&2 ;;
+      *)
+        echo "$2 does not start on this host" >&2 ;;
+    esac
   fi
+  echo "  $why" >&2
   echo "  the files ARE updated; this build cannot run here. Report that line." >&2
 }
 

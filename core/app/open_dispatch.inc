@@ -266,17 +266,43 @@ static std::string updateScript() { return bootstrapScript(false); }
 // and sort's stderr is dropped so a macOS peer (no Mach-O GLIBC_ strings, no
 // sort -V) says nothing instead of something confusing.
 //
+// THE DIAGNOSIS IS CHOSEN FROM WHAT HAPPENED, never assumed. The glibc
+// sentence used to be printed whenever the binary contained a GLIBC_ string at
+// all - which every build does - so a $HOME mounted noexec, a mode-644 copy, an
+// x86_64 peer on an aarch64 box (Exec format error) and a half-finished
+// download all reported "needs GLIBC_2.17 but this host has 2.35": a statement
+// that is FALSE about a host whose glibc is newer than required. docs/guides
+// call this line the machine's answer and tell the user to report it, so a
+// wrong one redirects the next bug report instead of merely confusing.
+//
+// The failure text is therefore CAPTURED and echoed first (it is the only thing
+// in the room that knows), and the glibc sentence is added only when that text
+// is about glibc. tools/binaries/update.sh's peer_starts has the same gate and
+// quotes the same expression, for the reason both exist: two diagnoses of one
+// failure must not disagree.
+//
 // `orElse` is what the caller wants printed when the peer is not there at all
 // - the marker the NO_PEER / "does not run" branches below read.
 static std::string peerProbeScript(const std::string& orElse) {
     return
         "p=\"$HOME/.viewer/viewer-serve\"\n"
-        "if \"$p\" --version 2>&1; then :; else\n"
-        "  need=$({ LC_ALL=C grep -ao 'GLIBC_[0-9.]*' \"$p\" 2>/dev/null"
+        "if why=$(\"$p\" --version 2>&1); then\n"
+        "  echo \"$why\"\n"
+        "else\n"
+        "  echo \"$why\"\n"
+        "  case \"$why\" in *GLIBC_*)\n"
+        "    need=$({ LC_ALL=C grep -ao 'GLIBC_[0-9.]*' \"$p\" 2>/dev/null"
         " || strings -a \"$p\" 2>/dev/null; }"
         " | grep -o 'GLIBC_[0-9.]*' | sort -Vu 2>/dev/null | tail -1)\n"
-        "  [ -n \"$need\" ] && echo \"viewer-serve needs $need but this host has "
-        "$(ldd --version 2>&1 | head -1)\"\n"
+        // `ldd --version 2>&1` read straight into the sentence made a host with
+        // no ldd say "...but this host has sh: ldd: not found" - the redirect
+        // turns the shell's complaint into something that LOOKS like an answer,
+        // so the emptiness test could never fire. Ask if the tool exists.
+        "    if command -v ldd >/dev/null 2>&1; then have=$(ldd --version 2>&1 | head -1);"
+        " else have=''; fi\n"
+        "    [ -n \"$have\" ] || have='an unknown libc (no ldd on this host)'\n"
+        "    [ -n \"$need\" ] && echo \"viewer-serve needs $need but this host has $have\"\n"
+        "  ;; esac\n"
         "  " + (orElse.empty() ? std::string(":") : orElse) + "\n"
         "fi\n";
 }
