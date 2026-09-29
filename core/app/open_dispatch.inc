@@ -2044,18 +2044,25 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     FrameSource urlStat;
     urlStat.remoteUrl = url;
     statLocalUrl(urlStat);
+    // Board 305: WHICH of these phases is the 344 ms. Every one of them is on
+    // this thread, and every one is a candidate for moving off it - which is why
+    // the marks are here and not inside a profiler. `VIEWER_TIME_OPEN=1` only.
+    OpenPhase phase("openRemote");
     std::string err;
     // app.uiSession, never the browse worker's: two threads framing requests
     // into one ssh stdin desynchronise the stream permanently, and the worker's
     // stop() would free the pipe under this thread's blocking read.
     if (!ensureUiSession(host, err, port)) { toast("remote: " + err, true); return false; }
+    phase.lap("ensureUiSession");
     // The DECLARED reading (§3.3), and it goes to META as well as to TILE: a
     // reading changes the geometry, so asking META natively and re-deriving
     // w/h/ch/frames here would put the layout rule on both sides of the link
     // with nothing checking they agree - which is what #71 cost a release.
     // Session::meta refuses a declaration a v8 peer cannot serve BEFORE sending.
     remote::Meta m;
+    const uint64_t rxBefore = app.uiSession.bytesReceived();
     if (!app.uiSession.meta(rpath, m, err, npyRead, rw, kd)) { toast("remote: " + err, true); return false; }
+    phase.lap("META round trip");
     // The peer fell back to native because the declaration does not fit this
     // shape - a session line against a file whose rank changed under it. The
     // local decoder's answer is a note and nothing else: the DECLARATION is
@@ -2081,6 +2088,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         toast("remote: " + err, true);
         return false;
     }
+    phase.lap("TILE + to float");
     if (tw < 1 || th < 1 || tch < 1 || tch > 4) {   // a 0ch doc would crash later
         toast("remote: peer returned a degenerate frame", true);
         return false;
@@ -2215,7 +2223,9 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         std::string leaf = s2 == std::string::npos ? dir : dir.substr(s2 + 1);
         doc->batchId = batchReuse(leaf.empty() ? host : leaf, host + ":" + dir);
     }
+    phase.lap("build the document");
     computeMinMax(*doc);
+    phase.lap("computeMinMax");
     // §6.2: a full-resolution open (step == 1) of an already-resident url+frame
     // shares that source. A PREVIEW never registers OR adopts, whatever its
     // step - it is a throwaway the next Browse click replaces, so it must not
@@ -2234,6 +2244,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
     app.imagesRev++;
     selectImage((int)app.images.size() - 1);
     app.fitRequested = true;
+    phase.lap("register + select");
     if (asPreview) {
         app.previewUid = app.images.back()->uid;
         // A frame axis makes the file previewable as a sequence too: the same
@@ -2320,6 +2331,16 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
                                  (member.empty() ? std::string() : ":" + member);
         toast(host.empty() ? "opened " + what : "opened " + what + " from " + host);
     }
+    phase.lap("stack + toast");
+    // What the two round trips above were FOR, so their milliseconds can be read
+    // as a rate rather than as a mystery. Printed after the last lap and before
+    // the phase lines (the destructor writes those), so this write is inside no
+    // measured region - see OpenPhase on why that matters here.
+    if (timeOpenPhases())
+        fprintf(stderr, "time:   [tile %dx%d %dch step %d = %.2f MB of pixels, "
+                        "%.2f MB received]\n",
+                tw, th, tch, step, (double)tw * th * tch * 4 / (1 << 20),
+                (double)(app.uiSession.bytesReceived() - rxBefore) / (1 << 20));
     return true;
 }
 

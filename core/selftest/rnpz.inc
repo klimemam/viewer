@@ -2235,6 +2235,251 @@
             closeAll();
         }
 
+        // ---- the fixture the last two sections share ---------------------------
+        // ONE WIDE frame, 2000 px across. openRemote's first view is decimated
+        // (step = ceil(max(w,h)/1600) = 2), so this file arrives as a preview and
+        // the full resolution is swapped in later by pumpRemoteFetch - which is
+        // the only shape either section below has anything to say about.
+        //
+        // The pixels are chosen so that the preview CANNOT know the answer. The
+        // peer's decimation samples x0, x0+step, ... (core/serve.cpp), so with
+        // step 2 it reads only EVEN columns; the extremes therefore sit on odd
+        // columns and odd rows, and the three non-finite samples sit among them.
+        // A test whose preview and full frame measured the same two numbers
+        // would pass without the swap having re-measured anything.
+        const int wideW = 2000, wideH = 8;
+        const float wideMax = 1000.0f, wideMin = -5.0f;
+        const std::string wide = root + "/wide.npy";
+        {
+            std::vector<float> px((size_t)wideW * wideH);
+            for (int y = 0; y < wideH; y++)
+                for (int x = 0; x < wideW; x++)
+                    px[(size_t)y * wideW + x] = (float)((x * 7 + y) % 251);
+            const float inf = std::numeric_limits<float>::infinity();
+            px[(size_t)0 * wideW + 3] = std::numeric_limits<float>::quiet_NaN();
+            px[(size_t)1 * wideW + 5] = inf;       // skipped: not finite
+            px[(size_t)2 * wideW + 7] = -inf;      // ...and so is this one
+            px[(size_t)3 * wideW + 1001] = wideMax;   // odd row, odd column
+            px[(size_t)5 * wideW + 1003] = wideMin;
+            npyWriteFile(wide, "<f4", { wideH, wideW }, px.data(), px.size() * sizeof(float));
+        }
+        // The one thing no test in this tree did: RE-MEASURE min/max from the
+        // pixels and compare the answer with the product's. Deliberately its own
+        // loop and not a call to the kernel - a reference that went through
+        // minMaxOf would move with it and could never go red (kernel inventory
+        // §4 P22: "there is not one test in the whole tree that recomputes
+        // min/max from the pixels and compares it with the product").
+        auto refMinMax = [](const std::vector<float>& px, float& lo, float& hi) {
+            double mn = 0, mx = 0;
+            bool any = false;
+            for (float v : px) {
+                if (!std::isfinite(v)) continue;
+                if (!any) { mn = mx = v; any = true; }
+                else { if (v < mn) mn = v; if (v > mx) mx = v; }
+            }
+            if (!any) { lo = 0; hi = 1; return; }
+            lo = (float)mn;
+            hi = (float)mx;
+            if (lo == hi) hi = lo + 1;
+        };
+
+        // ---- R28: min/max over the link is ONE kernel (board 299) --------------
+        // rfWorker measured the full-resolution frame with a COPY of
+        // computeMinMax's loop and its two degenerate guards - the only silent
+        // duplicate the kernel inventory found (§3 K10 #1/#2, §4 P22). It is one
+        // function now (minMaxOf), and this is what holds it there: the numbers
+        // the worker wrote onto the source are compared against an independent
+        // re-measurement AND against what the UI thread's own entry point says
+        // about the same pixels. Mutate minMaxOf and the second and third of
+        // those move together while the first does not - which is the
+        // calibration, and the reason the reference above is hand-written.
+        {
+            closeAll();
+            const bool opened = openRemote(urlOf(wide), false, 0);
+            const int stepAtOpen = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+            const float pvMin = app.images.empty() ? 0 : app.images[0]->src->vmin;
+            const float pvMax = app.images.empty() ? 0 : app.images[0]->src->vmax;
+            drainRemote(120.0);
+            ImageDoc* d = cur();
+            check(opened && stepAtOpen > 1 && d && d->src->remoteStep == 1 &&
+                      d->w == wideW && d->h == wideH,
+                  "R28a (setup) a wide remote frame arrives decimated and the full "
+                  "resolution lands");
+            float lo = 0, hi = 0;
+            if (d) refMinMax(d->src->data, lo, hi);
+            const float gotMin = d ? d->src->vmin : 0, gotMax = d ? d->src->vmax : 0;
+            fprintf(stderr, "rnpzselftest:   R28 preview %.7g..%.7g -> full %.7g..%.7g "
+                            "(recomputed %.7g..%.7g)\n",
+                    (double)pvMin, (double)pvMax, (double)gotMin, (double)gotMax,
+                    (double)lo, (double)hi);
+            check(d && gotMin == lo && gotMax == hi,
+                  "R28b the range the fetch worker wrote is the range the pixels have");
+            check(d && gotMax == wideMax && gotMin == wideMin,
+                  "R28c ...including the extremes only an odd column holds, and the "
+                  "three non-finite samples are not values");
+            // The UI thread's own entry point, over the pixels that are now
+            // resident: the same two floats, bit for bit, or the two halves of
+            // K10 have drifted - which is the whole of P22.
+            bool same = false;
+            if (d) {
+                computeMinMax(*d);
+                same = d->src->vmin == gotMin && d->src->vmax == gotMax &&
+                       d->vmin == gotMin && d->vmax == gotMax;
+            }
+            check(same,
+                  "R28d ...and computeMinMax on the same pixels answers the same two "
+                  "floats: one kernel, two threads");
+            // ...and the preview really did not know. If these agreed, R28b
+            // would be green with the swap never having measured anything.
+            check(d && pvMax != gotMax,
+                  "R28e the preview's census could not have produced this answer "
+                  "(anti-vacuity)");
+            // The degenerate guards, over the LINK rather than in a unit test:
+            // an array with no finite sample at all reads 0..1, and a flat one is
+            // widened by one so that black < white. They were written twice; a
+            // copy that dropped either would show up here and nowhere else.
+            const std::string allNan = root + "/allnan.npy";
+            const std::string flatf = root + "/flat.npy";
+            {
+                std::vector<float> nn((size_t)wideW * wideH,
+                                      std::numeric_limits<float>::quiet_NaN());
+                npyWriteFile(allNan, "<f4", { wideH, wideW }, nn.data(),
+                             nn.size() * sizeof(float));
+                std::vector<float> ff((size_t)wideW * wideH, 4.25f);
+                npyWriteFile(flatf, "<f4", { wideH, wideW }, ff.data(),
+                             ff.size() * sizeof(float));
+            }
+            // The numbers are copied OUT before the next closeAll: `cur()` is a
+            // borrowed pointer into app.images and closeAll frees it, so reading
+            // it again to print the comparison would be reading freed memory -
+            // and a use-after-free in the reporting half of a test is still a
+            // use-after-free.
+            //
+            // AND THE PREVIEW'S ANSWER IS POISONED FIRST (review P3-8). These two
+            // fixtures are uniform, so the decimated preview's own computeMinMax
+            // already writes exactly the numbers the rule demands - 0..1 for an
+            // all-NaN array, 4.25..5.25 for a flat one - and a landing that
+            // measured nothing at all would leave them in place and pass. Writing
+            // an impossible range over them before the swap means what is read
+            // back can only have come from the landing.
+            auto landed = [&](const std::string& url, float& lo, float& hi) {
+                closeAll();
+                const bool o = openRemote(url, false, 0);
+                if (!o || app.images.empty() || app.images[0]->src->remoteStep <= 1)
+                    return false;
+                app.images[0]->src->vmin = -9999.0f;
+                app.images[0]->src->vmax = 9999.0f;
+                app.images[0]->syncMirrors();
+                drainRemote(60.0);
+                const ImageDoc* d2 = cur();
+                if (!d2 || d2->src->remoteStep != 1) return false;
+                lo = d2->src->vmin;
+                hi = d2->src->vmax;
+                // ...and the doc's mirror of the source agrees, which is the half
+                // the panels actually read (syncMirrors in the swap path).
+                if (d2->vmin != lo || d2->vmax != hi) return false;
+                return true;
+            };
+            float nLo = 0, nHi = 0, fLo = 0, fHi = 0;
+            const bool nanOk = landed(urlOf(allNan), nLo, nHi) &&
+                               nLo == 0.0f && nHi == 1.0f;
+            const bool flatOk = landed(urlOf(flatf), fLo, fHi) &&
+                                fLo == 4.25f && fHi == 5.25f;
+            fprintf(stderr, "rnpzselftest:   R28 all-NaN %.7g..%.7g  flat %.7g..%.7g\n",
+                    (double)nLo, (double)nHi, (double)fLo, (double)fHi);
+            check(nanOk && flatOk,
+                  "R28f the LANDING writes the two degenerate guards, over a range "
+                  "no measurement could have produced (no finite sample -> 0..1, "
+                  "flat -> widened by one)");
+            closeAll();
+        }
+
+        // ---- R29: a saved crop on a remote preview lands with the full frame ---
+        // Board 172. cropInPlace refuses a decimated source BY NAME (39b6c0b):
+        // the full-resolution landing replaces data/w/h wholesale and knows
+        // nothing of crop bookkeeping, so a crop measured against the decimated
+        // grid would be reverted by the swap and leave srcW stamped with PREVIEW
+        // dimensions - a phantom crop (isCropped forever true) and an
+        // unshareable source. A restore therefore cannot apply the crop when it
+        // reads the line; it parks it (parkRestoreWait) and pumpRestoreWaits
+        // applies it in the same frame the swap happens.
+        //
+        // browse.inc's restore-wait block asserts the DIMENSIONS that come back.
+        // What it does not assert is the phantom crop itself - and that is the
+        // damage the refusal exists to prevent, because it is the part that
+        // SURVIVES. A future "just apply it on the preview" is caught by the
+        // dimensions too (the swap replaces data/w/h wholesale, so R29b's 400x4
+        // would come back as the full 2000x8 and go red); what it leaves behind
+        // after that revert is srcW/srcH stamped with PREVIEW dimensions, and no
+        // later crop or uncrop can undo it - isCropped is true forever and the
+        // source can never be shared. R29c is the only line that sees it.
+        // So: srcW/srcH are the FULL source, and the crop rect is
+        // source-relative full-resolution coordinates end to end.
+        {
+            std::error_code sec;
+            const std::string sess = root + "/crop-restore.vsession";
+            closeAll();
+            const bool opened = openRemote(urlOf(wide), false, 0);
+            // A MANUAL crop while the preview is up is refused, and that refusal
+            // is why there is no "which crop wins" rule to write: the user
+            // cannot get a manual crop in before the landing, so the parked one
+            // is never in competition with anything.
+            const bool refusedOnPreview = !app.images.empty() &&
+                                          !cropInPlace(*app.images[0], 10, 1, 40, 2);
+            const bool srcWClean = !app.images.empty() && app.images[0]->src->srcW == 0;
+            drainRemote(120.0);
+            ImageDoc* d = cur();
+            const bool cropped = d && cropInPlace(*d, 100, 2, 400, 4);
+            saveSession(sess, true);
+            closeAll();
+            const std::string lerr = loadSession(sess);
+            // The moment the crop line is read: the doc is the preview again, so
+            // the restore has to park rather than apply. Asserted, because a
+            // fixture that arrived at full resolution would make everything
+            // below green while proving nothing.
+            const int stepAtRestore = app.images.empty() ? 1 : app.images[0]->src->remoteStep;
+            const bool parked = !app.restoreWait.empty();
+            {   // the drain a frame loop does, in its order: the swap lands and
+                // the parked line is acted on in the SAME frame (core/main.cpp).
+                double t = nowSec();
+                while (nowSec() - t < 120.0) {
+                    pumpRemoteFetch();
+                    pumpRestoreWaits();
+                    pumpSequenceAndQueue();
+                    if (app.rfPending == 0 && app.restoreWait.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                pumpRemoteFetch();
+                pumpRestoreWaits();
+            }
+            ImageDoc* r = cur();
+            fprintf(stderr, "rnpzselftest:   R29 opened=%d refusedOnPreview=%d step %d at "
+                            "restore, parked=%d, err=\"%s\" -> %dx%d at (%d,%d) of "
+                            "%dx%d\n",
+                    opened ? 1 : 0, refusedOnPreview ? 1 : 0, stepAtRestore,
+                    parked ? 1 : 0, lerr.c_str(), r ? r->w : -1, r ? r->h : -1,
+                    r ? r->src->cropX : -1, r ? r->src->cropY : -1,
+                    r ? r->src->srcW : -1, r ? r->src->srcH : -1);
+            check(opened && refusedOnPreview && srcWClean && cropped && stepAtRestore > 1 &&
+                      parked,
+                  "R29a (setup) a crop is refused on the preview and leaves no trace, "
+                  "and the restore parks the saved one");
+            check(lerr.empty() && r && r->w == 400 && r->h == 4 &&
+                      r->src->cropX == 100 && r->src->cropY == 2,
+                  "R29b the saved rect is put back in full-resolution source "
+                  "coordinates once the frame lands");
+            check(r && r->src->srcW == wideW && r->src->srcH == wideH,
+                  "R29c ...and srcW/srcH are the FULL source, not the preview's: no "
+                  "phantom crop");
+            // The whole point of srcW being right: a crop that recorded preview
+            // dimensions is a source that can never be shared or uncropped.
+            check(r && isCropped(*r) && r->src->srcW > r->w,
+                  "R29d ...so the doc is cropped in the one way the rest of the "
+                  "program can read");
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sess), sec);
+        }
+
         setEnv("VIEWER_SERVE_CACHE", "");
         closeAll();
         app.uiSession.stop();
