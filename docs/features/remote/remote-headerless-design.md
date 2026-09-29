@@ -749,7 +749,7 @@ client 側事前拒否 (§7.3 の文)。
 | Browse の行のダブルクリック | **入っていた** (`openRemoteRawRow`、行の `Entry::size`) | 同じ。共有関数 `openRemoteRawDeclared` に寄せただけ |
 | Browse の複数選択 Enter | 入っていた (`rbOpenItemRow` 経由なので同じ扉) | 同じ |
 | **url を名指しで開く** (File ▸ Open / D&D / デスクトップショートカット / CLI の positional) | **抜けていた。** `openRemote(path)` を `rw == nullptr` で呼び、§4.4 第1段の拒否が出た | `openRemote` の門でヘッダ無しを `openRemoteRawDeclared(url, 0)` に回す。サイズは **LIST 1回** (§5.2、新 wire 無し) |
-| **リモートのフォルダを stack** (グループ行 / フォルダ scan の連鎖 open) | **抜けていた。** `openRemote(files[0])` が `nullptr`。先頭が断られ、メンバーも 1本ずつ断られた | `openRemoteStack` がヘッダ無しを見たら、フォルダの LIST 1回でサイズを検算し、**Open につき 1回**レシピを訊く (`g_remoteRawStack` に park、ダイアログの Load で resume) |
+| **リモートのフォルダを stack** (グループ行 / フォルダ scan の連鎖 open) | **抜けていた。** `openRemote(files[0])` が `nullptr`。先頭が断られ、メンバーも 1本ずつ断られた | `openRemoteStack` がヘッダ無しを見たら、フォルダの LIST 1回でサイズを検算し、**Open につき 1回**レシピを訊く (`App::remoteRawStack` に park、ダイアログの Load で resume。`pumpRemoteOpenQueue` はそのスロットが生きている間 queue を止める —— 止めないと次の Open がダイアログを上から立てて park した Open を孤児にする) |
 | **stack のメンバー取得** (`RFetchJob`) | **抜けていた。** ジョブにレシピの欄が無く、§6.3 が予告した `rfInheritRecipe` が存在しなかった | `RFetchJob::hasRecipe/recipe` + `rfInheritRecipe`。着地した doc の `FrameSource` にもレシピを書く (identity と M1) |
 | **全解像度の follow-up** (`requestFullRemote`) | **抜けていた。** §6.3 が「FrameSource の raw 欄から再構成」と書いた所が空。1600px を超える raw は 1/N の preview のまま固まった | `rawWireOfSource` で再構成して積む |
 | **Reload** (`ReloadJob` の remote 枝) | **抜けていた。** リモート raw doc の Reload は毎回 peer に断られた | `ReloadSpec` は raw 欄を既に持っていたので、META/TILE に渡すだけ。fresh な doc にも raw 欄を書く (landing が identity を引き直す) |
