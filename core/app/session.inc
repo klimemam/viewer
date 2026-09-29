@@ -3669,8 +3669,36 @@ static std::string loadSession(const std::string& path,
                 d.littleEndian = le != 0;
                 d.path = restOfLine(ls);
                 lineFile = d.path;
-                err = loadRaw(d);
-                if (err.empty()) cur()->cfaColorize = col != 0;
+                // A headerless frame that lived on a PEER. The line already
+                // holds every field of the recipe - that is what raw3 IS - so
+                // the restore has a declaration and never needs to ask; what it
+                // needed was a door, and it was calling the LOCAL decoder on a
+                // url (decodeRawFrame opens a file named "ssh://...", which
+                // fails, so a saved remote raw doc could not come back).
+                // 9 wrote this dispatch down and stage 4 shipped without it.
+                // M2 holds either way: the session wins, no dialog, no binding.
+                if (isPeerUrl(d.path)) {
+                    const rp::RawWire rw = rawWireFrom(d);
+                    if (openRemote(d.path, false, 0, NR_NATIVE, &rw)) {
+                        // the crop the line recorded is re-applied to what came
+                        // back, because the wire carries none (3.2) - and it is
+                        // applied the way the npy3 branch below applies its own:
+                        // cropInPlace REFUSES while the source is a decimated
+                        // preview, and G10 (PR #177) is the record of what
+                        // ignoring that `false` cost. Same situation, same
+                        // answer, no second mechanism.
+                        if (d.cropOn && cur() &&
+                            !cropInPlace(*cur(), d.cropX, d.cropY, d.cropW, d.cropH)) {
+                            parkRestoreWait(*cur(), d.cropX, d.cropY, d.cropW, d.cropH);
+                            rep.note(LK_CropDeferred, cur()->name);
+                        }
+                    } else {
+                        err = "cannot reopen " + d.path;
+                    }
+                } else {
+                    err = loadRaw(d);
+                }
+                if (err.empty() && cur()) cur()->cfaColorize = col != 0;
             } else if (kind == "npy2" || kind == "npy3") {
                 int cfa = 0, pat = 0, col = 0, ccx = 0, ccy = 0, ccw = 0, cch = 0;
                 ls >> cfa >> pat >> col;

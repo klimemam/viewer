@@ -205,6 +205,12 @@ struct RawDialog {
     bool open = false;
     bool forQueue = false;            // settings will be applied to every queued stack
     int queueCount = 0;               // stacks waiting on these settings (for the prompt)
+    // ...and the same thing for a folder on a PEER, which has its own parked
+    // Open (g_remoteRawStack in open_dispatch.inc). A separate flag rather than
+    // reuse of forQueue, because forQueue's Load and Cancel both reach into
+    // app.seqQueue - a remote folder is not in that queue, and sharing the flag
+    // would make one Open's Cancel drop the other's stacks.
+    bool forRemoteStack = false;
     std::string path;
     size_t fileSize = 0;
     int w = 1920, h = 1080, offset = 0;
@@ -280,12 +286,14 @@ static std::string rawRecipeNote(const RawDialog& d, int cfa, int cfaPattern) {
 // therefore applies to what came back, not to what was fetched.
 static rp::RawWire rawWireFrom(const RawDialog& d) {
     rp::RawWire w{};
-    w.dtype = (uint32_t)std::clamp(d.dtype, 0, RD_COUNT - 1);
-    w.interp = (uint32_t)std::clamp(d.interp, 0, RI_COUNT - 1);
-    w.w = (uint32_t)std::max(1, d.w);
-    w.h = (uint32_t)std::max(1, d.h);
-    w.offset = (uint32_t)std::max(0, d.offset);
-    w.flags = d.littleEndian ? rp::RW_LITTLE_ENDIAN : 0u;
+    // rawWireOf (core/app/state.h) and not a second assignment of the same six
+    // fields: a follow-up request rebuilds the recipe from a FrameSource
+    // through that function, and two spellings of one struct are two places to
+    // forget the endian flag. The clamps stay here because only a DIALOG can
+    // hold an out-of-range index - a source was written from a wire that was
+    // already checked.
+    rawWireOf(std::clamp(d.dtype, 0, RD_COUNT - 1), std::clamp(d.interp, 0, RI_COUNT - 1),
+              d.w, d.h, d.offset, d.littleEndian, w);
     return w;
 }
 
