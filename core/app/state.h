@@ -1416,11 +1416,11 @@ struct App {
         char planeName[8] = "";
     } highlight;
     // What the PAINTING loop counted, per document uid. renderDocRGBA is the
-    // ONLY writer: the histogram bins are a different POPULATION (sampled to
-    // ~1M px, and limited to the ROI when a ROI drives the panel) while the
-    // paint sees every pixel of the frame, so deriving the count from the bins
-    // would put two numbers with different denominators behind one sentence.
-    // The panel and the canvas badge only READ this.
+    // ONLY writer of the numbers: the histogram bins are a different POPULATION
+    // (sampled to ~1M px, and limited to the ROI when a ROI drives the panel)
+    // while the paint sees every pixel of the frame, so deriving the count from
+    // the bins would put two numbers with different denominators behind one
+    // sentence. The panel and the canvas badge only READ this.
     struct HlCount {
         bool painted = false;         // this document could answer at all
         std::string why;              // ...and when it could not, why, in words
@@ -1430,6 +1430,22 @@ struct App {
         size_t hit[4] = {}, fin[4] = {};   // matched / finite, per plane
     };
     std::map<uint64_t, HlCount> hlCount;
+    // WHICH DRAW PASS PUT EACH DOCUMENT'S PIXELS IN FRONT OF THE USER (drawPass
+    // below; 0 / absent = never yet). hlCount says what the paint MEASURED;
+    // this says whether that measurement is still a statement about the screen.
+    // Without it hlCount is a record of "the last paint of each uid" that the
+    // footer and the badge read as "what is on screen now", and those are the
+    // same thing only until the set of drawn panes changes - 板 275, three
+    // defects, one cause.
+    //
+    // A SEPARATE MAP, not a field of HlCount, and that is structural rather than
+    // tidy: histHlPaint assigns a whole fresh HlCount, so a field inside it was
+    // reset to 0 by every paint - which made "nothing calls renderDocRGBA
+    // between drawCanvas and drawPanelHistogram" an invariant that nothing
+    // enforced and no test could see. Split in two, the paint cannot reach the
+    // stamp at all. One writer each: histHlPaint writes the numbers,
+    // histHlShown writes the pass.
+    std::map<uint64_t, uint64_t> hlShown;
 
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
     struct SeqInfo {
@@ -3111,6 +3127,29 @@ struct App {
     // the first frame is 1, so a panel that has never been drawn (drawnFrame 0)
     // is never mistaken for one that was drawn in frame 0.
     uint64_t uiFrame = 0;
+    // One increment per RENDER PASS of the window - which is NOT one per
+    // uiFrame. uiFrame is bumped by the main loop, but the GLFW window
+    // refresh / size / pos callbacks call redrawNow() -> g_drawFrame() while
+    // the OS holds the thread in a modal resize loop, so a single uiFrame can
+    // contain several complete draws. Anything whose question is "did this
+    // happen in the pass being drawn right now" has to count passes: with
+    // uiFrame, a resize made the value highlight's stamps stale INSIDE one
+    // frame and the footer went quiet over visible paint. Bumped once at the
+    // head of g_drawFrame (core/main.cpp), so the first pass is 1 and a stamp
+    // of 0 is "never drawn" and can never match.
+    uint64_t drawPass = 0;
+    // A "make this document current" request filed DURING a frame, applied at
+    // the end of it (core/main.cpp, beside window_frame::endFrame). -1 = none.
+    //
+    // WHY IT IS DEFERRED: the canvas scrub bar is drawn after the canvas badge,
+    // so calling selectImage() from it changed cur() halfway through the frame
+    // and the badge and the histogram footer then described DIFFERENT documents
+    // in one picture - during frame stepping, which is this feature's flagship
+    // gesture (#68 §9, T12). The invariant is "within one frame there is exactly
+    // one current document". The one-frame lag this costs a drag is invisible at
+    // 60 fps; moving the scrub bar ahead of the canvas is not an option, because
+    // its rectangle is only known once the canvas has been laid out.
+    int pendingSelect = -1;
     bool lowBandwidth = false;        // remote/ssh: draw the minimum, not a tail
     bool showFps = false;
     bool fitOnSwitch = false;         // view (zoom/pan) is shared; switching keeps it
