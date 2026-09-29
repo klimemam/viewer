@@ -466,6 +466,7 @@ std::string peerRefusal(const std::string& path, RefusedBy by) {
     // fall-through, which is the whole reason this branch exists - and it names
     // a limit of the REQUEST rather than making a claim about the file, which
     // is the rule G9 (PR #176) settled.
+    //
     // THE SENTENCE THIS BRANCH USED TO CARRY WAS STAGE 1's, and stage 1 ended
     // on 2026-08-13: "this link cannot yet carry that declaration ... update
     // both ends when a recipe-carrying build ships". Protocol 11 shipped that
@@ -474,8 +475,9 @@ std::string peerRefusal(const std::string& path, RefusedBy by) {
     // (2026-09-29). A refusal that describes a limit the build does not have is
     // verify-matrix G11's defect turned inside out: it sends the reader to
     // update something already new enough, and it hides what IS missing.
-    // remote-headerless-design.md 4.4 wrote both sentences in advance and said
-    // the first would be replaced by the second; this is that replacement.
+    // docs/features/remote/remote-headerless-design.md 4.4 wrote both sentences
+    // in advance and said the first would be replaced by the second; this is
+    // that replacement.
     //
     // What is missing is never the build and never the file: it is A RECIPE IN
     // THIS REQUEST. Who can act on that differs, which is the whole of why
