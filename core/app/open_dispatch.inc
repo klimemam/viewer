@@ -3076,8 +3076,8 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
             return openRemoteNpz(url, member);
         }
         // A HEADERLESS name on a peer, with no recipe in hand. It is not a
-        // refusal - it is a question, and this is where it gets asked (issue
-        // the user's report of 2026-09-29, PR #278). The Browse row has asked it
+        // refusal - it is a question, and this is where it gets asked (the
+        // user's report of 2026-09-29, PR #278). The Browse row has asked it
         // since #188; every other door - a url on the command line, a drop,
         // File > Open, a session line with no geometry - came here instead and
         // got a sentence blaming the wire. ONE place, not one per call site,
