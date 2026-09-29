@@ -625,6 +625,11 @@ static void drawPanelProjection() {
             // sample - and both the bucketing and the decimation below are over
             // the SAMPLES, never over the holes.
             //
+            // The x axis stays the sensor's column number, and the reason is
+            // docs/features/analysis/stats-taxonomy.md §10: five places are
+            // already built on absolute columns and packing each plane into a
+            // dense array of its own breaks all five at once.
+            //
             // Walking every entry instead put one sample in each bucket the
             // moment `stride` came out 1, every other bucket was then a single
             // hole, the run was flushed before it held the two points a
