@@ -64,15 +64,21 @@ enum class RbPollState {
     On,           // counting; the next round is due at polledAt + the interval
 };
 RbPollState rbPollStateNow(const App::BrowseInstance& I, uint64_t uiFrame);
-// Seconds as this feature prints them ("3 s", "12 s", "0.4 s"). Shared with the
-// panel's tooltip so an interval cannot be spelled two ways on one row.
-std::string rbSecsText(double s);
 // ONE sentence for all of it - drawn on the status line, asserted by
 // --browse-selftest, and built from `browseWatchInterval` rather than from a
 // number typed into a string. `now` is a parameter for rbPollDue's reason: the
-// selftest sets the clock rather than living through three seconds of it. Empty
-// for NotDrawn alone, and see the definition for why that one says nothing.
+// selftest sets the clock rather than living through three seconds of it.
+//
+// EMPTY for Offline / Searching / NotDrawn, and that is the contract and not an
+// oversight: in those three the panel has already returned before the status
+// row exists, so a sentence there would be one no reader can ever reach. See
+// the definition for which return each one is.
 std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t uiFrame);
+// ...and the mark's tooltip, whole. Here and not in the draw call because it
+// quotes two menu labels and two intervals, and a claim that only exists inside
+// an ImGui call is a claim no test can hold (--browse-selftest B9d holds these
+// against menus.inc and against the constants).
+std::string rbPollTipText(const App::BrowseInstance& I, double now, uint64_t uiFrame);
 bool   rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame);
 bool   rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame);
 void   pumpBrowseWatch(double now);            // every instance, once per frame

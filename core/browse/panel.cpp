@@ -891,6 +891,31 @@ static std::string rbElideMiddle(const std::string& s, float maxW) {
     return build(lo);
 }
 
+// ...and the same binary search cutting the TAIL instead of the middle, for the
+// poll mark. Middle-out is right for the status line because both of its ends
+// carry a fact (the machine at the head, the counts at the tail); the mark's
+// facts are all at the head - "auto-refresh: off", "every 3 s" - and what
+// follows is the detail, so narrowing drops the detail and keeps the verdict.
+static std::string rbElideTail(const std::string& s, float maxW) {
+    if (s.empty()) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    if (ImGui::CalcTextSize("...").x > maxW) return std::string();
+    auto onBoundary = [&s](size_t i) {         // never cut a UTF-8 sequence
+        return i == 0 || i >= s.size() || (s[i] & 0xC0) != 0x80;
+    };
+    auto build = [&](size_t keep) {
+        while (keep > 0 && !onBoundary(keep)) keep--;
+        return s.substr(0, keep) + "...";
+    };
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (ImGui::CalcTextSize(build(mid).c_str()).x <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    return build(lo);
+}
+
 void drawPanelRemote(App::BrowseInstance& I) {
     App::RemoteBrowse& B = I.b;
     // watch-design §2, second row: THIS INSTANCE IS BEING DRAWN, and that is the
@@ -1560,6 +1585,16 @@ void drawPanelRemote(App::BrowseInstance& I) {
                       "and its right-click menu runs it.\n\n"
                       "It follows the poll, so it stops while this panel is not\n"
                       "being drawn."
+                    // The second sentence POINTS somewhere, so it is said only
+                    // when that somewhere exists. This menu is drawn on the
+                    // toolbar, which is above the search-results view's own
+                    // return - so during a search the status line the sentence
+                    // named is not on screen at all, and the review caught it
+                    // pointing at a row that was not there.
+                    : I.search.active
+                    ? "Needs File > \"Watch source files on disk\":\n"
+                      "nothing polls this folder while that is off, so there is\n"
+                      "nothing for this to notice."
                     : "Needs File > \"Watch source files on disk\":\n"
                       "nothing polls this folder while that is off, so there is\n"
                       "nothing for this to notice. The status line at the bottom\n"
@@ -2815,7 +2850,12 @@ void drawPanelRemote(App::BrowseInstance& I) {
         // will open a stack nobody asked for is stated NOWHERE ELSE on screen.
         // The count is there because "3 opened" is what makes the claim checkable
         // afterwards; it is left off at zero, like the selection count above.
-        if (I.watchOpenNew && app.watchEnabled) {
+        // `watchPaused` is in the condition for the reason the review found:
+        // without it this clause promised "opening new stacks" on the same row
+        // as a mark saying the poll is stopped, and the poll is what opens
+        // anything. The three terms are rbPollStateNow's first three, which is
+        // what "this panel will open a stack" actually depends on.
+        if (I.watchOpenNew && app.watchEnabled && !app.watchPaused) {
             line += DOT;
             line += "opening new stacks";
             if (I.openNewOpened > 0) {
@@ -2862,7 +2902,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
         // carries the whole of it - the counts are what a glance is for, and
         // this is what a question is for.
         std::string markShown =
-            pollSaid.empty() ? std::string() : rbElideMiddle(pollSaid, avail * 0.55f);
+            pollSaid.empty() ? std::string() : rbElideTail(pollSaid, avail * 0.55f);
         const float markW =
             markShown.empty() ? 0.0f : ImGui::CalcTextSize(markShown.c_str()).x + gap;
         // One row, always - the line elides, it does not wrap (300 px is a width
@@ -2892,38 +2932,12 @@ void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SameLine(0, 0);
             ImGui::SetCursorPosX(lineX0 + avail - markW + gap);
             ImGui::TextDisabled("%s", markShown.c_str());
-            if (ImGui::IsItemHovered()) {
-                // §19's clauses 2 and 3. Every number in here is read off the
-                // constants (browseWatchInterval), so moving one moves this
-                // tooltip with it - the panel must not carry a second opinion
-                // about its own interval.
-                const std::string here = rbSecsText(browseWatchInterval(false));
-                const std::string peer = rbSecsText(browseWatchInterval(true));
-                ImGui::SetTooltip(
-                    "%s\n\n"
-                    "While this panel is being DRAWN it re-reads its own folder\n"
-                    "every %s (a folder on a peer every %s) and the listing simply\n"
-                    "becomes the new one - nothing is added to it, and the cursor\n"
-                    "and the ticks stay on the rows they were on. It stops while\n"
-                    "the panel is collapsed, closed or behind another dock tab:\n"
-                    "there is nothing on screen to bring up to date. F5 does the\n"
-                    "same round by hand, at any time.\n\n"
-                    "This interval is the Browse panel's own (%s here, %s for a\n"
-                    "peer). The setting watch.intervalSec is the OTHER half - how\n"
-                    "often the files behind the stacks you have OPEN are looked at.\n\n"
-                    "And those two halves do different things, which is the usual\n"
-                    "surprise: a listing here is REPLACED for you, but an open\n"
-                    "stack whose files changed only SAYS so on its row in Files\n"
-                    "until you right-click > Reload from disk - unless\n"
-                    "File > \"Auto-reload a stack when its files change\" is on,\n"
-                    "and that one is OFF by default. So \"the folder updated but my\n"
-                    "image did not\" is both of them working as asked.\n\n"
-                    "The switch for all of it is File > \"Watch source files on\n"
-                    "disk\" (Preferences, and loading.watchFiles in settings.jsonc,\n"
-                    "set the same one).",
-                    pollSaid.c_str(), here.c_str(), peer.c_str(),
-                    here.c_str(), peer.c_str());
-            }
+            if (ImGui::IsItemHovered())
+                // §19's clauses 2 and 3, worded in nav.cpp beside the state it
+                // describes: it quotes two menu labels and two intervals, and a
+                // claim that lives inside a draw call is one no test can hold.
+                ImGui::SetTooltip("%s",
+                                  rbPollTipText(I, I.pollClock, app.uiFrame).c_str());
         }
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }

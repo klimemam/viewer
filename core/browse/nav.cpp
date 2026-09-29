@@ -557,11 +557,11 @@ RbPollState rbPollStateNow(const App::BrowseInstance& I, uint64_t uiFrame) {
     return RbPollState::On;
 }
 
-// Seconds as the panel prints them: "3 s", "12 s", "0.4 s". Whole numbers stay
+// Seconds as the panel prints them: "3 s", "12 s", "0.5 s". Whole numbers stay
 // whole - `watch.intervalSec` is whole seconds and so are the two Browse
-// constants - and the fractional form exists for the AGE, which is whatever the
-// frame clock says.
-std::string rbSecsText(double s) {
+// constants. INTERVALS only: an interval is a constant and its width therefore
+// never changes while anybody is reading.
+static std::string rbSecsText(double s) {
     char b[32];
     if (s < 0) s = 0;
     const double r = std::floor(s + 0.5);
@@ -570,14 +570,49 @@ std::string rbSecsText(double s) {
     return b;
 }
 
-// WHAT THE PANEL SAYS, and the only place it is worded. Each state names its own
-// gate, and the one the reader can do something about also names WHERE: the
-// label is menus.inc's own, letter for letter, so the sentence and the switch
-// cannot come to be called different things.
+// ...and the AGE, which is a different problem and gets a different function.
+// The age changes every second, and the mark that carries it sets the width the
+// status line elides into - so "2 s" becoming "10 s" moved the line's "..." one
+// character along, ONCE A SECOND, under the reader's eye. That is #275's defect
+// (「目の下で動く」) wearing a smaller hat, in the very panel that closed it.
+//
+// So the field is FIXED WIDTH: two digits always, and 99 is the ceiling. Digits
+// are tabular in every font this program loads, so "07 s" and "12 s" measure the
+// same; zero-padding is what keeps a one-digit age from being narrower than a
+// two-digit one. The cap is reached only by a clock that jumped (a resumed
+// machine), never in the running state - a round is due at the interval, which
+// is 3 s here and 12 s for a peer - and it says "99+" rather than "99" because
+// a number that has stopped counting must not look like a measurement.
+static std::string rbAgeText(double s) {
+    char b[32];
+    if (s < 0) s = 0;
+    const int n = (int)std::floor(s + 0.5);
+    if (n > 99) return "99+ s";
+    snprintf(b, sizeof b, "%02d s", n);
+    return b;
+}
+
+// WHAT THE PANEL SAYS, and the only place it is worded.
+//
+// EMPTY MEANS "THIS STATE HAS NO SURFACE" - not "nothing to say". Three of the
+// eight states cannot reach the status line at all, because drawPanelRemote has
+// already returned before that row:
+//   * Offline   - panel.cpp's `if (!B.connected)` draws the empty state and
+//                 returns. There is no listing on screen to be kept up to date.
+//   * Searching - panel.cpp's `if (I.search.active)` draws the results view and
+//                 returns. The listing is not on screen; the results are.
+//   * NotDrawn  - the panel is collapsed, closed, or behind another dock tab,
+//                 so ImGui::Begin answered false and the spine never called us.
+// Each of those reads THE SAME FIELD the state does (`b.connected`,
+// `search.active`, `drawnFrame`), one field and not a copy of a gate, so the
+// door and the state cannot come to disagree. Returning a sentence for them
+// would be the shape §19.3 exists to forbid: a string a test can assert and a
+// reader can never see. --browse-selftest B9 asserts the emptiness instead.
 //
 // The interval is `browseWatchInterval`, never a number typed in here: move
-// either constant and this sentence moves with it (--browse-selftest B9b holds
-// that, by moving one).
+// either constant and this sentence moves with it (B9b holds that, by moving
+// one). The switch is named with menus.inc's own label, letter for letter, and
+// B9d holds THAT by reading menus.inc.
 std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
     const std::string every =
         "auto-refresh: every " + rbSecsText(browseWatchInterval(!I.b.host.empty()));
@@ -591,20 +626,20 @@ std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t u
             // away from the panel this sentence is on.
             return "auto-refresh: off - File > \"Watch source files on disk\"";
         case RbPollState::Paused:
-            // Not a setting: the window is minimised (§2's own line for the
-            // stack half), or a scripted run asked for no watcher.
-            return "auto-refresh: stopped while the window is minimised";
+            // NOT "while the window is minimised", which is what this said
+            // until the review took it apart: the minimised half of watchPaused
+            // is set in the frame loop's ICONIFIED branch, which draws NOTHING
+            // and then clears the flag again on the frame that comes back - so
+            // that cause can never be on screen. What CAN be on screen is the
+            // other half: a scripted run (--browse-keys) that suppressed the
+            // watcher deliberately, with the window wide open in front of it.
+            // A sentence whose stated cause is false every time it is visible
+            // is worse than no sentence.
+            return "auto-refresh: stopped - the watcher is suppressed for this run";
         case RbPollState::Offline:
-            return "auto-refresh: stopped - not connected";
         case RbPollState::Searching:
-            return "auto-refresh: stopped - search results are showing, not this folder";
         case RbPollState::NotDrawn:
-            // NOTHING, and it is not an omission: this state means the panel is
-            // collapsed, closed or behind another dock tab, so there is no
-            // reader to tell. The sentence would be drawn on a surface nobody
-            // is looking at. It stays a NAMED state all the same, because
-            // rbPollDue's gate is real and the selftest asks about it by name.
-            return std::string();
+            return std::string();          // no surface - see the note above
         case RbPollState::Arming:
             // A frame away, and said anyway. It is the state a navigation and
             // F5 both leave behind (rbEnqueue zeroes the timer), so it is
@@ -613,9 +648,12 @@ std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t u
             // than an age of zero seconds would be.
             return every + ", starting";
         case RbPollState::Working:
-            // Transient by construction, and the round is SKIPPED rather than
-            // queued - so the interval is still the promise and this says so.
-            return every + ", listing now";
+            // §2's SKIP, NEVER QUEUE, in the panel's own words. It deliberately
+            // does not say "listing now": when the worker is busy the status
+            // line to the LEFT of this mark is already printing the worker's
+            // own phase, and one row saying the same thing twice is how a
+            // status line stops being read.
+            return every + ", skipped while busy";
         case RbPollState::On:
             break;
     }
@@ -623,7 +661,61 @@ std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t u
     // read, from which the next round follows (last + the interval). ONE mark
     // for both halves of §19's first clause - the tooltip does the arithmetic
     // out loud, the line does not spend a second clause on it.
-    return every + ", last " + rbSecsText(now - I.polledAt) + " ago";
+    return every + ", last " + rbAgeText(now - I.polledAt) + " ago";
+}
+
+// ...and the WHOLE TOOLTIP, here rather than in the panel, for three reasons
+// that are all the same reason: it quotes two menu labels and two intervals,
+// and a claim that only exists inside a draw call is a claim no test can hold.
+// --browse-selftest B9d reads it - the labels against menus.inc, the intervals
+// against the constants.
+//
+// `%` is never formatted into this: it is assembled, and the panel hands it to
+// SetTooltip with a "%s".
+std::string rbPollTipText(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    const bool peer = !I.b.host.empty();
+    // THIS PANEL's interval first, and that is the review's finding: the mark
+    // beside it says "every 12 s" on a peer's panel, so a tooltip that opened
+    // with the local 3 s would be two numbers for one fact. The other one is
+    // named as the contrast it is.
+    const std::string mine  = rbSecsText(browseWatchInterval(peer));
+    const std::string other = rbSecsText(browseWatchInterval(!peer));
+    std::string t = rbPollStateText(I, now, uiFrame);
+    if (!t.empty()) t += "\n\n";
+    t += "While this panel is being DRAWN it re-reads the folder it is showing\n"
+         "every " + mine + " (this one is " + (peer ? "a peer's" : "on this machine") +
+         "; " + (peer ? "a folder on this machine" : "a folder on a peer") +
+         " is re-read every " + other + ").\n"
+         "The listing simply becomes the new one - nothing is added to it, and\n"
+         "the cursor and the ticks stay on the rows they were on. It stops while\n"
+         "the panel is collapsed, closed or behind another dock tab: there is\n"
+         "nothing on screen to bring up to date.\n\n"
+         // F5, ACCURATELY. It was "the same round by hand, at any time", and it
+         // is neither: it needs this panel to hold the keyboard, and it is a
+         // NAVIGATION (rbRefresh forgets the tree cache and re-lists through
+         // rbGoTo), which also restarts the timer - where a round only replaces
+         // the rows.
+         "F5 re-lists it now, when this panel has the keyboard. That is a\n"
+         "navigation and not this round: it also forgets the folders a tree has\n"
+         "cached, and it starts the interval again from now.\n\n"
+         "This interval is the Browse panel's own. The setting watch.intervalSec\n"
+         "is the OTHER half - how often the files behind the stacks you have\n"
+         "OPEN are looked at.\n\n"
+         "And those two halves do different things, which is the usual surprise:\n"
+         "a listing here is REPLACED for you, but an open stack whose files\n"
+         "changed only SAYS so on its row in Files until you right-click >\n"
+         "Reload from disk - unless this is on:\n"
+         // ONE LINE, and it has to be: B9d pulls every `File > \"...\"` label out
+         // of this text and looks it up in menus.inc, so a label broken across
+         // two lines would be a label that check can never find - and the
+         // coupling this tooltip needs most is the one to the menu it names.
+         "  File > \"Auto-reload a stack when its files change\"\n"
+         "...which is OFF by default. So \"the folder updated but my image did\n"
+         "not\" is both of them working as asked.\n\n"
+         "The switch for all of it is File > \"Watch source files on disk\"\n"
+         "(Preferences, and loading.watchFiles in settings.jsonc, set the same\n"
+         "one).";
+    return t;
 }
 
 // Does this instance owe a round right now? The gates are rbPollStateNow's, and
