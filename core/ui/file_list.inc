@@ -151,6 +151,107 @@ static const char* shareGlyph() {
     }
     return have ? "\xE2\xA7\x89" : "";
 }
+
+// §4.1: the characters of a NAME this atlas cannot draw (板306 D).
+//
+// A code point the font does not hold renders as the fallback '?' - a half
+// width question mark, not a tofu box, because none of the candidate fonts
+// carry U+FFFD either and ImGui's FallbackChar is '?'. So 测试1.npy and
+// 试测1.npy both read "??1.npy": two different files, identical on screen, in
+// the Files panel and in every tooltip, message and export header built from
+// the same name. Nothing in the program is wrong at that point - the bytes are
+// right, the file opens, the pixels are the file's - and the one thing the user
+// cannot do is tell the two rows apart.
+//
+// THIS NOTICE IS NEEDED EVEN THOUGH THE RANGES WERE WIDENED (板306 A), and the
+// reason is that the two fix different things. Widening the ranges removes the
+// characters this build forgot to ASK for. What is left over is the characters
+// the FONT does not have - Meiryo has 1819 of the 2500 common simplified
+// Chinese characters, measured - and every code point outside the BMP, which
+// does not fit in ImWchar at all and so can never be asked for by this build of
+// ImGui. Those cannot be removed by asking for more; they can only be declared.
+//
+// WHAT IS DELIBERATELY NOT DONE: the name on screen is never rewritten. An
+// escaped row reading "测试1.npy" is a row nobody can match against
+// their own folder, which trades one unreadable string for another. The name
+// stays exactly as the file gave it and a COUNT is added beside it, in the two
+// places a reader is already looking - the row's tooltip and one Messages line
+// per document.
+//
+// Same shape as shareGlyph() above: it asks the BUILT ATLAS rather than the
+// range table, because what the user sees is what was baked and nothing else.
+static ImFont* bakedFont() {
+    if (!ImGui::GetCurrentContext()) return nullptr;
+    // ImGui::GetFont() is only set from NewFrame() onwards, so a windowless run
+    // - every NOGL selftest - would see no font at all and could not tell "this
+    // name cannot be drawn" from "nothing has been baked". The atlas itself is
+    // built at start-up either way (fontAtlasBake), so ask it directly.
+    if (ImFont* f = ImGui::GetFont()) return f;
+    ImFontAtlas* a = ImGui::GetIO().Fonts;
+    return (a && a->Fonts.Size) ? a->Fonts[0] : nullptr;
+}
+static int undrawableCount(const std::string& utf8Name) {
+    ImFont* f = bakedFont();
+    if (!f) return 0;                  // nothing baked: nothing to claim
+    int n = 0;
+    const char* p = utf8Name.c_str();
+    const char* e = p + utf8Name.size();
+    while (p < e) {
+        unsigned int cp = 0;
+        const int used = ImTextCharFromUtf8(&cp, p, e);
+        if (used <= 0) break;
+        p += used;
+        // Bytes that are not UTF-8 come back as U+FFFD, which no candidate
+        // font has either - so they are counted, which is right: a name with
+        // broken bytes in it is a name that will not draw.
+        if (cp > 0xFFFF) { n++; continue; }   // outside the BMP: not askable at all
+        if (!f->FindGlyphNoFallback((ImWchar)cp)) n++;
+    }
+    return n;
+}
+// The sentence the count turns into. ONE function, so the tooltip and the
+// Messages line cannot drift into two different claims about one name.
+static std::string undrawableNote(const std::string& utf8Name) {
+    const int n = undrawableCount(utf8Name);
+    if (n <= 0) return {};
+    char b[320];
+    snprintf(b, sizeof b,
+             "%d character(s) of this name have no glyph in the font and draw "
+             "as '?' - two different files can look identical here. The name on "
+             "disk is untouched. \"appearance.fontPath\" (settings.jsonc) points "
+             "at another font; it takes effect at the next start.", n);
+    return b;
+}
+// ...and the Messages line, once per document.
+//
+// Driven off app.imagesRev rather than hooked into an open: there are six
+// separate places that push onto app.images (the local loader, the npz loader,
+// the remote client, sequence building, a plugin and Watch's reload), and a
+// notice added to one of them would be a notice the other five do not give.
+// The revision counter is the one thing every one of them bumps.
+//
+// Said ONCE per name per run: a name is a property of the file, so repeating it
+// on every reload would turn the log into noise about a fact that has not
+// changed. Kept by NAME rather than by uid for exactly that reason - the same
+// file reopened is the same sentence.
+static void undrawableReportNewDocs() {
+    static uint64_t seenRev = (uint64_t)-1;
+    static std::vector<std::string> said;
+    if (app.imagesRev == seenRev) return;
+    seenRev = app.imagesRev;
+    if (!bakedFont()) return;
+    for (const auto& d : app.images) {
+        if (d->name.empty()) continue;
+        if (std::find(said.begin(), said.end(), d->name) != said.end()) continue;
+        const std::string note = undrawableNote(d->name);
+        if (note.empty()) continue;
+        said.push_back(d->name);
+        logMsg(d->name + ": " + note, true);
+    }
+    // The list is per RUN and bounded by how many documents a run opens, but a
+    // batch script can open thousands - so it is capped the way msgLog is.
+    if (said.size() > 512) said.erase(said.begin(), said.begin() + 256);
+}
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
 // `shared` = the row's frames whose source has another holder. Counterparts
 // are counted PER STACK - `4 frame(s) shared - 2 with "D1", 2 with "D2"` -
@@ -944,6 +1045,13 @@ static void drawFileList() {
                     lead = rn + "\n" + lead;
                 std::string tip = lead + "\n" + meta;
                 if (!share.empty()) tip += "\n\n" + share;
+                // §4.1 (板306 D): and if this name cannot be DRAWN, say so on
+                // the row that cannot draw it. Last, because it is a statement
+                // about the label above rather than about the pixels - and
+                // because the row it lands on is the one the reader is already
+                // trying to tell apart from its neighbour.
+                if (std::string ud = undrawableNote(d.name); !ud.empty())
+                    tip += "\n\n" + ud;
                 g_filesRowTipProbe = tip;      // the value, not a second derivation
                 if (hov) ImGui::SetTooltip("%s", tip.c_str());
             }

@@ -2612,6 +2612,12 @@ static bool g_watchSuppressed = false;
                 }
             }
         }
+        // 板306 D: a name this atlas cannot draw gets one line in Messages.
+        // Here rather than at any of the six places that push onto app.images,
+        // because a notice added to one of those doors is a notice the other
+        // five do not give - see undrawableReportNewDocs(), which returns
+        // immediately on every frame where nothing was opened.
+        undrawableReportNewDocs();
         {   // Autosave on change, debounced. A hard kill cannot run any handler,
             // so the safety net has to be written while things still work.
             static uint64_t lastState = 0;
