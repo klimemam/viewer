@@ -1203,36 +1203,57 @@ int main(int argc, char** argv) {
             uiScalePlatformName(uiGlfwPlatform()), xs, uiScale, fontScale, uis.how);
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
-    std::string fontPath = jpFontPath();
-    // The Japanese ranges plus U+2025 TWO DOT LEADER: stack names carry it
-    // (frame_000‥023.npy - see rp::patternWithExtent), and a glyph the atlas
-    // does not hold renders as a fallback '?', which is precisely the
-    // uninformative character the extent exists to remove.
+    // WHICH font, and - if none - which paths were looked at. The override is
+    // read from settings.jsonc / prefs.txt, both of which have already loaded
+    // by the time the window is made (loadPrefs and loadSettings are hundreds
+    // of lines above), so a value typed there is in force on the very next
+    // start rather than the one after it.
+    g_fontChoice = jpFontChoice(g_settingsFontPath);
+    const std::string fontPath = g_fontChoice.path;
     static ImVector<ImWchar> fontRanges;
-    {
-        ImFontGlyphRangesBuilder b;
-        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
-        b.AddChar((ImWchar)0x2025);
-        // ...and U+29C9 TWO JOINED SQUARES, the Files panel's share mark (§4).
-        // Not every CJK font carries it: shareGlyph() checks the built atlas
-        // and falls back to the word "shared" rather than showing '?'.
-        b.AddChar((ImWchar)0x29C9);
-        // GetGlyphRangesJapanese covers Latin-1 and the kana/kanji but NOT
-        // Greek, so a table of noise figures could only write "sigma_f" where
-        // it means one symbol. (Unicode has no subscript f or v, so the axis
-        // letter rides alongside the symbol rather than under it.)
-        b.AddChar((ImWchar)0x03C3);        // sigma
-        b.AddChar((ImWchar)0x03BC);        // mu
-        b.BuildRanges(&fontRanges);
-    }
+    cjkFontRanges(io.Fonts, fontRanges);
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
                                        fontRanges.Data);
+    // ---- the SECOND face, merged on top of the first (板306 B) --------------
+    // THE ORDER IS THE POINT, and it is why this is a merge rather than a
+    // choice. ImFontAtlas merges FIRST COME FIRST SERVED - imgui_draw.cpp's
+    // builder skips a code point the earlier face already claimed
+    // ("if (dst_tmp.GlyphsSet.TestBit(codepoint)) continue;") - so with Meiryo
+    // added first and YaHei merged after it, every Japanese kana and kanji is
+    // still drawn by MEIRYO and only the characters Meiryo does not have come
+    // from YaHei. Swap the two lines and Japanese text quietly changes typeface
+    // to a Chinese face's shapes for the same code points, which is the defect
+    // this arrangement exists to avoid. See cjkMergeFontPath() for why Windows
+    // needs a second file at all.
+    //
+    // Nothing is said when there is no second file: the merge is an improvement
+    // where it is possible and its absence is not a new failure. What the user
+    // is owed is the state of the RESULT, and that is what the two messages
+    // below report - either the atlas has the kana or it says which font does
+    // not have them.
+    std::string mergePath;
+    if (jp) mergePath = cjkMergeFontPath(fontPath);
+    if (!mergePath.empty()) {
+        ImFontConfig m;
+        m.MergeMode = true;
+        if (!io.Fonts->AddFontFromFileTTF(mergePath.c_str(), 17.0f * fontScale, &m,
+                                          fontRanges.Data))
+            mergePath.clear();          // unreadable: one face, and say nothing
+    }
+    g_fontMergePath = mergePath;
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
-        toast("CJK font not found - Japanese filenames may not display correctly", true);
     }
+    fontAtlasBake(fontRanges, fontScale);
+    // The refusals, AFTER the bake, because only the built atlas can tell the
+    // two apart: "no font at all" and "a font with no CJK in it" look the same
+    // from the candidate list and are different things to say. fc-match answers
+    // sans:lang=ja with DejaVu Sans on a machine that has no Japanese font, so
+    // the second case is not hypothetical - it is what the fallback produces.
+    if (!jp)                     toast(cjkFontMissingText(g_fontChoice), true);
+    else if (!fontAtlasHasCjk()) toast(cjkFontNoGlyphsText(g_fontChoice), true);
     // ...and the settings file's refusal, held since loadSettings() because
     // that ran before there was a context to draw a toast in (see the function).
     // After the font toast, so that "your settings file would not parse" is the

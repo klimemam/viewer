@@ -1161,6 +1161,10 @@ struct PrefsBase {
     // settings.inc owns the variables - so loadPrefs fills them HERE and that
     // is the layer settings.inc falls back to when the file stops naming them.
     std::string repoUrl, editorCmd;
+    // ...and 板306's font override, for the same reason: util.inc owns the
+    // variable (it is the file that reads it), so this is the layer
+    // settings.inc falls back to when settings.jsonc stops naming it.
+    std::string fontPath;
 };
 static PrefsBase g_prefsBase;
 // Inactive until the lower layer has actually been captured. main() captures it
@@ -1267,6 +1271,10 @@ static void writePrefsTo(std::ostream& f) {
     // "not set" for both (判断9), and an empty line would be a third state.
     if (!P.repoUrl.empty()) f << "repourl " << P.repoUrl << "\n";
     if (!P.editorCmd.empty()) f << "editor " << P.editorCmd << "\n";
+    // appearance.fontPath (板306 C), written for those same two reasons. Only
+    // when set: empty means "search the usual places", so an empty line would
+    // be a third state that means neither.
+    if (!P.fontPath.empty()) f << "fontpath " << P.fontPath << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!P.remoteExe.empty()) f << "remoteexe " << P.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -1343,6 +1351,7 @@ static void loadPrefs() {
     // "no lower layer" rather than "whatever the last read left here".
     g_prefsBase.repoUrl.clear();
     g_prefsBase.editorCmd.clear();
+    g_prefsBase.fontPath.clear();
     std::vector<uint8_t> buf;
     std::string p = prefsPath();
     if (p.empty() || !readFileBytes(p, buf)) return;
@@ -1470,6 +1479,7 @@ static void loadPrefs() {
             // next and is the one place that resolves file-over-prefs for them.
             else if (key == "repourl")   g_prefsBase.repoUrl = s;
             else if (key == "editor")    g_prefsBase.editorCmd = s;
+            else if (key == "fontpath")  g_prefsBase.fontPath = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
             else if (key == "pythonexe") app.pythonExe = s;
