@@ -145,10 +145,13 @@ static const char* roiChannelName(const ImageDoc& im, int chSel) {
 // the next column along. That is abProjOverlayable's refusal, one panel over:
 // a correspondence the data does not support is declined and SAID, never
 // invented (docs/features/compare/ab-stats-plan.md 5).
+//
+// One predicate, not two: this is annFits() in core/app/annotations.inc, which
+// is where the WRITES that must honour the same "fits this frame" are. A
+// second copy here is how "the panel says it does not fit" and "the editor
+// wrote it anyway" came to be two different questions.
 static bool roiSideCovers(const ImageDoc& d, const App::Ann& a) {
-    if (a.x < 0 || a.y < 0) return false;
-    if (a.type != 0) return a.x < d.w && a.y < d.h;          // POI: one pixel
-    return a.w > 0 && a.h > 0 && a.x + a.w <= d.w && a.y + a.h <= d.h;
+    return annFits(a, d.w, d.h);
 }
 
 // ...and the channel selector names a plane of A. Planes correspond BY NAME and
@@ -1025,21 +1028,41 @@ static void drawPanelRois() {
             ImGui::SetNextItemWidth(-1);
             ImGui::InputInt4("##xywh", xywh);      // full width: a visible label would clip
             xywhEditing = ImGui::IsItemActive();
+            // Only the component that was EDITED is written, and a value
+            // this frame cannot hold is refused and said rather than clamped
+            // into range: annWriteFields() carries the reasoning and the
+            // measurement. The four std::clamps that used to be here rewrote
+            // the three fields nobody touched, permanently, whenever the ROI
+            // was not on this frame.
             if (ImGui::IsItemDeactivatedAfterEdit()) {
-                sel->x = std::clamp(xywh[0], 0, im->w - 1);
-                sel->y = std::clamp(xywh[1], 0, im->h - 1);
-                sel->w = std::clamp(xywh[2], 1, im->w - sel->x);
-                sel->h = std::clamp(xywh[3], 1, im->h - sel->y);
-                app.annRev++;
+                std::string why;
+                if (annWriteFields(*sel, xywh, im->w, im->h, &why)) app.annRev++;
+                else if (!why.empty()) toast(why, true);
+                // Either way the fields go back to the ROI on the next frame:
+                // xywhEditing is false now, so the seeding above re-reads it.
+                // A refused number must not sit in the box looking applied.
             }
         } else {
-            int v[2] = { sel->x, sel->y };
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputInt2("##pinxy", v)) {
-                sel->x = std::clamp(v[0], 0, im->w - 1);
-                sel->y = std::clamp(v[1], 0, im->h - 1);
+            // The pin's two fields go through the same seam, and for the
+            // same two reasons: writing per keystroke clamped BOTH numbers on
+            // every edit, so raising x by one moved y as well the moment the
+            // pin was not on this frame. Commit on Enter / focus loss, like
+            // the rectangle above, so a half-typed 4 of 4096 is not a write.
+            static int pxy[2] = {};
+            static bool pxyEditing = false;
+            static int pxyId = -1;
+            if (!pxyEditing || pxyId != sel->id) {
+                pxy[0] = sel->x; pxy[1] = sel->y;
+                pxyId = sel->id;
             }
-            if (ImGui::IsItemDeactivatedAfterEdit()) app.annRev++;
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputInt2("##pinxy", pxy);
+            pxyEditing = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                std::string why;
+                if (annWriteFields(*sel, pxy, im->w, im->h, &why)) app.annRev++;
+                else if (!why.empty()) toast(why, true);
+            }
             ImGui::TextDisabled("X / Y: select this pin's row / column");
         }
     } else {
