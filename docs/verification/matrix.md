@@ -98,7 +98,7 @@ File > Open、Browse、フォルダ走査、リモート接続、リーダはそ
 
 | | 件 | 状態 |
 |---|---|---|
-| G1 | ヘッダ無し RAW が peer 越しに開けない | **済** PR #185/#186/#187/#188/#189/#314 — protocol 11。試験 F4d F4e F4f F4h P8 P8b P9。**2026-08-13 に「済」と書いたのは早すぎた**: レシピを訊く扉は Browse の行だけで、url 名指し・フォルダ stack・Reload・Watch・session 復元は断られ続け、段1 の拒否文も差し替え忘れていた (ユーザー報告 2026-09-29)。扉の表は remote-headerless-design.md §12.1 |
+| G1 | ヘッダ無し RAW が peer 越しに開けない | **済** PR #185/#186/#187/#188/#189/#278 — protocol 11。試験 F4d F4e F4f F4h P8 P8b P9。**2026-08-13 に「済」と書いたのは早すぎた**: レシピを訊く扉は Browse の行だけで、url 名指し・フォルダ stack・Reload・Watch・session 復元は断られ続け、段1 の拒否文も差し替え忘れていた (ユーザー報告 2026-09-29)。扉の表は remote-headerless-design.md §12.1 |
 | G2 | ローカル Browse が偽の拒否理由を出す | **済** PR #174 — 試験 F4b |
 | G3 | `.npz` のフォルダが幾何プロンプトへ | **済** PR #173 — 試験 UC8 |
 | G4 | 間引かれた preview を export できてしまう | **済** PR #170 — 試験 E5/E6 |

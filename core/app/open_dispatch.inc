@@ -3073,7 +3073,7 @@ static bool openRemote(const std::string& url, bool asPreview, int frame, int np
         }
         // A HEADERLESS name on a peer, with no recipe in hand. It is not a
         // refusal - it is a question, and this is where it gets asked (issue
-        // #313, the user's report of 2026-09-29). The Browse row has asked it
+        // the user's report of 2026-09-29, PR #278). The Browse row has asked it
         // since #188; every other door - a url on the command line, a drop,
         // File > Open, a session line with no geometry - came here instead and
         // got a sentence blaming the wire. ONE place, not one per call site,
@@ -4465,7 +4465,7 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
     // A HEADERLESS folder asks for a geometry, ONCE per Open (11 stage 4), and
     // it did not: this door called openRemote with a null recipe, so the head
     // frame was refused (or, over local://, silently rerouted to the local
-    // dialog) and the members were refused one by one. Issue #313.
+    // dialog) and the members were refused one by one (PR #278).
     if (imagefile::isHeaderless(files[0])) {
         uint64_t sz = 0;
         std::string why;
