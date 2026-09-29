@@ -614,15 +614,16 @@ static void drawPanelHistogram() {
         // line that appears after the layout pushes the whole footer out of the
         // bottom of the panel - which is exactly the state where the highlight
         // must not be the thing that scrolls away.
-        // Counted by the SAME rule the lines are emitted by (histHlCountShown:
-        // drawn on this frame, not merely painted once), or the layout reserves
-        // rows for letters that will not print and the footer floats.
-        int hlLines = 0;
-        if (app.highlight.on) {
-            for (const HistSide& sd : sides)
-                if (histHlCountShown(sd.H->img)) hlLines++;
-            if (!hlLines) hlLines = 1;              // the one "why not" line
-        }
+        // ONE ROW PER SLOT while the highlight is armed, whether or not that
+        // slot is on screen (板 275 R2). Counting the DRAWN panes here is what
+        // made the footer breathe: hold-B removed A's row for as long as the key
+        // was down (§7 says a temporary Hold B does not change the pane
+        // composition, and this contradicted it), and blink swapped two rows
+        // every half second, so the plot above resized under the cursor. A row
+        // that is not on screen carries its reason and no number, which is also
+        // what keeps the older defect closed - the number is what must not
+        // survive, not the letter.
+        const int hlLines = app.highlight.on ? (int)nSides : 0;
         float footerH = ImGui::GetTextLineHeightWithSpacing() *
                             (float)(nSides + hlLines)
                       + (tooNarrow ? abNarrowNoteH() : 0.0f) + offMsgH;
@@ -738,31 +739,39 @@ static void drawPanelHistogram() {
             std::string joined;
             const std::string head = histHlRangeSaid(im->dtype);
             bool first = true;
-            auto emit = [&](const std::string& line) {
-                ImGui::TextUnformatted(line.c_str());
+            auto emit = [&](const std::string& line, bool dim) {
+                if (dim) ImGui::TextDisabled("%s", line.c_str());
+                else     ImGui::TextUnformatted(line.c_str());
                 if (first) {          // one clear button, on the first line
                     ImGui::SameLine();
                     if (ImGui::SmallButton("clear##hl")) histHlClear();
                     first = false;
                 }
-                joined += (joined.empty() ? "" : "|") + line;
+                // The probe carries the dim marker too: "the row is still there,
+                // quietly" is the claim R2 makes, and a claim about what the
+                // screen looks like has to be readable by the selftest.
+                joined += std::string(joined.empty() ? "" : "|") + (dim ? "[dim] " : "") + line;
             };
-            // A line for every side whose pixels are ON THE SCREEN on this
-            // frame - and only those. A slot that is not drawn makes no claim:
-            // the only way to give it a number would be to derive one from the
-            // bins, which is the sampled, possibly ROI-limited population that
-            // must never wear the same face as this count. "Was painted once"
-            // is not the test - it was, and the footer printed a Split count
-            // for a pane that Wipe had dropped (板 275 DEFECT(3)).
+            // ONE ROW PER SLOT, in slot order. A row whose pane is on the screen
+            // in this pass carries the count the PAINT measured; a row whose
+            // pane is not carries the reason and NO NUMBER.
+            //   The number is the thing that must not survive: printing a Split
+            //   count for a pane Wipe had dropped was 板 275 DEFECT(3), and
+            //   deriving one from the bins would be worse (a sampled, possibly
+            //   ROI-limited population wearing this count's face).
+            //   The ROW must survive, because this panel's own discipline is to
+            //   name what it could not show rather than go quiet, and because a
+            //   row that appears and disappears moves the plot above it.
+            // ONE reading of the screen for the whole footer: every row is
+            // answered against the same stamped set the canvas badge read.
+            const bool anyShown = !histHlShownPanes().empty();
             for (const HistSide& sd : sides) {
                 const ImageDoc* d = sd.H->img;
-                if (!histHlCountShown(d)) continue;
-                emit(head + "  -  " + histHlSideSaid(d, sd.letter));
+                const std::string said = histHlSideSaid(d, sd.letter);
+                if (!said.empty()) emit(head + "  -  " + said, false);
+                else emit(head + "  -  " + sd.letter + ": " +
+                          histHlNotShownWhy(d, anyShown), true);
             }
-            // Armed and nobody answered. Say the interval anyway, with the
-            // reason: silence here would be the one state this feature is not
-            // allowed to have, and one line is all the layout above reserved.
-            if (first) emit(head + "  -  " + histHlNothingShownWhy());
             histHlProbeSet("panel", joined);
         } else {
             histHlProbeSet("panel", "");

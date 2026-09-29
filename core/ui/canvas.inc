@@ -913,13 +913,13 @@ static void drawCanvas(ImVec2 avail) {
         if (d->texDirty) rebuildTexture(*d);
         else touchTex(*d);                 // keep it resident: it is on screen
         // THIS is where the value highlight's count becomes a statement about
-        // the screen: the frame that put a document's pixels in front of the
-        // user writes the frame number down, and the footer and the badge print
-        // only the current frame's. After the rebuild, so a first draw stamps
-        // the count the rebuild just measured; on every later frame the cached
-        // texture still carries the magenta and this re-declares it. The
-        // alternative - stamping inside the paint - is wrong in both
-        // directions, and histHlShown's note says how.
+        // the screen: the pass that puts a document's pixels in front of the
+        // user writes its number down, and the footer and the badge read only
+        // the current pass's. After the rebuild, so a first draw stamps the
+        // count the rebuild just measured; on every later pass the cached
+        // texture still carries the magenta and this re-declares it without a
+        // repaint. The alternative - stamping inside the paint - is wrong in
+        // both directions, and histHlShown's note says how.
         histHlShown(*d);
         setFilter(*d, app.view.zoom >= 1.0f);
         ImVec2 p0 = map(0, 0), p1 = map((float)d->w, (float)d->h);
@@ -1521,7 +1521,18 @@ static void drawCanvas(ImVec2 avail) {
                         int d = std::abs(ord - wantOrd);
                         if (d < bestD) { bestD = d; best = k; }
                     }
-                    if (best != pos) selectImage(fr[best]);
+                    // FILED, not applied (板 275 R3). This bar is drawn after
+                    // the canvas badge, so calling selectImage here changed
+                    // cur() halfway through the frame: the badge had already
+                    // spoken about the old frame while the histogram footer
+                    // below spoke about the new one - two statements about one
+                    // picture, during the very gesture this feature is built
+                    // for ("select the tail, step frames, watch which pixels
+                    // enter and leave"). app.pendingSelect is applied at the
+                    // end of the frame, so within a frame there is exactly one
+                    // current document. The one-frame lag is invisible at 60 fps
+                    // and the bar's own rectangle cannot be known any earlier.
+                    if (best != pos) app.pendingSelect = fr[best];
                 }
                 // The keys named here are the ones that work HERE. It used to
                 // say ". and ," - those step the Browse panel's preview, and

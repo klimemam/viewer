@@ -92,6 +92,24 @@ static int histHlSelftest() {
             ImGui::EndFrame();
         }
     };
+    // Is there a DIM footer row whose text contains this? The panel probe joins
+    // the highlight rows with '|' and marks a dim row at its head, so the marker
+    // has to be matched per ROW - a plain substring search would let a dim
+    // marker on one row vouch for the text of another. Both halves of R2's claim
+    // ("the row is still there" and "it carries no number") are asserted through
+    // this.
+    auto dimRow = [](const std::string& probe, const char* what) {
+        size_t at = 0;
+        while (at <= probe.size()) {
+            const size_t e = probe.find('|', at);
+            const std::string row = probe.substr(at, e == std::string::npos ? e : e - at);
+            if (row.rfind("[dim] ", 0) == 0 && row.find(what) != std::string::npos)
+                return true;
+            if (e == std::string::npos) break;
+            at = e + 1;
+        }
+        return false;
+    };
     auto probeField = [](const char* key) {
         const std::string k = std::string(key) + "=";
         size_t at = g_histHlProbe.find(k);
@@ -103,24 +121,30 @@ static int histHlSelftest() {
 
     // ---- the canvas, stood in for ---------------------------------------
     // drawCanvas cannot run here (it uploads textures), and what stands in for
-    // it is these two lines in drawImageOnly's own order: renderDocRGBA is the
-    // paint that MEASURES, histHlShown is the canvas saying it put those pixels
-    // in front of the user. Both, because the footer and the badge now print
-    // only what the CURRENT frame drew - the paint alone is a measurement with
-    // no claim on the screen, which is the whole of the 板 275 fix.
+    // it is drawImageOnly's own two steps: renderDocRGBA is the paint that
+    // MEASURES (and only when the texture is dirty), histHlShown is the canvas
+    // saying it put those pixels in front of the user. Both surfaces read the
+    // second one, so the paint alone is a measurement with no claim on the
+    // screen - the whole of the 板 275 fix.
     auto canvasDrew = [&](ImageDoc& d, std::vector<uint8_t>& px) {
         renderDocRGBA(d, px);
         histHlShown(d);
     };
-    // A frame boundary. Without it every simulated frame would carry one
-    // app.uiFrame and a count left by the PREVIOUS mode would still look
-    // current - exactly the confusion under test, so the test has to be able
-    // to turn the page. The entry value is put back at the end: one selftest
-    // home is shared by every test, and app.uiFrame is read by the browse
-    // panels' own "was I drawn" rule.
-    const uint64_t uiFrame0 = app.uiFrame;
-    auto nextFrame = [&]() { app.uiFrame++; };
-    nextFrame();                  // ...and frame 0 is "never drawn", never a match
+    // The OTHER half of drawImageOnly, and the one that carries the first reason
+    // the stamp is at the draw: `if (d->texDirty) rebuildTexture(*d); else
+    // touchTex(*d);`. A pass over a CLEAN texture never reaches the paint at
+    // all, and the magenta is still on the screen, so the stamp has to be
+    // written anyway. Every ordinary frame after the first goes through here.
+    auto canvasRedrewCached = [&](ImageDoc& d) { histHlShown(d); };
+    // A DRAW PASS boundary. Without it every simulated pass would carry one
+    // number and a count left by the PREVIOUS mode would still look current -
+    // exactly the confusion under test, so the test has to be able to turn the
+    // page. Passes, not uiFrames (板 275 R4): a window resize draws several
+    // times inside one uiFrame. The entry value is put back at the end - one
+    // selftest home is shared by every test.
+    const uint64_t drawPass0 = app.drawPass;
+    auto nextFrame = [&]() { app.drawPass++; };
+    nextFrame();                  // ...and pass 0 is "never drawn", never a match
 
     closeAll();
     app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.selectedAnn = 0;
@@ -623,8 +647,10 @@ static int histHlSelftest() {
         fprintf(stderr, "histhlselftest: T14 narrow '%s'\n", panel4.c_str());
         check(has(panel4, "A: 1 px") && has(panel4, "B: 2 px"),
               "T14 the narrow-width fallback: the two drawn panes still answer");
-        check(!has(panel4, "C: "),
-              "T14 ...and the pane that was not drawn says NOTHING (not '3 px')");
+        check(!has(panel4, "C: 3 px"),
+              "T14 ...and the pane that was not drawn offers NO number (not '3 px')");
+        check(dimRow(panel4, "C: not on screen"),
+              "T14 ...while keeping its row, dim, saying why (板 275 R2)");
 
         // ---- T14b: the visible-pane switch, Wipe and Off -------------------
         // The switch is what makes this hard, so the group walks it: arm in
@@ -662,7 +688,7 @@ static int histHlSelftest() {
                 panel4.c_str(), app.hlCount.size());
         check(has(panel4, "A: 1 px") && has(panel4, "B: 2 px"),
               "T14b Wipe: one pane, two images, two answers");
-        const bool staleWipe = has(panel4, "C: ");
+        const bool staleWipe = has(panel4, "C: 3 px");
         app.compareMode = App::CmpOff;
         nextFrame();
         canvasDrew(*A2, p1);                     // the only pane Off draws
@@ -687,17 +713,23 @@ static int histHlSelftest() {
         // switch to Wipe, switch to Off, or widen/narrow the window so tileLayout
         // changes its mind - C's count from the last frame that drew it was still
         // in the map and the footer still printed it.
-        //   That is closed by HlCount::shownFrame: the canvas stamps the frame it
-        //   put a document on screen in (histHlShown, called from drawImageOnly),
-        //   and histHlCountShown - the ONE reader the footer, the badge and the
-        //   row count all go through - matches it against app.uiFrame. Wipe drew
-        //   A and B on this frame; C's stamp is the Split frame's and no longer
-        //   matches, so C has no line. The fixture assert above is what makes
-        //   this non-vacuous: C's line DOES appear while C is drawn.
+        //   That is closed by app.hlShown: the canvas stamps the DRAW PASS it put
+        //   a document on screen in (histHlShown, called from drawImageOnly), and
+        //   histHlCountShown - the ONE reader the footer, the badge and the row
+        //   count all go through - matches it against app.drawPass. Wipe drew A
+        //   and B in this pass; C's stamp is the Split pass's and no longer
+        //   matches, so C has no NUMBER. Its ROW stays, dim (板 275 R2). The
+        //   fixture assert above is what makes this non-vacuous: C's number DOES
+        //   appear while C is drawn.
         check(!staleWipe,
               "T14b FIXED(3) Wipe: C is not drawn, so its Split count is not printed");
-        check(!has(panel4, "C: "),
+        check(!has(panel4, "C: 3 px"),
               "T14b FIXED(3) Off: ...and the same in Off, on the same stamp");
+        // ...and it is the NUMBER that goes, not the row (板 275 R2): this panel
+        // names what it could not show rather than falling silent, and a row
+        // that came and went would move the plot above it.
+        check(dimRow(panel4, "C: not on screen"),
+              "T14b FIXED(3) ...and C keeps its row, dim, saying why");
 
         // ---- the PAINT is not the claim -----------------------------------
         // Which is why the stamp is written by the canvas and not by
@@ -715,7 +747,7 @@ static int histHlSelftest() {
         fprintf(stderr, "histhlselftest: T14b export-paint '%s'\n", panel4.c_str());
         check(has(panel4, "A: 1 px"),
               "T14b the pane the canvas drew still answers (anti-vacuity)");
-        check(!has(panel4, "C: "),
+        check(!has(panel4, "C: 3 px") && dimRow(panel4, "C: not on screen"),
               "T14b ...and a document the PAINT touched with no canvas behind it does not");
         // ...and the narrow-fallback assert above is NOT this case: there the
         // selection is armed while C is off screen, so C never had a count to go
@@ -883,8 +915,8 @@ static int histHlSelftest() {
             fprintf(stderr, "histhlselftest: T16 mismatch badge '%s'\n", mbadge.c_str());
             check(has(mpanel, "A: 1 px"),
                   "T16 dimension mismatch: the pane that IS drawn answers for itself");
-            check(!has(mpanel, "B: "),
-                  "T16 ...and a B that was never painted has no line to print");
+            check(!has(mpanel, "B: 1 px") && dimRow(mpanel, "B: not on screen"),
+                  "T16 ...and a B that was never painted has no NUMBER to print");
             // ---- FIXED(2), same predicate, the other surface ---------------
             // §9 asks that at a dimension mismatch the highlight "shows the same
             // A fallback as the canvas". The CANVAS falls back: its diffMode is
@@ -934,7 +966,7 @@ static int histHlSelftest() {
             fprintf(stderr, "histhlselftest: T16 twin mismatch badge '%s'\n", tbadge.c_str());
             check(has(tpanel, "A: 1 px (25.00% of finite R"),
                   "T16 twin: the A fallback answers for the pane that is drawn");
-            check(!has(tpanel, "B: "),
+            check(!has(tpanel, "B: 1 px") && dimRow(tpanel, "B: not on screen"),
                   "T16 twin: ...and the B painted in Split keeps its count to itself");
             check(tbadge == "highlight R 100..200 DN: 1 px (25.00% of finite R)",
                   "T16 twin: ...and the badge is about that same A, not about a limit");
@@ -944,14 +976,221 @@ static int histHlSelftest() {
         }
     }
 
+
+    // ======================================================================
+    // STAGE 5 - ONE TRUTH ABOUT WHAT IS ON SCREEN (板 275 R1-R4).
+    //
+    // Review of the first fix found that `cmpDiffComposes()` is not "what the
+    // canvas drew": hold the B key in the difference view and the canvas draws
+    // B with the magenta on it, while a badge reading the MODE went on saying
+    // "not shown in difference view" beside a footer printing "B: 2 px". The
+    // same shape as the defect that fix removed, and it broke that fix's own
+    // central claim - that the two surfaces cannot describe one frame two ways.
+    // Blink has the same root.
+    //
+    // The ruling: the truth is the STAMPED SET and every surface reads it. The
+    // badge speaks about the panes that were drawn; the footer keeps one row per
+    // SLOT, dim and numberless when that slot is not up. This group is what
+    // holds it. Each assert below was run RED first - see the PR body for the
+    // three runs and what each one failed on.
+    // ======================================================================
+    {
+        closeAll();
+        app.cmpExtra.clear();
+        app.compareMode = App::CmpOff;
+        app.histPlane = 0;
+        // A: 1 R pixel in range of 4. B: 2 of 4. SAME SIZE, so the difference
+        // view really composes - which is what makes hold-B interesting: the
+        // mode says "difference" and the canvas is showing B.
+        auto mk5 = [&](const char* nm, int n) {
+            auto d = mk(nm, 4, 4, 1, "u8");
+            d->cfa = 1; d->cfaPattern = 0;              // RGGB: R at (0,0) (2,0) (0,2) (2,2)
+            const int rx[4] = { 0, 2, 0, 2 }, ry[4] = { 0, 0, 2, 2 };
+            for (int i = 0; i < n; i++) d->px()[(size_t)ry[i] * 4 + rx[i]] = 150;
+            setRange(*d, 0, 255);
+            app.images.push_back(std::move(d));
+            return app.images.back().get();
+        };
+        ImageDoc* A5 = mk5("hl5_A", 1);
+        ImageDoc* B5 = mk5("hl5_B", 2);
+        app.current = 0;
+        const Grid g5 = gridOf(*A5);
+        HistHlRange r5 = histHlFromDrag(g5.pr, g5.pr.at(100.0f, 0), g5.pr.at(199.5f, 0),
+                                        g5.origin, g5.w);
+        std::vector<uint8_t> q1, q2;
+        auto rows = [&](const std::string& s) {     // how many footer lines the probe holds
+            if (s.empty()) return 0;
+            int n = 1;
+            for (size_t i = 0; i + 1 < s.size(); i++) if (s[i] == '|') n++;
+            return n;
+        };
+
+        // ---- T17 (R1): HOLD B in the difference view -----------------------
+        // flashB: the canvas takes its "B held" branch and draws B ALONE,
+        // painted, whatever the compare mode is. The mode still says difference,
+        // and that is exactly the trap: a badge that asks the mode says the
+        // paint is not shown while the paint is the only thing on screen.
+        histHlArm(r5.lo, r5.hi, r5.loOpen, r5.hiOpen, 0, "R");
+        app.compareMode = App::CmpDiff;
+        setCompareB(B5);
+        check(cmpDiffComposes(),
+              "T17 fixture: A and B are one shape, so the mode CAN compose a difference");
+        nextFrame();
+        canvasDrew(*B5, q2);                     // hold-B: B alone, on screen, painted
+        histFrame();
+        std::string bd = histHlBadgeSaid();
+        std::string pn = probeField("panel");
+        fprintf(stderr, "histhlselftest: T17 hold-B badge '%s'\n", bd.c_str());
+        fprintf(stderr, "histhlselftest: T17 hold-B panel '%s'\n", pn.c_str());
+        check(bd == "highlight R 100..200 DN  -  B: 2 px (50.00% of finite R)",
+              "T17 R1 hold-B: the badge reports the pane that was DRAWN, and names it B");
+        check(!has(bd, "not shown in difference view"),
+              "T17 R1 ...and does not claim the paint is unshown while it is the screen");
+        check(has(pn, "B: 2 px (50.00% of finite R, whole frame)"),
+              "T17 R1 ...the footer says the same about the same pane");
+        check(dimRow(pn, "A: not on screen") && !has(pn, "A: 1 px"),
+              "T17 R1 ...and A keeps its row, dim, with no number");
+
+        // ...and with nothing drawn at all the difference view is what IS on
+        // screen, so the stated limit comes back - one word, in both places.
+        nextFrame();
+        histFrame();
+        bd = histHlBadgeSaid();
+        pn = probeField("panel");
+        fprintf(stderr, "histhlselftest: T17 diff-only badge '%s' panel '%s'\n",
+                bd.c_str(), pn.c_str());
+        check(bd == "highlight armed - not shown in difference view",
+              "T17 R1 no pane drawn: the badge names the limit, as it always did");
+        check(dimRow(pn, "A: not shown in difference view") &&
+              dimRow(pn, "B: not shown in difference view"),
+              "T17 R1 ...and every row carries the badge's OWN word, not a number");
+
+        // ---- T18 (R2): BLINK - the rows hold still, the numbers move --------
+        // Blink shows A, then B, twice a second. Counting the drawn panes for
+        // the row count made two rows trade places 2x a second and the plot
+        // above resize under the cursor; one row per slot does not move.
+        app.compareMode = App::CmpFlip;
+        nextFrame();
+        canvasDrew(*A5, q1);                     // app.flipShowB == false
+        histFrame();
+        const std::string blinkA = probeField("panel");
+        nextFrame();
+        canvasDrew(*B5, q2);                     // ...and the other half of the blink
+        histFrame();
+        const std::string blinkB = probeField("panel");
+        const std::string blinkBadgeB = histHlBadgeSaid();
+        fprintf(stderr, "histhlselftest: T18 blink A '%s'\n", blinkA.c_str());
+        fprintf(stderr, "histhlselftest: T18 blink B '%s'\n", blinkB.c_str());
+        check(rows(blinkA) == 2 && rows(blinkB) == 2,
+              "T18 R2 blink: two slots, two rows, in BOTH halves of the cycle");
+        check(has(blinkA, "A: 1 px") && dimRow(blinkA, "B: not on screen"),
+              "T18 R2 ...the half showing A carries A's number and B's dim row");
+        check(has(blinkB, "B: 2 px") && dimRow(blinkB, "A: not on screen"),
+              "T18 R2 ...and the next half moves the NUMBER, not the rows");
+        check(blinkBadgeB == "highlight R 100..200 DN  -  B: 2 px (50.00% of finite R)",
+              "T18 R1 ...and the badge follows the pane on screen, naming it");
+
+        // ---- T19 (R3): one frame, ONE current document ---------------------
+        // The scrub bar is drawn below the canvas, so it is drawn after the
+        // canvas badge. It files its step and applyPendingSelect lands it at the
+        // frame boundary; read here in the frame's own order - badge first,
+        // footer after - so a cur() that moved in between would show up as two
+        // documents in one picture.
+        app.compareMode = App::CmpOff;
+        setCompareB(nullptr);
+        nextFrame();
+        canvasDrew(*A5, q1);
+        const std::string badgeEarly = histHlBadgeSaid();      // as drawCanvas reads it
+        app.pendingSelect = 1;                                 // ...the scrub bar files B5
+        histFrame();                                           // ...the footer, later
+        const std::string panelLate = probeField("panel");
+        fprintf(stderr, "histhlselftest: T19 badge(early) '%s'  panel(late) '%s'  cur=%d\n",
+                badgeEarly.c_str(), panelLate.c_str(), app.current);
+        check(app.current == 0,
+              "T19 R3 a filed frame step does not move cur() inside the frame");
+        check(has(badgeEarly, ": 1 px (25.00% of finite R)") &&
+              has(panelLate, "A: 1 px (25.00% of finite R"),
+              "T19 R3 ...so the badge and the footer describe ONE document");
+        applyPendingSelect();                                  // the frame boundary
+        check(app.current == 1 && app.pendingSelect == -1,
+              "T19 R3 ...and the step lands at the boundary, exactly once");
+        applyPendingSelect();
+        check(app.current == 1,
+              "T19 R3 ...and a boundary with nothing filed does nothing (anti-vacuity)");
+        app.current = 0;
+
+        // ---- T20 (R4): "this frame" is one DRAW PASS, not one uiFrame -------
+        // The window refresh / size / pos callbacks call redrawNow(), which runs
+        // the whole frame body again while the main loop's uiFrame stands still -
+        // so a resize puts several complete draws inside one uiFrame. Keyed on
+        // uiFrame, the second pass inherited the first pass's stamps and spoke
+        // for a canvas it had not drawn.
+        const uint64_t frameHeld = app.uiFrame;
+        nextFrame();
+        canvasDrew(*A5, q1);
+        histFrame();
+        check(has(probeField("panel"), "A: 1 px"),
+              "T20 fixture: the first pass drew A, and A answers");
+        nextFrame();                             // a second pass, same uiFrame...
+        histFrame();                             // ...and this one drew nothing
+        const std::string pass2 = probeField("panel");
+        fprintf(stderr, "histhlselftest: T20 pass2 (uiFrame %llu held) '%s'\n",
+                (unsigned long long)app.uiFrame, pass2.c_str());
+        check(app.uiFrame == frameHeld,
+              "T20 fixture: uiFrame did not move between the two passes");
+        check(!has(pass2, "A: 1 px") && dimRow(pass2, "A: not on screen"),
+              "T20 R4 a second pass inside one uiFrame inherits no stamps");
+
+        // ---- T21: the paint is LAZY, and the stamp outlives it -------------
+        // The FIRST reason the stamp is at the draw and not in histHlPaint.
+        // drawImageOnly repaints only when texDirty; every ordinary pass after
+        // the first reuses a texture that still carries the magenta. So a pass
+        // that only DRAWS - no renderDocRGBA at all - must still answer, or the
+        // footer would say "not painted yet" over paint the user can see.
+        nextFrame();
+        canvasDrew(*A5, q1);                     // pass 1: dirty texture, painted
+        histFrame();
+        check(has(probeField("panel"), "A: 1 px"), "T21 fixture: the painted pass answers");
+        const size_t countsBefore = app.hlCount.size();
+        nextFrame();
+        canvasRedrewCached(*A5);                 // pass 2: CLEAN texture, no paint
+        histFrame();
+        const std::string cached = probeField("panel");
+        fprintf(stderr, "histhlselftest: T21 cached-texture pass '%s'\n", cached.c_str());
+        check(has(cached, "A: 1 px (25.00% of finite R, whole frame)"),
+              "T21 a pass that DRAWS a cached texture without repainting still answers");
+        check(app.hlCount.size() == countsBefore && !has(cached, "not painted yet"),
+              "T21 ...and nothing was re-measured to make it do so");
+
+        // ---- T22 (R5): the paint cannot reach the stamp --------------------
+        // The stamp lives in app.hlShown, not in HlCount, because histHlPaint
+        // assigns a whole fresh HlCount - which used to zero a field inside it
+        // and made "no renderDocRGBA between drawCanvas and drawPanelHistogram"
+        // an invariant nothing enforced. An export paint of the SAME document
+        // the canvas drew must not un-say what the canvas said.
+        nextFrame();
+        canvasDrew(*A5, q1);
+        renderDocRGBA(*A5, q1);                  // an export, after the draw, same doc
+        histFrame();
+        const std::string afterExport = probeField("panel");
+        fprintf(stderr, "histhlselftest: T22 export-after-draw '%s'\n", afterExport.c_str());
+        check(has(afterExport, "A: 1 px (25.00% of finite R, whole frame)"),
+              "T22 R5 a paint after the draw does not erase what the canvas declared");
+
+        histHlClear();
+        app.compareMode = App::CmpOff;
+        setCompareB(nullptr);
+    }
+
     // The home is shared: leave nothing armed behind for the next test. STAGE 4
     // arms a lettered slot and injects mouse events, so the slot list and the
     // toast go back too - a C nobody armed would put a third pane on the next
-    // render test's canvas. app.uiFrame is borrowed the same way: this test
-    // turns the page on it to make "this frame" mean something, and the browse
-    // panels read it as their own "was I drawn" clock.
+    // render test's canvas. app.drawPass and app.pendingSelect are borrowed the
+    // same way: this test turns the page on the first to make "this pass" mean
+    // something, and files a request on the second.
     histHlClear();
-    app.uiFrame = uiFrame0;
+    app.drawPass = drawPass0;
+    app.pendingSelect = -1;
     app.histPlane = -1;
     app.compareMode = App::CmpOff;
     setCompareB(nullptr);

@@ -155,11 +155,18 @@ A、B (wipe/split/flip)、view export、サムネイル — 1つの規則。diff
 renderDocRGBA を通らない別経路で、画素が差であって値ではないから**塗らない**
 — ただし黙らない: diff 表示中に armed なら、canvas のバッジ (§5) が
 `not shown in difference view` を添える。語られた制限は欠陥ではない。
-ただし**「diff モード」と「diff が実際に合成された」は別**: A と B の寸法が違うと
-canvas は差分にできず A を**塗り付きで**描く (加えて amber の
-`difference needs A and B to be the same size` を出す)。その場合バッジは制限を
-言ってはならず、いま描いている A の数を言う。判定は canvas と共通の
-`cmpDiffComposes()` 1箇所 — 綴りを2つ作らない (§9 の板 275 修正)。
+ただし**「diff モード」は「diff が画面にある」ではない**。canvas が差分を描かない
+のに mode が diff のままである経路が3つある:
+- A と B の寸法が違う → 差分にできず **A を塗り付きで**描く (加えて amber の
+  `difference needs A and B to be the same size`)。
+- **Hold B** (B キー) → **B を塗り付きで**描く。
+- **blink** → A と B を交互に、どちらも塗り付きで描く。
+
+いずれもバッジは制限を言ってはならず、**いま描いているペインの数**を言う (A 以外
+なら letter を名乗る)。よって**バッジは mode を読まない。読むのは刻印された集合**
+= このパスで canvas が画面に出したペイン (`histHlShownPanes`、板 275 R1)。
+`cmpDiffComposes()` は canvas 自身が分岐を選ぶときの述語と、「差分が塗りの代わりに
+画面にある」という**語**の出どころに限る (綴りを2つ作らない)。
 
 **性能**: renderDocRGBA は 12 Mpx で ~76 ms の熱いループ。off のとき
 コスト0 (ループ外分岐)、on のとき画素あたり比較1回 + CFA ならプレーン判定。
@@ -182,7 +189,7 @@ provenance の規律に入る: 量と単位、どの対象の、どの領域を�
 プレーン別の有限画素数)、パネルとバッジは**その塗りの数を読むだけ** —
 独立に数え直す第2の実装を作らない。
 **ただし「最後の塗り」ではなく「現フレームに画面へ出た分」を読む。** 数は
-`HlCount` に、それを画面に出したフレーム番号 (`shownFrame`) と一緒に載る。刻むのは
+`App::hlShown` が「どの描画パスで画面に出したか」を uid ごとに持つ。刻むのは
 canvas の `drawImageOnly` (`histHlShown()`) で、塗りの側ではない — 塗りは
 `texDirty` のときだけ走る遅延処理で、かつ export も同じ関数を通るため。読み口は
 `histHlCountShown()` 1つ (§9 の板 275 修正)。
@@ -197,22 +204,39 @@ canvas の `drawImageOnly` (`histHlShown()`) で、塗りの側ではない — 
 - 塗りは今の画素を読むので**画素については stale が構造的に存在しない** (曲線は
   stale になるが塗りはならない — 言われた時のために書いておく)。**「画面に出て
   いるか」は別問題**で、arm も clear もせずに描くペインの集合が変わる (モード切替、
-  tileLayout の判断が変わる窓幅変更) と、正しい数が「いま画面にあるもの」では
-  なくなる。`shownFrame` がその半分を受け持つ (§9 の板 275 修正)。
+  tileLayout の判断が変わる窓幅変更、Hold B、blink) と、正しい数が「いま画面に
+  あるもの」ではなくなる。`App::hlShown` がその半分を受け持つ (§9 の板 275 修正)。
 
 **言う場所は2つ、文は1箇所で組む** (abHistXLabel と同じ理由 — selftest が
 パネルの出す文字列そのものを印字できること):
 
-1. **ヒストグラムパネルの footer** (描画される side ごとに1行 + clear ボタン):
+1. **ヒストグラムパネルの footer** — **スロットごとに1行**、armed の間は常に
+   同じ行数 (+ 先頭行に clear ボタン)。画面に出ているスロットは数を、出ていない
+   スロットは**淡色で理由**を持つ。行が出たり消えたりしない理由は §7。
    ```
    highlight R 1000..1124 DN  -  A: 1234 px (0.12% of finite R, whole frame)   [clear]
    highlight 1000..1124 DN  -  A: R 12 (0.05%) | Gr 3 (0.01%) | Gb 4 (0.02%) | B 890 (3.48%) px  (whole frame)
    highlight R >= 1000 DN  -  B: no R plane
+   highlight R 1000..1124 DN  -  C: not on screen                      ← 淡色、数なし
    ```
 2. **canvas のバッジ** (armed の間、常時)。パネルを閉じてもハイライトは
    効いている。状態説明だけが消えることを防ぐため、canvas にも常時表示する。
-   A の要約のみの短い形: `highlight R 1000..1124 DN: 1234 px (0.12%)`。
-   diff 中は `highlight armed - not shown in difference view`。
+   **バッジは「このパスで実際に描かれたペイン」について語る** — compare mode に
+   ついてではない (板 275 R1)。1枚だけ出ているならそのペインの数、A 以外なら
+   letter を名乗る。複数出ているなら区間だけ (数は footer の letter 行が持つ)。
+   1枚も出ていないなら区間と、footer の行と**同じ理由語**。
+   ```
+   highlight R 1000..1124 DN: 1234 px (0.12%)            ← A が1枚だけ出ている
+   highlight R 1000..1124 DN  -  B: 890 px (3.48%)       ← Hold B / blink で B が出ている
+   highlight R 1000..1124 DN                             ← A と B が同時に出ている
+   highlight armed - not shown in difference view        ← 差分が画面にある
+   highlight armed - not on screen                       ← canvas が描かれていない
+   highlight armed - not painted yet                     ← まだ一度も塗られていない
+   ```
+   **理由語は 3 つだけ**で、`histHlNotShownWhy()` 1箇所が組む:
+   `not shown in difference view` / `not on screen` / `not painted yet`。
+   footer の淡色行とバッジが同じ語を使うのが要点 — 2つの面が同じフレームについて
+   反対のことを言えない構造にする。
    ImGui オーバレイなので **export には入らない** — 従って export された
    PNG のマゼンタは絵の中では説明されない。これは既存の view export と同じ
    受け入れ (レンジ/ガンマ/LUT も焼き込まれて説明されない) だが、export の
@@ -241,20 +265,47 @@ canvas の `drawImageOnly` (`histHlShown()`) で、塗りの側ではない — 
 それぞれの画素へ適用し、該当画素数を side ごとに1行表示する。N 比較では
 Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対象になる。
 
-描画されない比較枠は塗られないため、画素数も表示しない。ビンから数値を導くと、
-サンプリング済みで ROI 制限を受ける別の母集団になるためである。A だけ、B だけなどの
-個別 on/off は v1 では設けない。実運用で side ごとの切り替えが必要になった場合は、
-「A の選択」「B の選択」ではなく、ペインごとの on/off として再検討する。
-ここでいう描画対象は比較 mode と layout が持つペインであり、一時的な Hold B 表示は
-ペイン構成を変更しない。
+**描画されない比較枠は塗られないため、画素数を表示しない。行そのものは消さない**
+(板 275 R2)。数を出さないのは、ビンから導くとサンプリング済みで ROI 制限を受ける
+別の母集団になるため、かつ前のモードが残した数を「いま」として見せてはならない
+ため。行を消さないのは2つの理由から:
+
+- このパネル自身の規律が「取れなかった letter はその場で名指しする」であり
+  (曲線を取れなかった slot の amber 行と同じ)、lettered slot について完全に
+  無言になるのはその規律に反する。
+- 行が出たり消えたりすると、footer の高さが変わってプロットが動く。**一時的な
+  Hold B 表示はペイン構成を変更しない**のに、行を「描かれたペインの数」で数えて
+  いた実装は B キーを押している間だけ A の行を消していた。blink は 0.5 秒ごとに
+  2行が入れ替わる。どちらも、カーソルの下でプロットが伸縮する。
+
+したがって出ていないスロットの行は**淡色 + 理由語、数なし**で残る (§5 の語彙)。
+「このパスで画面に出ているか」の判定は 1 箇所 (`histHlIsShown`) で、compare mode
+からは導かない — mode は Hold B と blink を見られない。
+
+A だけ、B だけなどの個別 on/off は v1 では設けない。実運用で side ごとの切り替えが
+必要になった場合は、「A の選択」「B の選択」ではなく、ペインごとの on/off として
+再検討する。
 
 ## 8. 置き場所
 
 - **状態**: `App::HistHighlight highlight` — state.h の HistState の隣。
   `on; float lo, hi; bool loOpen, hiOpen; int plane; char planeName[8]`
   (名前は束縛時に写す — 当てるのは名前で、番号ではない §3)。
-  数の置き場は、`renderDocRGBA` が書き、パネルが読む `App::hlCount` である。
-  uid をキーに描画済みの全 side を保持し、塗りを行うループ以外からは書き込まない。
+  数の置き場は、`renderDocRGBA` が書き、パネルとバッジが読む `App::hlCount`
+  (uid キー)。**数と「見せたパス」は別の入れ物に分ける** (板 275 R5):
+  **塗りのループが数を書き** (`hlCount`)、**描画がどのパスで見せたかを記録する**
+  (`App::hlShown`、uid → `App::drawPass`)。1つの struct に同居させると
+  `histHlPaint` の丸ごと代入が刻印を 0 に戻すので、「drawCanvas と
+  drawPanelHistogram の間で `renderDocRGBA` が走らない」が**誰も守っていない
+  不変条件**になる。分けると塗りは刻印に触れられない。読み口は
+  `histHlIsShown` / `histHlCountShown` / `histHlShownPanes` の3つだけ。
+  `App::drawPass` は**描画パスごと**に進む (`uiFrame` ごとではない — 窓の
+  refresh / size コールバックは 1 uiFrame の中で何度も全体を描き直す、板 275 R4)。
+- **フレームの境界**: 「どの文書が current か」を変えるジェスチャは
+  `App::pendingSelect` に記録し、`applyPendingSelect()` がフレーム末に適用する
+  (板 275 R3)。canvas の scrub bar は canvas のバッジより後に描かれるので、
+  その場で `selectImage` を呼ぶと**1フレームの中で 2 つの文書**について語られた。
+  不変条件: **1 フレームの中では current 文書は 1 つ**。
 - **純関数**: `histHlFromDrag(pr, a, b, origin, w) -> {b0, b1, ok}` と
   スナップ/開区間の規則 — canvas.inc の zoomRangeFromDrag の隣。マウス無しで
   selftest が写像を釘付けにできる形 (同じ理由、同じ場所)。
@@ -321,7 +372,7 @@ Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対�
   Split 値残存・difference footer の stale 値・寸法不一致時の badge 誤文の 3 件は
   現行実装の欠陥で、#273 は `histhl.inc` STAGE 4 に DEFECT(1)(2)(3) の stderr 報告
   だけを置いた (assert せず)。**修正済み (PR #277、板 275 の続き)**。裁定どおり `HlCount` に
-  フレーム番号 (`shownFrame`) を刻み、footer と badge は**現フレームに画面へ出た分
+  パス番号を刻み (`App::hlShown`)、footer と badge は**現パスに画面へ出た分
   だけ**を読む。刻むのは**塗った所ではなく描いた所**である: `renderDocRGBA` は
   `texDirty` のときだけ走る遅延処理で、かつ PNG / 動画 export も同じ関数を通るので、
   塗りに刻むと「arm の次フレームで黙る (塗りは画面に残っているのに)」と「export が
@@ -335,6 +386,25 @@ Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対�
   の順で、badge は `drawCanvas` の中で全ペインを描いた後に出る。よって刻印は両方の
   読み手より先に書かれ、**同フレームで正しい** (1フレーム遅れは mode 切替の直後
   1フレームだけ前のモードのペインを出すので、ここでは誤り)。
+- 上の修正のレビューで **P1 が1件** 出た: `cmpDiffComposes()` は「実際に描いた経路」
+  ではない。Hold B と blink は diff mode のまま B を塗り付きで描くので、mode を読む
+  バッジは同じ欠陥を別経路で残していた。**裁定 R1〜R6 で片付け済み**:
+  - **R1** 「このパスで画面に出ているもの」の真実は 1 つ = 刻印された集合。badge も
+    footer もそれを読む。badge は描かれたペインについて語り、1枚なら (A 以外は
+    letter を名乗って) その数、複数なら区間だけ、0枚なら footer と同じ理由語 (§5)。
+  - **R2** footer の letter 行は**スロットの行**で、画面に出ているかで現れ消えしない。
+    出ていないスロットは**淡色 + 理由語、数なし** (§7 に理由)。
+  - **R3** current 文書を変えるジェスチャは**フレーム境界**で効かせる
+    (`App::pendingSelect` / `applyPendingSelect()`、§8)。不変条件「1フレームの中で
+    current 文書は 1 つ」。
+  - **R4** 「このフレーム」は**1回の描画パス**。`App::drawPass` を描画パスごとに
+    進める (`uiFrame` は窓の refresh / size コールバック経由の再描画では進まない)。
+  - **R5** 刻印は塗りが上書きする構造の中に置かない。`App::hlShown` を別の map に
+    出した (§8)。
+  - **R6** §4 / §5 / §7 / §8 / §9 を実装に合わせた (この節)。
+  試験は STAGE 5 (T17 Hold B / T18 blink / T19 フレーム境界 / T20 描画パス /
+  T21 遅延塗り / T22 塗りは刻印に触れない)。R1〜R4 は fail-first — 直す前の
+  実装で赤を見てから直した。
 - T11（現行試験）: RGB 多ch + all の拒否文、個別 ch なら受理する反例、描画対象の
   ペインが拒否理由を返すこと、difference view の canvas badge が非表示理由を示す
   ことを固定する。

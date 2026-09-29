@@ -1518,6 +1518,14 @@ static bool g_watchSuppressed = false;
     // inside the callback.
     g_drawFrame = [&]() {
         double frameBodyT0 = nowSec();
+        // ONE PASS, ONE NUMBER (板 275 R4). uiFrame is bumped by the loop below,
+        // but the window refresh / size / pos callbacks call redrawNow() ->
+        // g_drawFrame() while the OS owns the thread during a resize, so a
+        // single uiFrame can contain several complete draws. Anything asking
+        // "did this happen in the pass on screen right now" counts passes: with
+        // uiFrame, a window resize made the value highlight's stamps stale
+        // INSIDE one frame and the footer fell silent over visible paint.
+        app.drawPass++;
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         if (g_injMouse.x >= 0) {            // see g_injMouse: after the backend
@@ -2199,6 +2207,12 @@ static bool g_watchSuppressed = false;
                 escProbeNote("unclaimed");
             }
         }
+        // The frame boundary for "which document is current" (板 275 R3, and
+        // applyPendingSelect's own note): a gesture that steps frames files its
+        // request, and it lands HERE - once, after every panel has spoken and
+        // before anything is rendered - so every surface in the frame above
+        // described the SAME document.
+        applyPendingSelect();
         // after every panel has had its say about the mouse: drag, resize and
         // the cursor shape along the window edges
         window_frame::endFrame();
