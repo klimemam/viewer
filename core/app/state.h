@@ -1353,11 +1353,11 @@ struct App {
         char planeName[8] = "";
     } highlight;
     // What the PAINTING loop counted, per document uid. renderDocRGBA is the
-    // ONLY writer: the histogram bins are a different POPULATION (sampled to
-    // ~1M px, and limited to the ROI when a ROI drives the panel) while the
-    // paint sees every pixel of the frame, so deriving the count from the bins
-    // would put two numbers with different denominators behind one sentence.
-    // The panel and the canvas badge only READ this.
+    // ONLY writer of the numbers: the histogram bins are a different POPULATION
+    // (sampled to ~1M px, and limited to the ROI when a ROI drives the panel)
+    // while the paint sees every pixel of the frame, so deriving the count from
+    // the bins would put two numbers with different denominators behind one
+    // sentence. The panel and the canvas badge only READ this.
     struct HlCount {
         bool painted = false;         // this document could answer at all
         std::string why;              // ...and when it could not, why, in words
@@ -1365,6 +1365,18 @@ struct App {
         int nSeries = 0;
         const char* names[4] = {};
         size_t hit[4] = {}, fin[4] = {};   // matched / finite, per plane
+        // WHICH FRAME PUT THESE PIXELS IN FRONT OF THE USER (uiFrame; 0 = never
+        // yet). The numbers above say what the paint measured; this says whether
+        // that measurement is still a statement about the screen. Without it the
+        // map is a record of "the last paint of each uid" that the footer and the
+        // badge read as "what is on screen now", and those are the same thing
+        // only until the set of drawn panes changes - 板 275, three defects, one
+        // cause. Stamped by histHlShown() at the point the canvas commits a
+        // document's pixels, NOT by the paint: the paint is lazy (a cached
+        // texture still carries the magenta, so a paint stamp would go silent
+        // one frame after arming) and the paint also runs for the PNG and video
+        // exports, which render documents that are not on screen at all.
+        uint64_t shownFrame = 0;
     };
     std::map<uint64_t, HlCount> hlCount;
 

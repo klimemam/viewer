@@ -478,8 +478,12 @@ static void drawCanvas(ImVec2 avail) {
             t.doc->texDirty = true;
     const bool split = imB && app.compareMode == App::CmpSplit && !tiled;
     const bool wipe  = imB && app.compareMode == App::CmpWipe;
-    const bool diffMode = imB && im && app.compareMode == App::CmpDiff &&
-                          imB->w == im->w && imB->h == im->h;
+    // "difference" the MODE is not "a difference is being composed": that needs
+    // two images of one shape, and at a mismatch the branches below fall through
+    // to drawing A alone. One spelling of it, in compare.inc, because the value
+    // highlight's badge has to make the same call and a second copy is how the
+    // two came to disagree (板 275 DEFECT(2)).
+    const bool diffMode = cmpDiffComposes();
     const bool flipMode = imB && app.compareMode == App::CmpFlip;
     if (flipMode && app.flipAuto) {          // alternate on its own
         double now = ImGui::GetTime();
@@ -908,6 +912,15 @@ static void drawCanvas(ImVec2 avail) {
         auto map = [&](float ix, float iy) { return mapIn(p, ix, iy); };
         if (d->texDirty) rebuildTexture(*d);
         else touchTex(*d);                 // keep it resident: it is on screen
+        // THIS is where the value highlight's count becomes a statement about
+        // the screen: the frame that put a document's pixels in front of the
+        // user writes the frame number down, and the footer and the badge print
+        // only the current frame's. After the rebuild, so a first draw stamps
+        // the count the rebuild just measured; on every later frame the cached
+        // texture still carries the magenta and this re-declares it. The
+        // alternative - stamping inside the paint - is wrong in both
+        // directions, and histHlShown's note says how.
+        histHlShown(*d);
         setFilter(*d, app.view.zoom >= 1.0f);
         ImVec2 p0 = map(0, 0), p1 = map((float)d->w, (float)d->h);
         dl->AddImage((ImTextureID)(intptr_t)d->tex, p0, p1);

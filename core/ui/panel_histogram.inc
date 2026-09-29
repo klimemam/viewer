@@ -614,11 +614,14 @@ static void drawPanelHistogram() {
         // line that appears after the layout pushes the whole footer out of the
         // bottom of the panel - which is exactly the state where the highlight
         // must not be the thing that scrolls away.
+        // Counted by the SAME rule the lines are emitted by (histHlCountShown:
+        // drawn on this frame, not merely painted once), or the layout reserves
+        // rows for letters that will not print and the footer floats.
         int hlLines = 0;
         if (app.highlight.on) {
             for (const HistSide& sd : sides)
-                if (sd.H->img && app.hlCount.count(sd.H->img->uid)) hlLines++;
-            if (!hlLines) hlLines = 1;              // the "(not painted yet)" line
+                if (histHlCountShown(sd.H->img)) hlLines++;
+            if (!hlLines) hlLines = 1;              // the one "why not" line
         }
         float footerH = ImGui::GetTextLineHeightWithSpacing() *
                             (float)(nSides + hlLines)
@@ -744,20 +747,22 @@ static void drawPanelHistogram() {
                 }
                 joined += (joined.empty() ? "" : "|") + line;
             };
-            // A line for every side whose pixels were actually PAINTED - and
-            // only those. A slot that is not drawn is not painted and makes no
-            // claim: the only way to give it a number would be to derive one
-            // from the bins, which is the sampled, possibly ROI-limited
-            // population that must never wear the same face as this count.
+            // A line for every side whose pixels are ON THE SCREEN on this
+            // frame - and only those. A slot that is not drawn makes no claim:
+            // the only way to give it a number would be to derive one from the
+            // bins, which is the sampled, possibly ROI-limited population that
+            // must never wear the same face as this count. "Was painted once"
+            // is not the test - it was, and the footer printed a Split count
+            // for a pane that Wipe had dropped (板 275 DEFECT(3)).
             for (const HistSide& sd : sides) {
                 const ImageDoc* d = sd.H->img;
-                if (!d || !app.hlCount.count(d->uid)) continue;
+                if (!histHlCountShown(d)) continue;
                 emit(head + "  -  " + histHlSideSaid(d, sd.letter));
             }
-            // Armed, but nothing has been through renderDocRGBA yet (the
-            // texture rebuild is lazy). Say the interval anyway: silence here
-            // would be the one state this feature is not allowed to have.
-            if (first) emit(head + "  -  (not painted yet)");
+            // Armed and nobody answered. Say the interval anyway, with the
+            // reason: silence here would be the one state this feature is not
+            // allowed to have, and one line is all the layout above reserved.
+            if (first) emit(head + "  -  " + histHlNothingShownWhy());
             histHlProbeSet("panel", joined);
         } else {
             histHlProbeSet("panel", "");

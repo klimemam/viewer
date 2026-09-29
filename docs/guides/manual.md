@@ -1165,7 +1165,14 @@ ROIs / Temporal に detrend のチェックボックスは付けません — �
   **Copy view (as displayed)** でも同じで、そちらは overlays の一覧にも
   `value highlight` が並びます([§2.3e](#23e-1枚をクリップボードへ--dot-by-dotと表示どおりは別物です))
 - 差分表示(A-B)は値ではなく差を描く別経路なので塗りません。armed のときは
-  バッジが `highlight armed - not shown in difference view` と言います
+  バッジが `highlight armed - not shown in difference view` と言います。
+  ただし A と B の寸法が違うと差分は作れず A がそのまま(塗り付きで)出るので、
+  そのときはバッジは制限ではなく A の数を言います
+- **申告文は「いま画面にあるペイン」の分だけ出ます**。Split で arm したあと
+  Wipe / Off / 差分に切り替えると、描かれなくなったペインの行は消えます
+  (前のモードの数を出し続けません)。誰も答えられないときは 1 行だけ理由を
+  言います — `(not painted yet)` / `(no pane on screen shows it)` /
+  `not shown in difference view`
 - セッションには保存されません(再起動で消えます)。ROI が「どこを測るか」の
   宣言なのに対し、これは手に取って覗くレンズだからです
 

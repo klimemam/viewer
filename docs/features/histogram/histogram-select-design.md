@@ -155,6 +155,11 @@ A、B (wipe/split/flip)、view export、サムネイル — 1つの規則。diff
 renderDocRGBA を通らない別経路で、画素が差であって値ではないから**塗らない**
 — ただし黙らない: diff 表示中に armed なら、canvas のバッジ (§5) が
 `not shown in difference view` を添える。語られた制限は欠陥ではない。
+ただし**「diff モード」と「diff が実際に合成された」は別**: A と B の寸法が違うと
+canvas は差分にできず A を**塗り付きで**描く (加えて amber の
+`difference needs A and B to be the same size` を出す)。その場合バッジは制限を
+言ってはならず、いま描いている A の数を言う。判定は canvas と共通の
+`cmpDiffComposes()` 1箇所 — 綴りを2つ作らない (§9 の板 275 修正)。
 
 **性能**: renderDocRGBA は 12 Mpx で ~76 ms の熱いループ。off のとき
 コスト0 (ループ外分岐)、on のとき画素あたり比較1回 + CFA ならプレーン判定。
@@ -174,8 +179,13 @@ provenance の規律に入る: 量と単位、どの対象の、どの領域を�
 違うから: ビンは ≤1M px にサンプリングされ、ROI 選択中は ROI しか見ない。
 塗りは全画素・全フレームを対象とする。同じ表示で異なる母集団の数値を示すと、
 利用者は両者を区別できない。`renderDocRGBA` が塗りながら数え（該当数と、分母になる
-プレーン別の有限画素数)、パネルとバッジは**最後の塗りの数を読むだけ** —
+プレーン別の有限画素数)、パネルとバッジは**その塗りの数を読むだけ** —
 独立に数え直す第2の実装を作らない。
+**ただし「最後の塗り」ではなく「現フレームに画面へ出た分」を読む。** 数は
+`HlCount` に、それを画面に出したフレーム番号 (`shownFrame`) と一緒に載る。刻むのは
+canvas の `drawImageOnly` (`histHlShown()`) で、塗りの側ではない — 塗りは
+`texDirty` のときだけ走る遅延処理で、かつ export も同じ関数を通るため。読み口は
+`histHlCountShown()` 1つ (§9 の板 275 修正)。
 
 - **領域は常に全フレーム。** ROI がヒストグラムを駆動していても、塗りと数は
   全フレーム (ROI 制限は §10 で断る)。パネル上部の `(selected ROI)` 表示と
@@ -184,8 +194,11 @@ provenance の規律に入る: 量と単位、どの対象の、どの領域を�
   **有限画素数** — clipLo/clipHi 行の分母の先例に合わせる。
 - **CFA の all 束縛では数はプレーン別に言う** (統計は混ぜない)。%はそのプレーン
   自身の有限画素数に対する share。
-- 塗りは今の画素を読むので**stale が構造的に存在しない** (曲線は stale に
-  なるが塗りはならない — 言われた時のために書いておく)。
+- 塗りは今の画素を読むので**画素については stale が構造的に存在しない** (曲線は
+  stale になるが塗りはならない — 言われた時のために書いておく)。**「画面に出て
+  いるか」は別問題**で、arm も clear もせずに描くペインの集合が変わる (モード切替、
+  tileLayout の判断が変わる窓幅変更) と、正しい数が「いま画面にあるもの」では
+  なくなる。`shownFrame` がその半分を受け持つ (§9 の板 275 修正)。
 
 **言う場所は2つ、文は1箇所で組む** (abHistXLabel と同じ理由 — selftest が
 パネルの出す文字列そのものを印字できること):
@@ -306,16 +319,32 @@ Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対�
   `B: no R plane` と表示する。
 - T10 の未固定範囲: phase④(PR #273)で T14 / T14b / T15 / T16 が固定。C スロットの
   Split 値残存・difference footer の stale 値・寸法不一致時の badge 誤文の 3 件は
-  現行実装の欠陥で、`histhl.inc` STAGE 4 が DEFECT(1)(2)(3) として stderr に報告
-  (assert せず)。裁定: `HlCount` に塗ったフレーム番号を刻み、footer と badge は現
-  フレーム分だけ読む。修正は板 275 の続きで別 PR。
+  現行実装の欠陥で、#273 は `histhl.inc` STAGE 4 に DEFECT(1)(2)(3) の stderr 報告
+  だけを置いた (assert せず)。**修正済み (板 275 の続き)**。裁定どおり `HlCount` に
+  フレーム番号 (`shownFrame`) を刻み、footer と badge は**現フレームに画面へ出た分
+  だけ**を読む。刻むのは**塗った所ではなく描いた所**である: `renderDocRGBA` は
+  `texDirty` のときだけ走る遅延処理で、かつ PNG / 動画 export も同じ関数を通るので、
+  塗りに刻むと「arm の次フレームで黙る (塗りは画面に残っているのに)」と「export が
+  消費中のフレームを画面と言う」の両方を踏む。canvas の `drawImageOnly` が
+  `histHlShown()` で刻み、`histHlCountShown()` が footer・badge・行数計算の唯一の
+  読み口になる。badge の difference 判定はモードをやめ、canvas と同じ 4 項述語を
+  `cmpDiffComposes()` 1箇所に寄せた (綴りを2つ作らない)。footer が誰も答えなかった
+  ときの1行は `histHlNothingShownWhy()` が badge と同じ語で言う。3 件は STAGE 4 の
+  FIXED(1)(2)(3) として assert 済みで、各 assert は mutation で較正した。
+  描画順の根拠: `core/main.cpp` の frame 本体は `drawCanvas` → `drawPanelHistogram`
+  の順で、badge は `drawCanvas` の中で全ペインを描いた後に出る。よって刻印は両方の
+  読み手より先に書かれ、**同フレームで正しい** (1フレーム遅れは mode 切替の直後
+  1フレームだけ前のモードのペインを出すので、ここでは誤り)。
 - T11（現行試験）: RGB 多ch + all の拒否文、個別 ch なら受理する反例、描画対象の
   ペインが拒否理由を返すこと、difference view の canvas badge が非表示理由を示す
   ことを固定する。
 - T11 の未固定範囲: 実際のドラッグ release が armed にせず同じ文を toast に出す
   こと、difference のパネルが古い A/B の画素数を出さないこと、寸法不一致時に
   canvas と同じ A fallback を示すこと。これらは phase④(PR #273)で T15 / T16 が
-  扱い、結果は上の T10 の段にまとめた (1件目は成立、残り 2 件は欠陥として報告)。
+  扱い、1件目は成立、残り 2 件は欠陥として報告 → 上記のとおり**修正済み**で、
+  T16 は #273 が「一度も塗られていない B は行を持たない」に改名して残した本来の版
+  (寸法の違う B を Split で塗ってから Difference に切り替える = 板 275 の(2)の
+  panel 側の双子) も assert する。
 - docs/guides/manual.md にひと節 (README は触らない)。
 
 ## 10. v1 で断ること (再訪条件つき)

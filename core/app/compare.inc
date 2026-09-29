@@ -71,6 +71,25 @@ static ImageDoc* resolveB() {
 }
 static ImageDoc* cmpB() { return app.compareMode == App::CmpOff ? nullptr : resolveB(); }
 
+// Does the difference view ACTUALLY compose a difference right now? The mode
+// alone does not decide it: a difference needs two images of one shape, and at
+// a mismatch drawCanvas falls through to drawing A - with whatever is painted
+// on it - plus the amber "difference needs A and B to be the same size".
+//
+// ONE SPELLING, because there were two and they disagreed. drawCanvas's
+// `diffMode` carried these four terms while histHlBadgeSaid tested the mode
+// alone, so at a mismatch the canvas drew A magenta and the badge said the
+// highlight was "not shown in difference view" - paint on the pixels with
+// nothing on screen explaining it, which is the one failure the value
+// highlight is not allowed to ship (板 275 DEFECT(2)). Every surface that has
+// to know what the canvas did asks here; a second spelling is the bug.
+static bool cmpDiffComposes() {
+    if (app.compareMode != App::CmpDiff) return false;
+    const ImageDoc* a = cur();
+    const ImageDoc* b = cmpB();
+    return a && b && a->w == b->w && a->h == b->h;
+}
+
 // fwd: A and B are named by their STACK wherever the two are set against each
 // other - two stacks of a series hold identically named frames
 static std::string abDocLabel(const ImageDoc* d);
@@ -1175,6 +1194,12 @@ static std::string histHlRefusalFor(const ImageDoc* im, int plane) {
 // (it happens when a texture is next drawn), which is what makes marking cheap.
 // The counts go with it - they were measured for the PREVIOUS interval, and a
 // sentence reading them afterwards would answer a question nobody asked.
+//
+// This is invalidation by INTERVAL, and it is not the whole story: the set of
+// panes the canvas draws changes with no arm and no clear (a mode switch, a
+// window resize that makes tileLayout change its mind), and a count that is
+// still correct about its pixels stops being a statement about the screen.
+// HlCount::shownFrame answers that half; see histHlShown below.
 static void histHlTouchAll() {
     app.hlCount.clear();
     for (auto& d : app.images) d->texDirty = true;
@@ -1264,6 +1289,46 @@ static void histHlPaint(ImageDoc& im, std::vector<uint8_t>& rgba) {
     app.hlCount[im.uid] = C;
 }
 
+// ---- "and it is on the screen NOW" ----------------------------------------
+// The paint above MEASURES. This pair is what turns a measurement into a
+// statement about the screen, and it is the whole of the 板 275 fix: three
+// defects, one cause - app.hlCount was a record of "the last paint of each
+// uid" that the footer and the badge read as "what is on screen now".
+//
+// WHY THE STAMP IS AT THE DRAW AND NOT AT THE PAINT. Two reasons, in opposite
+// directions, and each one alone is fatal to a paint-time stamp:
+//   - the paint is LAZY. drawImageOnly rebuilds a texture only when texDirty,
+//     so the frame after arming reuses a texture that still carries the
+//     magenta. A paint stamp would be one frame old and the footer would say
+//     "(not painted yet)" over visible paint - the feature's own forbidden
+//     failure, silence over colour.
+//   - the paint also runs where nothing is on screen. exportDocRGBA and
+//     pumpVideoExport call renderDocRGBA for documents that are not drawn (a
+//     video export walks a whole stack), so a paint stamp would have the
+//     footer report whichever frame the encoder just consumed.
+// So the canvas - the only code that knows what it put in front of the user -
+// says so, right after it has committed the pixels.
+static void histHlShown(const ImageDoc& im) {
+    auto it = app.hlCount.find(im.uid);
+    if (it != app.hlCount.end()) it->second.shownFrame = app.uiFrame;
+}
+// The count for a document AS IT IS ON SCREEN THIS FRAME, or null. SAME frame,
+// no lag: drawCanvas runs before drawPanelHistogram in the frame body
+// (core/main.cpp), and the canvas badge is emitted inside drawCanvas after
+// every pane has been drawn - so on any frame the stamp is written before
+// either surface reads it. A one-frame lag would be wrong here, not merely
+// stale: for one frame after a mode switch it would print the panes the
+// PREVIOUS mode drew, which is the defect this is removing.
+static const App::HlCount* histHlCountShown(const ImageDoc* d) {
+    if (!d || !app.highlight.on) return nullptr;
+    auto it = app.hlCount.find(d->uid);
+    if (it == app.hlCount.end()) return nullptr;
+    // uiFrame starts at 1 (core/main.cpp), so shownFrame 0 = never drawn and
+    // can never match - the same rule BrowseInstance::drawnFrame follows.
+    if (it->second.shownFrame != app.uiFrame) return nullptr;
+    return &it->second;
+}
+
 // The interval, in words. ONE builder for the panel footer, the canvas badge
 // and the export note, on abHistXLabel's rule: three surfaces must not be able
 // to say three different things about one selection.
@@ -1320,14 +1385,31 @@ static std::string histHlCountPhrase(const App::HlCount& C, const char* region) 
 }
 
 // What ONE document answered, with its letter in front. Read from the paint,
-// never re-derived: a second count wearing the same face is the trap.
+// never re-derived: a second count wearing the same face is the trap. "" when
+// this document's pixels are not on the screen on this frame - a letter that
+// is not being drawn has nothing to say, whatever it said last time.
 static std::string histHlSideSaid(const ImageDoc* d, const std::string& letter) {
-    if (!d || !app.highlight.on) return {};
-    auto it = app.hlCount.find(d->uid);
-    if (it == app.hlCount.end()) return {};
-    const App::HlCount& C = it->second;
+    const App::HlCount* Cp = histHlCountShown(d);
+    if (!Cp) return {};
+    const App::HlCount& C = *Cp;
     if (!C.painted) return letter + ": " + C.why;
     return letter + ": " + histHlCountPhrase(C, "whole frame");
+}
+
+// Armed, and not one side answered. WHY, in one line - because "armed" with no
+// number and no reason is the same silence the feature exists to remove. One
+// line, never two: the footer is sized against a fixed row count (#56).
+static std::string histHlNothingShownWhy() {
+    // The same words the canvas badge uses for the same state, deliberately:
+    // the footer and the badge are two surfaces of one frame and were caught
+    // saying opposite things about it (板 275 DEFECT(1)).
+    if (cmpDiffComposes()) return "not shown in difference view";
+    // Painted at some point since the arm, but no pane on screen carries it -
+    // a mode switch that dropped the pane, or no canvas drawn at all.
+    if (!app.hlCount.empty()) return "(no pane on screen shows it)";
+    // ...and the honest original: the texture rebuild is lazy, so on the frame
+    // the selection is armed nothing has been measured yet.
+    return "(not painted yet)";
 }
 
 // The canvas badge: A's summary, short. It exists because the panel that made
@@ -1339,16 +1421,23 @@ static std::string histHlBadgeSaid() {
     // path that never reaches renderDocRGBA - so it is not painted, and that
     // limit is spoken rather than left to be discovered. A stated limit is not
     // a defect; an unstated one is.
-    if (app.compareMode == App::CmpDiff)
+    //
+    // ...but only when it really composes one. cmpDiffComposes() is the CANVAS's
+    // own predicate, asked here instead of re-spelt: the mode alone was the bug,
+    // because at a dimension mismatch drawCanvas draws A with the magenta on it
+    // and this badge went on claiming nothing was shown (板 275 DEFECT(2)).
+    if (cmpDiffComposes())
         return "highlight armed - not shown in difference view";
     ImageDoc* a = cur();
     const std::string head = histHlRangeSaid(a ? a->dtype : std::string());
     if (!a) return head;
-    auto it = app.hlCount.find(a->uid);
-    if (it == app.hlCount.end()) return head;
-    const App::HlCount& C = it->second;
-    if (!C.painted) return head + ": " + C.why;
-    return head + ": " + histHlCountPhrase(C, nullptr);
+    // Only what THIS frame drew. A is not always the document on screen (blink
+    // shows B, B-held shows B), and the interval alone is the honest answer
+    // then: armed, and this badge has no number of its own to offer.
+    const App::HlCount* Cp = histHlCountShown(a);
+    if (!Cp) return head;
+    if (!Cp->painted) return head + ": " + Cp->why;
+    return head + ": " + histHlCountPhrase(*Cp, nullptr);
 }
 
 // upload/normalize into RGBA8 texture
