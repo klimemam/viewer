@@ -458,14 +458,29 @@ static int cjkFontSelftest() {
                 if (app.msgLog[k].text.find("no glyph in the font") != std::string::npos)
                     said = true;
             check(said, "C4 opening such a file leaves ONE line in Messages");
-            // ...and not a second one for the same name on the next sweep: a
-            // name is a property of the file, so repeating it would be noise
-            // about a fact that has not changed.
+            // ...and not a second one on the next sweep: a name is a property
+            // of the file, so repeating it would be noise about a fact that has
+            // not changed.
             const size_t after = app.msgLog.size();
             app.imagesRev++;
             undrawableReportNewDocs();
             check(app.msgLog.size() == after,
-                  "C4 ...and never again for the same name");
+                  "C4 ...and not again for the same document");
+            // ...and not for a DIFFERENT document carrying the same name
+            // either. Two assertions rather than one because two mechanisms
+            // are doing the work: documents are examined once by uid (so a
+            // loading stack does not pay for a re-scan per frame), and the
+            // SENTENCE is kept once per name. Only this case reaches the second.
+            auto d2 = std::make_unique<ImageDoc>();
+            d2->name = thai;
+            d2->src->w = 4; d2->src->h = 4; d2->src->ch = 1;
+            d2->src->dtype = "u16";
+            d2->uid = app.nextUid++;
+            app.images.push_back(std::move(d2));
+            app.imagesRev++;
+            undrawableReportNewDocs();
+            check(app.msgLog.size() == after,
+                  "C4 ...nor for another document with the same name");
         }
         app.images.clear();
         app.imagesRev = revWas;

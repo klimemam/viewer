@@ -234,23 +234,34 @@ static std::string undrawableNote(const std::string& utf8Name) {
 // on every reload would turn the log into noise about a fact that has not
 // changed. Kept by NAME rather than by uid for exactly that reason - the same
 // file reopened is the same sentence.
+// ...and each document is examined ONCE, by uid. Not merely tidiness: a stack
+// bumps imagesRev per frame as it loads, so a re-scan of the whole of
+// app.images on every bump is a sweep of n documents once per UI frame for as
+// long as the load takes - and the names are decoded code point by code point.
+// A 2000-frame stack would pay that 2000 times over for an answer that cannot
+// have changed. uid is the identity every loader assigns and is stable across a
+// reopen, which is exactly what "examined already" needs.
 static void undrawableReportNewDocs() {
     static uint64_t seenRev = (uint64_t)-1;
-    static std::vector<std::string> said;
+    static std::unordered_map<uint64_t, char> seenUid;   // uid -> examined
+    static std::vector<std::string> said;                // name -> already said
     if (app.imagesRev == seenRev) return;
     seenRev = app.imagesRev;
     if (!bakedFont()) return;
     for (const auto& d : app.images) {
         if (d->name.empty()) continue;
+        if (d->uid && !seenUid.emplace(d->uid, 1).second) continue;
         if (std::find(said.begin(), said.end(), d->name) != said.end()) continue;
         const std::string note = undrawableNote(d->name);
         if (note.empty()) continue;
         said.push_back(d->name);
         logMsg(d->name + ": " + note, true);
     }
-    // The list is per RUN and bounded by how many documents a run opens, but a
-    // batch script can open thousands - so it is capped the way msgLog is.
+    // Both lists are per RUN. A session that opens and closes folders all day
+    // would otherwise grow them without bound, so they are capped the way
+    // msgLog is: the oldest half goes, and at worst a name is said twice.
     if (said.size() > 512) said.erase(said.begin(), said.begin() + 256);
+    if (seenUid.size() > 200000) seenUid.clear();
 }
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
 // `shared` = the row's frames whose source has another holder. Counterparts
