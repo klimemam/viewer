@@ -755,6 +755,70 @@ static int asyncOpenSelftest(const std::string& root) {
               "loop");
     }
 
+    // ---- R9: §12's frame-axis plan survives the worker ----------------------
+    // The merge of two changes that landed the same week (board 222 and this
+    // one), and the one place they touch: watch-design §12's frame-axis
+    // rebuild decides its plan BEFORE a byte is re-read and applies its
+    // ARRIVALS after, and those two moments used to be two halves of one call.
+    // They are not any more, so the plan travels on App::ReloadJob::axis. If it
+    // did not, a .npy whose script wrote five frames where it had written three
+    // would come back as three, silently, with two frames of the capture
+    // outside the measurement - which is exactly the defect board 222 fixed for
+    // the synchronous door.
+    {
+        closeAll();
+        writeRel(1);
+        openPath(rel);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        check(seq != 0 && framesOfSeq(seq).size() == (size_t)RF,
+              "R9 (setup) a three-frame single-file stack");
+        // the same file, FIVE frames now
+        {
+            uint8_t nothing = 0;
+            std::vector<uint8_t> hdr = selftestNpyBytes("<u2", { 5, RH, RW }, &nothing, 0);
+            std::ofstream f(pathFromUtf8(rel), std::ios::binary);
+            f.write((const char*)hdr.data(), (std::streamsize)hdr.size());
+            std::vector<uint16_t> row((size_t)RW);
+            for (int64_t fr = 0; fr < 5; fr++)
+                for (int64_t y = 0; y < RH; y++) {
+                    for (int64_t x = 0; x < RW; x++)
+                        row[(size_t)x] = (uint16_t)((3 * 1000 + fr * 100 + y + x) & 0xffff);
+                    f.write((const char*)row.data(), (std::streamsize)(RW * 2));
+                }
+        }
+        watchReloadNow(seq, false);
+        const bool took = app.reloadJob != nullptr;
+        const bool drained = driveReload(16000, -1);
+        const std::vector<float> now = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R9 grew 3 -> 5: took=%d drained=%d "
+                        "frames=%zu px=%g/%g/%g/%g/%g\n", (int)took, (int)drained,
+                now.size(),
+                now.size() > 0 ? (double)now[0] : -1.0,
+                now.size() > 1 ? (double)now[1] : -1.0,
+                now.size() > 2 ? (double)now[2] : -1.0,
+                now.size() > 3 ? (double)now[3] : -1.0,
+                now.size() > 4 ? (double)now[4] : -1.0);
+        check(took && drained && now.size() == 5,
+              "R9 the frame-axis plan crosses the worker: F 3 -> 5 lands FIVE frames");
+        bool own = now.size() == 5;
+        for (int f = 0; f < 5 && own; f++) own = now[(size_t)f] == relPx(3, f);
+        check(own, "R9b ...each one the FILE's own frame, in the file's order");
+        // ...and the other direction, whose departures are applied BEFORE the
+        // job starts (so the items are built from what is left).
+        writeRel(2);                       // back to three frames
+        watchReloadNow(seq, false);
+        const bool drained2 = driveReload(16000, -1);
+        const std::vector<float> back = relSamples(seq);
+        fprintf(stderr, "asyncopenselftest: R9 shrank 5 -> 3: drained=%d frames=%zu "
+                        "mark=\"%s\"\n", (int)drained2, back.size(), seqReloadMark(seq));
+        check(drained2 && back.size() == (size_t)RF && back[0] == relPx(2, 0) &&
+                  back[2] == relPx(2, 2),
+              "R9c F 5 -> 3: the tail leaves and the survivors hold their own bytes");
+        check(!*seqReloadMark(seq),
+              "R9d ...and a frame that is GONE is not a frame that failed to read");
+    }
+
     closeAll();
     g_forceAsyncOpen = flagOnEntry;        // borrowed state, given back
     if (!shared.intact("asyncopenselftest")) ok = false;

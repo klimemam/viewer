@@ -34,10 +34,16 @@ static void selectImage(int idx);
 // Plain line-based text format (.vsession): view state + per-image reload recipes.
 // Rendering is separate from writing so the crash handler can keep a pre-rendered
 // copy and never has to build one while the process is already dying.
-static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
-                           int* lostMembersOut = nullptr,
-                           int* lostSetsOut = nullptr,
-                           int* lostSetRolesOut = nullptr) {
+// Fills *repOut (LossKind / SessionReport, board row 126) with what this file
+// could NOT carry. It used to be four int* out-parameters and four stderr lines,
+// which is why "what did that save lose?" had no answer a caller could ask: the
+// series numbers came back to saveSession, the derived/average/detrend numbers
+// went to stderr and nowhere else, and neither said WHICH. The counters below
+// are all still counted - they are just counted into one typed report, and the
+// one sentence about it is said by the caller (saveSession), once.
+static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
+    SessionReport local;
+    SessionReport& rep = repOut ? *repOut : local;
     f << "viewer-session 1\n";
     f << std::setprecision(9);        // 6 digits silently rounded measured values
     f << "gamma " << displayGammaText(app.dispGamma) << "\n";
@@ -168,18 +174,30 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     }
     // A derived image (a ROI montage) has no file behind it, so isSavedLine
     // drops it - correctly, since nothing could reload it. But dropping it in
-    // silence is the one thing this format does not do: say how many.
-    int derived = 0, avgs = 0;
-    for (auto& d : app.images)
-        if (d->src->path.empty()) { derived++; if (!d->avgOfPath.empty()) avgs++; }
-    if (derived)
-        fprintf(stderr, "session: %d derived image(s) not saved (no file to reload "
-                        "them from); %d of those are frame averages, whose RECIPE "
-                        "is saved instead\n", derived, avgs);
+    // silence is the one thing this format does not do: say how many, and now
+    // say WHICH. The two kinds of COMPUTED pixels are not counted here - a frame
+    // average (avgOfPath) and a detrend product's frames (the stack carries the
+    // recipe) both have their own line below, and that is where the writer knows
+    // whether the recipe could be written at all. What is left in this loop is
+    // the picture with no file AND no derivation: a ROI montage.
+    for (auto& d : app.images) {
+        if (!d->src->path.empty() || !d->avgOfPath.empty()) continue;
+        const App::SeqInfo* psq = d->seqId != 0 ? seqInfo(d->seqId) : nullptr;
+        if (psq && psq->dt.made()) continue;         // a detrend product: see below
+        rep.note(LK_NoFile, d->name);
+    }
     for (auto& d : app.images) {
         // Sequences: one line per STACK (the frame that stack was left on), not
         // one per frame - and not only the stack that happens to be on screen.
         if (!isSavedLine(d.get())) continue;
+        rep.docs++;               // one `image` line: what the report counts as a doc
+        // A remote frame over the preview threshold is on screen as a DECIMATED
+        // tile, and what the line below carries is its url: the load re-fetches,
+        // so the pixels that come back are not the pixels that were being looked
+        // at (and a crop taken on them is deferred - see LK_CropDeferred on the
+        // load side). Detected, not guessed: remoteStep is the same field
+        // srcShareable refuses a preview by.
+        if (d->src->remoteStep > 1) rep.note(LK_RemotePreview, d->name);
         if (!d->src->member.empty()) f << "member " << d->src->member << "\n";
         // A Reader and a Viewer-NPZ both materialise reserved `__pixels_N`
         // members, locally and remotely.  The member name therefore cannot tell
@@ -207,6 +225,12 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         if (d->src->member.rfind("__pixels_", 0) == 0 && !npzIssuer) {
             const std::string rh = readerFor(d->src->path);
             if (!rh.empty()) f << "readerhint " << rh << "\n";
+            // ...and when it does NOT: the memo is a bounded LRU, so a session
+            // written on a machine that has forgotten cannot even name what made
+            // these pixels, and #179 C forbids running a reader from a session
+            // anyway. That is a real thing this file cannot carry, known exactly
+            // here, and it used to be carried in silence.
+            else rep.note(LK_ReaderNoMemo, d->name);
         }
         // §3.3: the reading is the user's declaration and it sticks across
         // sessions. ADDITIVE, and written only when there IS a declaration - an
@@ -252,7 +276,50 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // seqLoadingId is the durable marker: it stays on this stack until
             // the stack is closed or the next load starts - and by then the
             // siblings are integrated and !inFile carries the line instead.
-            if (!inFile || (app.seqLoadingId != 0 && d->seqId == app.seqLoadingId))
+            // ---- an EXPLICIT membership, written out (§5.2, board row 267) ----
+            // BEFORE seqload, deliberately: the reader acts on `seqload` the
+            // moment it reads it (it queues the rescan, or for a peer folder it
+            // attaches the stack there and then), so a member list arriving
+            // afterwards would have nothing left to change. `stackmember` is an
+            // additive key, so an older viewer skips these lines and restores
+            // exactly as it does today - the folder rescan, degraded but open,
+            // which is why `seqload 1` is still written below either way.
+            //
+            // WHICH stacks get them: the ones whose membership is a DECISION and
+            // not a rule. SeqInfo::ruleDir/ruleHead is that question already
+            // answered, at mint time, by RUNNING the rule (watch-design §6) -
+            // empty means findSequenceSiblings did not reproduce this member
+            // list, i.e. a derived subset, a hand-picked open, a stack spanning
+            // two folders. Without this block such a stack came back as "every
+            // sibling in the folder, wearing the derived stack's name" (§5.1's
+            // recorded defect): the frames the user excluded were re-admitted,
+            // and the next autosave froze that as the truth.
+            //
+            // LOCAL only. A peer folder stack's membership is re-derived from the
+            // peer's own grouper on restore (PR #117's accepted behaviour), and
+            // freezing a list of urls here would claim a membership the reader
+            // does not honour - a file that lies is worse than one that says
+            // less. Left as a caveat rather than half-done.
+            bool explicitMembers = false;
+            if (!inFile && !hasUrlScheme(d->src->path)) {
+                const App::SeqInfo* msq = seqInfo(d->seqId);
+                const std::vector<int> mfr = framesOfSeq(d->seqId);
+                // ruleDir empty = explicit. mfr.size() >= 2 is the same floor the
+                // reader applies (a one-member "stack" is not one), and it also
+                // keeps the mid-load window out: a stack whose siblings have not
+                // been integrated yet would freeze itself down to its head.
+                if (msq && msq->ruleDir.empty() && mfr.size() >= 2) {
+                    explicitMembers = true;
+                    for (int idx : mfr)            // framesOfSeq is in seqIndex order
+                        f << "stackmember " << app.images[idx]->seqIndex << " "
+                          << app.images[idx]->src->path << "\n";   // path last: spaces
+                }
+            }
+            // explicitMembers implies !inFile, so the member list always has a
+            // seqload after it to be consumed by. Stated rather than assumed,
+            // because a member list nothing consumes would be read by nobody.
+            if (!inFile || explicitMembers ||
+                (app.seqLoadingId != 0 && d->seqId == app.seqLoadingId))
                 f << "seqload 1\n";
             // AFTER seqload: for a folder stack the SeqInfo only exists once the
             // rescan ran, and a name applied before that lands on nothing. The
@@ -277,8 +344,23 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             // a lone image - taking its series member down with it, because a
             // member resolves through a stack. "seqload 1" is exactly the
             // request that is still outstanding; ask for it again.
-            for (const auto& r : app.seqRestore)
-                if (r.uid == d->uid) { f << "seqload 1\n"; break; }
+            //
+            // ...and if the outstanding request carries an EXPLICIT membership,
+            // ask for THAT again and not for a rescan. Same window, same class
+            // of bug as the seriesRestore block further down: Ctrl+S, the 0.4 s
+            // crash snapshot, the debounced autosave and the autosave on quit
+            // are all live while a restore is still queued, and a save inside it
+            // that fell back to "seqload 1" alone would re-derive the membership
+            // from the folder next time - silently re-admitting the frames the
+            // user excluded, and freezing that as the truth.
+            for (const auto& r : app.seqRestore) {
+                if (r.uid != d->uid) continue;
+                if (r.explicitMembers)
+                    for (size_t k = 0; k < r.files.size(); k++)
+                        f << "stackmember " << k << " " << r.files[k] << "\n";
+                f << "seqload 1\n";
+                break;
+            }
         }
     }
     // ---- computed frames: the RECIPE, never the pixels ----------------------
@@ -295,14 +377,21 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // worse still - the session would reload frame 0 from disk and hand it back
     // under the name "frame average", with the note that said otherwise gone.
     // A computed frame either comes back computed or does not come back.
-    int avgLost = 0;
     for (auto& d : app.images) {
         if (d->avgOfPath.empty()) continue;
         bool live = false;                    // its stack must still be open, or
         for (auto& o : app.images)            // there is nothing left to average
             if (o->seqId != 0 && o->src->path == d->avgOfPath &&
                 o->src->member == d->avgOfMember) { live = true; break; }
-        if (!live) { avgLost++; continue; }
+        // LK_ComputedGone vs LK_ComputedPixels: the difference is whether the
+        // recipe can be written at all. With the source stack closed there is
+        // nothing left to fold and the picture does not come back; with it open
+        // the recipe travels and the PIXELS still do not, which is the smaller
+        // loss and a real one - the restore recomputes over today's disk, and
+        // §10.2's generation record is what lets it SAY whether that was still
+        // the same picture.
+        if (!live) { rep.note(LK_ComputedGone, d->name); continue; }
+        rep.note(LK_ComputedPixels, d->name);
         // Two keys, not one key plus a flag: an older viewer skips lines it
         // does not know (the series block's rule), so a sum saved here simply
         // does not come back there - which is the right failure. A flag on the
@@ -333,9 +422,6 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             f << gb << d->avgWhen << "\n";          // timestamp last: has spaces
         }
     }
-    if (avgLost)
-        fprintf(stderr, "session: %d frame average(s) whose source stack is closed - "
-                        "not saved, because the frames they averaged are gone\n", avgLost);
     // ---- preprocessor products: the RECIPE, for the same reason -------------
     // docs/analysis-layers.md §5 raised the frame average's rule to the rule for
     // every AnalysisPreProcessor product: no file, so the session carries the
@@ -346,15 +432,18 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // The four numbers before the path are the spec, spelled out rather than
     // packed: a session that could not say WHICH surface was removed would
     // bring the stack back under a name claiming a band it might not have.
-    int dtLost = 0;
     for (const auto& s : app.seqs) {
         if (!s.dt.made()) continue;
-        if (s.dt.ofPath.empty()) { dtLost++; continue; }
+        if (s.dt.ofPath.empty()) { rep.note(LK_ComputedGone, s.name); continue; }
         bool live = false;
         for (auto& o : app.images)
             if (o->seqId != 0 && o->src->path == s.dt.ofPath &&
                 o->src->member == s.dt.ofMember) { live = true; break; }
-        if (!live) { dtLost++; continue; }
+        // The frame average's two kinds, applied to the other computed stack:
+        // no source stack open = not even the recipe (LK_ComputedGone); source
+        // open = the recipe travels and the pixels are recomputed.
+        if (!live) { rep.note(LK_ComputedGone, s.name); continue; }
+        rep.note(LK_ComputedPixels, s.name);
         f << "detrend " << s.dt.spec.method << " " << s.dt.spec.degree << " "
           << s.dt.spec.block << " " << (s.dt.spec.divide ? 1 : 0) << " "
           << s.dt.ofPath << "\n";                   // path last: may contain spaces
@@ -363,10 +452,6 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         // node), so the session owns the name the way seqname does.
         f << "detrendname " << s.name << "\n";
     }
-    if (dtLost)
-        fprintf(stderr, "session: %d detrend product(s) whose source stack is closed - "
-                        "not saved, because the frames they were computed from are gone\n",
-                dtLost);
     // ---- series (系列), after the image lines -------------------------------
     // A FLAT block with unique keys, on purpose: an older viewer skips every
     // line it does not know and still opens the session, and this one opens a
@@ -378,14 +463,17 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // what the session already proves it can round-trip: it is how the image
     // lines themselves work. (seqname itself DOES survive now - it rides on
     // the queued App::SeqRestore entry - but that does not make it a key.)
-    int lostSeries = 0, lostMembers = 0;
     for (const auto& S : app.series) {
         std::string bn = batchNameOf(S.batchId);
         // no batch, nothing to restore it into - and nothing silently: the load
         // side counts every member it cannot resolve, so the save side owes the
         // same. A series that leaves the file is a sweep's worth of hand-typed
         // parameter values gone.
-        if (bn.empty()) { lostSeries++; lostMembers += (int)S.members.size(); continue; }
+        if (bn.empty()) {
+            rep.note(LK_SeriesUnwritable, S.name);
+            for (size_t k = 0; k < S.members.size(); k++) rep.note(LK_SeriesMember, S.name);
+            continue;
+        }
         f << "series " << S.name << "\n";              // name last on its line: spaces
         f << "seriesbatch " << bn << "\n";             // by NAME, like imgbatch
         f << "seriesparam " << S.paramName << "\n";
@@ -402,7 +490,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             std::string path, member;
             if (m.seqId != 0) {
                 std::vector<int> fr = framesOfSeq(m.seqId);
-                if (fr.empty()) { lostMembers++; continue; }
+                if (fr.empty()) { rep.note(LK_SeriesMember, S.name); continue; }
                 path = app.images[fr.front()]->src->path;
                 member = app.images[fr.front()]->src->member;
                 if (m.fold == FOLD_SUM) key2 = "seriessum ";
@@ -410,7 +498,10 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                 // a computed frame (frame average) has no file, so it cannot
                 // be written - counted, like every loss this format admits to
                 const ImageDoc* fd = frameMemberDoc(m.frameUid);
-                if (!fd || fd->src->path.empty()) { lostMembers++; continue; }
+                if (!fd || fd->src->path.empty()) {
+                    rep.note(LK_SeriesMember, S.name);
+                    continue;
+                }
                 path = fd->src->path;
                 member = fd->src->member;
                 key2 = "seriesframe ";
@@ -439,10 +530,11 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // VERBATIM: SeriesRestore holds exactly the fields this format has, members
     // by path included.
     for (const auto& R : app.seriesRestore) {
-        lostMembers += R.truncated;      // unreadable in, unwritable out
+        for (int t = 0; t < R.truncated; t++)   // unreadable in, unwritable out
+            rep.note(LK_SeriesMember, R.name);
         if (R.batchName.empty() || R.members.empty()) {
-            lostSeries++;
-            lostMembers += (int)R.members.size();
+            rep.note(LK_SeriesUnwritable, R.name);
+            for (size_t k = 0; k < R.members.size(); k++) rep.note(LK_SeriesMember, R.name);
             continue;
         }
         f << "series " << R.name << "\n";
@@ -465,30 +557,28 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     // of frames that do not exist yet. Counted, so the toast warns instead of
     // reading clean - which is the whole point of these counters.
     for (const auto& P : app.seriesPending) {
-        lostSeries++;
-        lostMembers += (int)P.members.size();
+        rep.note(LK_SeriesUnwritable, P.name);
+        for (size_t k = 0; k < P.members.size(); k++) rep.note(LK_SeriesMember, P.name);
     }
     // Legacy per-stack levels waiting on the same drain gate are in the same
     // position: not writable in this format (their stacks do not exist yet),
     // so they must at least be COUNTED, or a save in their window reads clean
     // while destroying every declared level.
     if (!app.seqLevelLegacy.empty()) {
-        lostSeries++;
-        lostMembers += (int)app.seqLevelLegacy.size();
+        rep.note(LK_SeriesUnwritable, "legacy per-stack levels");
+        for (size_t k = 0; k < app.seqLevelLegacy.size(); k++)
+            rep.note(LK_SeriesMember, "legacy per-stack level");
     }
-    if (lostSeries || lostMembers)
-        fprintf(stderr, "series: NOT saved: %d series and %d member(s) had nothing to "
-                        "restore them from\n", lostSeries, lostMembers);
-    if (lostSeriesOut) *lostSeriesOut = lostSeries;
-    if (lostMembersOut) *lostMembersOut = lostMembers;
     // ---- analysis sets (docs/features/adapters/reader-analysisset.md §5), AFTER the series ----
     // blocks: a set may bind a series, and the referenced side writes first.
     // The four rules are the series block's, by name (§5): flat unique keys;
     // members travel by first-frame path (stack) / path (frame) / (batch,
     // series name); what cannot be resolved is COUNTED; and the pending
     // blocks below round-trip verbatim while the restore is still waiting.
-    int lostSets = 0, lostSetRoles = 0;
-    auto writeSetRole = [&](const App::ASetRole& r) {
+    // The set NAME is a parameter and not a capture: the report names what it
+    // counted (a bare "1 role binding that could not be saved" cannot be acted
+    // on), and the roles of every set go through this one lambda.
+    auto writeSetRole = [&](const App::ASetRole& r, const std::string& setName) {
         if (r.seqId != 0) {
             std::vector<int> fr = framesOfSeq(r.seqId);
             const std::string p = fr.empty() ? std::string()
@@ -496,7 +586,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
             if (p.empty()) {          // computed pixels: nothing reloads them
                 f << "setrole " << r.role << " unbound the bound member has no "
                      "file to come back from\n";
-                lostSetRoles++;
+                rep.note(LK_SetRoleUnbound, setName + " / " + r.role);
                 return;
             }
             f << "setrole " << r.role << " stack "
@@ -509,7 +599,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                     if (d->src->path.empty()) {
                         f << "setrole " << r.role << " unbound the bound member "
                              "has no file to come back from\n";
-                        lostSetRoles++;
+                        rep.note(LK_SetRoleUnbound, setName + " / " + r.role);
                         return;
                     }
                     f << "setrole " << r.role << " frame " << batchNameOf(d->batchId)
@@ -517,7 +607,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                     return;
                 }
             f << "setrole " << r.role << " unbound the bound frame is gone\n";
-            lostSetRoles++;
+            rep.note(LK_SetRoleUnbound, setName + " / " + r.role);
             return;
         }
         if (r.seriesId != 0) {
@@ -528,7 +618,7 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
                     return;
                 }
             f << "setrole " << r.role << " unbound the bound series is gone\n";
-            lostSetRoles++;
+            rep.note(LK_SetRoleUnbound, setName + " / " + r.role);
             return;
         }
         // unbound roles are WRITTEN (§5.1): the declaration is a record, and
@@ -538,22 +628,28 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
     };
     for (const auto& S : app.analysisSets) {
         std::string bn = batchNameOf(S.batchId);
-        if (bn.empty()) { lostSets++; lostSetRoles += (int)S.roles.size(); continue; }
+        if (bn.empty()) {
+            rep.note(LK_SetUnwritable, S.name);
+            for (const auto& r : S.roles)
+                rep.note(LK_SetRoleUnbound, S.name + " / " + r.role);
+            continue;
+        }
         f << "analysisset " << S.name << "\n";
         f << "setbatch " << bn << "\n";
         if (!S.readerSpec.empty()) f << "setreader " << S.readerSpec << "\n";
         if (!S.origin.empty())     f << "setorigin " << S.origin << "\n";
-        for (const auto& r : S.roles) writeSetRole(r);
+        for (const auto& r : S.roles) writeSetRole(r, S.name);
         f << "setend\n";
     }
     // Blocks still waiting for their stacks write back VERBATIM (§5 rule 4 -
     // the seriesRestore precedent above, and the same window: the autosave and
     // the crash snapshot are both live while a restore is still draining).
     for (const auto& R : app.aSetRestore) {
-        lostSetRoles += R.truncated;
+        for (int t = 0; t < R.truncated; t++) rep.note(LK_SetRoleUnbound, R.name);
         if (R.batchName.empty()) {
-            lostSets++;
-            lostSetRoles += (int)R.roles.size();
+            rep.note(LK_SetUnwritable, R.name);
+            for (const auto& rr : R.roles)
+                rep.note(LK_SetRoleUnbound, R.name + " / " + rr.role);
             continue;
         }
         f << "analysisset " << R.name << "\n";
@@ -569,11 +665,6 @@ static void writeSessionTo(std::ostream& f, int* lostSeriesOut = nullptr,
         }
         f << "setend\n";
     }
-    if (lostSets || lostSetRoles)
-        fprintf(stderr, "analysisset: NOT saved whole: %d set(s) and %d role(s) "
-                        "had nothing to restore them from\n", lostSets, lostSetRoles);
-    if (lostSetsOut) *lostSetsOut = lostSets;
-    if (lostSetRolesOut) *lostSetRolesOut = lostSetRoles;
     for (const auto& a : app.anns)   // label last: may contain spaces
         f << "ann " << a.type << " " << a.x << " " << a.y << " " << a.w << " " << a.h << " "
           << a.color << " " << (a.visible ? 1 : 0) << " "
@@ -710,39 +801,59 @@ static bool writeFileAtomically(const std::string& utf8Path,
 static bool releaseCrashFileFor(const std::string& path);   // fwd
 static void retakeCrashFile();                              // fwd
 
-static void saveSession(std::string path, bool quiet = false) {
+// reportOut, when given, receives the SessionReport this save produced - the
+// counts and the first few names per LossKind. Callers that only want the file
+// written pass nothing and get the sentence in the toast / the Messages log,
+// which is where it belongs: ONE sentence per save, not four stderr lines and
+// two parenthesised clauses.
+static void saveSession(std::string path, bool quiet = false,
+                        SessionReport* reportOut = nullptr) {
     // A saved session has no transients - but the way to honour that is to
     // leave the preview OUT of the file (isSavedLine), not to promote it into
     // a real open behind the user's back.
     if (path.find('.') == std::string::npos) path += ".vsession";
-    int lostSeries = 0, lostMembers = 0, lostSets = 0, lostSetRoles = 0;
+    SessionReport rep;
     bool retake = releaseCrashFileFor(path);
     std::string why;
     bool ok = writeFileAtomically(path, [&](std::ostream& f) {
-        writeSessionTo(f, &lostSeries, &lostMembers, &lostSets, &lostSetRoles);
+        writeSessionTo(f, &rep);
     }, &why);
     if (retake) retakeCrashFile();
+    if (reportOut) *reportOut = rep;
     if (!ok) {
         // The news is not that a write failed; it is that nothing was lost by
         // it - the file they had is still the file they have. The autosave says
         // it in the Messages log instead of a toast: it runs every few seconds
         // with nobody watching, and logMsg drops a repeat of the line it just
         // wrote, so a disk that stays full says this once and not forever.
+        //
+        // The report is NOT spoken here, and that is deliberate: nothing was
+        // written, so nothing was lost, and reading out a list of things this
+        // file would not have carried would be the one message that could make
+        // a failed save sound like a successful lossy one.
         std::string msg = "session NOT saved: " + why + " - the previous " +
                           baseName(path) + " is unchanged";
         if (quiet) logMsg(msg, true); else toast(msg, true);
         return;
     }
-    if (quiet) return;
-    std::string msg = "session saved: " + baseName(path);
-    // the load side counts what it could not restore; so does this one now
-    if (lostSeries || lostMembers)
-        msg += " (" + std::to_string(lostSeries) + " series and " +
-               std::to_string(lostMembers) + " series member(s) could NOT be saved)";
-    if (lostSets || lostSetRoles)
-        msg += " (" + std::to_string(lostSets) + " set(s) and " +
-               std::to_string(lostSetRoles) + " role binding(s) could NOT be saved)";
-    toast(msg, lostSeries > 0 || lostMembers > 0 || lostSets > 0 || lostSetRoles > 0);
+    // stderr gets it whether or not anybody is watching a window: it is what a
+    // scripted run, a CI log and a bug report have. It carries the NAMES.
+    const std::string det = rep.detail("not round-trippable");
+    if (!det.empty()) fprintf(stderr, "session: %s\n", det.c_str());
+    // "session saved: keepme.vsession - 12 doc(s) - 2 not round-trippable:
+    //  1 computed frame (recipe saved, pixels recomputed), 1 remote preview"
+    std::string msg = "session saved: " + baseName(path) + " - " +
+                      std::to_string(rep.docs) + " doc(s)";
+    if (!det.empty()) msg += " - " + det;
+    // The autosave runs every few seconds with nobody watching, so it does not
+    // get a toast - but a loss is not nothing, and the Messages log is where it
+    // can still be read afterwards. logMsg drops an immediate repeat, so an
+    // unchanged session says this once and not once per autosave.
+    if (quiet) {
+        if (!det.empty()) logMsg(msg, true);
+        return;
+    }
+    toast(msg, rep.lost() > 0);
 }
 
 static std::string loadNpy(const std::string& path, int npyRead,
@@ -1029,6 +1140,7 @@ struct PrefsBase {
     bool compactUi = true;
     bool dragPans = false, wheelZoomPlain = false, fitOnSwitch = false;
     bool watchEnabled = true, watchAutoReload = false;
+    int watchIntervalSec = 5;            // board row 297
     int seqLoadMode = 0;
     int folderScanDepth = 6;
     bool showFps = false;
@@ -1080,6 +1192,7 @@ static void capturePrefsBase() {
     g_prefsBase.fitOnSwitch = app.fitOnSwitch;
     g_prefsBase.watchEnabled = app.watchEnabled;
     g_prefsBase.watchAutoReload = app.watchAutoReload;
+    g_prefsBase.watchIntervalSec = app.watchIntervalSec;
     g_prefsBase.seqLoadMode = app.seqLoadMode;
     g_prefsBase.folderScanDepth = app.folderScanDepth;
     g_prefsBase.showFps = app.showFps;
@@ -1115,6 +1228,7 @@ static void writePrefsTo(std::ostream& f) {
     f << "fitonswitch " << (P.fitOnSwitch ? 1 : 0) << "\n";
     f << "watchfiles " << (P.watchEnabled ? 1 : 0) << "\n";
     f << "watchauto " << (P.watchAutoReload ? 1 : 0) << "\n";
+    f << "watchinterval " << P.watchIntervalSec << "\n";
     f << "seqload " << P.seqLoadMode << "\n";
     f << "scandepth " << P.folderScanDepth << "\n";
     f << "showfps " << (P.showFps ? 1 : 0) << "\n";
@@ -1250,6 +1364,14 @@ static void loadPrefs() {
         // in-class default (OFF) is what an upgrading user gets - which is the
         // only answer: nobody has opted in to anything by upgrading.
         else if (key == "watchauto")   { ls >> v; app.watchAutoReload = v != 0; }
+        // Board row 297. Read RAW and NOT clamped here, for scandepth's reason
+        // below: watchPollSeconds() (core/app/state.h) is the one reader and the
+        // one place the window is enforced, so a prefs.txt somebody hand-edited
+        // to 0 is kept as 0 in the panel's own row - where it can be seen and
+        // corrected - while the worker still waits a sane interval. A prefs.txt
+        // written before this key existed has no such line, so an upgrading user
+        // gets the in-class default of 5, which is the interval that shipped.
+        else if (key == "watchinterval") { ls >> app.watchIntervalSec; }
         else if (key == "seqload")     { ls >> app.seqLoadMode; }
         // #204. Read RAW, and not clamped here on purpose: scanDepthBelow()
         // (core/app/state.h) is the one reader and the one place the window is
@@ -2620,7 +2742,13 @@ static void pumpRestoreWaits() {
     }
 }
 
-static std::string loadSession(const std::string& path) {
+// reportOut, when given, receives the SessionReport for this LOAD: what the
+// file asked for that the restore could not do (board row 126). The two toasts
+// at the bottom of this function used to be the whole of it, and neither could
+// be asked for by a caller.
+static std::string loadSession(const std::string& path,
+                              SessionReport* reportOut = nullptr) {
+    SessionReport rep;
     std::vector<uint8_t> buf;
     if (!readFileBytes(path, buf)) return "cannot read session file";
     std::string text((const char*)buf.data(), buf.size());
@@ -2646,6 +2774,15 @@ static std::string loadSession(const std::string& path) {
     app.selectedAnn = 0;
     app.annRev++;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
+    // The member list a `stackmember` block is accumulating for the NEXT
+    // `seqload` line (docs/reference-design.md §5.2, board row 267). Read
+    // BEFORE seqload, because seqload acts the moment it is read - it queues the
+    // rescan, or for a peer folder attaches the stack there and then - so a
+    // member list arriving after it would have nothing left to change.
+    // (seqIndex, path); sorted by seqIndex when it is consumed, so the order the
+    // stack comes back in is the order it was saved in and not the order the
+    // lines happen to sit in.
+    std::vector<std::pair<int, std::string>> pendingMembers;
     // ...and the other loss this file can suffer: the image line opened, but
     // the STACK around it could not be rebuilt, so what came back is one frame
     // where the session recorded many. Counted separately because it is a
@@ -3023,6 +3160,7 @@ static std::string loadSession(const std::string& path) {
                 }
                 if (bad || vals.empty()) {
                     fprintf(stderr, "session: seqaxisvals unreadable - x axis dropped\n");
+                    rep.note(LK_LineRejected, "seqaxisvals");
                     if (si2) si2->axisVals.clear(); else sr->axisVals.clear();
                 } else if (si2) si2->axisVals = std::move(vals);
                 else sr->axisVals = std::move(vals);
@@ -3227,17 +3365,84 @@ static std::string loadSession(const std::string& path) {
                 // simply not among the frames that existed when the line was
                 // read, the loop matched nothing, and the stack came back on
                 // frame 0 with nothing said (verify-matrix G5).
-                if (!found) parkRestoreWait(*cur(), want);
+                if (!found) {
+                    parkRestoreWait(*cur(), want);
+                    rep.note(LK_CropDeferred, cur()->name + ": frame " +
+                                              std::to_string(want) + " not here yet");
+                }
             }
+        }
+        // ---- an EXPLICIT membership, read back (§5.2, board row 267) -------
+        // A stack whose membership was a DECISION (a derived subset, a
+        // hand-picked open, a stack spanning two folders) used to come back as
+        // "every sibling in the folder, wearing that stack's name": the writer
+        // recorded no member list, so the reader's only move was the rescan, and
+        // the frames the user excluded were re-admitted. These lines are that
+        // list. They must be followed by the `seqload` that consumes them; a
+        // block with no seqload after it is dropped by the reset at the end of
+        // the image line, which is the same rule `member` and `readerhint`
+        // already live by (one image line, one qualifier).
+        else if (key == "stackmember") {
+            int at = -1;
+            ls >> at;
+            std::string mp = restOfLine(ls);
+            if (at >= 0 && !mp.empty()) pendingMembers.emplace_back(at, mp);
+            else rep.note(LK_LineRejected, "stackmember");
         }
         else if (key == "seqload") {   // applies to the image loaded just above
             int on = 0; ls >> on;
+            // Whatever `stackmember` block led up to this line, taken now: one
+            // seqload consumes one list, and a list left over must not drift
+            // onto the next stack (the `member` / `readerhint` rule).
+            std::vector<std::pair<int, std::string>> mine;
+            mine.swap(pendingMembers);
+            std::sort(mine.begin(), mine.end());   // by saved seqIndex
             // only if that image actually loaded, and not when it is already a
             // stack (an in-file frame axis) - that would split it in two
             if (on && lastImageOk && cur() && !cur()->src->path.empty() && cur()->seqId == 0) {
                 const std::string p = cur()->src->path;
                 const bool isRemote = hasUrlScheme(p);
-                if (isRemote) {
+                // An EXPLICIT membership: the file says which frames this stack
+                // is, so no rule is re-applied. Local only, because the writer
+                // only writes these for a local stack (a peer folder stack's
+                // membership is re-derived from the peer's own grouper, PR #117);
+                // a list that arrived for a remote stack is refused out loud
+                // rather than half-honoured.
+                std::vector<std::string> explicitFiles;
+                if (mine.size() >= 2) {
+                    if (isRemote) {
+                        rep.note(LK_LineRejected,
+                                 baseName(p) + ": an explicit membership on a remote "
+                                               "stack is not restored");
+                    } else {
+                        for (const auto& mm : mine) explicitFiles.push_back(mm.second);
+                        // The head this line opened has to BE one of them, or the
+                        // list is about some other stack and startSequenceLoad
+                        // would silently put the head at index 0.
+                        bool head = false;
+                        for (const std::string& ef : explicitFiles)
+                            if (ef == p) { head = true; break; }
+                        if (!head) {
+                            explicitFiles.clear();
+                            rep.note(LK_LineRejected,
+                                     baseName(p) + ": its stackmember list does not "
+                                                   "contain it");
+                        }
+                    }
+                } else if (mine.size() == 1) {
+                    // one member is not a stack; refusing it out loud beats
+                    // restoring a "stack" of one frame from a file that meant N
+                    rep.note(LK_LineRejected,
+                             baseName(p) + ": a one-member stackmember list");
+                }
+                if (!explicitFiles.empty()) {
+                    // No pattern: an explicit list has no folder rule to name it
+                    // by, and `seqname` (which the writer emits for every named
+                    // stack) carries the display name onto the queued entry the
+                    // way it already does for a rescan.
+                    app.seqRestore.push_back({ cur()->uid, std::move(explicitFiles),
+                                               std::string(), {}, {}, {}, {}, true });
+                } else if (isRemote) {
                     // A folder stack whose frames live on a peer. Its siblings
                     // are a LISTING, and findSequenceSiblings below walks THIS
                     // filesystem: handed a url it returns nothing, so this
@@ -3286,8 +3491,13 @@ static std::string loadSession(const std::string& path) {
                 ls.clear(); ls.seekg(save);
                 a.prevW = a.prevH = -1;
             }
-            if (a.type < 0 || a.type > 1 || a.x < 0 || a.y < 0 || a.w < 0 || a.h < 0)
-                continue;                 // reject malformed lines (would read out of bounds)
+            if (a.type < 0 || a.type > 1 || a.x < 0 || a.y < 0 || a.w < 0 || a.h < 0) {
+                // reject malformed lines (would read out of bounds) - and SAY so:
+                // a ROI that quietly fails to come back is a measurement whose
+                // subject moved with nothing on screen to say it did
+                rep.note(LK_LineRejected, "ann");
+                continue;
+            }
             a.color &= 7;
             a.visible = vis != 0;
             a.label = restOfLine(ls);
@@ -3303,10 +3513,25 @@ static std::string loadSession(const std::string& path) {
                                  if (w > 0 && h > 0) addAnn(0, x, y, w, h); }
         else if (key == "image") {
             settleCurrent();              // the previous image line is done
+            // A `stackmember` block belongs to the seqload of the image line it
+            // followed. Reaching the NEXT image line with one still in hand means
+            // no seqload consumed it, so it is dropped HERE rather than allowed
+            // to drift onto the next stack - and the drop is said, because a
+            // membership silently applied to the wrong stack is the defect this
+            // whole key exists to fix, pointed the other way.
+            if (!pendingMembers.empty()) {
+                rep.note(LK_LineRejected, "a stackmember block with no seqload after it");
+                pendingMembers.clear();
+            }
             lineOrd++;
             float bk = 0, wt = 1; std::string kind;
             ls >> bk >> wt >> kind;
             std::string err;
+            // WHICH file this line named, kept for the report: several of the
+            // errors below are bare ("cannot read file"), and a list of bare
+            // reasons cannot be acted on - which is half of what board row 126
+            // was about. Set by each branch as it reads its path.
+            std::string lineFile;
             const size_t docsBefore = app.images.size();   // "did this line open anything"
             int materializedIssuer = -1;  // ...and which unit rebuilds this line (#219)
             if (kind == "raw3" || kind == "raw2" || kind == "raw") {
@@ -3332,6 +3557,7 @@ static std::string loadSession(const std::string& path) {
                 }
                 d.littleEndian = le != 0;
                 d.path = restOfLine(ls);
+                lineFile = d.path;
                 err = loadRaw(d);
                 if (err.empty()) cur()->cfaColorize = col != 0;
             } else if (kind == "npy2" || kind == "npy3") {
@@ -3339,6 +3565,7 @@ static std::string loadSession(const std::string& path) {
                 ls >> cfa >> pat >> col;
                 if (kind == "npy3") ls >> ccx >> ccy >> ccw >> cch;
                 std::string p = restOfLine(ls);
+                lineFile = p;
                 // an .npz member must go back through the zip reader; loadNpy
                 // would fail the magic check and the array would silently vanish
                 std::string lowp = p;
@@ -3627,11 +3854,14 @@ static std::string loadSession(const std::string& path) {
                         // Ignoring the `false` meant the saved crop disappeared
                         // with no message, on exactly the large images where a
                         // crop is worth saving (verify-matrix G10).
-                        if (!cropInPlace(*cur(), ccx, ccy, ccw, cch))
+                        if (!cropInPlace(*cur(), ccx, ccy, ccw, cch)) {
                             parkRestoreWait(*cur(), ccx, ccy, ccw, cch);
+                            rep.note(LK_CropDeferred, cur()->name);
+                        }
                 }
             } else {                          // legacy "npy"
                 std::string p = restOfLine(ls);
+                lineFile = p;
                 err = loadNpy(p);
             }
             pendingMember.clear();
@@ -3640,7 +3870,13 @@ static std::string loadSession(const std::string& path) {
             pendingMaterializedRun = 0;      // one image line, one materialisation occurrence
             pendingRead = NR_NATIVE;      // must not leak onto the next image
             if (!err.empty()) {
-                failures.push_back(err);
+                // The file first, unless the reason already names it: "cannot
+                // read file" on its own does not tell anybody WHICH file, and
+                // the report quotes these strings verbatim.
+                failures.push_back(
+                    !lineFile.empty() && err.find(lineFile) == std::string::npos
+                        ? lineFile + ": " + err
+                        : err);
                 lastImageOk = false;
                 pendingLut = -1;          // must not leak onto the next image
                 continue;
@@ -3699,21 +3935,22 @@ static std::string loadSession(const std::string& path) {
         app.selectedAnn = app.anns[selAnnIndex].id;
     else
         app.selectedAnn = 0;
-    if (!failures.empty()) {
-        std::string msg = std::to_string(failures.size()) + " image(s) could not be restored:\n";
-        for (size_t i = 0; i < failures.size() && i < 5; i++) msg += "  " + failures[i] + "\n";
-        if (failures.size() > 5) msg += "  ...";
-        toast(msg, true);
-    }
-    if (!stackFailures.empty()) {
-        std::string msg = std::to_string(stackFailures.size()) +
-                          " stack(s) came back as a single frame:\n";
-        for (size_t i = 0; i < stackFailures.size() && i < 5; i++)
-            msg += "  " + stackFailures[i] + "\n";
-        if (stackFailures.size() > 5) msg += "  ...";
-        toast(msg, true);
-        fprintf(stderr, "session: %zu stack(s) could not be rebuilt; the first is: %s\n",
-                stackFailures.size(), stackFailures.front().c_str());
+    // The two lists the parser kept, into the ONE typed report - with the
+    // reasons as the names, because "2 image(s) could not be restored" that does
+    // not say which two is the report row 126 was opened about.
+    for (const std::string& fl : failures) rep.note(LK_ImageNotRestored, fl);
+    for (const std::string& sf : stackFailures) rep.note(LK_StackNotRebuilt, sf);
+    rep.docs = (int)app.images.size();
+    if (reportOut) *reportOut = rep;
+    // ONE toast for the whole load and not one per kind - and it CONTAINS both
+    // the kind phrase and the names, in one Messages entry: that is how
+    // selftest.browse reads "came back as a single frame" together with the
+    // file's own name, and it is the same thing a person needs in one place.
+    const std::string det = rep.detail("not restored as saved");
+    if (!det.empty()) {
+        toast("session loaded: " + baseName(path) + " - " +
+              std::to_string(rep.docs) + " doc(s) - " + det, true);
+        fprintf(stderr, "session: %s\n", det.c_str());
     }
     g_sessionRestoring = false;        // deferred refs resolve at the drain gate
     if (gammaFromSession) settingsOriginSessionPath("appearance.displayGamma");

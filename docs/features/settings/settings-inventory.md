@@ -857,17 +857,35 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 - **`browse.folderActivate` / `sortColumn` / `sortDescending` / `panels`** ——
   機構そのものが無い。設定にしても効かないので、v1 は「まだ」と名指しする。
 
-## 11. 現行の実装帳簿 (2026-08-20、phase④ で更新)
+## 11. 現行の実装帳簿 (2026-09-28、板 297 で更新)
 
 §10.7 は stage 1 当時の「まだ」であり、現在形ではない。現在は JSONC reader、
 `File > Preferences...`、出所バッジ、Copy as JSONC / Copy template / Reset to
 default、`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
-`loading.folderScanDepth`、`appearance.uiScale`、`browse.folderClick` まで
-実装されている。
-`SETTING_KEYS` の現行照合は **29 Read / 4 Later / 2 NotHere = 35行**。`prefs.txt` は
-`writePrefsTo` が32キーを書き、`loadPrefs` が互換入力を含む34キーを読む
-(phase④ が `folderclick` / `repourl` / `editor` を足した。28 Read / 5 Later と
+`loading.folderScanDepth`、`appearance.uiScale`、`browse.folderClick`、
+`watch.intervalSec` まで実装されている。
+`SETTING_KEYS` の現行照合は **30 Read / 4 Later / 2 NotHere = 36行**。`prefs.txt` は
+`writePrefsTo` が33キーを書き、`loadPrefs` が互換入力を含む35キーを読む
+(板 297 が `watchinterval` を足した。phase④ が `folderclick` / `repourl` /
+`editor` を足して 29 Read / 32書き/34読み。28 Read / 5 Later と
 29書き/31読みは phase④ 直前の値で、当時の記録として書き換えない)。
+
+`watch.intervalSec` (板 297) は**節を1つ開いた**唯一のキーなので、ここに1段落
+置く。Watch の2つのスイッチ (見るか / 自動で読み直すか) は 段2e で
+loading 級と裁定され、`loading.watchFiles` / `loading.watchAutoReload` のまま
+動かない。**どれくらいの頻度で見るか**は「このビルドがどう読み込むか」の問いでは
+ないので、名前がそのまま言っている `watch` 節に置いた。以後の線はこれである:
+**loading の挙動を切り替えるスイッチは loading、watcher 自身の調整は watch**。
+値は整数秒で、範囲 **1..3600**、既定 **5** —— 出荷済みの定数と同じなので、
+上げたユーザーの polling は動かない。範囲外は判断8 どおり**行・列を名指しで
+断り、clamp しない**。手で書いた `prefs.txt` は断れないので、窓は**唯一の読み手**
+`watchPollSeconds()` (`core/app/state.h`) が守る —— `scanDepthBelow()` と同じ形で、
+0 や負値なら worker が spin する側に倒れないためである。
+反映は**次の poll**: worker が毎周この値を読むので**再起動は要らない**。行の下の
+文と tooltip がそう言う (数字の箱だけでは言えない唯一のこと)。peer の間隔は
+この値から比で出る (`watchRemoteEvery`) ので、local を遅くすれば peer も遅くなり、
+**local より速くなることはない**。設計は
+`docs/features/watch/watch-design.md §17.3`。
 
 `appearance.uiScale` (#257) は他のキーと**判定の形が違う**ので、ここに1段落置く。
 値は「UI を何倍で描くか」で、**0 = ディスプレイに訊いて決める**が既定。自動側が
@@ -886,8 +904,10 @@ toast で言う。起動時に stderr へ1行、
 
 出所は通常の `default` / `this machine` / `settings.jsonc:<line>` /
 `command line (--flag)` に、gamma と grid だけ `session (.vsession)` が加わる。
-現行 `--settings-selftest` の台帳は O1–O6 (O6 が `appearance.uiScale`: ファイル /
-範囲外の拒否 / 0 / フラグが勝つ)、行モデルとコピーは W1–W5、
+現行 `--settings-selftest` の台帳は O1–O8 (O6 が `appearance.uiScale`: ファイル /
+範囲外の拒否 / 0 / フラグが勝つ、O8 が `watch.intervalSec`: ファイル / 唯一の
+読み手が返す生きた値 / 範囲外の拒否 / 手編集 prefs の clamp / 既定は何も書かない)、
+行モデルとコピーは W1–W5、
 memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。
 拡大率の決定そのものは `--uiscale-selftest` が持つ (純関数の表 + 復元窓のクランプ)。§10 の22キー、27書き/29読み、
 「Preferences 未実装」は、いずれもその時点の履歴として残している。

@@ -428,6 +428,10 @@ enum SKey {
     // sits with the other browse keys, in the place browse.folderActivate was
     // holding open for it.
     SK_folderClick,
+    // Board row 297: how often Watch looks. Appended at the end for the reason
+    // above; its ROW sits with the other two watch keys, because what a reader
+    // wants next to "watch source files on disk" is "how often".
+    SK_watchInterval,
     // The end marker, and it is not bookkeeping. The origin ledger and the
     // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
     // used to be SK_defaultUnit - the last id on the day they were written. Any
@@ -585,6 +589,15 @@ static const SKeyDef SETTING_KEYS[] = {
     { SK_watchAuto,   "loading.watchAutoReload",  SS_Read,
       "Needs watchFiles. Every automatic reload says what it did, on the stack's "
       "row in Files and again in Messages - nothing here is silent.", "true" },
+    // Board row 297. §9 of the Watch design left the interval a constant with
+    // "prefs 化はユーザーが欲しがってから" beside it; they wanted it. Whole
+    // seconds, 1..3600, default 5 - the constant that already shipped, so no
+    // machine's polling rate moves on upgrade. The sample is deliberately not
+    // the default, so the schema walk feeds this row a number that has to land.
+    { SK_watchInterval, "watch.intervalSec",     SS_Read,
+      "Seconds between polls, 1..3600. A change takes effect at the NEXT poll - "
+      "the worker reads it every round, so nothing has to be restarted. A peer's "
+      "folder is still asked every 15 s, or every poll if this is slower.", "12" },
     // #204 (裁定 2026-08-17: "the depth is a setting, and its default is 6").
     // Loading-class for the watch keys' own reason: how far under a folder
     // "all stacks below" looks is a question about what this build LOADS, not
@@ -605,7 +618,14 @@ static const size_t SETTING_KEY_COUNT = sizeof SETTING_KEYS / sizeof SETTING_KEY
 // and saying that once beats saying "unknown key" seven times under it.
 static const char* SETTING_SECTIONS[] = {
     "appearance", "input", "browse", "loading", "panels", "remote", "readers",
-    "series", "measuring"
+    "series", "measuring",
+    // Board row 297. The two switches (does it look, does it reload) were ruled
+    // loading-class in 段2e and stay where they are; HOW OFTEN it looks is not a
+    // question about how this build loads at all, and `watch` is the section its
+    // name already says. The split is stated here so nobody has to wonder which
+    // of the two sections the next watch key belongs in: a SWITCH over loading
+    // behaviour is loading's, the watcher's own tuning is watch's.
+    "watch"
 };
 static const size_t SETTING_SECTION_COUNT =
     sizeof SETTING_SECTIONS / sizeof SETTING_SECTIONS[0];
@@ -1183,6 +1203,20 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             if (A.wantBool(v, path, b2)) A.setB(app.watchAutoReload, b2, path);
             break;
         }
+        case SK_watchInterval: {
+            double n = 0;
+            if (!A.wantNum(v, path, n)) break;
+            // REFUSED outside the window, not clamped - 判断8 again. The window
+            // itself is watchPollSeconds()'s (core/app/state.h), where the one
+            // reader enforces it for values that did not come through this file.
+            if (n != floor(n) || n < 1 || n > 3600) {
+                A.rangeErr(v, path, "a whole number of seconds from 1 to 3600 "
+                                    "(the default 5 is the interval that shipped)");
+                break;
+            }
+            A.setI(app.watchIntervalSec, (int)n, path);
+            break;
+        }
         case SK_scanDepth: {
             double n = 0;
             if (!A.wantNum(v, path, n)) break;
@@ -1527,7 +1561,7 @@ static SWidget settingsWidgetFor(SKey id) {
         case SK_naturalSort: case SK_lowBandwidth:
         case SK_watchFiles: case SK_watchAuto:
             return SW_Bool;
-        case SK_accent: case SK_scanDepth:
+        case SK_accent: case SK_scanDepth: case SK_watchInterval:
             return SW_Int;
         // #257. A multiplier, so a float box rather than the gamma control's
         // presets: there is no pair of blessed values here - what is right is
@@ -1603,6 +1637,10 @@ static int* prefIntField(SKey id) {
         // clamp still happens on the way out of the control - prefAfterChange
         // below - so the row cannot sit there showing 40 while walks use 16.
         case SK_scanDepth: return &app.folderScanDepth;
+        // Board row 297: whole seconds, so an InputInt over exactly the window
+        // the applier accepts. The clamp on the way out is prefAfterChange's,
+        // for scanDepth's reason.
+        case SK_watchInterval: return &app.watchIntervalSec;
         default:           return nullptr;
     }
 }
@@ -1740,6 +1778,7 @@ static void prefsRecordFrom(PrefsBase& B, SKey id) {
         case SK_watchFiles:  B.watchEnabled = app.watchEnabled; break;
         case SK_watchAuto:   B.watchAutoReload = app.watchAutoReload; break;
         case SK_scanDepth:   B.folderScanDepth = app.folderScanDepth; break;
+        case SK_watchInterval: B.watchIntervalSec = app.watchIntervalSec; break;
         // rawRecipes has no prefs.txt line - it is a settings.jsonc library and
         // nothing else writes it - and the two non-keys are not keys. All three
         // are listed so that the compiler, not a reader, notices the next key.
@@ -1802,6 +1841,14 @@ static void prefAfterChange(SKey id) {
         // be the "I set it and nothing happened" this panel exists to end.
         case SK_scanDepth:
             app.folderScanDepth = std::clamp(app.folderScanDepth, 1, 16);
+            break;
+        // Board row 297, the same shape: the box has no bounds, watchPollSeconds()
+        // enforces the window, and a row left showing 0 while the worker polled
+        // every second would be the disagreement that clamp exists to prevent.
+        // NOTHING has to be restarted - the worker reads the value every round -
+        // so there is no toast here either.
+        case SK_watchInterval:
+            app.watchIntervalSec = std::clamp(app.watchIntervalSec, 1, 3600);
             break;
         // #257, the same shape one more time: an InputFloat has no bounds, so
         // the control's answer is put back inside the window the file enforces.
@@ -1878,6 +1925,7 @@ static void prefResetToDefault(SKey id) {
         case SK_watchFiles:  app.watchEnabled = true; break;
         case SK_watchAuto:   app.watchAutoReload = false; break;
         case SK_scanDepth:   app.folderScanDepth = 6; break;
+        case SK_watchInterval: app.watchIntervalSec = 5; break;
         case SK_None: case SK_Count: break;
     }
 }
@@ -2075,6 +2123,10 @@ static std::string settingsCurrentValue(SKey id) {
         // "chose 6" and "never chose" apart for the day the default moves.
         case SK_scanDepth:
             return app.folderScanDepth == 6 ? "" : std::to_string(app.folderScanDepth);
+        // 5 is the built-in default (board row 297) and the constant that shipped,
+        // so 5 writes nothing: 判断9 keeps "chose 5" and "never chose" apart.
+        case SK_watchInterval:
+            return app.watchIntervalSec == 5 ? "" : std::to_string(app.watchIntervalSec);
         case SK_stackPrompt:
             return app.seqLoadMode == 0 ? "" :
                    (app.seqLoadMode == 1 ? "\"always\"" : "\"never\"");

@@ -2115,7 +2115,8 @@ static bool startReloadJob(App::ReloadJob* j);
 // asynchronous door took it - false means the caller must do the reload itself,
 // here and now (reloadStackFromDisk).
 static bool startStackReload(int seqId, bool automatic,
-                             const ReloadPeer& peer = ReloadPeer()) {
+                             const ReloadPeer& peer = ReloadPeer(),
+                             const WatchAxisPlan& axis = WatchAxisPlan()) {
     // THE SYNCHRONOUS DOOR, and it is wide for startOpenJob's reason exactly:
     // --reload-selftest, --watch-selftest and --rwatch-selftest all call
     // reloadStackFromDisk (or watchReloadNow) and assert on app.images on the
@@ -2132,13 +2133,15 @@ static bool startStackReload(int seqId, bool automatic,
         if (app.reloadJob->seqId == seqId && !app.reloadJob->cancel.load()) return true;
         for (const auto& w : app.reloadQueue)
             if (w.seqId == seqId) return true;
-        app.reloadQueue.push_back({ seqId, 0, automatic });
+        app.reloadQueue.push_back({ seqId, 0, automatic, axis });
         return true;
     }
     std::unique_ptr<App::ReloadJob> j(new App::ReloadJob());
     j->seqId = seqId;
     j->automatic = automatic;
     j->peer = peer;
+    j->axis = axis;                    // watch-design §12's frame-axis plan, if
+                                       // this gesture took one (watchReloadNow)
     if (const App::SeqInfo* si = seqInfo(seqId)) j->name = si->name;
     // §12.5's other half, sampled ACROSS the whole reload: a pin on a frame
     // that VANISHES is dropped by closeImages, and the summary is about files.
@@ -2246,7 +2249,7 @@ static std::string reloadOneFrameText(const ImageDoc& d, const std::string& note
 // included after this file: ONE post-processing, so a click and the automaton
 // cannot come to do two different things.
 static void watchReloadFinish(int seqId, bool automatic, const std::string& msg,
-                              int failed, uint64_t pinWas);
+                              int failed, uint64_t pinWas, const WatchAxisPlan& ax);
 
 static void startNextQueuedReload();
 
@@ -2312,7 +2315,7 @@ static void pumpReloadJob() {
     int failed = 0;
     const std::string msg = reloadStackTail(j->seqId, j->plan, j->hadBefore, t, &failed,
                                             j->peer);
-    watchReloadFinish(j->seqId, j->automatic, msg, failed, j->pinWas);
+    watchReloadFinish(j->seqId, j->automatic, msg, failed, j->pinWas, j->axis);
 }
 
 static void startNextQueuedReload() {
@@ -2338,10 +2341,10 @@ static void startNextQueuedReload() {
         return;                          // the frame closed while it waited
     }
     if (!seqInfo(w.seqId)) return;
-    if (!startStackReload(w.seqId, w.automatic)) {
+    if (!startStackReload(w.seqId, w.automatic, ReloadPeer(), w.axis)) {
         int failed = 0;
         const std::string msg = reloadStackFromDisk(w.seqId, &failed);
-        watchReloadFinish(w.seqId, w.automatic, msg, failed, app.compareBUid);
+        watchReloadFinish(w.seqId, w.automatic, msg, failed, app.compareBUid, w.axis);
     }
 }
 

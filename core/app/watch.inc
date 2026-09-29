@@ -259,7 +259,7 @@ using WatchLister = std::function<bool(const App::WatchTarget& t,
 // constants rather than typed, so moving either one cannot silently leave the
 // peer polled at the local rate. 5 s and 15 s give 3.
 static int watchRemoteEvery() {
-    const double a = app.watchIntervalSec, b = app.watchRemoteIntervalSec;
+    const double a = watchPollSeconds(), b = app.watchRemoteIntervalSec;
     if (a <= 0.0 || b <= a) return 1;
     return (int)std::ceil(b / a - 1e-9);
 }
@@ -547,7 +547,12 @@ static void watchWorker() {
             glfwPostEmptyEvent();
         }
         std::unique_lock<std::mutex> lk(app.watchMtx);
-        app.watchCv.wait_for(lk, std::chrono::duration<double>(app.watchIntervalSec),
+        // The interval is READ HERE, every round (board row 297): it is the
+        // setting `watch.intervalSec` now, and a worker that had cached it at
+        // startup would need a restart to honour a change - which is the "I set
+        // it and nothing happened" the Preferences panel exists to end. The
+        // window is watchPollSeconds()'s, the one reader.
+        app.watchCv.wait_for(lk, std::chrono::duration<double>(watchPollSeconds()),
                              [] { return app.watchStop.load(); });
     }
 }
@@ -605,6 +610,170 @@ static bool watchReloadOffered(int seqId) {
 static const char* watchActionText(int seqId) {
     return watchReloadOffered(seqId) ? " - Reload in Files to re-read them"
                                      : " - re-open the file to re-read it";
+}
+
+// ============================================================================
+//  §12's OTHER membership: F FRAMES INSIDE ONE FILE
+//  ============================================================================
+//
+// §6's rebuild is about NAMES, and planStackMembership refuses a frame-axis .npy
+// by name: "a frame-axis .npy is F memberships of ONE path, so which names are
+// members is not a question about that stack's names". True - and the stack's
+// membership moved all the same the day the script that wrote it wrote six
+// frames where it had written four. Until this existed the Watch line said the
+// file had changed, the [Reload] under it re-read four frames out of six, and
+// nothing anywhere said that two frames of the capture were simply not in the
+// measurement.
+//
+// So the same three steps, asked about a COUNT instead of a name list, and in
+// §6's own order: the header is re-read, the departures happen BEFORE the walk
+// (§12.1 - a frame the file no longer holds must not reach reloadSource and be
+// counted as a refusal) and the arrivals AFTER it (so a joining frame is
+// measured against the head's current shape). What runs in the middle is still
+// the one reloadStackFromDisk.
+
+// How many frames the .npy at `path` declares RIGHT NOW. -1 = the question has
+// no answer here (not a .npy, unreadable, a shape this build refuses), and then
+// nothing below runs.
+//
+// THE HEADER, not the file. A frame-axis capture is the one shape that gets big
+// - 600 frames of 4096x3000 is 29 GB - and "has F changed?" is answered by the
+// first few hundred bytes. Reading the whole array to count its frames would
+// spend a minute of disk per Reload on a question the header already answers.
+//
+// `npyRead` is the reading this stack was born under (FrameSource::npyRead,
+// §3.3), threaded in rather than read from any global for npyLayout's own
+// reason: the frame axis is a function of the DECLARED reading, so asking
+// natively about a stack the user re-read would answer about a different axis.
+static int watchNpyFrames(const std::string& path, int npyRead) {
+    std::ifstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) return -1;
+    std::vector<uint8_t> head(65536);
+    f.read((char*)head.data(), (std::streamsize)head.size());
+    const std::streamsize got = f.gcount();
+    if (got <= 0) return -1;
+    head.resize((size_t)got);
+    NpyHead Hd;
+    std::string err;
+    if (!npyPeekHeader(head, Hd, err)) return -1;
+    int64_t F = 1, sf = 0, H = 1, W = 1, C = 1, sh = 0, sw = 0, sc = 0;
+    std::string note, lerr;
+    if (!npyLayout(Hd.shape, npyStridesOf(Hd.shape, Hd.fortran), npyRead,
+                   F, sf, H, W, C, sh, sw, sc, note, lerr))
+        return -1;
+    return (int)F;
+}
+
+// Is this stack F frames of ONE file, and how many does that file declare now?
+// `applies == false` means it is some other shape of stack and this whole
+// mechanism stays out of the way.
+//
+// The TYPE lives in state.h, beside App::ReloadJob, which carries one: since
+// the 2026-09-28 change the re-read happens on a worker, so the plan's two
+// halves (drop before, grow after) are no longer two halves of one call and the
+// plan has to travel with the job. The decision record stays here, where the
+// plan is taken.
+
+// Every refusal below fails towards CHANGING NOTHING, and each is the frame-axis
+// spelling of a refusal §6 already takes:
+//
+//   NOT ONE FILE - a folder stack (its frames are one file each) and a stack
+//   spanning two files are §6's business, not this one.
+//   AN .npz MEMBER - the file on disk is the CONTAINER, so its (mtime, size)
+//   and its header are not this array's. §6.2 keeps `member` in the identity
+//   tuple for exactly this reason and it is asked here for exactly that reason.
+//   NOT FRAMES 0..N-1 OF IT - a derived subset of a frame-axis stack, or a
+//   stack one of whose frames would not decode at the open (n of N), is not the
+//   file's whole axis. §6 never re-applies a derive's membership and §12.2's
+//   argument is that a subset and a grown set cannot be told apart after the
+//   fact; the contiguous prefix is the one case where they can.
+static WatchAxisPlan watchFrameAxisPlan(int seqId) {
+    WatchAxisPlan p;
+    const std::vector<int> fr = framesOfSeq(seqId);
+    if (fr.empty()) return p;
+    const FrameSource& s0 = *app.images[fr.front()]->src;
+    if (!s0.member.empty()) return p;
+    const std::string path = watchLocalPathOf(s0);
+    if (path.empty()) return p;
+    std::vector<int> ff;
+    for (int idx : fr) {
+        const FrameSource& s = *app.images[idx]->src;
+        if (watchLocalPathOf(s) != path || !s.member.empty()) return p;
+        if (s.npyRead != s0.npyRead) return p;
+        ff.push_back(s.fileFrame);
+    }
+    std::sort(ff.begin(), ff.end());
+    for (size_t k = 0; k < ff.size(); k++) if (ff[k] != (int)k) return p;
+    const int want = watchNpyFrames(path, s0.npyRead);
+    if (want < 1) return p;
+    p.applies = true;
+    p.path = path;
+    p.npyRead = s0.npyRead;
+    p.have = (int)fr.size();
+    p.want = want;
+    return p;
+}
+
+// F SHRANK: the tail leaves, before a byte is re-read.
+//
+// closeImages, exactly as §6's folder rebuild drops a vanished member: the
+// membership goes, the SOURCE dies only if nothing else references it, and the
+// pin / selection / series pruning is the pruning any close does - which is also
+// what CLAMPS the current frame. §12.5's rule, unchanged and not re-implemented:
+// app.current moves to a neighbour by closeImages' own agreement, and a compare
+// pin on a frame that is gone goes the way closing that frame takes it.
+static void watchFrameAxisDrop(int seqId, int keep) {
+    std::vector<int> gone;
+    for (int idx : framesOfSeq(seqId))
+        if (app.images[idx]->src->fileFrame >= keep) gone.push_back(idx);
+    if (!gone.empty()) closeImages(gone);
+}
+
+// F GREW: the new frames join, numbered where the FILE puts them - frame 4 of
+// the file is frame 4 of the stack, so there is no renumbering to do and none
+// is done (the survivors' seqIndex is their fileFrame already).
+//
+// The per-membership half is inherited from the head exactly as §6's join
+// inherits it (decodeJoiningMember's list, same reason): the same range, the
+// same mosaic, the same batch, or the new frame is not comparable with the ones
+// beside it. A frame that will not decode ENDS the growth and is not a failure -
+// it is the n-of-N §12.4 already prints, and `expected` below is what the header
+// declared while the membership is what read.
+static void watchFrameAxisGrow(int seqId, const WatchAxisPlan& p) {
+    const std::vector<int> fr = framesOfSeq(seqId);
+    if (fr.empty()) return;
+    const ImageDoc* ref = app.images[fr.front()].get();
+    for (int f = p.have; f < p.want; f++) {
+        std::string err;
+        int frames = 1;
+        int64_t fstride = 0;
+        std::unique_ptr<ImageDoc> nd =
+            decodeNpyFrame(p.path, err, f, frames, fstride, p.npyRead);
+        if (nd) {
+            const std::string bad = stackShapeRefusal(nd->w, nd->h, nd->ch,
+                                                     ref->w, ref->h, ref->ch,
+                                                     baseName(p.path));
+            if (!bad.empty()) { err = bad; nd.reset(); }
+        }
+        if (!nd) {
+            toast(baseName(p.path) + ": frame " + std::to_string(f) + ": " +
+                      (err.empty() ? std::string("decode failed") : err), true);
+            break;
+        }
+        computeMinMax(*nd);
+        nd->seqId = seqId;
+        nd->seqIndex = f;
+        nd->batchId = ref->batchId;
+        nd->black = ref->black; nd->white = ref->white;
+        nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
+        nd->cfaColorize = ref->cfaColorize;
+        nd->displayLut = ref->displayLut;
+        nd->texDirty = true;
+        nd->uid = app.nextUid++;
+        app.images.push_back(std::move(nd));
+        app.imagesRev++;
+        shareOrRegisterSource(*app.images.back());   // §6.2: identity, then bytes
+    }
 }
 
 // ============================================================================
@@ -795,9 +964,45 @@ static bool watchAutoDue() {
 // and calls this - and a second copy of the record, the clearing and the toast
 // is the one place §9 could not afford one.
 static void watchReloadFinish(int seqId, bool automatic, const std::string& summary,
-                              int failed, uint64_t pinWas) {
+                              int failed, uint64_t pinWas, const WatchAxisPlan& ax) {
     const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
     std::string msg = summary;
+    // §12's frame-axis half, SECOND HALF (board row 222). The plan was decided
+    // and its departures applied BEFORE a byte was re-read - that is
+    // watchReloadNow below - and the arrivals belong after, in §6's own order.
+    // The plan is HANDED to this function rather than re-taken here for the
+    // reason the whole of the 2026-09-28 change is about: the re-read happens on
+    // a worker now, so "before" and "after" are no longer two halves of one
+    // call, and re-asking watchFrameAxisPlan here would answer about the stack
+    // the reload has already rebuilt (want == have, nothing moved).
+    if (ax.moved()) {
+        if (ax.want > ax.have) watchFrameAxisGrow(seqId, ax);
+        const int resident = (int)framesOfSeq(seqId).size();
+        if (App::SeqInfo* si = seqInfo(seqId)) {
+            si->expectedFrames = ax.want;
+            // The NAME the loader minted STATES the count ("x.npy  (4 frames)"),
+            // and leaving it saying 4 would put a stale number in the first place
+            // the reader looks. It is rewritten only when it is still verbatim
+            // what the loader wrote: a name the user or a session has given this
+            // stack is theirs, and renaming somebody's stack is worse than a
+            // parenthesis this code did not write.
+            const std::string mint = baseName(ax.path) + "  (" +
+                                     std::to_string(ax.have) + " frames)";
+            if (si->name == mint)
+                si->name = baseName(ax.path) + "  (" + std::to_string(ax.want) +
+                           " frames)";
+        }
+        // The member LIST moved, so everything keyed on the stack AS A SET moves
+        // with it - the sigma_t of four frames is not the sigma_t of six even
+        // when not one frame's pixels changed. reloadStackFromDisk makes this
+        // call for ITS OWN plan, and this plan is not its (planStackMembership
+        // refuses this shape of stack by name), so it is made here, once, with
+        // the same function and for the same reason (§3.2 / §10.1).
+        if (invalidateStackDerived(seqId)) linFitStale();
+        app.watchTargetsDirty = true;   // ...and the watcher's seed is a new set
+        const std::string ft = watch::frameAxisText(ax.have, resident, ax.want);
+        if (!ft.empty()) msg += " - " + ft;
+    }
     const bool pinDropped = pinWas != 0 && app.compareBUid != pinWas;
     char hm[16] = "";
     if (automatic) {
@@ -836,12 +1041,21 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
 }
 
 static void watchReloadNow(int seqId, bool automatic) {
-    // THE WORKER FIRST (the 2026-09-28 report). startStackReload takes the
-    // whole gesture - the plan, the re-reads, the summary and watchReloadFinish
-    // above - and returns having read nothing; pumpReloadJob finishes it. False
-    // means it declined (a scripted run without --async-open), and then this is
-    // the synchronous door it always was.
-    if (startStackReload(seqId, automatic)) return;
+    // §12's frame-axis half, FIRST HALF (board row 222): decided before a byte
+    // is re-read, and its DEPARTURES applied before the walk - a frame the file
+    // no longer holds must not reach reloadSource and be counted as a refusal.
+    // `applies` is false for every other shape of stack, and then these two
+    // lines are one predicate and nothing else. The plan then travels with the
+    // reload (App::ReloadJob::axis) to watchReloadFinish above, which applies
+    // the arrivals.
+    const WatchAxisPlan ax = watchFrameAxisPlan(seqId);
+    if (ax.moved() && ax.want < ax.have) watchFrameAxisDrop(seqId, ax.want);
+    // THE WORKER NEXT (the 2026-09-28 report). startStackReload takes the rest
+    // of the gesture - the membership plan, the re-reads, the summary and
+    // watchReloadFinish above - and returns having read nothing; pumpReloadJob
+    // finishes it. False means it declined (a scripted run without
+    // --async-open), and then this is the synchronous door it always was.
+    if (startStackReload(seqId, automatic, ReloadPeer(), ax)) return;
     // §12.5's other half: a pin on a frame that VANISHES is dropped by
     // closeImages, exactly as closing that frame drops it. Sampled across the
     // call, because the summary reloadStackFromDisk returns is about files and
@@ -849,7 +1063,7 @@ static void watchReloadNow(int seqId, bool automatic) {
     const uint64_t pinWas = app.compareBUid;
     int failed = 0;
     const std::string msg = reloadStackFromDisk(seqId, &failed);
-    watchReloadFinish(seqId, automatic, msg, failed, pinWas);
+    watchReloadFinish(seqId, automatic, msg, failed, pinWas, ax);
 }
 
 // The reload the LAST frame armed. Called at the head of pumpWatch and therefore

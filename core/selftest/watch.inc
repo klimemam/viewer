@@ -1236,6 +1236,211 @@
                   "W45b ...and it says when the compare pin went with a gone frame");
         }
 
+        // ======================================================================
+        //  W46-W49: §12's OTHER membership - F FRAMES INSIDE ONE FILE
+        //
+        //  §6's rebuild is about NAMES, and planStackMembership refuses a
+        //  frame-axis .npy by name. So the file whose script wrote six frames
+        //  where it had written four said "1 file(s) changed on disk", offered a
+        //  [Reload], and re-read four frames out of six for ever - with nothing
+        //  anywhere saying that two frames of the capture were not in the
+        //  measurement. These four cases are the count taking the place of the
+        //  name list.
+        //
+        //    W46  the two sentences, with no filesystem at all.
+        //    W47  F GREW: the new frames join, numbered where the FILE puts them,
+        //         and they are really decoded.
+        //    W48  F SHRANK: the tail leaves, the current frame is clamped, and it
+        //         is NOT a refusal (#56's mark stays off - a frame that is gone is
+        //         not a frame that failed to read).
+        //    W49  F UNCHANGED: a rewrite of the same shape says nothing about
+        //         membership at all, which is the anti-vacuity of both.
+        //
+        //  (W50, after them, is §5's third item - a different section's decision,
+        //  with no filesystem either.)
+        // ======================================================================
+        {   // ---- W46: the sentences, and the decision, with no disk -----------
+            check(watch::frameAxisText(4, 6, 6) ==
+                    "membership rebuilt: the frame axis in this file holds 6 frame(s), "
+                    "was 4 - 6 of 6 frame(s)",
+                  "W46 the sentence a grown frame axis leaves, with BOTH counts");
+            check(watch::frameAxisText(6, 3, 3) ==
+                    "membership rebuilt: the frame axis in this file holds 3 frame(s), "
+                    "was 6 - 3 of 6 frame(s)" ||
+                  watch::frameAxisText(6, 3, 3) ==
+                    "membership rebuilt: the frame axis in this file holds 3 frame(s), "
+                    "was 6 - 3 of 3 frame(s)",
+                  "W46b ...and the same sentence when it shrank");
+            // n of N: the header declared 6 and only 5 decoded (§12.4's case,
+            // over here). The RATIO survives the toast, which is the point.
+            check(watch::frameAxisText(4, 5, 6).find("5 of 6 frame(s)") !=
+                      std::string::npos,
+                  "W46c a frame the header declared and that would not decode is n/N");
+            check(watch::frameAxisText(4, 4, 4).empty(),
+                  "W46d ...and a count that did not move says NOTHING");
+        }
+        {   // ---- W47/W48/W49: the real file, the real Reload ------------------
+            closeAll();
+            const std::string axd = root + "/axis";
+            std::filesystem::create_directories(pathFromUtf8(axd), ec);
+            const std::string cube = axd + "/cube.npy";
+            // (F,H,W) f32, every pixel of frame f = base + f. Same shape of
+            // header as writeNpy2's, one axis wider - and the VALUE names the
+            // frame, so "frame 5 was really decoded" is a number and not a hope.
+            //
+            // W is 8 AND THAT IS LOAD-BEARING: rank 3 is (F,H,W) only when its
+            // LAST axis is more than 4 (rp::npyNativeRead - a trailing 3 is
+            // channels, because that is what a colour picture looks like). A
+            // (4,3,3) fixture is one 3x4 RGB image and this whole section would
+            // be asserting about a stack that was never a stack.
+            auto writeNpy3 = [](const std::string& path, int F, int h, int w, float base) {
+                char dict[160];
+                snprintf(dict, sizeof dict,
+                         "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }",
+                         F, h, w);
+                std::string hdr = dict;
+                size_t pad = (64 - (10 + hdr.size() + 1) % 64) % 64;
+                hdr.append(pad, ' ');
+                hdr += '\n';
+                std::ofstream f(pathFromUtf8(path), std::ios::binary);
+                uint16_t hl = (uint16_t)hdr.size();
+                f.write("\x93NUMPY\x01\x00", 8);
+                f.write((const char*)&hl, 2);
+                f.write(hdr.data(), (std::streamsize)hdr.size());
+                for (int k = 0; k < F; k++) {
+                    std::vector<float> px((size_t)w * h, base + (float)k);
+                    f.write((const char*)px.data(),
+                            (std::streamsize)(px.size() * sizeof(float)));
+                }
+            };
+            writeNpy3(cube, 4, 6, 8, 10.0f);
+            openPath(cube);
+            int cs = 0;
+            for (const auto& s : app.seqs) if (!s.name.empty()) cs = s.id;
+            auto axFrame = [&](int index) {
+                ImageDoc* d = memberDoc(cs, index);
+                return d ? d->px()[0] : -1.0f;
+            };
+            check(cs != 0 && (int)framesOfSeq(cs).size() == 4 &&
+                  axFrame(0) == 10.0f && axFrame(3) == 13.0f,
+                  "W47 (setup) ONE .npy of 4 frames is a 4-frame stack");
+            // ...and it is watched AS THAT FILE (§1's one-file branch), which is
+            // the finding this whole mechanism hangs off.
+            std::map<int, WatchSet> cst;
+            std::vector<App::WatchDone> cout2;
+            auto cpoll = [&]() {
+                cout2.clear();
+                return watchPollRound(watchTargetsNow(), cst, cout2);
+            };
+            {
+                std::vector<App::WatchTarget> tg = watchTargetsNow();
+                const App::WatchTarget* t = nullptr;
+                for (const auto& x : tg) if (x.seqId == cs) t = &x;
+                check(t && t->dir.empty() && !t->file.empty() &&
+                      t->file.find("cube.npy") != std::string::npos,
+                      "W47b ...watched as ONE FILE, not as a folder of members");
+            }
+            {   // ---- W47: F 4 -> 6. The finding, then the Reload -------------
+                writeNpy3(cube, 6, 6, 8, 10.0f);
+                cpoll();
+                const bool spoke = cpoll();
+                check(spoke && cout2.size() == 1 && cout2[0].seqId == cs &&
+                      cout2[0].found.changed == 1,
+                      "W47c the file's own (mtime,size) moved: 1 changed, confirmed");
+                // THE CONTRAST, and it is what board row 222 was: §6's NAME rule
+                // alone re-reads the four frames it has and rebuilds nothing, so
+                // two frames of the capture stay out of the measurement with
+                // nothing anywhere saying so. Harmless to run here (the file
+                // GREW, so every frame it holds still exists); the shrink case
+                // below deliberately does not run it, because reloadSource then
+                // refuses the tail by name and latches #56's mark on a stack
+                // where nothing failed - which is §12.1's whole argument and is
+                // why the departures happen before the walk.
+                int failed0 = -1;
+                const std::string plain = reloadStackFromDisk(cs, &failed0);
+                fprintf(stderr, "watchselftest: W47 name-rule-only summary: %s\n",
+                        plain.c_str());
+                check((int)framesOfSeq(cs).size() == 4 && failed0 == 0 &&
+                      plain.find("membership rebuilt") == std::string::npos,
+                      "W47c2 (contrast) the NAME rule alone rebuilds nothing: still 4 of 6");
+                watchReloadNow(cs, false);
+                check((int)framesOfSeq(cs).size() == 6 &&
+                      seqInfo(cs) && seqInfo(cs)->expectedFrames == 6,
+                      "W47d F grew 4 -> 6: the stack holds SIX frames now");
+                // If they were appended without being numbered by the FILE, frame
+                // 4 would hold frame 0's pixels. 14 and 15 are the file's own.
+                check(axFrame(0) == 10.0f && axFrame(3) == 13.0f &&
+                      axFrame(4) == 14.0f && axFrame(5) == 15.0f,
+                      "W47e ...and frames 4 and 5 are the FILE's frames 4 and 5");
+                check(seqInfo(cs) && seqInfo(cs)->name == "cube.npy  (6 frames)",
+                      "W47f ...and the name the loader minted no longer says 4");
+                check(seqReloadNote(cs).empty() && !*seqReloadMark(cs),
+                      "W47g ...with no (reload failed) mark: nothing refused");
+            }
+            {   // ---- W48: F 6 -> 3. The tail leaves, the selection clamps ----
+                // ANTI-VACUITY of the clamp: the current frame is the LAST one,
+                // so a shrink that did not move it would leave app.current on a
+                // doc that no longer exists.
+                if (ImageDoc* d5 = memberDoc(cs, 5))
+                    for (int i = 0; i < (int)app.images.size(); i++)
+                        if (app.images[i].get() == d5) selectImage(i);
+                const int wasCur = app.current;
+                const int curIdxWas = app.images[app.current]->seqIndex;
+                writeNpy3(cube, 3, 6, 8, 10.0f);
+                cpoll();
+                cpoll();
+                check((int)framesOfSeq(cs).size() == 6,
+                      "W48 (setup) six frames in memory, three left on disk");
+                watchReloadNow(cs, false);
+                check((int)framesOfSeq(cs).size() == 3 &&
+                      seqInfo(cs) && seqInfo(cs)->expectedFrames == 3,
+                      "W48b F shrank 6 -> 3: the tail is out, three frames left");
+                check(axFrame(0) == 10.0f && axFrame(2) == 12.0f && !memberDoc(cs, 3),
+                      "W48c ...and the survivors are still the file's frames 0..2");
+                check(app.current >= 0 && app.current < (int)app.images.size() &&
+                      app.images[app.current]->seqIndex <= 2 && curIdxWas == 5,
+                      "W48d ...with the current frame CLAMPED (it was frame 5)");
+                check(seqReloadNote(cs).empty() && !*seqReloadMark(cs),
+                      "W48e a frame that is GONE is not a refusal: no #56 mark");
+                (void)wasCur;
+            }
+            {   // ---- W49: the same shape again says nothing about membership --
+                // Without this, "the rebuild fires on every Reload" passes W47
+                // and W48. The pixels change, the count does not.
+                writeNpy3(cube, 3, 6, 8, 90.0f);
+                cpoll();
+                cpoll();
+                watchReloadNow(cs, false);
+                check((int)framesOfSeq(cs).size() == 3 && axFrame(0) == 90.0f &&
+                      axFrame(2) == 92.0f && seqInfo(cs) &&
+                      seqInfo(cs)->expectedFrames == 3,
+                      "W49 a rewrite of the SAME shape re-reads and rebuilds nothing");
+            }
+            closeAll();
+        }
+        {   // ---- W50: §5's third item - "Watch: open new stacks", as a DECISION
+            // The whole of what the Browse toggle decides, with no listing, no
+            // panel and no open in it: SEEN not opened, and the identity of a
+            // stack is its MEMBERS. The real thing - a poll that finds a stack
+            // and opens it - is --browse-selftest B7, because the poll and the
+            // listing live there.
+            check(!watch::unseenStack({ "a_0.npy", "a_1.npy" }, { "a_0.npy", "a_1.npy" }),
+                  "W50 what was already there is not news (the baseline opens nothing)");
+            check(watch::unseenStack({ "a_0.npy", "a_1.npy" }, { "b_0.npy", "b_1.npy" }),
+                  "W50b ...while a stack sharing not one name with it IS an arrival");
+            // THE CORRECTION the implementation forced: a group row is named with
+            // the EXTENT of its frame axis, so growth renames the stack and a
+            // name-keyed watcher opens it twice. Keyed on members, a stack that
+            // GAINS a frame shares three names with what is known and is not an
+            // arrival - which is §6's membership rebuild's event, not this one's.
+            check(!watch::unseenStack({ "a_0.npy", "a_1.npy", "a_2.npy" },
+                                      { "a_0.npy", "a_1.npy", "a_2.npy", "a_3.npy" }),
+                  "W50c a stack that GAINED a frame is not an arrival (one known name)");
+            check(watch::unseenStack({}, { "a_0.npy" }) &&
+                  !watch::unseenStack({ "a_0.npy" }, {}),
+                  "W50d an empty baseline is all news; an empty stack is not an arrival");
+        }
+
         app.watchAutoReload = autoWas;   // see the note above the §9 section
         closeAll();
         std::filesystem::remove_all(pathFromUtf8(root), ec);
