@@ -571,9 +571,9 @@ std::string rbSecsText(double s) {
 }
 
 // WHAT THE PANEL SAYS, and the only place it is worded. Each state names its own
-// gate, and the two that the reader can do something about name WHERE:
-// "File > Watch source files on disk" is the menu item's own label (menus.inc),
-// so the sentence and the switch cannot come to be called different things.
+// gate, and the one the reader can do something about also names WHERE: the
+// label is menus.inc's own, letter for letter, so the sentence and the switch
+// cannot come to be called different things.
 //
 // The interval is `browseWatchInterval`, never a number typed in here: move
 // either constant and this sentence moves with it (--browse-selftest B9b holds
@@ -583,9 +583,12 @@ std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t u
         "auto-refresh: every " + rbSecsText(browseWatchInterval(!I.b.host.empty()));
     switch (rbPollStateNow(I, uiFrame)) {
         case RbPollState::WatchOff:
-            // NAMED, because this is the one state whose cause is a setting the
-            // reader owns and cannot see from here. Three doors set it and they
-            // set the same flag; the menu is the one that is two clicks away.
+            // NAMED, because this is the one state whose cause is a setting
+            // the reader owns and cannot see from here. Four doors reach the
+            // same flag - this menu item, the Preferences row, the
+            // `loading.watchFiles` key in settings.jsonc, and the `watchfiles`
+            // line in prefs.txt - and the menu is the one that is two clicks
+            // away from the panel this sentence is on.
             return "auto-refresh: off - File > \"Watch source files on disk\"";
         case RbPollState::Paused:
             // Not a setting: the window is minimised (§2's own line for the
