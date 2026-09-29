@@ -2893,10 +2893,30 @@ void drawPanelRemote(App::BrowseInstance& I) {
             ImGui::SetCursorPosX(lineX0 + avail - markW + gap);
             ImGui::TextDisabled("%s", markShown.c_str());
             if (ImGui::IsItemHovered()) {
-                // The untruncated sentence, for the width at which the mark
-                // itself had to be elided. What the FEATURE is, and how it
-                // differs from an open stack's reload, joins it here next.
-                ImGui::SetTooltip("%s", pollSaid.c_str());
+                // §19's clause 2 (what the feature IS). Every number in here is
+                // read off the
+                // constants (browseWatchInterval), so moving one moves this
+                // tooltip with it - the panel must not carry a second opinion
+                // about its own interval.
+                const std::string here = rbSecsText(browseWatchInterval(false));
+                const std::string peer = rbSecsText(browseWatchInterval(true));
+                ImGui::SetTooltip(
+                    "%s\n\n"
+                    "While this panel is being DRAWN it re-reads its own folder\n"
+                    "every %s (a folder on a peer every %s) and the listing simply\n"
+                    "becomes the new one - nothing is added to it, and the cursor\n"
+                    "and the ticks stay on the rows they were on. It stops while\n"
+                    "the panel is collapsed, closed or behind another dock tab:\n"
+                    "there is nothing on screen to bring up to date. F5 does the\n"
+                    "same round by hand, at any time.\n\n"
+                    "This interval is the Browse panel's own (%s here, %s for a\n"
+                    "peer). The setting watch.intervalSec is the OTHER half - how\n"
+                    "often the files behind the stacks you have OPEN are looked at.\n\n"
+                    "The switch for all of it is File > \"Watch source files on\n"
+                    "disk\" (Preferences, and loading.watchFiles in settings.jsonc,\n"
+                    "set the same one).",
+                    pollSaid.c_str(), here.c_str(), peer.c_str(),
+                    here.c_str(), peer.c_str());
             }
         }
     }
