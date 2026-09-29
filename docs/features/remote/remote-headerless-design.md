@@ -758,6 +758,7 @@ client 側事前拒否 (§7.3 の文)。
 | **CLI `--raw-*` + url** | **入っていた** (`rawReady && isUrl`) | 同じ。ただし `--raw-size` は `rawReady` を立てないので**幾何だけ宣言した url が扉に届かなかった** —— `rawSizeGiven` を別に数える |
 | **CLI 宣言無しの ssh raw** | fall-through で §4.4 第1段の拒否 | 名指しで断る (§5.5 の文)。§10 の「LIST→ダイアログで救わない」判断は維持 |
 | **1クリック preview** | 拒否 (§5.3 の判断どおり) | **機能は足さない** (§5.3 維持)。**文だけ**新しいものに直す |
+| recipe panel の Apply (`rawRecipeReinterpretCurrent`) | ❌ **未実装で、かつ未拒否。** §7.2 が「remote 版が第4段で繋がる」と書いた所が空で、url を `decodeRawFrame` に渡して「cannot open ssh://...」と言っていた (peer は普通に serve できているファイルについて) | **まだ繋がない** —— `openRemote` に in-place の着地が無く、`replaceIdx` の契約を守れない。ただし**名指しで断り、動く扉を名指す**ようにした |
 | **peer 側 (レシピ無しの要求)** | §4.4 第1段の文 (client 用の文を peer が喋っていた) | §4.4 第2段の文。`imagefile::RefusedBy::Peer` |
 
 **レシピをどこから得るか、最終形:**

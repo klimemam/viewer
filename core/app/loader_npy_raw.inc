@@ -627,6 +627,17 @@ static std::string rawRecipeReinterpretCurrent(const RawRecipe& r) {
     if (!im) return "no image is open";
     if (im->src->rawDtype < 0 || im->src->path.empty())
         return "this document did not come in through the headerless dialog";
+    // ...and it must be on THIS disk. Over a link the re-read is a round trip
+    // that appends a document - openRemote has no in-place landing - so the
+    // replaceIdx contract below cannot be honoured, and decodeRawFrame would
+    // simply fail to open a path spelled "ssh://...". Refused BY NAME, with the
+    // door that does work, rather than left to say "cannot open ssh://host/x.raw"
+    // about a file the peer is serving perfectly well
+    // (docs/features/remote/remote-headerless-design.md 7.2 named this as the
+    // remaining piece; it is still unbuilt, and now it says so).
+    if (hasUrlScheme(im->src->path))
+        return "re-reading in place is not wired over a link yet - close this "
+               "frame and open it again from Browse, which asks for the geometry";
     RawDialog d;
     rawRecipeIntoDialog(r, d);
     d.path = im->src->path;
