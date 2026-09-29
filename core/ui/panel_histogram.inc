@@ -1007,6 +1007,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         App::ProjState::Stats& f = P.fStat[s];
         f = {};
         if (!fN[s]) continue;
+        f.n = fN[s];                   // the pooling weight, published
         f.mean = fSum[s] / fN[s];
         double var = fSum2[s] / fN[s] - f.mean * f.mean;
         f.sd = sqrt(var > 0 ? var : 0);
@@ -1052,6 +1053,7 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             // uniform sensor. A single sample has a mean and no spread, and
             // this structure carries both together, so neither is published.
             if (n < 2) continue;
+            st.n = n;
             st.mean = sum / n;
             // ddof=1 (docs/features/analysis/stats-taxonomy.md §8 判断2). These are the row and column
             // MEANS, not the pixels: sigma of them is A and B of the flat-field

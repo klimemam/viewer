@@ -3062,7 +3062,19 @@ struct App {
         std::vector<float> h[5], v[5];    // per series: mean along columns / rows
         float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
         // statistics of the profiles themselves (sigma of column means = column FPN)
-        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
+        // `n` is HOW MANY SAMPLES the row is over - the plane's finite pixels
+        // for fStat, its finite profile entries for hStat/vStat. It is not
+        // decoration: pooling per-plane means needs the per-plane WEIGHT, and
+        // with no weight published the only proxy to hand was the profile's
+        // LENGTH (rw, identical for every plane of a mosaic), which is right
+        // only while every plane contributes the same number of pixels.
+        // --verify-selftest V17 was weighting by it.
+        //
+        // It sits AFTER the six doubles: --abstats-selftest A3 memcmps that
+        // prefix to prove B's existence moves no digit of A's, and a field
+        // inserted among them would be compared as a double.
+        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0;
+                       size_t n = 0; bool valid = false; };
         Stats hStat[5], vStat[5];
         // ...and of the REGION itself. sigma of the column means says how much
         // the columns differ; this says how much the pixels do. Reading the two
