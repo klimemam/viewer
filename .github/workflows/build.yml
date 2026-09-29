@@ -203,13 +203,20 @@ jobs:
           rm -rf "$d"; mkdir -p "$d"
           # A HOME and a TMPDIR of this run's own, for the reason CMakeLists.txt
           # gives every selftest one: the app writes preferences into HOME, and
-          # a value left there by another test is read by this one. Nothing here
-          # needs a display - --settings-selftest is a NOGL test.
+          # a value left there by another test is read by this one.
+          #
+          # --no-window is NOT optional and is not xvfb's job: CMakeLists.txt
+          # appends it to every NOGL test and drops the launcher, because the
+          # flag is what skips glfwInit entirely. Without it this binary dies at
+          # "Failed to detect any supported platform" on a headless runner
+          # before it ever reaches the selftest. Same two words the ctest
+          # wrapper uses, so this run takes the same startup path.
           home="$PWD/$d/home"
           tmp="$PWD/$d/tmp"
           mkdir -p "$home" "$tmp"
           HOME="$home" APPDATA="$home" TMPDIR="$tmp" TMP="$tmp" TEMP="$tmp" \
-            ./build/viewer --settings-selftest > "$d/dump.txt" 2> "$d/selftest.log" || {
+            ./build/viewer --no-window --settings-selftest \
+            > "$d/dump.txt" 2> "$d/selftest.log" || {
               echo "--settings-selftest failed; its own assertions come first:"
               cat "$d/selftest.log"
               exit 1
