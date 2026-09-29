@@ -73,8 +73,100 @@
 // until P6: statSourceFile / statLocalUrl / srcKeyPath below need it, and this
 // header must not depend on a fragment. util.inc is included after this header
 // in the spine, so its remaining functions keep seeing it.
+//
+// ---- WHAT IT DOES WITH BYTES THAT ARE NOT UTF-8 (板306 E) -------------------
+// std::filesystem::u8path THROWS on an illegal byte sequence - measured with
+// this toolchain, "filesystem error: Cannot convert character sequence: Illegal
+// byte sequence", for a stray 0xFF and for a truncated three-byte kanji alike -
+// because on Windows it has to convert to UTF-16 and there is no code unit to
+// convert those bytes into. This function is called from ~40 places, on every
+// path the program ever handles, and NONE of them is inside a try: a filename
+// that is not UTF-8 therefore terminated the process. There are at least four
+// separate doors such bytes arrive through (the Windows argv is in the ACP, so
+// is getenv("APPDATA"), and a .vsession or a directory listing can carry
+// anything) and closing those doors is its own change; what is fixed HERE is
+// the one thing that has to be true whichever door they came through: a bad
+// name is a bad NAME, not a crash.
+//
+// It does not throw, and it does not pretend either. Each illegal byte becomes
+// U+FFFD REPLACEMENT CHARACTER - a code point that exists, so the conversion
+// completes - and the substitution is COUNTED and the offending string kept, so
+// the program can say "this name was not UTF-8" instead of quietly working with
+// a path it invented. A path built this way names no file on disk, which is the
+// correct outcome: every caller goes on to exists() / ifstream / status() and
+// gets a clean "no" it can report, in place of a std::terminate.
+inline int& pathFromUtf8BadCount() { static int n = 0; return n; }
+inline std::string& pathFromUtf8LastBad() { static std::string s; return s; }
+
+// UTF-8 in, UTF-8 out, with every ill-formed byte replaced by U+FFFD. Written
+// by hand rather than through a codecvt because the point is to NEVER fail:
+// overlong forms, surrogates encoded as three bytes, code points above
+// U+10FFFF and truncated sequences are all ill-formed and all become one
+// U+FFFD, which is what the Unicode standard's own substitution rule says.
+inline std::string utf8Sanitized(const std::string& s, int* replacedOut = nullptr) {
+    std::string out;
+    out.reserve(s.size());
+    int replaced = 0;
+    const unsigned char* p = (const unsigned char*)s.data();
+    const size_t n = s.size();
+    size_t i = 0;
+    auto bad = [&]() { out += "\xEF\xBF\xBD"; replaced++; i++; };
+    while (i < n) {
+        const unsigned char c = p[i];
+        if (c < 0x80) { out += (char)c; i++; continue; }
+        int need = 0;
+        uint32_t cp = 0;
+        if (c >= 0xC2 && c <= 0xDF)      { need = 1; cp = c & 0x1Fu; }
+        else if (c >= 0xE0 && c <= 0xEF) { need = 2; cp = c & 0x0Fu; }
+        else if (c >= 0xF0 && c <= 0xF4) { need = 3; cp = c & 0x07u; }
+        else { bad(); continue; }        // 0x80..0xC1 and 0xF5..0xFF start nothing
+        // The continuation bytes have to BE there: i+1 .. i+need, so the last
+        // one needed is i+need and it has to be inside the string.
+        if (i + (size_t)need >= n) { bad(); continue; }
+        bool okSeq = true;
+        for (int k = 1; k <= need; k++) {
+            const unsigned char cc = p[i + k];
+            if (cc < 0x80 || cc > 0xBF) { okSeq = false; break; }
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        // Overlong, surrogate and out-of-range sequences are well formed as
+        // bytes and still not characters, so they are checked on the VALUE.
+        if (okSeq && ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000) ||
+                      (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF))
+            okSeq = false;
+        if (!okSeq) { bad(); continue; }
+        out.append((const char*)p + i, (size_t)need + 1);
+        i += (size_t)need + 1;
+    }
+    if (replacedOut) *replacedOut = replaced;
+    return out;
+}
+
 inline std::filesystem::path pathFromUtf8(const std::string& s) {
-    return std::filesystem::u8path(s);
+    try {
+        return std::filesystem::u8path(s);
+    } catch (const std::exception&) {
+        // NAME IT, then carry on. stderr rather than the Messages log because
+        // this header is included before the log exists (compare.inc is later
+        // in the spine), and because the crash this replaces printed nothing at
+        // all: one line naming the bytes is what a report of it needs.
+        int replaced = 0;
+        const std::string fixed = utf8Sanitized(s, &replaced);
+        pathFromUtf8BadCount()++;
+        pathFromUtf8LastBad() = s;
+        // Capped, because a directory of such names would otherwise print one
+        // line per entry per listing. The COUNT keeps rising after the lines
+        // stop, so the fact is never lost - only the repetition is.
+        if (pathFromUtf8BadCount() <= 8)
+            fprintf(stderr, "path: %d byte(s) of this name are not UTF-8 and were "
+                            "replaced by U+FFFD - it will not match any file: %s\n",
+                    replaced, fixed.c_str());
+        try {
+            return std::filesystem::u8path(fixed);
+        } catch (const std::exception&) {
+            return std::filesystem::path();   // cannot happen; not a crash if it does
+        }
+    }
 }
 
 // Display gamma has two convenient presets, but its persisted value is not an
