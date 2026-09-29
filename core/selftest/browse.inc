@@ -2157,6 +2157,133 @@
                 closeAll();
                 settle();
             }
+            {   // ---- B9: watch-design §19 - the panel SAYS whether this
+                // listing refreshes itself, and NAMES the gate when it does not.
+                //
+                // The 2026-09-29 report was 「以前あったフォルダ監視がなくなった?
+                // F5 おさないと更新されなくなった」 and every gate above was
+                // exactly where it had been. What was missing was the sentence:
+                // a listing that re-reads itself and one that does not look
+                // identical, so "is this broken, is it my setting, or did it
+                // never exist" could not be answered from the screen.
+                //
+                // BORROWED STATE, given back at the single exit below. The one
+                // that matters is `app.watchEnabled`: it is the prefs key
+                // `watchfiles`, VIEWER_TEST_HOME is ONE directory shared by
+                // every selftest, and a run that left it false would turn Watch
+                // off for every test after this one and for the user whose home
+                // that is (settings.inc's a9b7973 is the recorded case).
+                const bool wasOn = app.watchEnabled;
+                const bool wasPaused = app.watchPaused;
+                const bool wasSearch = I.search.active;
+                const bool wasConn = I.b.connected;
+                const double wasEvery = app.browseWatchIntervalSec;
+                settle();                     // nothing in flight: Working is not a gate
+                                              // under test, and it outranks On
+                // The states, as a TABLE, because B9 and B9c must be about the
+                // same six: each case shuts exactly one gate and the last shuts
+                // none. Gate 4 (not drawn) is not here - the panel that would
+                // draw the sentence is the panel that is not being drawn, so
+                // there is no reader to tell and the sentence is deliberately
+                // empty; it is asserted as empty, once, below.
+                auto setCase = [&](int c) {
+                    app.watchEnabled = true;
+                    app.watchPaused = false;
+                    I.b.connected = true;
+                    I.search.active = false;
+                    I.drawnFrame = FR;
+                    I.polledAt = clk - 99.0;  // long overdue: the clock is not the gate
+                    switch (c) {
+                        case 0: app.watchEnabled = false; break;   // gate 1
+                        case 1: app.watchPaused = true;   break;   // gate 1, minimised
+                        case 2: I.b.connected = false;    break;   // gate 2
+                        case 3: I.search.active = true;   break;   // gate 3
+                        case 4: I.polledAt = 0;           break;   // gate 7: arming
+                        default: break;                            // 5: nothing shut
+                    }
+                };
+                // What each one has to SAY. The first names the menu item that
+                // owns the switch, letter for letter as menus.inc draws it -
+                // "auto-refresh is off" without a way to turn it on is the
+                // defect one layer up. The last is the running sentence, and
+                // " ago" is its signature: it is the only state that has an AGE,
+                // because it is the only one in which a round has happened.
+                const char* WANT[6] = { "File > \"Watch source files on disk\"",
+                                        "minimised", "not connected",
+                                        "search results", "starting", " ago" };
+                clk += 100.0;
+                bool named = true;
+                for (int c = 0; c < 6; c++) {
+                    setCase(c);
+                    const std::string t = rbPollStateText(I, clk, FR);
+                    const bool hit = t.find(WANT[c]) != std::string::npos;
+                    if (!hit) named = false;
+                    fprintf(stderr, "browseselftest: B9 gate %d -> \"%s\" (wants \"%s\"): "
+                                    "%s\n", c, t.c_str(), WANT[c], hit ? "ok" : "FAIL");
+                }
+                setCase(5);
+                I.drawnFrame = FR - 2;        // the window went away
+                const std::string tGone = rbPollStateText(I, clk, FR);
+                I.drawnFrame = FR;
+                check(named && tGone.empty(),
+                      "B9 every shut gate is NAMED on the panel; not drawn says nothing");
+                {   // ---- B9b: the interval comes from the CONSTANT ------------
+                    // Move it and the sentence moves. Without this, a "3 s"
+                    // typed into the string passes B9 for as long as the
+                    // constant happens to be 3 - and then lies for ever.
+                    setCase(5);
+                    const std::string t3 = rbPollStateText(I, clk, FR);
+                    app.browseWatchIntervalSec = 7.0;
+                    const std::string t7 = rbPollStateText(I, clk, FR);
+                    app.browseWatchIntervalSec = wasEvery;
+                    const bool moved =
+                        t3.find("every 3 s") != std::string::npos &&
+                        t3.find("every 7 s") == std::string::npos &&
+                        t7.find("every 7 s") != std::string::npos &&
+                        t7.find("every 3 s") == std::string::npos;
+                    fprintf(stderr, "browseselftest: B9b 3 s -> \"%s\"; the constant at "
+                                    "7 s -> \"%s\": %s\n", t3.c_str(), t7.c_str(),
+                            moved ? "ok" : "FAIL");
+                    check(moved, "B9b the interval in the sentence IS browseWatchInterval, "
+                                 "not a number typed into it");
+                }
+                {   // ---- B9c: THE LOAD-BEARING ONE ---------------------------
+                    // The sentence and the decision may not disagree. Same six
+                    // states, and in every one of them the clock is left LONG
+                    // OVERDUE - so "the sentence says a round is happening" and
+                    // "rbPollDue says a round is due" are the same claim and
+                    // agreement is an equality, not an implication. A panel that
+                    // transcribed the gates into words would pass B9 and fail
+                    // here the first time one of them moved.
+                    bool agree = true;
+                    for (int c = 0; c < 6; c++) {
+                        setCase(c);
+                        const std::string t = rbPollStateText(I, clk, FR);
+                        const bool saysRunning = t.find(" ago") != std::string::npos;
+                        const bool due = rbPollDue(I, clk, FR);
+                        if (saysRunning != due) agree = false;
+                        fprintf(stderr, "browseselftest: B9c gate %d: says running=%d, "
+                                        "rbPollDue=%d: %s\n", c, saysRunning ? 1 : 0,
+                                due ? 1 : 0, saysRunning == due ? "ok" : "FAIL");
+                    }
+                    // ANTI-VACUITY: "nothing is ever running" agrees with
+                    // "nothing is ever due" in all six. Case 5 must be BOTH.
+                    setCase(5);
+                    const bool live = rbPollDue(I, clk, FR) &&
+                                      rbPollStateText(I, clk, FR).find(" ago") !=
+                                          std::string::npos;
+                    check(agree && live,
+                          "B9c the sentence and rbPollDue cannot disagree (one set of gates)");
+                }
+                app.watchEnabled = wasOn;     // the user's prefs (`watchfiles`), back
+                app.watchPaused = wasPaused;
+                I.search.active = wasSearch;
+                I.b.connected = wasConn;
+                app.browseWatchIntervalSec = wasEvery;
+                I.polledAt = 0;
+                I.drawnFrame = FR;
+                settle();
+            }
             I.cursor = -1;
             I.cursorKey.clear();
             I.sel.clear();
