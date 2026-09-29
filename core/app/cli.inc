@@ -59,6 +59,17 @@ static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean
 static std::string g_precisionSelftest; // --precision-selftest <dir>: the u32/i32/f64 values a
                                         // float32 cannot hold, and what is shown for them, exit
 static bool g_profileNoiseSelftest = false; // single-frame banding/pixel ratios
+static bool g_rowColSigmaSelftest = false;  // --rowcol-sigma-selftest: the four
+                                            // implementations of "sigma of the row /
+                                            // column means", against each other
+static bool g_anaValueSelftest = false;     // --anavalue-selftest: the shipped
+                                            // analyzers' VALUES on closed-form
+                                            // fixtures (板 304)
+// --nogl-groups-skipped: this run is the NOGL SIBLING of a test that also holds
+// one group needing a real ImGui frame. glGroup() (core/selftest/util.inc) skips
+// that one group and says so, instead of failing the whole test as needWindow()
+// does. Registered in CMakeLists.txt beside the GL run, never instead of it.
+static bool g_noglGroupsSkipped = false;
 static std::string g_abstatsSelftest;   // --abstats-selftest <dir>: A/B stats caches, exit
 static std::string g_tileSelftest;      // --tile-selftest <dir>: side-by-side pane geometry, exit
 static std::string g_seriesSelftest;    // --series-selftest <dir>: series invariants, exit
@@ -718,6 +729,16 @@ static void printUsage() {
         "                              AVI container, the refusals, and that a video\n"
         "                              frame IS the PNG export of that frame\n"
         "  --profile-noise-selftest    single-frame horizontal/vertical banding ratios\n"
+        "  --rowcol-sigma-selftest     the four implementations of 'sigma of the\n"
+        "                              row / column means' on one analytic fixture:\n"
+        "                              each against its own definition, and the\n"
+        "                              relations between them (板 303)\n"
+        "  --anavalue-selftest         the shipped analyzers' VALUES on fixtures\n"
+        "                              whose answer is closed form: prnu-fpn,\n"
+        "                              sharpness/gradient and iso12233/e-sfr\n"
+        "  --nogl-groups-skipped       (with a selftest) this run is the NOGL\n"
+        "                              sibling: skip the one group that needs a\n"
+        "                              real ImGui frame, run every other one\n"
         "  --settings-selftest         settings.jsonc: the dialect, the load order\n"
         "                              (prefs < file < flag) and the two refusals\n"
         "  --rawrecipe-selftest        headerless RAW recipes: the library in\n"
@@ -960,6 +981,12 @@ static void parseCli(int argc, char** argv) {
             g_precisionSelftest = next();          // handled in main()
         } else if (a == "--profile-noise-selftest") {
             g_profileNoiseSelftest = true;
+        } else if (a == "--rowcol-sigma-selftest") {
+            g_rowColSigmaSelftest = true;
+        } else if (a == "--anavalue-selftest") {
+            g_anaValueSelftest = true;
+        } else if (a == "--nogl-groups-skipped") {
+            g_noglGroupsSkipped = true;
         } else if (a == "--abstats-selftest") {
             g_abstatsSelftest = next();            // handled in main()
         } else if (a == "--tile-selftest") {

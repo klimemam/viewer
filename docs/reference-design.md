@@ -234,6 +234,14 @@ npy 3850 / raw 3991 / crop 4059 / remote 先頭 8205 (+ selftest の fixture 6 �
 キーの**追加のみ**。旧ビューアは未知キーを読み飛ばして開ける (形式の常道、
 項目10 で再確認済み)。
 
+**この形式が運べないもの**は型で言う: `LossKind` / `SessionReport`
+(板 126)。一覧と「読み込むとどうなるか」は
+[terminology.md](terminology.md) の「セッションが往復できないもの
+(loss taxonomy)」の表。保存・読込それぞれ1文だけを toast / Messages と
+stderr に出し、数と**名前**を持つ。書き込み自体は temp + rename で原子的
+(PR #113): 失敗したときは旧バイトがそのまま残るので、その場合この表は
+1行も出さない。
+
 ### 5.1 まず、記録すべき既存欠陥 (コードで確認)
 
 derive でコピーされた stack は、今日**セッションを正しく往復しない**。
@@ -260,6 +268,31 @@ path を持つ派生コピーはこの防衛線の外。つまり、既存セッ
 - 読む側 (新): 直前の image 行に `stackmember` が続いたら、sibling スキャンの
   `App::SeqRestore` (947) を**明示ファイル列**に差し替える。SeqRestore は既に
   files のリストを運べる構造をしている。
+
+**実装済み (2026-09-28, 板 267)**: `stackmember <seqIndex> <path>` は入った。
+確定した細部を3つ記録する。
+
+- **どの stack が対象か**は新しいフラグでは決めない。`SeqInfo::ruleDir` /
+  `ruleHead` が既にその問いの答である (watch-design §6: mint 時に**規則を
+  実際に走らせて**記録する)。空 = `findSequenceSiblings` がこのメンバ列を
+  再現しなかった = **明示**。派生部分集合・手で選んだ open・2フォルダに
+  跨る stack がそれである。二重帳簿を作らない。
+- **行は `seqload` の前に書く**。読み手は `seqload` を読んだ瞬間に動く
+  (rescan を queue する / peer フォルダならその場で attach する) ので、
+  後から来たメンバ列には変えるものが残っていない。`seqload 1` は従来どおり
+  併記するので、旧ビューアは今日と同じ復元 (劣化して開く) になる。
+- **ローカル限定**。peer のフォルダ stack のメンバーシップは復元時に peer 自身の
+  grouper から**再導出**する (PR #117 で受け入れた挙動) ので、url の列を凍結
+  すると読み手が守らないメンバーシップをファイルが主張することになる。
+  半端にやらず、`LK_LineRejected` で声に出して拒否する。
+- `stackrule <text>` は入れていない (derive の rule text は名前と note が既に
+  運んでいる)。往復するのは**メンバ列と明示性**である。
+
+明示メンバーシップが drain 待ち (`App::SeqRestore`) の間の保存も同じ列を
+書き戻す: Ctrl+S・0.4 秒のクラッシュ snapshot・debounce した autosave・終了時の
+autosave はどれもその窓の中で動いており、そこで rescan に落ちると**ユーザが
+外した frame を黙って入れ直して**次の autosave がそれを事実にする
+(seriesRestore が同じ窓で同じ理由の逐語書き戻しをしている)。
 - 復元で同じ path が複数の stack に現れたら (共有)、ローダは §6.2 の registry
   で source を共有する。復元順に依存しない (registry は identity tuple で引く)。
 

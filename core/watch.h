@@ -423,6 +423,69 @@ inline std::string rebuildText(const Rebuild& r, int before, int resident, int e
            std::to_string(expected) + " frame(s), was " + std::to_string(before);
 }
 
+// ---- §12's OTHER membership: F frames inside ONE file -----------------------
+//
+// planRebuild answers "which FILES is this stack made of now?", and there is one
+// shape of stack it cannot be asked about at all: a frame-axis .npy, which is F
+// memberships of ONE path (planStackMembership refuses it by name - "which names
+// are members" is not a question about that stack's names). Its membership moved
+// all the same when the script that wrote it wrote six frames where it had
+// written four, and until this existed the Watch line said the file had changed
+// and the Reload behind it re-read four frames out of six for ever.
+//
+// So: the same statement, made about a COUNT rather than about names. The rule
+// it keeps is rebuildText's - BOTH numbers, always - because a rebuild that
+// moved the frame count and did not print the new one leaves a stack quietly
+// measuring a different set. `expected` is what the header declares now,
+// `resident` is what actually decoded (a grown file whose new frame will not
+// decode is n-of-N, §12.4, and not a failure), and `before` is what the stack
+// held when the Reload started. "" = the count did not move, and then this
+// whole mechanism has nothing to say and the ordinary re-read summary stands
+// alone.
+inline std::string frameAxisText(int before, int resident, int expected) {
+    if (before == expected && before == resident) return {};
+    return "membership rebuilt: the frame axis in this file holds " +
+           std::to_string(expected) + " frame(s), was " + std::to_string(before) +
+           " - " + std::to_string(resident) + " of " + std::to_string(expected) +
+           " frame(s)";
+}
+
+// ---- §5's third item: "Watch: open new stacks" -------------------------------
+//
+// Is this stack one the caller has NOT seen before? The whole of the decision,
+// with no filesystem, no listing type and no open in it: the caller hands in the
+// names it already knows about and the member names of one stack in the listing
+// it just read.
+//
+// SEEN, not OPENED. A stack that was already in the folder when the toggle went
+// ON is seen and is never opened - "open new stacks" is about what ARRIVES, and
+// a switch that opened the twelve stacks already sitting there would be a
+// different feature and a far more expensive one. The baseline is taken at the
+// moment the switch is thrown, exactly as §1 takes the watcher's, and like §1's
+// first observation it announces nothing and opens nothing.
+//
+// THE IDENTITY IS THE MEMBERS, and that is a correction the implementation
+// forced. The obvious key is the stack's own name, and it does not work: a group
+// row's name carries the EXTENT of its frame axis ("mv_000‥002.npy",
+// rp::patternWithExtent), so a folder that gains a frame RENAMES the stack that
+// is already open and a name-keyed watcher opens it a second time. Member names
+// do not move - a frame that appears is one more name beside the ones that were
+// there - so they are what is remembered.
+//
+// NOT ONE of them, rather than not all of them. A capture writing frame 4 into a
+// stack whose 0..3 are open shares three names with what is known, and a rule
+// asking "are they all new?" would call that an arrival. Asking "is any of them
+// known?" calls it the growth it is, which is §6's membership rebuild's event
+// (PR #160) and not this one's: two mechanisms claiming one event is how a stack
+// comes to be opened again every time a frame lands in it.
+inline bool unseenStack(const std::vector<std::string>& seen,
+                        const std::vector<std::string>& members) {
+    if (members.empty()) return false;        // nothing to open is not an arrival
+    for (const std::string& m : members)
+        if (std::find(seen.begin(), seen.end(), m) != seen.end()) return false;
+    return true;
+}
+
 // ---- §9: the line an AUTOMATIC reload leaves on the stack -------------------
 //
 // The same discipline as findingText and rebuildText - ONE spelling, read by the

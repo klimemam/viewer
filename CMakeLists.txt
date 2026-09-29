@@ -1096,6 +1096,13 @@ set_tests_properties(test_abi_probe PROPERTIES LABELS "selftest;nogl" TIMEOUT 60
 # and assert on the LAYOUT that comes back, which is exactly what the backends
 # the window carries are what produce.
 #
+# THREE of those six hold that frame in ONE group and everything else in CPU, so
+# since 板 304 they are registered twice: abstats / verify / abstats-cfa-bayer
+# keep their GL line and gain a `-nogl` sibling that runs every OTHER group on
+# every runner (--nogl-groups-skipped, and glGroup() in core/selftest/util.inc).
+# tile is not split: two of its groups draw, and one of them reads the
+# framebuffer back, which is the thing a context is FOR.
+#
 # `roistats` is the one that had to EARN its NOGL rather than merely take it,
 # because it is the only test here that draws ImGui frames without a backend
 # under them (roiStatsSelftest() supplies the display size, the delta time and
@@ -1204,7 +1211,19 @@ scanhere,waitpick,pickok,waitimg:24,chkimg:24")
 # The T group lays out the Temporal panel in real ImGui frames (the chart that
 # was drawn past the panel's bottom edge is a layout fact, invisible to the
 # recompute functions).
+#
+# ...and it is ONE group of eight, which is why the same test is registered twice
+# (板 304, inventory §4.3). The line above runs everything on the runner that has
+# a context; the NOGL sibling below runs everything EXCEPT the T group, on all
+# three. What that moves onto the other two runners is A1 (the 4x256 histogram
+# bins, memcmp against the test's own independent RefHist), A2 (mean / sd, and
+# the per-plane sigma_t against refSigmaT - the ONLY parity that kernel has),
+# A1p, A3, P1-P3 and the slot group S. --nogl-groups-skipped is what makes
+# glGroup() skip instead of fail; without it, --no-window on this test is still
+# the error it was.
 viewer_selftest(abstats     --abstats-selftest tools/testdata/multi)
+viewer_selftest(abstats-nogl NOGL --abstats-selftest tools/testdata/multi
+                            --nogl-groups-skipped)
 viewer_selftest(range       NOGL --range-selftest tools/testdata/multi)
 viewer_selftest(close       NOGL --close-selftest tools/testdata/multi)
 viewer_selftest(batch       NOGL --batch-selftest tools/testdata/multi)
@@ -1212,7 +1231,14 @@ viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
 # The ROI row probe: real frames with an injected cursor, asserting on where the
 # rows the panel laid out actually are - the delete button's rect and the clicks
 # that have to reach it past a span-all-columns Selectable.
+#
+# V19 is that probe and it is the only group in the file that needs a context, so
+# the same split as abstats above (板 304). What the sibling moves onto the other
+# two runners includes V13, which measures ONE NaN fixture through both sigma_t
+# implementations (inventory P10) - the nearest thing that pair has to a test.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)
+viewer_selftest(verify-nogl NOGL --verify-selftest tools/testdata/multi
+                            --nogl-groups-skipped)
 # AnalysisSet (docs/features/adapters/reader-analysisset.md): transport read, Ref binding order,
 # close semantics, session block + adopt. Fixtures are built by the test
 # itself under a scratch dir, so the argument is only a place to put them.
@@ -1421,6 +1447,16 @@ viewer_selftest(stackavg    NOGL --stackavg-selftest tools/testdata)
 # is a number or the string a panel prints, so it gates on all three runners.
 viewer_selftest(precision   NOGL --precision-selftest tools/testdata)
 viewer_selftest(profile-noise NOGL --profile-noise-selftest)
+# The four sites that compute "sigma of the row / column means" (板 303), held
+# against each other on one analytic fixture. NOGL and fixture-free for
+# profile-noise's reasons - the documents are built in memory and every expected
+# value is a rational derived by hand - and it needs the shipped
+# uniformity/prnu-fpn dll, which startup loads before parseCli either way.
+viewer_selftest(rowcol-sigma NOGL --rowcol-sigma-selftest)
+# The VALUES of the three shipped analyzers that had none (板 304 / inventory
+# §4.2). Same NOGL reasoning and the same dlls as selftest.bundled - which fixes
+# their keys and version - on fixtures whose answer is closed form instead.
+viewer_selftest(anavalue    NOGL --anavalue-selftest)
 viewer_selftest(export-tsv  NOGL --export-tsv-selftest tools/testdata/multi --stack always
                             --cfa bayer --bayer-pattern RGGB)
 # (frame-lin retired with the §3.3 migration: the frame-axis linearity fit
@@ -1617,6 +1653,12 @@ viewer_selftest(rset NOGL --rset-selftest tools/testdata
 # selftest.abstats with 12 asserts silently skipped against ".". --cfa goes
 # AFTER the directory; the run prints "series=4" when it took effect.
 viewer_selftest(abstats-cfa-bayer --abstats-selftest tools/testdata/multi --cfa bayer)
+# ...and its NOGL sibling, for the reason above doubled: the four per-plane
+# refSigmaT numbers this run checks are the mosaic half of that parity, and until
+# 板 304 they ran on one machine of three. --nogl-groups-skipped goes last, after
+# the directory AND after --cfa's value, for the same argument-order reason.
+viewer_selftest(abstats-cfa-bayer-nogl NOGL --abstats-selftest tools/testdata/multi
+                            --cfa bayer --nogl-groups-skipped)
 
 # The BENCH ITSELF, as a test - no --*-selftest flag, because the subject is
 # the benchmark and not a routine it calls. `viewer --bench N` now prints the

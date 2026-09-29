@@ -80,6 +80,12 @@ static int settingsSelftest() {
         app.memBudgetGB = 0;
         app.watchEnabled = true;
         app.watchAutoReload = false;
+        // Board row 297, and here for the reason the two above it are: group O
+        // feeds this key values and the schema walk feeds it its sample (12), and
+        // a 12 that survived into T3 would put an extra key in the template and
+        // make T3's count measure the previous group. 5 is the built-in default
+        // and the interval that shipped.
+        app.watchIntervalSec = 5;
         // #204, and here for the same reason the three above are: group D sets
         // this key, and a value that survived into T3 would put a seventh key
         // in the template and make T3's count measure the previous group.
@@ -1066,6 +1072,65 @@ static int settingsSelftest() {
         baseline();
     }
 
+    // O8: watch.intervalSec (board row 297). §9 of the Watch design left the
+    // polling interval a constant with "prefs 化はユーザーが欲しがってから"
+    // beside it, and this is that. The shape is loading.folderScanDepth's - a
+    // whole number in a window, refused outside it by name (判断8) rather than
+    // clamped - plus the one thing that is this key's own: the worker READS IT
+    // LIVE, so a change takes effect at the next poll and the value on this row
+    // is the value the next poll uses.
+    {
+        baseline();
+        const std::string wi = writeFix("// a comment, so the line number is not 1\n"
+                                        "{ \"watch\": { \"intervalSec\": 30 } }\n");
+        const SettingsReport wr = loadSettingsFrom(wi);
+        const OriginEntry& oW = settingsOriginOf(SK_watchInterval);
+        fprintf(stderr, "settingsselftest: O8 file intervalSec=%d origin=%d line=%d "
+                        "value=\"%s\" poll=%.1f remoteEvery=%d\n",
+                app.watchIntervalSec, (int)oW.who, oW.line,
+                settingsCurrentValue(SK_watchInterval).c_str(),
+                watchPollSeconds(), watchRemoteEvery());
+        check(wr.rejected == 0 && wr.unknown == 0 && app.watchIntervalSec == 30 &&
+              oW.who == SetOrigin::File && oW.line == 2 &&
+              settingsCurrentValue(SK_watchInterval) == "30",
+              "O8 watch.intervalSec 30 lands and names the file and the line");
+        // ...and the ONE READER is what the worker waits on, so the row and the
+        // poll cannot disagree. 30 s local against 15 s remote also exercises
+        // watchRemoteEvery's floor: a peer is never asked FASTER than the local
+        // rate, so the answer is 1 round and not a fraction.
+        check(watchPollSeconds() == 30.0 && watchRemoteEvery() == 1,
+              "O8b ...and the poll the worker waits on IS that number, live");
+        // Outside the window: refused by name, changing nothing. 0 is the one
+        // that matters - it would turn the watcher into a spin - and it is not a
+        // second meaning here the way 0 is for uiScale and the memory budget.
+        const char* badInt[] = { "0", "-5", "3601", "2.5" };
+        bool refused = true;
+        for (const char* b : badInt) {
+            baseline();
+            app.watchIntervalSec = 7;             // a value that must SURVIVE it
+            const SettingsReport br3 = loadSettingsFrom(writeFix(
+                std::string("{ \"watch\": { \"intervalSec\": ") + b + " } }\n"));
+            refused = refused && br3.rejected == 1 && app.watchIntervalSec == 7 &&
+                      settingsOriginOf(SK_watchInterval).who == SetOrigin::None;
+        }
+        check(refused, "O8c an interval outside 1..3600 is refused, changing nothing");
+        // ...and a hand-edited prefs.txt is not a file this refusal can reach, so
+        // the READER is where the window is finally enforced (scanDepthBelow's
+        // rule): the row keeps showing what was written, the worker waits sanely.
+        baseline();
+        app.watchIntervalSec = 0;
+        const double sane0 = watchPollSeconds();
+        app.watchIntervalSec = 99999;
+        const double saneHi = watchPollSeconds();
+        baseline();
+        check(sane0 == 1.0 && saneHi == 3600.0 && watchPollSeconds() == 5.0,
+              "O8d ...while the one READER clamps whatever prefs.txt was edited to");
+        check(settingsCurrentValue(SK_watchInterval).empty() &&
+              settingsBadgeFor(SK_watchInterval) == "default",
+              "O8e the default 5 writes nothing and the row says \"default\"");
+        baseline();
+    }
+
     // O5: a loaded document is a fifth, later authority for the two display
     // values .vsession actually carries. Gamma starts under a CLI claim and
     // grid under a File claim, so this pins precedence rather than merely the
@@ -1278,10 +1343,15 @@ static int settingsSelftest() {
         // as browse.folderClick - the name says which click the user is choosing
         // rather than which verb the click performs. So the table is still 35
         // rows and the split moves by one: 29 readable, 4 "later", 2 "not here".
-        check(readable == 29, "W1 ...and 29 of them are editable today");
+        // Board row 297 adds watch.intervalSec - the third key here that was
+        // never a prefs.txt line before it was a setting (it is one now, for
+        // scanDepth's and uiScale's reason: the panel edits it) - and it opens the
+        // `watch` section, which had no rows at all: 30 readable over 36 rows,
+        // with the 4 "later" and 2 "not here" untouched.
+        check(readable == 30, "W1 ...and 30 of them are editable today");
         check(later == 4 && notHere == 2,
-              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 35");
-        check(rows.size() == 35, "W1 ...over 35 rows, which is the whole table");
+              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 36");
+        check(rows.size() == 36, "W1 ...over 36 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1883,11 +1953,11 @@ static int settingsSelftest() {
         fprintf(stderr, "settingsselftest: W6 %d row(s) moved off the default, "
                         "%d came back%s%s\n", moved, reset,
                 stuck.empty() ? "" : "; stuck: ", stuck.c_str());
-        // 29 readable rows, and every one of them has a sample (S1 feeds them
+        // 30 readable rows, and every one of them has a sample (S1 feeds them
         // all). `moved` is the anti-vacuity number: a sample equal to the default
         // would make that row's reset meaningless, and W1's own count is what
         // says how many rows there are to move.
-        check(moved == 29 && reset == 29 && stuck.empty(),
+        check(moved == 30 && reset == 30 && stuck.empty(),
               "W6 every readable key is moved off its default by its sample, and resets back");
 
         // W7: the reset is a CHANGE, so it owes what a change owes - this machine's
@@ -1952,7 +2022,10 @@ static int settingsSelftest() {
         const char* wantNotes[] = { "browse.naturalSort", "browse.folderClick",
                                     "readers.searchPath", "readers.editor",
                                     "series.defaultUnit", "measuring.memoryBudgetGB",
-                                    "loading.watchAutoReload", "loading.folderScanDepth" };
+                                    "loading.watchAutoReload", "loading.folderScanDepth",
+                                    // board row 297: the one thing a number in a
+                                    // box cannot say is when it takes effect
+                                    "watch.intervalSec" };
         int found = 0;
         for (const char* w : wantNotes)
             for (const PrefRow& r : rows)

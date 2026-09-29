@@ -233,13 +233,17 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 
 | # | 実装site | 備考 |
 |---|---|---|
-| 1 | `core/app/compare.inc:643` `computeMinMax` | 正規の入口。`src->vmin/vmax` を書き、percentile / median キャッシュを落とす |
-| 2 | `core/app/remote_client.inc:151-156` (`rfWorker` 内) | **#1 と同じループと同じ縮退ガードを書き写したもの。UI スレッド外で測るため。どのコメントも重複に触れていない** |
+| 0 | `core/app/compare.inc` `minMaxOf` | **カーネル本体**。ImageDoc を知らない純関数で、3つの規約 (非有限は値でない / 有限標本ゼロは 0..1 / 平坦は +1 で広げる) はここにしか無い |
+| 1 | `core/app/compare.inc` `computeMinMax` | 正規の入口。#0 を呼び、`src->vmin/vmax` を書き、percentile / median キャッシュを落とす |
+| 2 | `core/app/remote_client.inc` (`rfWorker` 内) | **#0 を呼ぶ**。UI スレッド外で測るため ImageDoc がまだ無い —— 写しが存在した理由がそれで、純関数化で消えた (板 299) |
 | 3 | `core/app/plugin_glue.inc:351-356` | ROI montage のタイル毎正規化 (面別にしないことを明記) |
 | 4 | `core/ui/panel_projection.inc:399-401` | プロット間引きの min-max バー (表示のみ) |
 | 5 | `core/shading_probe.h:185-190` | フィット面の p-p (派生面のモーメント) |
 
-**#1 と #2 が本書で見つかった唯一の「無言の重複」である。**
+**#1 と #2 が本書で見つかった唯一の「無言の重複」であった。**
+**【解消 2026-09-28 板 299】** #2 は #1 のループと縮退ガードの写しで、どのコメントも
+重複に触れていなかった。純粋な重複削除: カーネルを `minMaxOf` (#0) に出し、#1 と #2 の
+両方がそれを呼ぶ。数は動かない (同一コードだった)。
 他のすべての重複site は、コードかドキュメントのどこかで自分が重複であると申告している。
 
 ## 4. 対 (pair) と parity 試験の有無
@@ -270,17 +274,18 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 | P19 | plugin `X.std` (K1#8/#9) ↔ 組み込み `sd` (K1#1/#2) | **はい** (同じ ddof、同じ CFA 規則) | **なし** | plugin parity は **name+version の宣言照合**で数値照合ではない (abi-v3.md §10 が明言)。P4 は「同じ dll を2つの転送路で」比べるだけで、組み込みとは比べない |
 | P20 | percentile: `p50` (K7#2 厳密) ↔ Med ボタン (K7#1 近似) | **はい** (同じ中央値) | **なし** | `--range-selftest` P4/P10/P12 は K7#1 を**自分自身の別の駆動**と突き合わせるだけ。分位そのものも 0.01/0.99 対 0.001/0.999 で違う |
 | P21 | histogram bin: K6#1 ↔ K6#3 (plugin entropy) | 一致しなくてよい | — | 用途が違う (表示 / エントロピー)。ただし規則が3つあることは記録に値する |
-| P22 | min/max: K10#1 ↔ K10#2 | **はい** (同じ `vmin/vmax` を書く) | **なし** | 今は同一コードなので値は同じ。**画素から min/max を再計算して製品と比べる試験はツリー全体に1本も無い** |
+| P22 | min/max: K10#1 ↔ K10#2 | **はい** (同じ `vmin/vmax` を書く) | **あり** (板 299 で追加) `--rnpz-selftest` R28: local:// peer で 2000px の frame を開き、preview → 全解像度の着地まで駆動して **(a) 着地の `vmin/vmax` = 試験が自分で書いた独立ループの答え、(b) 同じ画素に対する `computeMinMax` の答えと bit 一致、(c) 非有限3標本・奇数列だけが持つ極値・全 NaN → 0..1・平坦 → +1** を固定 | **画素から再計算して製品と比べる試験**。較正2通りを実測: (A) `minMaxOf` を書き換えると R28b/c/f が赤・**R28d は緑**(両方が同時に動く = 1カーネル)、(B) worker 側にだけ差分を戻すと **R28d が赤**。両方を1本に統一したのが板 299 |
 | P23 | Histogram 値域ハイライトの件数 ↔ bin の件数 | **一般には一致しない。母集団が一致する場合だけ一致する** | **あり** `--histhl-selftest` T5/T6 が**厳密 `==`** | `core/app/state.h:1134-1138` が「母集団が違う (bin は ~1M 間引き + ROI 限定、paint は全画素)。bin から導けば分母の違う2つの数が1つの文に並ぶ」と明記。T5/T6 は**間引きも ROI も効かない fixture で「2経路・1つの等式」を固定する**。片方を他方から導く実装にした瞬間、この試験は無意味になる |
 
 ### 4.1 数えると
 
-- **parity 試験がある対: 9 (P1–P9)。** うち 4 本が local/peer、2 本が client 内部の
-  2経路、1 本が閉形式、1 本が構造的 (再計算しない)、1 本がキャッシュ対直呼び。
-- **parity 試験が無い / 間接だけの対: 10 (P10–P14、P17–P20、P22)。**
+- **parity 試験がある対: 10 (P1–P9、P22)。** うち 4 本が local/peer、2 本が client 内部の
+  2経路、1 本が閉形式、1 本が構造的 (再計算しない)、1 本がキャッシュ対直呼び、
+  **1 本が画素からの再計算 (P22、板 299 で追加)**。
+- **parity 試験が無い / 間接だけの対: 9 (P10–P14、P17–P20)。**
 - **local/peer 軸はほぼ守られている。** 守られていないのは
   **client 内部の対 (P10、P14、P17)**、**plugin 対 組み込み (P19)**、
-  **percentile の2方式 (P20)**、**min/max の写し (P22)** である。
+  **percentile の2方式 (P20)** である。**min/max の写し (P22) は板 299 で解消**。
 - 板 99 行が名指した σ_t は、**最も試験が厚い対 (P1) と、最も薄い対 (P10/P12) を
   同時に持っている。**
 
@@ -288,15 +293,17 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 
 | 量 | 状態 |
 |---|---|
-| `uniformity/prnu-fpn` の `prnu_pct` / `row_fpn_pct` / `col_fpn_pct` / `shading_pct` | `core/selftest/bundled.inc` が `key:unit` の一覧と version `1.0.0` だけを固定する。**値はどこにも assert されていない** (`plugins/test/test_prnu.c` は `boxblur2d` 単体の応答を 1e-5 で見るだけ) |
-| `sharpness/gradient` の `varlap` / `tenengrad` / `grad_mean` | 同上 |
-| `iso12233/e-sfr` の `mtf50` / `mtf20` / `sfr@nyquist` | 同上。カーブは stdout に出るだけで、**commit 間の人間の byte-diff** が唯一の防御 |
-| Temporal の per-frame TSV 全体 | `core/selftest/framestats.inc` は**全 21 行で assert が 0 本**。TSV を stdout に印字して 0 を返す。ヘッダは「独立した numpy 実装が全数値を再現しなければならない」と書くが、**その実装はリポジトリにも CI にも無い** |
+| `uniformity/prnu-fpn` の `prnu_pct` / `row_fpn_pct` / `col_fpn_pct` / `shading_pct` | `core/selftest/bundled.inc` が `key:unit` の一覧と version `1.0.0` だけを固定する。**値はどこにも assert されていない** (`plugins/test/test_prnu.c` は `boxblur2d` 単体の応答を 1e-5 で見るだけ) → **板 302/303 で閉じた** (`--anavalue-selftest` U1/U2 が bilinear ramp 上の4量を閉形式で当てる) |
+| `sharpness/gradient` の `varlap` / `tenengrad` / `grad_mean` | 同上 → **閉じた** (`--anavalue-selftest` G1-G4。ramp と checkerboard が互いの零を埋めるので3量すべてが `==` で固定) |
+| `iso12233/e-sfr` の `mtf50` / `mtf20` / `sfr@nyquist` | 同上。カーブは stdout に出るだけで、**commit 間の人間の byte-diff** が唯一の防御 → **閉じた** (`--anavalue-selftest` S1-S3。理想エッジの `\|sinc(f)\|*sinc(f/4)^2` モデルに曲線 1%・交点 1%。副産物として `DEFECT(esfr-1)`: 暗レベル≠0 だと先頭空 bin の 0 埋めが LSF に偽インパルスを作り mtf50 が −5.4% ずれる。analyzer 側の欠陥なので別行) |
+| Temporal の per-frame TSV 全体 | `core/selftest/framestats.inc` は**全 21 行で assert が 0 本**。TSV を stdout に印字して 0 を返す。ヘッダは「独立した numpy 実装が全数値を再現しなければならない」と書くが、**その実装はリポジトリにも CI にも無い** → **閉じた** (同ファイルの F1-F5。stdout は不変のまま、8x8 x5 枚の合成 stack の mean / σ / σ_col / σ_row / NaN 1画素 / 非常駐枚を有理数で固定) |
 
 これは `stats-taxonomy.md` §6.6 が記録した事故の形そのものである:
 ddof=1 の2式を ddof=0 に反転して **42 テスト全 PASS**。その後
 `--export-tsv-selftest` E11 が値 assert を1本足して per-frame **領域**σだけが守られた
-(P6)。**P14 / P17 と上の4量は今日もこの状態である。**
+(P6)。**上の4量は板 302/303 (PR #273) で閉じた。P14 / P17 の一般形は
+`--rowcol-sigma-selftest` が「現状の差を数値で固定」した段までで、統一そのものは
+§6.1 順位 5 の裁定待ちである。**
 
 ### 4.3 「試験があるが、どこでも走るわけではない」
 
@@ -313,6 +320,19 @@ ddof=1 の2式を ddof=0 に反転して **42 テスト全 PASS**。その後
 - **`verify` V13** (K4#1 と K4#2 を同じ NaN fixture で測る、P10 の間接分) も同様。
 - CI の Linux ジョブは xvfb を入れ、`VIEWER_SELFTEST_REQUIRE_GL` で「コンテキスト
   無し」を失敗に変える。**つまりこの2本は3 OS のうち1つでしか効いていない。**
+
+**板 302/303 (PR #273) で閉じた。** GL が要るのは `abstats` では T / S4-S6 / N の
+3群、`verify` では V19 の1群だけだったので、**GL 行はそのまま残したまま `-nogl`
+兄弟を並べて登録**する形にした (`abstats-nogl` / `verify-nogl` /
+`abstats-cfa-bayer-nogl`)。土台は `glGroup()` (`core/selftest/util.inc`) と
+`--nogl-groups-skipped` で、旗が無ければ従来の `needWindow()` そのままなので
+NOGL の誤付与は今までどおり赤になる。これで A1 / A2 / A1p / A3 / P1-P3 / S1-S3 の
+**106 assert** と `verify` の **227 assert** (V13 を含む) が3 OS で走る。
+`tile` は分割しない —— 2群が描き、うち1つは framebuffer を読み戻す。
+
+**この形を今後の GL 混在テストの標準とする** (裁定, PR #273 レビュー)。代償は
+GL ランナーで CPU 群が2回走ることで、CI 時間が問題になったら GL ランナー側で
+`ctest -E '-nogl$'` として `-nogl` 兄弟を除外する。
 
 参考として、`abstats-cfa-bayer` は `6308888` から一時 `DISABLED` にされた履歴を持ち、
 原因は**製品ではなく selftest 側の `refSigmaT` が4面を pooled にしていたこと**だった
@@ -382,7 +402,7 @@ Series Analysis 経路は全画素の数、peer の応答は何画素が分散�
 
 | 順 | 候補 | 何を1つにするか | 数は動くか | 要る裁定 |
 |---|---|---|---|---|
-| **1** | **K10 min/max** (P22) | `computeMinMax` を worker から呼べる形にし、`remote_client.inc:151-156` の写しを消す | **動かない** (今は同一コード) | **不要**。純粋な重複削除 |
+| ~~**1**~~ **済** | **K10 min/max** (P22) | 純関数 `minMaxOf` を切り出し、`computeMinMax` と `rfWorker` の両方がそれを呼ぶ形にした | **動かなかった** (同一コードだった) | 不要だった。**【完了 2026-09-28 板 299】** parity 試験も同時に追加 (`--rnpz-selftest` R28) |
 | **2** | **K4 σ_t の蓄積器** (P10/P11/P12/P13) | `setfold::pixelMeanCorr` の形を temporal 経路にも広げ、**CFA 面規則と NaN 報告構造体を関数の一部にする** | **動く**: 規則が食い違っている場所でだけ (モザイク上の小 ROI、`cfa!=0 && ch>1`、preview stack)。1面の場合は**ビット不変** (P1 が既に保証) | **要る**: 3つの CFA 規則のどれを正とするか。ch>1 + CFA 宣言を「拒否」(peer の今) か「pooled」(local の今) か |
 | **3** | **K4 の在室・標本規則** | `remoteStep>1` / `px().empty()` の濾しを1箇所に。40k 格子を残すか撤去するか | **動く**: preview stack と小 ROI で | **要る**: Temporal パネルの応答性 (40k の理由) と正典の「実際に集計した枚数」の衝突 |
 | **4** | **K1 領域モーメント + 標本上限の申告** (P17/P18/P19) | 1つの蓄積器 + **結果構造体に n と cap を必須フィールドで持たせる** | **動く**: 上限を揃えるなら、最小の cap より大きい ROI の**全部**で | **要る**: 5つの cap (200k/1M/2M/40k/full) をどれに寄せるか。統一せず「n を出す」だけなら数は動かない |
@@ -432,7 +452,11 @@ Series Analysis 経路は全画素の数、peer の応答は何画素が分散�
 1. **P10 (K4#1 ↔ K4#2)**: 同じ stack・同じ ROI で、**K4#1 の 40k 格子と同じ格子を
    K4#2 に渡せば**同じ標本になる。片方を格子に合わせられるので閾値が勘にならない。
    V13 は既に両方を同じ fixture で走らせているので、**assert を1行足すだけ**である。
-2. **P22 (min/max)**: 同じ画素・同じ式。**ビット一致を要求できる。**
+2. ~~**P22 (min/max)**: 同じ画素・同じ式。**ビット一致を要求できる。**~~
+   **【完了 2026-09-28 板 299】** `--rnpz-selftest` R28 が、試験自身の手書きループで
+   画素から再計算した答えと、着地が書いた `vmin/vmax` と、同じ画素に対する
+   `computeMinMax` の答えを**ビット一致**で突き合わせる。参照ループはカーネルを
+   呼ばない (呼べば一緒に動いて永久に緑になるため)。較正2通りを実測済み。
 3. **P17 のうち K1#1 ↔ K1#3**: どちらもモザイクセル単位ストライドなので、
    cap を揃えた呼び出しを1本立てれば同じ標本になる。
 
@@ -451,16 +475,16 @@ Series Analysis 経路は全画素の数、peer の応答は何画素が分散�
 | | 数 |
 |---|---|
 | カーネル種 | 10 (K1–K10) |
-| 実装site (出荷コード、selftest を除く) | **42** (K1 10 / K2 4 / K3 1 / K4 5 / K5 3 / K6 3 / K7 6 / K8 2 / K9 3 / K10 5) |
-| うち共有で解決済み | 5 (`setfold.h` / `shading_probe.h` / `detrend.inc` の語と面 / `setPlaneFpn` / panel↔export の struct 読み) |
+| 実装site (出荷コード、selftest を除く) | **41** (K1 10 / K2 4 / K3 1 / K4 5 / K5 3 / K6 3 / K7 6 / K8 2 / K9 3 / K10 4) —— 初版は 42・K10 5、板 299 で K10 の写し1件が消えた |
+| うち共有で解決済み | 6 (`setfold.h` / `shading_probe.h` / `detrend.inc` の語と面 / `setPlaneFpn` / panel↔export の struct 読み / **`minMaxOf`(板 299)**) |
 | 立てた対 | 23 (P1–P23) |
-| parity 試験がある対 | 9 |
-| 間接だけ / 無い対 | 10 |
+| parity 試験がある対 | 10 (初版 9、板 299 で P22 を追加) |
+| 間接だけ / 無い対 | 9 (初版 10) |
 | 一致しなくてよい・してはならない対 | 4 (P15 / P16 / P21 / P23) |
 | 数値 assert を1つも持たない出荷測定量 | 4 群 (§4.2) |
 
 **先行調査との突き合わせ**: stats-taxonomy.md §6.2 は**分散/σ を計算する式だけ**を
-数えて 25 箇所だった。本書の 42 はその集合に percentile / histogram bin / median /
+数えて 25 箇所だった。本書の 41 (初版 42) はその集合に percentile / histogram bin / median /
 min-max / detrend を足したもので、**σ 系 (K1–K5 + K9 の `prnu_pct`) だけを取れば
 §6.2 の 25 と同じ範囲を指す**。差は数える境界だけで、**site の集合に食い違いは
 見つからなかった**。§6.2 の行番号は 2026-08-10 時点、本書は `fdbf5297` 時点である。

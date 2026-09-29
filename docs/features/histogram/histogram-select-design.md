@@ -304,15 +304,18 @@ Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対�
 - T10（現行試験）: compare on で A/B に異なる既知値を置き、両ペインがそれぞれ
   自分の画素数を表示する。名前不一致（B が mono、束縛 R）では塗らず
   `B: no R plane` と表示する。
-- T10 の未固定範囲: C を含む Split、Wipe / Off の可視ペイン切替、Split の狭幅
-  fallback で、描画されないペインの古い `hlCount` を表示しないこと。現行実装の
-  挙動ではあるが、`selftest.histhl` はここまでを直接 assert していない。
+- T10 の未固定範囲: phase④(PR #273)で T14 / T14b / T15 / T16 が固定。C スロットの
+  Split 値残存・difference footer の stale 値・寸法不一致時の badge 誤文の 3 件は
+  現行実装の欠陥で、`histhl.inc` STAGE 4 が DEFECT(1)(2)(3) として stderr に報告
+  (assert せず)。裁定: `HlCount` に塗ったフレーム番号を刻み、footer と badge は現
+  フレーム分だけ読む。修正は板 275 の続きで別 PR。
 - T11（現行試験）: RGB 多ch + all の拒否文、個別 ch なら受理する反例、描画対象の
   ペインが拒否理由を返すこと、difference view の canvas badge が非表示理由を示す
   ことを固定する。
 - T11 の未固定範囲: 実際のドラッグ release が armed にせず同じ文を toast に出す
   こと、difference のパネルが古い A/B の画素数を出さないこと、寸法不一致時に
-  canvas と同じ A fallback を示すこと。これらは phase④ の回帰追加対象とする。
+  canvas と同じ A fallback を示すこと。これらは phase④(PR #273)で T15 / T16 が
+  扱い、結果は上の T10 の段にまとめた (1件目は成立、残り 2 件は欠陥として報告)。
 - docs/guides/manual.md にひと節 (README は触らない)。
 
 ## 10. v1 で断ること (再訪条件つき)

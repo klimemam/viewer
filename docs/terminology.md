@@ -190,3 +190,40 @@ Yes なら series、No なら batch。
   あるメンバから series を作る場合は、先に同じ batch へ移す（管理先の付け替えで
   あって、複製ではない）。
 - **batch 名は一意**。セッションは batch を名前で復元するため、衝突には ` (2)` を付す。
+
+## セッションが往復できないもの（loss taxonomy）
+
+`.vsession` は「開き直すもの」の一覧である。開き直せないものは必ず存在する
+——このプログラムが**計算した**画素、間引きタイルとして画面に出ているだけの
+frame、stack を閉じてしまった series。どれも、書き手が飛ばした行・読み手が
+諦めた行で**その時点では分かっていた**。分かっていたのに、言う場所が
+writeSessionTo の stderr 4 本と loadSession 末尾の toast 2 本にばらけており、
+「この保存は何を落としたか」を**呼び出し側が型で問える形**にはなっていなかった。
+
+`LossKind`（`core/app/state.h`）がその答の閉じた一覧、`SessionReport` が
+数え上げと**先頭いくつかの名前**である。保存側・読込側それぞれ**1文**だけを
+toast / Messages と stderr に出す。列挙に入れてよいのは**書き手か読み手が
+実際にその場で検出しているもの**だけ——「危なそうだから」では入れない。
+
+| LossKind | いつ | 何が往復しないか | 読み込むと |
+|---|---|---|---|
+| `LK_ComputedPixels` | 保存 | frame 平均 / 合計・detrend 産物の**画素**。往復するのは**レシピ**だけ（上の不変条件の「計算で作った frame」） | 今日のディスクに対して**計算し直す**。§10.2 の世代記録が「同じ絵だったか」を言う |
+| `LK_ComputedGone` | 保存 | 同じレシピで、元 stack が**閉じている**もの。畳む対象が無いのでレシピすら書けない | 戻らない |
+| `LK_NoFile` | 保存 | ファイルもレシピも持たない doc（ROI montage）。`src->path` が空 | 戻らない |
+| `LK_RemotePreview` | 保存 | `remoteStep > 1` の remote doc。画面にあるのは間引きタイルで、行が運ぶのは元 url | url から**取り直す**（画面にあった画素そのものではない）。この上の crop は `LK_CropDeferred` になる |
+| `LK_ReaderNoMemo` | 保存 | reader が作った `__pixels_N` で、どの reader かの memo がこの機械に無いもの（memo は有界 LRU） | 戻らない。session は reader を**名指すだけで走らせない**（#179 裁定 C）ので、名前すら書けない |
+| `LK_SeriesUnwritable` | 保存 | batch の無い series、この形式で綴れない未解決 picker 掃引 | 戻らない |
+| `LK_SeriesMember` | 保存 | 書ける series の中の、frame が消えたメンバ1つ。メンバは**手で入れたパラメータ値**である | そのメンバだけ欠けて戻る |
+| `LK_SetUnwritable` | 保存 | batch の無い AnalysisSet | 戻らない |
+| `LK_SetRoleUnbound` | 保存 | 束縛先にファイルが無い role 1つ。role 自体は理由つき `unbound` として**書かれる**（宣言は記録である） | role は戻り、**束縛は戻らない** |
+| `LK_ImageNotRestored` | 読込 | `image` 行が開けなかった | その doc は無い |
+| `LK_StackNotRebuilt` | 読込 | 行は開いたが、周りの **stack** を組み直せなかった | frame 1枚として戻る |
+| `LK_CropDeferred` | 読込 | 保存された crop（または `seqframe`）を**まだ**当てられない（全解像度 frame が飛行中） | `App::restoreWait` に停めて、着いたら当てる。**欠落ではなく保留** |
+| `LK_LineRejected` | 読込 | 読み手が**拒否**した行（壊れた `ann`、読めない `seqaxisvals`、主語の無い限定行） | その行だけ落ちる。落とすのは正しい（描けない軸に 0 を捏造する方が悪い）が、黙って落とすのをやめた |
+
+- **原子的書き込みとは別の話である。** 書き込みが失敗したときは「旧ファイルが
+  そのまま残った」であり、この表は1行も出さない——**何も失っていない**保存を
+  損失つき保存のように読ませる文が、いちばん悪い報告になる。
+- 報告は**名前を持つ**。「series メンバ2件が保存できませんでした」で
+  どの2件か言わないなら、行 126 が問題にしたものと同じである。
+- セッション形式そのものは [reference-design.md](reference-design.md) §5。

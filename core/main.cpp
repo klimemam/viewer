@@ -265,6 +265,19 @@ static std::string fmtVal(float v, const std::string& dtype) {
 // is constant-initialized and no browse call can ever beat it. This sits after
 // cli.inc because the spine has only now seen all fifteen definitions.
 static void browseWakeUi() { glfwPostEmptyEvent(); }   // rbWorker's UI wake
+// Board row 134: §4.12 asked at the panel's layer. It IS openRemoteMemoFirst -
+// the door the registered remote open already goes through - with the out
+// parameter dropped, because what the panel needs to know is only "has this door
+// taken it", and a reader that cannot run has said so itself. One spelling, so a
+// row opened from a selection and the same row opened by its own double-click
+// cannot come to disagree about which reader is remembered for it. The name
+// carries "Remote" and the argument may be a bare local path: startReader has
+// split those two since #180 and the memo is keyed in whichever vocabulary the
+// choice was made in (rbReaderKey).
+static bool browseOpenViaReaderMemo(const std::string& path) {
+    bool opened = false;
+    return openRemoteMemoFirst(path, opened);
+}
 const BrowseHost g_browseHost = {
     &toast,
     &savePrefs,
@@ -282,6 +295,7 @@ const BrowseHost g_browseHost = {
     &openPickerWith,
     &openFolder,
     &openReaderPicker,
+    &browseOpenViaReaderMemo,
     &browseFolderDialog,
     &selectImage,
     &promotePreview,
@@ -1408,6 +1422,17 @@ int main(int argc, char** argv) {
     // the nearest neighbour this claim has in the tree.
     #include "selftest/precision.inc"
     #include "selftest/profile-noise.inc"
+
+    // The four sites that compute "sigma of the row / column means" (板 303).
+    // Directly after profile-noise.inc because one of the four IS
+    // computeProfileNoise and the fixtures are of the same kind - analytic, with
+    // the expected value a rational derived by hand.
+    #include "selftest/rowcolsigma.inc"
+
+    // The three shipped analyzers that had no value assertion at all (板 304).
+    // Beside rowcolsigma.inc because it is the same discipline on the other side
+    // of the ABI: analytic fixtures whose answer can be written down.
+    #include "selftest/anavalue.inc"
 
     #include "selftest/abstats.inc"
 

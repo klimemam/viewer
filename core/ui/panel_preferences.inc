@@ -165,6 +165,17 @@ static void prefWidget(const PrefRow& r) {
                 prefAfterChange(r.id);
                 settingsWarnIfSticky(r.id, r.path);
             }
+            // Board row 297. The one thing the row's own sentence cannot say by
+            // being a sentence: NOTHING HAS TO BE RESTARTED. Every other number
+            // on this panel that takes effect later says so in a toast
+            // (uiScale); this one takes effect at the next poll, so it says so
+            // here, where the question is asked.
+            if (r.id == SK_watchInterval && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Seconds between polls, 1 .. 3600 (default 5).\n"
+                                  "The watcher reads this every round, so a change\n"
+                                  "takes effect at the NEXT poll - no restart.\n"
+                                  "A peer's folder is asked every 15 s, or every\n"
+                                  "poll when this is slower than that.");
             break;
         }
         case SW_Float: {

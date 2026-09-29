@@ -5,6 +5,7 @@
 #pragma once
 #include <atomic>
 #include <string>
+#include <thread>                 // lastProbeThread: WHERE the numpy probe ran
 #include <vector>
 
 namespace adapter {
@@ -49,8 +50,50 @@ Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
 // wins when it is set. Probed by RUNNING it: on Windows the bare python3 on PATH
 // is a Microsoft Store stub that prints an advert and exits non-zero, and numpy
 // is what the harness actually needs, so importing it IS the probe.
+//
+// CALLABLE FROM ANY THREAD, and it has to be: the reader's job thread asks for
+// it (board 304 - the probe is 113 ms of starting a Python and it used to be
+// spent on the UI thread). The cache is locked, and THE LOCK IS HELD ACROSS A
+// PROBE: a second caller waits for the first one's answer rather than starting
+// its own Python, which costs it no more than doing the probe itself would have.
+//
+// SO THIS CALL CAN BLOCK, and the bound is worth writing down rather than
+// discovering: a probe runs up to `run()`'s 30 s timeout per candidate, and there
+// are up to four candidates (the configured one, then python / python3 / py), so
+// the worst case is ~120 s of a hung interpreter. Everything waiting on the same
+// answer waits that long too - including ~ReaderJob's join, which is what Stop
+// and Quit go through, so a Quit during a hung probe is not instant. That is the
+// accepted price of asking the question exactly once (board 304 ruling); it is
+// not a reason for a SECOND thread to start a second Python.
+//
+// A caller that draws every frame must therefore use findPythonIfKnown instead.
 std::string findPython(const std::string& configured, std::string& why);
+
+// The same answer, NEVER WAITING FOR ANOTHER THREAD'S PROBE. For the callers that
+// run once per frame: the Readers window's status row and the reader picker's
+// "this will run" line, which are drawn in the very window that must keep
+// answering while a reader runs.
+//
+// "IfKnown" means "if it can be known without waiting on somebody else", not
+// "only from cache". When the lock is free this DOES probe, once, exactly as the
+// picker always has - a form that never probed could never name a command before
+// the first reader of the process ran, which is the whole of §4.13's "show the
+// exact command before running it". When another thread is mid-probe it returns
+// "" with `why` = "checking which Python has numpy...", and the caller says so
+// and asks again next frame.
+std::string findPythonIfKnown(const std::string& configured, std::string& why);
+
 void forgetPython();                      // re-probe (the configured path changed)
+// How many times the probe actually RAN in this process. The cache's promise is
+// "once", and that is only testable by counting. Lock-free: a caller asking this
+// must not end up waiting behind the probe it is asking about.
+int pythonProbes();
+// ...and which thread ran the last one. Recorded where the probe is DECIDED, so
+// it answers "where was the 113 ms spent" and not "who asked most recently" - a
+// caller served from the cache does not move it. Default-constructed until the
+// first probe. Read it after the work that was supposed to probe has FINISHED:
+// it is a completed fact, not a race to sample.
+std::thread::id lastProbeThread();
 
 // readers.editor from settings.jsonc, or "" for not set. This TU is free of the
 // viewer's state by design, so the setting is pushed in rather than read out.
