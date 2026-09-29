@@ -1497,19 +1497,41 @@
             // flight from the case before would land in the middle of the next
             // one, which is the shape of the intermittent failures this panel
             // has already produced twice.
+            //
+            // `pollPending` is in the condition, and it is the whole of what was
+            // wrong here. It is the ONLY term that can see a poll being
+            // EXECUTED: rbWorker's `rbQuiet` line does not raise `busy` for one
+            // (a poll is not something anybody waits for), and the job is off
+            // the queue before it runs - so between "the worker took it" and
+            // "the reply is in done" the other three terms all say quiet while a
+            // LIST is still out. Breaking there and clearing the flag BY HAND is
+            // what let B6's round - the one case that issues a round and never
+            // waits for it - land in the middle of B7. Only the pump clears the
+            // flag, and it clears it for a dropped reply too, so waiting on it
+            // is a wait for the pump and not for a listing to change.
             auto settle = [&]() {
                 double t0 = nowSec();
+                bool quiet = false;
                 while (nowSec() - t0 < 60.0) {
                     pumpRemoteBrowse();
-                    bool quiet;
                     {
                         std::lock_guard<std::mutex> lk(I.mtx);
                         quiet = I.queue.empty() && I.done.empty();
                     }
-                    if (quiet && !I.busy) break;
+                    if (quiet && !I.busy && !I.pollPending) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                I.pollPending = false;
+                if (I.pollPending) {
+                    // SAID, not swallowed. The flag is still cleared so the
+                    // cases after this one can run at all, but a round that has
+                    // not answered in 60 s is a finding, and the next failure
+                    // should not have to be re-derived from a silent one.
+                    fprintf(stderr, "browseselftest: settle: a poll was STILL pending "
+                                    "after 60 s (queue/done quiet=%d) - cleared by "
+                                    "hand, the case after this one is not clean\n",
+                            quiet ? 1 : 0);
+                    I.pollPending = false;
+                }
             };
             // ---- the fixture ---------------------------------------------------
             // Its own folder, written by hand: the case is "a file appeared
@@ -1858,35 +1880,169 @@
                 // drive, because that is the design's own wording: a listing that
                 // nobody asked for is what may open something, and a navigation
                 // or an F5 - which the user DID ask for - must not.
-                auto pollAndWait = [&]() {
-                    const uint64_t rev0 = B.rev;
-                    clk += 100.0;
-                    I.polledAt = clk - 99.0;
-                    const bool issued = rbPollRound(I, clk, FR);
+                //
+                // ---- HOW IT WAITS, and why "issue one round, watch rev" is not
+                // enough. It was exactly that, and it went red on the macOS AND
+                // Windows runners of 42f1246d with B7b..B7f in a row while
+                // B0..B6 and B8 passed on the same binary (Linux stayed green
+                // twice). Two assumptions, both of them the test's own:
+                //
+                //   THAT THE ROUND IT PRESENTED WAS THE ROUND THAT ANSWERED.
+                //   settle() above could not see a poll being EXECUTED, so B6 -
+                //   the one case that issues a round and never waits for it -
+                //   could leave one in flight. A LOCAL browse still lists
+                //   through a peer PROCESS over a pipe (rbEnqueue hands the job
+                //   app.exePath when the host is empty), and that round trip is
+                //   what settle had to lose to: inside its 5 ms on Linux, well
+                //   outside it on a hosted macOS or Windows runner. The OS split
+                //   is process-and-pipe latency, not a file system.
+                //   THAT A LISTING WHICH ARRIVED IS THE LISTING IT ASKED ABOUT.
+                //   That in-flight LIST reads the folder WHILE this case writes
+                //   its files, one at a time, and the peer needs TWO members to
+                //   call a numbered set a stack (groupNumbered) - so a read
+                //   taken between ng_000.npy and ng_001.npy answers "one loose
+                //   file, no stack". That is not the listing on screen, so the
+                //   pump applies it and `rev` moves, and the old wait took it for
+                //   its answer: B7b's group term went red on a listing from
+                //   before its own round, B7c then seeded an EMPTY baseline, and
+                //   B7d opened *ng* as an arrival - four frames where it asserts
+                //   three - so openNewOpened ran one ahead for the rest of the
+                //   block. Five checks, one stale reply.
+                //
+                // So a round is presented until one is ISSUED - a round can be
+                // SKIPPED and B3 fixes that as the rule, which makes a single
+                // presentation an assumption - and the wait is on CONTENT: the
+                // names this case wrote, present in the listing. It returns only
+                // with no reply outstanding, which is what keeps the NEXT case's
+                // writes clear of a LIST. Nothing here sleeps for an interval:
+                // the clock is still SET, one synthetic step per presentation.
+                //
+                // Are those names in the listing yet? A MEMBER of a group row
+                // counts: a stack's frames are in the listing, under the group
+                // that folded them, and that fold is the subject of this block.
+                auto listingHas = [&](const std::vector<std::string>& want) {
+                    for (const std::string& w : want) {
+                        bool found = false;
+                        for (const remote::Entry& e : B.entries) {
+                            if (e.name == w) { found = true; break; }
+                            for (const std::string& m : e.members)
+                                if (m == w) { found = true; break; }
+                            if (found) break;
+                        }
+                        if (!found) return false;
+                    }
+                    return true;
+                };
+                auto pollAndWait = [&](const std::vector<std::string>& want) {
+                    int tries = 0, issued = 0;
                     double t0 = nowSec();
-                    while (nowSec() - t0 < 120.0) {
+                    while (nowSec() - t0 < 120.0 && tries < 256) {
                         pumpRemoteBrowse();
-                        if (B.rev != rev0) break;
+                        // ONE round out at a time, which is the invariant the
+                        // product itself runs on (nothing but the pump clears
+                        // pollPending). Breaking it by hand is what produced the
+                        // two-replies-one-flag failure this block is fixing.
+                        if (!I.pollPending) {
+                            if (listingHas(want)) break;
+                            tries++;
+                            clk += 100.0;                 // overdue, by arithmetic
+                            I.polledAt = clk - 99.0;
+                            if (rbPollRound(I, clk, FR)) issued++;
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
-                    return issued && B.rev != rev0;
+                    if (tries > 1)
+                        fprintf(stderr, "browseselftest: B7: %d round(s) presented, %d "
+                                        "issued - a SKIPPED round, or a listing read "
+                                        "before this case had written all of its "
+                                        "files\n", tries, issued);
+                    return issued > 0 && !I.pollPending && listingHas(want);
                 };
+                // ...and it hands back the names it wrote, because those names
+                // ARE what the wait is taken on.
                 auto writeSet = [&](const char* stem, int n, float base) {
+                    std::vector<std::string> made;
                     for (int i = 0; i < n; i++) {
                         char nm[64];
                         snprintf(nm, sizeof nm, "%s_%03d.npy", stem, i);
                         writeNpy4(scratch + "/" + nm, base + (float)i);
+                        made.push_back(nm);
                     }
+                    return made;
+                };
+                // Every number these checks are taken on, in the shape B4 prints.
+                // B7 printed nothing at all, so the CI failure above had to be
+                // re-derived from which five lines were red. `got` is "-" for a
+                // check that rides no poll of its own.
+                auto detail = [&](const char* tag, int got) {
+                    std::string q;
+                    for (const App::RemoteOpen& ro : app.rbOpenQueue) {
+                        q += (q.empty() ? "" : " | ") + ro.name + " x" +
+                             std::to_string(ro.files.size());
+                        if (!ro.files.empty()) q += " first=" + ro.files.front();
+                    }
+                    fprintf(stderr, "browseselftest: %s detail: got=%s on=%d rows=%zu "
+                                    "rev=%llu applied=%d pending=%d groups [%s] "
+                                    "queue=%zu {%s} opened=%d seen=%zu dir='%s' "
+                                    "seeded='%s'\n",
+                            tag, got < 0 ? "-" : (got ? "1" : "0"),
+                            I.watchOpenNew ? 1 : 0, B.entries.size(),
+                            (unsigned long long)B.rev, I.pollsApplied,
+                            I.pollPending ? 1 : 0,
+                            say(rbGroupNames(B.entries)).c_str(),
+                            app.rbOpenQueue.size(), q.c_str(), I.openNewOpened,
+                            I.openNewSeen.size(), B.dir.c_str(),
+                            I.openNewDir.c_str());
                 };
                 app.rbOpenQueue.clear();
                 I.openNewOpened = 0;
                 check(!I.watchOpenNew,
                       "B7 (setup) the per-panel toggle is OFF, which is the default");
-                writeSet("ng", 4, 30.0f);              // a stack appears...
-                const bool got1 = pollAndWait();
-                check(got1 && app.rbOpenQueue.empty() && I.openNewOpened == 0 &&
-                      !rbGroupNames(B.entries).empty(),
+                const std::vector<remote::Entry> pre = B.entries;   // for B7a
+                const std::vector<std::string> ng = writeSet("ng", 4, 30.0f);
+                // ---- B7a: the reply that broke this block, PUT THERE BY HAND --
+                // A round from the case before, answering with the folder as it
+                // was after one of these four files and before the other three:
+                // one loose name, no stack, and not what is on screen - so the
+                // pump applies it and `rev` moves. It goes into `done` rather
+                // than being raced for, because the point of the wait above is
+                // that this test no longer depends on beating a peer process.
+                // Without it, "the wait is on content" is untested: a wait that
+                // still stopped at the first rev bump passes every check below on
+                // any machine fast enough to have written all four files first,
+                // which is every machine this suite is run on by hand.
+                {
+                    App::RbResult stale;
+                    stale.kind = App::RbPoll;
+                    stale.ok = true;
+                    stale.host = B.host;
+                    stale.port = B.port;
+                    stale.dir  = B.dir;
+                    stale.entries = pre;
+                    remote::Entry half;
+                    half.name = ng.front();          // ...and only the first one
+                    half.size = 320;                 // 128 header + 4*4*4, as B4 sums it
+                    stale.entries.push_back(half);
+                    // What the worker carries home from ITS session, which the
+                    // pump applies for every kind: `alive` false here would put
+                    // B.connected out and rbPollDue would then skip every round
+                    // for the rest of this panel's life.
+                    stale.peerVersion = B.peerVersion;
+                    stale.alive = true;
+                    stale.rx = B.rxBytes;
+                    std::lock_guard<std::mutex> lk(I.mtx);
+                    I.done.push_back(std::move(stale));
+                }
+                const uint64_t revStale = B.rev;
+                const bool got1 = pollAndWait(ng);        // a stack appears...
+                // rev +2 is the anti-vacuity term for the wait itself: the
+                // half-written listing WAS applied (+1) and the round this case
+                // presented afterwards answered on top of it (+1). A wait that
+                // stopped at the first bump reads +1 here and says so.
+                check(got1 && B.rev == revStale + 2 && app.rbOpenQueue.empty() &&
+                      I.openNewOpened == 0 && !rbGroupNames(B.entries).empty(),
                       "B7b OFF: a numbered stack appears in the listing and nothing opens");
+                detail("B7b", got1 ? 1 : 0);
                 // ...and now ON. The baseline is taken at the switch, so what is
                 // ALREADY here is seen: "open new stacks" is about arrivals, and
                 // a switch that opened the folder would be a different feature.
@@ -1895,10 +2051,11 @@
                 const std::vector<std::string> seen0 = I.openNewSeen;
                 check(seen0.size() == 4 && I.openNewDir == B.dir,
                       "B7c ON: the four frames already here are SEEN, and the folder named");
+                detail("B7c", -1);
                 // ANTI-VACUITY of B7b in the other direction: the same event,
                 // with only the switch different, DOES open something.
-                writeSet("mv", 3, 60.0f);
-                const bool got2 = pollAndWait();
+                const std::vector<std::string> mv = writeSet("mv", 3, 60.0f);
+                const bool got2 = pollAndWait(mv);
                 bool three = app.rbOpenQueue.size() == 1 &&
                              app.rbOpenQueue[0].files.size() == 3;
                 bool named = three && app.rbOpenQueue[0].host == B.host &&
@@ -1908,6 +2065,7 @@
                 check(got2 && three && named && I.openNewOpened == 1 &&
                       I.openNewSeen.size() == 7,
                       "B7d ...and the stack that ARRIVED is queued once, with its 3 frames");
+                detail("B7d", got2 ? 1 : 0);
                 // A GROUP THAT GROWS IS NOT AN ARRIVAL (PR #160 owns that event).
                 // The listing really does change - a fourth member moves the
                 // group row's bytes and its member list - so this is a poll that
@@ -1915,18 +2073,20 @@
                 // assert "not twice" without asserting on a dropped listing.
                 app.rbOpenQueue.clear();
                 writeNpy4(scratch + "/mv_003.npy", 63.0f);
-                const bool got3 = pollAndWait();
+                const bool got3 = pollAndWait({ "mv_003.npy" });
                 check(got3 && app.rbOpenQueue.empty() && I.openNewOpened == 1 &&
                       I.openNewSeen.size() == 8,
                       "B7e a stack that GAINS a frame is not opened again (that is Reload)");
+                detail("B7e", got3 ? 1 : 0);
                 // ...and OFF is off: another arrival, nothing queued.
                 I.watchOpenNew = false;
                 I.openNewDir.clear();
                 I.openNewSeen.clear();
-                writeSet("zz", 2, 90.0f);
-                const bool got4 = pollAndWait();
+                const std::vector<std::string> zz = writeSet("zz", 2, 90.0f);
+                const bool got4 = pollAndWait(zz);
                 check(got4 && app.rbOpenQueue.empty() && I.openNewOpened == 1,
                       "B7f OFF again: the next arrival is not opened either");
+                detail("B7f", got4 ? 1 : 0);
                 app.rbOpenQueue.clear();
                 settle();
             }
