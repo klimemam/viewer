@@ -1214,6 +1214,16 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 
 // ---- numbered-sequence grouping ------------------------------------------
 
+// std::filesystem::file_size returns (uintmax_t)-1 on failure, and a size that
+// reaches the client is quoted back at a person: a row that could not be statted
+// used to make the headerless refusal say "18446744073709551615 bytes" (review
+// P3-8). 0 is what every other unknown size on this wire is, and the client
+// already refuses a 0-byte member by name.
+static uint64_t fileSizeOr0(const std::filesystem::path& p, std::error_code& ec) {
+    const std::uintmax_t n = std::filesystem::file_size(p, ec);
+    return ec || n == static_cast<std::uintmax_t>(-1) ? 0u : (uint64_t)n;
+}
+
 struct SeqGroup {
     std::string pattern;                // frame_###.npy - display name
     std::vector<std::string> names;     // member file names, numeric order
@@ -1341,7 +1351,7 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
             g.names.push_back(files[i].first);
             used[i] = 1;
             std::error_code ec;
-            const uint64_t sz = (uint64_t)std::filesystem::file_size(files[i].second, ec);
+            const uint64_t sz = fileSizeOr0(files[i].second, ec);
             g.bytes += sz;
             g.minBytes = first ? sz : std::min(g.minBytes, sz);
             g.maxBytes = first ? sz : std::max(g.maxBytes, sz);
@@ -1750,10 +1760,20 @@ static void handleScan(Buf& in) {
             } else {
                 g.pattern = files[mem[0]].first;
             }
+            bool firstMem = true;
             for (size_t i : mem) {
                 g.names.push_back(files[i].first);
+                // ...and the extremes, which this fold left at 0 - so every
+                // group SCAN produced announced min = max = 0 and the client's
+                // headerless check refused it as "0 bytes" rather than opening
+                // it. The measured half of the row has to be measured on every
+                // road that builds one (review P2-1).
                 std::error_code e2;
-                g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, e2);
+                const uint64_t sz = fileSizeOr0(files[i].second, e2);
+                g.bytes += sz;
+                g.minBytes = firstMem ? sz : std::min(g.minBytes, sz);
+                g.maxBytes = firstMem ? sz : std::max(g.maxBytes, sz);
+                firstMem = false;
                 g.mtime = std::max(g.mtime, unixMtime(files[i].second));
             }
             g.first = files[mem.front()].second;

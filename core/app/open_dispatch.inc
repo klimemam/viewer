@@ -12,6 +12,10 @@ static void openPath(const std::string& path);
 static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::string& dir,
                               const std::vector<std::string>& names,
                               uint64_t& sizeOut, std::string& why);
+static bool remoteRawSameSizeIn(const std::vector<remote::Entry>& es, int peerVersion,
+                                const std::string& dir,
+                                const std::vector<std::string>& names,
+                                uint64_t& sizeOut, std::string& why);
 
 // `knownSize` > 0: the bytes are not on this disk and the caller already has
 // the count (a peer's listing carries it - MSG_LIST has since protocol 3). The
@@ -1670,10 +1674,18 @@ static watch::Rebuild planStackMembershipRemote(int seqId, const ReloadPeer& pee
 // order of the tests is startSequenceLoad's worker's own, because it is the same
 // decision made in the same order. Returns null and a reason; the caller counts
 // it exactly as the loader counts a sibling that would not read.
+// `folder` is the peer's listing of the directory the new member lives in, when
+// the caller has one - the headerless size check reads it instead of asking for
+// its own. ONE LIST PER DRAIN, not one per member: this runs on the UI thread,
+// and a round trip per arriving frame is the freeze this file spent two PRs
+// removing. Null (the default) means "fetch it", which is what the local doors
+// and the tests want.
 static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
                                                      const std::string& path,
                                                      std::string& errOut,
-                                                     const ReloadPeer& peer = ReloadPeer()) {
+                                                     const ReloadPeer& peer = ReloadPeer(),
+                                                     const std::vector<remote::Entry>* folder
+                                                         = nullptr) {
     const FrameSource& R = *ref.src;
     const bool isRaw = R.rawDtype >= 0;
     // ...and the PEER's door is one of them (§16). It is chosen by the same
@@ -1729,10 +1741,10 @@ static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
             uint64_t sameSz = 0;
             std::string sameWhy;
             const std::vector<std::string> pair = { baseName(rpath), baseName(R.remoteUrl) };
-            if (!remoteRawSameSize(*ses, ses->peerVersion(), mdir, pair, sameSz, sameWhy)) {
-                errOut = sameWhy;
-                return nullptr;
-            }
+            const bool same = folder
+                ? remoteRawSameSizeIn(*folder, ses->peerVersion(), mdir, pair, sameSz, sameWhy)
+                : remoteRawSameSize(*ses, ses->peerVersion(), mdir, pair, sameSz, sameWhy);
+            if (!same) { errOut = sameWhy; return nullptr; }
         }
         remote::Meta m;
         if (!ses->meta(rpath, m, errOut, R.npyRead, jrwp)) return nullptr;
@@ -1942,11 +1954,32 @@ static std::string reloadStackTail(int seqId, const watch::Rebuild& plan, int ha
         const ImageDoc* ref = fr.empty() ? nullptr : app.images[fr.front()].get();
         std::string dir;
         if (const App::SeqInfo* si = seqInfo(seqId)) dir = si->ruleDir;
+        // ONE listing for the whole drain. A headerless member may only join a
+        // stack when it is the same number of bytes as the ones already in it
+        // (remoteRawSameSizeIn), and that question is answered out of the
+        // peer's listing of this folder - so the folder is listed ONCE here and
+        // the rows are handed to every arrival, rather than each of them asking
+        // for its own on the UI thread. Fetched only for a headerless remote
+        // stack, because nothing else asks the question.
+        std::vector<remote::Entry> folderRows;
+        const std::vector<remote::Entry>* folderPtr = nullptr;
+        if (ref && ref->src && ref->src->rawDtype >= 0 && isPeerUrl(ref->src->remoteUrl) &&
+            !dir.empty()) {
+            std::string host, rp2, ferr;
+            int fport = 0;
+            if (remote::parseUrl(ref->src->remoteUrl, host, rp2, &fport)) {
+                if (remote::Session* fs = reloadPeerFor(peer, host, fport, ferr))
+                    if (fs->list(dir, folderRows, ferr)) folderPtr = &folderRows;
+            }
+            // A listing that did not come back is not an excuse to skip the
+            // check: folderPtr stays null and each member asks for its own,
+            // which is slow and correct rather than fast and blind.
+        }
         for (const std::string& n : plan.added) {
             if (!ref || dir.empty()) break;
             std::string err;
             std::unique_ptr<ImageDoc> nd =
-                decodeJoiningMember(*ref, dir + "/" + n, err, peer);
+                decodeJoiningMember(*ref, dir + "/" + n, err, peer, folderPtr);
             if (!nd) {
                 // NOT counted with the re-read refusals, and this is the same
                 // distinction #56 rests on: a file the rule NAMES but cannot
@@ -2979,8 +3012,12 @@ static RawDoorAnswer openRemoteRawDeclared(const std::string& url, uint64_t size
         toast(rawRecipeAppliedLine(*r, baseName(rpath), (size_t)sizeBytes));
         return RD_Opened;
     }
-    openRawDialogFor(url, sizeBytes);
-    return rawDlg.open ? RD_Asked : RD_Refused;
+    // RD_Asked only when the dialog is actually STANDING and is this url's.
+    // openRawDialogFor refuses a second question over a live park and says so,
+    // and reporting that as "asked" told the caller a geometry prompt was up
+    // for a file it was not up for (review P3-12).
+    if (!openRawDialogFor(url, sizeBytes)) return RD_Refused;
+    return RD_Asked;
 }
 
 // The shape core/browse/host.h binds (see main.cpp's table). The panel has the
@@ -4373,7 +4410,17 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
 // 8x6 u16 with 12 B skipped and the second one comes back as a PLAUSIBLE
 // picture of the wrong bytes. Every door that opens more than one of them under
 // ONE recipe therefore has to ask this before it reads anything, and there are
-// two such doors (a folder opened as a stack, and a member Watch saw appear).
+// THREE such doors:
+//
+//   a folder opened as a stack        openRemoteStack
+//   a member Watch saw appear         decodeJoiningMember, via the drain's
+//                                     one listing
+//   a SESSION rebuilding a stack      remoteSequenceSiblings
+//
+// The third was missed twice - once when this feature shipped and once when
+// this comment said there were two - and it is the one that matters most,
+// because a restore runs with nobody watching it (review P1). Anything that
+// adds a fourth adds a row here and a call there.
 //
 // HOW IT IS ONE ROUND TRIP. The listing answers per-file for the rows it names
 // individually, and per-GROUP for a numbered family - and since protocol 16 a
@@ -4392,17 +4439,16 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
 // finished as a stack of three frames two of which were read from the wrong
 // offsets with nothing anywhere saying so. min == max is the check; the sum
 // never was one.
-static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::string& dir,
-                              const std::vector<std::string>& names,
-                              uint64_t& sizeOut, std::string& why) {
-    std::string err;
-    std::vector<remote::Entry> es;
-    if (!ses.list(dir, es, err)) {
-        why = "the peer would not list " + dir + " - " + err +
-              "\n  a headerless stack is opened from a byte count, and that listing is "
-              "where the count comes from";
-        return false;
-    }
+// ...over a listing ALREADY IN HAND. Split from the fetching form below because
+// two of the three doors already hold one: the Watch drain lists the folder once
+// per drain and hands the same rows to every member joining from it, and the
+// SESSION restore gets its member names out of a group row it just read. A LIST
+// per member is a round trip per frame on the UI thread, which is the freeze two
+// PRs were spent removing in the last two days; it does not come back here.
+static bool remoteRawSameSizeIn(const std::vector<remote::Entry>& es, int peerVersion,
+                                const std::string& dir,
+                                const std::vector<std::string>& names,
+                                uint64_t& sizeOut, std::string& why) {
     std::map<std::string, uint64_t> one;                   // name -> its own size
     std::map<std::string, const remote::Entry*> inGroup;   // name -> the group row holding it
     for (const remote::Entry& e : es) {
@@ -4438,10 +4484,16 @@ static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::
         // and BY NUMBER rather than approximated: "probably all the same" is
         // how the bytes of one file get read as another's.
         if (!grp.hasMemberSizes) {
-            why = grp.name + ": this peer speaks protocol " + std::to_string(peerVersion) +
-                  " and does not report the size of each member, so there is no way to "
-                  "check that one recipe fits them all - and a headerless file has no "
-                  "header to disagree with"
+            // `peerVersion` here is the EFFECTIVE number - the smaller of what
+            // the peer announced and what this client announced - so quoting it
+            // as "this peer speaks" was a sentence that contradicted itself
+            // whenever the two differed (review P3-7). What is true either way
+            // is that the two ends, TOGETHER, are speaking a protocol that does
+            // not carry the field.
+            why = grp.name + ": this link is running protocol " +
+                  std::to_string(peerVersion) + ", which does not report the size of "
+                  "each member, so there is no way to check that one recipe fits them "
+                  "all - and a headerless file has no header to disagree with"
                   "\n  open them one at a time (each asks for its own geometry), or "
                   "update viewer-serve (protocol 16 reports it)";
             return false;
@@ -4456,24 +4508,44 @@ static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::
         return false;
     }
     if (lo != hi) {
-        const std::string loWho = loName.empty() ? std::string("its smallest member")
-                                                 : loName;
-        const std::string hiWho = hiName.empty() ? std::string("its largest member")
-                                                 : hiName;
+        // WHOSE numbers. A single row names itself; a group row carries only the
+        // two extremes, so what can be named there is the FOLDER they are in -
+        // "its smallest member" had no antecedent in a sentence that starts
+        // "these files" (review P3-13).
+        const std::string loWho = loName.empty()
+            ? "the smallest file in " + dir : loName;
+        const std::string hiWho = hiName.empty()
+            ? "the largest file in " + dir : hiName;
         why = "these files are not all one size: " + loWho + " is " + std::to_string(lo) +
               " bytes and " + hiWho + " is " + std::to_string(hi) +
-              " - one recipe cannot be right for both, and a headerless file has no "
-              "header to disagree with"
+              " bytes - one recipe cannot be right for both, and a headerless file has "
+              "no header to disagree with"
               "\n  open them separately (each asks for its own geometry), or leave the "
               "odd one out of the folder";
         return false;
     }
     if (lo == 0) {
-        why = "these files are 0 bytes: there is no geometry a recipe could describe";
+        why = "the files in " + dir + " are 0 bytes: there is no geometry a recipe "
+              "could describe";
         return false;
     }
     sizeOut = lo;
     return true;
+}
+
+// ...and the form that fetches the listing itself, for the door that has none.
+static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::string& dir,
+                              const std::vector<std::string>& names,
+                              uint64_t& sizeOut, std::string& why) {
+    std::string err;
+    std::vector<remote::Entry> es;
+    if (!ses.list(dir, es, err)) {
+        why = "the peer would not list " + dir + " - " + err +
+              "\n  a headerless stack is opened from a byte count, and that listing is "
+              "where the count comes from";
+        return false;
+    }
+    return remoteRawSameSizeIn(es, peerVersion, dir, names, sizeOut, why);
 }
 
 // The STACK door's form of the question: ensure the session, then ask.
@@ -4599,9 +4671,12 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         // at a time - pumpRemoteOpenQueue holds the queue while this slot is
         // live, and openRawDialogFor refuses a second question over a live one
         // rather than taking the slot from the Open already waiting.
-        // openRawDialogFor is the one place that decides whether a second
-        // question may be raised over a live park, and it says so by name - so
-        // there is no second guard here to drift from it.
+        // openRawDialogFor decides whether a second question may be raised OVER
+        // a live park, and says so by name. It is not a guard in both
+        // directions: nothing here stops a park being taken while some OTHER
+        // dialog is standing, because the two callers that could do it are
+        // already held - pumpRemoteOpenQueue by `!rawDlg.open` at its call site
+        // in main.cpp, and a Browse double-click by the modal owning the input.
         if (!openRawDialogFor(makeRemoteUrl(host, files[0], port), sz)) return;
         rawDlg.forRemoteStack = true;
         app.remoteRawStack.alive = true;
@@ -4651,6 +4726,32 @@ static bool remoteSequenceSiblings(const std::string& url,
         bool mine = false;
         for (const auto& m : e.members) if (m == base) { mine = true; break; }
         if (!mine) continue;
+        // THE THIRD DOOR. A headerless folder may only be opened under ONE
+        // recipe when every member is the same number of bytes, and this
+        // function is how a SESSION gets back a remote folder stack - so it is
+        // one of the doors that has to ask, and it did not. The review's
+        // `silent` case (108/112/104 read at offset 0, where the recipe needs
+        // 96) went straight through: the sum matched, the peer refused nothing,
+        // and the stack came back with the face of a complete one while two of
+        // its three frames were read out of files of other lengths. Restore is
+        // the WORST place for that, because nobody is watching it happen.
+        //
+        // Asked from the row already in hand - the listing above is the same
+        // one the check wants, so this costs no round trip at all.
+        if (imagefile::isHeaderless(base)) {
+            uint64_t memberSz = 0;
+            std::string sameWhy;
+            if (!remoteRawSameSizeIn(entries, app.uiSession.peerVersion(), dir,
+                                     e.members, memberSz, sameWhy)) {
+                // Said in the RESTORE's own terms. The check's sentence is
+                // about a folder; what the operator needs to know here is that
+                // a stack their session recorded is not coming back, and why.
+                err = stackNameFor(dir, e.name) +
+                      ": the frames this stack was saved with cannot be shown to be "
+                      "one size, so it is not rebuilt - " + sameWhy;
+                return false;
+            }
+        }
         for (const auto& m : e.members)
             filesOut.push_back(dir == "/" ? "/" + m : dir + "/" + m);   // RbRow::join
         nameOut = stackNameFor(dir, e.name);

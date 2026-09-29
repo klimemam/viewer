@@ -519,11 +519,20 @@ static void pumpRemoteFetch() {
                 // whose frames disagreed about CFA would demosaic frame 1 and
                 // not frame 2 (openRemote makes the same call from the wire)
                 doc->cfa = rp::rawInterpCfa(d.recipe.interp);
-                // ...and the PHASE the head was demosaiced in. It rides in the
-                // recipe's flags, so a sibling cannot come back in another one:
-                // a stack whose frames disagreed about RGGB vs BGGR would show
-                // two colours for one folder as the user stepped it.
+                // ...and the PHASE, taken FROM THE STACK AS IT IS NOW rather
+                // than from the recipe this fetch was enqueued with. The recipe
+                // is a snapshot: the Inspector can change the phase while
+                // siblings are in flight (seqMosaicChanged walks the frames
+                // that are already here), and a frame landing afterwards with
+                // the old phase would give one folder two colours - #148's
+                // defect one level down. The wire value is the fallback for a
+                // frame that belongs to no stack yet.
                 doc->cfaPattern = rp::rawWireCfaPattern(d.recipe.flags);
+                if (d.seqId != 0)
+                    if (const App::SeqInfo* si = seqInfo(d.seqId)) {
+                        doc->cfa = si->cfaType;
+                        doc->cfaPattern = si->cfaPattern;
+                    }
             }
             S.dtype = d.dtype;
             S.w = d.w; S.h = d.h; S.ch = d.ch;

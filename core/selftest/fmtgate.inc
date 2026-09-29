@@ -1213,6 +1213,51 @@
                     closeAll();
                 }
 
+                // ---- (6d) ...and the THIRD door: a session rebuilding it -
+                // remoteSequenceSiblings is how a saved session gets a remote
+                // folder stack back, and it had no check at all - so the
+                // `silent` case went through it with no refusal anywhere and
+                // the stack came back looking complete while two of its three
+                // frames were read out of files of other lengths. Restore is
+                // the worst place for that: nobody is watching it happen
+                // (review P1). Driven with the SAME three fixtures as (6),
+                // because a check that only one door runs is not a check.
+                {
+                    struct RCase { const char* dir; const char* lo; const char* hi; };
+                    const RCase rc[] = {
+                        { "odd",    "108", "112" },
+                        { "cancel", "106", "110" },
+                        { "silent", "104", "112" },
+                    };
+                    for (const RCase& c : rc) {
+                        std::vector<std::string> rf;
+                        std::string rn, rw2;
+                        std::string u = "local://" + (ddir / c.dir / "g_001.raw").u8string();
+                        std::replace(u.begin(), u.end(), (char)92, '/');
+                        const bool got = remoteSequenceSiblings(u, rf, rn, rw2);
+                        fprintf(stderr, "fmtgateselftest:   F4h restore %s: rebuilt=%d \n"
+                                        "fmtgateselftest:   F4h restore %s said: \"%s\"\n",
+                                c.dir, got ? 1 : 0, c.dir, rw2.c_str());
+                        const std::string l1 = std::string("F4h a session does NOT rebuild "
+                            "a headerless stack whose members differ (") + c.dir + ")";
+                        const std::string l2 = std::string("F4h ...and says so in the "
+                            "RESTORE's terms, with both counts (") + c.dir + ")";
+                        check(!got && rf.empty(), l1.c_str());
+                        check(has(rw2, "saved with") && has(rw2, "not rebuilt") &&
+                              has(rw2, c.lo) && has(rw2, c.hi), l2.c_str());
+                    }
+                    // ...and the uniform folder still rebuilds, so the check is
+                    // a check and not a wall.
+                    std::vector<std::string> okf;
+                    std::string okn, okw;
+                    std::string u2 = "local://" + (sdir / "f_001.raw").u8string();
+                    std::replace(u2.begin(), u2.end(), (char)92, '/');
+                    const bool okGot = remoteSequenceSiblings(u2, okf, okn, okw);
+                    fprintf(stderr, "fmtgateselftest:   F4h restore uniform: rebuilt=%d \nmembers=%zu %s\n",
+                            okGot ? 1 : 0, okf.size(), okw.c_str());
+                    check(okGot && okf.size() == 3,
+                          "F4h ...while a folder that IS one size rebuilds all three");
+                }
                 // ---- (6b) the group row is what ANSWERS it, and a pre-16 peer
                 //           cannot -----------------------------------------
                 // min == max is the check, and it is one field pair on the LIST
@@ -2090,6 +2135,67 @@
                         old15.stop();
                     }
                     selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+                }
+
+                // ---- P9c: a CURRENT peer and a client that announced less --
+                // The other half of the version pair, and the one that had no
+                // test at all: the peer sends the member sizes only to a
+                // client that ANNOUNCED 16, so a client announcing less must
+                // not read them - and effectiveVersion() is the fix that
+                // makes it not (review P2-3). Before that fix this parse used
+                // peerVersion_ alone and would have read four u32s the peer
+                // never wrote, desynchronising the rest of the reply.
+                //
+                // The peer here is the real, current one. Only the CLIENT is
+                // lowered, which is the combination nothing else covers.
+                {
+                    std::filesystem::path c15dir = rdir / "c15grp";
+                    std::filesystem::remove_all(c15dir, rec);
+                    std::filesystem::create_directories(c15dir, rec);
+                    for (int k = 0; k < 3; k++) {
+                        std::vector<uint16_t> v((size_t)RW_W * RW_H, (uint16_t)(k + 1));
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "c_%03d.raw", k + 1);
+                        std::ofstream cf(pathFromUtf8((c15dir / nm).u8string()),
+                                         std::ios::binary);
+                        const std::vector<uint8_t> junk(HDR, 0xA5);
+                        cf.write((const char*)junk.data(), HDR);
+                        cf.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                    }
+                    remote::Session c15;
+                    c15.setHelloVersionForTest(15);
+                    std::string e15c;
+                    if (!c15.start("", exe, e15c)) {
+                        fprintf(stderr, "fmtgateselftest:   P9c client: %s\n", e15c.c_str());
+                        check(false, "P9c the lowered client connects");
+                    } else {
+                        std::vector<remote::Entry> ce;
+                        std::string cerr2;
+                        const bool cl = c15.list(c15dir.u8string(), ce, cerr2);
+                        const remote::Entry* cg = nullptr;
+                        for (const remote::Entry& e : ce) if (e.group) cg = &e;
+                        uint64_t csz = 0;
+                        std::string cwhy;
+                        const bool cok = cg && remoteRawSameSizeIn(ce, 15, c15dir.u8string(),
+                                                                   cg->members, csz, cwhy);
+                        fprintf(stderr, "fmtgateselftest:   P9c peer=%d list=%d group=%d "
+                                        "members=%zu hasSizes=%d checked=%d\n"
+                                        "fmtgateselftest:   P9c refusal: \"%s\"\n",
+                                c15.peerVersion(), cl ? 1 : 0, cg ? 1 : 0,
+                                cg ? cg->members.size() : 0,
+                                cg && cg->hasMemberSizes ? 1 : 0, cok ? 1 : 0, cwhy.c_str());
+                        check(c15.peerVersion() == (int)rp::VERSION,
+                              "P9c the peer is the CURRENT one, only the client is lowered");
+                        // the listing still parses: that is the whole point -
+                        // a field read on the wrong number breaks the reply
+                        check(cl && cg && cg->members.size() == 3,
+                              "P9c ...and its LIST still parses, group row and all");
+                        check(cg && !cg->hasMemberSizes,
+                              "P9c ...without member sizes, because 15 does not carry them");
+                        check(!cok && has(cwhy, "protocol 15"),
+                              "P9c so the folder is refused by name, not read on a guess");
+                        c15.stop();
+                    }
                 }
                 std::filesystem::remove_all(rdir, rec);
             }

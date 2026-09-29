@@ -387,13 +387,20 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int helloVersion_ = (int)rp::VERSION;
-    // The protocol actually IN FORCE for a field the peer gates on the CLIENT's
-    // number - the LIST group row's member sizes are the one such field
-    // (protocol 16). It is the smaller of the two numbers, not peerVersion_
-    // alone: a client that announced less than it can parse would read a field
-    // the peer correctly did not send. Only setHelloVersionForTest can make
-    // those two disagree today, and a seam that can desynchronise a parser is
-    // not a seam worth leaving armed.
+    // The protocol actually IN FORCE for a field whose presence is decided by
+    // the CLIENT's announced number rather than the peer's. It is the smaller
+    // of the two, not peerVersion_ alone: a client that announced less than it
+    // can parse would otherwise read a field the peer correctly did not send,
+    // or write one the peer will not consume - and everything after it is then
+    // parsed from the wrong offset.
+    //
+    // There are TWO such fields, not one (this comment claimed one and was
+    // wrong): the LIST/SCAN group row's member sizes, which the peer only
+    // sends to a client that announced 16 (serve.cpp putGroupEntryV3), and the
+    // MEASURE keyed reading, which the peer only reads from a client that
+    // announced 15 (serve.cpp handleMeasure). Both go through here. Only
+    // setHelloVersionForTest can make the two numbers disagree today, and a
+    // seam that can desynchronise a parser is not a seam worth leaving armed.
     int effectiveVersion() const { return std::min(peerVersion_, helloVersion_); }
     int port_ = 0;
     bool serveReaders_ = true;

@@ -1188,7 +1188,14 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     if (q.hasKeyed) {
         w.str(q.keyed.key);
         w.u32((uint32_t)std::max(0, q.keyed.node));
-        if (peerVersion_ >= 15) w.u32((uint32_t)q.keyedRead);
+        // effectiveVersion, not peerVersion_ (review P2-2): the PEER reads this
+        // field only when the client ANNOUNCED 15 or better (serve.cpp's
+        // `servedVersion() >= 15 && g_clientVersion >= 15`), so writing it on
+        // the peer's number alone can put four bytes on the wire that the peer
+        // will not consume - and everything after them is then parsed from the
+        // wrong offset. The same asymmetry the LIST member sizes had, in the
+        // request direction.
+        if (effectiveVersion() >= 15) w.u32((uint32_t)q.keyedRead);
     }
     // the parity block, last, so that the three older ops send the same bytes
     // they always sent (remote_proto.h)
