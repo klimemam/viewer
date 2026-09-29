@@ -627,6 +627,40 @@ static int cjkFontSelftest() {
             check(g_settingsFontPath == "/from/prefs.ttc",
                   "C5 with no settings.jsonc the prefs.txt layer is what is in force");
         }
+        // ...and the sentence the Preferences row owes. It is said ONCE, when
+        // the box is left, not once per character: ImGui::InputText returns
+        // true on every keystroke, so a path typed by hand used to be worth one
+        // toast and one Messages line per letter - thirty lines about one
+        // change, which is the log made useless by the very thing meant to make
+        // the change visible. The panel sets g_prefTextMidEdit around its
+        // commit and says the sentence on IsItemDeactivatedAfterEdit; what is
+        // asserted here is the half that is not ImGui - that the flag silences
+        // it and that clearing the flag does not.
+        {
+            const std::string toastWas = app.toast;
+            const size_t logWas2 = app.msgLog.size();
+            g_settingsFontPath = "/some/font.ttc";
+            app.toast.clear();
+            g_prefTextMidEdit = true;
+            prefAfterChange(SK_fontPath);
+            g_prefTextMidEdit = false;
+            check(app.toast.empty(),
+                  "C5 mid-edit the 'next start' sentence is not said at all");
+            prefAfterChange(SK_fontPath);
+            check(app.toast.find("next start") != std::string::npos &&
+                  app.toast.find("/some/font.ttc") != std::string::npos,
+                  "C5 ...and once the edit is over it is said, naming the font");
+            // Empty means "back to the built-in search", which is a different
+            // sentence and not the absence of one.
+            g_settingsFontPath.clear();
+            app.toast.clear();
+            prefAfterChange(SK_fontPath);
+            check(app.toast.find("built-in search") != std::string::npos &&
+                  app.toast.find("next start") != std::string::npos,
+                  "C5 ...and clearing it says so, also at the next start");
+            app.toast = toastWas;
+            app.msgLog.resize(logWas2);
+        }
         // Given back at the ONE exit of this group, because every selftest
         // shares one home and a borrowed setting outlives the process.
         g_settingsFontPath = keptPath;

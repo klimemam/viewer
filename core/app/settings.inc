@@ -1868,6 +1868,21 @@ static PrefsBase prefsToWrite() {
     return P;
 }
 
+// 板306 C: the "takes effect at the next start" sentence, in one place, so the
+// row's own toast and the Reset menu's cannot become two different promises.
+static std::string fontPathNextStartText() {
+    if (g_settingsFontPath.empty())
+        return "Font is back to the built-in search at the next start.";
+    return "Font \"" + g_settingsFontPath + "\" takes effect at the next start "
+           "(the glyphs are baked once, while the window is being created).";
+}
+// ...and TRUE while a Preferences text box is mid-edit. Set by the panel around
+// its commit, and consulted by exactly one case below: the value is stored on
+// every keystroke (so nothing typed is lost) while the SENTENCE waits for the
+// edit to finish. Here rather than in the panel because prefAfterChange is what
+// decides what a change owes, and "say it once" is part of that.
+static bool g_prefTextMidEdit = false;
+
 // The side effect a change owes the rest of the program. The SAME helpers the
 // menu calls - the helper is the shared thing, and a panel that re-implemented
 // "apply the theme" would be a second theme applier.
@@ -1927,12 +1942,15 @@ static void prefAfterChange(SKey id) {
         // take effect now. The glyphs are baked once, while the window is being
         // created, and a control that silently did nothing is the "I set it and
         // nothing happened" this panel exists to end.
+        //
+        // Not said WHILE the box is being typed into - see the flag. This is
+        // the only text row whose change is worth a sentence, and InputText
+        // returns true once per character, so a path typed by hand would
+        // otherwise leave one toast and one Messages line per letter: thirty
+        // lines about one change, which is the log made useless by the thing
+        // that was supposed to make the change visible.
         case SK_fontPath:
-            toast(g_settingsFontPath.empty()
-                      ? "Font is back to the built-in search at the next start."
-                      : "Font \"" + g_settingsFontPath + "\" takes effect at the "
-                        "next start (the glyphs are baked once, while the window "
-                        "is being created).");
+            if (!g_prefTextMidEdit) toast(fontPathNextStartText());
             break;
         default: break;
     }
