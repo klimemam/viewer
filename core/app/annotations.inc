@@ -119,14 +119,78 @@ static void toggleBand(bool horizontal) {
     if (!im) return;
     App::Ann* a = findAnn(app.selectedAnn);
     if (a && a->type == 0) {                     // ROI: the existing toggle
+        // The second root of the 2026-09-29 report. prevX/prevW (and
+        // prevY/prevH; -1 = nothing saved) hold the rectangle the band was made
+        // from, in the pixels of whatever frame was open at the time - and Ann
+        // has no room to record WHICH frame that was. The old code decided
+        // between "put the rect back" and "save the rect and widen" by asking
+        // whether the ROI is the full width of the frame on screen:
+        //
+        //     bool full = a->x == 0 && a->w == im->w;
+        //
+        // A band made on 4096x3000 is not "full" on 2048x1500, so the toggle
+        // took the SAVE arm there and overwrote the memory with 0 / 4096.
+        // Measured before the fix (--roistats-selftest W7): the 200-wide
+        // rectangle the band came from was gone for good, and the next press
+        // restored a 4096-wide ROI onto a 2048-wide frame.
+        //
+        // X / Y means "the row / column of the frame I am looking at", so the
+        // frame has to be able to hold what is being toggled. Which arm we are
+        // on is the PRESENCE of a memory - never a width compared against this
+        // frame - and both arms are gated on annFits, so nothing is clamped and
+        // nothing is overwritten:
+        //   * a ROI this frame does not hold: refused, the memory kept. It is
+        //     still the way back, once a frame that holds it is open.
+        //   * a memory this frame does not hold: refused for the same reason,
+        //     and kept for the same reason.
+        // A ROI off the frame is NOT repaired by this key: it is left alone and
+        // the refusal says which frame it is being measured against.
+        //
+        // Still open, and deliberately not touched here: the two "Widen ROI to
+        // full width / height" items in core/ui/canvas.inc write prevX/prevW
+        // themselves, so widening from the context menu still overwrites the
+        // memory the way this function no longer does. That file belongs to
+        // another change in flight; the seam for it is right here, and the
+        // items should come through this arm rather than keep their own copy.
+        char b[224];
+        // one wording for "the rect I am holding does not belong to this
+        // frame", said the same way on both axes
+        auto refuseBack = [&](const App::Ann& back) {
+            char m[224];
+            snprintf(m, sizeof m, "the rect this band was made from (%dx%d @%d,%d) is "
+                                  "outside this frame (%dx%d) - kept as it is, not "
+                                  "resized", back.w, back.h, back.x, back.y,
+                     im->w, im->h);
+            toast(m, true);
+        };
+        if (!annFits(*a, im->w, im->h)) {
+            snprintf(b, sizeof b, "%s (%dx%d @%d,%d) is outside this frame (%dx%d) - "
+                                  "X / Y bands a ROI against the frame it is on; "
+                                  "the rect it remembers is kept",
+                     a->label.c_str(), a->w, a->h, a->x, a->y, im->w, im->h);
+            toast(b, true);
+            return;
+        }
         if (horizontal) {
-            bool full = a->x == 0 && a->w == im->w;
-            if (full && a->prevW >= 1) { a->x = a->prevX; a->w = a->prevW; a->prevW = -1; }
-            else if (!full)            { a->prevX = a->x; a->prevW = a->w; a->x = 0; a->w = im->w; }
+            if (a->prevW >= 1) {                 // a memory: put that rect back
+                App::Ann back = *a;
+                back.x = a->prevX; back.w = a->prevW;
+                if (!annFits(back, im->w, im->h)) { refuseBack(back); return; }
+                a->x = back.x; a->w = back.w; a->prevW = -1;
+            } else {                             // no memory: save it and widen
+                a->prevX = a->x; a->prevW = a->w;
+                a->x = 0; a->w = im->w;
+            }
         } else {
-            bool full = a->y == 0 && a->h == im->h;
-            if (full && a->prevH >= 1) { a->y = a->prevY; a->h = a->prevH; a->prevH = -1; }
-            else if (!full)            { a->prevY = a->y; a->prevH = a->h; a->y = 0; a->h = im->h; }
+            if (a->prevH >= 1) {
+                App::Ann back = *a;
+                back.y = a->prevY; back.h = a->prevH;
+                if (!annFits(back, im->w, im->h)) { refuseBack(back); return; }
+                a->y = back.y; a->h = back.h; a->prevH = -1;
+            } else {
+                a->prevY = a->y; a->prevH = a->h;
+                a->y = 0; a->h = im->h;
+            }
         }
         app.annRev++;
         return;
