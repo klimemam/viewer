@@ -320,7 +320,7 @@ Histogram の `sides` と画像の row/grid に含まれる A、B、C…が対�
 - T10 の未固定範囲: phase④(PR #273)で T14 / T14b / T15 / T16 が固定。C スロットの
   Split 値残存・difference footer の stale 値・寸法不一致時の badge 誤文の 3 件は
   現行実装の欠陥で、#273 は `histhl.inc` STAGE 4 に DEFECT(1)(2)(3) の stderr 報告
-  だけを置いた (assert せず)。**修正済み (板 275 の続き)**。裁定どおり `HlCount` に
+  だけを置いた (assert せず)。**修正済み (PR #277、板 275 の続き)**。裁定どおり `HlCount` に
   フレーム番号 (`shownFrame`) を刻み、footer と badge は**現フレームに画面へ出た分
   だけ**を読む。刻むのは**塗った所ではなく描いた所**である: `renderDocRGBA` は
   `texDirty` のときだけ走る遅延処理で、かつ PNG / 動画 export も同じ関数を通るので、
