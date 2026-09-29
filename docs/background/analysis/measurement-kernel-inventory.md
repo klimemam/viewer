@@ -293,15 +293,17 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 
 | 量 | 状態 |
 |---|---|
-| `uniformity/prnu-fpn` の `prnu_pct` / `row_fpn_pct` / `col_fpn_pct` / `shading_pct` | `core/selftest/bundled.inc` が `key:unit` の一覧と version `1.0.0` だけを固定する。**値はどこにも assert されていない** (`plugins/test/test_prnu.c` は `boxblur2d` 単体の応答を 1e-5 で見るだけ) |
-| `sharpness/gradient` の `varlap` / `tenengrad` / `grad_mean` | 同上 |
-| `iso12233/e-sfr` の `mtf50` / `mtf20` / `sfr@nyquist` | 同上。カーブは stdout に出るだけで、**commit 間の人間の byte-diff** が唯一の防御 |
-| Temporal の per-frame TSV 全体 | `core/selftest/framestats.inc` は**全 21 行で assert が 0 本**。TSV を stdout に印字して 0 を返す。ヘッダは「独立した numpy 実装が全数値を再現しなければならない」と書くが、**その実装はリポジトリにも CI にも無い** |
+| `uniformity/prnu-fpn` の `prnu_pct` / `row_fpn_pct` / `col_fpn_pct` / `shading_pct` | `core/selftest/bundled.inc` が `key:unit` の一覧と version `1.0.0` だけを固定する。**値はどこにも assert されていない** (`plugins/test/test_prnu.c` は `boxblur2d` 単体の応答を 1e-5 で見るだけ) → **板 302/303 で閉じた** (`--anavalue-selftest` U1/U2 が bilinear ramp 上の4量を閉形式で当てる) |
+| `sharpness/gradient` の `varlap` / `tenengrad` / `grad_mean` | 同上 → **閉じた** (`--anavalue-selftest` G1-G4。ramp と checkerboard が互いの零を埋めるので3量すべてが `==` で固定) |
+| `iso12233/e-sfr` の `mtf50` / `mtf20` / `sfr@nyquist` | 同上。カーブは stdout に出るだけで、**commit 間の人間の byte-diff** が唯一の防御 → **閉じた** (`--anavalue-selftest` S1-S3。理想エッジの `\|sinc(f)\|*sinc(f/4)^2` モデルに曲線 1%・交点 1%。副産物として `DEFECT(esfr-1)`: 暗レベル≠0 だと先頭空 bin の 0 埋めが LSF に偽インパルスを作り mtf50 が −5.4% ずれる。analyzer 側の欠陥なので別行) |
+| Temporal の per-frame TSV 全体 | `core/selftest/framestats.inc` は**全 21 行で assert が 0 本**。TSV を stdout に印字して 0 を返す。ヘッダは「独立した numpy 実装が全数値を再現しなければならない」と書くが、**その実装はリポジトリにも CI にも無い** → **閉じた** (同ファイルの F1-F5。stdout は不変のまま、8x8 x5 枚の合成 stack の mean / σ / σ_col / σ_row / NaN 1画素 / 非常駐枚を有理数で固定) |
 
 これは `stats-taxonomy.md` §6.6 が記録した事故の形そのものである:
 ddof=1 の2式を ddof=0 に反転して **42 テスト全 PASS**。その後
 `--export-tsv-selftest` E11 が値 assert を1本足して per-frame **領域**σだけが守られた
-(P6)。**P14 / P17 と上の4量は今日もこの状態である。**
+(P6)。**上の4量は板 302/303 (PR #273) で閉じた。P14 / P17 の一般形は
+`--rowcol-sigma-selftest` が「現状の差を数値で固定」した段までで、統一そのものは
+§6.1 順位 5 の裁定待ちである。**
 
 ### 4.3 「試験があるが、どこでも走るわけではない」
 
@@ -318,6 +320,19 @@ ddof=1 の2式を ddof=0 に反転して **42 テスト全 PASS**。その後
 - **`verify` V13** (K4#1 と K4#2 を同じ NaN fixture で測る、P10 の間接分) も同様。
 - CI の Linux ジョブは xvfb を入れ、`VIEWER_SELFTEST_REQUIRE_GL` で「コンテキスト
   無し」を失敗に変える。**つまりこの2本は3 OS のうち1つでしか効いていない。**
+
+**板 302/303 (PR #273) で閉じた。** GL が要るのは `abstats` では T / S4-S6 / N の
+3群、`verify` では V19 の1群だけだったので、**GL 行はそのまま残したまま `-nogl`
+兄弟を並べて登録**する形にした (`abstats-nogl` / `verify-nogl` /
+`abstats-cfa-bayer-nogl`)。土台は `glGroup()` (`core/selftest/util.inc`) と
+`--nogl-groups-skipped` で、旗が無ければ従来の `needWindow()` そのままなので
+NOGL の誤付与は今までどおり赤になる。これで A1 / A2 / A1p / A3 / P1-P3 / S1-S3 の
+**106 assert** と `verify` の **227 assert** (V13 を含む) が3 OS で走る。
+`tile` は分割しない —— 2群が描き、うち1つは framebuffer を読み戻す。
+
+**この形を今後の GL 混在テストの標準とする** (裁定, PR #273 レビュー)。代償は
+GL ランナーで CPU 群が2回走ることで、CI 時間が問題になったら GL ランナー側で
+`ctest -E '-nogl$'` として `-nogl` 兄弟を除外する。
 
 参考として、`abstats-cfa-bayer` は `6308888` から一時 `DISABLED` にされた履歴を持ち、
 原因は**製品ではなく selftest 側の `refSigmaT` が4面を pooled にしていたこと**だった

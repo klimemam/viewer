@@ -750,8 +750,12 @@
         // state, not pixels: this machine's screen capture returns a white
         // client area for OpenGL content, and glReadPixels of a 1600x1000
         // window is not a regression test anyone will keep running.
-        {
-            if (!needWindow("--abstats-selftest (the Temporal chart group)")) return 1;
+        // ...and it is one of THREE groups here that do - this one, S4-S6 and N -
+        // against seven that are CPU, so selftest.abstats-nogl runs those seven
+        // on every runner (板 304). A1/A2/A3/A1p are in them, and A2's per-plane
+        // sigma_t against refSigmaT is the only parity that kernel has.
+        if (!glGroup("--abstats-selftest (the Temporal chart group)")) return 1;
+        if (g_haveWindow) {
             auto temporalFrame = [&](float w, float h) {
                 // two passes: the first settles the window, the second is the
                 // one whose layout is measured
@@ -1170,7 +1174,11 @@
         // (defects, 2026-07-30: 「Cに選んだやつが，Stackだとフレーム数更新され
         // ない」, 「FilesにC,D,,,,が表示されない」, and A standing on the pinned
         // B reading as 「比較を抜けてしまう」.)
-        {
+        // do/while(0) and not a plain block: S1-S3 are CPU and S4-S6 drive real
+        // frames, so the NOGL sibling has to stop in the MIDDLE of this group
+        // (板 304). `break` is the only exit a block has, and re-indenting 200
+        // lines to gain an `if` would bury the change it is making.
+        do {
             check(app.seqs.size() >= 2, "S fixture: two stacks are open");
             int sid0 = app.seqs[0].id, sid1 = app.seqs[1].id;
             std::vector<int> f0 = framesOfSeq(sid0), f1 = framesOfSeq(sid1);
@@ -1225,6 +1233,8 @@
             // C reads "BC"; a standalone frame in slot D reads "D". Real ImGui
             // frames, asserted through g_filesBadgeProbe - same reasoning as
             // the T group above.
+            if (!glGroup("--abstats-selftest (S4-S6, the Files list group)")) return 1;
+            if (!g_haveWindow) break;        // S1-S3 above are the sibling's share
             f1 = framesOfSeq(sid1);
             selectImage(f0[0]);
             setCompareB(app.images[f1[0]].get());       // B = stack 1, frame 0
@@ -1440,7 +1450,7 @@
                       g_filesBadgeProbe.find(row1 + "=B;") != std::string::npos,
                       "S6 ...and the letters are back at full ink");
             }
-        }
+        } while (0);
 
         // ---- N: the panel says something about EVERY slot it holds -----------
         // The defect (issue #60): with C, D, E armed the Statistics/Histogram
@@ -1452,7 +1462,12 @@
         // omission under it. The invariant every case below re-checks is that
         // those last two ACCOUNT FOR the first. A letter with a row and no
         // curve and no mention is the defect, restated as an equation.
-        {
+        //
+        // Every assert in this group reads a probe a real frame wrote, so all of
+        // it is the GL run's (板 304). The W group after it is CPU and runs in
+        // both, which is why the two are separate blocks.
+        if (!glGroup("--abstats-selftest (N, the N-slot panel group)")) return 1;
+        if (g_haveWindow) {
             check(app.seqs.size() >= 2, "N fixture: two stacks are open");
             int sid0 = app.seqs[0].id, sid1 = app.seqs[1].id;
             std::vector<int> f0 = framesOfSeq(sid0), f1 = framesOfSeq(sid1);

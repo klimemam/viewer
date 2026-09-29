@@ -1423,6 +1423,17 @@ int main(int argc, char** argv) {
     #include "selftest/precision.inc"
     #include "selftest/profile-noise.inc"
 
+    // The four sites that compute "sigma of the row / column means" (板 303).
+    // Directly after profile-noise.inc because one of the four IS
+    // computeProfileNoise and the fixtures are of the same kind - analytic, with
+    // the expected value a rational derived by hand.
+    #include "selftest/rowcolsigma.inc"
+
+    // The three shipped analyzers that had no value assertion at all (板 304).
+    // Beside rowcolsigma.inc because it is the same discipline on the other side
+    // of the ABI: analytic fixtures whose answer can be written down.
+    #include "selftest/anavalue.inc"
+
     #include "selftest/abstats.inc"
 
     #include "selftest/tile.inc"
