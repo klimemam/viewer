@@ -216,18 +216,6 @@ static void drawPanelProjection() {
                           "display range: the black/white points - link those across images\n"
                           "and every image's profile lands on the same axis\n"
                           "fixed: whatever you type below");
-    float yLo, yHi;
-    if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
-    else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
-    else {                       // shared across H, V - and across EVERY side,
-                                 // so no pane and no curve is rescaled to fit
-        yLo = FLT_MAX; yHi = -FLT_MAX;
-        for (const ProjSide& sd : sides) {
-            yLo = std::min(yLo, std::min(sd.S->hMin, sd.S->vMin));
-            yHi = std::max(yHi, std::max(sd.S->hMax, sd.S->vMax));
-        }
-        if (!(yLo < yHi)) { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }
-    }
     if (app.projYMode == 2) {
         ImGui::SameLine();
         // shadow buffer: committing per keystroke would re-project the image on
@@ -293,6 +281,56 @@ static void drawPanelProjection() {
     auto drawn = [&](int s) { return app.histPlane < 0 || app.histPlane == s; };
     int nDrawn = 0;
     for (int s = 0; s < P.nSeries; s++) if (drawn(s)) nDrawn++;
+    // WHERE side `si` keeps A's series of the same NAME, or -1 for a series only
+    // this side has. One spelling, because the stroke, the hover readout and the
+    // legend all have to agree about which curve is which plane - and a legend
+    // that names a different plane than the stroke drew is worse than none.
+    auto matchA = [&](size_t si, int s) {
+        return si == 0 ? s
+                       : abSeriesMatch(P.seriesNames, P.nSeries,
+                                       sides[si].S->seriesNames[s]);
+    };
+    // ---- the value axis, AFTER the plane selector, because it depends on it.
+    // ProjState::hMin/hMax are over every plane the pass computed, so
+    // narrowing the selector to one plane left the axis sized for four - and on
+    // a mosaic the planes sit at different LEVELS, which is what a colour
+    // filter array does. A lens-shading tilt of a few percent inside one plane
+    // was then flattened into a straight line by three other planes' levels,
+    // on the axis whose "auto" is there to make the shape readable. It is also
+    // the canon's own rule (planes are not mixed) applied to the axis.
+    auto drawnRange = [&](bool horizontal, float& lo, float& hi) {
+        lo = FLT_MAX; hi = -FLT_MAX;
+        for (size_t si = 0; si < sides.size(); si++) {
+            const App::ProjState& S = *sides[si].S;
+            const std::vector<float>* series = horizontal ? S.h : S.v;
+            for (int s = 0; s < S.nSeries; s++) {
+                const int a = matchA(si, s);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                for (float v : series[s])
+                    if (std::isfinite(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
+            }
+        }
+    };
+    float yLo, yHi;
+    if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
+    else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
+    else {                       // shared across H, V - and across EVERY side,
+                                 // so no pane and no curve is rescaled to fit
+        float hl, hh, vl, vh;
+        drawnRange(true, hl, hh);
+        drawnRange(false, vl, vh);
+        yLo = std::min(hl, vl); yHi = std::max(hh, vh);
+        // ...and if the selector has left nothing measurable on the axis, the
+        // whole-image range rather than an inverted one
+        if (!(yLo < yHi)) {
+            yLo = FLT_MAX; yHi = -FLT_MAX;
+            for (const ProjSide& sd : sides) {
+                yLo = std::min(yLo, std::min(sd.S->hMin, sd.S->vMin));
+                yHi = std::max(yHi, std::max(sd.S->hMax, sd.S->vMax));
+            }
+        }
+        if (!(yLo < yHi)) { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }
+    }
 
     // Overlay is only honest when the profiles are the SAME axis: same length
     // and same origin. Different lengths cannot be aligned without knowing the
@@ -363,15 +401,65 @@ static void drawPanelProjection() {
     // hue so R stays R.
     const bool bySlotInk = !side && nPlot > 2;
 
-    // reserve the statistics table first: the plots must not push it off-panel
-    int extraSeries = 0;
-    for (const ResolvedSlot& rs : xslots)
-        if (rs.idx < app.projExtra.size()) extraSeries += app.projExtra[rs.idx].nSeries;
-    // ...plus one pooled "all" row per side when it is switched on
-    int allRows = (P.allRow ? 1 : 0) + (Bim && PB.allRow ? 1 : 0);
-    for (const ResolvedSlot& rs : xslots)
-        if (rs.idx < app.projExtra.size() && app.projExtra[rs.idx].allRow) allRows++;
-    int statRows = (P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries + allRows) * plots;
+    // "ch, then side" pairs planes BY NAME, never by index (board 265 /
+    // docs/background/project/todo-open.md §24). A is a mosaic with R, Gr, Gb, B and
+    // B is a plain 1-channel image with ch0; the old walk ran `for i < maxSeries`
+    // and put whatever each side held at index i on consecutive lines, so R:A was
+    // followed by ch0:B and the whole point of the order - "R:A directly above
+    // R:B, for comparing ONE plane across sides" - said the opposite of the
+    // truth. ch0 is not R, and the canon's iron rule is that CFA planes are
+    // never mixed; two rows the reader is invited to compare ARE mixed planes.
+    //
+    // So the row axis is the union of the plane NAMES, in first-appearance order
+    // across the sides (arming a letter must not reorder what is already on
+    // screen, exactly as for the sides themselves), and abSeriesMatch - the
+    // matching predicate everything else in the panel already uses - answers
+    // where each side keeps that name. A plane a side does not have gets a row
+    // with its name and "-" in every value: dropping it would slide the next
+    // plane's numbers onto this side's line, which is the defect restated.
+    //
+    // `i` is that side's series slot, or -1 for "not on this side"; `plane` is
+    // the name the row is about, and is the only thing a -1 row has.
+    auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*,
+                                                      int, const char*)>& row) {
+        if (app.projStatOrder == 0) {
+            for (const auto& sr : sides) {
+                for (int i = 0; i < sr.S->nSeries; i++)
+                    row(*sr.S, sr.name.c_str(), i, sr.S->seriesNames[i]);
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
+            }
+        } else {
+            std::vector<const char*> planes;     // the union, in the sides' order
+            for (const auto& sr : sides)
+                for (int i = 0; i < sr.S->nSeries; i++) {
+                    const char* nm = sr.S->seriesNames[i];
+                    if (!nm) continue;
+                    if (abSeriesMatch(planes.data(), (int)planes.size(), nm) < 0)
+                        planes.push_back(nm);
+                }
+            for (const char* nm : planes)
+                for (const auto& sr : sides)
+                    row(*sr.S, sr.name.c_str(),
+                        abSeriesMatch(sr.S->seriesNames, sr.S->nSeries, nm), nm);
+            // the pooled row is always last of its group - it is not a plane,
+            // and sorting it among them would invite reading it as one
+            for (const auto& sr : sides)
+                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
+        }
+    };
+    // reserve the statistics table first: the plots must not push it off-panel.
+    //
+    // THE ROW COUNT COMES FROM THE WALK, never from a sum of the sides' plane
+    // counts. In "ch, then side" the row axis is the UNION OF THE PLANE NAMES
+    // times the sides, so A as a mosaic (R, Gr, Gb, B) against a B that was
+    // never told it is one (ch0) is five names x two sides = TEN rows, while
+    // `P.nSeries + PB.nSeries` said five. The table then hung half its rows
+    // below the visible panel - on the very pair the "-" rows exist to make
+    // readable. One spelling of the row set, walked twice.
+    int tableRowsWalked = 0;
+    projForEachRow([&](const App::ProjState&, const char*, int, const char*) {
+        ++tableRowsWalked;
+    });
     float lineH = ImGui::GetTextLineHeightWithSpacing();
     // wide draws one row per PLANE per side; per-axis draws one per axis too
     const bool wideGuess = app.projStatLayout == 1 ||
@@ -379,7 +467,7 @@ static void drawPanelProjection() {
                             ImGui::GetContentRegionAvail().x >=
                                 ImGui::GetFontSize() * (Bim ? 4.0f : 2.4f) + numColW() * 12 +
                                 ImGui::GetStyle().CellPadding.x * 28);
-    if (wideGuess) statRows = P.nSeries + (Bim ? PB.nSeries : 0) + extraSeries + allRows;
+    const int statRows = wideGuess ? tableRowsWalked : tableRowsWalked * plots;
     float statsH = ImGui::GetFrameHeightWithSpacing()      // "profile statistics" separator
                  + ImGui::GetFrameHeightWithSpacing()      // the layout combo
                  + lineH * (statRows + 1)                  // header + one row per axis/channel
@@ -390,15 +478,6 @@ static void drawPanelProjection() {
         statsH += ImGui::CalcTextSize(offMsg.c_str(), nullptr, false,
                                       ImGui::GetContentRegionAvail().x).y +
                   ImGui::GetStyle().ItemSpacing.y;
-    // WHERE side `si` keeps A's series of the same NAME, or -1 for a series only
-    // this side has. One spelling, because the stroke, the hover readout and the
-    // legend all have to agree about which curve is which plane - and a legend
-    // that names a different plane than the stroke drew is worse than none.
-    auto matchA = [&](size_t si, int s) {
-        return si == 0 ? s
-                       : abSeriesMatch(P.seriesNames, P.nSeries,
-                                       sides[si].S->seriesNames[s]);
-    };
     // ...and the COLOUR rule, once, for the same reason. `a` is matchA's answer.
     auto seriesInk = [&](size_t si, int s, int a, bool tint) -> ImU32 {
         const bool mono = !cfa && P.nSeries == 1;
@@ -477,7 +556,13 @@ static void drawPanelProjection() {
     }
     float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
-    float each = std::max((avail - lineH * plots) / plots
+    // One p-p ("in view") line PER SERIES under each plot, not one line per
+    // plot: a mosaic draws four of them, five with the pooled row, and the
+    // budget of one pushed the statistics table below the visible panel
+    // exactly where the numbers are read. P.nFill is how many the spread loop
+    // will draw - the slots the pass filled - so the two cannot drift.
+    const int ppRows = std::max(1, P.nFill);
+    float each = std::max((avail - lineH * (float)ppRows * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
     // x range: the UNION of every side's sample range, so every plot (side by
@@ -601,17 +686,48 @@ static void drawPanelProjection() {
     // "There is a spike - WHICH column is it?" The readout answers with the
     // exact index and the values under the cursor, without decimation: the
     // marker snaps to the true sample, not to the plotted min-max bucket.
+    //
+    // ...and on a MOSAIC it answers about the CELL, not about the column. Two
+    // of an RGGB frame's four planes have no sample at any given column, and
+    // the reason to have this panel on a mosaic at all is to compare the four
+    // planes AT THE SAME PLACE - so naming one column and then going silent
+    // about half the planes is the worst of the three available answers
+    // (silence, "no sample", or the cell). The heading therefore says
+    // "column x 1000-1001" and every plane gets a line, with the column its
+    // own sample came from. The heading MEANS something different from the
+    // mono/RGB case, which is why it says so on the line itself.
     auto hoverReadout = [&](const PlotRect& pr, bool horizontal,
                             const std::vector<size_t>& which) {
         if (!ImGui::IsMouseHoveringRect(pr.p0, pr.p1)) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float mx = ImGui::GetMousePos().x;
         float t = (mx - pr.p0.x) / std::max(pr.p1.x - pr.p0.x, 1.0f);
-        int at = (int)(pr.xmin + t * (pr.xmax - pr.xmin) + 0.5f);
+        const int at = (int)(pr.xmin + t * (pr.xmax - pr.xmin) + 0.5f);
+        // the widest cell on this plot: A can be a mosaic while B is not, and
+        // then the reading is still about A's cell, which contains B's column
+        int cellW = 1;
+        for (size_t si : which) cellW = std::max(cellW, sides[si].S->cell);
+        const int cellAt = at - ((at % cellW) + cellW) % cellW;   // cell-aligned
+        if (cellW > 1) {   // the cell, faintly, so the heading has something to point at
+            const ImVec2 c0 = pr.at((float)cellAt - 0.5f, pr.ymin);
+            const ImVec2 c1 = pr.at((float)(cellAt + cellW - 1) + 0.5f, pr.ymax);
+            dl->AddRectFilled(ImVec2(c0.x, c1.y), ImVec2(c1.x, c0.y),
+                              IM_COL32(230, 200, 90, 30));
+        }
         dl->AddLine(pr.at((float)at, pr.ymin), pr.at((float)at, pr.ymax),
                     IM_COL32(230, 200, 90, 140), 1.0f);
-        char tip[768];
-        int off = snprintf(tip, sizeof tip, "%s %d", horizontal ? "column x" : "row y", at);
+        // A string rather than a char[768] and an `off` that was added to
+        // without being checked: four planes across five sides is twenty lines
+        // now that every plane gets one, and `sizeof tip - off` underflows into
+        // a huge size_t the moment off passes the end of the buffer.
+        std::string tip = std::string(horizontal ? "column x " : "row y ") +
+                          std::to_string(cellAt);
+        if (cellW > 1)
+            tip += "-" + std::to_string(cellAt + cellW - 1) +
+                   " (one mosaic cell - each plane's own sample in it)";
+        auto say = [&](const std::string& line) {
+            if (tip.size() < 3000) tip += line;      // a tooltip, not a report
+        };
         // ...for every side ON THIS PLOT, and only the plane(s) drawn: a
         // readout that quotes a curve the plot does not carry is a value with
         // no line to point at.
@@ -620,20 +736,51 @@ static void drawPanelProjection() {
             const std::string dt = abValueUnit(S.img ? S.img->dtype : im->dtype);
             const std::string pre = nSides > 1 ? sides[si].name + " " : std::string();
             const std::vector<float>* series = horizontal ? S.h : S.v;
-            int origin = horizontal ? S.rx : S.ry;
-            int i = at - origin;
+            const int origin = horizontal ? S.rx : S.ry;
             for (int s2 = 0; s2 < S.nSeries; s2++) {
-                int a = si == 0 ? s2 : abSeriesMatch(P.seriesNames, P.nSeries, S.seriesNames[s2]);
+                const int a = matchA(si, s2);
                 if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                if (i < 0 || i >= (int)series[s2].size() || !std::isfinite(series[s2][i])) continue;
                 const char* nm = S.nSeries == 1 ? "" : S.seriesNames[s2];
-                off += snprintf(tip + off, sizeof tip - off, "\n%s%s%s%.6g %s",
-                                pre.c_str(), nm, *nm ? ": " : "", series[s2][i], dt.c_str());
-                dl->AddCircleFilled(pr.at((float)at, series[s2][i]), 3.0f,
+                const std::string head = "\n" + pre + nm + (*nm ? ": " : "");
+                // this plane's OWN sample inside the cell, the one nearest the
+                // cursor when the cell holds two of them (quad Bayer)
+                int best = -1;
+                for (int k = 0; k < cellW; k++) {
+                    const int i = cellAt - origin + k;
+                    if (i < 0 || i >= (int)series[s2].size()) continue;
+                    if (!projHasSample(S, s2, horizontal, i)) continue;
+                    if (best < 0 || abs(origin + i - at) < abs(origin + best - at)) best = i;
+                }
+                if (best < 0) {
+                    // Not silence. A plane with no sample anywhere in the cell
+                    // means the cell is outside this side's region - a smaller
+                    // frame, or an ROI that does not reach here - and that is a
+                    // fact about the SIDE, which the reader can act on.
+                    say(head + std::string("no sample in this ") +
+                        (cellW > 1 ? "cell" : (horizontal ? "column" : "row")));
+                    continue;
+                }
+                const int atCol = origin + best;
+                if (!std::isfinite(series[s2][best])) {
+                    // ...and a hole in the DATA, which is the other fact and
+                    // has to read differently: this plane owns the position and
+                    // no finite pixel was found there.
+                    say(head + "no data (no finite pixel in " +
+                        std::string(horizontal ? "column " : "row ") +
+                        std::to_string(atCol) + ")");
+                    continue;
+                }
+                char b[96];
+                snprintf(b, sizeof b, "%.6g %s", series[s2][best], dt.c_str());
+                say(head + b + (cellW > 1 ? (horizontal ? " at column " : " at row ") +
+                                                std::to_string(atCol)
+                                          : std::string()));
+                dl->AddCircleFilled(pr.at((float)atCol, series[s2][best]), 3.0f,
                                     IM_COL32(230, 200, 90, 230));
             }
         }
-        ImGui::SetTooltip("%s", tip);
+        g_projHoverProbe = tip;
+        ImGui::SetTooltip("%s", tip.c_str());
     };
     // One plot, carrying the sides in `which` - one of them in a pane, all of
     // them on the shared axis. There is no wantA/wantB any more: two booleans
@@ -838,6 +985,15 @@ static void drawPanelProjection() {
         g_projSideProbe += std::string("plane=") +
                            (app.histPlane < 0 ? "all" : P.seriesNames[app.histPlane]) + ";";
         g_projSideProbe += std::string("layout=") + (side ? "side" : "overlay") + ";";
+        {   // the value axis the curves were drawn on, and the number of table
+            // rows the plots were sized around. Both are decisions with no
+            // other printed form: "auto" that ignores the plane selector, and a
+            // row budget that is half the rows, are silent failures otherwise.
+            char b[96];
+            snprintf(b, sizeof b, "y=%.9g..%.9g;statrows=%d;", (double)yLo, (double)yHi,
+                     tableRowsWalked);
+            g_projSideProbe += b;
+        }
         if (!offMsg.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(AB_AMBER, "%s", offMsg.c_str());
@@ -904,52 +1060,6 @@ static void drawPanelProjection() {
     auto sideIsStale = [&](const char* name) {
         for (const auto& sr : sides) if (sr.name == name) return sr.stale;
         return false;
-    };
-    // "ch, then side" pairs planes BY NAME, never by index (board 265 /
-    // docs/background/project/todo-open.md §24). A is a mosaic with R, Gr, Gb, B and
-    // B is a plain 1-channel image with ch0; the old walk ran `for i < maxSeries`
-    // and put whatever each side held at index i on consecutive lines, so R:A was
-    // followed by ch0:B and the whole point of the order - "R:A directly above
-    // R:B, for comparing ONE plane across sides" - said the opposite of the
-    // truth. ch0 is not R, and the canon's iron rule is that CFA planes are
-    // never mixed; two rows the reader is invited to compare ARE mixed planes.
-    //
-    // So the row axis is the union of the plane NAMES, in first-appearance order
-    // across the sides (arming a letter must not reorder what is already on
-    // screen, exactly as for the sides themselves), and abSeriesMatch - the
-    // matching predicate everything else in the panel already uses - answers
-    // where each side keeps that name. A plane a side does not have gets a row
-    // with its name and "-" in every value: dropping it would slide the next
-    // plane's numbers onto this side's line, which is the defect restated.
-    //
-    // `i` is that side's series slot, or -1 for "not on this side"; `plane` is
-    // the name the row is about, and is the only thing a -1 row has.
-    auto projForEachRow = [&](const std::function<void(const App::ProjState&, const char*,
-                                                      int, const char*)>& row) {
-        if (app.projStatOrder == 0) {
-            for (const auto& sr : sides) {
-                for (int i = 0; i < sr.S->nSeries; i++)
-                    row(*sr.S, sr.name.c_str(), i, sr.S->seriesNames[i]);
-                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
-            }
-        } else {
-            std::vector<const char*> planes;     // the union, in the sides' order
-            for (const auto& sr : sides)
-                for (int i = 0; i < sr.S->nSeries; i++) {
-                    const char* nm = sr.S->seriesNames[i];
-                    if (!nm) continue;
-                    if (abSeriesMatch(planes.data(), (int)planes.size(), nm) < 0)
-                        planes.push_back(nm);
-                }
-            for (const char* nm : planes)
-                for (const auto& sr : sides)
-                    row(*sr.S, sr.name.c_str(),
-                        abSeriesMatch(sr.S->seriesNames, sr.S->nSeries, nm), nm);
-            // the pooled row is always last of its group - it is not a plane,
-            // and sorting it among them would invite reading it as one
-            for (const auto& sr : sides)
-                if (sr.S->allRow) row(*sr.S, sr.name.c_str(), 4, sr.S->seriesNames[4]);
-        }
     };
     // The row walk, as a string, for --abstats-selftest: "R@A,R@B-,Gr@A,Gr@B-,..."
     // where a trailing '-' is a plane that side does not have. The row ORDER is
@@ -1125,9 +1235,9 @@ static void drawPanelProjection() {
     // panel, hiding the single-frame limitation exactly where numbers are read.
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
-    int tablePlanes = 0;
-    // every row the walk will draw, the "-" ones included: they take a line too
-    projForEachRow([&](const App::ProjState&, const char*, int, const char*) { ++tablePlanes; });
+    // every row the walk will draw, the "-" ones included: they take a line too.
+    // The same number the height budget above reserved for, counted once.
+    const int tablePlanes = tableRowsWalked;
     const int tableRows = wide ? tablePlanes : tablePlanes * (int(app.showProjH) + int(app.showProjV));
     // ScrollX's default height is the REMAINING window space. At a larger UI
     // scale that can be zero, so scrolling the panel never reveals its rows.
