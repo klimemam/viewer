@@ -797,6 +797,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // pure, and both have existed since the include block above.
 #include "selftest/uiscale.inc"
 
+// Japanese and Chinese filenames draw as themselves (板306). Here rather than
+// earlier because it needs BOTH ends of the spine: cjkFontRanges / jpFontChoice
+// from app/util.inc at the top, and undrawableCount / undrawableNote from
+// ui/file_list.inc, which is one of the last fragments in.
+#include "selftest/cjkfont.inc"
+
 // A stack out as a lossless video (#253). Here beside framesize for its reason:
 // it is a function like frameSizeSelftest(), its documents are built in memory,
 // and everything it drives - startStackVideoExport, pumpVideoExport,
@@ -1388,6 +1394,13 @@ int main(int argc, char** argv) {
     // the platform under test is one no machine in this project can run, so the
     // decision is a pure function and this asserts it as one.
     if (g_uiScaleSelftest) return uiScaleSelftest();
+
+    // Japanese and Chinese filenames draw as themselves (板306). Windowless for
+    // the uiScaleSelftest reasons and one that is stronger here: the subject IS
+    // the font atlas, the atlas is rasterised on the CPU by stb_truetype, and
+    // start-up builds it whether or not there is a renderer to hand it to - so
+    // this test interrogates the very atlas the user would be looking at.
+    if (g_cjkFontSelftest) return cjkFontSelftest();
     if (g_videoSelftest) return videoSelftest();
 
     // The open worker (#232 stage 2): openPath returns with nothing read, the

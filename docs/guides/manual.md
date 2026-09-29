@@ -1421,6 +1421,14 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
   **local より速くなることはありません**。見に行くかどうか自体は
   `loading.watchFiles`、見つけたら自動で読み直すかは `loading.watchAutoReload` です
 
+- `appearance.fontPath` は**日本語・中国語のファイル名を描くフォントファイル**を
+  名指しします。書くと組み込みの探索より先に使います。空文字列は
+  「探索に戻す」ではなく**行・列を名指しで断ります** —— 探索に戻す方法は
+  判断9 どおり**キーを消す**ことです。**反映は次回起動から**(字形は
+  ウィンドウ生成時に一度だけ焼くので、パネルで変えるとその旨 toast が出ます)。
+  ファイルが無い / フォントに CJK が無い場合は、設定を読む時点ではなく
+  **フォントを読む時点で**名指しします(§8c)
+
 読むキーのうち `loading.rawRecipes` だけは**オブジェクトの配列**です(§2.2b)。
 1件が読めなくても**その1件だけ**を名指しで断り、残りのレシピは読み込みます。
 
@@ -1430,7 +1438,7 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
 
 ### 8b. Preferences パネル
 
-`File > Preferences...` は設定表36行を並べます。Read 30行には現在値と、
+`File > Preferences...` は設定表37行を並べます。Read 31行には現在値と、
 **どの層が決めたか** (`default` / `this machine` /
 `settings.jsonc:<line>` / `command line` / `session (.vsession)`) が出ます。session の
 出所は `.vsession` が復元する表示ガンマとピクセルグリッドの2行だけです。
@@ -1457,6 +1465,35 @@ Later 4行 / NotHere 2行は値の代わりに、その場で扱わない理由�
 - `settings.jsonc` やコマンドラインが決めているキーは、**あなたがそれを変えるまで**
   `prefs.txt` に焼き付きません。別の設定を保存しても、そのキーについて
   `prefs.txt` が持っていた値がそのまま残ります (キーを消せば元に戻ります)
+
+### 8c. 日本語・中国語のファイル名
+
+字形は**起動時に一度だけ**焼きます。だから**どのフォントを使うか**と
+**どの字を要求するか**は起動時に決まり、変更は次回起動から効きます。
+起動時に stderr へ 1 行出るので、あとから確かめられます:
+
+```
+font atlas: 4963 glyph(s) of 5075 requested codepoint(s), 1024x2048 px (8.0 MB RGBA), 2 face(s), built in 35 ms (font scale 1.00, kana present)
+```
+
+- 要求する字は**日本語 + 簡体字中国語 2500 字 + General Punctuation +
+  Letterlike Symbols + σ / μ / ⧉**。`—` `–` `…` `“` `”` `‘` `№` `℃` が入るのは
+  ここで、`25℃.npy` のような名前のためです。**ハングルは入れません**
+  (glyph が 4.5 倍・テクスチャが 4 倍になり、要求が出ていないため)
+- Windows では **2枚重ねます**。1枚目が日本語フォント (既定 Meiryo)、2枚目が
+  **Microsoft YaHei**。同じ字は**先に来た方が勝つ**ので、日本語の字形は
+  1枚目のままで、Meiryo が持たない簡体字だけ YaHei から来ます
+  (Meiryo は簡体字 2500 のうち 1819 字しか持たず、`测` `试` はどの日本語
+  フォントにもありません)。macOS は同じ形で Hiragino Sans GB を重ね、
+  Linux は Noto Sans CJK 1枚で足ります
+- **フォントを探す順番**は `appearance.fontPath` → 組み込み候補 →
+  (Windows 以外) `fc-match sans:lang=ja`。全部外れたときのトーストは
+  **探したパスを全部並べます**
+- **それでも「?」になるもの**があります: フォントが持たない字と、BMP の外
+  (絵文字など) です。そのときは行の tooltip と Messages が
+  **いくつの字が描けないか**を言います。ファイル名は書き換えません ——
+  `测试1.npy` と `试测1.npy` はどちらも `??1.npy` に見えますが、
+  エスケープして見せると手元のフォルダと照合できなくなるからです
 
 ## 9. コマンドライン
 
@@ -1507,7 +1544,8 @@ viewer [options] [files...]
 | Linux でファイルダイアログが開かない | `zenity` か `kdialog` をインストール(D&D は常に可) |
 | 文字が巨大 / ウィンドウが画面に収まらない (Linux) | `viewer --ui-scale 1` で起動。定着させるなら `settings.jsonc` に `appearance.uiScale`(§10a) |
 | ウィンドウを動かせない / 枠が変 | `viewer --frame system` で OS のタイトルバーに戻して起動(`View > Integrated title bar` でも切替。設定は保持されます) |
-| 日本語ファイル名が「?」になる | CJK フォント導入(Ubuntu: `fonts-noto-cjk`)。起動時トーストで警告 |
+| 日本語・中国語のファイル名が「?」になる | フォントが足りていません。Ubuntu なら `fonts-noto-cjk`。起動時トーストが**探したパスを全部並べる**ので、手元のフォントがそこに無ければ `settings.jsonc` の `appearance.fontPath` にファイルを名指ししてください(反映は次回起動)。フォントが見つかっても字が無い場合は「この字が無い」と名指しで言います(§8c) |
+| 名前の一部だけ「?」になる / 別の2ファイルが同じ名前に見える | フォントがその字を持っていません。行の tooltip と Messages に**いくつの字が描けないか**が出ます。ファイル名そのものは書き換えません(書き換えると照合できなくなるため)。別のフォントを `appearance.fontPath` で指す、が唯一の手です(§8c) |
 | Bayer の crop 位置が 1px ずれる | 仕様: CFA 周期(2/4px)へのスナップ。パターン破壊防止 |
 | e-sfr が "no clear single edge" | ROI 内にエッジ1本だけ入れる。傾き 5〜40°、コントラスト確保 |
 | ROI が多くて解析グリッドの右端が読めない | グリッドは**横スクロール**します(metric と unit の2列は固定表示)。ROI 数の上限はありません |
