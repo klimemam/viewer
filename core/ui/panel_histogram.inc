@@ -892,6 +892,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // ...and the budget has to know that each step now covers `cell` lines
     int step = (int)std::max<size_t>(1, ((size_t)rw * rh * cell) / PROJ_MAX_SAMPLES);
     if (cell > 1) step = ((step + cell - 1) / cell) * cell;   // whole cells only
+    // WHERE each plane's samples land, recorded as the pass visits them
+    // (ProjState::hPhase, core/app/state.h). The reader of a mosaic profile has
+    // to tell a hole in the lattice from a hole in the data, and this is the
+    // pass's own answer to the first half - taken from cfaChannelAt below, so
+    // the panel never spells the phase a second time.
+    P.cell = cell;
+    for (int s = 0; s < 5; s++) { P.hPhase[s] = 0; P.vPhase[s] = 0; }
     auto accumulate = [&](int x, int y, bool toH) {
         const float* src = &im->px()[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
         int lo = 0, hi = P.nSeries;
@@ -905,6 +912,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             else if (useMin) acc = std::min(acc, (double)val);
             else acc += val;
             (toH ? hN[slot][x] : vN[slot][y])++;
+            // ...and the OFFSET it landed on, which is a statement about the
+            // mosaic rather than about this position: one bit per offset, so a
+            // plane whose value at ONE of its own columns is NaN keeps the bit
+            // (the other columns of that offset set it) and the curve still
+            // breaks there. `cell` is 1 off a mosaic, so bit 0 and nothing else.
+            if (toH) P.hPhase[slot] |= 1u << (x % cell);
+            else     P.vPhase[slot] |= 1u << (y % cell);
             if (toH) {           // one pass only, or every pixel counts twice
                 fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
                 fMn[slot] = std::min(fMn[slot], (double)val);

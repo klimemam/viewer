@@ -3074,6 +3074,37 @@ struct App {
         std::array<profile_noise::Result, 4> noise;
         bool allRow = false;              // slot 4 holds the plane-mixed row
         bool roiUsed = false;
+        // ---- THE SAMPLE LATTICE, per series ------------------------------
+        // A mosaic plane does not exist at every position: an RGGB R plane
+        // lives on even columns only, so its H profile is a sample, a hole, a
+        // sample, and h[R] carries a NaN at every odd entry. `cell` is the
+        // mosaic period along either axis (1 = dense, 2 = Bayer, 4 = quad
+        // Bayer) and hPhase/vPhase carry ONE BIT PER OFFSET inside it: bit p
+        // of hPhase[s] means "series s has samples at h[s] indices p, p+cell,
+        // p+2*cell, ...". Offsets are in the PROFILE's own index space, so an
+        // ROI whose origin is odd is described correctly with no arithmetic at
+        // the reader's end.
+        //
+        // RECORDED BY THE PASS, out of the same cfaChannelAt call that decides
+        // which plane a pixel belongs to - never recomputed from the pattern
+        // tables. A second spelling of the phase is a second thing to get
+        // wrong, and quad Bayer is the proof: there a plane is TWO columns
+        // wide (x>>1), which an "even/odd column" formula gets exactly
+        // backwards for half of the planes.
+        //
+        // What it buys is the distinction the drawing needs. A NaN at an
+        // offset this plane HAS is a real data gap - no finite pixel there -
+        // and a curve must BREAK at it. A NaN at an offset the plane does not
+        // have is the mosaic, and carries no information whatever. Skipping
+        // every NaN alike would bridge the first kind in silence; treating
+        // every NaN as a break drew nothing at all whenever one bucket held
+        // one sample (the 2026-09-29 report).
+        //
+        // An all-zero word means the pass never said - a state from before
+        // this field existed, or one never filled - and readers then walk
+        // every position, which is what the panel did before.
+        int cell = 1;
+        uint32_t hPhase[5] = {}, vPhase[5] = {};
     } proj[2];                        // 0 = A, 1 = B (compare)
     std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
     // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.

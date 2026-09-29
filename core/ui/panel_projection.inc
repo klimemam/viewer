@@ -8,6 +8,68 @@
 // cured of, unguarded here because no probe existed to assert it.
 static std::string g_projSideProbe;
 
+// What the profile plots DREW, one entry per side per plane per axis, on the
+// last frame they drew. g_projSideProbe above answers "which LETTERS did the
+// panel speak about"; this answers the question underneath it - "and did that
+// letter's curve have any points" - which is the one the 2026-09-29 report is
+// about: the panel's frame, its axes and its whole statistics table were there
+// and ONLY the curves were gone. A table full of correct numbers over an empty
+// plot is precisely the defect, so the assertion has to be about the PAINT -
+// the shape --verify-selftest V29 uses for the Files rows
+// (g_filesStackRowProbe): the drawing records what it handed the draw list.
+//
+// It records, and changes nothing that is shown.
+struct ProjCurveProbe {
+    std::string side;        // "A", "B", ... - the position, as ProjSide names it
+    std::string plane;       // "R", "Gr", "Gb", "B", "ch0", ...
+    bool horizontal = false; // which of the two profiles
+    int points = 0;          // points handed to AddPolyline, over every stroke
+    int strokes = 0;         // separate polylines: a break in the curve adds one
+    int lattice = 0;         // positions this plane has samples at AT ALL
+    int stride = 0;          // decimation, over this plane's OWN samples
+    // The DATA x of the first and last point drawn - a column or row number,
+    // never a packed index. This is what "the x axis is not compressed" means
+    // as a measurement: an RGGB Gr curve starts at column 1, not at 0.
+    int xFirst = -1, xLast = -1;
+    float px0 = 0, px1 = 0, py0 = 0, py1 = 0;   // the plot rect, in screen px
+    float xmin = 0, xmax = 0;                   // ...and the axis it carries, so
+                                                // a test can aim at a column
+};
+static std::vector<ProjCurveProbe> g_projCurveProbe;
+// ...and the hover readout, as it was BUILT. What the panel says at a column
+// where a plane has no sample is a sentence, and a sentence nothing asserts is
+// a sentence that drifts.
+static std::string g_projHoverProbe;
+
+// Does series `s` carry a sample at profile index `i` AT ALL? The mosaic's
+// answer, not the data's: for a Bayer plane every other index is a position the
+// plane does not exist at, which is a different statement from "the value there
+// is NaN". The phase words are recorded by the projection pass out of
+// cfaChannelAt itself (core/app/state.h, ProjState::hPhase), so this is the one
+// spelling of the phase on this side of the panel.
+static bool projHasSample(const App::ProjState& S, int s, bool horizontal, int i) {
+    if (s < 0 || s >= 5) return true;
+    const uint32_t ph = (horizontal ? S.hPhase : S.vPhase)[s];
+    if (!ph) return true;              // the pass never said: walk everything
+    const int cell = std::max(1, S.cell);
+    return ((ph >> (i % cell)) & 1u) != 0;
+}
+// ...and how many of them a profile of `n` entries holds, which is what the
+// decimation has to be computed against: a plane's OWN sample count, not the
+// image's column count. n/cell of them for Bayer, and - because a quad Bayer
+// plane is two columns wide - 2n/cell there, which is why this counts the bits
+// instead of dividing by the cell.
+static int projSampleCount(const App::ProjState& S, int s, bool horizontal, int n) {
+    if (s < 0 || s >= 5 || n <= 0) return std::max(0, n);
+    const uint32_t ph = (horizontal ? S.hPhase : S.vPhase)[s];
+    if (!ph) return n;
+    const int cell = std::max(1, S.cell);
+    int c = 0;
+    for (int p = 0; p < cell && p < 32; p++)
+        if ((ph >> p) & 1u) c += (n - p + cell - 1) / cell;
+    return c;
+}
+
 // Both clipboard surfaces use these same values and availability statements.
 // H/V here name the direction of the BANDING, not the profile's plot axis.
 static std::string projNoiseStatus(const App::ProjState& P, int plane) {
@@ -67,6 +129,8 @@ struct ProjSide {
 
 static void drawPanelProjection() {
     g_projSideProbe.clear();
+    g_projCurveProbe.clear();
+    g_projHoverProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -385,28 +449,87 @@ static void drawPanelProjection() {
             // everywhere else in the application.
             if (bySlotInk) col = sides[si].ink;
             const std::vector<float>& d = series[s];
+            ProjCurveProbe cp;
+            cp.side = sides[si].name;
+            cp.plane = S.seriesNames[s] ? S.seriesNames[s] : "?";
+            cp.horizontal = horizontal;
+            cp.px0 = pr.p0.x; cp.px1 = pr.p1.x; cp.py0 = pr.p0.y; cp.py1 = pr.p1.y;
+            cp.xmin = pr.xmin; cp.xmax = pr.xmax;
+            // WALK THIS PLANE'S OWN SAMPLES. A mosaic plane lives on its own
+            // offsets of the cell, so an RGGB R profile is a sample, a hole, a
+            // sample - and both the bucketing and the decimation below are over
+            // the SAMPLES, never over the holes.
+            //
+            // Walking every entry instead put one sample in each bucket the
+            // moment `stride` came out 1, every other bucket was then a single
+            // hole, the run was flushed before it held the two points a
+            // polyline needs, and NOT ONE SEGMENT WAS DRAWN: the panel's frame,
+            // its axes and its whole statistics table over two empty plots
+            // (user report 2026-09-29). `stride` is 1 whenever the plot is at
+            // least as wide in pixels as the region is in columns - a small
+            // frame, a widened panel, and above all an ROI.
+            //
+            // What is NOT done here: skipping every NaN alike. A NaN at an
+            // offset this plane owns is a column no finite pixel was found in,
+            // and the line has to BREAK at it or the plot bridges missing data
+            // in silence. projHasSample tells the two apart, out of the phase
+            // the pass recorded from cfaChannelAt.
+            const int n = (int)d.size();
+            const int nOwn = projSampleCount(S, s, horizontal, n);
+            cp.lattice = nOwn;
             // decimate to the plot's pixel width: 4000 samples into 400 px was
-            // 4000 line segments per series per frame
+            // 4000 line segments per series per frame. Over nOwn, because that
+            // is how many points this curve can have - taking it over n gave a
+            // mosaic plane a stride `cell` times larger than it needed and
+            // threw away half of every plane's resolution.
             int px = std::max(1, (int)(pr.p1.x - pr.p0.x));
-            int stride = std::max(1, (int)d.size() / px);
+            int stride = std::max(1, nOwn / px);
+            cp.stride = stride;
             std::vector<ImVec2> run;
+            std::vector<int> runX;            // the data x of each point in `run`
             auto flush = [&]() {
-                if (run.size() >= 2)
+                if (run.size() >= 2) {
                     dl->AddPolyline(run.data(), (int)run.size(), col, 0, w);
+                    cp.points += (int)run.size();
+                    cp.strokes++;
+                    if (cp.xFirst < 0) cp.xFirst = runX.front();
+                    cp.xLast = runX.back();
+                }
                 run.clear();
+                runX.clear();
             };
-            for (int i = 0; i < (int)d.size(); i += stride) {
-                float lo = FLT_MAX, hi = -FLT_MAX;
-                for (int k = i; k < std::min(i + stride, (int)d.size()); k++)
-                    if (std::isfinite(d[k])) { lo = std::min(lo, d[k]); hi = std::max(hi, d[k]); }
-                if (lo > hi) { flush(); continue; }
+            // One bucket = `stride` of THIS PLANE'S samples, plotted at the
+            // first of them - so the x stays the image's column (or row)
+            // number, four planes can still be read against each other on one
+            // axis, and the hover's "column x" and the table's x go on meaning
+            // the same thing. Packing each plane into a dense array of its own
+            // would draw the same four curves and destroy all of that.
+            int bAt = 0, bN = 0;
+            float lo = FLT_MAX, hi = -FLT_MAX;
+            auto closeBucket = [&]() {
+                if (!bN) return;
+                bN = 0;
+                if (lo > hi) { flush(); return; }   // every sample in it is NaN:
+                                                    // a REAL gap, and the curve
+                                                    // breaks here, mosaic or not
                 if (bars && stride > 1) {
-                    ImVec2 a2 = pr.at((float)(origin + i), lo), b2 = pr.at((float)(origin + i), hi);
+                    ImVec2 a2 = pr.at((float)(origin + bAt), lo),
+                           b2 = pr.at((float)(origin + bAt), hi);
                     if (b2.y != a2.y) dl->AddLine(a2, b2, col, w);   // min-max bar
                 }
-                run.push_back(pr.at((float)(origin + i), (lo + hi) * 0.5f));
+                run.push_back(pr.at((float)(origin + bAt), (lo + hi) * 0.5f));
+                runX.push_back(origin + bAt);
+            };
+            for (int i = 0; i < n; i++) {
+                if (!projHasSample(S, s, horizontal, i)) continue;   // not a hole:
+                                                                    // not a position
+                if (!bN) { bAt = i; lo = FLT_MAX; hi = -FLT_MAX; }
+                if (std::isfinite(d[i])) { lo = std::min(lo, d[i]); hi = std::max(hi, d[i]); }
+                if (++bN >= stride) closeBucket();
             }
+            closeBucket();
             flush();
+            g_projCurveProbe.push_back(std::move(cp));
         }
     };
     // "There is a spike - WHICH column is it?" The readout answers with the
