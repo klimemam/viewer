@@ -40,6 +40,39 @@ void pumpRemoteOpenQueue();          // folder-scan stacks, opened one at a time
 // the test that pins a 3-second interval would have to live through one.
 int    browseWatchEvery();                     // peer rounds per local round
 double browseWatchInterval(bool peer);         // ...as seconds
+// ---- ...and whether it IS, said out loud (watch-design §19) -------------------
+// The 2026-09-29 report was 「以前あったフォルダ監視がなくなった? F5 おさないと
+// 更新されなくなった」, and every gate below was still exactly where it had been.
+// The defect was that the panel never said which of them was shut: a listing
+// that refreshes itself and a listing that does not look identical, so "is this
+// broken, is it my setting, or did it never exist" cannot be answered from the
+// screen.
+//
+// So the gates of rbPollDue that are not about the clock are ONE value, and
+// rbPollDue is this plus the interval. A panel that transcribed the gates into
+// a sentence would be a second opinion on them: the day one moves, the screen
+// keeps the old answer and is then a lie wearing the shape of a feature.
+// In the order they are asked, which is the order rbPollDue asked them in.
+enum class RbPollState {
+    WatchOff,     // File > Watch source files on disk (prefs `watchfiles`)
+    Paused,       // app.watchPaused: the window is minimised
+    Offline,      // this panel is not connected to anything
+    Searching,    // search results stand in for the listing
+    NotDrawn,     // collapsed, closed, or behind another dock tab
+    Arming,       // polledAt <= 0: the timer starts on the next round
+    Working,      // a job, a poll or a navigation is in flight - skip, never queue
+    On,           // counting; the next round is due at polledAt + the interval
+};
+RbPollState rbPollStateNow(const App::BrowseInstance& I, uint64_t uiFrame);
+// Seconds as this feature prints them ("3 s", "12 s", "0.4 s"). Shared with the
+// panel's tooltip so an interval cannot be spelled two ways on one row.
+std::string rbSecsText(double s);
+// ONE sentence for all of it - drawn on the status line, asserted by
+// --browse-selftest, and built from `browseWatchInterval` rather than from a
+// number typed into a string. `now` is a parameter for rbPollDue's reason: the
+// selftest sets the clock rather than living through three seconds of it. Empty
+// for NotDrawn alone, and see the definition for why that one says nothing.
+std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t uiFrame);
 bool   rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame);
 bool   rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame);
 void   pumpBrowseWatch(double now);            // every instance, once per frame

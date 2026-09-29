@@ -221,6 +221,16 @@ struct Instance {
     // the listing on screen arrived a moment ago, and re-reading it because a
     // panel opened would be a round trip for a fact already on the glass.
     double polledAt = 0;
+    // The frame clock, as of the last pumpBrowseWatch for THIS instance, and
+    // the only reason it is stored: the panel has to say how long ago it last
+    // re-listed, and panel.cpp cannot read a clock. nowSec() is a function
+    // static in the spine TU anchored ON FIRST USE, so a second copy of it in
+    // another TU would have a LATER epoch and every age drawn from it would be
+    // wrong by however long the process took to reach that call. The one place
+    // that already holds `now` for this instance is the pump that decides its
+    // rounds, so the pump leaves it here. Written and read on the UI thread
+    // only (the pump and the draw), which is why it is not atomic.
+    double pollClock = 0;
     // A poll is out. §2 says a round is SKIPPED when the worker is busy rather
     // than queued behind it, and a poll deliberately does NOT set `busy` (it is
     // not something anybody is waiting for, and rbAnyBusy drives the window's
