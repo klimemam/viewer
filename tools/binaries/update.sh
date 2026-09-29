@@ -199,6 +199,15 @@ install_peer() {
     [ -f "$f" ] || continue
     b=$(basename "$f")
     if [ -e "$DIR/plugins/$b" ]; then continue; fi
+    # ONLY what the peer can dlopen. The reason to delete is "the new peer
+    # loads it", and the peer loads shared libraries - so anything else in
+    # this directory is not that hazard and is not ours to remove. The
+    # viewer's own bootstrap wipes the whole directory, so nothing here is
+    # meant to be kept; that is a reason not to widen this, not a licence.
+    case "$b" in
+      *.so|*.so.*|*.dll|*.dylib) ;;
+      *) continue ;;
+    esac
     rm -f "$f"
     echo "~/.viewer/plugins/$b  removed (not in this build)"
   done
