@@ -1091,7 +1091,13 @@ static bool openServed(ServedFile& n, const std::string& path, std::string& err,
     // asked, so it is refused - the mirror of openPicture's declared-reading
     // refusal, and for the identical reason.
     if (!isNpySuffix(path) && imagefile::isHeaderless(path)) {
-        if (!rw) { err = imagefile::peerRefusal(path); return false; }
+        // THE PEER's half of the protocol-11 refusal. Said with RefusedBy::Peer
+        // because only the peer can know which half applies: the client that
+        // sent this request did not put a recipe in it, so the sentence names
+        // the build at the other end rather than the doors of this one (which
+        // a peer has none of). One function, two sentences -
+        // core/imagefile.h RefusedBy.
+        if (!rw) { err = imagefile::peerRefusal(path, imagefile::RefusedBy::Peer); return false; }
         if (read != NR_NATIVE) {
             err = "a declared .npy reading does not apply to a headerless file";
             return false;

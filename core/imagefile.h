@@ -163,11 +163,26 @@ const std::vector<Backend>& backends();
 // bytes yet. What actually decodes is still decided by the content (`decode`).
 bool peerServes(const std::string& path);
 
+// WHICH END is refusing. For every format but a headerless one the answer is
+// the same sentence either way - "this build has no decoder for it" is a fact
+// about the build, and both ends run this one. A headerless file is the
+// exception, and the reason is protocol 11: the wire CARRIES a recipe, so the
+// only thing that can be missing is a recipe in THIS request, and what to do
+// about that depends on who noticed. The peer noticing means the client that
+// called it is too old; the client noticing means the operator has not said
+// the shape yet, and the ways to say it are this build's own doors.
+//
+// One enum rather than two functions, so the two sentences are built in one
+// place and cannot drift into two spellings of one fact (#148's rule applied
+// to a refusal). imagefile.cpp is the ONLY translation unit both binaries
+// compile, which is why it holds both.
+enum class RefusedBy { Client, Peer };
+
 // Why the peer will not serve it, as a sentence; "" when it will. The reason a
 // format is refused over the link is not always the reason it is refused here -
 // vendor RAW is READ on this machine - so the sentence is built where the
 // column that knows lives, in the register of docs/features/adapters/input-adapters.md §3.2.
-std::string peerRefusal(const std::string& path);
+std::string peerRefusal(const std::string& path, RefusedBy by = RefusedBy::Client);
 
 // Which format the NAME claims (extension, lower-cased). Null = not one of ours,
 // and the caller falls through to whatever it did before. This is dispatch, not

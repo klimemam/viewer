@@ -713,7 +713,12 @@ bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
     const size_t slash = path.find_last_of("/\\");
     const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
     if (peerVersion_ < 11) { err = rp::rawTooOldText(peerVersion_, name); return false; }
-    if (!rw) { err = imagefile::peerRefusal(path); return false; }
+    // ...and THIS BUILD's half. RefusedBy::Client, explicitly: what is left
+    // here after every interactive door learned to ask (openRemoteRawDeclared)
+    // is the scripted roads - the command line, a session line with no
+    // geometry, a selftest - so the way out this sentence names is --raw-*
+    // and the doors that bind a recipe for this session.
+    if (!rw) { err = imagefile::peerRefusal(path, imagefile::RefusedBy::Client); return false; }
     return true;
 }
 
