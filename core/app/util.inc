@@ -39,9 +39,6 @@ static double nowSec() {
     static const auto t0 = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
-// Whole-file reads, counted so a selftest can assert that opening one file
-// reads it ONCE. loadNpy used to read a 252 MB stack 120 times and nothing
-// noticed, because "it works, slowly" looks exactly like "it works".
 // ---- is a RELOAD of these pixels IN FLIGHT? (the 2026-09-28 report) --------
 // nullptr = no. A sentence = yes, and the sentence is what to refuse with.
 //
@@ -69,6 +66,15 @@ static const char* reloadInFlightFor(int seqId, uint64_t uid) {
         if (uid != 0 && j.oneUid == uid)
             return "this frame is being re-read - wait for it, or press Stop on "
                    "the Files row";
+        // ...and a STACK is asked about too, because a one-frame reload of one
+        // of its members is still a reload of pixels a detrend would read
+        // (review): the job names a document, so the stack it belongs to is
+        // found through that document rather than carried on the job.
+        if (seqId != 0)
+            for (const auto& q : app.images)
+                if (q->uid == j.oneUid && q->seqId == seqId)
+                    return "a frame of this stack is being re-read - wait for it, "
+                           "or press Stop on the Files row";
         return nullptr;
     }
     if (seqId != 0 && j.seqId == seqId)
@@ -77,6 +83,11 @@ static const char* reloadInFlightFor(int seqId, uint64_t uid) {
     return nullptr;
 }
 
+// Whole-file reads, counted so a selftest can assert that opening one file
+// reads it ONCE. loadNpy used to read a 252 MB stack 120 times and nothing
+// noticed, because "it works, slowly" looks exactly like "it works".
+// (--asyncopen-selftest R2 is the same assertion for a RELOAD: three
+// memberships of one file are one read of it.)
 static long long g_fileReads = 0;
 
 static bool readFileBytes(const std::string& utf8Path, std::vector<uint8_t>& out) {

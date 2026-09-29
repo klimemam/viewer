@@ -134,6 +134,11 @@ static std::vector<FilesStackRowProbe> g_filesStackRowProbe;
 // ...and the last row's tooltip text, set by rowWithMeta as it builds one. The
 // stack row reads it back into its own probe entry (review P3-19).
 static std::string g_filesRowTipProbe;
+// ...and the panel's BUSY row while a reload is in flight ("reloading <stack>:
+// 3 / 12 - 1.2 s"), recorded where it is drawn for the same reason. "" = no
+// reload was running on the last draw, which is itself what V29 asserts once
+// the job has landed.
+static std::string g_filesBusyRowProbe;
 
 // §4: the share mark. U+29C9 (two joined squares) when the atlas has it - the
 // CJK fonts jpFontPath picks vary here - else the plain word, which is longer
@@ -344,6 +349,7 @@ static std::string g_filesPinProbe;
 static void drawFileList() {
     g_filesBadgeProbe.clear();
     g_filesStackRowProbe.clear();
+    g_filesBusyRowProbe.clear();
     // No Open / Close buttons here (2026-08-03). Browse is how a file is found
     // and opened, and it reaches remote machines as well, which the OS dialog
     // never did. Close was the worse of the two: it silently escalated from the
@@ -414,7 +420,11 @@ static void drawFileList() {
     // a true fraction where an open can only name a phase (openJobPhase says
     // why) - and what Stop MEANS, which is the tooltip's whole subject.
     if (app.reloadJob) {
-        ImGui::TextDisabled("%s", reloadJobRowText(*app.reloadJob).c_str());
+        // ...recorded as drawn, for the row tooltip's reason (review, item 5):
+        // a test that called reloadJobRowText for itself would assert the
+        // function and not the panel.
+        g_filesBusyRowProbe = reloadJobRowText(*app.reloadJob);
+        ImGui::TextDisabled("%s", g_filesBusyRowProbe.c_str());
         if (!app.reloadQueue.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("(+%d stack%s)", (int)app.reloadQueue.size(),
@@ -885,21 +895,16 @@ static void drawFileList() {
             // confused with. Its provenance note takes the path's place, which
             // is what the note is for. The share sentence (§4) follows either
             // lead: whose pixels these also are is true of computed frames too.
-            // What this row's tooltip WOULD say, recorded whether or not the
-            // mouse is over it (review P3-19): a test that read
-            // seqWatchTooltip() for itself was asserting a function rather than
-            // a panel, and a row that stopped calling it would have passed.
-            // Built outside the `hov` gate for exactly that reason - a probe
-            // that needs the mouse in the right place is a probe about the
-            // mouse.
-            if (d.seqId != 0) {
-                g_filesRowTipProbe = seqWatchTooltip(d.seqId);
-                const std::string rn0 = seqReloadNote(d.seqId);
-                if (!rn0.empty())
-                    g_filesRowTipProbe = rn0 +
-                        (g_filesRowTipProbe.empty() ? "" : "\n") + g_filesRowTipProbe;
-            }
-            if (hov) {
+            // THE TOOLTIP, built whether or not the mouse is over this row.
+            //
+            // Built unconditionally, and recorded as the ONE string SetTooltip
+            // is handed (review P3-19, and its second pass): a probe that
+            // re-derives the text is a probe about the deriving, so a row that
+            // stopped calling seqWatchTooltip would have gone on passing. A
+            // probe that needs the mouse in the right place is a probe about
+            // the mouse. So the row composes it once, the probe is that value,
+            // and the hover only decides whether to SHOW it.
+            {
                 std::string lead = d.src->path.empty() && !d.note.empty()
                                  ? d.note : dispPath(d.src->path);
                 // the generation statements, where the provenance is read
@@ -937,10 +942,10 @@ static void drawFileList() {
                     lead = wt + "\n" + lead;
                 if (std::string rn = seqReloadNote(d.seqId); !rn.empty())
                     lead = rn + "\n" + lead;
-                if (share.empty())
-                    ImGui::SetTooltip("%s\n%s", lead.c_str(), meta);
-                else
-                    ImGui::SetTooltip("%s\n%s\n\n%s", lead.c_str(), meta, share.c_str());
+                std::string tip = lead + "\n" + meta;
+                if (!share.empty()) tip += "\n\n" + share;
+                g_filesRowTipProbe = tip;      // the value, not a second derivation
+                if (hov) ImGui::SetTooltip("%s", tip.c_str());
             }
             return clicked;
         };

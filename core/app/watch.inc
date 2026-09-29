@@ -816,18 +816,22 @@ static void watchFrameAxisGrow(int seqId, const WatchAxisPlan& p) {
 //   was that §6's rebuild could not reach a peer's stack at all, so an automatic
 //   reload would have refused every member and latched #56 onto a stack where
 //   nothing failed. That is spent: the rebuild reaches it, watchReloadOffered
-//   says yes, and the button below the amber line works.
+//   says yes, and the "Reload from disk" the row's menu offers works.
 //
 //   What has NOT changed is what the act COSTS, and that is the whole of the
 //   argument now. A local reload is N file reads on a disk that answers or
 //   errors in milliseconds. A remote one is META + TILE per member on a link
-//   that can drop, read to completion on the UI thread with nothing repainting
-//   (openRemote's UiThreadStall says so in as many words) - so a stack of forty
-//   resident frames is forty round trips and a folder's worth of pixels, with
+//   that can drop - so a stack of forty resident frames is forty round trips
+//   and a folder's worth of pixels, with
 //   nobody's click behind it, repeatable every time the peer's folder settles.
 //   Waiting it out is not available either: watchAutoBusy waits for work the
 //   frame loop is already keeping frames coming for, and a blocked ssh read is
 //   the opposite of that.
+//
+//   (§18 moved the READ off the UI thread, so the "nothing repaints" half of
+//   this argument is spent - see §18.3. The bandwidth and the peer's load are
+//   not, which is why the term stays and why dropping it is a separate
+//   judgment.)
 //
 //   So: the gesture reaches the peer, the AUTOMATON does not. That is one term
 //   in this predicate rather than a second copy of §12/§13's rules - what runs
@@ -859,8 +863,8 @@ static const char* watchAutoRefusal(int seqId) {
 // Is something IN FLIGHT that this reload must not run underneath? nullptr = no.
 //
 // THE DECISION (§15): an automatic reload WAITS. It does not cancel the work and
-// it does not run beside it - the finding stays on the row, the amber line stays
-// up, and the reload happens on a later frame. Silently swapping the pixels
+// it does not run beside it - the finding stays on the row, its token stays up,
+// and the reload happens on a later frame. Silently swapping the pixels
 // under a running measurement is the one failure this stage could introduce that
 // no later reading of the screen would ever reveal, because the number would
 // look perfectly ordinary.
@@ -904,7 +908,10 @@ static const char* watchAutoBusy(int seqId) {
     // second stack every frame while the first one was still re-reading, and
     // the queue in front of the job would answer "already asked" - correct, but
     // silently, where the line says WHY it is holding off.
-    if (app.reloadJob) return "a reload of another stack is still running";
+    if (app.reloadJob)
+        return app.reloadJob->seqId == seqId
+                   ? "this stack's own reload is still running"
+                   : "a reload of another stack is still running";
     if (app.seqRunning || seqReadyPending() || !app.seqQueue.empty())
         return "frames are still loading";
     // A drag is a measurement being AIMED. temporal_model.inc already holds off
@@ -968,8 +975,10 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
     const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
     std::string msg = summary;
     // §12's frame-axis half, SECOND HALF (board row 222). The plan was decided
-    // and its departures applied BEFORE a byte was re-read - that is
-    // watchReloadNow below - and the arrivals belong after, in §6's own order.
+    // and its departures applied BEFORE a byte was re-read - in startStackReload
+    // for the worker's door and in reloadStackSync for the synchronous one, at
+    // the point the read begins either way (review P1-2) - and the arrivals
+    // belong after, in §6's own order.
     // The plan is HANDED to this function rather than re-taken here for the
     // reason the whole of the 2026-09-28 change is about: the re-read happens on
     // a worker now, so "before" and "after" are no longer two halves of one

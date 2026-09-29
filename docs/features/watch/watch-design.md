@@ -1173,7 +1173,7 @@ frame メニューの Reload、§9 の `watchAutoDrain`) が `reloadSource` を
 1フレーム = 1 FrameSource** なので、`reloadStackFromDisk` はその全部を
 **メンバーごとに繰り返す**。480 MB の .npy を10フレームで開いた stack の
 Reload は、**ファイル全読み10回と decode 20回**、その間ずっと再描画なしで
-**実測 3003 ms**。构成も数値も §18.2b の表の1行目と同じものを使っています
+**実測 3003 ms**。構成も数値も §18.2b の表の1行目と同じものを使っています
 —— 「実測」と書いて表に無い数字を出していたのがレビューで指摘された点です。
 
 これは issue #232 stage 2 が open について直した病理 (V22f) そのもので、
@@ -1295,17 +1295,21 @@ before/after どちらの timeline にも、Reload の前の open の位置に
   消えたりするボタンは breadcrumb-as-buttons の失敗の再演である。
 
 受入れは**描いたものを測る**形にした (`g_filesStackRowProbe`):
-`--verify-selftest` V29 は 1 stack のブロックの**高さ (px)** を記録し、
-finding を載せても、§9 の note を載せても、#56 の失敗を載せても
-**高さが変わらない** ことを assert する。行を戻す退行は、その行に何と
-書いてあっても数値を動かす。印そのものは `--watch-selftest` W18d-g / W20c-d と
+`--verify-selftest` V29 は 1 stack のブロックの**高さ (px)**、描かれた
+ラベル、**琥珀のバー**、そして行が実際に `SetTooltip` に渡した文字列を
+記録し、**5状態**で assert する —— 静かな stack / finding を載せた / §9 の note を
+載せた / #56 の失敗を載せた / **reload 飛行中**。いずれでも**高さが
+変わらない** (実測 29.0 px)。行を戻す退行は、その行に何と書いてあっても
+数値を動かす。バーは「#56 の赤枠の下でも残る」と「全フレームが読めた
+Reload 1回で消える」の両方を assert する (§5 が規則として書いていること)。
+印そのものは `--watch-selftest` W18d-g / W20c-d / W42d-e と
 `--rwatch-selftest` R6f-g が文字列で押さえる (`findingText` の規律を1段上へ)。
 
 ### 18.5 レビューで入った裁定 (2026-09-29、4観点 x 反証3名)
 
 実装の形が決まったものだけを残す。
 
-**(a) フォールドは黄って捨てない。** 同じ stack への2回目のジェスチャは
+**(a) フォールドは黙って捨てない。** 同じ stack への2回目のジェスチャは
 飛行中の job にフォールドされる (1 stack 1本)。しかしその読みは要求より
 **前に始まっている**ので、要求に対する答えになっていない。「あなたの要求は
 既に読まれた」と言えるのは、その読みが要求より**後に**始まったときだけ。
@@ -1319,13 +1323,13 @@ finding を載せても、§9 の note を載せても、#56 の失敗を載せ�
 されたジェスチャが drop だけ適用して arrivals と帳簿を失う」経路が**構造的に**
 消える (job がなければ plan も drop もない)。queue 項も plan を持ち運ばない ——
 持っていたところで job 開始時には古い。fail-first で赤を見てから直した:
-`--asyncopen-selftest` **R9e** (飛行中に F を 3→、5→2 へ書き換えてから2回目を打つ)。
+`--asyncopen-selftest` **R9e** (飛行中に F を 3→5 と 5→2 へ書き換えてから2回目を打つ)。
 
 **(c) 飛行中の in-place 画素操作は断る。** reload が飛行中の stack への
 crop / restore full / detrend は**ジェスチャの時点で**断る
 (`reloadInFlightFor`)。理由は Files 行の Stop と同じ語彙で言う:
 「this stack is being re-read - wait for it, or press Stop on the Files row」。
-「着地で refuse する」案は、ユーザーが頑んだ作業を見えない形で捨てるので
+「着地で refuse する」案は、ユーザーが頼んだ作業を見えない形で捨てるので
 採らない。`cropInPlace` が decimated な remote tile を名指しで断るのと同じ形です。
 
 **(d) Stop が1フレームも着地していないときの文を固定した。** 挙動は変えない
@@ -1335,11 +1339,11 @@ crop / restore full / detrend は**ジェスチャの時点で**断る
 
 **(e) worker は app を一切読まない。** `app.remoteExe` / `app.exePath` は UI
 スレッドが書く std::string なので、worker からの直読みは古い値ではなく
-**data race** 。rfEnqueue が「起動時に凍結する」と書いているのと同じ形で、
+**data race**。rfEnqueue が「起動時に凍結する」と書いているのと同じ形で、
 job 生成時に凍結する。凍結するのは**2つの入力**であって解決済みの答えではない:
 答えは host に依存し (ensureUiSession の 1 式)、host は resolver の引数だからです。
 
-**(f) 琥珀のバーも行の高さも律になった。** `g_filesStackRowProbe` に `bar` と
+**(f) 琥珀のバーも行の高さも規則になった。** `g_filesStackRowProbe` に `bar` と
 `tip` (行が実際に組んだツールチップ) を追加し、V29 は**5状態**で高さと
 バーを assert する。第5状態は**reload 飛行中** —— 「reloading <stack>: 3 / 12」は
 自動 Reload ではクリック無しに出るので、これが行だったら発注そのものを

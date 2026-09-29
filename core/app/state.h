@@ -2902,6 +2902,17 @@ struct App {
         // the resolver's own argument (ensureUiSession's one expression); the
         // freeze is the same freeze either way and this one needs no assumption
         // about a job being one peer.
+        //
+        // The DIAL LATCH beside it does make that assumption, and says so here
+        // rather than pretending otherwise (review): reloadJobWorker dials once
+        // and then reuses that Session for every peer item without comparing
+        // host or port, so a job whose items named two different peers would
+        // send the second one's requests down the first one's link. Nothing can
+        // build such a job today - planStackMembershipRemote refuses a stack
+        // whose members are not one folder, SeqInfo carries one remoteHost, and
+        // a one-frame job has one item - so the latch is correct by what the
+        // callers are, not by what it checks. Written down because a future
+        // caller that broke it would fail somewhere else entirely.
         std::string remoteExe, exePath;
         // A gesture that arrived WHILE this job was reading. It is folded - one
         // reload of one stack at a time - but folding is not discarding: "your

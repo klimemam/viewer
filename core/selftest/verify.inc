@@ -3421,8 +3421,10 @@
             const bool flying = app.reloadJob != nullptr;
             filesFrame();
             const FilesStackRowProbe* r4 = rowOf(rs);
-            const std::string rowText = app.reloadJob
-                                      ? reloadJobRowText(*app.reloadJob) : std::string();
+            // ...as the panel DREW it (review, item 5): calling
+            // reloadJobRowText here would assert the function, which is the
+            // shape P3-19 already corrected once for the row tooltip.
+            const std::string rowText = g_filesBusyRowProbe;
             fprintf(stderr, "verifyselftest: V29k in flight: flying=%d h=%.1f "
                             "row=\"%s\"\n", (int)flying, r4 ? (double)r4->h : -1.0,
                     rowText.c_str());
@@ -3450,6 +3452,22 @@
                       !reloadInFlightFor(rs, 0),
                   "V29k4 ...and the row goes back to exactly its own height when it "
                   "lands");
+            // ...and the busy row is GONE from the panel, which is the other half
+            // of "nothing was added": a row that stayed would be exactly the
+            // thing the report is about.
+            check(g_filesBusyRowProbe.empty(),
+                  "V29k5 ...and the busy row is gone with it");
+            // THE BAR, in the fourth of the four states (review, item 4). A
+            // clean reload re-seeds Watch's baseline, so the finding - and with
+            // it the amber bar - has stopped being true. §5 states that as the
+            // one thing that clears it.
+            fprintf(stderr, "verifyselftest: V29k6 after a clean reload: bar=%d "
+                            "label=\"%s\"\n", r5 ? (int)r5->bar : -1,
+                    r5 ? r5->label.c_str() : "");
+            check(r5 && !r5->bar &&
+                      r5->label.find("(changed") == std::string::npos,
+                  "V29k6 ...and a reload in which every frame read clears the token "
+                  "AND the bar");
             g_forceAsyncOpen = flag0;          // borrowed state, given back
         }
         // ---- V26: the Messages panel past its own cap -------------------------

@@ -696,7 +696,8 @@ static int asyncOpenSelftest(const std::string& root) {
               "R5b a repeat of ONE frame folds, is remembered, and runs once more");
         check(app.images[fr[1]]->src->data[0] == relPx(4, 1),
               "R5c ...and the re-run reads the generation that was on disk when the "
-              "repeat was asked for");    }
+              "repeat was asked for");
+    }
 
     // ---- R6: ONE AT A TIME, and what a repeat of the same stack means ------
     // Two different claims, and review P1-2 separated them. A second gesture

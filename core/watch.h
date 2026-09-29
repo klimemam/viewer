@@ -286,10 +286,15 @@ inline Finding remoteFinding(const Finding& raw, const std::string& host, int me
     return f;
 }
 
-// The sentence §5 puts under the stack's header row, amber, and the ONE string
-// both the panel and the selftests read (seqReloadNote's discipline: the guard
-// asserts the wording that is drawn, not a second opinion beside it).
-// "" = nothing to say.
+// The sentence §5 says about a stack, and the ONE string both the panel and the
+// selftests read (seqReloadNote's discipline: the guard asserts the wording that
+// is drawn, not a second opinion beside it). "" = nothing to say.
+//
+// WHERE it is drawn moved on 2026-09-28 and this string did not: §5 used to put
+// it on an amber LINE under the stack's header row, and it is now the row's own
+// tooltip and its right-click menu, with seqWatchMark's one-word token on the
+// row itself (§18.4 says why). Everything below is unchanged - what a finding
+// may honestly SAY is not a question about where it is printed.
 //
 // "3 file(s) changed on disk", "1 file(s) no longer exist (w_004.npy)". ONE
 // spelling of this phrase, because §5's line and §6's Reload summary say the

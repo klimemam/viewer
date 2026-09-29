@@ -1232,8 +1232,10 @@ viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
 # rows the panel laid out actually are - the delete button's rect and the clicks
 # that have to reach it past a span-all-columns Selectable.
 #
-# V19 is that probe and it is the only group in the file that needs a context, so
-# the same split as abstats above (板 304). What the sibling moves onto the other
+# V19 is that probe, and the Files stack-row probe (V29, the 2026-09-28 report)
+# is the second and last group in the file that needs a context, so the same
+# split as abstats above (板 304). Each takes its own glGroup() gate, so adding
+# one more later costs one line and cannot silently skip. What the sibling moves onto the other
 # two runners includes V13, which measures ONE NaN fixture through both sigma_t
 # implementations (inventory P10) - the nearest thing that pair has to a test.
 viewer_selftest(verify      --verify-selftest tools/testdata/multi)

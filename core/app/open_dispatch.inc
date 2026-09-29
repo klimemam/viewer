@@ -2346,7 +2346,17 @@ static void pumpReloadJob() {
     // still saying "reloading 3 / 10" and the next stack in the queue waiting
     // behind work nobody will take. closeAll already does this; Close stack
     // reaches the same state by a different door and owes the same answer.
-    const bool gone = j->seqId != 0 && !seqInfo(j->seqId);
+    // ...and a ONE-FRAME job's subject is a document, not a stack, so it is
+    // asked about by uid (review): with `seqId != 0` alone a frame closed under
+    // its own reload went on being read for nobody, which is the very thing
+    // this term exists to stop.
+    bool gone = false;
+    if (j->seqId != 0) {
+        gone = !seqInfo(j->seqId);
+    } else if (j->oneUid != 0) {
+        gone = true;
+        for (const auto& q : app.images) if (q->uid == j->oneUid) gone = false;
+    }
     if (gone && !j->cancel.load()) j->cancel.store(true);
     const bool stop = j->cancel.load() || gone;
     if (!stop && j->landedN < j->doneCount.load()) {
@@ -2398,9 +2408,15 @@ static void pumpReloadJob() {
     // would be reached by stacks only, and the rule is about WHEN the read
     // started, which does not depend on how many items the job had.
     //
-    // It cannot ping-pong. A gesture arriving while the re-run WAITS folds into
-    // the queue entry instead of setting this flag, so one flight can add at
-    // most one re-run.
+    // It is BOUNDED, with one frame's exception worth stating. A gesture that
+    // arrives while the re-run WAITS folds into the queue entry, so one flight
+    // adds at most one re-run - except in the single frame between this landing
+    // and the next pump's startNextQueuedReload, where the queue entry exists
+    // but no job does, so a gesture there starts a job of its own and the
+    // re-run then folds into IT. One extra flight, once, on a one-frame window.
+    // Accepted (review): it is finite, it re-reads the file the user asked
+    // about, and the alternative is a second piece of bookkeeping about which
+    // request is whose.
     if (j->again && !stop) {
         if (j->oneUid != 0) {
             bool alive = false;
@@ -2429,17 +2445,6 @@ static void pumpReloadJob() {
     const std::string msg = reloadStackTail(j->seqId, j->plan, j->hadBefore, t, &failed,
                                             j->peer);
     watchReloadFinish(j->seqId, j->automatic, msg, failed, j->pinWas, j->axis);
-    // ---- and a gesture that arrived WHILE this job was reading (P1-2) -------
-    // It was folded, which is not the same as answered: the read that just
-    // finished started before that request was made. So it goes to the FRONT of
-    // the queue and runs once more, through the one door that takes a fresh plan
-    // and a fresh stat (startNextQueuedReload -> startStackReload). A Stop is
-    // the exception and needs none: Stop means stop, and it has cleared the
-    // queue already.
-    //
-    // It cannot ping-pong. A gesture arriving while the re-run WAITS folds into
-    // the queue entry instead of setting this flag, so one flight can add at
-    // most one re-run.
 }
 
 static void startNextQueuedReload() {
