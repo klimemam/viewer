@@ -794,6 +794,14 @@ static void printUsage() {
 static void parseCli(int argc, char** argv) {
     RawDialog d;                       // accumulates --raw-* options for positional raw files
     bool rawReady = false, cliQuad = false;
+    // --raw-size on its own, tracked apart from rawReady. GEOMETRY is the one
+    // thing that cannot be defaulted for a headerless file - dtype and
+    // interpretation have the same defaults the dialog opens with - so a url
+    // given a size IS a complete declaration and may cross the link, while the
+    // LOCAL branch keeps its old meaning (rawReady) and still raises the dialog.
+    // The two are separate because they answer different questions: "is there
+    // enough here to decode" and "did the operator state a shape at all".
+    bool rawSizeGiven = false;
     bool haveZoom = false, haveCenter = false;
     float zoom = 1, cx = 0, cy = 0;
     int cliCompare = -1;
@@ -827,6 +835,7 @@ static void parseCli(int argc, char** argv) {
             if (x != std::string::npos) {
                 d.w = std::clamp(atoi(v.substr(0, x).c_str()), 1, 32768);
                 d.h = std::clamp(atoi(v.substr(x + 1).c_str()), 1, 32768);
+                rawSizeGiven = true;
             }
         } else if (a == "--raw-crop") {            // x,y,WxH
             std::string v = next();
@@ -1088,7 +1097,21 @@ static void parseCli(int argc, char** argv) {
                            // line is for the files that carry none
                            imagefile::forPath(a) != nullptr;
             const bool isUrl = hasUrlScheme(low);
-            if (!special && rawReady && isUrl) {
+            // A headerless url with NO declaration at all. Refused BY NAME,
+            // here, rather than left to the door: the command line is the
+            // non-interactive road, and 5.5's judgment was that naming the
+            // flags beats raising a dialog nobody is sitting in front of. The
+            // Browse door raises one (openRemoteRawDeclared), which is what
+            // makes this refusal cheap to obey rather than a dead end - 10's
+            // revisit key for this row, now met.
+            if (!special && isUrl && !rawReady && !rawSizeGiven &&
+                imagefile::isHeaderless(a) && isPeerUrl(a)) {
+                fprintf(stderr, "%s: a headerless file carries no header to state its "
+                        "shape, and this command line stated none\n"
+                        "  state the geometry with --raw-size WxH (and --raw-dtype / "
+                        "--raw-interp when it is not u8 gray), or open it from the "
+                        "Browse panel - that door asks\n", a.c_str());
+            } else if (!special && (rawReady || rawSizeGiven) && isUrl) {
                 // A headerless file on a PEER, declared on the command line.
                 // The same six numbers the local branch below would decode
                 // with, put on the wire (protocol 11) instead of applied here:
