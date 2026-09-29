@@ -3122,6 +3122,16 @@ struct App {
         // box hit the cache and do nothing until some other condition - moving
         // the ROI, stepping a frame - happened to change too.
         bool allReq = false;
+        // Why there is no profile at all, in one line, or empty when there is
+        // one. It exists for the decimated remote PREVIEW of a mosaic: the rows
+        // and columns a preview carries are every Nth of the sensor's, so the
+        // mosaic phase is not preserved and cfaChannelAt over preview
+        // coordinates names a plane the pixel is not from. Every plane's
+        // profile would be some other plane's values under this plane's name.
+        // Said, in the wording computeProfileNoise already uses for the same
+        // cause - and NOT pooled into one dense series, which would invite
+        // reading shading off a curve whose phase has been destroyed.
+        std::string unavail;
     } proj[2];                        // 0 = A, 1 = B (compare)
     std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
     // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.

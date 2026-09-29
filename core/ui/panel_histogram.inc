@@ -826,9 +826,26 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // out-of-range write, on a checkbox, on every non-CFA image with more than
     // one plane - the viewer died the moment it was ticked. CFA hid it because
     // there nSeries IS 4 and the count is accidentally the right answer.
+    // ...and whether there is a profile to compute AT ALL. A decimated remote
+    // preview of a mosaic carries every Nth row and column of the sensor, so
+    // the mosaic phase is gone: cfaChannelAt over preview coordinates would
+    // name a plane the pixel is not from, and every plane's curve would be
+    // another plane's values under this plane's name. Refused in the wording
+    // computeProfileNoise already uses for the same cause, rather than pooled
+    // into one dense series - a curve whose phase has been destroyed is not
+    // something to read shading off, and an empty plot with a reason is the
+    // better of the two. The real planes arrive with the full-resolution frame.
+    P.unavail.clear();
+    if (cfa && im->src->remoteStep > 1)
+        P.unavail = "full-resolution remote pixels required: this is a decimated "
+                    "preview, and it does not keep the mosaic phase - no plane's "
+                    "profile can be told from the others'. The planes appear when "
+                    "the full-resolution frame lands.";
     int fillSlot[5], nAcc = 0;
-    for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
-    if (P.allRow) fillSlot[nAcc++] = 4;
+    if (P.unavail.empty()) {
+        for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
+        if (P.allRow) fillSlot[nAcc++] = 4;
+    }
     // ...and the list itself goes into the state, so the panel's readers walk
     // the slots the pass filled instead of counting them (ProjState::fill).
     for (int i = 0; i < nAcc; i++) P.fill[i] = fillSlot[i];
@@ -952,12 +969,15 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     };
     // Each step lands on a mosaic cell and takes ALL of its lines, so every
     // plane is sampled the same number of times whatever the stride.
-    for (int y = 0; y < rh; y += step)          // H profile: every column
-        for (int dy = 0; dy < cell && y + dy < rh; dy++)
-            for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
-    for (int y = 0; y < rh; y++)                // V profile: every row
-        for (int x = 0; x < rw; x += step)
-            for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
+    if (nAcc) {           // ...and no slots to fill means no pass: accumulate
+                          // would write into the vectors it never sized
+        for (int y = 0; y < rh; y += step)          // H profile: every column
+            for (int dy = 0; dy < cell && y + dy < rh; dy++)
+                for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
+        for (int y = 0; y < rh; y++)                // V profile: every row
+            for (int x = 0; x < rw; x += step)
+                for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
+    }
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
     // The one place the profile narrows to float: the mean is DIVIDED in double
     // and rounded once, on its way into the vector the plot draws. One rounding
@@ -1003,6 +1023,19 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
             App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
             st = {};
+            // THE POOLED ROW HAS NO PROFILE SIGMA ON A MOSAIC. Pooling the
+            // planes puts their LEVEL DIFFERENCES into every column mean, so
+            // the sigma of those means is a period-2 (period-4 for quad) comb
+            // of the inter-plane offsets wearing column FPN's name - and it is
+            // large, which makes it the most quotable wrong number on the
+            // panel. Left invalid, so the table and the TSV print "-" and the
+            // status column says "unavailable: pooled planes", which is the
+            // wording HFPN/RN already uses for exactly this cause.
+            //
+            // The pooled PROFILE is still computed and still drawn: it is a
+            // dense mean level across the columns and means what it says. It is
+            // the sigma OF it, and its p-p, that are not row/column FPN.
+            if (cfa && s == 4) continue;
             double sum = 0, sum2 = 0;
             double mn = DBL_MAX, mx = -DBL_MAX;
             size_t n = 0;
@@ -1012,7 +1045,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
                 mn = std::min(mn, (double)v); mx = std::max(mx, (double)v);
                 n++;
             }
-            if (!n) continue;
+            // n < 2, not n == 0: with one sample the variance below is 0 by
+            // construction and `valid` would publish that exact zero as a
+            // measurement. One column of a Bayer plane - a 2-wide ROI, or a
+            // 3x3 one - then reported sigma_col = 0, which reads as a perfectly
+            // uniform sensor. A single sample has a mean and no spread, and
+            // this structure carries both together, so neither is published.
+            if (n < 2) continue;
             st.mean = sum / n;
             // ddof=1 (docs/features/analysis/stats-taxonomy.md §8 判断2). These are the row and column
             // MEANS, not the pixels: sigma of them is A and B of the flat-field

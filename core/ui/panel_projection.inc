@@ -197,6 +197,20 @@ static void drawPanelProjection() {
                                             P.rw, P.rh);
     }
 
+    // ---- no profile at all, and WHY (ProjState::unavail) ------------------
+    // The decimated remote preview of a mosaic: the phase is gone, so there is
+    // nothing to draw that would not be one plane's values under another's
+    // name. Said and stopped, rather than drawn empty with a full table of
+    // dashes under it - the reader's next question ("is my sensor broken or is
+    // this the preview?") is answered by the sentence and by nothing else.
+    if (!P.unavail.empty()) {
+        g_projSideProbe += "unavail=A;";
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(AB_AMBER, "no profile: %s", P.unavail.c_str());
+        ImGui::PopTextWrapPos();
+        return;
+    }
+
     // value axis: a rescaling y axis makes profiles impossible to compare
     const char* ymodes[3] = { "auto", "display range", "fixed" };
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
@@ -969,6 +983,25 @@ static void drawPanelProjection() {
         ImGui::PopTextWrapPos();
     }
     if (tooNarrow) abNarrowNote();
+    {   // A side with no profile of its own - a slot showing a mosaic preview
+        // while A shows a full-resolution frame. Its curves are absent and the
+        // plane-level notice above already names them; this says why, once,
+        // with the letter, because "no curve" and "no profile" are different
+        // answers and only one of them will change on its own.
+        std::string un;
+        for (size_t i = 1; i < nSides; i++)
+            if (!sides[i].S->unavail.empty()) {
+                if (!un.empty()) un += ", ";
+                un += sides[i].name;
+            }
+        if (!un.empty()) {
+            g_projSideProbe += "unavail=" + un + ";";
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(AB_AMBER, "slot %s: no profile - %s", un.c_str(),
+                               sides[1].S->unavail.c_str());
+            ImGui::PopTextWrapPos();
+        }
+    }
     {   // What the plots took and what they left, as the panel says it - the
         // silence issue #60 caught here was slots getting table rows while the
         // plots drew A and B and said NOTHING about the letters they left off.
@@ -1235,6 +1268,17 @@ static void drawPanelProjection() {
     // panel, hiding the single-frame limitation exactly where numbers are read.
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
+    if (cfa && P.allRow)
+        // The pooled row's mean is a level and means what it says; its sigma of
+        // the row/column MEANS is the inter-plane level difference - a comb with
+        // the mosaic's period - and not row or column FPN. Left as "-" in the
+        // table and in the TSV, and said here, in the same words HFPN/RN uses
+        // for the same cause, because a dash with no sentence reads as a bug.
+        ImGui::TextWrapped("\"all\": sigma (row), sigma (col) and their p-p are "
+                           "unavailable: pooled planes. Mixing the mosaic's planes puts "
+                           "their level difference into every row and column mean, so "
+                           "those sigmas would be that difference - not FPN. The mean "
+                           "and the frame sigma are over the pooled pixels and stand.");
     // every row the walk will draw, the "-" ones included: they take a line too.
     // The same number the height budget above reserved for, counted once.
     const int tablePlanes = tableRowsWalked;
