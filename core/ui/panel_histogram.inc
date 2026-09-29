@@ -796,11 +796,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     }
     if (P.uid == im->uid && P.dataRev == im->dataRev && P.mode == app.projMode &&
         P.cfa == im->cfa && P.cfaPattern == im->cfaPattern &&
+        P.allReq == app.projAllRow &&
         P.rx == rx && P.ry == ry && P.rw == rw && P.rh == rh)
         return;
     if (app.annBusy && P.uid == im->uid) return;   // mid-drag: keep the last profile
     P.img = im; P.uid = im->uid; P.dataRev = im->dataRev;
     P.mode = app.projMode; P.cfa = im->cfa; P.cfaPattern = im->cfaPattern;
+    P.allReq = app.projAllRow;     // the ASK, keyed on above; allRow is the answer
     P.rx = rx; P.ry = ry; P.rw = rw; P.rh = rh; P.roiUsed = roiUsed;
     // Always a mean-based decomposition of this frame/ROI, independent of the
     // plot's reduce mode. Do not combine the orthogonally strided plot samples.
@@ -827,6 +829,10 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     int fillSlot[5], nAcc = 0;
     for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
     if (P.allRow) fillSlot[nAcc++] = 4;
+    // ...and the list itself goes into the state, so the panel's readers walk
+    // the slots the pass filled instead of counting them (ProjState::fill).
+    for (int i = 0; i < nAcc; i++) P.fill[i] = fillSlot[i];
+    P.nFill = nAcc;
 
     // ...and everything below is indexed BY SLOT, never by position, so the
     // five-slot arrays and the loops cannot drift apart again.
@@ -851,7 +857,19 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         hN[s].assign(rw, 0);
         vN[s].assign(rh, 0);
     }
-    if (!P.allRow) { P.h[4].clear(); P.v[4].clear(); P.fStat[4] = {}; P.hStat[4] = {}; P.vStat[4] = {}; }
+    {   // EVERY slot the pass did not fill is cleared, not just slot 4. An
+        // unfilled slot keeps the PREVIOUS document's profile and statistics
+        // under this document's names: open a Bayer frame, then a 3-channel
+        // one, and slot 3 still held the mosaic's B plane while the readers
+        // that counted rather than walked went looking for it as "ch3".
+        bool filled[5] = {};
+        for (int i = 0; i < nAcc; i++) filled[fillSlot[i]] = true;
+        for (int s = 0; s < 5; s++)
+            if (!filled[s]) {
+                P.h[s].clear(); P.v[s].clear();
+                P.fStat[s] = {}; P.hStat[s] = {}; P.vStat[s] = {};
+            }
+    }
     // Region moments, gathered from the SAME samples the H pass visits (every
     // column, every step-th row). So the region statistics and the H profile
     // describe one and the same set of pixels, and - every column of a

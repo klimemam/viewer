@@ -3105,6 +3105,23 @@ struct App {
         // every position, which is what the panel did before.
         int cell = 1;
         uint32_t hPhase[5] = {}, vPhase[5] = {};
+        // WHICH SLOTS the pass filled, not how many. The pooled row is slot 4
+        // BY NAME whatever nSeries is - that is the whole point of it not being
+        // a fifth plane - so a count is only ever right when nSeries happens to
+        // be 4. Every reader that walked `nSeries + allRow` therefore read slot
+        // 3 on a 3-plane RGB image with "all" ticked: "ch3", a slot this pass
+        // never fills and that a previously open mosaic leaves its B plane in.
+        // recomputeProjectionIfNeeded already had to learn this once (the
+        // out-of-range write that killed the viewer on a checkbox); the readers
+        // now walk the same list instead of re-deriving it.
+        int fill[5] = {};
+        int nFill = 0;
+        // ...and the "all" checkbox AS ASKED FOR, which is what the cache has to
+        // be keyed on. allRow is the answer (it is false on a single-plane
+        // image whatever the checkbox says), so keying on it let a tick of the
+        // box hit the cache and do nothing until some other condition - moving
+        // the ROI, stepping a frame - happened to change too.
+        bool allReq = false;
     } proj[2];                        // 0 = A, 1 = B (compare)
     std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
     // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.

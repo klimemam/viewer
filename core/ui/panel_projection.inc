@@ -611,13 +611,42 @@ static void drawPanelProjection() {
         // side's numbers are.
         if (!which.empty() && which[0] == 0) {
             const std::vector<float>* srcs = horizontal ? P.h : P.v;
-            const int nS = P.nSeries + (P.allRow ? 1 : 0);
-            for (int k = 0; k < nS && k < 5; k++) {
-                const PlotSpread sp = plotSpreadIn({}, srcs[k], pr.xmin, pr.xmax);
+            const int origin0 = horizontal ? P.rx : P.ry;
+            // BY SLOT, never by count. The pooled row is slot 4 whatever
+            // nSeries is - that is the whole point of it not being a fifth
+            // plane - so `k < nSeries + allRow` read slot 3 on a 3-plane RGB
+            // image with "all" ticked: "ch3", a vector this pass never fills
+            // and that a previously open mosaic can have left data in. The
+            // pooled line never appeared, and a stale plane could appear under
+            // that name. Exactly the count/slot confusion
+            // recomputeProjectionIfNeeded carries a paragraph about - which is
+            // why the list it built is now in the state and walked from here
+            // (ProjState::fill) rather than re-derived.
+            int nSpread = 0;
+            for (int k = 0; k < P.nFill && k < 5; k++) {
+                const int sl = P.fill[k];
+                // ...and the window in the PROFILE'S OWN index space. pr.xmin
+                // is a column number - rx..rx+rw-1 under an ROI - while the
+                // series is indexed from 0, so an ROI at x=1000 put every
+                // sample outside the window and the line said NOTHING. It
+                // failed silently, because a PlotSpread that is not ok draws
+                // nothing: measured spreadH=0 against spreadV=4 on the same
+                // frame, the V axis being at origin 0 and therefore accidentally
+                // right. (Not an xs vector: that is one allocation per series
+                // per plot per frame for a window this maps exactly.)
+                PlotSpread sp = plotSpreadIn({}, srcs[sl], pr.xmin - (float)origin0,
+                                             pr.xmax - (float)origin0);
                 if (!sp.ok) continue;
-                const char* nm = P.seriesNames[k] ? P.seriesNames[k] : "value";
+                sp.x0 = pr.xmin; sp.x1 = pr.xmax;   // ...spoken as the plot's axis
+                const char* nm = P.seriesNames[sl] ? P.seriesNames[sl] : "value";
                 plotSpreadLine(sp, nm);
+                nSpread++;
             }
+            // how many of them SPOKE, in the probe's own grammar: a spread line
+            // that quietly declines to appear is the failure mode this number
+            // exists to catch
+            g_projSideProbe += std::string(horizontal ? "spreadH=" : "spreadV=") +
+                               std::to_string(nSpread) + ";";
         }
         if (overlaid) {
             // ...and the fixed A/B row only when B is really the second side:
