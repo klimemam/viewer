@@ -27,6 +27,71 @@ win64\viewer.exe
 
 中身: `win64/viewer.exe`(GUI)+ `win64/plugins/`、`linux-x64/viewer-serve`(サーバに置く方)ほか。
 
+### Linux 配布物が動く範囲(要求 glibc)
+
+ホストの glibc は `ldd --version` で分かります。**GUI と peer で floor が違います**:
+
+| 配布物 | 置く場所 | 要求 glibc | 動く distro |
+|---|---|---|---|
+| `linux-x64/viewer`(GUI) | 手元の Linux PC | **2.31** | Ubuntu 20.04 以降 / Debian 11 以降 / RHEL・Rocky 9 以降 |
+| `linux-x64/viewer-serve` + `linux-x64/plugins/`(peer) | データのあるサーバ | **2.17** | **CentOS 7・RHEL 7 以降** / Ubuntu 16.04 以降 / Debian 9 以降 |
+
+peer の方だけ古い distro まで下げてあるのは、**計算サーバは手元の PC より古い**からです。
+CI は peer(`viewer-serve` と `plugins/*.so`)を manylinux2014 コンテナ(CentOS 7)で、
+GUI を Ubuntu 20.04 コンテナで組み、それぞれの要求 glibc を毎回 assert しています。
+GUI は GLFW / X11 / Wayland のヘッダが要るので CentOS 7 では組めません。
+
+要求より古いホストに置くと `version 'GLIBC_2.17' not found` で起動しません(peer の場合。
+GUI なら `GLIBC_2.31`)。**どちらの版が足りないかは機械が言います** —— `./update.sh` は
+更新後に peer を起動して、失敗したらこの 3 行を出します(リモート接続時の自動導入も
+同じ 1 行目を返します。[issue #268](https://github.com/klimemam/viewer/issues/268)):
+
+```
+~/.viewer/viewer-serve needs GLIBC_2.17 but this host has ldd (GNU libc) 2.12
+  /home/u/.viewer/viewer-serve: /lib64/libm.so.6: version `GLIBC_2.17' not found
+  the files ARE updated; this build cannot run here. Report that line.
+```
+
+この **`needs ...` の行は glibc が本当の原因のときだけ**出ます。起動しない理由が
+別にあるとき —— `$HOME` が `noexec`、mode 644、別 arch のバイナリ(x86_64 のビルドを
+aarch64 のホストに置いた)、途中で切れたファイル —— は版数の話にすり替えず、
+ローダ自身の言葉と `this build is for x86_64, this host is aarch64` のような
+事実をそのまま出します。**報告は出た行をそのまま貼ってください。**
+
+### `./update.sh` が更新するのは**このフォルダ**で、`~/.viewer/` ではない
+
+**viewer が起動する peer は必ず `~/.viewer/viewer-serve` です。** このフォルダの
+`linux-x64/viewer-serve` ではありません。`./update.sh` はこの checkout を
+`git fetch` + `reset --hard` するだけなので、**データのあるホストが同時に
+`update.sh` を走らせるマシンでもある**とき、2 つは別のファイルとして食い違います ——
+update は成功し、viewer は古い peer を起動し続けます([#268](https://github.com/klimemam/viewer/issues/268))。
+
+```bash
+./update.sh          # このフォルダを最新にする
+./update.sh --peer   # ...を ~/.viewer/viewer-serve と ~/.viewer/plugins/ へ入れる
+```
+
+`--peer` は**いま手元の木にあるもの**を入れます(fetch はしません)。つまり
+`./update.sh` の**あとに走らせる 2 回目**で、`./update.sh` に足すフラグではありません。
+だから `./update.sh --fetch binaries-pr64 && ./update.sh --peer` でその branch の peer を
+試せます。差があるときは `./update.sh` が自分で `--peer` を促します。
+
+`~/.viewer/plugins/` は**出荷セットに揃えます** —— いまのビルドに無い `.so` は
+消し、消したものを 1 行ずつ名指しします。peer は `~/.viewer/plugins` の `.so` を
+**全部** `dlopen` するので、古い版が 1 つ残っているだけで「peer は起動するのに
+サーバ側の解析だけが落ちる」になります(実例: 以前の `analyzer_stats.so` が
+`GLIBC_2.29` を要求していた)。
+
+入れ替えたあと**再起動や再ビルドは要りません**が、**すでに接続している viewer は
+自分が起動した peer を持ち続けます** —— 接続ごとに `~/.viewer/viewer-serve` を 1 回
+exec し、リンクが生きている間そのプロセスを保持するからです。新しい peer が使われるのは
+**次の接続**から(Browse の Disconnect、`File > Update remote peer`、または viewer の再起動)。
+
+なお、**リモート越し(ssh)に使う場合はこの手順は要りません** —— viewer 側が
+`~/.viewer/viewer-serve` を `--version` で確かめ、古い/動かないなら置き換えます
+(`File > Update remote peer` でも明示的にできます)。`--peer` が要るのは
+「データのあるマシンで自分で peer を配る」ときです。
+
 **毎回コマンドラインを開くのが面倒なら、次節でショートカットを作ってください**
 (`win64\install_shortcut.cmd` をダブルクリックするだけ)。
 

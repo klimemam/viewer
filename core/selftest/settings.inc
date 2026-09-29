@@ -480,6 +480,85 @@ static int settingsSelftest() {
         check(over.find(VIEWER_REPO_URL) == std::string::npos,
               "L7 ...and the built-in URL is no longer in it");
     }
+    {
+        // L8 (#268): WHAT THE BOOTSTRAP SCRIPT CALLS "already installed".
+        //
+        // It used to be `[ -x "$d/viewer-serve" ]` - a file EXISTS - and that
+        // answer was wrong in every case that can reach the script: deployPeer
+        // only runs it after its own probe has decided the peer is missing,
+        // dead or stale, so the early-out fired on exactly the binary that had
+        // just failed. The user's report was an update that said it succeeded
+        // and left the same broken peer running.
+        //
+        // Asserted on the SCRIPT for L7's reason: the script is where the
+        // decision is actually spent, and it is a string this process can read
+        // without an ssh connection to anywhere.
+        //
+        // AND THAT IS THE SMALLER HALF OF THE CLAIM. Everything below is a test
+        // on TEXT: it can say the `--version` call and the `-ge` comparison are
+        // in the script, and it cannot say they decide correctly - that is a
+        // question about `sh`, which this process is not. The six shell states
+        // are therefore executed for real, by CI, against the string dumped at
+        // the end of this block; see .github/workflows/build.yml, "The peer
+        // bootstrap's six shell states", which runs tools/test_bootstrap_states.sh.
+        // Neither half stands alone: the text assertions name WHICH decision is
+        // meant, the shell run proves the decision.
+        //
+        // MEASURED, because a claim about how much a test catches is itself a
+        // claim. Putting the old `[ -x "$d/viewer-serve" ]` back and rebuilding
+        // turns TWO of the five assertions below red (the first two: the banned
+        // line is present, and nothing asks for a protocol number) - not three,
+        // which is what counting the suite's own trailing "FAILED" summary line
+        // gives. The other three stay green, and that is the point of the shell
+        // run: the states the old line gets WRONG are its 3rd, 4th and 5th
+        // (older peer / dies on glibc / garbage, all answered "already
+        // installed"), and no assertion on this page can see them.
+        baseline();
+        const std::string s = bootstrapScript();
+        check(s.find("[ -x \"$d/viewer-serve\" ]") == std::string::npos,
+              "L8 a file that merely EXISTS is no longer an installed peer");
+        const std::string gate = " -ge " + std::to_string((int)rp::VERSION) + " ]";
+        check(s.find("--version") != std::string::npos && s.find(gate) != std::string::npos,
+              "L8 the installed peer is asked for its protocol, and compared with ours");
+        // The early-out must also be REACHABLE, or this test passes on a script
+        // that lost its fast path. Note what that fast path is and is NOT for:
+        // deployPeer does not reach this script at all when its own step-1
+        // probe finds a current peer (it returns "peer already installed"), so
+        // the line below is not what spares a healthy host a clone on every
+        // connect. It is what spares the SECOND probe - the install path
+        // entered because step 1 saw nothing, or saw something older, and the
+        // peer turns out to be current by the time the script runs (a race, a
+        // --remote-exe pointing elsewhere, an update landed by another hand).
+        check(s.find("VIEWER_SERVE_OK; exit 0") != std::string::npos,
+              "L8 ...and a current peer still short-circuits the install");
+        // The forced form has no early-out AT ALL, and it is now a parameter
+        // rather than a line deleted from the finished text by search - the
+        // rewording above is exactly what would have broken that surgery.
+        const std::string u = updateScript();
+        check(u.find("VIEWER_SERVE_OK; exit 0") == std::string::npos,
+              "L8 the forced update keeps no early-out");
+        check(u.find("git clone") != std::string::npos &&
+              u.find("chmod +x \"$d/viewer-serve.new\"") != std::string::npos,
+              "L8 ...and is otherwise the same script (it still installs)");
+        // THE HANDOFF TO CI, on stdout (every assertion above goes to stderr,
+        // so the two never mix). It is here and not behind a --print-bootstrap
+        // flag because a flag would be a SECOND way to ask for this string, and
+        // the day one of them is reworded the other keeps answering: the whole
+        // shape of the bug this group exists for. One producer, read by the
+        // test that reasons about the text and by the job that runs it.
+        printf("VIEWER_BOOTSTRAP_BEGIN\n%sVIEWER_BOOTSTRAP_END\n", s.c_str());
+        printf("VIEWER_UPDATESCRIPT_BEGIN\n%sVIEWER_UPDATESCRIPT_END\n", u.c_str());
+        // ...and the third script this feature sends to a remote `sh`: the
+        // probe that says WHY a peer will not start. It rides along because it
+        // is the other half of #268's shell - the install decision above chose
+        // to replace the peer, this one chooses what to BLAME when the
+        // replacement still does not run, and its gate ("only say glibc when
+        // the failure text says glibc") is exactly as unprovable from C++.
+        printf("VIEWER_PROBE_BEGIN\n%sVIEWER_PROBE_END\n",
+               peerProbeScript("echo NO_PEER").c_str());
+        printf("VIEWER_PROTOCOL_VERSION %d\n", (int)rp::VERSION);
+        fflush(stdout);
+    }
 
     // ======================================================================
     //  R — THE REFUSALS

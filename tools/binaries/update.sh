@@ -1,5 +1,11 @@
 #!/bin/sh
 #   ./update.sh                       - the published build, in place
+#   ./update.sh --peer                - what is in this folder NOW into
+#                                       ~/.viewer/, which is the peer the
+#                                       VIEWER actually starts. It FETCHES
+#                                       NOTHING, so it is a second run after
+#                                       one of the forms above, never a flag
+#                                       that adds a step to them.
 #   ./update.sh --fetch binaries-pr64 - that branch's build, in place, git only
 #   ./update.sh --pr 64               - that pull request's build, into try/pr64/
 #   ./update.sh --commit a1b2c3       - that commit's build, into try/a1b2c3/
@@ -60,6 +66,173 @@ running_pids() {                 # $1 = path to a binary
   fi
 }
 
+# Did the update leave behind a peer that can actually START here?
+#
+# #268 is the reason this exists, and the report was the whole of it: "remote
+# の update ができない。glibc で怒られます." The update had SUCCEEDED - git
+# replaced every file without complaint - and the binary it left could not run
+# on that host. Nothing anywhere said WHICH glibc the binary wanted or which
+# one the machine had, so the answer needed a round trip to ask, and the next
+# report would have needed another one.
+#
+# viewer-serve is the one that gets probed because it is the one that HAS a
+# flag for it: --version prints its protocol number and exits. `viewer` has no
+# such flag - running it to find out would try to open a window - so the GUI
+# binary's floor stays a documented number (docs/guides/startup.md) instead of
+# a measured one.
+#
+# grep -a over the binary rather than objdump, and strings only as a fallback:
+# the machine that needs this sentence is a compute box with no build
+# environment, which is exactly the machine with no binutils. The versioned
+# symbol names sit in .gnu.version_r as plain ASCII either way, and
+# `sort -Vu | tail -1` is the same expression the CI assertion runs on
+# objdump's output - so both halves of the project quote the same number.
+peer_glibc() {                   # $1 = an ELF binary; prints e.g. GLIBC_2.29
+  { LC_ALL=C grep -ao 'GLIBC_[0-9.]*' "$1" 2>/dev/null \
+    || strings -a "$1" 2>/dev/null; } \
+    | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+}
+
+# This host's libc in one line, or an honest shrug. `ldd --version 2>&1` was
+# read straight into the sentence before, so a host with no ldd at all (musl,
+# a stripped container) said "...but this host has sh: ldd: not found" - the
+# 2>&1 makes the shell's complaint LOOK like an answer, so the emptiness test
+# guarding it could never fire. Ask whether the tool exists instead.
+host_libc() {
+  command -v ldd >/dev/null 2>&1 || { echo "an unknown libc (no ldd on this host)"; return 0; }
+  v=$(ldd --version 2>&1 | sed -n '/./{p;q;}')
+  [ -n "$v" ] || v="an unknown libc (ldd said nothing)"
+  echo "$v"
+}
+
+# WHY the peer does not start - and the diagnosis is chosen from WHAT HAPPENED,
+# never assumed.
+#
+# This function used to reach for peer_glibc the moment `--version` failed, so
+# every other way a file fails to execute was reported as a glibc mismatch: a
+# $HOME mounted noexec, mode 644 after a copy that dropped the bit, an x86_64
+# build on an aarch64 box (Exec format error), a download that stopped halfway.
+# All four printed "needs GLIBC_2.17 but this host has 2.35" - a sentence that
+# is FALSE about a host whose glibc is newer than required - and the loader's
+# own words, the only thing in the room that knew, were thrown away. docs call
+# this line the machine's answer and tell the user to report it, so a wrong one
+# does not merely confuse: it redirects the next bug report.
+#
+# So: capture the failure text first, print it always, and add the glibc
+# sentence only when the text is actually about glibc. Same gate as the viewer's
+# own probe (core/app/open_dispatch.inc, peerProbeScript), for the reason both
+# quote the same peer_glibc expression - two diagnoses of one failure must not
+# disagree.
+peer_starts() {                  # $1 = path to a peer, $2 = what to call it
+  [ "$DIR" = linux-x64 ] || return 0        # a glibc question; macOS has none
+  # -e, not -x: a peer that is PRESENT and not executable is exactly one of the
+  # failures this is here to name (the viewer cannot start it either), and the
+  # old -x test returned silently OK on it.
+  [ -e "$1" ] || return 0                   # nothing to start is not a failed start
+  if why=$("$1" --version 2>&1); then return 0; fi
+  why=$(printf '%s\n' "$why" | sed -n '/./{s/^[[:space:]]*//;p;q;}')
+  [ -n "$why" ] || why='(it printed nothing)'
+  # The published tree has ONE Linux build and it is x86_64; the `case` above
+  # sends every non-Darwin uname to linux-x64, aarch64 included. That fallback
+  # stays (a new port would otherwise need two edits) but the DIAGNOSIS stops
+  # lying here: on the wrong machine the glibc number is irrelevant.
+  arch=$(uname -m 2>/dev/null) || arch=''
+  if [ -n "$arch" ] && [ "$arch" != x86_64 ] && [ "$arch" != amd64 ]; then
+    echo "$2: this build is for x86_64, this host is $arch" >&2
+  else
+    case "$why" in
+      *GLIBC_*)
+        need=$(peer_glibc "$1")
+        echo "$2 needs ${need:-a newer glibc} but this host has $(host_libc)" >&2 ;;
+      *)
+        echo "$2 does not start on this host" >&2 ;;
+    esac
+  fi
+  echo "  $why" >&2
+  echo "  the files ARE updated; this build cannot run here. Report that line." >&2
+}
+
+# THE PEER THE VIEWER STARTS IS ~/.viewer/viewer-serve, NEVER THIS CHECKOUT'S
+# COPY. core/app/remote_client.inc builds that path from REMOTE_HOME and
+# remote.cpp execs exactly it; this script updates the CHECKOUT. On the machine
+# that is both the data host and the place `update.sh` is run, those are two
+# different files, and nothing here ever touched the second one - so the update
+# genuinely succeeded, reported success, and the viewer went on starting the
+# same old binary. Together with the viewer's own bootstrap, which used to
+# early-out on the mere EXISTENCE of ~/.viewer/viewer-serve, that is #268: "the
+# remote update does not work" about an update that worked.
+install_peer() {
+  src="$DIR/viewer-serve"
+  [ -f "$src" ] || { echo "no $src in this checkout - nothing to install" >&2; return 1; }
+  d="$HOME/.viewer"
+  mkdir -p "$d"
+  # .new + mv, never a write in place. A live peer has its file MAPPED (the
+  # viewer keeps one per worker for the life of the app), and truncating it
+  # under the mapping is a SIGBUS in that process. Unlinking is free: the
+  # running peer keeps the inode, and therefore the code, it started with -
+  # the same reason bootstrapScript does .new + mv on the far side.
+  cp "$src" "$d/viewer-serve.new"
+  chmod +x "$d/viewer-serve.new"
+  mv "$d/viewer-serve.new" "$d/viewer-serve"
+  echo "~/.viewer/viewer-serve <- $src"
+  # The plugins travel with it: server-side MEASURE dlopens ~/.viewer/plugins,
+  # so a peer updated without them analyses with the old analyzers.
+  [ -d "$DIR/plugins" ] || return 0
+  mkdir -p "$d/plugins"
+  for f in "$DIR"/plugins/*; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    cp "$f" "$d/plugins/$b.new"
+    mv "$d/plugins/$b.new" "$d/plugins/$b"
+  done
+  echo "~/.viewer/plugins/   <- $DIR/plugins/"
+  # ...and whatever is no longer shipped GOES. This is not tidiness: the peer
+  # dlopens every .so it finds in ~/.viewer/plugins, so one left behind by an
+  # older release is loaded by the new peer. That is #268 one level down, and
+  # analyzer_stats.so is the recorded case - the copy published before this
+  # branch required GLIBC_2.29, so a 2.17 peer would start on CentOS 7 and
+  # server-side MEASURE would still die on the stale analyzer. The viewer's own
+  # bootstrap has always done `rm -rf "$d/plugins"` for exactly this reason;
+  # --peer merged into the directory instead. Named out loud, one per line,
+  # because a file disappearing silently is how the next puzzle starts.
+  for f in "$d"/plugins/*; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    if [ -e "$DIR/plugins/$b" ]; then continue; fi
+    # ONLY what the peer can dlopen. The reason to delete is "the new peer
+    # loads it", and the peer loads shared libraries - so anything else in
+    # this directory is not that hazard and is not ours to remove. The
+    # viewer's own bootstrap wipes the whole directory, so nothing here is
+    # meant to be kept; that is a reason not to widen this, not a licence.
+    case "$b" in
+      *.so|*.so.*|*.dll|*.dylib) ;;
+      *) continue ;;
+    esac
+    rm -f "$f"
+    echo "~/.viewer/plugins/$b  removed (not in this build)"
+  done
+}
+
+# Say the above out loud when it matters, and only then: this folder's peer and
+# the one the viewer starts are different builds.
+peer_note() {
+  [ -f "$HOME/.viewer/viewer-serve" ] || return 0
+  [ -f "$DIR/viewer-serve" ] || return 0
+  if cmp -s "$DIR/viewer-serve" "$HOME/.viewer/viewer-serve"; then return 0; fi
+  cat >&2 <<EOF
+
+The viewer starts ~/.viewer/viewer-serve, not the copy in this folder, and that
+one is a DIFFERENT build from what this update just placed here. To refresh it:
+    ./update.sh --peer
+
+Nothing needs rebuilding or reinstalling afterwards, but a viewer that is
+ALREADY CONNECTED keeps the peer it started: each connection execs
+~/.viewer/viewer-serve once and holds that process for as long as the link is
+up. The new peer is what the NEXT connection gets - reconnect (Browse's
+Disconnect, or File > Update remote peer) or restart the viewer.
+EOF
+}
+
 reset_to() {                     # $1 = ref to make the tree be
   # Only the binaries this reset actually REWRITES are worth asking about: a
   # viewer running out of a file the update does not touch is still the
@@ -70,18 +243,34 @@ reset_to() {                     # $1 = ref to make the tree be
            git diff --quiet "$1" -- "$b" 2>/dev/null || running_pids "$b"
          done | sort -un | tr '\n' ' ')
   git reset --hard "$1"
-  [ -n "$busy" ] || return 0
-  cat >&2 <<EOF
+  if [ -n "$busy" ]; then
+    cat >&2 <<EOF
 
 The files are updated, but a viewer started from this folder is still running
 (pid ${busy% }). Replacing a program's file does not change the program that
 is already running - it keeps the code it started with. Quit that window and
 start ./$DIR/$BIN again to be on the new build.
 EOF
+  fi
+  # ...and LAST, because these are the lines that say the update was not
+  # enough. Both are silent on a normal run: the peer starts, and ~/.viewer
+  # either does not exist or already holds this same build.
+  peer_starts "$DIR/viewer-serve" "viewer-serve"
+  peer_note
 }
 
 case "$1" in
   "")   git fetch origin binaries && reset_to origin/binaries; exit 0 ;;
+  --peer)
+        # Installs what is IN THE TREE RIGHT NOW, and fetches nothing. That is
+        # what makes it composable: after the plain form the tree is the
+        # published build, and after `--fetch binaries-pr64` it is that branch's
+        # build - so `--peer` always means "the peer beside me becomes the peer
+        # the viewer starts", with no second rule about which build that is and
+        # nothing that can silently undo a --fetch.
+        install_peer
+        peer_starts "$HOME/.viewer/viewer-serve" "~/.viewer/viewer-serve"
+        exit 0 ;;
   --fetch)
         [ -n "$2" ] || { echo "--fetch needs a ref: ./update.sh --fetch binaries-pr64" >&2; exit 2; }
         # In place, like the plain form - this branch is disposable by design,
@@ -93,7 +282,11 @@ case "$1" in
         }
         reset_to FETCH_HEAD; exit 0 ;;
   --pr|--commit) ;;
-  *)    echo "usage: ./update.sh [--fetch REF | --pr N | --commit SHA]" >&2; exit 2 ;;
+  *)    echo "usage: ./update.sh [--peer | --fetch REF | --pr N | --commit SHA]" >&2
+        echo "  --peer  install THIS FOLDER'S viewer-serve + plugins into ~/.viewer/" >&2
+        echo "          (that copy, not this one, is what the viewer starts)" >&2
+        echo "          it fetches nothing: run ./update.sh first, then --peer" >&2
+        exit 2 ;;
 esac
 
 [ -n "$2" ] || { echo "$1 needs a value: ./update.sh $1 <value>" >&2; exit 2; }

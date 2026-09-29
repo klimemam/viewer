@@ -1415,6 +1415,8 @@ viewer [options] [files...]
 
 | 症状 | 対処 |
 |---|---|
+| Linux で `version 'GLIBC_2.29' not found` と出て起動しない | 配布物の要求 glibc がそのホストより新しい。`ldd --version` で確認。**peer**(`viewer-serve` + `plugins/`)は **2.17**(CentOS 7・RHEL 7 以降 / Ubuntu 16.04 以降 / Debian 9 以降)、**GUI の `viewer`** は **2.31**(Ubuntu 20.04 / Debian 11 / RHEL 9 以降)。どの版が足りないかは機械が言います —— `./update.sh` は更新後に `viewer-serve needs GLIBC_x.y but this host has ...` の 1 行を出し、リモートの自動導入も同じ 1 行を返します([startup §0](startup.md#linux-配布物が動く範囲要求-glibc)) |
+| **`./update.sh` を走らせたのに peer が古いまま**(glibc や protocol で怒られる) | viewer が起動する peer は **`~/.viewer/viewer-serve`** で、`update.sh` が更新するのは**この checkout** です。データのあるホストで自分で配っているなら `./update.sh --peer` を実行(差があれば `update.sh` 自身が促します)。ssh 越しなら viewer 側が `--version` で確かめて置き換えるので手作業は不要 —— 明示するなら `File > Update remote peer`([startup §0](startup.md#updatesh-が更新するのはこのフォルダでviewer-ではない)) |
 | Linux でファイルダイアログが開かない | `zenity` か `kdialog` をインストール(D&D は常に可) |
 | 文字が巨大 / ウィンドウが画面に収まらない (Linux) | `viewer --ui-scale 1` で起動。定着させるなら `settings.jsonc` に `appearance.uiScale`(§10a) |
 | ウィンドウを動かせない / 枠が変 | `viewer --frame system` で OS のタイトルバーに戻して起動(`View > Integrated title bar` でも切替。設定は保持されます) |

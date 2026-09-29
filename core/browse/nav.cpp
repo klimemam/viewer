@@ -75,6 +75,15 @@ static void rbWorker(App::BrowseInstance* ip) {
             if (!I.session) {
                 I.session.reset(new remote::Session());
                 I.session->setAbort(&I.stop);   // Quit interrupts a blocked read
+                // NO setExplainFailure: this is the one path that goes on to
+                // ask the SERVER the same question, better. Every connect
+                // failure with a host reaches deployPeer below, whose step-1
+                // probe runs peerProbeScript over there - where the wanted
+                // glibc and the host's own are both readable - and whose log
+                // lands in r.info / r.err and is shown. Opting in would buy
+                // one line this branch then OVERWRITES (err is replaced by the
+                // retry's, or by "could not install the peer"), at the price of
+                // a third ssh handshake before the install even starts.
             }
             std::string err;
             bool alive = I.session->alive() && I.session->host() == job.host;

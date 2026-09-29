@@ -165,7 +165,7 @@ static bool readWholeFile(const std::string& path, std::string& out) {
     return !out.empty();
 }
 
-static std::string bootstrapScript() {
+static std::string bootstrapScript(bool keepCurrentPeer) {
     // POSIX sh, delivered over stdin so no quoting layer can mangle it.
     // Prints VIEWER_SERVE_OK on success; anything else is shown to the user.
     // 判断17: the build-time VIEWER_REPO_URL is the DEFAULT, not the answer.
@@ -182,8 +182,28 @@ static std::string bootstrapScript() {
         "set -e\n"
         "d=$HOME/.viewer\n"
         "mkdir -p \"$d\"\n"
-        "if [ -x \"$d/viewer-serve\" ]; then echo VIEWER_SERVE_OK; exit 0; fi\n"
-        "if ! command -v git >/dev/null 2>&1; then\n"
+      + (keepCurrentPeer ? std::string(
+        // THE EARLY-OUT IS ABOUT A PEER THAT RUNS, not about a file that
+        // exists. This line used to be `[ -x "$d/viewer-serve" ]` and that
+        // was wrong in EVERY case that can reach this script: deployPeer only
+        // gets here after its OWN probe has already decided the peer is
+        // missing, dead or stale (see step 1), so an existence test answers
+        // "already installed" about the very binary that just failed to
+        // start. #268 is what that cost - `./update.sh` refreshed the
+        // binaries checkout but not ~/.viewer/viewer-serve, the viewer then
+        // found a file there, said VIEWER_SERVE_OK, and the user got an
+        // update that reported success and changed nothing.
+        //
+        // So: ask it, and believe it only if it answers with a protocol
+        // number at least as new as ours. `--version` prints
+        // "viewer-serve protocol N", hence the last word.
+        "if v=$(\"$d/viewer-serve\" --version 2>/dev/null); then\n"
+        "  n=${v##* }\n"
+        "  case \"$n\" in ''|*[!0-9]*) ;;\n"
+        "    *) [ \"$n\" -ge " + std::to_string((int)rp::VERSION) + " ] && { echo VIEWER_SERVE_OK; exit 0; } ;;\n"
+        "  esac\n"
+        "fi\n") : std::string())
+      + "if ! command -v git >/dev/null 2>&1; then\n"
         "  echo 'no git on the server: copy viewer-serve to ~/.viewer/ manually'; exit 1\n"
         "fi\n"
         // A private repo would sit forever on a credential prompt, and an
@@ -221,12 +241,70 @@ static std::string bootstrapScript() {
         "echo VIEWER_SERVE_OK\n";
 }
 
-// Update an already-installed peer (menu action): same script, forced refresh.
-static std::string updateScript() {
-    std::string s = bootstrapScript();
-    size_t p = s.find("if [ -x \"$d/viewer-serve\" ]");
-    if (p != std::string::npos) s.erase(p, s.find('\n', p) + 1 - p);   // skip the early-out
-    return s;
+// Update an already-installed peer (menu action): the same script with the
+// early-out switched off.
+//
+// It used to DELETE that line from the finished script by searching for its
+// text - surgery that stops working SILENTLY the day the line is reworded, and
+// #268 is the rewording that would have done it (one `[ -x ]` test became a
+// four-line --version check). One parameter instead, so the two forms cannot
+// drift apart.
+static std::string updateScript() { return bootstrapScript(false); }
+
+// Does the peer over there RUN, and if not, WHY NOT in one line.
+//
+// #268: the loader's own words name the version the binary wanted and never
+// the version the host has ("version `GLIBC_2.29' not found"), so a report
+// that quoted them cost a round trip to answer - and the next report would
+// have cost another one. The missing half is on the SERVER, where both are
+// readable, so the probe says it there: ONE sentence, and the same sentence
+// tools/binaries/update.sh prints, produced by the same expression.
+//
+// grep -a over the binary rather than objdump, for update.sh's reason: the
+// machine that needs this sentence is a compute box with no build environment,
+// which is exactly the machine with no binutils. `strings` is the fallback,
+// and sort's stderr is dropped so a macOS peer (no Mach-O GLIBC_ strings, no
+// sort -V) says nothing instead of something confusing.
+//
+// THE DIAGNOSIS IS CHOSEN FROM WHAT HAPPENED, never assumed. The glibc
+// sentence used to be printed whenever the binary contained a GLIBC_ string at
+// all - which every build does - so a $HOME mounted noexec, a mode-644 copy, an
+// x86_64 peer on an aarch64 box (Exec format error) and a half-finished
+// download all reported "needs GLIBC_2.17 but this host has 2.35": a statement
+// that is FALSE about a host whose glibc is newer than required. docs/guides
+// call this line the machine's answer and tell the user to report it, so a
+// wrong one redirects the next bug report instead of merely confusing.
+//
+// The failure text is therefore CAPTURED and echoed first (it is the only thing
+// in the room that knows), and the glibc sentence is added only when that text
+// is about glibc. tools/binaries/update.sh's peer_starts has the same gate and
+// quotes the same expression, for the reason both exist: two diagnoses of one
+// failure must not disagree.
+//
+// `orElse` is what the caller wants printed when the peer is not there at all
+// - the marker the NO_PEER / "does not run" branches below read.
+static std::string peerProbeScript(const std::string& orElse) {
+    return
+        "p=\"$HOME/.viewer/viewer-serve\"\n"
+        "if why=$(\"$p\" --version 2>&1); then\n"
+        "  echo \"$why\"\n"
+        "else\n"
+        "  echo \"$why\"\n"
+        "  case \"$why\" in *GLIBC_*)\n"
+        "    need=$({ LC_ALL=C grep -ao 'GLIBC_[0-9.]*' \"$p\" 2>/dev/null"
+        " || strings -a \"$p\" 2>/dev/null; }"
+        " | grep -o 'GLIBC_[0-9.]*' | sort -Vu 2>/dev/null | tail -1)\n"
+        // `ldd --version 2>&1` read straight into the sentence made a host with
+        // no ldd say "...but this host has sh: ldd: not found" - the redirect
+        // turns the shell's complaint into something that LOOKS like an answer,
+        // so the emptiness test could never fire. Ask if the tool exists.
+        "    if command -v ldd >/dev/null 2>&1; then have=$(ldd --version 2>&1 | head -1);"
+        " else have=''; fi\n"
+        "    [ -n \"$have\" ] || have='an unknown libc (no ldd on this host)'\n"
+        "    [ -n \"$need\" ] && echo \"viewer-serve needs $need but this host has $have\"\n"
+        "  ;; esac\n"
+        "  " + (orElse.empty() ? std::string(":") : orElse) + "\n"
+        "fi\n";
 }
 
 // Install the peer, best method first. Returns a human-readable log either way.
@@ -236,8 +314,7 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
     //    (--help must actually run: a peer that was copied but dies on a glibc
     //    mismatch reported only "connection lost" before this check existed)
     if (!remote::runSshScript(host, port,
-            "uname -s; uname -m\n"
-            "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || echo NO_PEER\n",
+            "uname -s; uname -m\n" + peerProbeScript("echo NO_PEER"),
             out, err, 20.0)) {
         log = "cannot reach " + host + ": " + err;
         return false;
@@ -282,9 +359,23 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                 // a newer distro dies on glibc with nothing but "connection
                 // lost" further down. Surface the loader's actual words.
                 std::string vout, verr3;
-                remote::runSshScript(host, port,
-                    "\"$HOME/.viewer/viewer-serve\" --version 2>&1 || true\n",
-                    vout, verr3, 15.0);
+                // The RETURN VALUE, not just the text. When the probe times out
+                // or the link drops, `vout` is empty and the sentence below
+                // read "but it does not run there:" with nothing after the
+                // colon - an accusation against a peer that was never asked.
+                // "we could not check" and "we checked and it is broken" are
+                // different facts and the install must not report the second
+                // when it means the first.
+                const bool asked = remote::runSshScript(host, port, peerProbeScript(""),
+                                                        vout, verr3, 15.0);
+                if (!asked) {
+                    log = "copied to " + host + ", but the check that it RUNS there did "
+                          "not come back (" + (verr3.empty() ? "no reason given" : verr3) +
+                          ") - the peer may well be fine; nothing here can say so. "
+                          "Try again, or run ~/.viewer/viewer-serve --version over ssh "
+                          "by hand.";
+                    return false;
+                }
                 size_t vp2 = vout.find("viewer-serve protocol ");
                 if (vp2 == std::string::npos) {
                     log = "copied to " + host + ", but it does not run there:\n" + vout +
@@ -353,7 +444,43 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
         log += (log.empty() ? "" : "\n") + o4;
         return false;
     }
-    log = "the server installed its own peer";
+    // PROVE it runs, exactly as the send-our-own path above does. This path had
+    // no such check: it cloned the binaries branch, saw its own `cp` succeed,
+    // printed VIEWER_SERVE_OK and reported an install - so a peer that cannot
+    // start on this host was installed and CALLED INSTALLED, and the only
+    // symptom left was "no answer from the remote viewer" at the next connect.
+    // Two ways to fail, and they are different sentences: it does not start
+    // (the loader's words, plus which glibc is missing), or it starts and is
+    // older than this viewer (the branch it cloned is behind). #268.
+    std::string vout5, verr5;
+    // ...and the return value here for the same reason as in step 2: a probe
+    // that never landed leaves vout5 empty, and "it does not run there:" with
+    // an empty line under it blames the peer for our own timeout.
+    if (!remote::runSshScript(host, port, peerProbeScript(""), vout5, verr5, 15.0)) {
+        log += (log.empty() ? "" : "\n") +
+               std::string("the server installed its own peer, but the check that it "
+               "RUNS there did not come back (") +
+               (verr5.empty() ? "no reason given" : verr5) + ") - nothing here can say "
+               "whether the install worked. Try again, or run "
+               "~/.viewer/viewer-serve --version over ssh by hand.";
+        return false;
+    }
+    size_t vp5 = vout5.find("viewer-serve protocol ");
+    if (vp5 == std::string::npos) {
+        log += (log.empty() ? "" : "\n") +
+               std::string("the server installed its own peer, but it does not run there:\n") +
+               vout5;
+        return false;
+    }
+    int gotProto = atoi(vout5.c_str() + vp5 + 22);
+    if (gotProto < (int)rp::VERSION) {
+        log += (log.empty() ? "" : "\n") + std::string("the server installed its own peer, but it "
+               "reports protocol ") + std::to_string(gotProto) + " (this viewer speaks " +
+               std::to_string((int)rp::VERSION) + ") - the `binaries` branch it cloned is "
+               "older than this viewer";
+        return false;
+    }
+    log = "the server installed its own peer (protocol " + std::to_string(gotProto) + ")";
     return true;
 }
 
@@ -361,7 +488,13 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
 // The UI thread's OWN connection to a host, used only by openRemote's meta+tile.
 // It deliberately does NOT install the peer: deployPeer is minutes of ssh and
 // the browse worker already owns that job (rbWorker's connect path). The most
-// this can cost the window is one ssh handshake, bounded by ConnectTimeout=10.
+// this can cost the window is one ssh handshake, bounded by ConnectTimeout=10 -
+// and that number is UNCHANGED by the peer diagnosis added for #268, because
+// this session never opts into it (remote.h, Session::setExplainFailure,
+// default false). Turning it on here would make an unreachable host cost two
+// handshakes plus the probe's own budget with the window not repainting, so
+// the sentence above is a constraint on this function and not a description:
+// whatever else ensureUiSession gains, it stays at one round trip.
 static bool ensureUiSession(const std::string& host, std::string& err, int port) {
     if (app.uiSession.alive() && app.uiSession.host() == host &&
         app.uiSession.port() == port)

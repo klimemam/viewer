@@ -54,7 +54,9 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
                             const std::string& name = std::string(), int port = 0,
                             int token = 0);
 static bool ensureUiSession(const std::string& host, std::string& err, int port = 0);
-static std::string bootstrapScript();
+// keepCurrentPeer: leave an installed peer alone when it ANSWERS --version with
+// a protocol at least as new as ours. False is the forced form (updateScript).
+static std::string bootstrapScript(bool keepCurrentPeer = true);
 static std::string updateScript();
 
 // ---- where a remote open's milliseconds go, when asked (board 305) ----------
@@ -175,6 +177,11 @@ static void ensureSession(remote::Session& ses, std::string& sesHost, int& sesPo
 static void rfWorker() {
     remote::Session ses;
     ses.setAbort(&app.rfStop);        // a blocked read gives up when Quit asks
+    // ...and a connect that got NO answer may spend one more ssh round trip
+    // asking the peer why. Allowed here and not on app.uiSession because this
+    // is a worker thread and because d.err below is SHOWN - the two conditions
+    // on remote.h's setExplainFailure.
+    ses.setExplainFailure(true);
     std::string sesHost = "\n";                  // impossible: force first connect
     int sesPort = -1;
     while (!app.rfStop) {
@@ -588,6 +595,7 @@ static void stopRemoteFetcher() {
 static void mWorker() {
     remote::Session ses;
     ses.setAbort(&app.mStop);         // a blocked read gives up when Quit asks
+    ses.setExplainFailure(true);      // rfWorker's reason: a worker, and d.err is shown
     std::string sesHost = "\n";
     int sesPort = -1;
     while (!app.mStop) {
