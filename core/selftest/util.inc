@@ -636,6 +636,187 @@ static int roiStatsSelftest() {
     app.abStatsLayout = App::AbAuto;
     app.flipShowB = false;
 
+    // ---- W: a WRITE to an annotation never clamps, and a band memory never
+    //         crosses a frame of another size (user report 2026-09-29) -------
+    // 「新しいファイルを開くと、ROI の原点がずれてあっちこっちいく」. Two of that
+    // report's roots are writes, and both are measured here on the reporter's
+    // own numbers: a 4096x3000 sensor, a 640x480 file and a 2048x1500 one, all
+    // three open at once - which is the situation, because app.anns is shared
+    // by every open document BY DESIGN (Ann has no document id; opening a file
+    // does not clear the list) and switching documents is what "opening the
+    // next file" is.
+    //
+    // What is asserted is what the rectangle IS after the write, never what the
+    // widget looked like: both defects were in the arithmetic of the commit,
+    // and the numbers do not need a display to be wrong.
+    closeAll();
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0; app.roiChannel = -1;
+    app.images.push_back(mkMono(4096, 3000, 1000.0, 1.0, 0.0));   // 0: the sensor
+    app.images.push_back(mkMono(640, 480, 1000.0, 1.0, 0.0));     // 1: a small file
+    app.images.push_back(mkMono(2048, 1500, 1000.0, 1.0, 0.0));   // 2: half of it
+    app.current = 0;
+    auto wSay = [&](const char* what, const App::Ann& a) {
+        fprintf(stderr, "roistatsselftest: W %-24s %dx%d @%d,%d   prev x=%d w=%d "
+                        "y=%d h=%d\n", what, a.w, a.h, a.x, a.y,
+                a.prevX, a.prevW, a.prevY, a.prevH);
+    };
+
+    // ---- W1/W2: the reported gesture - edit ONE field with a small file
+    //             open, on a ROI placed on the big one ----------------------
+    addAnn(0, 3000, 2000, 200, 200);
+    const int wRoi = app.anns.back().id;
+    app.current = 1;                       // "open" the 640x480 file
+    check(app.anns.size() == 1 && findAnn(wRoi)->x == 3000 && findAnn(wRoi)->w == 200,
+          "W1 opening a smaller file leaves the ROI alone");
+    {
+        App::Ann* a = findAnn(wRoi);
+        int f[4] = { a->x, a->y, a->w, 100 };            // h 200 -> 100, nothing else
+        std::string why;
+        bool wrote = annWriteFields(*a, f, cur()->w, cur()->h, &why);
+        wSay("h 200 -> 100 on 640x480", *a);
+        fprintf(stderr, "roistatsselftest: W2 wrote=%d why=[%s]\n",
+                (int)wrote, why.c_str());
+        check(wrote && a->h == 100, "W2 the edit lands: a ROI off this frame is editable");
+        check(a->x == 3000 && a->y == 2000 && a->w == 200,
+              "W2 ...and x / y / w - untouched fields - are not written");
+        check(!(a->x == 639 && a->y == 479 && a->w == 1 && a->h == 1),
+              "W2 ...never the clamped (639,479) 1x1 the report measured");
+    }
+    // ---- W3/W4: an edit that takes a ROI this frame HOLDS and puts it
+    //             outside is refused, in the panel's own words --------------
+    addAnn(0, 400, 300, 100, 100);                        // fits 640x480
+    {
+        App::Ann* a = findAnn(app.selectedAnn);
+        int f[4] = { a->x, a->y, 500, a->h };             // w 100 -> 500: x+w = 900
+        std::string why;
+        bool wrote = annWriteFields(*a, f, cur()->w, cur()->h, &why);
+        fprintf(stderr, "roistatsselftest: W3 wrote=%d why=[%s]\n",
+                (int)wrote, why.c_str());
+        check(!wrote && a->w == 100 && a->x == 400,
+              "W3 an edit that would push a fitting ROI off the frame is refused");
+        check(why.find("outside this frame (640x480)") != std::string::npos,
+              "W3 ...and says so in the table's own words");
+        int g[4] = { a->x, a->y, a->w, -3 };              // h = -3 is not a size
+        why.clear();
+        check(!annWriteFields(*a, g, cur()->w, cur()->h, &why) && a->h == 100,
+              "W4 a component that is not a rectangle at all is refused");
+        fprintf(stderr, "roistatsselftest: W4 why=[%s]\n", why.c_str());
+        check(why.find("h = -3") != std::string::npos,
+              "W4 ...naming the component that was edited");
+    }
+    // ---- W5: the pin - raising x by one must not move y -------------------
+    addAnn(1, 3000, 2000, 0, 0);                          // a pin off this frame
+    {
+        App::Ann* a = findAnn(app.selectedAnn);
+        int f[2] = { 3001, a->y };
+        std::string why;
+        bool wrote = annWriteFields(*a, f, cur()->w, cur()->h, &why);
+        fprintf(stderr, "roistatsselftest: W5 pin @%d,%d wrote=%d why=[%s]\n",
+                a->x, a->y, (int)wrote, why.c_str());
+        check(wrote && a->x == 3001, "W5 a pin takes the number typed into its x");
+        check(a->y == 2000, "W5 ...and y, which was not edited, does not move with it");
+        check(!(a->x == 639 || a->y == 479),
+              "W5 ...neither number is clamped to the frame on screen");
+    }
+
+    // ---- W6..W9: the band memory (prevX/prevW) and a frame of another size
+    // The report's second root. prev* is a rectangle in the pixels of whatever
+    // frame was open when X was pressed, and Ann has no room to say which frame
+    // that was - so the toggle refuses rather than guesses, and above all does
+    // not overwrite the one copy of the rectangle it is holding.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 0;                                      // 4096x3000
+    addAnn(0, 100, 100, 200, 200);
+    const int bRoi = app.anns.back().id;
+    toggleBand(true);                                     // X: the row band
+    wSay("X on 4096x3000", *findAnn(bRoi));
+    {
+        const App::Ann* b = findAnn(bRoi);
+        check(b->x == 0 && b->w == 4096 && b->h == 200,
+              "W6 X bands the ROI to the full width of the frame it is on");
+        check(b->prevX == 100 && b->prevW == 200,
+              "W6 ...and remembers the rect it came from");
+    }
+    app.current = 2;                                      // "open" 2048x1500
+    app.toast.clear();
+    toggleBand(true);                                     // X on the smaller frame
+    wSay("X on 2048x1500", *findAnn(bRoi));
+    fprintf(stderr, "roistatsselftest: W7 toast [%s]\n", app.toast.c_str());
+    {
+        const App::Ann* b = findAnn(bRoi);
+        check(b->prevX == 100 && b->prevW == 200,
+              "W7 the rect the band was made from survives a smaller frame");
+        check(!(b->prevX == 0 && b->prevW == 4096),
+              "W7 ...the memory is NOT overwritten with this frame 0 / 4096");
+        check(app.toast.find("outside this frame (2048x1500)") != std::string::npos,
+              "W7 ...and the refusal says which frame, in the panel words");
+        const App::Ann was = *b;
+        toggleBand(true);                                 // ...and again
+        b = findAnn(bRoi);
+        wSay("X again on 2048x1500", *b);
+        check(b->x == was.x && b->y == was.y && b->w == was.w && b->h == was.h &&
+              b->prevX == was.prevX && b->prevW == was.prevW,
+              "W8 pressing X again writes nothing - no 4096-wide ROI is restored");
+    }
+    app.current = 0;                                      // back on 4096x3000
+    toggleBand(true);
+    wSay("X back on 4096x3000", *findAnn(bRoi));
+    {
+        const App::Ann* b = findAnn(bRoi);
+        check(b->x == 100 && b->w == 200 && b->y == 100 && b->h == 200,
+              "W9 back on a frame that holds it, X restores the ORIGINAL rect");
+        check(b->prevW == -1, "W9 ...and the memory is spent, not left to fire twice");
+    }
+    // the column axis is the same code with y/h, and is asserted so that a fix
+    // applied to one axis cannot pass for both
+    toggleBand(false);                                    // Y: the column band
+    {
+        const App::Ann* b = findAnn(bRoi);
+        check(b->y == 0 && b->h == 3000 && b->prevY == 100 && b->prevH == 200,
+              "W9b Y bands the other axis and remembers that one");
+    }
+    app.current = 1;                                      // 640x480
+    app.toast.clear();
+    toggleBand(false);
+    {
+        const App::Ann* b = findAnn(bRoi);
+        fprintf(stderr, "roistatsselftest: W9b toast [%s]\n", app.toast.c_str());
+        check(b->prevY == 100 && b->prevH == 200,
+              "W9b ...and the y memory survives the smaller frame too");
+    }
+
+    // ---- W10: a ROI outside the frame is a NORMAL state -------------------
+    // The report is "the ROI moves"; the wrong cure is a viewer that tidies
+    // ROIs onto whatever frame is showing. Opening another sensor file MUST
+    // leave every number alone - the panel says "outside this frame" and that
+    // is the whole of its response. Asserted through real frames of the real
+    // panel, because the draw is where a well-meant repair would live.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 0;
+    addAnn(0, 3000, 2000, 200, 200);
+    addAnn(1, 4000, 2900, 0, 0);
+    const std::vector<App::Ann> snap = app.anns;
+    for (int c : { 1, 2, 0, 1, 2 }) { app.current = c; settle(); }
+    bool wSame = app.anns.size() == snap.size();
+    for (size_t i = 0; wSame && i < snap.size(); i++) {
+        const App::Ann& g = app.anns[i];
+        const App::Ann& e = snap[i];
+        wSame = g.x == e.x && g.y == e.y && g.w == e.w && g.h == e.h &&
+                g.prevX == e.prevX && g.prevW == e.prevW &&
+                g.prevY == e.prevY && g.prevH == e.prevH;
+        if (!wSame)
+            fprintf(stderr, "roistatsselftest: W10 ann %zu moved: %dx%d @%d,%d -> "
+                            "%dx%d @%d,%d\n", i, e.w, e.h, e.x, e.y, g.w, g.h, g.x, g.y);
+    }
+    check(wSame, "W10 opening frames of other sizes rewrites no annotation at all");
+    // the list belongs to whatever runs next in this process: leave it empty
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    closeAll();
+
     g_roiRowProbeOn = false;
     fprintf(stderr, "roistatsselftest: %s\n", ok ? "ok" : "FAILED");
     // the same orderly shutdown every early-returning selftest does: an
