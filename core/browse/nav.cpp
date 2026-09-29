@@ -9,8 +9,9 @@
 #include "browse.h"                  // ...and the declarations this TU defines
 
 #include <algorithm>
-#include <cmath>                     // ceil (browseWatchEvery's ratio)
+#include <cmath>                     // ceil (browseWatchEvery) / floor (rbSecsText)
 #include <cstring>                   // strstr (rbIsBrowseWindowName), memcmp
+#include <cstdio>                    // snprintf (rbSecsText)
 #include <mutex>                     // the poll round asks the instance's queue
 #include <string>
 #include <vector>
@@ -518,34 +519,209 @@ double browseWatchInterval(bool peer) {
     return peer ? a * browseWatchEvery() : a;
 }
 
-// Does this instance owe a round right now? Nothing in here reads a clock or
-// touches the network: `now` is handed in, for the reason watchPollRound is
-// handed its lister - a test that had to live through a three-second interval
-// would be a slow test that fails on a loaded machine.
-bool rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+// EVERY GATE, ONCE (watch-design §19). Nothing in here reads a clock or touches
+// the network: the one term that needs `now` is the interval, and it is left to
+// rbPollDue below for the reason watchPollRound is handed its lister - a test
+// that had to live through a three-second interval would be a slow test that
+// fails on a loaded machine.
+//
+// The order is the order rbPollDue asked these in, with one deliberate move:
+// `polledAt <= 0` is now asked BEFORE the three "occupied" terms. It changes no
+// answer (both said false) and it makes ARMING namable, which is what
+// rbPollRound below needs.
+RbPollState rbPollStateNow(const App::BrowseInstance& I, uint64_t uiFrame) {
     // ONE switch for the feature (§9: "start with one global switch"). Watch
     // turned off stops the Browse half with the stack half; a listing that
     // refreshes itself is Watch whichever panel it lands in.
-    if (!app.watchEnabled || app.watchPaused) return false;
-    if (!I.b.connected) return false;
+    if (!app.watchEnabled)   return RbPollState::WatchOff;
+    if (app.watchPaused)     return RbPollState::Paused;
+    if (!I.b.connected)      return RbPollState::Offline;
     // §2 says the instance's CURRENT DIR. The search results view stands in for
     // the listing (remoteBrowseTo turns it off for that very reason), so while
     // it is up the listing is not on screen and re-reading it would be a round
     // trip for rows nobody can see.
-    if (I.search.active) return false;
-    if (!rbInstanceDrawn(I, uiFrame)) return false;
+    if (I.search.active)     return RbPollState::Searching;
+    if (!rbInstanceDrawn(I, uiFrame)) return RbPollState::NotDrawn;
+    if (I.polledAt <= 0)     return RbPollState::Arming;   // the timer is not running yet
     // §2: SKIP, NEVER QUEUE. A queue of stale listings is worse than a missed
     // round - each one replaces the listing when it lands, so a slow link would
     // redraw the panel N times with N answers to the same question, the last
     // N-1 already out of date on arrival. Three ways to be occupied and all
     // three count: a job running, a poll already out (a poll deliberately does
     // not set `busy`), and a navigation waiting to go out.
-    if (I.busy || I.pollPending) return false;
+    if (I.busy || I.pollPending) return RbPollState::Working;
     {
         std::lock_guard<std::mutex> lk(I.mtx);
-        if (!I.queue.empty()) return false;
+        if (!I.queue.empty()) return RbPollState::Working;
     }
-    if (I.polledAt <= 0) return false;          // the timer is not running yet
+    return RbPollState::On;
+}
+
+// Seconds as the panel prints them: "3 s", "12 s", "0.5 s". Whole numbers stay
+// whole - `watch.intervalSec` is whole seconds and so are the two Browse
+// constants. INTERVALS only: an interval is a constant and its width therefore
+// never changes while anybody is reading.
+static std::string rbSecsText(double s) {
+    char b[32];
+    if (s < 0) s = 0;
+    const double r = std::floor(s + 0.5);
+    if (std::fabs(s - r) < 0.05) snprintf(b, sizeof b, "%d s", (int)r);
+    else                         snprintf(b, sizeof b, "%.1f s", s);
+    return b;
+}
+
+// ...and the AGE, which is a different problem and gets a different function.
+// The age changes every second, and the mark that carries it sets the width the
+// status line elides into - so "2 s" becoming "10 s" moved the line's "..." one
+// character along, ONCE A SECOND, under the reader's eye. That is #275's defect
+// (「目の下で動く」) wearing a smaller hat, in the very panel that closed it.
+//
+// So the field is FIXED WIDTH: two digits always, and 99 is the ceiling. Digits
+// are tabular in every font this program loads, so "07 s" and "12 s" measure the
+// same; zero-padding is what keeps a one-digit age from being narrower than a
+// two-digit one. The cap is reached only by a clock that jumped (a resumed
+// machine), never in the running state - a round is due at the interval, which
+// is 3 s here and 12 s for a peer - and it says "99+" rather than "99" because
+// a number that has stopped counting must not look like a measurement.
+static std::string rbAgeText(double s) {
+    char b[32];
+    if (s < 0) s = 0;
+    const int n = (int)std::floor(s + 0.5);
+    if (n > 99) return "99+ s";
+    snprintf(b, sizeof b, "%02d s", n);
+    return b;
+}
+
+// WHAT THE PANEL SAYS, and the only place it is worded.
+//
+// EMPTY MEANS "THIS STATE HAS NO SURFACE" - not "nothing to say". Three of the
+// eight states cannot reach the status line at all, because drawPanelRemote has
+// already returned before that row:
+//   * Offline   - panel.cpp's `if (!B.connected)` draws the empty state and
+//                 returns. There is no listing on screen to be kept up to date.
+//   * Searching - panel.cpp's `if (I.search.active)` draws the results view and
+//                 returns. The listing is not on screen; the results are.
+//   * NotDrawn  - the panel is collapsed, closed, or behind another dock tab,
+//                 so ImGui::Begin answered false and the spine never called us.
+// Each of those reads THE SAME FIELD the state does (`b.connected`,
+// `search.active`, `drawnFrame`), one field and not a copy of a gate, so the
+// door and the state cannot come to disagree. Returning a sentence for them
+// would be the shape §19.3 exists to forbid: a string a test can assert and a
+// reader can never see. --browse-selftest B9 asserts the emptiness instead.
+//
+// The interval is `browseWatchInterval`, never a number typed in here: move
+// either constant and this sentence moves with it (B9b holds that, by moving
+// one). The switch is named with menus.inc's own label, letter for letter, and
+// B9d holds THAT by reading menus.inc.
+std::string rbPollStateText(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    const std::string every =
+        "auto-refresh: every " + rbSecsText(browseWatchInterval(!I.b.host.empty()));
+    switch (rbPollStateNow(I, uiFrame)) {
+        case RbPollState::WatchOff:
+            // NAMED, because this is the one state whose cause is a setting
+            // the reader owns and cannot see from here. Four doors reach the
+            // same flag - this menu item, the Preferences row, the
+            // `loading.watchFiles` key in settings.jsonc, and the `watchfiles`
+            // line in prefs.txt - and the menu is the one that is two clicks
+            // away from the panel this sentence is on.
+            return "auto-refresh: off - File > \"Watch source files on disk\"";
+        case RbPollState::Paused:
+            // NOT "while the window is minimised", which is what this said
+            // until the review took it apart: the minimised half of watchPaused
+            // is set in the frame loop's ICONIFIED branch, which draws NOTHING
+            // and then clears the flag again on the frame that comes back - so
+            // that cause can never be on screen. What CAN be on screen is the
+            // other half: a scripted run (--browse-keys) that suppressed the
+            // watcher deliberately, with the window wide open in front of it.
+            // A sentence whose stated cause is false every time it is visible
+            // is worse than no sentence.
+            return "auto-refresh: stopped - the watcher is suppressed for this run";
+        case RbPollState::Offline:
+        case RbPollState::Searching:
+        case RbPollState::NotDrawn:
+            return std::string();          // no surface - see the note above
+        case RbPollState::Arming:
+            // A frame away, and said anyway. It is the state a navigation and
+            // F5 both leave behind (rbEnqueue zeroes the timer), so it is
+            // exactly what is on screen the instant after the gesture the user
+            // is complaining about - and "starting" is a truer answer there
+            // than an age of zero seconds would be.
+            return every + ", starting";
+        case RbPollState::Working:
+            // §2's SKIP, NEVER QUEUE, in the panel's own words. It deliberately
+            // does not say "listing now": when the worker is busy the status
+            // line to the LEFT of this mark is already printing the worker's
+            // own phase, and one row saying the same thing twice is how a
+            // status line stops being read.
+            return every + ", skipped while busy";
+        case RbPollState::On:
+            break;
+    }
+    // ...and the running state is the one with a number in it: when it last
+    // read, from which the next round follows (last + the interval). ONE mark
+    // for both halves of §19's first clause - the tooltip does the arithmetic
+    // out loud, the line does not spend a second clause on it.
+    return every + ", last " + rbAgeText(now - I.polledAt) + " ago";
+}
+
+// ...and the WHOLE TOOLTIP, here rather than in the panel, for three reasons
+// that are all the same reason: it quotes two menu labels and two intervals,
+// and a claim that only exists inside a draw call is a claim no test can hold.
+// --browse-selftest B9d reads it - the labels against menus.inc, the intervals
+// against the constants.
+//
+// `%` is never formatted into this: it is assembled, and the panel hands it to
+// SetTooltip with a "%s".
+std::string rbPollTipText(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    const bool peer = !I.b.host.empty();
+    // THIS PANEL's interval first, and that is the review's finding: the mark
+    // beside it says "every 12 s" on a peer's panel, so a tooltip that opened
+    // with the local 3 s would be two numbers for one fact. The other one is
+    // named as the contrast it is.
+    const std::string mine  = rbSecsText(browseWatchInterval(peer));
+    const std::string other = rbSecsText(browseWatchInterval(!peer));
+    std::string t = rbPollStateText(I, now, uiFrame);
+    if (!t.empty()) t += "\n\n";
+    t += "While this panel is being DRAWN it re-reads the folder it is showing\n"
+         "every " + mine + " (this one is " + (peer ? "a peer's" : "on this machine") +
+         "; " + (peer ? "a folder on this machine" : "a folder on a peer") +
+         " is re-read every " + other + ").\n"
+         "The listing simply becomes the new one - nothing is added to it, and\n"
+         "the cursor and the ticks stay on the rows they were on. It stops while\n"
+         "the panel is collapsed, closed or behind another dock tab: there is\n"
+         "nothing on screen to bring up to date.\n\n"
+         // F5, ACCURATELY. It was "the same round by hand, at any time", and it
+         // is neither: it needs this panel to hold the keyboard, and it is a
+         // NAVIGATION (rbRefresh forgets the tree cache and re-lists through
+         // rbGoTo), which also restarts the timer - where a round only replaces
+         // the rows.
+         "F5 re-lists it now, when this panel has the keyboard. That is a\n"
+         "navigation and not this round: it also forgets the folders a tree has\n"
+         "cached, and it starts the interval again from now.\n\n"
+         "This interval is the Browse panel's own. The setting watch.intervalSec\n"
+         "is the OTHER half - how often the files behind the stacks you have\n"
+         "OPEN are looked at.\n\n"
+         "And those two halves do different things, which is the usual surprise:\n"
+         "a listing here is REPLACED for you, but an open stack whose files\n"
+         "changed only SAYS so on its row in Files until you right-click >\n"
+         "Reload from disk - unless this is on:\n"
+         // ONE LINE, and it has to be: B9d pulls every `File > \"...\"` label out
+         // of this text and looks it up in menus.inc, so a label broken across
+         // two lines would be a label that check can never find - and the
+         // coupling this tooltip needs most is the one to the menu it names.
+         "  File > \"Auto-reload a stack when its files change\"\n"
+         "...which is OFF by default. So \"the folder updated but my image did\n"
+         "not\" is both of them working as asked.\n\n"
+         "The switch for all of it is File > \"Watch source files on disk\"\n"
+         "(Preferences, and loading.watchFiles in settings.jsonc, set the same\n"
+         "one).";
+    return t;
+}
+
+// Does this instance owe a round right now? The gates are rbPollStateNow's, and
+// this is that answer plus the clock.
+bool rbPollDue(const App::BrowseInstance& I, double now, uint64_t uiFrame) {
+    if (rbPollStateNow(I, uiFrame) != RbPollState::On) return false;
     return now - I.polledAt >= browseWatchInterval(!I.b.host.empty());
 }
 
@@ -557,10 +733,17 @@ bool rbPollRound(App::BrowseInstance& I, double now, uint64_t uiFrame) {
     // fact already on the glass. So the first round after either event starts
     // the clock and lists nothing - the same shape as §1's first observation,
     // which takes the baseline and announces nothing.
+    //
+    // Asked of rbPollStateNow and not of the four gates by hand, which is the
+    // whole of §19: this branch used to re-state Watch / paused / connected /
+    // drawn, and a copy of a gate is a place for the two to disagree. One
+    // behaviour changed with it and is deliberate: the timer no longer starts
+    // while SEARCH RESULTS are on screen, because that is not a state the
+    // listing is being watched in. So closing a search leaves the panel armed
+    // for one interval rather than due at once - three seconds later instead of
+    // immediately, for a listing that did not change while the search was up.
     if (I.polledAt <= 0) {
-        if (app.watchEnabled && !app.watchPaused && I.b.connected &&
-            rbInstanceDrawn(I, uiFrame))
-            I.polledAt = now;
+        if (rbPollStateNow(I, uiFrame) == RbPollState::Arming) I.polledAt = now;
         return false;
     }
     if (!rbPollDue(I, now, uiFrame)) return false;
@@ -670,8 +853,14 @@ int rbOpenNewStacks(App::BrowseInstance& I) {
 
 // ...and every instance, once per UI frame, beside pumpRemoteBrowse.
 void pumpBrowseWatch(double now) {
-    for (size_t i = 0; i < app.browsePanels.size(); i++)
+    for (size_t i = 0; i < app.browsePanels.size(); i++) {
+        // The clock, left where the DRAW can reach it (§19): this pump is the
+        // one place that holds `now` for this instance, and panel.cpp has no
+        // clock of its own - see BrowseInstance::pollClock for why a second
+        // nowSec() would be worse than no clock at all.
+        app.browsePanels[i]->pollClock = now;
         rbPollRound(*app.browsePanels[i], now, app.uiFrame);
+    }
 }
 // The idle-skip chain's term (§3). It asks "is a round DUE", never "is a Browse
 // panel open": with no panel drawn, none connected or Watch switched off it is
