@@ -1038,16 +1038,19 @@ static int asyncOpenSelftest(const std::string& root) {
         check(g_reloadArrivalStages - stages0 == 1 &&
                   arrivedOn != std::thread::id() && arrivedOn != uiThread,
               "R9f3 the ARRIVALS were decoded on the JOB's thread, not the UI's");
-        // ...and the RE-READ's own probe still says what it said: two stages,
-        // two recorded ids, neither of them this thread's.
+        // ...and the RE-READ's own probe says the same thing about stage 1.
         //
-        // What is NOT asserted is `arrivedOn != reReadOn`, and it was, and
-        // macOS went red on it (CI run 36749229396). Stage 1's thread is
-        // JOINED before stage 2's is started, so its id is free for the
-        // library to hand out again - [thread.thread.id] says an id may be
-        // reused once the thread it named has finished - and on macOS it is.
-        // The two-stage claim is `g_reloadArrivalStages`, which counts the
-        // passes; an id comparison was never evidence for it.
+        // DO NOT ADD `arrivedOn != reReadOn` HERE. It was here, and Linux and
+        // macOS went red on it while Windows went green (CI run 36749229396) -
+        // a correct implementation failing on two platforms out of three.
+        //
+        // THE CONTRACT IS "NOT THE UI THREAD", NEVER "NOT EACH OTHER". Stage
+        // 1's thread is JOINED before stage 2's is started, so its id is free
+        // to be handed out again ([thread.thread.id]: an id may be reused once
+        // the thread it named has finished), and a pool REUSING a thread is
+        // the behaviour one wants rather than a defect. The claim that there
+        // were two passes is `g_reloadArrivalStages`, which counts them; an id
+        // comparison was never evidence for it.
         check(reReadOn != std::thread::id() && reReadOn != uiThread,
               "R9f4 ...and the RE-READ's own thread is recorded too, and is not "
               "this one either");
@@ -1066,6 +1069,41 @@ static int asyncOpenSelftest(const std::string& root) {
         check(own, "R9g2 ...each frame the FILE's own, in the file's order");
         check(si && si->expectedFrames == 5 && !*seqReloadMark(seq),
               "R9g3 ...and the bookkeeping ran, with nothing refused");
+    }
+
+    {   // ---- R9g4/R9g5: TWO reads WHATEVER the number of joining frames -----
+        // What `reads` counts is whole-file READS: g_fileReads is incremented
+        // in readFileBytes, which pulls the entire file into a vector. So the
+        // number this change is about is "how many times were the 480 MB taken
+        // off the disk", and the answer has to be TWO for any grow - one for
+        // the re-read's group, one for the arrivals' group - and in particular
+        // it must NOT MOVE when more frames join. Before this change it was
+        // 1 + (want - have), so five joining frames cost six reads and the
+        // extra five were on the UI thread.
+        //
+        // R9g measures the same thing with two arrivals. This case exists
+        // because a count that happened to equal 2 for two arrivals would say
+        // nothing about the claim; the claim is that it is CONSTANT.
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeArr(2, 8, AH, AW);              // FIVE joining frames, not two
+        const long long reads0 = g_fileReads;
+        watchReloadNow(seq, false);
+        const bool drained = driveReload(24000, -1);
+        const long long reads = g_fileReads - reads0;
+        fprintf(stderr, "asyncopenselftest: R9g4 grew 3 -> 8 (FIVE joining): "
+                        "drained=%d frames=%zu reads=%lld  (whole-file reads; must "
+                        "be 2 for ANY number of arrivals - it was 1+arrivals, so "
+                        "6 here)\n",
+                (int)drained, framesOfSeq(seq).size(), reads);
+        check(drained && framesOfSeq(seq).size() == 8,
+              "R9g4 a grow of FIVE frames lands all five");
+        check(reads == 2,
+              "R9g5 ...and still costs TWO whole-file reads: the count does not "
+              "move with the number of joining frames");
     }
 
     {   // ---- R9h: the SHAPE is a RECORD, and a frame that cannot join says so
