@@ -965,25 +965,38 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         // into the pooled "all" row as well. Pooling here rather than in a
         // second pass keeps the two rows over EXACTLY the same samples.
         auto put = [&](int slot, float val) {
-            double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
-            if (useMax) acc = std::max(acc, (double)val);
-            else if (useMin) acc = std::min(acc, (double)val);
-            else acc += val;
-            (toH ? hN[slot][x] : vN[slot][y])++;
-            // ...and the OFFSET it landed on, which is a statement about the
-            // mosaic rather than about this position: one bit per offset, so a
-            // plane whose value at ONE of its own columns is NaN keeps the bit
-            // (the other columns of that offset set it) and the curve still
-            // breaks there. `cell` is 1 off a mosaic, so bit 0 and nothing else.
-            if (toH) P.hPhase[slot] |= 1u << (x % cell);
-            else     P.vPhase[slot] |= 1u << (y % cell);
+            if (hasProfile[slot]) {         // a slot with no profile - the pooled
+                                            // row on a mosaic - still has moments
+                double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
+                if (useMax) acc = std::max(acc, (double)val);
+                else if (useMin) acc = std::min(acc, (double)val);
+                else acc += val;
+                (toH ? hN[slot][x] : vN[slot][y])++;
+            }
             if (toH) {           // one pass only, or every pixel counts twice
                 fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
                 fMn[slot] = std::min(fMn[slot], (double)val);
                 fMx[slot] = std::max(fMx[slot], (double)val);
             }
         };
+        // THE LATTICE IS WHERE THE PASS LOOKED, NOT WHERE IT FOUND SOMETHING.
+        // Recorded here, before the finiteness test, from the cfaChannelAt call
+        // above (ProjState::hPhase, core/app/state.h). Recording it inside
+        // put() - after the test - made an offset whose samples are ALL
+        // non-finite look like an offset the plane does not have, and then the
+        // stroke walked straight past it and JOINED THE TWO SIDES OF A REAL
+        // GAP. That is exactly the distinction the lattice exists to draw, lost
+        // in the one case it matters: a quad-Bayer frame with one phase dead,
+        // or any plane whose every sample at one offset is NaN.
         for (int s = lo; s < hi; s++) {
+            if (hasProfile[s]) {
+                if (toH) P.hPhase[s] |= 1u << (x % cell);
+                else     P.vPhase[s] |= 1u << (y % cell);
+            }
+            if (P.allRow && hasProfile[4]) {
+                if (toH) P.hPhase[4] |= 1u << (x % cell);
+                else     P.vPhase[4] |= 1u << (y % cell);
+            }
             float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
             if (!std::isfinite(val)) continue;
             put(s, val);

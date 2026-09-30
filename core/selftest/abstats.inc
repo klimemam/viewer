@@ -2234,6 +2234,12 @@
             const bool keepH = app.showProjH, keepV = app.showProjV;
             const bool keepAllRow = app.projAllRow;
             const int keepPlane = app.histPlane;
+            // C14b and C15 put two sides on the panel, and whether the plots
+            // overlay or go side by side is app.abStatsLayout's answer - it
+            // decides whether the plane legend is built over one side or both,
+            // so a group that reads the legend depends on it. Pinned below and
+            // restored here: one selftest home is shared by every test.
+            const auto keepAbLayout = app.abStatsLayout;
             const int keepStatLayout = app.projStatLayout, keepStatOrder = app.projStatOrder;
             const int keepDecimals = app.projDecimals;
             const auto keepCompare = app.compareMode;
@@ -2255,6 +2261,7 @@
             app.projStatOrder = 0;                  // the same whatever the panel width
             app.projDecimals = -1;
             app.histPlane = -1;                     // every plane on the axis
+            app.abStatsLayout = App::AbOverlay;     // one axis, both sides on it
             app.proj[0] = App::ProjState{};
             app.proj[1] = App::ProjState{};
             app.projExtra.clear();
@@ -2294,8 +2301,13 @@
                 return app.images[0].get();
             };
 
-            // The Projection panel, drawn for real - histHlSelftest's frame, unchanged
-            // apart from the panel it calls and the mouse it can aim.
+            // The Projection panel, drawn for real. histHlSelftest's frame shape:
+            // the GL backends when there is a window, io.DisplaySize and a
+            // built font atlas when there is not, two passes so the first one
+            // sizes the window. It is NOT this file's panelFrame - that one is
+            // GL-only and takes no mouse - and it does not clear the step
+            // throttle the way projFrameNow does in N9, because every fixture
+            // here installs its documents and its caches by hand.
             ImGuiIO& io = ImGui::GetIO();
             auto projFrame = [&](float w, float h, ImVec2 mouse) {
                 for (int pass = 0; pass < 2; pass++) {   // the first frame sizes the window
@@ -2950,33 +2962,84 @@
             }
 
             // ======================================================================
-            // C15 - A MOSAIC PREVIEW HAS NO PROFILE, AND SAYS SO. A decimated
-            // remote preview carries every Nth row and column of the sensor, so
-            // the mosaic phase is not preserved: cfaChannelAt over preview
-            // coordinates names a plane the pixel is not from, and every plane's
-            // curve was another plane's values under this plane's name. Four
-            // wrong curves and four wrong columns of numbers, with nothing on
-            // screen distinguishing them from the real thing.
+            // C15 - A MOSAIC PREVIEW HAS NO PROFILE, AND SAYS SO - PER SIDE.
+            // A decimated remote preview carries every Nth row and column of
+            // the sensor, so the mosaic phase is not preserved: cfaChannelAt
+            // over preview coordinates names a plane the pixel is not from, and
+            // every plane's curve was another plane's values under this plane's
+            // name. Four wrong curves and four wrong columns of numbers, with
+            // nothing on screen distinguishing them from the real thing.
+            //
+            // The refusal belongs to THE SIDE, and the panel goes on drawing the
+            // others. Stopping the whole panel because A is a preview took B's
+            // and C's curves and the entire statistics table with them, without
+            // a word - a slot measured perfectly well, blanked because a
+            // different slot is a preview.
             // ======================================================================
             {
-                ImageDoc* d = useOnly(mkFrame("pc_preview", 16, 16, 1, 1));
-                d->src->remoteStep = 2;               // a preview, as the loader marks one
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_preview_A", 16, 16, 1, 1));
+                app.images.push_back(mkFrame("pc_preview_B", 16, 16, 1, 1));
+                app.current = 0;
+                app.images[0]->src->remoteStep = 2;   // A is a preview, as the loader marks one
                 app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
                 draw();
-                dump("C15 a mosaic preview");
-                check(!app.proj[0].unavail.empty(),
-                      "C15 the profile is refused, with a reason");
+                dump("C15 A is a mosaic preview, B is full resolution");
+                fprintf(stderr, "abstatsselftest: C15 notices '%s'\n",
+                        g_projUnavailProbe.c_str());
+                check(!app.proj[0].unavail.empty() && app.proj[1].unavail.empty(),
+                      "C15 A's profile is refused and B's is not");
                 check(app.proj[0].unavail.find("full-resolution remote pixels required") == 0,
                       "C15 ...in computeProfileNoise's words for the same cause");
                 check(field(g_projSideProbe, "unavail=") == "A",
-                      "C15 ...and the panel says it, about A, rather than drawing");
-                check(g_projCurveProbe.empty(),
-                      "C15 no curve is drawn: there is no honest one to draw");
-                check(app.proj[0].h[0].empty() && app.proj[0].hStat[0].valid == false,
-                      "C15 ...and no numbers either, which is the half that was wrong");
-                // ANTI-VACUOUS: the same frame at full resolution has all four.
-                d->src->remoteStep = 1;
+                      "C15 ...and the panel names A, and only A");
+                check(g_projUnavailProbe.find("A: no profile - full-resolution") == 0,
+                      "C15 ...with A's OWN reason in the notice, not an empty string");
+                check(app.proj[0].h[0].empty() && !app.proj[0].hStat[0].valid,
+                      "C15 A has no profile and no numbers - the half that was wrong");
+                // A's planes are named as having no curve, rather than silently
+                // absent; B's four are drawn.
+                check(field(g_projSideProbe, "said-no-curve-planeH=") ==
+                          "R@A,Gr@A,Gb@A,B@A",
+                      "C15 A's four planes are NAMED as having no curve");
+                for (const char* nm : { "R", "Gr", "Gb", "B" }) {
+                    char what[128];
+                    snprintf(what, sizeof what,
+                             "C15 B's plane %s keeps its curve: A's refusal is not B's", nm);
+                    const ProjCurveProbe* c = nullptr;
+                    for (const auto& e : g_projCurveProbe)
+                        if (e.plane == nm && e.horizontal && e.side == "B") c = &e;
+                    check(c && c->points == 8 && c->strokes == 1, what);
+                }
+                check(field(g_projSideProbe, "drewH=") == "R@B,Gr@B,Gb@B,B@B",
+                      "C15 ...and the panel says B is what it drew");
+                // ...and the reason comes from THE SIDE IT IS ABOUT. With the
+                // refused side past B, reading sides[1] printed nothing at all.
+                addCompareSlot(app.images[0].get());       // C, the same preview doc
+                selectImage(1);                            // A is now the full-res frame
+                setCompareB(app.images[1].get());
+                app.abStepBusyUntil = 0;
                 app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C15b unavail='%s' notices '%s'\n",
+                        field(g_projSideProbe, "unavail=").c_str(),
+                        g_projUnavailProbe.c_str());
+                check(field(g_projSideProbe, "unavail=") == "C",
+                      "C15b the refused side is C now, and the panel says C");
+                check(g_projUnavailProbe.find("C: no profile - full-resolution") == 0,
+                      "C15b ...with C's own reason, which sides[1] would have left empty");
+                app.cmpExtra.clear();
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+                app.projExtra.clear();
+                app.images[0]->src->remoteStep = 1;
+                // ANTI-VACUOUS: the same frame at full resolution has all four.
+                useOnly(mkFrame("pc_preview_full", 16, 16, 1, 1));
                 draw();
                 check(app.proj[0].unavail.empty() && curve("R", true) &&
                       curve("R", true)->points == 8,
@@ -2984,12 +3047,18 @@
             }
 
             // ======================================================================
-            // C16 - THE POOLED ROW'S SIGMA IS NOT COLUMN FPN ON A MOSAIC.
-            // Pooling the planes puts their LEVEL DIFFERENCE into every column
-            // mean, so the sigma of those means is a comb with the mosaic's
-            // period - large, and the most quotable wrong number on the panel.
-            // The pooled PROFILE is a dense mean level and stays; the sigma of
-            // it goes.
+            // C16 - ON A MOSAIC THE POOLED ROW HAS NO PROFILE AT ALL. Pooling
+            // the planes makes a DENSE column mean out of their level
+            // difference: every column carries the same mix of planes, so the
+            // profile is perfectly plottable and means the inter-plane offset.
+            // On this 16x16 RGGB fixture its p-p is 415 DN, of which 400 is the
+            // step between the planes and 15 is all the column structure there
+            // is - and it was appearing under the plots as
+            // "all in view [0 .. 15]: p-p 415 (37.38% of mean 1110.19)" three
+            // lines above a footnote saying p-p was unavailable.
+            //
+            // So: no profile, no p-p line, no axis-direction statistics. The
+            // pooled REGION moments - what the row was added for - stand.
             // ======================================================================
             {
                 useOnly(mkFrame("pc_pooled", 16, 16, 1, 1));
@@ -2998,23 +3067,39 @@
                 draw();
                 const App::ProjState& PP = app.proj[0];
                 fprintf(stderr, "abstatsselftest: C16 pooled: profile %zu long, fStat %d, "
-                                "hStat %d, vStat %d\n",
+                                "hStat %d, vStat %d, nFill %d\n",
                         PP.h[4].size(), PP.fStat[4].valid ? 1 : 0,
-                        PP.hStat[4].valid ? 1 : 0, PP.vStat[4].valid ? 1 : 0);
-                check(PP.allRow && PP.h[4].size() == 16,
-                      "C16 fixture: the pooled row is filled, and it is dense");
+                        PP.hStat[4].valid ? 1 : 0, PP.vStat[4].valid ? 1 : 0, PP.nFill);
+                fprintf(stderr, "abstatsselftest: C16 sides '%s'\n",
+                        g_projSideProbe.c_str());
+                check(PP.allRow, "C16 fixture: the pooled row is switched on");
+                check(PP.h[4].empty() && PP.v[4].empty(),
+                      "C16 the pooled PROFILE is not built on a mosaic");
+                check(PP.nFill == 4,
+                      "C16 ...so the walk that draws p-p lines never reaches it");
+                check(field(g_projSideProbe, "spreadH=") == "4" &&
+                      field(g_projSideProbe, "spreadV=") == "4",
+                      "C16 four p-p lines under each plot - the planes, and not 'all'");
                 check(!PP.hStat[4].valid && !PP.vStat[4].valid,
-                      "C16 its sigma of the row/column means is unavailable: pooled planes");
-                check(PP.fStat[4].valid && PP.fStat[4].mean > 0,
+                      "C16 no axis-direction statistics either: unavailable: pooled planes");
+                check(PP.fStat[4].valid && PP.fStat[4].mean > 0 && PP.fStat[4].n > 0,
                       "C16 ...while the pooled REGION mean and sigma are over pixels and stand");
                 // ANTI-VACUOUS: on a 3-channel image the pooled row is still a
-                // pooled row, but the planes are not a mosaic's and there is no
-                // period in the pooling, so the profile sigma is a real one.
+                // pooled row, the planes are not a mosaic's, there is no period
+                // in the pooling - so it keeps its profile, its p-p line and its
+                // profile sigma, and spreadH is four for a DIFFERENT reason
+                // (three channels plus the pooled row).
                 useOnly(mkFrame("pc_pooled_rgb", 16, 16, 0, 3));
                 app.proj[0] = App::ProjState{};
                 draw();
+                fprintf(stderr, "abstatsselftest: C16 RGB sides '%s'\n",
+                        g_projSideProbe.c_str());
+                check(app.proj[0].h[4].size() == 16 && app.proj[0].nFill == 4,
+                      "C16 a non-mosaic pooled row DOES get a profile");
                 check(app.proj[0].hStat[4].valid && app.proj[0].vStat[4].valid,
-                      "C16 a non-mosaic pooled row keeps its profile sigma");
+                      "C16 ...and keeps its profile sigma");
+                check(field(g_projSideProbe, "spreadH=") == "4",
+                      "C16 ...and its p-p line: three channels plus 'all'");
                 app.projAllRow = false;
             }
 
@@ -3058,6 +3143,136 @@
                 app.annRev++;
             }
 
+            // ======================================================================
+            // C18 - THE LATTICE IS WHERE THE PASS LOOKED, NOT WHERE IT FOUND
+            // SOMETHING. The phase bits were being set inside put(), which runs
+            // only for FINITE values - so an offset whose every sample is
+            // non-finite looked like an offset the plane does not have, the
+            // stroke walked straight past it, and it JOINED THE TWO SIDES OF A
+            // REAL GAP. That is the one distinction this whole change exists to
+            // draw, lost in the case where it matters most.
+            //
+            // The fixture is quad Bayer, where a plane owns TWO offsets of the
+            // four - R owns x mod 4 in {0, 1} - and every pixel at offset 0 is
+            // NaN. 32 columns, so R has 16 sample positions, 8 of them dead.
+            //   before: the offset-0 bit never set, lattice 8, one unbroken
+            //           8-point curve from column 1 to column 29 - bridging
+            //           seven dead columns in silence
+            //   after:  lattice 16, and no two live samples are adjacent on it,
+            //           so there is NO LINE TO DRAW - and the panel says which
+            //           plane it left off instead of drawing a lie
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_dead_phase", 32, 32, 2, 1));
+                for (int y = 0; y < 32; y++)
+                    for (int x = 0; x < 32; x++)
+                        if ((x % 4) == 0 && cfaChannelAt(*d, x, y) == 0)
+                            d->px()[(size_t)y * 32 + x] =
+                                std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C18 quad Bayer with R's offset 0 dead");
+                const App::ProjState& PQ = app.proj[0];
+                check(PQ.cell == 4, "C18 fixture: a quad cell, so a plane owns two offsets");
+                check(std::isnan(PQ.h[0][0]) && std::isnan(PQ.h[0][4]) &&
+                      std::isfinite(PQ.h[0][1]) && std::isfinite(PQ.h[0][5]),
+                      "C18 fixture: R's offset-0 columns really hold no finite pixel");
+                const ProjCurveProbe* r = curve("R", true);
+                check(r && r->lattice == 16,
+                      "C18 the dead offset is still a POSITION R has: lattice 16, not 8");
+                check(r && r->points == 0,
+                      "C18 ...so no two live samples are adjacent and no line is drawn");
+                check(field(g_projSideProbe, "said-no-curve-planeH=") == "R@A",
+                      "C18 ...and the panel names R rather than bridging the gap");
+                // ANTI-VACUOUS: Gr owns offsets 2 and 3, both alive, and is a
+                // whole 16-point curve on the same frame.
+                const ProjCurveProbe* g = curve("Gr", true);
+                check(g && g->lattice == 16 && g->points == 16 && g->strokes == 1,
+                      "C18 Gr, whose offsets are both alive, is one whole curve");
+                check(field(g_projSideProbe, "drewH=") == "Gr@A,Gb@A,B@A",
+                      "C18 ...and the other three planes are what was drawn");
+            }
+
+            // ======================================================================
+            // C19 - THE "all" CHECKBOX TAKES EFFECT AT ONCE. app.projAllRow was
+            // not in the cache key, so ticking it hit the cache and did nothing
+            // until some OTHER condition changed - move the ROI, step a frame -
+            // and the row then appeared for a reason the reader did not do.
+            // Asserted on a non-mosaic image, where the pooled row has a
+            // profile, so the change is visible in the walk itself.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_allrow_key", 16, 16, 0, 3));
+                app.projAllRow = false;
+                draw();
+                const int fillOff = app.proj[0].nFill;
+                const bool rowOff = app.proj[0].allRow;
+                app.projAllRow = true;          // ...and NOTHING else changes
+                draw();
+                const int fillOn = app.proj[0].nFill;
+                fprintf(stderr, "abstatsselftest: C19 nFill %d -> %d, allRow %d -> %d\n",
+                        fillOff, fillOn, rowOff ? 1 : 0, app.proj[0].allRow ? 1 : 0);
+                check(fillOff == 3 && !rowOff,
+                      "C19 fixture: three channels and no pooled row");
+                check(fillOn == 4 && app.proj[0].allRow && app.proj[0].h[4].size() == 16,
+                      "C19 ticking 'all' recomputes on the very next frame");
+                app.projAllRow = false;
+                draw();
+                check(app.proj[0].nFill == 3 && !app.proj[0].allRow,
+                      "C19 ...and un-ticking it does too, with nothing else touched");
+            }
+
+            // ======================================================================
+            // C20 - THE p-p LINES ARE RESERVED FOR. One "in view" line per
+            // series is drawn under each plot, and the height budget allowed
+            // ONE line per plot - so a mosaic's four (five with the pooled row)
+            // pushed the statistics table below the visible panel, exactly where
+            // the numbers are read.
+            //
+            // Asserted as the relation between the two numbers rather than as a
+            // plot height: `each` has a 60 px floor, so on a panel with little
+            // room both budgets clamp to the same height and a height
+            // comparison passes or fails on how much space the test window
+            // happened to have. What has to be true is that the reservation is
+            // the number of lines the spread loop will DRAW - which is the
+            // 1-against-4 the defect was.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_reserve", 16, 16, 1, 1));       // a mosaic: four
+                app.projAllRow = false;
+                draw();
+                fprintf(stderr, "abstatsselftest: C20 mosaic pprows=%s spreadH=%s "
+                                "(plot %.1f px)\n",
+                        field(g_projSideProbe, "pprows=").c_str(),
+                        field(g_projSideProbe, "spreadH=").c_str(),
+                        curve("R", true) ? curve("R", true)->py1 - curve("R", true)->py0 : 0.0f);
+                check(field(g_projSideProbe, "pprows=") == "4" &&
+                      field(g_projSideProbe, "spreadH=") == "4",
+                      "C20 a mosaic reserves four p-p rows and draws four");
+                useOnly(mkFrame("pc_reserve_rgb", 16, 16, 0, 3));   // three + pooled
+                app.projAllRow = true;
+                draw();
+                fprintf(stderr, "abstatsselftest: C20 RGB+all pprows=%s spreadH=%s\n",
+                        field(g_projSideProbe, "pprows=").c_str(),
+                        field(g_projSideProbe, "spreadH=").c_str());
+                check(field(g_projSideProbe, "pprows=") == "4" &&
+                      field(g_projSideProbe, "spreadH=") == "4",
+                      "C20 ...and three channels plus the pooled row reserve four too");
+                // ANTI-VACUOUS: a single plane reserves ONE, so "4" above is not
+                // a constant the panel always prints.
+                app.projAllRow = false;
+                useOnly(mkFrame("pc_reserve_mono", 16, 16, 0, 1));
+                draw();
+                fprintf(stderr, "abstatsselftest: C20 mono pprows=%s spreadH=%s\n",
+                        field(g_projSideProbe, "pprows=").c_str(),
+                        field(g_projSideProbe, "spreadH=").c_str());
+                check(field(g_projSideProbe, "pprows=") == "1" &&
+                      field(g_projSideProbe, "spreadH=") == "1",
+                      "C20 one plane reserves one - the budget follows the series count");
+            }
+
             // ---- everything borrowed, put back ------------------------------------
             app.anns.clear();
             app.nextAnnId = 1;
@@ -3081,6 +3296,7 @@
             app.projStatOrder = keepStatOrder;
             app.projDecimals = keepDecimals;
             app.histPlane = keepPlane;
+            app.abStatsLayout = keepAbLayout;
             app.compareMode = keepCompare;
             app.linkRange = keepLink;
             app.prefsDirty = keepPrefsDirty;

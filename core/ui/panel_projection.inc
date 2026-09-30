@@ -31,6 +31,9 @@ struct ProjCurveProbe {
     // never a packed index. This is what "the x axis is not compressed" means
     // as a measurement: an RGGB Gr curve starts at column 1, not at 0.
     int xFirst = -1, xLast = -1;
+    int sideIdx = -1;        // this side's place in the panel's side list, so a
+                             // notice about the curve can reach the side's own
+                             // region size rather than A's
     float px0 = 0, px1 = 0, py0 = 0, py1 = 0;   // the plot rect, in screen px
     float xmin = 0, xmax = 0;                   // ...and the axis it carries, so
                                                 // a test can aim at a column
@@ -40,6 +43,11 @@ static std::vector<ProjCurveProbe> g_projCurveProbe;
 // where a plane has no sample is a sentence, and a sentence nothing asserts is
 // a sentence that drifts.
 static std::string g_projHoverProbe;
+// ...and the "no profile" notices, one per refused side, joined by '|'. The
+// LETTERS alone are not enough to assert: the defect this catches was the
+// reason being read from sides[1] whatever side it was about, which printed an
+// empty string for C and later and is invisible in a list of letters.
+static std::string g_projUnavailProbe;
 
 // Does series `s` carry a sample at profile index `i` AT ALL? The mosaic's
 // answer, not the data's: for a Bayer plane every other index is a position the
@@ -131,6 +139,7 @@ static void drawPanelProjection() {
     g_projSideProbe.clear();
     g_projCurveProbe.clear();
     g_projHoverProbe.clear();
+    g_projUnavailProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -197,18 +206,31 @@ static void drawPanelProjection() {
                                             P.rw, P.rh);
     }
 
-    // ---- no profile at all, and WHY (ProjState::unavail) ------------------
+    // ---- the sides with no profile at all, and WHY (ProjState::unavail) ---
     // The decimated remote preview of a mosaic: the phase is gone, so there is
-    // nothing to draw that would not be one plane's values under another's
-    // name. Said and stopped, rather than drawn empty with a full table of
-    // dashes under it - the reader's next question ("is my sensor broken or is
-    // this the preview?") is answered by the sentence and by nothing else.
-    if (!P.unavail.empty()) {
-        g_projSideProbe += "unavail=A;";
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextColored(AB_AMBER, "no profile: %s", P.unavail.c_str());
-        ImGui::PopTextWrapPos();
-        return;
+    // nothing to draw for THAT SIDE that would not be one plane's values under
+    // another's name.
+    //
+    // PER SIDE, and the panel goes on. Returning here because A is a preview
+    // took B's and C's curves and their whole statistics table with it, and
+    // said nothing about having done so - a slot that was measured perfectly
+    // well, blanked because a different slot is a preview. And the reason is
+    // read from THE SIDE IT IS ABOUT: taking it from sides[1] printed an empty
+    // string whenever the refused side was C or later.
+    {
+        std::string un;
+        for (const ProjSide& sd : sides) {
+            if (sd.S->unavail.empty()) continue;
+            if (!un.empty()) un += ",";
+            un += sd.name;
+            if (!g_projUnavailProbe.empty()) g_projUnavailProbe += "|";
+            g_projUnavailProbe += sd.name + ": no profile - " + sd.S->unavail;
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(AB_AMBER, "%s: no profile - %s", sd.name.c_str(),
+                               sd.S->unavail.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        if (!un.empty()) g_projSideProbe += "unavail=" + un + ";";
     }
 
     // value axis: a rescaling y axis makes profiles impossible to compare
@@ -304,47 +326,6 @@ static void drawPanelProjection() {
                        : abSeriesMatch(P.seriesNames, P.nSeries,
                                        sides[si].S->seriesNames[s]);
     };
-    // ---- the value axis, AFTER the plane selector, because it depends on it.
-    // ProjState::hMin/hMax are over every plane the pass computed, so
-    // narrowing the selector to one plane left the axis sized for four - and on
-    // a mosaic the planes sit at different LEVELS, which is what a colour
-    // filter array does. A lens-shading tilt of a few percent inside one plane
-    // was then flattened into a straight line by three other planes' levels,
-    // on the axis whose "auto" is there to make the shape readable. It is also
-    // the canon's own rule (planes are not mixed) applied to the axis.
-    auto drawnRange = [&](bool horizontal, float& lo, float& hi) {
-        lo = FLT_MAX; hi = -FLT_MAX;
-        for (size_t si = 0; si < sides.size(); si++) {
-            const App::ProjState& S = *sides[si].S;
-            const std::vector<float>* series = horizontal ? S.h : S.v;
-            for (int s = 0; s < S.nSeries; s++) {
-                const int a = matchA(si, s);
-                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
-                for (float v : series[s])
-                    if (std::isfinite(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
-            }
-        }
-    };
-    float yLo, yHi;
-    if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
-    else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
-    else {                       // shared across H, V - and across EVERY side,
-                                 // so no pane and no curve is rescaled to fit
-        float hl, hh, vl, vh;
-        drawnRange(true, hl, hh);
-        drawnRange(false, vl, vh);
-        yLo = std::min(hl, vl); yHi = std::max(hh, vh);
-        // ...and if the selector has left nothing measurable on the axis, the
-        // whole-image range rather than an inverted one
-        if (!(yLo < yHi)) {
-            yLo = FLT_MAX; yHi = -FLT_MAX;
-            for (const ProjSide& sd : sides) {
-                yLo = std::min(yLo, std::min(sd.S->hMin, sd.S->vMin));
-                yHi = std::max(yHi, std::max(sd.S->hMax, sd.S->vMax));
-            }
-        }
-        if (!(yLo < yHi)) { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }
-    }
 
     // Overlay is only honest when the profiles are the SAME axis: same length
     // and same origin. Different lengths cannot be aligned without knowing the
@@ -579,6 +560,53 @@ static void drawPanelProjection() {
     float each = std::max((avail - lineH * (float)ppRows * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
+    // ---- the value axis, AFTER the plane selector AND after nPlot, because it
+    // depends on both.
+    // ProjState::hMin/hMax are over every plane the pass computed, so
+    // narrowing the selector to one plane left the axis sized for four - and on
+    // a mosaic the planes sit at different LEVELS, which is what a colour
+    // filter array does. A lens-shading tilt of a few percent inside one plane
+    // was then flattened into a straight line by three other planes' levels,
+    // on the axis whose "auto" is there to make the shape readable. It is also
+    // the canon's own rule (planes are not mixed) applied to the axis.
+    // ...and only over the sides the plots actually CARRY. A side a spoken
+    // limit keeps off the axis still set the axis, so arming a fifth slot with
+    // four planes on the axis - which puts C, D and E off the plot by name -
+    // moved the scale of the two curves that are on it.
+    auto drawnRange = [&](bool horizontal, float& lo, float& hi) {
+        lo = FLT_MAX; hi = -FLT_MAX;
+        for (size_t si = 0; si < sides.size() && si < nPlot; si++) {
+            const App::ProjState& S = *sides[si].S;
+            const std::vector<float>* series = horizontal ? S.h : S.v;
+            for (int s = 0; s < S.nSeries; s++) {
+                const int a = matchA(si, s);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                for (float v : series[s])
+                    if (std::isfinite(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
+            }
+        }
+    };
+    float yLo, yHi;
+    if (app.projYMode == 1) { yLo = effBlack(*im); yHi = effWhite(*im); }
+    else if (app.projYMode == 2) { yLo = app.projYLo; yHi = app.projYHi; }
+    else {                       // shared across H, V - and across EVERY side,
+                                 // so no pane and no curve is rescaled to fit
+        float hl, hh, vl, vh;
+        drawnRange(true, hl, hh);
+        drawnRange(false, vl, vh);
+        yLo = std::min(hl, vl); yHi = std::max(hh, vh);
+        // ...and if the selector has left nothing measurable on the axis, the
+        // whole-image range rather than an inverted one
+        if (!(yLo < yHi)) {
+            yLo = FLT_MAX; yHi = -FLT_MAX;
+            for (const ProjSide& sd : sides) {
+                yLo = std::min(yLo, std::min(sd.S->hMin, sd.S->vMin));
+                yHi = std::max(yHi, std::max(sd.S->hMax, sd.S->vMax));
+            }
+        }
+        if (!(yLo < yHi)) { yLo = std::min(P.hMin, P.vMin); yHi = std::max(P.hMax, P.vMax); }
+    }
+
     // x range: the UNION of every side's sample range, so every plot (side by
     // side or overlaid) carries the same axis and none is rescaled to fit.
     auto xRange = [&](bool horizontal, float& x0, float& x1) {
@@ -616,6 +644,7 @@ static void drawPanelProjection() {
             const std::vector<float>& d = series[s];
             ProjCurveProbe cp;
             cp.side = sides[si].name;
+            cp.sideIdx = (int)si;
             cp.plane = S.seriesNames[s] ? S.seriesNames[s] : "?";
             cp.horizontal = horizontal;
             cp.px0 = pr.p0.x; cp.px1 = pr.p1.x; cp.py0 = pr.p0.y; cp.py1 = pr.p1.y;
@@ -650,8 +679,12 @@ static void drawPanelProjection() {
             // decimate to the plot's pixel width: 4000 samples into 400 px was
             // 4000 line segments per series per frame. Over nOwn, because that
             // is how many points this curve can have - taking it over n gave a
-            // mosaic plane a stride `cell` times larger than it needed and
-            // threw away half of every plane's resolution.
+            // mosaic plane a stride TWICE what it needed and threw away half of
+            // every plane's resolution. Twice, not `cell` times: a Bayer plane
+            // owns one column of every two and a quad-Bayer plane owns two of
+            // every four, so nOwn is rw/2 either way and the ratio does not
+            // depend on the cell. (That is also why projSampleCount counts the
+            // phase bits instead of dividing by the cell.)
             int px = std::max(1, (int)(pr.p1.x - pr.p0.x));
             int stride = std::max(1, nOwn / px);
             cp.stride = stride;
@@ -820,8 +853,20 @@ static void drawPanelProjection() {
         else
             snprintf(yl, sizeof yl, "%s value (%s%s)", modes[std::clamp(app.projMode, 0, 2)],
                      abValueUnit(im->dtype).c_str(), yr);
-        PlotRect pr = beginPlot(horizontal ? "column x (px)" : "row y (px)", yl,
-                                x0, x1, yLo, yHi, true, false, each);
+        // A decimated preview's columns are every Nth column OF THE SENSOR, so
+        // "column x (px)" names a sensor coordinate these samples do not have -
+        // and this panel's whole x-axis ruling is that x IS the sensor's column
+        // (docs/features/analysis/stats-taxonomy.md §10). A MOSAIC preview is
+        // refused outright (the phase is gone); a mono or RGB one is still an
+        // honest profile, of the preview's own grid, and says so.
+        char xl[112];
+        bool anyPreview = false;
+        for (size_t si : which)
+            if (sides[si].S->img && sides[si].S->img->src->remoteStep > 1) anyPreview = true;
+        snprintf(xl, sizeof xl, "%s%s", horizontal ? "column x (px)" : "row y (px)",
+                 anyPreview ? "  -  PREVIEW grid: every Nth sensor line, not sensor x"
+                            : "");
+        PlotRect pr = beginPlot(xl, yl, x0, x1, yLo, yHi, true, false, each);
         if (!pr.ok) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->PushClipRect(pr.p0, pr.p1, true);
@@ -848,28 +893,38 @@ static void drawPanelProjection() {
         // the KEY, as it is for spreadH/spreadV, because a plot says this once
         // per axis and a probe field is found by its first occurrence.
         {
-            std::string drew, quiet;
+            std::string drew, quiet, why;
             for (size_t k = probe0; k < g_projCurveProbe.size(); k++) {
                 const ProjCurveProbe& c = g_projCurveProbe[k];
                 std::string& into = c.points >= 2 ? drew : quiet;
                 if (!into.empty()) into += ",";
                 into += c.plane + "@" + c.side;
+                if (c.points >= 2) continue;
+                // The reason is THIS plane's on THIS side. One reason built
+                // from A's rw applied it to every side's planes and told a mono
+                // frame about the mosaic: with A 4000 wide and C an 8-column
+                // ROI, the sentence quoted 4000 for the curve that is missing.
+                const int span = c.sideIdx >= 0 && (size_t)c.sideIdx < sides.size()
+                               ? (horizontal ? sides[c.sideIdx].S->rw
+                                             : sides[c.sideIdx].S->rh)
+                               : 0;
+                char b[128];
+                snprintf(b, sizeof b, "%s%s@%s: %d of %s %d",
+                         why.empty() ? "" : ", ", c.plane.c_str(), c.side.c_str(),
+                         c.lattice, horizontal ? "column" : "row", span);
+                why += b;
             }
             g_projSideProbe += std::string(horizontal ? "drewH=" : "drewV=") + drew + ";";
-            if (!quiet.empty())
+            if (!quiet.empty()) {
                 g_projSideProbe += std::string(horizontal ? "said-no-curve-planeH="
                                                           : "said-no-curve-planeV=") +
                                    quiet + ";";
-            if (!quiet.empty()) {
                 ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextColored(AB_AMBER,
-                                   "no curve for %s: fewer than two points on this axis "
-                                   "here - the region is %d %s wide and a mosaic plane "
-                                   "has its own share of that. Their numbers are in the "
-                                   "table below.",
-                                   quiet.c_str(),
-                                   horizontal ? P.rw : P.rh,
-                                   horizontal ? "column(s)" : "row(s)");
+                                   "no curve for %s - a line needs two points and these "
+                                   "have fewer samples than that (%s). Their numbers are "
+                                   "in the table below.",
+                                   quiet.c_str(), why.c_str());
                 ImGui::PopTextWrapPos();
             }
         }
@@ -988,25 +1043,6 @@ static void drawPanelProjection() {
         ImGui::PopTextWrapPos();
     }
     if (tooNarrow) abNarrowNote();
-    {   // A side with no profile of its own - a slot showing a mosaic preview
-        // while A shows a full-resolution frame. Its curves are absent and the
-        // plane-level notice above already names them; this says why, once,
-        // with the letter, because "no curve" and "no profile" are different
-        // answers and only one of them will change on its own.
-        std::string un;
-        for (size_t i = 1; i < nSides; i++)
-            if (!sides[i].S->unavail.empty()) {
-                if (!un.empty()) un += ", ";
-                un += sides[i].name;
-            }
-        if (!un.empty()) {
-            g_projSideProbe += "unavail=" + un + ";";
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextColored(AB_AMBER, "slot %s: no profile - %s", un.c_str(),
-                               sides[1].S->unavail.c_str());
-            ImGui::PopTextWrapPos();
-        }
-    }
     {   // What the plots took and what they left, as the panel says it - the
         // silence issue #60 caught here was slots getting table rows while the
         // plots drew A and B and said NOTHING about the letters they left off.
@@ -1028,8 +1064,8 @@ static void drawPanelProjection() {
             // other printed form: "auto" that ignores the plane selector, and a
             // row budget that is half the rows, are silent failures otherwise.
             char b[96];
-            snprintf(b, sizeof b, "y=%.9g..%.9g;statrows=%d;", (double)yLo, (double)yHi,
-                     tableRowsWalked);
+            snprintf(b, sizeof b, "y=%.9g..%.9g;statrows=%d;pprows=%d;",
+                     (double)yLo, (double)yHi, tableRowsWalked, ppRows);
             g_projSideProbe += b;
         }
         if (!offMsg.empty()) {
