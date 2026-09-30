@@ -1,15 +1,21 @@
 # Watch 設計 — 元ファイルの変化を検知し、通知し、再読込する (項目20)
 
-> **現行状態 (2026-09-29):** 項目20 は全節実装済み —— ローカル／remote の変化検知と
+> **現行状態 (2026-10-01):** 項目20 は全節実装済み —— ローカル／remote の変化検知と
 > 通知、手動 Reload、ローカル stack の opt-in Auto-reload、remote の membership 再構築、
 > Browse インスタンスの「Watch: open new stacks」(§17.1)、frame 軸1ファイルの枚数変化
-> (§17.2)、設定 `watch.intervalSec` (§17.3)、そして **Reload 自体を UI スレッドから
-> 外し §5 の通知を stack 行へ折り畳んだ** (§18)。意図して残る境界は remote
-> Auto-reload の明示拒否だけである。
-> §11〜§18 は、実装時に設計を訂正した経緯を残す実装記録である。それ以前の「未着手」は後続節に
+> (§17.2)、設定 `watch.intervalSec` (§17.3)、**Reload 自体を UI スレッドから
+> 外し §5 の通知を stack 行へ折り畳み** (§18)、そして **伸びた frame 軸の arrivals も
+> worker へ出した** (§20)。意図して残る境界は remote Auto-reload の明示拒否だけである。
+> §11〜§20 は、実装時に設計を訂正した経緯を残す実装記録である。それ以前の「未着手」は後続節に
 > よって上書きされる。現行の受入れは `selftest.watch` / `selftest.rwatch` /
-> `selftest.browse` (B7, §5 の Browse 側) / `selftest.asyncopen` (R 群、§18) /
+> `selftest.browse` (B7, §5 の Browse 側) / `selftest.asyncopen` (R 群、§18・§20) /
 > `selftest.verify` (V29、§18) が担う。
+>
+> **§20 (2026-09-30 の板 319) が §18.2 の4つ目の決定を訂正している。**
+> 「§6 の arrivals は動かさない —— 参加する frame は参照フレームの**現在の**形に対して
+> 測るので、その形は最後の item が着地するまで存在しない」は**もう成り立たない**。
+> 形は1段目の着地時に**1回記録**され、2段目の worker が参加フレームをその記録に対して
+> 測る。UI スレッドは1バイトも読まない (§20)。
 >
 > **§18 (2026-09-28 のユーザー報告2件) が §5 と §16.6 を訂正している。**
 > 通知面はもう「ヘッダ行直下の琥珀の1行 + [Reload]」ではなく**stack 行そのものの印**
@@ -1239,6 +1245,9 @@ membership と departures) / ループ / `reloadStackTail` (arrivals、seqIndex
   最後の item が着地するまで存在しない。だから「ファイルが増えたフォルダの
   Reload」は、その**1ファイル**をいまも UI スレッドで decode する。
   報告の原因だった F メンバーの再読みはその手前にいた部分で、そこが動いた。
+  **(この決定は §20 が訂正した —— 板 319。「形が最後の item まで存在しない」は
+  その通りで、だから形を1段目の着地時に1回記録して2段目へ渡す。以後は §20 が
+  優先する。)**
 
 ### 18.2b 実測 —— そして残った 1.5 秒は Reload のものではない
 
@@ -1521,3 +1530,200 @@ File > "Watch source files on disk" (Preferences と settings.jsonc の
   書いているのと同じ制約で、起こして直すのは 0 fps アイドルそのものを壊す。
 - 印は Browse パネルにしかない。stack 側 (Files 行) の「見ているか」は
   §5 の印が別に持っている。両者を1つの語彙に寄せるかは未決。
+
+---
+
+## 20. 実装記録と設計訂正 (2026-09-30、板 319 —— 伸びた frame 軸の arrivals も worker へ)
+
+§18 は「Reload はもう UI スレッドで走らない」と書いた。**1本だけ残っていた。**
+
+§18.2 の4つ目の決定が、残すことを明示して残した経路である —— 「参加する frame は
+**参照フレームの現在の形**に対して測るのが §6 で、その形は最後の item が着地するまで
+存在しない。だから『ファイルが増えた』側の Reload は、その1ファイルをいまも UI
+スレッドで decode する」。書いてあったので隠れてはいなかったが、**撮影が 3 枚の
+ところに 5 枚書いた日の Reload は、直したはずの freeze をそのまま再現した**。
+
+### 20.1 まず測った —— 板の備考が「実測は未取得」と言っていた
+
+道具は §18.2b と同じ (`viewer_work/g232/tools/measure/freeze_probe.ps1` の
+WM_NULL + `IsHungAppWindow`、50 ms 刻み、warm cache、中央値3回)。**ジェスチャは
+本当に起こしている**: `loading.watchFiles` + `loading.watchAutoReload` を ON にした
+窓付き実行で stack を開き、絵が出て 2.5 秒 pump が澄んでから**横からファイルを
+rename で差し替え**、§4 の2回読みが確定して `watchReloadNow(seq, true)` が走るのを
+測る。報告するのは**差し替えより後**の最長無応答だけなので、open 自身の停止
+(別経路・既測) と混ざらない。
+
+| ケース (480 MB の `.npy` 1ファイル) | before | after |
+| --- | --- | --- |
+| 3 枚常駐 → ディスクが 5 枚 (1枚 6000x4000 f32 = 96 MB) | **375 ms** | **0 ms** |
+| 3 枚常駐 → ディスクが 10 枚 (1枚 4000x3000 f32 = 48 MB) | **1374 ms** | **0 ms** |
+
+before/after は同じ機械で**連続して**取った (before は 372 / 502 / 375 ms と
+1370 / 1374 / 1499 ms、after は 6 回すべて 0 ms)。before はどの回も
+**連続1本**の停止で (timeline が `stall:1374 ok:…` の1本)、after はどの回も
+`stall` の区間が**1つも無い**。停止は参加フレームの枚数に比例していて
+(2 枚で 375 ms、7 枚で 1374 ms ≒ 枚数 × 1 回のファイル全読み)、それが板の行の
+「1 frame ごとに whole-file read を UI スレッドで回す」そのものである。
+
+**機械の騒がしさは実際に効く**ので書いておく: 同じ2つのケースを、他のエージェントが
+同じ機械でビルドを回している最中に測ると before 641 / 1797 ms、after 376 / 375 ms で、
+after 側に 125〜500 ms の短い episode が 8〜11 本並んだ。静かな機械では after は
+0 ms になるので、**あの残差はこの経路のものではない**。after に残りうる停止の正体は
+§18.2b が2行目の残差として切り出した「1枚が何画素か」に比例する GL テクスチャ
+アップロードで、**別課題**のままである。
+
+読みの回数も動いた: 3 枚常駐 → 5 枚の grow は**ファイル全読み 3 回 → 2 回**
+(1回目が再読み、2回目が**参加フレーム全部で1回**)。7 枚参加なら 8 回 → 2 回である。
+`--asyncopen-selftest` **R9g** が `g_fileReads == 2` で押さえる。
+
+### 20.2 裁定 (Fable, 2026-09-30) —— 2段の job。形は**1段目の着地時に1回**記録する
+
+> 頭のフレームを1段目で着地させ、その着地した形を plan に記録し、2段目の worker が
+> 参加フレームをその記録に対して測る。**UI スレッドは1バイトも読まない。**
+
+理由は「**着地時に読むのをやめる**」である。参加フレームが着地するたびに頭の
+*現在の*形を見る実装は、**同じ Reload が item のスケジューリング次第で違う結果を
+出す**: 頭の再読みより前に着地した frame は昨日の形に対して測られ、後に着地した
+frame は今日の形に対して測られる。これはこのプロジェクトが別の名前で2回閉じてきた
+欠陥の型である —— **ROI のバンド記憶が寸法をまたいで使われた**件、**Projection の
+位相格子を有限性から推測していた**件。両方から出た規律は1つで、**形は1箇所で1回
+決まり、記録され、以後それが参照される**。
+
+実装上の型は `WatchAxisPlan` の2組の数である:
+
+- `was{W,H,Ch}` —— plan を取った時点 (1バイトも再読みする前) の頭の形。
+- `head{W,H,Ch}` —— **着地した**頭の形。`watchFrameAxisHead` が、再読みが終わった
+  その1点で書き込む。以後の join はこれしか見ない。
+
+2組にしてあるのは、**幾何が動いたことを言わなければならない**からで、「動いた」は
+比較だからである (§20.3)。
+
+### 20.3 画面が言うこと —— 2つとも「枚数」では言えない事実である
+
+`watch::frameAxisText` (§17.2) は「いま何枚が測定に入っているか」を言う。arrivals に
+ついてそれが言えないことが2つある。両方 `core/watch.h` に1綴りで置き、パネルと
+selftest が同じ文字列を読む (`findingText` の規律)。
+
+**(a) stack の幾何が動いた。** 参加フレームは新しい頭に対して測ってよい —— それが
+いまディスクにあるファイルのフレームだから。しかし**黙って**それをやると、読んで
+いる人の手元には「見ていたのと違う絵の time 軸を持つ stack」が残り、それを告げる
+ものがどこにも無い。自動 Reload は誰もクリックしていないので、これはまさに静かで
+あってはいけない変化である (§9 rule 3)。語彙は `frameShapeText` のもので、stack
+行と `stackShapeRefusal` が形を書くのと同じ3つの数・同じ順である:
+
+```
+this stack's geometry changed: its frames are 450x350 1ch now, was 900x700 1ch
+ - the joining frame(s) were measured against the new shape
+```
+
+**(b) 参加できなかったフレームは、理由を言って拒否する。** 黙って落とす / 黙って
+縮めるのは禁止。**拒否は growth を終わらせる**のであって飛び越えない —— これは
+手抜きではなく不変条件で、`watchFrameAxisPlan` は「frames 0..N-1 の連続した前半」
+にしか適用されないから、frame 3 を拒否して frame 4 を受け入れた stack は**次の
+plan に名指しで断られ**、この機構がその stack について静かに働かなくなる。だから
+言う理由は1つで、**その後ろのフレームは数えられる**:
+
+```
+0 of 2 new frame(s) joined - frame 3 did not: 900x700 1ch and arr.npy is 100x80 1ch:
+ a run of numbered files is a stack, and a stack's frames are one shape - open it on
+ its own, and the 1 frame(s) after it are not in the measurement either (a stack's
+ frames are the file's first N)
+```
+
+Stop で終わった grow も同じ文で言う (「読まれる前に止められた」が理由になる) ——
+**止まったから黙って UI スレッドで残りを読む、にはしない。** それが板の行そのもの
+だからである。
+
+`detail` 行も出す。`watch: frame axis 3 -> 5 offered=2 joined=2 refused=0 resident=5
+shape=6000x4000 1ch->6000x4000 1ch` —— 何枚参加し何枚しなかったかが、トーストが
+消えた後にログから読める。
+
+### 20.4 どこに足したか —— **新しい並行機構は作らない**。既存 job の2段目にした
+
+`core/app/open_dispatch.inc` の既存構造を読んでから決めた。`App::ReloadJob` を
+そのまま2周させる:
+
+    stage 1   `items` = 常駐メンバー。再読み (reloadSpecOf / reloadDecodeGroup /
+              reloadLand) が着地する。**そこで初めて**頭の形が事実になるので、
+              `watchFrameAxisHead` が plan に書き込む。
+    stage 2   `arrivals` = 参加フレーム。`reloadArrivalItems` が plan だけから
+              `ReloadSpec` を組み、同じ `reloadJobWorker` / `reloadDecodeGroup` が
+              decode する。着地は swap ではなく **join** (`watchFrameAxisJoin`)。
+
+**同じ job にした理由**は、`app.reloadJob` が「reload は走っているか」を訊かれる
+唯一のフィールドだからである —— `watchAutoBusy`、`reloadInFlightFor` (飛行中の
+crop 拒否)、`startStackReload` のフォールド、Files 行の進捗と Stop、`closeAll` の
+cancel、`waitForReloadJob`。2つ目のオブジェクトを作れば**その全部に2つ目の項**が
+必要になり、間違っているのは常に誰も見ていない方である。ジェスチャは1回の Reload
+で、**新しいフレームが入るまで終わっていない**。
+
+足したもの (`core/app/state.h`、watch / reload の plan に必要な分だけ):
+
+- `WatchAxisPlan`: `offered()` / `was{W,H,Ch}` / `head{W,H,Ch}` / `headRecorded()` /
+  `shapeMoved()` / `arrived` / `joined` / `firstRefusal`。
+- `App::ReloadJob`: `stage` / `arrivals` / `arrivalEnd` / `arrivalsLanded` /
+  `arrivalThread`。
+- `g_reloadArrivalThread` / `g_reloadArrivalStages` (probe。`g_reloadDecodeThread`
+  の隣、同じ理由)。
+
+**arrivals の item は `src` が null** である。参加フレームにはまだ membership が
+無く、`reloadDecodeGroup` は生きた `FrameSource` を欲しがらない (worker が触れない
+ように値で `ReloadSpec` を取る) —— だから arrivals は**再読みとまったく同じ
+decode** に届き、2本目の decode 経路にならない。しかも `reloadReadKey` から見ると
+**1ファイル・1 member・同じ npyRead・互いに違う frame** なので**必ず1グループ**
+であり、何枚参加しようと**1 stat・1 read・1 decode パス**になる。
+
+`arrived` は「この plan の arrivals は `watchReloadFinish` の仕事ではない」という
+意味で、**worker を持つ扉に限って**立てる。**同期の扉** (`g_scriptedRun` で
+`--async-open` が無い実行、および queue のフォールバック) は worker を持たないので
+今までどおり自分のスレッドで decode する —— そこでは誰も窓を見ていない。記録と
+join は共有なので、**2つの扉が1つの記録・1つの join・1組の拒否**を通る
+(§18.2 の `reloadSource` / `reloadDecodeGroup`+`reloadLand` と同じ形)。
+
+Files 行は stage 2 で分数を arrivals のものに切り替える
+(`reloading <stack>: 1 / 2 new frame(s)`) —— 後半ずっと `3 / 3` を出していたら、
+終わった分数を出しながら隣に Stop があることになる。
+
+### 20.5 受入れ —— `--asyncopen-selftest` R9f〜R9k と `--watch-selftest` W46e〜W46i
+
+headless な実行が freeze について言える唯一のことは**どのスレッドで decode したか**
+で、前例は `rreader` の R24b (「interpreter は JOB のスレッドで探された、UI のでは
+なく」)。同じ作法で:
+
+- **R9f3** —— `g_reloadArrivalThread` が**この**スレッドでなく、かつ**書かれている**
+  (probe はジェスチャごとに default-construct へ戻すので、stage 2 が走らなければ
+  空のまま赤になる)。`g_reloadArrivalStages` が 1 だけ進む。
+- **R9f4** —— 再読み側の id も記録され、これも UI のではなく、しかも別のスレッド
+  である (= 本当に2段ある)。**R9f5** —— それでも「1回の Reload は1回の start」。
+- **R9g** —— grow 全体で `g_fileReads == 2`。直す前は `1 + (want - have)`。
+- **R9h** —— 頭を **crop** してからファイルを伸ばす。1つの `.npy` の frame は構造上
+  全部同じ形なので、**頭の crop が、参加フレームが頭と食い違える唯一の道**であり、
+  手で1ジェスチャで到達できる (frame 0 を crop → script が2枚足す)。参加は
+  **記録された 100x80 に対して**拒否され、`0 of 2` と理由と「後ろの1枚も入っていない」
+  が文字列で出る。**§12.4 どおり枚数は縮まない** (`expectedFrames` は 5)。
+- **R9i / R9j** —— 幾何が動いた側と、動かなかった側 (どちらの文も出ない = 反証)。
+- **R9k** —— stage 2 の途中で Stop。着地した分は残り、文は「止められた」と言い、
+  そして `g_fileReads == 2` のまま = **UI スレッドで残りを読み直していない**。
+- **W46e〜W46i** —— 2つの文と、その「差が無ければ何も言わない」半分。ディスク無し。
+
+**条件を反転させたら落ちることを実際に見て確かめた** (実装を一時的に壊して赤を
+確認し、戻した): stage 2 の dispatch を止めると R9f3 / R9g / R9k / R9k2 / R9k3 が
+赤 (`stages+0 arrivalRecorded=0 reads=3`、Stop 側は `reads=4`)。文を消す・言い換える
+と R9h2 / R9h3 / R9h4 / R9i2 / R9i3 / R9k2 / W46e / W46g / W46h が赤。
+emptiness を見ている W46f / W46i はどちらの改変でも緑のまま —— それが反証側の役目
+だからである。
+
+### 20.6 直していないこと
+
+- **per-frame の GL テクスチャアップロードは触っていない。** 静かな機械では
+  after が 0 ms になるのでこの経路には出ないが、機械が混んでいると 1 枚ごとの
+  短い停止として顔を出す。§18.2b が2行目の残差として切り出したものと同じで、
+  **同じ止まり方が同じ frame を『開く』ときにも起きている**。別課題のまま。
+- **frame 軸が縮んだ側・変わらない側は1行も動かしていない。** departures は今までどおり
+  `startStackReload` で plan を取った直後に適用され (§18.5(b))、`R9c` / `R9d` /
+  `R9e5`〜`R9e9` / `W48` がそのまま緑である。
+- **peer (remote) の frame 軸は対象外のまま。** `watchFrameAxisPlan` は
+  `watchLocalPathOf` が空を返す source を名指しで断る —— ディスク上のファイルが
+  容器でない・ヘッダが訊けることが前提だからで、これは §16 の判断である。
+- **`watchAutoRefusal` の peer 項も落としていない** (§18.3 の「尽きていない半分」=
+  帯域と peer の負荷は、スレッドの話ではない)。

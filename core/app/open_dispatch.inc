@@ -2133,17 +2133,45 @@ static std::string reloadItemName(const App::ReloadJob::Item& it) {
 // would say the same word twelve times over. (openJobPhase is the twin, and its
 // note says why an OPEN has no fraction to give.)
 static std::string reloadJobRowText(const App::ReloadJob& j) {
-    char b[160];
-    snprintf(b, sizeof b, "reloading %s: %d / %d  %.1f s",
-             j.name.empty() ? "frame" : j.name.c_str(), j.landedN, (int)j.items.size(),
-             nowSec() - j.startedAt);
+    char b[192];
+    // §12.6: in STAGE 2 the fraction is the ARRIVALS'. Going on printing
+    // "3 / 3" while the new frames are being read would put a finished
+    // fraction on the row for the whole second half of the gesture, and the
+    // Stop beside it would look like a Stop for nothing. The verb stays
+    // "reloading" - one gesture, and the row is not the place to teach
+    // anybody about stages - and the noun says what the count counts.
+    if (j.stage == 2)
+        snprintf(b, sizeof b, "reloading %s: %d / %d new frame(s)  %.1f s",
+                 j.name.empty() ? "frame" : j.name.c_str(), j.arrivalsLanded,
+                 (int)j.arrivals.size(), nowSec() - j.startedAt);
+    else
+        snprintf(b, sizeof b, "reloading %s: %d / %d  %.1f s",
+                 j.name.empty() ? "frame" : j.name.c_str(), j.landedN,
+                 (int)j.items.size(), nowSec() - j.startedAt);
     return b;
 }
 
 // Everything the worker does, and nothing else. Every call in here is pure or
 // is already called from the sequence loader's thread for the same reason.
 static void reloadJobWorker(App::ReloadJob* j) {
-    j->decodeThread = std::this_thread::get_id();
+    // WHICH LIST, and the answer is the STAGE (§12.6). Stage 1 re-reads the
+    // resident memberships; stage 2 decodes the frames that are JOINING, which
+    // have no FrameSource yet and are therefore items with a null `src` and a
+    // spec built from the plan.
+    //
+    // `stage` is a plain int read here and written by the UI thread, and that
+    // is not a race: it is written only while NO worker is running - after
+    // th.join() and before the next std::thread(), whose constructor is the
+    // synchronisation point that publishes it to this thread. The same argument
+    // covers `arrivals`, `arrivalEnd` and the reset of doneCount/done.
+    const bool second = j->stage == 2;
+    std::vector<App::ReloadJob::Item>& items = second ? j->arrivals : j->items;
+    const std::vector<int>& ends = second ? j->arrivalEnd : j->groupEnd;
+    // The two probes are kept apart for the reason written at
+    // g_reloadArrivalThread: an assert about the arrivals must not be
+    // satisfiable by the re-read's thread id.
+    if (second) j->arrivalThread = std::this_thread::get_id();
+    else        j->decodeThread  = std::this_thread::get_id();
     // ---- the peer, dialled ONCE, and never again once it is gone -----------
     // A function-local Session, rfWorker's shape and its reason: a 300 s round
     // trip must not hold the UI's frame, and two threads framing requests into
@@ -2207,14 +2235,14 @@ static void reloadJobWorker(App::ReloadJob* j) {
     // order, so `doneCount` is monotone in the order the landing lands: item k
     // is decoded when doneCount > k, whichever group it was in.
     size_t from = 0;
-    for (int end : j->groupEnd) {
+    for (int end : ends) {
         if (j->cancel.load()) break;       // between GROUPS, never inside one:
                                            // half a file read is not a read
         std::vector<const ReloadSpec*> specs;
         std::vector<ReloadPre*> pres;
         for (size_t i = from; i < (size_t)end; i++) {
-            specs.push_back(&j->items[i].spec);
-            pres.push_back(&j->items[i].pre);
+            specs.push_back(&items[i].spec);
+            pres.push_back(&items[i].pre);
         }
         reloadDecodeGroup(specs, pres, &j->cancel, own);
         j->doneCount.store(end);
@@ -2268,6 +2296,48 @@ static size_t reloadJobItemsForStack(App::ReloadJob* j, int seqId) {
     return j->items.size();
 }
 
+// ---- §12.6 STAGE 2: the frame-axis ARRIVALS, as items of the SAME job -------
+//
+// Built on the UI thread at the one moment stage 1 is over, out of the PLAN and
+// nothing else. Not a byte is read here: `path`, `fileFrame` and `npyRead` are
+// all a joining frame is, and the shape it will be measured against is already
+// in the record (watchFrameAxisHead wrote it on the line above the call).
+//
+// The items carry a NULL `src`, and that is what makes this possible at all: a
+// joining frame has no FrameSource yet, and reloadDecodeGroup does not want one
+// - it takes ReloadSpecs by value precisely so the worker cannot touch a live
+// source. So the arrivals reach the very same decode the re-read reaches, and
+// their landing is a JOIN instead of a swap (watchFrameAxisJoin) rather than a
+// second decode path.
+//
+// ONE GROUP, always, and it is provable rather than hoped: every arrival is the
+// same local .npy (watchFrameAxisPlan refuses a container member, a peer frame
+// and a raw recipe by name, so reloadReadKey cannot answer "" for one of
+// these), they share npyRead, and reloadPickIndex is their fileFrame, which is
+// distinct by construction. So N joining frames are ONE stat, ONE read and ONE
+// decode pass - where the UI thread used to pay one whole-file read PER frame.
+//
+// `w/h/ch` are deliberately left at 0. A joining frame has no RECORDED shape to
+// re-apply: it is new. Those fields are what reloadLand's dims note and
+// reloadDecodeGroup's recrop compare against, and the arrivals reach neither -
+// they are measured against the plan's record, in the join, once.
+static size_t reloadArrivalItems(App::ReloadJob* j) {
+    const WatchAxisPlan& p = j->axis;
+    j->arrivals.clear();
+    j->arrivalEnd.clear();
+    j->arrivalsLanded = 0;
+    if (!p.moved() || p.want <= p.have || p.path.empty()) return 0;
+    for (int f = p.have; f < p.want; f++) {
+        App::ReloadJob::Item it;
+        it.spec.path = p.path;
+        it.spec.fileFrame = f;
+        it.spec.npyRead = p.npyRead;
+        j->arrivals.push_back(std::move(it));
+    }
+    j->arrivalEnd.push_back((int)j->arrivals.size());
+    return j->arrivals.size();
+}
+
 static bool startReloadJob(App::ReloadJob* j);
 // watch-design 12's frame-axis membership, defined in watch.inc (included after
 // this file). Declared here because THE PLAN BELONGS TO THE JOB that does the
@@ -2275,6 +2345,14 @@ static bool startReloadJob(App::ReloadJob* j);
 // startStackReload below rather than at the gesture.
 static WatchAxisPlan watchFrameAxisPlan(int seqId);
 static void watchFrameAxisDrop(int seqId, int keep);
+// ...and §12.6's two halves of the ARRIVALS, watch.inc's too. THE SHAPE is
+// recorded once, at the one moment the re-read is over (watchFrameAxisHead),
+// and every joining frame goes through ONE join against that record
+// (watchFrameAxisJoin) whichever thread decoded it. Declared here because the
+// job's stage 2 is what decodes them and pumpReloadJob is what lands them.
+static bool watchFrameAxisHead(int seqId, WatchAxisPlan& p);
+static bool watchFrameAxisJoin(int seqId, WatchAxisPlan& p, int f,
+                               std::unique_ptr<ImageDoc> nd, std::string err);
 // ...and the SYNCHRONOUS door's whole gesture, also watch.inc's: the plan, the
 // re-read and the sentence, in that order. One spelling, so the queue's
 // fall-back below cannot drift from watchReloadNow's own body.
@@ -2284,7 +2362,7 @@ static void reloadStackSync(int seqId, bool automatic);
 // post-processing, so a click and the automaton cannot come to do two different
 // things.
 static void watchReloadFinish(int seqId, bool automatic, const std::string& msg,
-                              int failed, uint64_t pinWas, const WatchAxisPlan& ax);
+                              int failed, uint64_t pinWas, WatchAxisPlan& ax);
 
 // Start a stack's reload without waiting for it. Returns whether the
 // asynchronous door took it - false means the caller must do the reload itself,
@@ -2366,6 +2444,23 @@ static bool startStackReload(int seqId, bool automatic,
         watchReloadFinish(seqId, automatic, msg, failed, j->pinWas, j->axis);
         return true;
     }
+    // ---- §12.6: THE ARRIVALS ARE THIS JOB'S, from here on -------------------
+    // Set only now, on the line after the job is known to have items and a
+    // worker: it means "watchReloadFinish must not read the file for these",
+    // and the one path that could have made that a lie is the early return
+    // above - a stack with nothing resident to re-read, which has no worker to
+    // hand them to. (It cannot actually co-occur with a grow:
+    // watchFrameAxisPlan returns applies=false for a stack with no frames, and
+    // a stack with frames always yields at least one item. The flag is set
+    // here anyway, so that the guarantee does not rest on that argument
+    // holding for ever.)
+    //
+    // Stage 2 is dispatched from pumpReloadJob, when stage 1 has landed and
+    // the head's shape is a fact. If it cannot run - a Stop, or the stack
+    // emptied under us - the arrivals do not happen and the summary SAYS which
+    // frames are not in the measurement; it does not quietly fall back to
+    // reading 480 MB per frame on this thread, which is the board row itself.
+    if (j->axis.moved() && j->axis.want > j->axis.have) j->axis.arrived = true;
     app.reloadJob = std::move(j);
     return startReloadJob(app.reloadJob.get());
 }
@@ -2409,6 +2504,14 @@ static bool startFrameReload(int imgIdx) {
 
 static bool startReloadJob(App::ReloadJob* j) {
     g_reloadStarts++;
+    // The two thread probes belong to THIS gesture and are cleared with it.
+    // Without the clear an assert about the arrivals could be satisfied by the
+    // id an EARLIER reload left behind, which is the anti-vacuity half of the
+    // only statement a headless test can make about a freeze (see
+    // g_reloadArrivalThread). Stage 2 does not come through this function -
+    // one gesture is one start - so the clear happens once per gesture.
+    g_reloadDecodeThread = std::thread::id();
+    g_reloadArrivalThread = std::thread::id();
     j->startedAt = nowSec();
     j->th = std::thread(reloadJobWorker, j);
     return true;
@@ -2492,30 +2595,99 @@ static void pumpReloadJob() {
     }
     if (gone && !j->cancel.load()) j->cancel.store(true);
     const bool stop = j->cancel.load() || gone;
-    if (!stop && j->landedN < j->doneCount.load()) {
-        App::ReloadJob::Item& it = j->items[(size_t)j->landedN];
-        std::string err, note;
-        const std::string who = reloadItemName(it);
-        if (reloadLand(it.src, it.spec, it.pre, err, &note)) {
-            j->ok++;
-            if (!note.empty()) {
-                j->dims++;
-                if (j->firstDims.empty()) j->firstDims = who + ": " + note;
-            }
-            if (!note.empty()) j->oneNote = note;
-            reloadSharedTally(it.src, j->seqId, j->sharedN, j->sharedNames);
+    // §12.6: which list this pump is landing out of, and which counter says how
+    // far it has got. One a frame in either stage, for the reason stated at the
+    // top of this block - twelve swaps in one landing would move the freeze
+    // from the reading to the swapping and nothing else.
+    const bool second = j->stage == 2;
+    int& landed = second ? j->arrivalsLanded : j->landedN;
+    if (!stop && landed < j->doneCount.load()) {
+        App::ReloadJob::Item& it = second ? j->arrivals[(size_t)landed]
+                                         : j->items[(size_t)landed];
+        if (second) {
+            // ---- an ARRIVAL: a JOIN, not a swap -------------------------
+            // There is no source to swap into - this frame is new - so
+            // reloadLand has no subject and watchFrameAxisJoin is the landing:
+            // the shape check against the plan's RECORD, the membership
+            // inherited from the head, the registry, the stack revision.
+            //
+            // Asked only while the growth is still CONTIGUOUS. A refusal ends
+            // it (watchFrameAxisJoin's own note says why), and the frames
+            // behind the refusal are counted and said rather than attempted:
+            // a stack holding the file's frames 0,1,2,4 is not the file's
+            // first N, which is the one shape watchFrameAxisPlan applies to,
+            // so the NEXT Reload would refuse this stack outright.
+            if (j->axis.firstRefusal.empty())
+                watchFrameAxisJoin(j->seqId, j->axis, it.spec.fileFrame,
+                                   std::move(it.pre.nd), it.pre.err);
             it.landed = true;
+            landed++;
         } else {
-            j->failed++;
-            if (j->firstErr.empty()) j->firstErr = who + ": " + err;
+            std::string err, note;
+            const std::string who = reloadItemName(it);
+            if (reloadLand(it.src, it.spec, it.pre, err, &note)) {
+                j->ok++;
+                if (!note.empty()) {
+                    j->dims++;
+                    if (j->firstDims.empty()) j->firstDims = who + ": " + note;
+                }
+                if (!note.empty()) j->oneNote = note;
+                reloadSharedTally(it.src, j->seqId, j->sharedN, j->sharedNames);
+                it.landed = true;
+            } else {
+                j->failed++;
+                if (j->firstErr.empty()) j->firstErr = who + ": " + err;
+            }
+            landed++;
         }
-        j->landedN++;
     }
     if (!j->done.load()) { g_reloadPumps++; return; }
-    if (!stop && j->landedN < j->doneCount.load()) return;   // one a frame, still
-    // ---- the job is over ---------------------------------------------------
+    if (!stop && landed < j->doneCount.load()) return;   // one a frame, still
+    // ---- this STAGE is over ------------------------------------------------
     j->th.join();
-    g_reloadDecodeThread = j->decodeThread;   // ordered by the join above
+    // ordered by the join above, and to the probe this stage belongs to
+    if (second) g_reloadArrivalThread = j->arrivalThread;
+    else        g_reloadDecodeThread  = j->decodeThread;
+    // ---- STAGE 1 -> STAGE 2: §12.6's arrivals, and this thread reads nothing
+    //
+    // THE SHAPE IS RECORDED HERE, and here is the only place it can honestly be
+    // recorded: the re-read has landed, so the head frame's shape has stopped
+    // being a moving target, and every joining frame below is measured against
+    // what watchFrameAxisHead writes on this line. That is board row 319's
+    // ruling, and the version it replaces - each arrival looking at "the head's
+    // current shape" as it landed - is why the arrivals had to be synchronous
+    // at all: the shape did not exist until the last item was in.
+    //
+    // A Stop, or a stack that emptied under us, skips this. Nothing then joins,
+    // and the summary SAYS which frames are not in the measurement
+    // (watch::frameAxisJoinText) - it does not fall back to reading the file on
+    // this thread, which is the defect being removed.
+    if (!second && !stop && j->seqId != 0 && j->axis.moved() &&
+        j->axis.want > j->axis.have) {
+        if (watchFrameAxisHead(j->seqId, j->axis) && reloadArrivalItems(j)) {
+            j->stage = 2;
+            j->doneCount.store(0);      // safe: no worker is running right now
+            j->done.store(false);
+            g_reloadArrivalStages++;
+            j->th = std::thread(reloadJobWorker, j);
+            g_reloadPumps++;
+            return;                     // ...the gesture is not over yet
+        }
+        // No head left to measure against, or nothing to build: fall through to
+        // the tail, which states the count it actually ended up with.
+    }
+    // An offered frame that never reached the join at all still owes a REASON.
+    // Without this the sentence would default to watch::frameAxisJoinText's
+    // "decode failed" about a frame nothing ever tried to decode, which is the
+    // kind of invented cause this project refuses to print. The three ways it
+    // happens are the three ways stage 2 can end early.
+    if (j->axis.arrived && j->axis.firstRefusal.empty() &&
+        j->axis.joined < j->axis.offered())
+        j->axis.firstRefusal =
+            stop ? "the reload was stopped before this frame was read"
+                 : (j->stage == 2 ? "the reload ended before this frame was read"
+                                  : "the stack had no frame left to measure it "
+                                    "against");
     // Taken out of App before anything is said. The tail decodes a joining
     // member, fires a toast and may reach seqInfo again, and everything that
     // asks "is a reload running?" must see the truth, which is no.

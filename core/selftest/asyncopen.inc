@@ -928,6 +928,312 @@ static int asyncOpenSelftest(const std::string& root) {
               "R9e9 ...and a frame that is GONE is not a frame that failed to read");
     }
 
+    // ========================================================================
+    //  R9f..R9k: §12.6 - the ARRIVALS are a SECOND STAGE of the same job
+    // ========================================================================
+    //
+    // Board row 319. PR #275 moved the RE-READ of a frame-axis stack off this
+    // thread and left one path behind it: the frames that JOIN when the file
+    // grew were decoded by watchReloadFinish, here, one whole-file read PER
+    // frame. So the Reload of a capture that wrote five frames where it had
+    // written three reproduced the very freeze #275 had just removed.
+    //
+    // Measured before it was fixed, with freeze_probe.ps1 and the gesture
+    // really made (watchFiles + watchAutoReload on, the file replaced from the
+    // side): a 480 MB .npy at 3 -> 5 frames froze the pump for 641 ms and at
+    // 3 -> 10 frames for 1797 ms, median of 3. This is what a headless run can
+    // hold down about that, and it is four separate statements:
+    //
+    //   (a) THE ARRIVALS DECODED ON THE JOB'S THREAD, not this one. rreader's
+    //       R24b is the pattern and its reason: the id is recorded where the
+    //       work is DECIDED and read after the job has finished, so there is
+    //       nothing left to race with. A SEPARATE probe from the re-read's,
+    //       because an assert reading g_reloadDecodeThread would go green on a
+    //       build where the arrivals had come back here - which is exactly the
+    //       state the board row describes.
+    //   (b) ONE READ for any number of joining frames. They are one group of
+    //       one file, which is R2's own statement one stage over; before this
+    //       they were one whole-file read each.
+    //   (c) THE SHAPE IS A RECORD, not a look. The joining frames are measured
+    //       against the head's shape AS IT LANDED, written down once. R9h
+    //       makes that observable: with the head CROPPED, the full-size
+    //       arrivals must be refused against the CROPPED shape - and be said,
+    //       with a count, not dropped.
+    //   (d) A GEOMETRY THAT MOVED IS SAID. R9i grows the file AND changes its
+    //       frame shape; the new frames may join (they are the frames of the
+    //       file that is there now) but the sentence has to carry it.
+    //
+    // The fixture is its own file again, and its shape is a PARAMETER: R9i
+    // needs the same path to declare a different frame shape on its second
+    // generation, which `rel` cannot do (its H and W are constants).
+    const std::string arr = dir + "/arr.npy";
+    auto writeArr = [&](int gen, int64_t frames, int64_t h, int64_t w) {
+        uint8_t nothing = 0;
+        std::vector<uint8_t> hdr = selftestNpyBytes("<u2", { frames, h, w }, &nothing, 0);
+        std::ofstream f(pathFromUtf8(arr), std::ios::binary);
+        f.write((const char*)hdr.data(), (std::streamsize)hdr.size());
+        std::vector<uint16_t> row((size_t)w);
+        for (int64_t fr = 0; fr < frames; fr++)
+            for (int64_t y = 0; y < h; y++) {
+                for (int64_t x = 0; x < w; x++)
+                    row[(size_t)x] = (uint16_t)((gen * 1000 + fr * 100 + y + x) & 0xffff);
+                f.write((const char*)row.data(), (std::streamsize)(w * 2));
+            }
+    };
+    auto arrPx = [&](int gen, int fr) { return (float)(gen * 1000 + fr * 100); };
+    const int64_t AH = 700, AW = 900;      // 3 * 700 * 900 * 2 = 3.8 MB a frame
+
+    {   // ---- R9f/R9g: the arrivals go to the WORKER, and cost ONE read ------
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        check(seq != 0 && framesOfSeq(seq).size() == 3,
+              "R9f (setup) a three-frame single-file stack");
+        const std::thread::id uiThread = std::this_thread::get_id();
+        writeArr(2, 5, AH, AW);                  // the same file, FIVE frames now
+        const long long reads0 = g_fileReads;
+        const int stages0 = g_reloadArrivalStages, starts0 = g_reloadStarts;
+        watchReloadNow(seq, false);
+        // The gesture returns having grown NOTHING: the arrivals belong to the
+        // job, so not one of them can have joined yet. It is the frame COUNT
+        // that is asked and not g_fileReads, and that is review P2-1's lesson
+        // (rreader R24): the worker may perfectly well have started reading on
+        // the line after the call, so a counter compared across a live thread
+        // is not a measurement of anything. A JOIN is this thread's, always, so
+        // "three frames" is a completed fact.
+        const bool clean = app.reloadJob != nullptr && framesOfSeq(seq).size() == 3;
+        const bool drained = driveReload(24000, -1);
+        // BOTH ids are read after the job has finished - rreader's R24 review
+        // P2-1, and the same reason: a counter or an id compared across a live
+        // thread is not a measurement of anything.
+        const std::thread::id arrivedOn = g_reloadArrivalThread;
+        const std::thread::id reReadOn = g_reloadDecodeThread;
+        const long long reads = g_fileReads - reads0;
+        const std::vector<float> now = relSamples(seq);
+        const App::SeqInfo* si = seqInfo(seq);
+        fprintf(stderr, "asyncopenselftest: R9f grew 3 -> 5 off-thread: clean=%d "
+                        "drained=%d frames=%zu stages+%d starts+%d reads=%lld "
+                        "arrivalOnUi=%d reReadOnUi=%d arrivalRecorded=%d "
+                        "expected=%d px=%g/%g/%g/%g/%g\n",
+                (int)clean, (int)drained, now.size(),
+                g_reloadArrivalStages - stages0, g_reloadStarts - starts0, reads,
+                (int)(arrivedOn == uiThread), (int)(reReadOn == uiThread),
+                (int)(arrivedOn != std::thread::id()), si ? si->expectedFrames : -1,
+                now.size() > 0 ? (double)now[0] : -1.0,
+                now.size() > 1 ? (double)now[1] : -1.0,
+                now.size() > 2 ? (double)now[2] : -1.0,
+                now.size() > 3 ? (double)now[3] : -1.0,
+                now.size() > 4 ? (double)now[4] : -1.0);
+        check(clean, "R9f the gesture STARTS the grow and returns: nothing read, "
+                     "nothing joined");
+        check(drained && now.size() == 5,
+              "R9f2 ...and draining it lands FIVE frames");
+        // (a) - THE statement about the freeze, and both halves of it. The id
+        // must not be this thread's, and it must have been WRITTEN: it is
+        // cleared at the start of every gesture, so a default-constructed id
+        // means stage 2 never ran and the assert must go red rather than green
+        // on a vacuous comparison.
+        check(g_reloadArrivalStages - stages0 == 1 &&
+                  arrivedOn != std::thread::id() && arrivedOn != uiThread,
+              "R9f3 the ARRIVALS were decoded on the JOB's thread, not the UI's");
+        check(reReadOn != std::thread::id() && reReadOn != uiThread &&
+                  arrivedOn != reReadOn,
+              "R9f4 ...and that is a SECOND stage: the re-read's own thread is "
+              "recorded, is not this one either, and is not the same one");
+        // ...and ONE gesture is ONE start, whatever it does in stages: the
+        // queue, the fold and §9's drain all count reloads, not passes.
+        check(g_reloadStarts - starts0 == 1,
+              "R9f5 ...and a two-stage reload is still ONE reload");
+        // (b) - 3 memberships are one read (R2), and 2 arrivals are one more.
+        // Before this change the arrivals were one whole-file read EACH, so
+        // this same fixture read the file 1 + 2 = 3 times.
+        check(reads == 2,
+              "R9g the whole grow is TWO reads: one for the re-read, one for "
+              "every arrival together");
+        bool own = now.size() == 5;
+        for (int f = 0; f < 5 && own; f++) own = now[(size_t)f] == arrPx(2, f);
+        check(own, "R9g2 ...each frame the FILE's own, in the file's order");
+        check(si && si->expectedFrames == 5 && !*seqReloadMark(seq),
+              "R9g3 ...and the bookkeeping ran, with nothing refused");
+    }
+
+    {   // ---- R9h: the SHAPE is a RECORD, and a frame that cannot join says so
+        // The head frame is CROPPED before the file grows. Its landed shape is
+        // therefore the CROP's, the arrivals decode at full size, and the join
+        // must refuse them against the record - by name, with a count, and
+        // without shortening or silently re-measuring anything.
+        //
+        // This is the case that makes "the shape is decided once" observable at
+        // all: every frame of one .npy array has the same shape by
+        // construction, so a crop on the head is the one way a joining frame
+        // can disagree with it. It is reachable by hand in one gesture - crop
+        // frame 0, then the script writes two more frames.
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        const std::vector<int> fr0 = framesOfSeq(seq);
+        const bool cropped = !fr0.empty() &&
+                             cropInPlace(*app.images[fr0.front()], 0, 0, 100, 80);
+        check(seq != 0 && fr0.size() == 3 && cropped &&
+                  app.images[framesOfSeq(seq).front()]->w == 100,
+              "R9h (setup) three frames, and the HEAD is cropped to 100x80");
+        writeArr(2, 5, AH, AW);
+        const int msgs0 = (int)app.msgLog.size();
+        watchReloadNow(seq, false);
+        const bool drained = driveReload(24000, -1);
+        std::string said;
+        for (int i = msgs0; i < (int)app.msgLog.size(); i++)
+            if (app.msgLog[(size_t)i].text.find("new frame(s) joined") !=
+                std::string::npos)
+                said = app.msgLog[(size_t)i].text;
+        const App::SeqInfo* si = seqInfo(seq);
+        fprintf(stderr, "asyncopenselftest: R9h cropped head: drained=%d frames=%zu "
+                        "expected=%d said=\"%s\"\n",
+                (int)drained, framesOfSeq(seq).size(), si ? si->expectedFrames : -1,
+                said.c_str());
+        check(drained && framesOfSeq(seq).size() == 3,
+              "R9h a frame that disagrees with the RECORDED head shape does not "
+              "join - and the frames it already had are untouched");
+        check(said.find("0 of 2 new frame(s) joined") != std::string::npos,
+              "R9h2 ...and the summary says HOW MANY joined, which is none");
+        check(said.find("frame 3 did not: ") != std::string::npos &&
+                  said.find("100x80 1ch") != std::string::npos,
+              "R9h3 ...and WHY, measured against the recorded 100x80 head rather "
+              "than against the file's own shape");
+        check(said.find("the 1 frame(s) after it are not in the measurement") !=
+                  std::string::npos,
+              "R9h4 ...and that the frame behind the refusal is out too");
+        // §12.4: the header's count is still the header's count, and n-of-N is
+        // what carries the difference. Nothing is clamped to what fitted.
+        check(si && si->expectedFrames == 5,
+              "R9h5 ...and the stack's own count is the FILE's 5, not the 3 that "
+              "fitted - a refusal is not a smaller capture");
+    }
+
+    {   // ---- R9i: the stack's GEOMETRY moved, and the screen says so --------
+        // The file grows AND its frames change shape. The arrivals are measured
+        // against the new head and may join - they are the frames of the file
+        // that is there now - but a stack that quietly became a stack of a
+        // different picture is the one outcome that is not allowed.
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        check(seq != 0 && framesOfSeq(seq).size() == 3 &&
+                  app.images[framesOfSeq(seq).front()]->w == (int)AW,
+              "R9i (setup) three frames of 900x700");
+        writeArr(3, 5, AH / 2, AW / 2);      // five frames, and HALF the size
+        const int msgs0 = (int)app.msgLog.size();
+        watchReloadNow(seq, false);
+        const bool drained = driveReload(24000, -1);
+        std::string said;
+        for (int i = msgs0; i < (int)app.msgLog.size(); i++)
+            if (app.msgLog[(size_t)i].text.find("geometry changed") !=
+                std::string::npos)
+                said = app.msgLog[(size_t)i].text;
+        const std::vector<int> fr = framesOfSeq(seq);
+        bool allNew = fr.size() == 5;
+        for (size_t k = 0; k < fr.size() && allNew; k++)
+            allNew = app.images[fr[k]]->w == (int)(AW / 2) &&
+                     app.images[fr[k]]->h == (int)(AH / 2);
+        fprintf(stderr, "asyncopenselftest: R9i geometry moved: drained=%d "
+                        "frames=%zu allNew=%d said=\"%s\"\n",
+                (int)drained, fr.size(), (int)allNew, said.c_str());
+        check(drained && fr.size() == 5 && allNew,
+              "R9i the arrivals join against the NEW head shape, and every frame "
+              "of the stack is that shape");
+        check(said.find("this stack's geometry changed: its frames are "
+                        "450x350 1ch now, was 900x700 1ch") != std::string::npos,
+              "R9i2 ...and the stack SAYS its geometry moved, with both shapes");
+        check(said.find("the joining frame(s) were measured against the new "
+                        "shape") != std::string::npos,
+              "R9i3 ...and says which shape the new frames were measured against");
+    }
+
+    {   // ---- R9j: a grow that did NOT move the geometry says nothing about it
+        // The anti-vacuity of R9i, and R9g's fixture is already this case: a
+        // five-frame rewrite at the same shape must not carry the sentence.
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeArr(2, 5, AH, AW);
+        const int msgs0 = (int)app.msgLog.size();
+        watchReloadNow(seq, false);
+        const bool drained = driveReload(24000, -1);
+        bool quiet = true;
+        for (int i = msgs0; i < (int)app.msgLog.size(); i++) {
+            const std::string& t = app.msgLog[(size_t)i].text;
+            if (t.find("geometry changed") != std::string::npos ||
+                t.find("new frame(s) joined") != std::string::npos)
+                quiet = false;
+        }
+        fprintf(stderr, "asyncopenselftest: R9j same shape: drained=%d frames=%zu "
+                        "quiet=%d\n", (int)drained, framesOfSeq(seq).size(),
+                (int)quiet);
+        check(drained && framesOfSeq(seq).size() == 5 && quiet,
+              "R9j a grow at the SAME shape with every frame joining says neither "
+              "sentence - both are about a difference");
+    }
+
+    {   // ---- R9k: STOP during the arrivals leaves what joined, and says so --
+        // §18.2's rule for stage 1 ("Stop leaves what landed") reaches stage 2
+        // unchanged, and the half that is new is what the summary owes: a
+        // stopped grow must not report the header's count as though it were in
+        // the measurement, and it must NOT quietly fall back to reading the
+        // rest on this thread.
+        closeAll();
+        writeArr(1, 3, AH, AW);
+        openPath(arr);
+        drive(8000);
+        const int seq = app.images.empty() ? 0 : app.images[0]->seqId;
+        writeArr(2, 6, AH, AW);
+        const int msgs0 = (int)app.msgLog.size();
+        const long long reads0 = g_fileReads;
+        watchReloadNow(seq, false);
+        // Stop on the first frame of stage 2 that has landed. The counter is
+        // the ARRIVALS' - j->landedN belongs to the re-read, which by then has
+        // finished, so driveReload's own stopAfter cannot express this.
+        int it = 0;
+        while ((app.reloadJob || !app.reloadQueue.empty()) && it++ < 24000) {
+            if (app.reloadJob && app.reloadJob->stage == 2 &&
+                app.reloadJob->arrivalsLanded >= 1)
+                app.reloadJob->cancel.store(true);
+            pumpReloadJob();
+            if (app.reloadJob && !app.reloadJob->done.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        const long long reads = g_fileReads - reads0;
+        const size_t left = framesOfSeq(seq).size();
+        std::string said;
+        for (int i = msgs0; i < (int)app.msgLog.size(); i++)
+            if (app.msgLog[(size_t)i].text.find("new frame(s) joined") !=
+                std::string::npos)
+                said = app.msgLog[(size_t)i].text;
+        fprintf(stderr, "asyncopenselftest: R9k stop in stage 2: frames=%zu "
+                        "reads=%lld said=\"%s\"\n", left, reads, said.c_str());
+        check(!app.reloadJob && left >= 4 && left < 6,
+              "R9k Stop during the arrivals: what joined stays joined, and the "
+              "rest never join");
+        check(said.find("new frame(s) joined") != std::string::npos &&
+                  said.find("was stopped before this frame was read") !=
+                      std::string::npos,
+              "R9k2 ...and the summary names the frames that are not in the "
+              "measurement, and says it was a Stop");
+        // THE ONE THAT MATTERS: a stopped grow must not make this thread read
+        // the file. Two reads is the whole gesture (re-read + arrivals); a
+        // fall-back to watchFrameAxisGrow here would add one per missing frame.
+        check(reads == 2,
+              "R9k3 ...and a stopped grow does NOT fall back to reading the rest "
+              "on this thread");
+    }
+
     // ---- R10: the AUTOMATIC door through the worker, and what it blocks -----
     // Review P2-8. Two things had no caller in the whole suite:
     //
