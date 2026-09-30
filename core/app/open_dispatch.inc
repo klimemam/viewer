@@ -2618,9 +2618,14 @@ static void pumpReloadJob() {
             // first N, which is the one shape watchFrameAxisPlan applies to,
             // so the NEXT Reload would refuse this stack outright.
             if (j->axis.firstRefusal.empty())
-                watchFrameAxisJoin(j->seqId, j->axis, it.spec.fileFrame,
-                                   std::move(it.pre.nd), it.pre.err);
-            it.landed = true;
+                it.landed = watchFrameAxisJoin(j->seqId, j->axis, it.spec.fileFrame,
+                                               std::move(it.pre.nd), it.pre.err);
+            // A frame behind a refusal is not landing, so its decode is
+            // released here rather than held to the end of the job. It costs a
+            // whole frame of pixels and nothing will ever read it - the
+            // arrivals are decoded as ONE group, so every one of them is in
+            // memory by the time the first one lands (see reloadArrivalItems).
+            it.pre.nd.reset();
             landed++;
         } else {
             std::string err, note;
