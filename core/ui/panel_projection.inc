@@ -1274,16 +1274,27 @@ static void drawPanelProjection() {
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
     if (cfa && P.allRow)
-        // The pooled row's mean is a level and means what it says; its sigma of
-        // the row/column MEANS is the inter-plane level difference - a comb with
-        // the mosaic's period - and not row or column FPN. Left as "-" in the
-        // table and in the TSV, and said here, in the same words HFPN/RN uses
-        // for the same cause, because a dash with no sentence reads as a bug.
-        ImGui::TextWrapped("\"all\": sigma (row), sigma (col) and their p-p are "
-                           "unavailable: pooled planes. Mixing the mosaic's planes puts "
-                           "their level difference into every row and column mean, so "
-                           "those sigmas would be that difference - not FPN. The mean "
-                           "and the frame sigma are over the pooled pixels and stand.");
+        // WHAT "all" HAS ON A MOSAIC, and it is a shorter list than the panel's
+        // other rows. It has the pooled REGION statistics - the mean and sigma
+        // of every pixel of the region, planes mixed, which is what the row was
+        // added for - and it has nothing along either axis: no curve, no p-p
+        // line under the plots, and mean (axis), sigma (axis), its % and its
+        // p-p all "-" in the table and in the TSV.
+        //
+        // The reason is one sentence: a column mean taken ACROSS the mosaic is
+        // the planes' level difference, not the column's. Every column carries
+        // the same mix of planes, so the profile is dense and perfectly
+        // plottable and means the inter-plane offset - measured on a 16x16 RGGB
+        // frame, p-p 415 DN of which 400 is the step between the planes and 15
+        // is all the column structure there is. The earlier wording named only
+        // sigma (row), sigma (col) and their p-p, which left mean (axis) out
+        // and did not match what the table showed.
+        ImGui::TextWrapped("\"all\" on a mosaic: pooled REGION statistics only - the "
+                           "mean and " SIGMA " (frame) over every pixel of the region. "
+                           "No curve, no p-p line, and no axis-direction numbers "
+                           "(mean (axis), " SIGMA " (axis), %% and p-p are \"-\"): "
+                           "unavailable: pooled planes. A column mean taken across the "
+                           "mosaic is the planes' LEVEL DIFFERENCE, not the column's.");
     // every row the walk will draw, the "-" ones included: they take a line too.
     // The same number the height budget above reserved for, counted once.
     const int tablePlanes = tableRowsWalked;

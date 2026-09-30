@@ -841,11 +841,32 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
                     "preview, and it does not keep the mosaic phase - no plane's "
                     "profile can be told from the others'. The planes appear when "
                     "the full-resolution frame lands.";
+    //
+    // TWO LISTS, because the pooled row does not get the same treatment as a
+    // plane on a mosaic. `fillSlot` is the slots that get a PROFILE (P.h/P.v);
+    // `momSlot` is the slots that get REGION moments (fStat).
+    //
+    // ON A MOSAIC THE POOLED ROW GETS NO PROFILE AT ALL. Pooling the planes
+    // makes a DENSE column mean out of their level difference, so the profile
+    // exists, is drawable, and means the inter-plane offset rather than
+    // anything about the columns: `all in view [0 .. 15]: p-p 415` on a 16x16
+    // RGGB frame, of which 400 is the level step between the planes and 15 is
+    // the only column structure there is. Nothing may draw it, its sigma and
+    // p-p are refused, and the per-axis mean it would carry is the pooled
+    // REGION mean computed a second time - so there is nothing to keep and a
+    // dense array no reader is allowed to touch is a trap. The region moments
+    // are the whole of what "all" means on a mosaic.
     int fillSlot[5], nAcc = 0;
+    int momSlot[5], nMom = 0;
     if (P.unavail.empty()) {
-        for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
-        if (P.allRow) fillSlot[nAcc++] = 4;
+        for (int s = 0; s < P.nSeries; s++) { fillSlot[nAcc++] = s; momSlot[nMom++] = s; }
+        if (P.allRow) {
+            momSlot[nMom++] = 4;
+            if (!cfa) fillSlot[nAcc++] = 4;
+        }
     }
+    bool hasProfile[5] = {};
+    for (int i = 0; i < nAcc; i++) hasProfile[fillSlot[i]] = true;
     // ...and the list itself goes into the state, so the panel's readers walk
     // the slots the pass filled instead of counting them (ProjState::fill).
     for (int i = 0; i < nAcc; i++) P.fill[i] = fillSlot[i];
@@ -879,13 +900,15 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         // under this document's names: open a Bayer frame, then a 3-channel
         // one, and slot 3 still held the mosaic's B plane while the readers
         // that counted rather than walked went looking for it as "ch3".
-        bool filled[5] = {};
-        for (int i = 0; i < nAcc; i++) filled[fillSlot[i]] = true;
-        for (int s = 0; s < 5; s++)
-            if (!filled[s]) {
+        bool moments[5] = {};
+        for (int i = 0; i < nMom; i++) moments[momSlot[i]] = true;
+        for (int s = 0; s < 5; s++) {
+            if (!hasProfile[s]) {
                 P.h[s].clear(); P.v[s].clear();
-                P.fStat[s] = {}; P.hStat[s] = {}; P.vStat[s] = {};
+                P.hStat[s] = {}; P.vStat[s] = {};
             }
+            if (!moments[s]) P.fStat[s] = {};
+        }
     }
     // Region moments, gathered from the SAME samples the H pass visits (every
     // column, every step-th row). So the region statistics and the H profile
@@ -969,8 +992,9 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     };
     // Each step lands on a mosaic cell and takes ALL of its lines, so every
     // plane is sampled the same number of times whatever the stride.
-    if (nAcc) {           // ...and no slots to fill means no pass: accumulate
-                          // would write into the vectors it never sized
+    if (nMom) {           // ...and nothing to gather means no pass at all: the
+                          // refused preview, where accumulate would write into
+                          // vectors that were never sized
         for (int y = 0; y < rh; y += step)          // H profile: every column
             for (int dy = 0; dy < cell && y + dy < rh; dy++)
                 for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
@@ -1002,8 +1026,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
-    for (int i = 0; i < nAcc; i++) {
-        const int s = fillSlot[i];
+    for (int i = 0; i < nMom; i++) {       // ...including the pooled row on a
+        const int s = momSlot[i];          // mosaic, which has ONLY these
         App::ProjState::Stats& f = P.fStat[s];
         f = {};
         if (!fN[s]) continue;
@@ -1024,19 +1048,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
             App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
             st = {};
-            // THE POOLED ROW HAS NO PROFILE SIGMA ON A MOSAIC. Pooling the
-            // planes puts their LEVEL DIFFERENCES into every column mean, so
-            // the sigma of those means is a period-2 (period-4 for quad) comb
-            // of the inter-plane offsets wearing column FPN's name - and it is
-            // large, which makes it the most quotable wrong number on the
-            // panel. Left invalid, so the table and the TSV print "-" and the
-            // status column says "unavailable: pooled planes", which is the
-            // wording HFPN/RN already uses for exactly this cause.
-            //
-            // The pooled PROFILE is still computed and still drawn: it is a
-            // dense mean level across the columns and means what it says. It is
-            // the sigma OF it, and its p-p, that are not row/column FPN.
-            if (cfa && s == 4) continue;
+            // (The pooled row on a mosaic never reaches here: it is not in
+            // fillSlot, because it has no profile at all. See the two lists.)
             double sum = 0, sum2 = 0;
             double mn = DBL_MAX, mx = -DBL_MAX;
             size_t n = 0;
