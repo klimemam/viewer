@@ -27,7 +27,15 @@ static App::Ann* findAnn(int id) {
 static bool annFits(const App::Ann& a, int W, int H) {
     if (a.x < 0 || a.y < 0) return false;
     if (a.type != 0) return a.x < W && a.y < H;              // POI: one pixel
-    return a.w > 0 && a.h > 0 && a.x + a.w <= W && a.y + a.h <= H;
+    if (a.w <= 0 || a.h <= 0) return false;
+    // 64-bit deliberately. These numbers arrive from a text box and from a
+    // session file, so w = 2147483647 is reachable, and `a.x + a.w` in int is
+    // signed overflow: undefined, and in practice it wraps NEGATIVE and reads
+    // as "it fits" - the one answer this predicate must never give, because
+    // the caller takes it as permission to WRITE that rectangle.
+    // --roistats-selftest W11 pins both the boundary and the overflow.
+    return (int64_t)a.x + (int64_t)a.w <= (int64_t)W &&
+           (int64_t)a.y + (int64_t)a.h <= (int64_t)H;
 }
 
 // Writing the ROIs panel's number fields onto the annotation: x/y/w/h for a
@@ -118,6 +126,7 @@ static void toggleBand(bool horizontal) {
     ImageDoc* im = cur();
     if (!im) return;
     App::Ann* a = findAnn(app.selectedAnn);
+    char b[256];                                 // both arms print a refusal
     if (a && a->type == 0) {                     // ROI: the existing toggle
         // The second root of the 2026-09-29 report. prevX/prevW (and
         // prevY/prevH; -1 = nothing saved) hold the rectangle the band was made
@@ -152,30 +161,39 @@ static void toggleBand(bool horizontal) {
         // memory the way this function no longer does. That file belongs to
         // another change in flight; the seam for it is right here, and the
         // items should come through this arm rather than keep their own copy.
-        char b[224];
-        // one wording for "the rect I am holding does not belong to this
-        // frame", said the same way on both axes
-        auto refuseBack = [&](const App::Ann& back) {
-            char m[224];
-            snprintf(m, sizeof m, "the rect this band was made from (%dx%d @%d,%d) is "
-                                  "outside this frame (%dx%d) - kept as it is, not "
-                                  "resized", back.w, back.h, back.x, back.y,
-                     im->w, im->h);
+        // ONE axis is remembered per press - prevX/prevW for X, prevY/prevH
+        // for Y - so a refusal names the RANGE it is holding and never a
+        // rectangle: printing w x h from a half-remembered rect would name a
+        // rectangle that never existed, because the other axis comes from the
+        // CURRENT rect, which the user may have edited since.
+        auto refuseRange = [&](const char* n0, int p0, const char* n1, int p1) {
+            char m[256];
+            snprintf(m, sizeof m, "the %s range this band was made from (%s=%d %s=%d) is "
+                                  "outside this frame (%dx%d) - kept as it is, not resized",
+                     n0, n0, p0, n1, p1, im->w, im->h);
             toast(m, true);
         };
+        // ...and for the same reason the refusal below promises to keep a
+        // memory only when there IS one on the axis being toggled. Saying "the
+        // rect it remembers is kept" about a ROI that remembers nothing sends
+        // the reader looking for a way back that does not exist.
+        const bool mem = horizontal ? a->prevW >= 1 : a->prevH >= 1;
         if (!annFits(*a, im->w, im->h)) {
             snprintf(b, sizeof b, "%s (%dx%d @%d,%d) is outside this frame (%dx%d) - "
-                                  "X / Y bands a ROI against the frame it is on; "
-                                  "the rect it remembers is kept",
-                     a->label.c_str(), a->w, a->h, a->x, a->y, im->w, im->h);
+                                  "X / Y bands a ROI against the frame it is on%s",
+                     a->label.c_str(), a->w, a->h, a->x, a->y, im->w, im->h,
+                     mem ? "; the rect it remembers is kept" : "");
             toast(b, true);
             return;
         }
         if (horizontal) {
-            if (a->prevW >= 1) {                 // a memory: put that rect back
+            if (a->prevW >= 1) {                 // a memory: put that range back
                 App::Ann back = *a;
                 back.x = a->prevX; back.w = a->prevW;
-                if (!annFits(back, im->w, im->h)) { refuseBack(back); return; }
+                if (!annFits(back, im->w, im->h)) {
+                    refuseRange("x", a->prevX, "w", a->prevW);
+                    return;
+                }
                 a->x = back.x; a->w = back.w; a->prevW = -1;
             } else {                             // no memory: save it and widen
                 a->prevX = a->x; a->prevW = a->w;
@@ -185,7 +203,10 @@ static void toggleBand(bool horizontal) {
             if (a->prevH >= 1) {
                 App::Ann back = *a;
                 back.y = a->prevY; back.h = a->prevH;
-                if (!annFits(back, im->w, im->h)) { refuseBack(back); return; }
+                if (!annFits(back, im->w, im->h)) {
+                    refuseRange("y", a->prevY, "h", a->prevH);
+                    return;
+                }
                 a->y = back.y; a->h = back.h; a->prevH = -1;
             } else {
                 a->prevY = a->y; a->prevH = a->h;
@@ -195,10 +216,24 @@ static void toggleBand(bool horizontal) {
         app.annRev++;
         return;
     }
+    // A pin that is not on this frame, said as itself. The line below used to
+    // catch this case too and answered "select a pin, or hover a pixel" -
+    // advice for a state the user is not in, because the pin IS selected. It
+    // could not be acted on, and it hid the only fact that explains the
+    // refusal: the pin is a pixel of another frame.
+    if (a && a->type == 1 && !annFits(*a, im->w, im->h)) {
+        snprintf(b, sizeof b, "%s (@%d,%d) is outside this frame (%dx%d) - X / Y takes "
+                              "the row / column through the pin, and this frame has no "
+                              "pixel there", a->label.c_str(), a->x, a->y, im->w, im->h);
+        toast(b, true);
+        return;
+    }
     int px = -1, py = -1;
     if (a && a->type == 1) { px = a->x; py = a->y; }          // the selected pin
     else if (app.hoverX >= 0) { px = app.hoverX; py = app.hoverY; }
     if (px < 0 || px >= im->w || py < 0 || py >= im->h) {
+        // ...so this one now means what it says: nothing is selected and
+        // nothing is hovered.
         toast("select a pin, or hover a pixel, then press X or Y");
         return;
     }
