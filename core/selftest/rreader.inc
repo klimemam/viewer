@@ -88,7 +88,6 @@
             return out;
         };
         auto cacheCount = [&](const char* suf) {
-            std::string e2;
             int n = 0;
             std::error_code e;
             const std::string sx = suf;
@@ -2346,18 +2345,14 @@
                       "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='race')\n");
             std::string raceText[3] = { std::string(), files[1], files[2] };
             check(slurp(rdRace, raceText[0]), "R17a (setup) the racing reader is readable");
-            auto countSuffix = [&](const char* suf) {
-                int n = 0;
-                std::error_code e;
-                const std::string s = suf;
-                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
-                    const std::string nm = d.path().filename().u8string();
-                    if (nm.size() > s.size() &&
-                        nm.compare(nm.size() - s.size(), s.size(), s) == 0) n++;
-                }
-                return n;
-            };
-            const int vstream0 = countSuffix(".vstream");
+            // Counting files in the cache directory by suffix is cacheCount,
+            // defined once beside cacheDir. This block used to carry a second
+            // copy of that body under another name - two predicates for one
+            // question, which this project's own discipline says will drift
+            // (#282 had just made roiSideCovers defer to annFits for the same
+            // reason). There is nothing here for a local copy to know that the
+            // shared one does not, so it is the shared one.
+            const int vstream0 = cacheCount(".vstream");
 
             struct Contender { bool sent = false; int outcome = -1; std::string key, err; };
             Contender c[2];
@@ -2394,8 +2389,8 @@
                                       std::chrono::steady_clock::now() - t0c).count();
                 if (el > 2.5 || done.load() >= 2) break;
                 if (el > 0.3) {
-                    if (countSuffix(".part") > 0) sawPart = true;
-                    maxDuring = std::max(maxDuring, countSuffix(".vstream"));
+                    if (cacheCount(".part") > 0) sawPart = true;
+                    maxDuring = std::max(maxDuring, cacheCount(".vstream"));
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
@@ -2407,14 +2402,14 @@
             fprintf(stderr, "rreaderselftest:   R17 outcomes %d/%d keys \"%s\"/\"%s\"; "
                             ".vstream %d -> %d (max %d while running), part seen=%d\n",
                     c[0].outcome, c[1].outcome, c[0].key.c_str(), c[1].key.c_str(),
-                    vstream0, countSuffix(".vstream"), maxDuring, sawPart ? 1 : 0);
+                    vstream0, cacheCount(".vstream"), maxDuring, sawPart ? 1 : 0);
             check(c[0].sent && c[1].sent && oks == 1 && bad == 1,
                   "R17b both contenders are answered: one ran, one refused");
             check(sawPart,
                   "R17c a run in progress is a temp of its own, not the cache file");
             check(maxDuring == vstream0,
                   "R17d ...so nothing appears under the key until it is WHOLE");
-            check(countSuffix(".vstream") == vstream0 + 1,
+            check(cacheCount(".vstream") == vstream0 + 1,
                   "R17e exactly one result was published");
             std::string partDetail;
             const int partsLeft = settleCache(".part", 60.0, partDetail);
