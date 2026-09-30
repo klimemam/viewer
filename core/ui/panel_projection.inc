@@ -25,7 +25,9 @@ struct ProjCurveProbe {
     bool horizontal = false; // which of the two profiles
     int points = 0;          // points handed to AddPolyline, over every stroke
     int strokes = 0;         // separate polylines: a break in the curve adds one
-    int lattice = 0;         // positions this plane has samples at AT ALL
+    int lattice = 0;         // positions this plane has AT ALL (0 = the pass
+                             // never landed on it in this region)
+    int finite = 0;          // ...of which this many hold a finite sample
     int stride = 0;          // decimation, over this plane's OWN samples
     // The DATA x of the first and last point drawn - a column or row number,
     // never a packed index. This is what "the x axis is not compressed" means
@@ -48,6 +50,15 @@ static std::string g_projHoverProbe;
 // reason being read from sides[1] whatever side it was about, which printed an
 // empty string for C and later and is invisible in a list of letters.
 static std::string g_projUnavailProbe;
+// ...and the "no curve" sentence, per axis, as it was BUILT. Same reason: the
+// letters say WHICH plane was left off and the sentence says why, and the why
+// is the part that was making claims about the sensor that were not true.
+static std::string g_projNoCurveProbe;
+// ...the pooled-row footnote, which has to name every side it is about, and the
+// x axis titles, which have to name the side whose grid they are warning about.
+// Both were sentences standing on A alone.
+static std::string g_projFootProbe;
+static std::string g_projXAxisProbe;
 
 // Does series `s` carry a sample at profile index `i` AT ALL? The mosaic's
 // answer, not the data's: for a Bayer plane every other index is a position the
@@ -56,11 +67,36 @@ static std::string g_projUnavailProbe;
 // cfaChannelAt itself (core/app/state.h, ProjState::hPhase), so this is the one
 // spelling of the phase on this side of the panel.
 static bool projHasSample(const App::ProjState& S, int s, bool horizontal, int i) {
-    if (s < 0 || s >= 5) return true;
+    if (s < 0 || s >= 5) return false;
     const uint32_t ph = (horizontal ? S.hPhase : S.vPhase)[s];
-    if (!ph) return true;              // the pass never said: walk everything
+    if (!ph) return false;             // the pass never landed on this plane at
+                                       // all: it has NO position here (below)
     const int cell = std::max(1, S.cell);
     return ((ph >> (i % cell)) & 1u) != 0;
+}
+// Did the pass land on this plane at ALL? An empty phase word used to be read
+// as "no constraint - walk every position", and on a mosaic that is exactly
+// backwards. The plane loop is `lo = cfaChannelAt(x, y); hi = lo + 1`, so a
+// pass only ever visits the ONE plane each pixel belongs to - and a region the
+// pass cannot reach a plane in leaves that plane's word at zero.
+//
+// A 1 px high ROI does it: the H pass runs `for (dy = 0; dy < cell && y + dy <
+// rh; dy++)`, so at rh == 1 only dy == 0 runs, only even rows are seen, and an
+// RGGB frame's Gb and B never enter the loop. Read as "no constraint" they then
+// claimed every column of the region - "Gb@A: 16 of column 16" in the same
+// sentence as "fewer samples than two" - and the hover said "no finite pixel in
+// column 6", which is a statement about the sensor and is not true. A 1 px band
+// is a supported gesture (see canvas.inc on the old 3px rule), and quad Bayer
+// reaches this at 1-2 px on either axis.
+//
+// Three different facts, three different answers, and this is what tells the
+// first from the other two:
+//   never visited   - this region holds no position of this plane
+//   visited, NaN    - it holds positions and no measurement at them
+//   visited, finite - it holds samples (and then only adjacency can refuse)
+static bool projPhaseSeen(const App::ProjState& S, int s, bool horizontal) {
+    if (s < 0 || s >= 5) return false;
+    return (horizontal ? S.hPhase : S.vPhase)[s] != 0;
 }
 // ...and how many of them a profile of `n` entries holds, which is what the
 // decimation has to be computed against: a plane's OWN sample count, not the
@@ -68,9 +104,9 @@ static bool projHasSample(const App::ProjState& S, int s, bool horizontal, int i
 // plane is two columns wide - 2n/cell there, which is why this counts the bits
 // instead of dividing by the cell.
 static int projSampleCount(const App::ProjState& S, int s, bool horizontal, int n) {
-    if (s < 0 || s >= 5 || n <= 0) return std::max(0, n);
+    if (s < 0 || s >= 5 || n <= 0) return 0;
     const uint32_t ph = (horizontal ? S.hPhase : S.vPhase)[s];
-    if (!ph) return n;
+    if (!ph) return 0;                 // no position at all - see projPhaseSeen
     const int cell = std::max(1, S.cell);
     int c = 0;
     for (int p = 0; p < cell && p < 32; p++)
@@ -140,6 +176,9 @@ static void drawPanelProjection() {
     g_projCurveProbe.clear();
     g_projHoverProbe.clear();
     g_projUnavailProbe.clear();
+    g_projNoCurveProbe.clear();
+    g_projFootProbe.clear();
+    g_projXAxisProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -552,10 +591,12 @@ static void drawPanelProjection() {
     float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
     if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
     // One p-p ("in view") line PER SERIES under each plot, not one line per
-    // plot: a mosaic draws four of them, five with the pooled row, and the
-    // budget of one pushed the statistics table below the visible panel
-    // exactly where the numbers are read. P.nFill is how many the spread loop
-    // will draw - the slots the pass filled - so the two cannot drift.
+    // plot: a mosaic draws four, a 3-channel frame with the pooled row draws
+    // four as well, and the budget of one pushed the statistics table below the
+    // visible panel exactly where the numbers are read. P.nFill is how many the
+    // spread loop will draw - the slots that got a PROFILE - so the two cannot
+    // drift, and on a mosaic that correctly excludes the pooled row, which has
+    // no profile to take a p-p of.
     const int ppRows = std::max(1, P.nFill);
     float each = std::max((avail - lineH * (float)ppRows * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
@@ -727,7 +768,10 @@ static void drawPanelProjection() {
                 if (!projHasSample(S, s, horizontal, i)) continue;   // not a hole:
                                                                     // not a position
                 if (!bN) { bAt = i; lo = FLT_MAX; hi = -FLT_MAX; }
-                if (std::isfinite(d[i])) { lo = std::min(lo, d[i]); hi = std::max(hi, d[i]); }
+                if (std::isfinite(d[i])) {
+                    lo = std::min(lo, d[i]); hi = std::max(hi, d[i]);
+                    cp.finite++;
+                }
                 if (++bN >= stride) closeBucket();
             }
             closeBucket();
@@ -804,12 +848,18 @@ static void drawPanelProjection() {
                     if (best < 0 || abs(origin + i - at) < abs(origin + best - at)) best = i;
                 }
                 if (best < 0) {
-                    // Not silence. A plane with no sample anywhere in the cell
-                    // means the cell is outside this side's region - a smaller
-                    // frame, or an ROI that does not reach here - and that is a
-                    // fact about the SIDE, which the reader can act on.
-                    say(head + std::string("no sample in this ") +
-                        (cellW > 1 ? "cell" : (horizontal ? "column" : "row")));
+                    // Not silence, and not a claim about the sensor. A plane the
+                    // pass never landed on has no position ANYWHERE in this
+                    // region (a 1 px band on a mosaic does that to two of the
+                    // four planes) - which is a different fact from a cell this
+                    // side's region does not reach, and neither is "no finite
+                    // pixel in column 6", which is what a phase word of zero
+                    // read as "no constraint" used to make it say.
+                    if (!projPhaseSeen(S, s2, horizontal))
+                        say(head + "no sample: this plane has no position in this region");
+                    else
+                        say(head + std::string("no sample in this ") +
+                            (cellW > 1 ? "cell" : (horizontal ? "column" : "row")));
                     continue;
                 }
                 const int atCol = origin + best;
@@ -859,13 +909,25 @@ static void drawPanelProjection() {
         // (docs/features/analysis/stats-taxonomy.md §10). A MOSAIC preview is
         // refused outright (the phase is gone); a mono or RGB one is still an
         // honest profile, of the preview's own grid, and says so.
-        char xl[112];
-        bool anyPreview = false;
-        for (size_t si : which)
-            if (sides[si].S->img && sides[si].S->img->src->remoteStep > 1) anyPreview = true;
-        snprintf(xl, sizeof xl, "%s%s", horizontal ? "column x (px)" : "row y (px)",
-                 anyPreview ? "  -  PREVIEW grid: every Nth sensor line, not sensor x"
-                            : "");
+        char xl[176];
+        // Which SIDE is on a preview grid, by name - the note used to fire for
+        // any side on the plot, including a refused one that draws no curve at
+        // all, and never said whose grid it was talking about. A side with no
+        // profile is not on this axis, so it does not get to annotate it.
+        std::string prevSides;
+        for (size_t si : which) {
+            const App::ProjState& S = *sides[si].S;
+            if (!S.unavail.empty() || S.h[0].empty()) continue;   // no curve here
+            if (!S.img || S.img->src->remoteStep <= 1) continue;
+            if (!prevSides.empty()) prevSides += ", ";
+            prevSides += sides[si].name;
+        }
+        snprintf(xl, sizeof xl, "%s%s%s%s", horizontal ? "column x (px)" : "row y (px)",
+                 prevSides.empty() ? "" : "  -  ", prevSides.c_str(),
+                 prevSides.empty() ? ""
+                                   : ": PREVIEW grid, every Nth sensor line, not sensor x");
+        if (!g_projXAxisProbe.empty()) g_projXAxisProbe += "|";
+        g_projXAxisProbe += xl;
         PlotRect pr = beginPlot(xl, yl, x0, x1, yLo, yHi, true, false, each);
         if (!pr.ok) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -894,37 +956,59 @@ static void drawPanelProjection() {
         // per axis and a probe field is found by its first occurrence.
         {
             std::string drew, quiet, why;
+            // ...and whether any of the silent planes belongs to a side that was
+            // MEASURED. A refused side's table row is all dashes, so pointing a
+            // reader at it is pointing at nothing.
+            bool anyMeasured = false;
             for (size_t k = probe0; k < g_projCurveProbe.size(); k++) {
                 const ProjCurveProbe& c = g_projCurveProbe[k];
                 std::string& into = c.points >= 2 ? drew : quiet;
                 if (!into.empty()) into += ",";
                 into += c.plane + "@" + c.side;
                 if (c.points >= 2) continue;
-                // The reason is THIS plane's on THIS side. One reason built
-                // from A's rw applied it to every side's planes and told a mono
-                // frame about the mosaic: with A 4000 wide and C an 8-column
-                // ROI, the sentence quoted 4000 for the curve that is missing.
-                const int span = c.sideIdx >= 0 && (size_t)c.sideIdx < sides.size()
-                               ? (horizontal ? sides[c.sideIdx].S->rw
-                                             : sides[c.sideIdx].S->rh)
-                               : 0;
-                char b[128];
-                snprintf(b, sizeof b, "%s%s@%s: %d of %s %d",
-                         why.empty() ? "" : ", ", c.plane.c_str(), c.side.c_str(),
-                         c.lattice, horizontal ? "column" : "row", span);
-                why += b;
+                // THE SENTENCE PRINTS THE NUMBER IT IS REASONING ABOUT, and
+                // three numbers are in play: the positions the pass visited for
+                // this plane, how many of them hold a finite sample, and
+                // whether any two of THOSE are neighbours - which is the one
+                // that decides whether a line can exist. Printing the first
+                // while reasoning about the third produced a sentence its own
+                // figure contradicted ("16 positions" beside "fewer than two"),
+                // so each branch below names only the quantity that failed.
+                //
+                // Per plane and per SIDE: one reason built from A's rw applied
+                // it to every side's planes and told a mono frame about the
+                // mosaic.
+                char nb[176];
+                if (c.lattice == 0)
+                    snprintf(nb, sizeof nb, "no sample position in this region");
+                else if (c.finite == 0)
+                    snprintf(nb, sizeof nb,
+                             "no finite sample at any of its %d position(s)", c.lattice);
+                else if (c.finite == 1)
+                    snprintf(nb, sizeof nb,
+                             "1 finite sample of %d position(s), and a line needs two",
+                             c.lattice);
+                else
+                    snprintf(nb, sizeof nb,
+                             "%d of %d position(s) hold a finite sample, but no two of "
+                             "them next to each other", c.finite, c.lattice);
+                why += (why.empty() ? "" : "; ") + (c.plane + "@" + c.side + " - ") + nb;
+                if (c.sideIdx >= 0 && (size_t)c.sideIdx < sides.size() &&
+                    sides[c.sideIdx].S->unavail.empty())
+                    anyMeasured = true;
             }
             g_projSideProbe += std::string(horizontal ? "drewH=" : "drewV=") + drew + ";";
             if (!quiet.empty()) {
                 g_projSideProbe += std::string(horizontal ? "said-no-curve-planeH="
                                                           : "said-no-curve-planeV=") +
                                    quiet + ";";
+                char line[768];
+                snprintf(line, sizeof line, "no curve for: %s.%s", why.c_str(),
+                         anyMeasured ? "  Their numbers are in the table below." : "");
+                if (!g_projNoCurveProbe.empty()) g_projNoCurveProbe += "|";
+                g_projNoCurveProbe += std::string(horizontal ? "H " : "V ") + line;
                 ImGui::PushTextWrapPos(0.0f);
-                ImGui::TextColored(AB_AMBER,
-                                   "no curve for %s - a line needs two points and these "
-                                   "have fewer samples than that (%s). Their numbers are "
-                                   "in the table below.",
-                                   quiet.c_str(), why.c_str());
+                ImGui::TextColored(AB_AMBER, "%s", line);
                 ImGui::PopTextWrapPos();
             }
         }
@@ -1309,10 +1393,17 @@ static void drawPanelProjection() {
     // panel, hiding the single-frame limitation exactly where numbers are read.
     ImGui::TextWrapped("HFPN/RN = row/pixel; VFPN/RN = column/pixel. One-frame spatial "
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
-    if (cfa && P.allRow)
+    std::string pooledMosaic;      // the sides whose "all" row is a mosaic's
+    for (const ProjSide& sd : sides)
+        if (sd.S->cell > 1 && sd.S->allRow) {
+            if (!pooledMosaic.empty()) pooledMosaic += ", ";
+            pooledMosaic += sd.name;
+        }
+    if (!pooledMosaic.empty()) g_projFootProbe = "pooled-mosaic=" + pooledMosaic;
+    if (!pooledMosaic.empty())
         // WHAT "all" HAS ON A MOSAIC, and it is a shorter list than the panel's
         // other rows. It has the pooled REGION statistics - the mean and sigma
-        // of every pixel of the region, planes mixed, which is what the row was
+        // over the region's pixels, planes mixed, which is what the row was
         // added for - and it has nothing along either axis: no curve, no p-p
         // line under the plots, and mean (axis), sigma (axis), its % and its
         // p-p all "-" in the table and in the TSV.
@@ -1325,12 +1416,16 @@ static void drawPanelProjection() {
         // is all the column structure there is. The earlier wording named only
         // sigma (row), sigma (col) and their p-p, which left mean (axis) out
         // and did not match what the table showed.
-        ImGui::TextWrapped("\"all\" on a mosaic: pooled REGION statistics only - the "
-                           "mean and " SIGMA " (frame) over every pixel of the region. "
-                           "No curve, no p-p line, and no axis-direction numbers "
-                           "(mean (axis), " SIGMA " (axis), %% and p-p are \"-\"): "
-                           "unavailable: pooled planes. A column mean taken across the "
-                           "mosaic is the planes' LEVEL DIFFERENCE, not the column's.");
+        // Asked of EVERY side, not of A. A B or a C that is the mosaic put
+        // dashes in its own rows with no sentence anywhere on the panel, which
+        // is the silence this notice exists to stop.
+        ImGui::TextWrapped("\"all\" on a mosaic (%s): pooled REGION statistics only - "
+                           "the mean and " SIGMA " (frame) over the region's pixels, "
+                           "planes mixed. No curve, no p-p line, and no axis-direction "
+                           "numbers (mean (axis), " SIGMA " (axis), %% and p-p are "
+                           "\"-\"): unavailable: pooled planes. A column mean taken "
+                           "across the mosaic is the planes' LEVEL DIFFERENCE, not the "
+                           "column's.", pooledMosaic.c_str());
     // every row the walk will draw, the "-" ones included: they take a line too.
     // The same number the height budget above reserved for, counted once.
     const int tablePlanes = tableRowsWalked;

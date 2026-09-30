@@ -3017,6 +3017,15 @@
                 }
                 check(field(g_projSideProbe, "drewH=") == "R@B,Gr@B,Gb@B,B@B",
                       "C15 ...and the panel says B is what it drew");
+                // ...and it does NOT send the reader to A's rows, which are all
+                // dashes: every silent plane here belongs to the refused side.
+                fprintf(stderr, "abstatsselftest: C15 no-curve '%s'\n",
+                        g_projNoCurveProbe.c_str());
+                check(g_projNoCurveProbe.find("no sample position in this region") !=
+                          std::string::npos,
+                      "C15 A's planes are refused for having no position at all");
+                check(g_projNoCurveProbe.find("table below") == std::string::npos,
+                      "C15 ...and the reader is not pointed at a table of dashes");
                 // ...and the reason comes from THE SIDE IT IS ABOUT. With the
                 // refused side past B, reading sides[1] printed nothing at all.
                 addCompareSlot(app.images[0].get());       // C, the same preview doc
@@ -3271,6 +3280,221 @@
                 check(field(g_projSideProbe, "pprows=") == "1" &&
                       field(g_projSideProbe, "spreadH=") == "1",
                       "C20 one plane reserves one - the budget follows the series count");
+            }
+
+            // ======================================================================
+            // C21 - A PLANE THE PASS NEVER LANDED ON HAS NO SAMPLE POSITIONS,
+            // and that is a THIRD answer, different from "its positions hold
+            // nothing finite".
+            //
+            // A 1 px high ROI is a supported gesture (a band), and the H pass
+            // walks `for (y = 0; y < rh; y += step) for (dy = 0; dy < cell &&
+            // y + dy < rh; dy++)`, so at rh == 1 only dy == 0 runs and only
+            // even rows are seen. cfaChannelAt returns R and Gr there, so Gb
+            // and B never enter the plane loop at all and their phase word
+            // stays 0.
+            //
+            // Reading that 0 as "no constraint - walk every position" made a
+            // plane with NOTHING claim every column of the region: "Gb@A: 16 of
+            // column 16" in the same sentence as "fewer samples than two", and
+            // a hover that said "no data (no finite pixel in column 6)" - a
+            // claim about the sensor that is not true. The right answer is that
+            // this region holds no Gb position, and the words for it were
+            // already three lines away and unreachable.
+            // ======================================================================
+            {
+                useOnly(mkFrame("pc_band", 4096, 16, 1, 1));
+                app.anns.clear();
+                App::Ann a4;
+                a4.id = app.nextAnnId++;
+                a4.type = 0;
+                a4.x = 200; a4.y = 0; a4.w = 16; a4.h = 1;    // a 1 px high band
+                a4.label = "pcband";
+                app.anns.push_back(a4);
+                app.selectedAnn = a4.id;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                draw();
+                dump("C21 a 1 px high ROI on a mosaic");
+                fprintf(stderr, "abstatsselftest: C21 no-curve '%s'\n",
+                        g_projNoCurveProbe.c_str());
+                check(app.proj[0].rh == 1 && app.proj[0].rw == 16,
+                      "C21 fixture: the ROI is 16 columns and ONE row");
+                check(app.proj[0].hPhase[2] == 0 && app.proj[0].hPhase[3] == 0,
+                      "C21 fixture: the pass never landed on Gb or B at all");
+                check(app.proj[0].hPhase[0] != 0 && app.proj[0].hPhase[1] != 0,
+                      "C21 fixture: ...and it did land on R and Gr");
+                // R and Gr have eight positions each and are drawn.
+                const ProjCurveProbe* r = curve("R", true);
+                const ProjCurveProbe* g = curve("Gr", true);
+                check(r && r->lattice == 8 && r->points == 8,
+                      "C21 R has its eight columns of the band and a curve");
+                check(g && g->lattice == 8 && g->points == 8,
+                      "C21 ...and so does Gr");
+                // Gb and B have NO positions - not sixteen.
+                for (const char* nm : { "Gb", "B" }) {
+                    const ProjCurveProbe* c = curve(nm, true);
+                    char what[144];
+                    snprintf(what, sizeof what,
+                             "C21 plane %s has ZERO sample positions here, not the "
+                             "region's 16", nm);
+                    check(c && c->lattice == 0 && c->points == 0, what);
+                }
+                check(g_projNoCurveProbe.find("16 of column 16") == std::string::npos,
+                      "C21 the sentence does not claim 16 positions for a plane with none");
+                check(g_projNoCurveProbe.find("no sample position in this region") !=
+                          std::string::npos,
+                      "C21 ...it says the region holds no position of that plane");
+                check(g_projNoCurveProbe.find("fewer samples than") == std::string::npos,
+                      "C21 ...and does not also call it 'fewer than two'");
+                // ...and the hover says the same thing, about the MOSAIC and not
+                // about the sensor.
+                if (r) {
+                    const float t = (206.0f - r->xmin) / std::max(r->xmax - r->xmin, 1e-6f);
+                    projFrame(900.0f, 900.0f,
+                              ImVec2(r->px0 + t * (r->px1 - r->px0),
+                                     (r->py0 + r->py1) * 0.5f));
+                    fprintf(stderr, "abstatsselftest: C21 hover '%s'\n",
+                            g_projHoverProbe.c_str());
+                    check(g_projHoverProbe.find("no finite pixel") == std::string::npos,
+                          "C21 hover makes no claim about the sensor's pixels");
+                    check(g_projHoverProbe.find("Gb: no sample") != std::string::npos &&
+                          g_projHoverProbe.find("B: no sample") != std::string::npos,
+                          "C21 ...it says Gb and B have no sample in this cell");
+                }
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+            }
+
+            // ======================================================================
+            // C22 - DEAD PHASE AND UNVISITED PLANE ARE DIFFERENT SENTENCES.
+            // C18's fixture has positions and no finite value at half of them;
+            // C21's has no positions at all. Both end with no curve, and the
+            // reason a reader can act on is not the same one - so the panel must
+            // not print one sentence for both.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_deadphase", 32, 32, 2, 1));
+                for (int y = 0; y < 32; y++)
+                    for (int x = 0; x < 32; x++)
+                        if ((x % 4) == 0 && cfaChannelAt(*d, x, y) == 0)
+                            d->px()[(size_t)y * 32 + x] =
+                                std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C22 dead-phase no-curve '%s'\n",
+                        g_projNoCurveProbe.c_str());
+                const ProjCurveProbe* r = curve("R", true);
+                check(r && r->lattice == 16 && r->points == 0,
+                      "C22 fixture: R has 16 positions and no drawable pair");
+                check(g_projNoCurveProbe.find("no sample position in this region") ==
+                          std::string::npos,
+                      "C22 a dead PHASE is not 'no sample position' - the positions exist");
+                check(g_projNoCurveProbe.find("8 of 16") != std::string::npos,
+                      "C22 ...the sentence counts the finite samples of the positions");
+                check(g_projNoCurveProbe.find("no two of them next to each other") !=
+                          std::string::npos,
+                      "C22 ...and names the condition that actually failed");
+            }
+
+            // ======================================================================
+            // C23 - THE "all" FOOTNOTE IS ABOUT EVERY SIDE, NOT ABOUT A. The
+            // notice that explains why the pooled row's axis numbers are dashes
+            // was raised on A's own mosaic flag, so a B (or a C) that is the
+            // mosaic put dashes in its own rows and no sentence appeared
+            // anywhere on the panel - the silence the notice exists to stop.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_foot_A", 16, 16, 0, 1));   // mono
+                app.images.push_back(mkFrame("pc_foot_B", 16, 16, 1, 1));   // mosaic
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.projAllRow = true;
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                draw();
+                fprintf(stderr, "abstatsselftest: C23 A mono / B mosaic foot '%s'\n",
+                        g_projFootProbe.c_str());
+                check(app.proj[0].cell == 1 && app.proj[1].cell == 2 &&
+                      app.proj[1].allRow,
+                      "C23 fixture: A is not a mosaic and B is, both with 'all' on");
+                check(g_projFootProbe == "pooled-mosaic=B",
+                      "C23 the footnote is raised, and it names B");
+                check(app.proj[1].h[4].empty() && !app.proj[1].hStat[4].valid,
+                      "C23 ...which is exactly the side whose pooled axis rows are dashes");
+                // ANTI-VACUOUS: with neither side a mosaic there is nothing to
+                // explain and the sentence must not appear at all.
+                app.images[1]->cfa = 0;
+                app.proj[1] = App::ProjState{};
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C23 both mono foot '%s'\n",
+                        g_projFootProbe.c_str());
+                check(g_projFootProbe.empty(),
+                      "C23 two non-mosaic sides raise no footnote at all");
+                // ...and with BOTH sides a mosaic it names both.
+                app.images[0]->cfa = 1; app.images[0]->cfaPattern = 0;
+                app.images[1]->cfa = 1; app.images[1]->cfaPattern = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C23 both mosaic foot '%s'\n",
+                        g_projFootProbe.c_str());
+                check(g_projFootProbe == "pooled-mosaic=A, B",
+                      "C23 ...and both sides when both are mosaics");
+                app.projAllRow = false;
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C24 - THE PREVIEW NOTE ON THE x AXIS BELONGS TO A SIDE, AND SAYS
+            // WHICH. A decimated preview's columns are every Nth column of the
+            // sensor, so "column x (px)" is a sensor coordinate its samples do
+            // not have - but the note was raised by ANY side on the plot,
+            // including a refused mosaic preview that draws no curve at all and
+            // is therefore not on this axis, and it never said whose grid it
+            // meant.
+            // ======================================================================
+            {
+                // (a) a MONO preview: it really is drawn, on its own grid
+                ImageDoc* d = useOnly(mkFrame("pc_xaxis_mono", 16, 16, 0, 1));
+                d->src->remoteStep = 2;
+                app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C24 mono preview x '%s'\n",
+                        g_projXAxisProbe.c_str());
+                check(g_projXAxisProbe.find("A: PREVIEW grid") != std::string::npos,
+                      "C24 a mono preview's axis names the SIDE and its grid");
+                check(curve("ch0", true) && curve("ch0", true)->points == 16,
+                      "C24 ...and that side really does have a curve on that axis");
+                // (b) a MOSAIC preview is refused, draws nothing, and must not
+                // annotate an axis it is not on.
+                ImageDoc* m = useOnly(mkFrame("pc_xaxis_cfa", 16, 16, 1, 1));
+                m->src->remoteStep = 2;
+                app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C24 mosaic preview x '%s' unavail '%s'\n",
+                        g_projXAxisProbe.c_str(),
+                        field(g_projSideProbe, "unavail=").c_str());
+                check(field(g_projSideProbe, "unavail=") == "A",
+                      "C24 fixture: the mosaic preview is the refused side");
+                check(g_projXAxisProbe.find("PREVIEW") == std::string::npos,
+                      "C24 a side with no curve does not get to annotate the axis");
+                // (c) ...and a full-resolution frame says nothing at all.
+                useOnly(mkFrame("pc_xaxis_full", 16, 16, 0, 1));
+                draw();
+                check(g_projXAxisProbe.find("PREVIEW") == std::string::npos &&
+                      g_projXAxisProbe.find("column x (px)") != std::string::npos,
+                      "C24 a full-resolution frame keeps the plain axis title");
             }
 
             // ---- everything borrowed, put back ------------------------------------
