@@ -285,6 +285,59 @@ static int cjkFontSelftest() {
         auto same = [](const float a[3], const float b[3]) {
             return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
         };
+        // ---- WHAT CAN AND CANNOT BE PINNED HERE (review P3) ----------
+        // Two assertions used to live here that could not fail on a machine
+        // reaching this branch. `selfMerged == 0` walks cjkMergeFontPath,
+        // which on Linux returns {} for every input because the merge list
+        // is empty there - so it asserted nothing at all. And
+        // `cjkMergeFontPath(path).empty()` re-evaluated the same pure
+        // function whose emptiness had already put this branch on the
+        // screen. Both are replaced by claims about the TABLE, which is
+        // the thing that can actually regress, and which is the same on
+        // every platform this builds for.
+        const std::vector<FontCandidate> tbl = cjkFontCandidates();
+        int ja = 0, zh = 0, dupes = 0;
+        std::vector<std::string> seenPath;
+        for (const FontCandidate& fc : tbl) {
+            if (fc.lang == LangJa) ja++; else zh++;
+            if (std::find(seenPath.begin(), seenPath.end(), fc.path) != seenPath.end())
+                dupes++;
+            seenPath.push_back(fc.path);
+        }
+        say("candidate table: " + std::to_string(ja) + " ja, " +
+            std::to_string(zh) + " zh, " + std::to_string(dupes) + " duplicate(s)");
+        // THE DEFECT THIS PINS: Hiragino Sans GB was in the primary list
+        // AND the merge list, so on macOS the "a Chinese face is being used
+        // for everything" message could never fire and a refusal could
+        // print one path twice. One tagged table makes that impossible, and
+        // a duplicate row here is the regression to catch.
+        check(dupes == 0,
+              "C3 no path appears twice in the candidate table (it used to: "
+              "Hiragino Sans GB was in both lists)");
+        check(ja >= 1,
+              "C3 ...and this platform lists at least one Japanese face");
+        // The two derived views are exactly the two halves of the table -
+        // asserted as a partition, so a font cannot be silently dropped
+        // from both or counted in both.
+        check((int)jpFontCandidates().size() == ja &&
+              (int)cjkMergeCandidates().size() == zh &&
+              ja + zh == (int)tbl.size(),
+              "C3 ...and the ja/zh views partition it exactly");
+        // ...and a Chinese face is never the merge partner of itself, which
+        // is the one thing the old loop was trying to say. Asserted only
+        // where there IS one, and said by name where there is not.
+        if (zh == 0) {
+            say("this platform lists no Chinese face at all, so 'never merged "
+                "onto itself' has no input here - it is asserted on the "
+                "platforms that have one.");
+        } else {
+            int selfMerged = 0;
+            for (const std::string& m : cjkMergeCandidates())
+                if (cjkMergeFontPath(m) == m) selfMerged++;
+            check(selfMerged == 0,
+                  "C3 ...and no Chinese face is ever merged onto itself (" +
+                  std::to_string(zh) + " checked)");
+        }
         if (g_fontMergePath.empty()) {
             // One face is the ordinary state off Windows: Noto Sans CJK and
             // Hiragino Sans GB are pan-CJK in one file, so there is no order to
@@ -298,27 +351,7 @@ static int cjkFontSelftest() {
                 "pan-CJK - and C3's per-glyph half needs two files.");
             check(g_fontAtlasCost.faces <= 1 || g_fontChoice.path.empty(),
                   "C3 with no second face the atlas carries one face");
-            // ...and the two PURE claims, which used to be written so that they
-            // could only ever fail and never report (review P3-17): a loop of
-            // `if (bad) check(false)` prints nothing at all when it is happy,
-            // so a reader could not tell it had run. Counted and asserted.
-            int selfMerged = 0;
-            std::string selfName;
-            std::vector<std::string> everything = jpFontCandidates();
-            for (const std::string& m : cjkMergeCandidates()) everything.push_back(m);
-            for (const std::string& cand : everything)
-                if (cjkMergeFontPath(cand) == cand) { selfMerged++; selfName = cand; }
-            check(selfMerged == 0,
-                  "C3 no font is ever merged onto itself (" +
-                  std::to_string((int)everything.size()) + " path(s) checked" +
-                  (selfName.empty() ? "" : ", first offender " + selfName) + ")");
-            // A Chinese face IS in the primary search now (review P2-8), so on
-            // a machine with one face it is either because the platform needs
-            // none or because none is installed - never because the list forgot
-            // to look. That is the thing worth pinning here.
-            check(cjkMergeFontPath(g_fontChoice.path).empty(),
-                  "C3 ...and the one-face state really is 'no second file "
-                  "available', not 'never asked'");
+
         } else {
             // AT THE SIZE START-UP USED (review P2-10). These were 17.0f
             // flat, so a run with --ui-scale 2 baked the probes at 17 px while
@@ -438,6 +471,41 @@ static int cjkFontSelftest() {
               "C4 ...and a name the atlas can draw counts 0");
         check(undrawableCount(broken) == 2,
               "C4 ...and each byte that is not UTF-8 counts (two here)");
+        // ---- WHICH CAUSE, not just how many (review P3) --------------------
+        // The classification used to read `used == 4` as "a code point above
+        // U+FFFF". ImGui's ImTextCharFromUtf8 returns, on its ERROR path,
+        // `ImMin(wanted, !!s[0] + !!s[1] + !!s[2] + !!s[3])` - the number of
+        // non-zero bytes it looked at - so an ILL-FORMED sequence starting
+        // with a 4-byte lead byte returns 4 exactly as a well-formed one does.
+        // The old code therefore told the user about "emoji and the rarer CJK
+        // extensions" when the truth was that their filename is not UTF-8, and
+        // offered a fix that cannot work. `*out_char` cannot separate them
+        // either: on every error path it is U+FFFD.
+        {
+            // F0 followed by ASCII: a 4-byte lead byte with no continuation
+            // bytes. This is the case that was misfiled.
+            const std::string lead4 = "x\xF0" "ABC.npy";
+            const UndrawableTally t4 = undrawableTally(lead4);
+            say("F0+ASCII -> noGlyph=" + std::to_string(t4.noGlyph) +
+                " tooHigh=" + std::to_string(t4.tooHigh) +
+                " badBytes=" + std::to_string(t4.badBytes));
+            check(t4.badBytes >= 1 && t4.tooHigh == 0,
+                  "C4 an ill-formed 4-byte lead is BAD BYTES, not 'above the BMP'");
+            // ...and a real emoji, which IS above the BMP, still lands there -
+            // or the fix above would have been "call everything bad bytes".
+            const UndrawableTally te = undrawableTally(emoji);
+            say("emoji    -> noGlyph=" + std::to_string(te.noGlyph) +
+                " tooHigh=" + std::to_string(te.tooHigh) +
+                " badBytes=" + std::to_string(te.badBytes));
+            check(te.total() == 1,
+                  "C4 ...while a real emoji is still counted exactly once");
+            // The SENTENCE must not offer a font as the cure for either of
+            // those two, because no font can be.
+            const std::string n4 = undrawableNoteOf(t4);
+            check(n4.find("not valid UTF-8") != std::string::npos &&
+                  n4.find("appearance.fontPath") == std::string::npos,
+                  "C4 ...and the sentence for bad bytes does NOT suggest a font");
+        }
         // THE CASE THE UBUNTU RUNNER CAUGHT, and it is the reason the two
         // assertions above are worth their own lines. ImGui decodes all three
         // of "not UTF-8", "truncated" and "above U+FFFF" to U+FFFD, and
@@ -496,10 +564,29 @@ static int cjkFontSelftest() {
         //
         // A sweep does not report a batch that is still GROWING - one more
         // sweep at the same size is what says the load has landed - so every
-        // case below sweeps twice, which is also what the frame loop does.
+        // case below sweeps twice.
+        //
+        // THE SWEEP DOES NOT TOUCH app.imagesRev, and that is the whole point
+        // of this group now. It used to read
+        //
+        //     auto sweep = [&]() { app.imagesRev++; undrawableReportNewDocs(); };
+        //
+        // with a comment claiming "which is also what the frame loop does".
+        // The frame loop does NOT do that: every `imagesRev++` in the program
+        // happens with a push, and nothing increments it periodically. So the
+        // test was supplying the one thing the real program never supplies,
+        // and it passed while the feature did not work at all - the comment
+        // pinned the defect as the specification. Calling the function twice
+        // with the counter held still is what a real second frame looks like,
+        // and it fails three ways:
+        //   - against the old implementation (rev-gated): 0 lines, because the
+        //     second call returns at the gate;
+        //   - against a naive fix that just deletes the gate: the line appears
+        //     on the FIRST call, with a count taken mid-load;
+        //   - against one that never settles: more than one line.
         const size_t logWas = app.msgLog.size();
         const uint64_t revWas = app.imagesRev;
-        auto sweep = [&]() { app.imagesRev++; undrawableReportNewDocs(); };
+        auto sweep = [&]() { undrawableReportNewDocs(); };
         auto mkDoc = [&](const std::string& nm, int batchId, int seqId) {
             auto d = std::make_unique<ImageDoc>();
             d->name = nm;
@@ -517,12 +604,19 @@ static int cjkFontSelftest() {
         };
         {
             mkDoc(thai, 101, 0);
+            app.imagesRev++;               // the push, as a real loader does it
             sweep();                       // records the size, says nothing yet
-            sweep();                       // settled: now it reports
+            const std::vector<std::string> mid = linesSince(logWas);
+            check(mid.empty(),
+                  "C4 the first sweep of a growing batch says nothing (the count "
+                  "would be mid-load)");
+            sweep();                       // ...and this one, with the counter
+                                           // held still, is the settled frame
             const std::vector<std::string> got = linesSince(logWas);
             for (const std::string& l : got) say("msg: " + l);
             check(got.size() == 1 && got[0].find("draw as '?'") != std::string::npos,
-                  "C4 one open of one such file leaves exactly ONE line");
+                  "C4 one open of one such file leaves exactly ONE line, WITHOUT "
+                  "app.imagesRev moving again");
             // ...and not again. THE TRAP THIS AVOIDS (review P2-11): logMsg
             // suppresses a line identical to the one before it, so an assertion
             // that only swept again would pass even with the de-duplication
@@ -530,10 +624,10 @@ static int cjkFontSelftest() {
             // under test is this function's and not logMsg's.
             logMsg("cjkfont selftest marker", false);
             const size_t after = app.msgLog.size();
-            sweep(); sweep();
+            sweep(); sweep(); sweep();
             check(app.msgLog.size() == after,
                   "C4 ...and never again for that open (asserted past logMsg's "
-                  "own duplicate suppression)");
+                  "own duplicate suppression, and past three more sweeps)");
         }
         // ---- A STACK IS ONE LINE, NOT ONE PER FRAME (review P2-5) ----------
         // THE DEFECT THIS REPLACES: a folder of 400 numbered frames is one
@@ -548,8 +642,10 @@ static int cjkFontSelftest() {
             si.id = app.nextSeqId++;
             si.name = thai;                // the STACK's name is undrawable
             app.seqs.push_back(si);
-            for (int k = 0; k < 40; k++)
+            for (int k = 0; k < 40; k++) {
                 mkDoc("frame_" + std::to_string(k) + ".npy", 102, si.id);
+                app.imagesRev++;           // one bump per push, as a stack load does
+            }
             sweep(); sweep();
             const std::vector<std::string> got = linesSince(before);
             for (const std::string& l : got) say("msg: " + l);
@@ -565,13 +661,40 @@ static int cjkFontSelftest() {
             si2.id = app.nextSeqId++;
             si2.name = "plain_stack";      // the stack's own name is fine
             app.seqs.push_back(si2);
-            for (int k = 0; k < 6; k++)
+            for (int k = 0; k < 6; k++) {
                 mkDoc(k < 2 ? thai : ("ok_" + std::to_string(k) + ".npy"), 103, si2.id);
+                app.imagesRev++;
+            }
             sweep(); sweep();
             const std::vector<std::string> got2 = linesSince(before2);
             for (const std::string& l : got2) say("msg: " + l);
             check(got2.size() == 1 && got2[0].find("2 of 6 frame(s)") != std::string::npos,
                   "C4 ...and a stack whose FRAMES carry it says 2 of 6");
+        }
+        // ---- A CLEAN FOLDER SAYS NOTHING (review, new critical 1) --------
+        // THE DEFECT THIS FIXES: the tooltip's tally was computed over the
+        // whole concatenated tooltip, which is multi-line - and the atlas has
+        // no glyph for U+000A because the ranges start at U+0020. So EVERY row
+        // in the panel, plain ASCII ones included, grew a "1 character here
+        // draws as '?'" that was false. A warning on everything is the same as
+        // no warning at all, and worse than silence because it is wrong.
+        {
+            const size_t before3 = app.msgLog.size();
+            for (int k = 0; k < 5; k++) {
+                mkDoc("plain_" + std::to_string(k) + ".npy", 104, 0);
+                app.imagesRev++;
+            }
+            sweep(); sweep();
+            check(linesSince(before3).empty(),
+                  "C4 an all-ASCII open leaves NO line at all");
+            // ...and the tooltip's own shape: the note for a multi-line block
+            // whose visible characters are all drawable must be empty, which is
+            // what the newline rule buys.
+            check(undrawableNote("C:/data/frame_000.npy\n256x256 1ch u16").empty(),
+                  "C4 ...and a multi-line tooltip body full of drawable "
+                  "characters is not reported either");
+            check(undrawableNote("a\tb\r\nc").empty(),
+                  "C4 ...nor are tabs and carriage returns");
         }
         app.images.clear();
         app.seqs.clear();
@@ -1211,17 +1334,18 @@ static int cjkFontSelftest() {
             // All six pairs, because three comparisons out of six is not "they
             // are all different".
             FontChoice any; any.path = "/x.ttc"; any.how = "built-in candidate";
-            const std::string five[5] = {
+            FontAtlasCost dropCost; dropCost.mergeDropped = "/y.ttc";
+            const std::string msgs[6] = {
                 cjkFontMissingText(any), cjkFontNoGlyphsText(any),
                 cjkFontUnreadableText(any), cjkFontChineseFallbackText(any),
-                cjkFontCrashSkipText(any),
+                cjkFontCrashSkipText(any), cjkFontMergeDroppedText(dropCost, any),
             };
             int distinct = 0, pairs = 0;
-            for (int i = 0; i < 5; i++)
-                for (int k = i + 1; k < 5; k++) { pairs++; if (five[i] != five[k]) distinct++; }
-            check(pairs == 10 && distinct == 10,
+            for (int i = 0; i < 6; i++)
+                for (int k = i + 1; k < 6; k++) { pairs++; if (msgs[i] != msgs[k]) distinct++; }
+            check(pairs == 15 && distinct == 15,
                   "C7 ...and all " + std::to_string(pairs) +
-                  " pairs of the five font messages differ");
+                  " pairs of the six font messages differ");
             // (4) SURVIVING CLEARS IT. Otherwise the first crash would disable
             // the override for good.
             fontBakeCrumbClear();

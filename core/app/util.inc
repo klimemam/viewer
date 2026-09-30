@@ -40,39 +40,79 @@ static std::string g_settingsFontPath;
 static FontChoice g_fontChoice;
 static std::string g_fontMergePath;
 
-// The paths this build knows about, in order. Named so the refusal can print
-// them and so a test can assert that it did.
-static std::vector<std::string> jpFontCandidates() {
-    static const char* candidates[] = {
+// The size the CJK faces are baked at. Named because it is used in three
+// places - the primary, the merged face, and the retry that drops the merge -
+// and three copies of a literal is how they stop agreeing.
+static constexpr float CJK_FONT_PX = 17.0f;
+
+// ---- ONE LIST, WITH THE LANGUAGE ON EACH ROW (review P2) -------------------
+// There used to be two lists and a font's language was inferred from which one
+// it sat in. That inference was wrong on macOS, where Hiragino Sans GB was in
+// BOTH - as a primary candidate and as a merge candidate - and a duplicated
+// truth produced exactly what one does: the "a Chinese face is being used for
+// everything" message could not fire on the one platform where that state is
+// reachable (the path came back tagged "built-in candidate", because the
+// primary list found it first), and a refusal could print the same path twice.
+//
+// So the language is a FIELD. The merge partner and the fourth message are both
+// read off it, which leaves one row as the single place either answer can move.
+//
+// HIRAGINO SANS GB IS TAGGED zh, by the criterion the review set: not "does it
+// have kana" - it does - but "does it draw JAPANESE forms". GB is 国标, the
+// PRC standard, and its ideographs follow Chinese conventions. That is the
+// whole reason it is useful as a second face and the whole reason it is wrong
+// as the first. PingFang SC is the same case.
+enum FontLang { LangJa, LangZh };
+struct FontCandidate { const char* path; FontLang lang; };
+
+static std::vector<FontCandidate> cjkFontCandidates() {
+    static const FontCandidate all[] = {
 #if defined(_WIN32)
-        "C:\\Windows\\Fonts\\meiryo.ttc",
-        "C:\\Windows\\Fonts\\YuGothM.ttc",
-        "C:\\Windows\\Fonts\\msgothic.ttc",
+        { "C:\\Windows\\Fonts\\meiryo.ttc",        LangJa },
+        { "C:\\Windows\\Fonts\\YuGothM.ttc",       LangJa },
+        { "C:\\Windows\\Fonts\\msgothic.ttc",      LangJa },
         // Bundled with Windows 11 itself rather than with the Japanese language
         // pack, so on the English install where the three above are all missing
         // this is the one that is there.
-        "C:\\Windows\\Fonts\\NotoSansJP-VF.ttf",
+        { "C:\\Windows\\Fonts\\NotoSansJP-VF.ttf", LangJa },
+        { "C:\\Windows\\Fonts\\msyh.ttc",          LangZh },   // Microsoft YaHei
+        { "C:\\Windows\\Fonts\\msyhl.ttc",         LangZh },   // ...Light
+        { "C:\\Windows\\Fonts\\simsun.ttc",        LangZh },   // the pre-Vista face
 #elif defined(__APPLE__)
-        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        { "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", LangJa },
+        { "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", LangJa },
+        { "/System/Library/Fonts/Hiragino Sans GB.ttc",      LangZh },
+        { "/System/Library/Fonts/PingFang.ttc",              LangZh },
 #else
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-JP-Regular.otf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        // Linux needs no second file: Noto Sans CJK is one pan-CJK font, and
+        // even the language-specific NotoSansCJK-JP-Regular.otf carries the
+        // whole ideograph set (the JP/SC/TC builds differ in which VARIANT is
+        // default, not in coverage). So every row here is ja and the merge list
+        // comes out EMPTY - which is the right answer, not a missing one.
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", LangJa },
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-JP-Regular.otf", LangJa },
+        { "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", LangJa },
+        { "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc", LangJa },
+        { "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf", LangJa },
         // The VARIABLE-font spellings, which is how Noto CJK is packaged now.
         // A machine with a perfectly good font and a newer file name used to
         // fall through the whole list.
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.otf.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-VF.otf.ttc",
-        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-VF.otf.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-JP-VF.otf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-JP-VF.otf",
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.otf.ttc", LangJa },
+        { "/usr/share/fonts/noto-cjk/NotoSansCJK-VF.otf.ttc", LangJa },
+        { "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-VF.otf.ttc", LangJa },
+        { "/usr/share/fonts/opentype/noto/NotoSansCJK-JP-VF.otf", LangJa },
+        { "/usr/share/fonts/noto-cjk/NotoSansCJK-JP-VF.otf", LangJa },
 #endif
     };
-    return std::vector<std::string>(candidates, candidates + (sizeof candidates / sizeof candidates[0]));
+    return std::vector<FontCandidate>(all, all + (sizeof all / sizeof all[0]));
+}
+
+// The Japanese faces, in order: what the primary search prefers.
+static std::vector<std::string> jpFontCandidates() {
+    std::vector<std::string> out;
+    for (const FontCandidate& c : cjkFontCandidates())
+        if (c.lang == LangJa) out.push_back(c.path);
+    return out;
 }
 
 // The last way out: ask fontconfig, which on a Linux box is the only thing that
@@ -367,21 +407,13 @@ static FontChoice jpFontChoice(const std::string& want,
 // Linux needs no second file: Noto Sans CJK is one pan-CJK font, and even the
 // language-specific NotoSansCJK-JP-Regular.otf carries the whole ideograph set
 // (the JP/SC/TC builds differ in which VARIANT is default, not in coverage).
+//
+// READ OFF THE LANGUAGE FIELD, not a second hand-written list - see
+// cjkFontCandidates() for what that duplication cost.
 static std::vector<std::string> cjkMergeCandidates() {
-    static const char* merges[] = {
-#if defined(_WIN32)
-        "C:\\Windows\\Fonts\\msyh.ttc",     // Microsoft YaHei
-        "C:\\Windows\\Fonts\\msyhl.ttc",    // ...Light, if only that one is there
-        "C:\\Windows\\Fonts\\simsun.ttc",   // the pre-Vista face, still installed on some
-#elif defined(__APPLE__)
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-#endif
-        nullptr,                            // so the array is never empty
-    };
     std::vector<std::string> out;
-    for (const char* m : merges)
-        if (m) out.push_back(m);
+    for (const FontCandidate& c : cjkFontCandidates())
+        if (c.lang == LangZh) out.push_back(c.path);
     return out;
 }
 
@@ -698,6 +730,9 @@ struct FontAtlasCost {
     // still could not parse it (CFF2 is the case with a name). The numbers
     // above are then the BUILT-IN font's, because that is what got baked.
     bool buildFailed = false;
+    // ...and the second face that had to be dropped for the first one to bake
+    // at all. Empty in every ordinary case.
+    std::string mergeDropped;
 };
 static FontAtlasCost g_fontAtlasCost;
 
@@ -768,7 +803,28 @@ static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale,
     // does have ASCII, and an application that draws its own menus is one the
     // user can use to fix this. The font that failed is NAMED: see
     // cjkFontUnreadableText(), which is what start-up puts on screen.
-    const bool built = a->Build();
+    bool built = a->Build();
+    // ---- IF THERE WERE TWO FACES, THE SECOND ONE MAY BE THE BAD ONE --------
+    // (review, reference finding 2.) A failed Build used to throw away BOTH
+    // faces and fall straight to the built-in font, so a broken Chinese face
+    // cost the user their perfectly good Japanese one - and the message then
+    // named the primary, which was innocent, and offered a fix for it that
+    // could not help. So the primary is given one more chance on its own. If
+    // that works the merge is simply gone, which is the ordinary state on
+    // Linux and a survivable one everywhere.
+    if (!built && !g_fontMergePath.empty() && !g_fontChoice.path.empty()) {
+        fprintf(stderr, "font atlas: build failed with two faces - retrying with "
+                        "%s alone (without %s)\n",
+                g_fontChoice.path.c_str(), g_fontMergePath.c_str());
+        a->Clear();
+        if (a->AddFontFromFileTTF(g_fontChoice.path.c_str(),
+                                  CJK_FONT_PX * fontScale, nullptr, ranges.Data) &&
+            a->Build()) {
+            built = true;
+            c.mergeDropped = g_fontMergePath;   // what the message has to name
+            g_fontMergePath.clear();
+        }
+    }
     c.buildFailed = !built || fontLoadFailed;
     if (!built) {
         fprintf(stderr, "font atlas: FAILED to build from %s - falling back to "
@@ -888,6 +944,21 @@ static std::string cjkFontCrashSkipText(const FontChoice& c) {
            " instead. To fix it, point \"appearance.fontPath\" in settings.jsonc "
            "(or `fontPath` in prefs.txt) at a different file, or delete that "
            "line to go back to the built-in search.";
+}
+
+// ...and the SIXTH: the two faces would not bake together, the primary alone
+// did, so the simplified-Chinese characters the second face was there to supply
+// are gone. Not a refusal - Japanese names draw exactly as they should - but it
+// must not be silent, because the ONE thing the merge existed for has stopped
+// happening and nothing else on screen would say so.
+static std::string cjkFontMergeDroppedText(const FontAtlasCost& c,
+                                           const FontChoice& ch) {
+    return "a second font could not be read, so it was left out: " +
+           c.mergeDropped + ". " + ch.path + " is in use on its own, which draws "
+           "Japanese correctly but has fewer simplified-Chinese characters - "
+           "some Chinese filenames will show '?'. Replacing that file, or "
+           "pointing \"appearance.fontPath\" at a font that covers both, fixes "
+           "it at the next start.";
 }
 
 // ...and the sentence for a machine with NO Japanese face, where a Chinese one

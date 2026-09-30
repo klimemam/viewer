@@ -197,6 +197,26 @@ static ImFont* bakedFont() {
 // cannot even be asked for, whatever font is installed), and `badBytes` is a
 // property of the FILENAME ON DISK. Telling somebody to change their font
 // because a file has an emoji in it is advice that cannot work.
+// Do the bytes at `p` form a WELL-FORMED UTF-8 sequence for a code point above
+// U+FFFF? Written out by hand because it is the one question ImGui's decoder
+// cannot answer on this build: with a 16-bit ImWchar it reports every such
+// sequence as an error, so "valid bytes this build cannot hold" and "invalid
+// bytes" arrive identical. Only the 4-byte forms can exceed U+FFFF, and the
+// overlong / surrogate / out-of-range rules are checked on the VALUE, because
+// a byte pattern can be correct and still not be a character.
+static bool utf8SequenceAbove16Bit(const char* p, const char* e) {
+    const unsigned char* u = (const unsigned char*)p;
+    if (e - p < 4) return false;
+    if (u[0] < 0xF0 || u[0] > 0xF4) return false;
+    for (int k = 1; k <= 3; k++)
+        if (u[k] < 0x80 || u[k] > 0xBF) return false;
+    const uint32_t cp = ((uint32_t)(u[0] & 0x07u) << 18) |
+                        ((uint32_t)(u[1] & 0x3Fu) << 12) |
+                        ((uint32_t)(u[2] & 0x3Fu) << 6) |
+                        (uint32_t)(u[3] & 0x3Fu);
+    return cp > 0xFFFF && cp <= 0x10FFFF;
+}
+
 struct UndrawableTally {
     int noGlyph = 0;        // in the ranges, the font does not have it
     int tooHigh = 0;        // above U+FFFF: not representable in this build
@@ -231,18 +251,47 @@ static UndrawableTally undrawableTally(const std::string& utf8Name) {
             cp == (unsigned)IM_UNICODE_CODEPOINT_INVALID &&
             !(used == 3 && (unsigned char)p[0] == 0xEF &&
               (unsigned char)p[1] == 0xBF && (unsigned char)p[2] == 0xBD);
-        // WHICH substitution it was is decidable from the bytes alone, and the
-        // two mean different things: a well-formed 4-byte sequence is a real
-        // code point this build cannot represent, while anything else is a
-        // name that is not UTF-8. (ImTextCharFromUtf8 consumes 4 bytes for the
-        // first and 1 for the second, so `used` says which happened.)
+        // A FAILED DECODE IS ALWAYS `badBytes`, and `used` must not be asked
+        // which kind it was. This was wrong, and ImGui's own source says why -
+        // imgui.cpp, ImTextCharFromUtf8, on the error path:
+        //
+        //     wanted = ImMin(wanted, !!s[0] + !!s[1] + !!s[2] + !!s[3]);
+        //     *out_char = IM_UNICODE_CODEPOINT_INVALID;
+        //
+        // so the return is the number of NON-ZERO BYTES it looked at, not 1,
+        // and an ILL-FORMED sequence whose first byte is in the 4-byte range
+        // returns 4 as readily as a well-formed one. The old code read that 4
+        // as "a real code point above U+FFFF" and told the user about emoji
+        // when the truth was broken bytes - and swallowed the following three
+        // bytes, ASCII included, as one character. `*out_char` cannot separate
+        // them either: on every error path it is U+FFFD.
+        //
+        // So `used` is not asked. The two are separated by READING THE BYTES
+        // AGAIN, independently: if they form a well-formed UTF-8 sequence whose
+        // value is above U+FFFF, the name is fine and this BUILD cannot hold
+        // the character; anything else is a name that is not UTF-8.
+        //
+        // That extra decode is not zeal. On this build ImWchar is 16 bits, so
+        // ImTextCharFromUtf8 reports a perfectly valid emoji as an ERROR - it
+        // is out of ITS range - and a split that trusted the decoder alone
+        // would tell a user with 🙂 in a filename that their bytes are broken
+        // and offer them a fix that cannot apply. Both sentences have to be
+        // true, so both need a fact the decoder does not carry.
         if (substituted) {
-            if (used == 4) t.tooHigh++;
-            else           t.badBytes++;
+            if (utf8SequenceAbove16Bit(p, e)) t.tooHigh++;
+            else                              t.badBytes++;
             p += used;
             continue;
         }
         p += used;
+        // CONTROL CHARACTERS ARE NOT COUNTED, and this is not a nicety: ImGui
+        // does not ASK the atlas for a glyph for U+000A, it breaks the line -
+        // and the glyph ranges start at U+0020, so the atlas has none. Counting
+        // one as "no glyph in the font" put a false "1 character here draws as
+        // '?'" on EVERY row of the Files panel the moment this function was
+        // handed a multi-line string. Something the renderer never looks up
+        // cannot be something the renderer cannot draw.
+        if (cp < 0x20 || cp == 0x7F) continue;
         if (cp > 0xFFFF) { t.tooHigh++; continue; }   // ImWchar32 builds land here
         if (!f->FindGlyphNoFallback((ImWchar)cp)) t.noGlyph++;
     }
@@ -260,10 +309,7 @@ static int undrawableCount(const std::string& utf8Name) {
 // bytes - no font on earth changes either of those. Cached because the atlas
 // cannot change after start-up and the Files panel asks this for every row on
 // every frame (review P3-11).
-static std::string undrawableNote(const std::string& text) {
-    static std::unordered_map<std::string, std::string> cache;
-    if (auto it = cache.find(text); it != cache.end()) return it->second;
-    const UndrawableTally t = undrawableTally(text);
+static std::string undrawableNoteOf(const UndrawableTally& t) {
     std::string s;
     if (t.total() > 0) {
         char b[256];
@@ -289,6 +335,15 @@ static std::string undrawableNote(const std::string& text) {
                  "(settings.jsonc) points at another font; it takes effect at "
                  "the next start.";
     }
+    return s;
+}
+// ...and the same sentence for ONE string. Cached because the atlas cannot
+// change after start-up and the Files panel asks this for every row on every
+// frame (review P3-11).
+static std::string undrawableNote(const std::string& text) {
+    static std::unordered_map<std::string, std::string> cache;
+    if (auto it = cache.find(text); it != cache.end()) return it->second;
+    const std::string s = undrawableNoteOf(undrawableTally(text));
     if (cache.size() > 4096) cache.clear();
     cache.emplace(text, s);
     return s;
@@ -330,12 +385,40 @@ static std::string undrawableNote(const std::string& text) {
 // members over many frames, so counting at the first sight of one would print
 // "1 frame" for a load that ends with 400. One frame of delay buys a count
 // that is true.
+// WAITING FOR THE BATCH TO SETTLE MEANS ASKING FOR ANOTHER FRAME (review P1-B).
+//
+// The settle rule was right and the way it waited was not. This used to return
+// immediately unless app.imagesRev had moved, and every one of the thirty
+// `imagesRev++` in the program happens WITH a push - there is no periodic
+// increment anywhere in the frame loop. So the sizes observed during a load are
+// strictly increasing, the last push's sweep recorded a size, and no further
+// sweep ever came: the batch that was just opened was never reported at all.
+// The line only appeared when something ELSE later moved the counter, which
+// meant the most recently opened thing was permanently silent - the exact
+// opposite of the intent.
+//
+// So when a batch is still growing this asks to be run again: `wantAnother`
+// gets it past the rev gate on the next frame, and app.wakeFrames guarantees
+// there IS a next frame (the loop is idle-driven and would otherwise sit in
+// glfwWaitEventsTimeout until the user moved the mouse). A frame with neither
+// a rev change nor that flag still returns at once, so the cost this avoided -
+// walking app.images every frame - stays avoided.
 static void undrawableReportNewDocs() {
     static uint64_t seenRev = (uint64_t)-1;
-    static std::unordered_map<int, int> batchSize;    // batchId -> size last sweep
-    static std::unordered_map<int, char> batchSaid;   // batchId -> already reported
-    if (app.imagesRev == seenRev) return;
+    static bool wantAnother = false;
+    // The batch is the SETTLE unit; the ROW is the "already said" unit. They
+    // have to be different things (review P2). batchReuse() hands back an
+    // EXISTING batch id whenever the same source directory is opened again -
+    // that is deliberate, it is what makes "clicked three files in a row" one
+    // batch - so a permanent per-batch flag silenced every later open from a
+    // folder that had already been reported once. Keyed on the row instead, a
+    // second open of the same folder reports its NEW rows and stays quiet
+    // about the ones it already named.
+    static std::unordered_map<int, int> batchSize;        // batchId -> size last sweep
+    static std::unordered_map<std::string, char> saidKey; // row key -> already reported
+    if (app.imagesRev == seenRev && !wantAnother) return;
     seenRev = app.imagesRev;
+    wantAnother = false;
     if (!bakedFont()) return;
 
     // Group this sweep's documents into ROWS as the Files panel groups them:
@@ -350,7 +433,6 @@ static void undrawableReportNewDocs() {
     std::unordered_map<int, int> nowSize;
     for (const auto& d : app.images) {
         nowSize[d->batchId]++;
-        if (batchSaid.count(d->batchId)) continue;
         // The name the PANEL DRAWS is the one that matters: a stack row draws
         // the STACK's name, not its head frame's (review P2-7).
         const App::SeqInfo* si = d->seqId ? seqInfo(d->seqId) : nullptr;
@@ -372,12 +454,25 @@ static void undrawableReportNewDocs() {
         // Still growing? Wait one more sweep, so the count is the final one and
         // not "1 frame" for a load that ends with 400.
         const int was = batchSize.count(batchId) ? batchSize[batchId] : -1;
-        if (was != nowSize[batchId]) { batchSize[batchId] = nowSize[batchId]; continue; }
-        batchSaid[batchId] = 1;
-        // The rows worth a line at all.
+        if (was != nowSize[batchId]) {
+            batchSize[batchId] = nowSize[batchId];
+            // Come back even if nothing else moves the revision counter, and
+            // make sure a frame happens at all. Without both of these the
+            // batch just opened is never reported - see the comment above.
+            wantAnother = true;
+            app.wakeFrames = std::max(app.wakeFrames, 2);
+            continue;
+        }
+        // The rows worth a line at all, and not yet said.
         std::vector<const Group*> hits;
-        for (const Group& g : gs)
+        for (const Group& g : gs) {
+            if (saidKey.count(g.key)) continue;
             if (!undrawableNote(g.name).empty() || g.affected > 0) hits.push_back(&g);
+        }
+        // Every row in this batch is accounted for now, said or not - otherwise
+        // the clean ones would be re-examined on every later sweep of a batch
+        // that keeps being reopened.
+        for (const Group& g : gs) saidKey[g.key] = 1;
         if (hits.empty()) continue;
         // ...and an absolute bound on the lines one gesture can produce. A
         // stack is already one line; this is for the case that is not a stack -
@@ -410,8 +505,8 @@ static void undrawableReportNewDocs() {
     }
     // Per RUN, and bounded: a session that opens and closes folders all day
     // would otherwise grow these without end, so they are capped the way
-    // msgLog is. At worst one open is reported twice.
-    if (batchSaid.size() > 4096) { batchSaid.clear(); batchSize.clear(); }
+    // msgLog is. At worst one row is reported twice.
+    if (saidKey.size() > 8192) { saidKey.clear(); batchSize.clear(); }
 }
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
 // `shared` = the row's frames whose source has another holder. Counterparts
@@ -1212,16 +1307,50 @@ static void drawFileList() {
                 // because the row it lands on is the one the reader is already
                 // trying to tell apart from its neighbour.
                 //
-                // Computed over `tip` ITSELF, not over d.name, and that fixes
-                // two things the review found. A stack row DRAWS the stack's
-                // name while d.name is its head frame's (review P2-7), and the
-                // tooltip's first line is the whole PATH while only the leaf
-                // was being counted - so a directory component full of '?' was
-                // silent (review P3-12). The tooltip is the thing on screen, so
-                // the tooltip is what gets counted; every label, path and
-                // sentence in it is included exactly once.
-                if (std::string ud = undrawableNote(tip); !ud.empty())
-                    tip += "\n\n" + ud;
+                // Counted over an EXPLICIT LIST of the strings this row draws,
+                // and not over `tip`.
+                //
+                // Handing it `tip` was worse than handing it d.name. `tip` is
+                // multi-line by construction, the atlas has no glyph for
+                // U+000A because the ranges begin at U+0020, and so every row
+                // in the panel - including every plain ASCII one - grew a
+                // "1 character here draws as '?'" that was simply false. (The
+                // control-character rule in undrawableTally now closes that
+                // too; both halves are needed, because a concatenation also
+                // mixes in the separators this code adds itself.)
+                //
+                // And `tip` never contained the one string the review asked
+                // for: a stack row DRAWS the stack's name, which is in `label`
+                // and not in the tooltip's body at all (review P2-7). The list
+                // names each piece once, so the stack name is counted, the full
+                // path is counted (review P3-12), and nothing is counted twice.
+                {
+                    UndrawableTally rowT;
+                    // The row's own label, with ImGui's "##id" suffix and the
+                    // leading indent removed - what is left is what a reader
+                    // sees on the row.
+                    std::string shown = label ? label : "";
+                    if (const size_t h = shown.find("##"); h != std::string::npos)
+                        shown.resize(h);
+                    while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
+                    // Deduplicated: on a loose row the label IS d.name, and on
+                    // a stack row the path's leaf usually is too. Counting a
+                    // string twice would double the number in the sentence.
+                    std::vector<std::string> pieces;
+                    for (const std::string& piece : { shown, d.name, d.src->path,
+                                                      d.src->member }) {
+                        if (piece.empty()) continue;
+                        if (std::find(pieces.begin(), pieces.end(), piece) != pieces.end())
+                            continue;
+                        pieces.push_back(piece);
+                        const UndrawableTally one = undrawableTally(piece);
+                        rowT.noGlyph += one.noGlyph;
+                        rowT.tooHigh += one.tooHigh;
+                        rowT.badBytes += one.badBytes;
+                    }
+                    if (std::string ud = undrawableNoteOf(rowT); !ud.empty())
+                        tip += "\n\n" + ud;
+                }
                 g_filesRowTipProbe = tip;      // the value, not a second derivation
                 if (hov) ImGui::SetTooltip("%s", tip.c_str());
             }

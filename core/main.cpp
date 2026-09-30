@@ -1250,7 +1250,7 @@ int main(int argc, char** argv) {
         fontBakeCrumbWrite(about);
     }
     ImFont* jp = fontPath.empty() ? nullptr
-        : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
+        : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), CJK_FONT_PX * fontScale, nullptr,
                                        fontRanges.Data);
     // ---- the SECOND face, merged on top of the first (板306 B) --------------
     // THE ORDER IS THE POINT, and it is why this is a merge rather than a
@@ -1274,7 +1274,7 @@ int main(int argc, char** argv) {
     if (!mergePath.empty()) {
         ImFontConfig m;
         m.MergeMode = true;
-        if (!io.Fonts->AddFontFromFileTTF(mergePath.c_str(), 17.0f * fontScale, &m,
+        if (!io.Fonts->AddFontFromFileTTF(mergePath.c_str(), CJK_FONT_PX * fontScale, &m,
                                           fontRanges.Data))
             mergePath.clear();          // unreadable: one face, and say nothing
     }
@@ -1313,6 +1313,12 @@ int main(int argc, char** argv) {
         else                           toast(cjkFontUnreadableText(g_fontChoice), true);
     } else if (g_fontAtlasCost.buildFailed) {
         toast(cjkFontUnreadableText(g_fontChoice), true);
+    } else if (!g_fontAtlasCost.mergeDropped.empty()) {
+        //  6. Two faces would not bake together and the primary alone did, so
+        //     the second face's characters are gone. Before the "no CJK" check
+        //     below because the atlas DOES have CJK in this case - it is the
+        //     simplified half that is missing, and only this sentence says so.
+        toast(cjkFontMergeDroppedText(g_fontAtlasCost, g_fontChoice), true);
     } else if (!fontAtlasHasCjk()) {
         toast(cjkFontNoGlyphsText(g_fontChoice), true);
     } else if (strcmp(g_fontChoice.how, "Chinese face (no Japanese face on this machine)") == 0) {
@@ -2373,6 +2379,18 @@ static bool g_watchSuppressed = false;
 
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = nowSec();
+        // 板306 D: a name this atlas cannot draw gets one line in Messages.
+        // Here rather than at any of the six places that push onto app.images,
+        // because a notice added to one of those doors is a notice the other
+        // five do not give.
+        //
+        // AT THE TOP OF THE LOOP, above the two `continue`s that skip an idle
+        // frame (review P1-B). Below them it was not merely late - on an idle
+        // frame it was never reached at all, which is half of why the line for
+        // the batch just opened never appeared. It returns immediately on every
+        // frame where nothing was opened and nothing is pending, so the cost of
+        // being here is a counter comparison.
+        undrawableReportNewDocs();
         // work that must keep animating even without input
         // rbBusy / mPending: a connect, a peer install or a server measurement is
         // in flight. Without these the idle path draws NOTHING while they run -
@@ -2682,12 +2700,6 @@ static bool g_watchSuppressed = false;
                 }
             }
         }
-        // 板306 D: a name this atlas cannot draw gets one line in Messages.
-        // Here rather than at any of the six places that push onto app.images,
-        // because a notice added to one of those doors is a notice the other
-        // five do not give - see undrawableReportNewDocs(), which returns
-        // immediately on every frame where nothing was opened.
-        undrawableReportNewDocs();
         {   // Autosave on change, debounced. A hard kill cannot run any handler,
             // so the safety net has to be written while things still work.
             static uint64_t lastState = 0;
