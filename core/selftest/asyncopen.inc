@@ -1038,10 +1038,19 @@ static int asyncOpenSelftest(const std::string& root) {
         check(g_reloadArrivalStages - stages0 == 1 &&
                   arrivedOn != std::thread::id() && arrivedOn != uiThread,
               "R9f3 the ARRIVALS were decoded on the JOB's thread, not the UI's");
-        check(reReadOn != std::thread::id() && reReadOn != uiThread &&
-                  arrivedOn != reReadOn,
-              "R9f4 ...and that is a SECOND stage: the re-read's own thread is "
-              "recorded, is not this one either, and is not the same one");
+        // ...and the RE-READ's own probe still says what it said: two stages,
+        // two recorded ids, neither of them this thread's.
+        //
+        // What is NOT asserted is `arrivedOn != reReadOn`, and it was, and
+        // macOS went red on it (CI run 36749229396). Stage 1's thread is
+        // JOINED before stage 2's is started, so its id is free for the
+        // library to hand out again - [thread.thread.id] says an id may be
+        // reused once the thread it named has finished - and on macOS it is.
+        // The two-stage claim is `g_reloadArrivalStages`, which counts the
+        // passes; an id comparison was never evidence for it.
+        check(reReadOn != std::thread::id() && reReadOn != uiThread,
+              "R9f4 ...and the RE-READ's own thread is recorded too, and is not "
+              "this one either");
         // ...and ONE gesture is ONE start, whatever it does in stages: the
         // queue, the fold and §9's drain all count reloads, not passes.
         check(g_reloadStarts - starts0 == 1,
