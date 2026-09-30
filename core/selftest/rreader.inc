@@ -46,6 +46,144 @@
         const std::string cacheDir = root + "/peer-cache";
         std::filesystem::create_directories(pathFromUtf8(cacheDir), ec);
         setEnv("VIEWER_SERVE_CACHE", cacheDir);
+        // ---- SOMEBODY ELSE'S FILES, COUNTED AFTER THEIR ANSWER --------------
+        // The cache directory belongs to the PEER, and the `.part` temps in it
+        // are created and removed by the viewer-serve PROCESSES the contenders
+        // below start. readerRun returns when the reply frame lands, so a count
+        // taken at that instant is a question about another subject's state at
+        // the moment of its answer - and until the peer dropped its temp BEFORE
+        // replying (core/serve.cpp, TempFile::drop) the honest answer could be
+        // "one, briefly".
+        //
+        // The peer's side of that is fixed, so `before settle` below should now
+        // read 0 every time. The settle stays anyway, for two reasons: it costs
+        // nothing when the count is already 0, and its detail line is what tells
+        // a future reader WHICH of the two worlds they are in - `before
+        // settle=0 -> 0 in 0 ms` (the peer answered with a clean directory) or
+        // `before settle=1 -> 0 in 40 ms` (the race is back).
+        auto cacheNames = [&](const char* suf) {
+            std::string out;
+            std::error_code e;
+            const std::string sx = suf;
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string nm = d.path().filename().u8string();
+                if (nm.size() > sx.size() &&
+                    nm.compare(nm.size() - sx.size(), sx.size(), sx) == 0) {
+                    if (!out.empty()) out += ", ";
+                    out += nm;
+                }
+            }
+            return out;
+        };
+        auto cacheCount = [&](const char* suf) {
+            int n = 0;
+            std::error_code e;
+            const std::string sx = suf;
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string nm = d.path().filename().u8string();
+                if (nm.size() > sx.size() &&
+                    nm.compare(nm.size() - sx.size(), sx.size(), sx) == 0) n++;
+            }
+            return n;
+        };
+        // ...and the SECOND opinion. A settle that reports "still there" is
+        // making a claim about the filesystem through directory_iterator, and
+        // before anybody debugs a leak on the strength of that claim it is
+        // worth knowing the claim is true: these names are statted one by one,
+        // and what comes back is size and mtime or the reason there is none.
+        // If the iterator were handing back entries that are already unlinked,
+        // this is the line that would say so - and every hour spent on the
+        // wrong subject afterwards is the hour this costs nothing to save.
+        auto cacheProof = [&](const char* suf) {
+            std::string out;
+            std::error_code e;
+            const std::string sx = suf;
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string nm = d.path().filename().u8string();
+                if (nm.size() <= sx.size() ||
+                    nm.compare(nm.size() - sx.size(), sx.size(), sx) != 0) continue;
+                std::error_code se;
+                const auto sz = std::filesystem::file_size(d.path(), se);
+                if (!out.empty()) out += "; ";
+                out += nm;
+                if (se) { out += " -> STAT FAILED: " + se.message(); continue; }
+                std::error_code me;
+                const auto mt = std::filesystem::last_write_time(d.path(), me);
+                const long long age = me ? -1 :
+                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::filesystem::file_time_type::clock::now() - mt).count();
+                char b[96];
+                snprintf(b, sizeof b, " -> %llu bytes, written %lld ms ago",
+                         (unsigned long long)sz, age);
+                out += b;
+            }
+            return out.empty() ? std::string("(nothing matches any more)") : out;
+        };
+        // ---- and the instrument is tested BEFORE it is trusted ------------
+        // cacheProof only runs on the branch where something was left over,
+        // which is the branch nobody sees until a leak comes back - so it
+        // would be dead code that is first exercised on the day it is needed
+        // and first found broken on the same day. One planted file, here,
+        // while the cache directory is still empty: the counter must see it,
+        // the namer must name it, and the prover must give its size. Then it
+        // goes away and the real tests start from an empty directory.
+        {
+            const std::string planted = cacheDir + "/pretend0123456789.9.9.part";
+            {   // ten bytes, on purpose (writeText is not declared until later)
+                std::ofstream pf(pathFromUtf8(planted), std::ios::binary);
+                pf << "0123456789";
+            }
+            const int saw = cacheCount(".part");
+            const std::string named = cacheNames(".part");
+            const std::string proof = cacheProof(".part");
+            std::error_code pe;
+            std::filesystem::remove(pathFromUtf8(planted), pe);
+            const int after = cacheCount(".part");
+            fprintf(stderr, "rreaderselftest:   R0t instrument: saw=%d named=%s\n"
+                            "rreaderselftest:   R0t proof: %s\n"
+                            "rreaderselftest:   R0t after removing it: %d\n",
+                    saw, named.c_str(), proof.c_str(), after);
+            check(saw == 1 && named == "pretend0123456789.9.9.part",
+                  "R0t-a the .part counter sees a file that is there, and names it");
+            check(has(proof, "pretend0123456789.9.9.part") &&
+                  has(proof, "10 bytes") && !has(proof, "STAT FAILED"),
+                  "R0t-b ...and the proof statted it: the claim is about a real file");
+            check(after == 0,
+                  "R0t-c ...and sees it gone once it is gone, so 0 means 0");
+        }
+        // WHY 60 s, AND WHAT IT IS NOT. The budget is not "long enough for
+        // anything the peer might be doing": the reader's own limit is 300 s
+        // (core/serve.cpp passes 300000 to adapter::run), so a temp whose run
+        // is still inside that call can outlive any settle worth waiting for,
+        // and a budget chosen to cover it would be a five-minute test. 60 s is
+        // chosen to be far longer than the only thing this settle is for - the
+        // gap between a reply and the unlink behind it, which is microseconds
+        // when it exists at all - and the deadline exists so that "it never
+        // went away" is REPORTED rather than waited out. A run that needs more
+        // than 60 s here is not a slow machine; it is a different defect, and
+        // the detail line names the file so it can be told apart.
+        //
+        // Returns what is left after the deadline. `detail` is the line to print.
+        auto settleCache = [&](const char* suf, double budget, std::string& detail) {
+            const int before = cacheCount(suf);
+            const double t0 = nowSec();
+            int n = before;
+            while (n > 0 && nowSec() - t0 < budget) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                n = cacheCount(suf);
+            }
+            const int ms = (int)((nowSec() - t0) * 1000.0 + 0.5);
+            char b[1024];
+            if (n == 0)
+                snprintf(b, sizeof b, "%s before settle=%d -> 0 in %d ms", suf, before, ms);
+            else
+                snprintf(b, sizeof b, "%s before settle=%d -> STILL %d after %d ms: %s"
+                                      " | proof: %s",
+                         suf, before, n, ms, cacheNames(suf).c_str(),
+                         cacheProof(suf).c_str());
+            detail = b;
+            return n;
+        };
         setEnv("VIEWER_SERVE_PYTHON", "");
 
         auto writeText = [&](const std::string& p, const std::string& s) {
@@ -1384,6 +1522,19 @@
                       ocNarrow.err == rp::typedAxesClientTooOldText(
                           14, "Reader Stack/FHW"),
                   "R21q ...but refuses the blank-layout narrow Stack seam");
+            // A REFUSAL IS AN ANSWER, and no temp may outlive it. This is the
+            // one refusal with a temp to leave behind: the peer started the
+            // reader, the reader wrote its `.part`, the axes were read OUT of
+            // that file and only then was the answer built - so the drop has to
+            // sit inside refuseOldClientAxes (core/serve.cpp), because a drop
+            // written at the call site would run after the reply had gone.
+            // Counted at the instant this refusal lands, for the same reason
+            // R17f is: that is the only moment a client has.
+            const int narrowParts = cacheCount(".part");
+            fprintf(stderr, "rreaderselftest:   R21 at the refusal: .part=%d\n",
+                    narrowParts);
+            check(narrowParts == 0,
+                  "R21q2 ...and the refusal itself leaves no temp behind");
             oldClient.stop();
             seed.stop();
         }
@@ -2268,18 +2419,11 @@
                       "        a.reshape(a.shape[0], a.shape[1], a.shape[2])), name='race')\n");
             std::string raceText[3] = { std::string(), files[1], files[2] };
             check(slurp(rdRace, raceText[0]), "R17a (setup) the racing reader is readable");
-            auto countSuffix = [&](const char* suf) {
-                int n = 0;
-                std::error_code e;
-                const std::string s = suf;
-                for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
-                    const std::string nm = d.path().filename().u8string();
-                    if (nm.size() > s.size() &&
-                        nm.compare(nm.size() - s.size(), s.size(), s) == 0) n++;
-                }
-                return n;
-            };
-            const int vstream0 = countSuffix(".vstream");
+            // Counting files in the cache directory by suffix is cacheCount,
+            // defined once beside cacheDir. A second copy of that body lived
+            // here under another name until this PR - two predicates for one
+            // question, which this project's discipline says will drift.
+            const int vstream0 = cacheCount(".vstream");
 
             struct Contender { bool sent = false; int outcome = -1; std::string key, err; };
             Contender c[2];
@@ -2316,8 +2460,8 @@
                                       std::chrono::steady_clock::now() - t0c).count();
                 if (el > 2.5 || done.load() >= 2) break;
                 if (el > 0.3) {
-                    if (countSuffix(".part") > 0) sawPart = true;
-                    maxDuring = std::max(maxDuring, countSuffix(".vstream"));
+                    if (cacheCount(".part") > 0) sawPart = true;
+                    maxDuring = std::max(maxDuring, cacheCount(".vstream"));
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
@@ -2329,17 +2473,30 @@
             fprintf(stderr, "rreaderselftest:   R17 outcomes %d/%d keys \"%s\"/\"%s\"; "
                             ".vstream %d -> %d (max %d while running), part seen=%d\n",
                     c[0].outcome, c[1].outcome, c[0].key.c_str(), c[1].key.c_str(),
-                    vstream0, countSuffix(".vstream"), maxDuring, sawPart ? 1 : 0);
+                    vstream0, cacheCount(".vstream"), maxDuring, sawPart ? 1 : 0);
             check(c[0].sent && c[1].sent && oks == 1 && bad == 1,
                   "R17b both contenders are answered: one ran, one refused");
             check(sawPart,
                   "R17c a run in progress is a temp of its own, not the cache file");
             check(maxDuring == vstream0,
                   "R17d ...so nothing appears under the key until it is WHOLE");
-            check(countSuffix(".vstream") == vstream0 + 1,
+            check(cacheCount(".vstream") == vstream0 + 1,
                   "R17e exactly one result was published");
-            check(countSuffix(".part") == 0,
-                  "R17f and no temp is left behind by either of them");
+            // TWO readings, and the first is the one that matters: the peer
+            // drops its temp before it replies, so by the time both contenders
+            // have answered the directory is already clean. The settle is the
+            // insurance behind it, and its detail line says which world this
+            // run was in.
+            const int partsAtAnswer = cacheCount(".part");
+            std::string partDetail;
+            const int partsLeft = settleCache(".part", 60.0, partDetail);
+            fprintf(stderr, "rreaderselftest:   R17 at the answer: .part=%d\n"
+                            "rreaderselftest:   R17 %s\n",
+                    partsAtAnswer, partDetail.c_str());
+            check(partsAtAnswer == 0,
+                  "R17f neither contender's temp outlives its own answer");
+            check(partsLeft == 0,
+                  "R17f2 ...and no temp is left behind by either of them");
             // The loser must not have taken the winner's file with it: the
             // third ask is a HIT, which is only possible if what was published
             // is still there and still validates.
@@ -2959,7 +3116,14 @@
             writeText(producerRelease, "go\n");
             ta.join();
             tc.join();
-            int vstreams = 0, parts = 0, bads = 0;
+            // THREE subjects here (A, B and C), each answering in its own
+            // time, so this is R17f's question with three chances to get it
+            // wrong. Same two readings: the count at the answer, and the settle
+            // behind it.
+            const int partsAtAnswer20 = cacheCount(".part");
+            std::string partDetail20;
+            const int parts = settleCache(".part", 60.0, partDetail20);
+            int vstreams = 0, bads = 0;
             {
                 std::error_code de;
                 for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), de)) {
@@ -2969,10 +3133,14 @@
                                nm.compare(nm.size() - s.size(), s.size(), s) == 0;
                     };
                     if (ends(".vstream")) vstreams++;
-                    else if (ends(".part")) parts++;
                     else if (ends(".bad")) bads++;
                 }
             }
+            fprintf(stderr, "rreaderselftest:   R20 at the answer: .part=%d\n"
+                            "rreaderselftest:   R20 %s\n",
+                    partsAtAnswer20, partDetail20.c_str());
+            check(partsAtAnswer20 == 0,
+                  "R20i2 no producer's temp outlives its own answer");
             fprintf(stderr, "rreaderselftest:   R20 A=%d/%s \"%s\" B=%d/%s "
                             "C=%d/%s \"%s\" | cache %d vstream / %d part / %d bad\n",
                     A.outcome, A.key.c_str(), A.text.c_str(), B.outcome, B.key.c_str(),
