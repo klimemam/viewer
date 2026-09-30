@@ -165,6 +165,11 @@ static int cjkFontSelftest() {
             " (chosen by " + g_fontChoice.how + ")");
         say("merged: " + (g_fontMergePath.empty() ? std::string("(no second face)")
                                                   : g_fontMergePath));
+        // THE RECORD start-up actually built, one line per path. This is what
+        // the refusal prints for a user, so it is worth seeing in a test log
+        // too: on a machine where the override was refused it says which path
+        // and WHY, which is the only place that reason exists.
+        for (const std::string& t : g_fontChoice.tried) say("tried: " + t);
         char b[256];
         snprintf(b, sizeof b, "atlas: %d glyph(s) of %d asked for, %dx%d px "
                               "(%.1f MB RGBA), %d face(s), %.0f ms, font scale %.2f",
