@@ -46,6 +46,84 @@
         const std::string cacheDir = root + "/peer-cache";
         std::filesystem::create_directories(pathFromUtf8(cacheDir), ec);
         setEnv("VIEWER_SERVE_CACHE", cacheDir);
+        // ---- SOMEBODY ELSE'S FILES, COUNTED AFTER THEIR ANSWER --------------
+        // The cache directory belongs to the PEER, and the `.part` temps in it
+        // are created and removed by the viewer-serve PROCESSES the contenders
+        // below start. readerRun returns when the reply frame lands; the losing
+        // contender's temp is removed by a scope guard that runs AFTER reply()
+        // - so the reply and the unlink are two events on the other side, in
+        // that order, and a count taken between them sees a file that is
+        // already on its way out. Joining the client threads does not close
+        // that window: they only wait for the reply.
+        //
+        // That is PR #274's B7 again - reading another subject's state at the
+        // instant of its answer instead of waiting for the state to catch up -
+        // and it made R17f/R20i fail on ONE macOS runner while the same commit
+        // passed on another (PR #278 review).
+        //
+        // THE PUBLISH SIDE HAS NO SUCH WINDOW and is deliberately left alone:
+        // handleReaderRun renames the temp onto the key and only then calls
+        // reply(), so a `.vstream` the reply speaks of is already there. The
+        // `vstream0 + 1` assertions stay absolute counts.
+        //
+        // What this returns is the count after settling, and what it PRINTS is
+        // the count before it - so "0 ms, already 0" and "the window was
+        // observed" are different lines in the log, and a settle that ran out
+        // of time names the files that are still there rather than just failing
+        // a number. The anti-vacuity for "a temp existed at all" is R17c's
+        // sawPart, taken while the runs are in flight, which this does not
+        // touch.
+        auto cacheNames = [&](const char* suf) {
+            std::string out;
+            std::error_code e;
+            const std::string sx = suf;
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string nm = d.path().filename().u8string();
+                if (nm.size() > sx.size() &&
+                    nm.compare(nm.size() - sx.size(), sx.size(), sx) == 0) {
+                    if (!out.empty()) out += ", ";
+                    out += nm;
+                }
+            }
+            return out;
+        };
+        auto cacheCount = [&](const char* suf) {
+            std::string e2;
+            int n = 0;
+            std::error_code e;
+            const std::string sx = suf;
+            for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), e)) {
+                const std::string nm = d.path().filename().u8string();
+                if (nm.size() > sx.size() &&
+                    nm.compare(nm.size() - sx.size(), sx.size(), sx) == 0) n++;
+            }
+            return n;
+        };
+        // Returns what is left after the deadline. `detail` is the line to print.
+        auto settleCache = [&](const char* suf, double budget, std::string& detail) {
+            const int before = cacheCount(suf);
+            const double t0 = nowSec();
+            int n = before;
+            while (n > 0 && nowSec() - t0 < budget) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                n = cacheCount(suf);
+            }
+            const int ms = (int)((nowSec() - t0) * 1000.0 + 0.5);
+            char b[512];
+            if (n == 0)
+                snprintf(b, sizeof b, "%s before settle=%d -> 0 in %d ms", suf, before, ms);
+            else {
+                // Named, because a number alone cannot be acted on - and the
+                // names are re-read here, so a file that vanished between the
+                // last count and this line reads as "(gone since)" rather than
+                // as an empty list.
+                const std::string who = cacheNames(suf);
+                snprintf(b, sizeof b, "%s before settle=%d -> STILL %d after %d ms: %s",
+                         suf, before, n, ms, who.empty() ? "(gone since)" : who.c_str());
+            }
+            detail = b;
+            return n;
+        };
         setEnv("VIEWER_SERVE_PYTHON", "");
 
         auto writeText = [&](const std::string& p, const std::string& s) {
@@ -2338,7 +2416,10 @@
                   "R17d ...so nothing appears under the key until it is WHOLE");
             check(countSuffix(".vstream") == vstream0 + 1,
                   "R17e exactly one result was published");
-            check(countSuffix(".part") == 0,
+            std::string partDetail;
+            const int partsLeft = settleCache(".part", 60.0, partDetail);
+            fprintf(stderr, "rreaderselftest:   R17 %s\n", partDetail.c_str());
+            check(partsLeft == 0,
                   "R17f and no temp is left behind by either of them");
             // The loser must not have taken the winner's file with it: the
             // third ask is a HIT, which is only possible if what was published
@@ -2959,7 +3040,15 @@
             writeText(producerRelease, "go\n");
             ta.join();
             tc.join();
-            int vstreams = 0, parts = 0, bads = 0;
+            // The `.part` count goes through the settle for R17f's reason, and
+            // here there are THREE subjects (A, B and C) finishing at their own
+            // pace, so the window between a reply and its unlink is wider.
+            // `.vstream` and `.bad` are counted absolutely: both are put in
+            // place by a rename that precedes the reply, so there is nothing to
+            // wait for (see settleCache).
+            std::string partDetail20;
+            const int parts = settleCache(".part", 60.0, partDetail20);
+            int vstreams = 0, bads = 0;
             {
                 std::error_code de;
                 for (auto& d : std::filesystem::directory_iterator(pathFromUtf8(cacheDir), de)) {
@@ -2969,10 +3058,10 @@
                                nm.compare(nm.size() - s.size(), s.size(), s) == 0;
                     };
                     if (ends(".vstream")) vstreams++;
-                    else if (ends(".part")) parts++;
                     else if (ends(".bad")) bads++;
                 }
             }
+            fprintf(stderr, "rreaderselftest:   R20 %s\n", partDetail20.c_str());
             fprintf(stderr, "rreaderselftest:   R20 A=%d/%s \"%s\" B=%d/%s "
                             "C=%d/%s \"%s\" | cache %d vstream / %d part / %d bad\n",
                     A.outcome, A.key.c_str(), A.text.c_str(), B.outcome, B.key.c_str(),
