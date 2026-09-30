@@ -258,6 +258,25 @@ static int roiStatsSelftest() {
     // MEASURED rather than asserted here: run the binary with and without
     // --no-window and diff the output. See the NOGL comment in CMakeLists.txt.
     ImGuiIO& io = ImGui::GetIO();
+    // ---- the input the W groups drive (see W12) -----------------------------
+    // Pushed INSIDE the frame, after the platform backend: ImGui_ImplGlfw_NewFrame
+    // feeds the real cursor and the real buttons every frame, the event queue is
+    // applied in order, and the last event wins. Pushing before the frame is
+    // therefore a no-op as soon as a window exists - measured, as a W12 that
+    // passed with --no-window and failed without it, which is the one thing
+    // CMakeLists does not allow this test to do.
+    //
+    // The POSITION is re-stated on every frame for the same reason: the backend
+    // would otherwise put the cursor back where the person's hand left it. Keys
+    // and characters are one-shot, because a key held down is a key repeating.
+    struct RoiInject {
+        bool on = false;                       // drive the mouse at all
+        ImVec2 pos = ImVec2(-FLT_MAX, -FLT_MAX);
+        bool down = false;
+        ImGuiKey key = ImGuiKey_None;          // one key event, this frame
+        bool keyDown = false;
+        std::string chars;                     // ...and characters, this frame
+    } inj;
     auto roiFrame = [&]() {
         if (g_haveWindow) {
             ImGui_ImplOpenGL3_NewFrame();
@@ -268,6 +287,16 @@ static int roiStatsSelftest() {
             io.DeltaTime = 1.0f / 60.0f;
             if (!io.Fonts->IsBuilt()) io.Fonts->Build();
         }
+        if (inj.on) {
+            io.AddMousePosEvent(inj.pos.x, inj.pos.y);
+            io.AddMouseButtonEvent(0, inj.down);
+        }
+        if (inj.key != ImGuiKey_None) {
+            io.AddKeyEvent(inj.key, inj.keyDown);
+            inj.key = ImGuiKey_None;
+        }
+        for (char c : inj.chars) io.AddInputCharacter((unsigned int)(unsigned char)c);
+        inj.chars.clear();
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_Always);
@@ -656,6 +685,10 @@ static int roiStatsSelftest() {
     app.images.push_back(mkMono(640, 480, 1000.0, 1.0, 0.0));     // 1: a small file
     app.images.push_back(mkMono(2048, 1500, 1000.0, 1.0, 0.0));   // 2: half of it
     app.current = 0;
+    // Every refusal sentence this group reaches, in the order it was said. A
+    // refusal nobody runs is a refusal that rots, so the ledger is asserted at
+    // the end: one entry per wording the code can produce, all distinct.
+    std::vector<std::string> wSaid;
     auto wSay = [&](const char* what, const App::Ann& a) {
         fprintf(stderr, "roistatsselftest: W %-24s %dx%d @%d,%d   prev x=%d w=%d "
                         "y=%d h=%d\n", what, a.w, a.h, a.x, a.y,
@@ -666,9 +699,23 @@ static int roiStatsSelftest() {
     //             open, on a ROI placed on the big one ----------------------
     addAnn(0, 3000, 2000, 200, 200);
     const int wRoi = app.anns.back().id;
+    const App::Ann wPlaced = *findAnn(wRoi);
     app.current = 1;                       // "open" the 640x480 file
-    check(app.anns.size() == 1 && findAnn(wRoi)->x == 3000 && findAnn(wRoi)->w == 200,
-          "W1 opening a smaller file leaves the ROI alone");
+    // ...and DRAW the panel on it. Asserting straight after the assignment
+    // pinned nothing - no code runs between the two lines, so it passed on
+    // every build including the broken one. What has to be observed is the
+    // PANEL's response to a ROI it cannot measure, and on all eight numbers:
+    // a well-meant repair that moved only the origin would walk past a check
+    // on x and w.
+    settle();
+    {
+        const App::Ann* g1 = findAnn(wRoi);
+        check(app.anns.size() == 1 && g1 && g1->x == wPlaced.x && g1->y == wPlaced.y &&
+              g1->w == wPlaced.w && g1->h == wPlaced.h && g1->prevX == wPlaced.prevX &&
+              g1->prevW == wPlaced.prevW && g1->prevY == wPlaced.prevY &&
+              g1->prevH == wPlaced.prevH,
+              "W1 drawing the panel on a smaller frame rewrites no number of the ROI");
+    }
     {
         App::Ann* a = findAnn(wRoi);
         int f[4] = { a->x, a->y, a->w, 100 };            // h 200 -> 100, nothing else
@@ -677,11 +724,9 @@ static int roiStatsSelftest() {
         wSay("h 200 -> 100 on 640x480", *a);
         fprintf(stderr, "roistatsselftest: W2 wrote=%d why=[%s]\n",
                 (int)wrote, why.c_str());
-        check(wrote && a->h == 100, "W2 the edit lands: a ROI off this frame is editable");
-        check(a->x == 3000 && a->y == 2000 && a->w == 200,
-              "W2 ...and x / y / w - untouched fields - are not written");
-        check(!(a->x == 639 && a->y == 479 && a->w == 1 && a->h == 1),
-              "W2 ...never the clamped (639,479) 1x1 the report measured");
+        check(wrote, "W2 the edit lands: a ROI off this frame is editable");
+        check(a->x == 3000 && a->y == 2000 && a->w == 200 && a->h == 100,
+              "W2 ...h is 100 and x / y / w untouched (not the clamped 1x1 @639,479)");
     }
     // ---- W3/W4: an edit that takes a ROI this frame HOLDS and puts it
     //             outside is refused, in the panel's own words --------------
@@ -697,6 +742,7 @@ static int roiStatsSelftest() {
               "W3 an edit that would push a fitting ROI off the frame is refused");
         check(why.find("outside this frame (640x480)") != std::string::npos,
               "W3 ...and says so in the table's own words");
+        wSaid.push_back(why);
         int g[4] = { a->x, a->y, a->w, -3 };              // h = -3 is not a size
         why.clear();
         check(!annWriteFields(*a, g, cur()->w, cur()->h, &why) && a->h == 100,
@@ -704,6 +750,7 @@ static int roiStatsSelftest() {
         fprintf(stderr, "roistatsselftest: W4 why=[%s]\n", why.c_str());
         check(why.find("h = -3") != std::string::npos,
               "W4 ...naming the component that was edited");
+        wSaid.push_back(why);
     }
     // ---- W5: the pin - raising x by one must not move y -------------------
     addAnn(1, 3000, 2000, 0, 0);                          // a pin off this frame
@@ -716,8 +763,19 @@ static int roiStatsSelftest() {
                 a->x, a->y, (int)wrote, why.c_str());
         check(wrote && a->x == 3001, "W5 a pin takes the number typed into its x");
         check(a->y == 2000, "W5 ...and y, which was not edited, does not move with it");
-        check(!(a->x == 639 || a->y == 479),
-              "W5 ...neither number is clamped to the frame on screen");
+        // ...and the pin's own refusal sentence, which is not the rectangle's:
+        // a pin has no w or h to name. Reached from a pin this frame HOLDS,
+        // edited off it.
+        a->x = 100; a->y = 300;                           // on the 640x480 frame
+        int q[2] = { 700, a->y };
+        why.clear();
+        check(!annWriteFields(*a, q, cur()->w, cur()->h, &why) && a->x == 100,
+              "W5b an edit that would push a fitting pin off the frame is refused");
+        fprintf(stderr, "roistatsselftest: W5b why=[%s]\n", why.c_str());
+        check(why.find("@700,300 would be outside this frame (640x480)") != std::string::npos &&
+              why.find("the pin is as it was") != std::string::npos,
+              "W5b ...naming the pixel it would have written, not a rectangle");
+        wSaid.push_back(why);
     }
 
     // ---- W6..W9: the band memory (prevX/prevW) and a frame of another size
@@ -748,10 +806,11 @@ static int roiStatsSelftest() {
         const App::Ann* b = findAnn(bRoi);
         check(b->prevX == 100 && b->prevW == 200,
               "W7 the rect the band was made from survives a smaller frame");
-        check(!(b->prevX == 0 && b->prevW == 4096),
-              "W7 ...the memory is NOT overwritten with this frame 0 / 4096");
         check(app.toast.find("outside this frame (2048x1500)") != std::string::npos,
               "W7 ...and the refusal says which frame, in the panel words");
+        check(app.toast.find("the rect it remembers is kept") != std::string::npos,
+              "W7 ...and promises the memory it really is holding");
+        wSaid.push_back(app.toast);
         const App::Ann was = *b;
         toggleBand(true);                                 // ...and again
         b = findAnn(bRoi);
@@ -785,6 +844,7 @@ static int roiStatsSelftest() {
         fprintf(stderr, "roistatsselftest: W9b toast [%s]\n", app.toast.c_str());
         check(b->prevY == 100 && b->prevH == 200,
               "W9b ...and the y memory survives the smaller frame too");
+        wSaid.push_back(app.toast);
     }
 
     // ---- W10: a ROI outside the frame is a NORMAL state -------------------
@@ -812,9 +872,318 @@ static int roiStatsSelftest() {
                             "%dx%d @%d,%d\n", i, e.w, e.h, e.x, e.y, g.w, g.h, g.x, g.y);
     }
     check(wSame, "W10 opening frames of other sizes rewrites no annotation at all");
-    // the list belongs to whatever runs next in this process: leave it empty
+
+    // ---- W11: annFits must not overflow ----------------------------------
+    // x + w in int is signed overflow for a w typed into the panel's field or
+    // read from a session, and an overflowed compare reads as "it fits" - so
+    // the editor would WRITE a rectangle 2^31 wide. The boundary is asserted on
+    // both sides of it, and the overflow through annWriteFields, which is the
+    // door a person actually gets to.
     app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
     app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(0, 100, 100, 100, 100);
+    {
+        App::Ann* a = findAnn(app.selectedAnn);
+        App::Ann t = *a;
+        t.x = 639; t.y = 479; t.w = 1; t.h = 1;
+        check(annFits(t, 640, 480), "W11 the last pixel of the frame fits");
+        t.w = 2;
+        check(!annFits(t, 640, 480), "W11 ...one past it does not");
+        t.x = 0; t.y = 0; t.w = 640; t.h = 480;
+        check(annFits(t, 640, 480), "W11 the whole frame fits exactly");
+        t.w = 641;
+        check(!annFits(t, 640, 480), "W11 ...one column more does not");
+        t.x = 1; t.w = INT_MAX; t.h = 480;
+        check(!annFits(t, 640, 480), "W11 x + w = 2^31 does not fit (it overflowed)");
+        t.x = 0; t.w = 640; t.y = 1; t.h = INT_MAX;
+        check(!annFits(t, 640, 480), "W11 ...nor does y + h");
+        // and the door: the editor must refuse it rather than write it
+        int g[4] = { a->x, a->y, INT_MAX, a->h };
+        std::string why;
+        const bool wrote = annWriteFields(*a, g, cur()->w, cur()->h, &why);
+        fprintf(stderr, "roistatsselftest: W11 wrote=%d w=%d why=[%s]\n",
+                (int)wrote, a->w, why.c_str());
+        check(!wrote && a->w == 100, "W11 w = 2147483647 is refused, not written");
+    }
+
+    // ---- W12: a refused number must not stay in the box ------------------
+    // The 2026-09-30 review's first finding, driven the way it is reached: real
+    // clicks and real keys through the real panel. InputInt4 is a GROUP of four
+    // children, and EndGroup reports the active child's id AND the deactivated
+    // flag independently (imgui.cpp:11666-11686), so Tab from w to h makes
+    // IsItemActive() and IsItemDeactivatedAfterEdit() both true in one frame.
+    // wBoth below MEASURES that rather than taking the comment's word for it.
+    // A buffer whose life was derived from IsItemActive() alone kept the
+    // refused 500, and the next field's commit counted it as an edit: after
+    // that, nothing could be written to the ROI at all.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(0, 400, 300, 100, 100);                        // fits, with room to fail
+    const int eRoi = app.anns.back().id;
+    bool wBoth = false;      // Active and DeactivatedAfterEdit in ONE frame
+    bool wDrop = false;      // ...and a commit that was dropped as another ROI's
+    auto wStep = [&]() {
+        roiFrame();
+        if (g_roiEditProbe.act && g_roiEditProbe.done) wBoth = true;
+        if (g_roiEditProbe.dropped) wDrop = true;
+    };
+    auto wSettle = [&]() { for (int f = 0; f < 4; f++) wStep(); };
+    auto wClick = [&](float x, float y) {
+        inj.on = true; inj.pos = ImVec2(x, y); inj.down = false; wStep();
+        inj.down = true;                                         wStep();
+        inj.down = false;                                        wStep();
+    };
+    auto wKey = [&](ImGuiKey k) {
+        inj.key = k; inj.keyDown = true;   wStep();
+        inj.key = k; inj.keyDown = false;  wStep();
+    };
+    auto wType = [&](const char* t) {
+        inj.chars = t;
+        wStep(); wStep();
+    };
+    wSettle();
+    const ImVec2 eMin = g_roiEditProbe.min, eMax = g_roiEditProbe.max;
+    fprintf(stderr, "roistatsselftest: W12 fields %s, seeded for %d, buf %d %d %d %d\n",
+            (eMax.x > eMin.x && eMax.y > eMin.y) ? "on screen" : "MISSING",
+            g_roiEditProbe.seededFor, g_roiEditProbe.buf[0], g_roiEditProbe.buf[1],
+            g_roiEditProbe.buf[2], g_roiEditProbe.buf[3]);
+    // Not decoration: every claim below is made by clicking inside this rect,
+    // so a panel that stopped drawing the fields has to FAIL here rather than
+    // pass the rest by never reaching a widget.
+    check(eMax.x > eMin.x && eMax.y > eMin.y && g_roiEditProbe.seededFor == eRoi &&
+          g_roiEditProbe.buf[0] == 400 && g_roiEditProbe.buf[2] == 100,
+          "W12 the editor's four fields are on screen, seeded from the ROI");
+    const float eY = (eMin.y + eMax.y) * 0.5f;
+    wClick(eMin.x + 4.0f, eY);                            // into x
+    wKey(ImGuiKey_Tab);                                   // -> y
+    wKey(ImGuiKey_Tab);                                   // -> w, text selected
+    app.toast.clear();
+    wType("500");                                         // w = 500: x + w = 900
+    wKey(ImGuiKey_Tab);                                   // -> h: w commits HERE
+    fprintf(stderr, "roistatsselftest: W12 after Tab: toast [%s] buf %d %d %d %d "
+                    "act+done-in-one-frame=%d\n", app.toast.c_str(),
+            g_roiEditProbe.buf[0], g_roiEditProbe.buf[1], g_roiEditProbe.buf[2],
+            g_roiEditProbe.buf[3], (int)wBoth);
+    check(wBoth, "W12 IsItemActive() and IsItemDeactivatedAfterEdit() in ONE frame");
+    {
+        const App::Ann* a = findAnn(eRoi);
+        check(a->w == 100 && a->x == 400,
+              "W12 ...the 500 is refused, so w is still 100");
+        check(app.toast.find("500x100 @400,300 would be outside this frame (640x480)")
+                  != std::string::npos,
+              "W12 ...and the refusal names the rectangle it would have written");
+        wSaid.push_back(app.toast);
+        // The commit is this frame; the box is re-seeded on the NEXT one, which
+        // is the frame the user sees. Measured: on the commit frame the buffer
+        // still reads 500 (it is what was just refused).
+        check(g_roiEditProbe.buf[2] == 500,
+              "W12 ...the refused number is still in the buffer on the commit frame");
+        wStep();
+        check(g_roiEditProbe.buf[2] == 100 && g_roiEditProbe.buf[3] == 100,
+              "W12 ...and the next frame puts the ROI's own numbers back in the boxes");
+    }
+    app.toast.clear();
+    wType("50");                                          // h, still focused
+    wKey(ImGuiKey_Enter);
+    {
+        const App::Ann* a = findAnn(eRoi);
+        fprintf(stderr, "roistatsselftest: W12 after h=50: %dx%d @%d,%d toast [%s]\n",
+                a->w, a->h, a->x, a->y, app.toast.c_str());
+        check(a->x == 400 && a->y == 300 && a->w == 100 && a->h == 50,
+              "W12 the NEXT edit writes its own component - h only");
+        check(app.toast.find("500") == std::string::npos,
+              "W12 ...and the refused 500 is not re-offered as this edit");
+    }
+
+    // ---- W13: a commit must not land on whichever ROI is selected now ----
+    // The review's second finding. An active text field does not hold the
+    // mouse (InputTextEx sets g.ActiveIdAllowOverlap = !io.MouseDown[0],
+    // imgui_widgets.cpp:4694, and NewFrame does not clear it), so a press on
+    // the canvas takes ActiveId and moves app.selectedAnn - and the canvas is
+    // drawn BEFORE this panel in the same frame (core/main.cpp), so the panel
+    // commits with the NEW selection in hand while InputTextEx re-applies the
+    // typed text (imgui_widgets.cpp:5094-5105).
+    //
+    // The canvas itself needs a GL context, so the test reproduces the
+    // ORDERING rather than the canvas: the selection moves before the panel
+    // draws, and the field ends in that frame. That is the invariant either
+    // way - a buffer belongs to the annotation it was seeded from.
+    addAnn(0, 100, 100, 50, 50);                          // B, also on this frame
+    const int e2Roi = app.anns.back().id;
+    app.selectedAnn = eRoi;                               // ...editing A
+    wSettle();
+    wDrop = false;                                        // from here on it means W13
+    wClick(eMin.x + 4.0f, eY);                            // into A's x
+    wKey(ImGuiKey_Tab);                                   // -> A's y, selected
+    wType("7");                                           // legal for BOTH ROIs
+    app.selectedAnn = e2Roi;                              // the canvas' press
+    app.toast.clear();
+    wKey(ImGuiKey_Enter);                                 // ...and the commit lands
+    {
+        const App::Ann* a = findAnn(eRoi);
+        const App::Ann* b2 = findAnn(e2Roi);
+        fprintf(stderr, "roistatsselftest: W13 A %dx%d @%d,%d  B %dx%d @%d,%d  "
+                        "dropped=%d\n", a->w, a->h, a->x, a->y, b2->w, b2->h, b2->x,
+                b2->y, (int)g_roiEditProbe.dropped);
+        check(b2->x == 100 && b2->y == 100 && b2->w == 50 && b2->h == 50,
+              "W13 the number typed into A is not written to B");
+        check(a->x == 400 && a->y == 300 && a->w == 100 && a->h == 50,
+              "W13 ...and A is left as it was: an uncommitted edit is dropped");
+        check(app.selectedAnn == e2Roi, "W13 ...while the selection still moved");
+        // Without this the group would pass on a build where the commit never
+        // arrived at all, which is not what is being claimed: the commit DID
+        // arrive, carrying A's typed number, and was dropped for B.
+        check(wDrop, "W13 ...and the drop is what stopped it, not a missing commit");
+    }
+    wKey(ImGuiKey_Escape);                                // leave no field active
+    inj.pos = ImVec2(-FLT_MAX, -FLT_MAX); inj.down = false;
+    wSettle();
+    inj.on = false;                                       // the cursor is the user's again
+
+    // ---- W14: the refusals nothing was running ---------------------------
+    // Three wordings had no test at all, and one of them - the band memory's -
+    // is the whole of this PR's second half. A refusal nobody runs is a
+    // refusal that rots.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    // (a) a ROI off the frame with NO memory: the refusal must NOT promise to
+    //     keep a rectangle it is not holding.
+    app.current = 1;                                      // 640x480
+    addAnn(0, 3000, 2000, 200, 200);
+    app.toast.clear();
+    toggleBand(true);
+    fprintf(stderr, "roistatsselftest: W14a toast [%s]\n", app.toast.c_str());
+    check(app.toast.find("is outside this frame (640x480)") != std::string::npos,
+          "W14a X on a ROI this frame cannot hold is refused");
+    check(app.toast.find("remembers") == std::string::npos,
+          "W14a ...and promises no memory, because it is holding none");
+    check(findAnn(app.selectedAnn)->prevW == -1 && findAnn(app.selectedAnn)->x == 3000,
+          "W14a ...and writes nothing at all");
+    wSaid.push_back(app.toast);
+    // (b) a memory this frame cannot hold, reached the way a person reaches it:
+    //     band on the big frame, open the small one, narrow the band to fit,
+    //     press X. The ROI fits now; the RANGE it remembers does not.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 0;                                      // 4096x3000
+    addAnn(0, 3000, 100, 200, 200);
+    const int mRoi = app.anns.back().id;
+    toggleBand(true);                                     // band, remembering x=3000 w=200
+    app.current = 2;                                      // 2048x1500
+    {
+        App::Ann* a = findAnn(mRoi);
+        int g[4] = { a->x, a->y, 2048, a->h };            // narrow it onto this frame
+        std::string why;
+        check(annWriteFields(*a, g, cur()->w, cur()->h, &why) && annFits(*a, 2048, 1500),
+              "W14b a band narrowed onto the smaller frame fits it");
+        // ...and edit the OTHER axis, which the x memory knows nothing about.
+        // Now every w-by-h rectangle a refusal could print is one that never
+        // existed: not the original (200x200), not the band (2048x200), not
+        // what is on screen (2048x50). Only the RANGE is real.
+        int g2[4] = { a->x, a->y, a->w, 50 };
+        check(annWriteFields(*a, g2, cur()->w, cur()->h, &why) && a->h == 50,
+              "W14b ...and the other axis is still editable");
+        app.toast.clear();
+        toggleBand(true);
+        fprintf(stderr, "roistatsselftest: W14b toast [%s]\n", app.toast.c_str());
+        check(app.toast.find("the x range this band was made from (x=3000 w=200)")
+                  != std::string::npos,
+              "W14b X names the RANGE it remembers");
+        check(app.toast.find("@") == std::string::npos,
+              "W14b ...and names no rectangle: none of them ever existed");
+        check(app.toast.find("outside this frame (2048x1500)") != std::string::npos,
+              "W14b ...while saying which frame it is measured against");
+        check(a->prevX == 3000 && a->prevW == 200 && a->x == 0 && a->w == 2048 &&
+              a->h == 50, "W14b ...keeps the range and writes nothing");
+        wSaid.push_back(app.toast);
+    }
+    // (c) the same on the other axis, so one wording cannot cover for two
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 0;
+    addAnn(0, 100, 2000, 200, 200);
+    const int m2Roi = app.anns.back().id;
+    toggleBand(false);                                    // remembers y=2000 h=200
+    app.current = 1;                                      // 640x480
+    {
+        App::Ann* a = findAnn(m2Roi);
+        int g[4] = { a->x, a->y, a->w, 480 };
+        std::string why;
+        check(annWriteFields(*a, g, cur()->w, cur()->h, &why) && annFits(*a, 640, 480),
+              "W14c the column band narrowed onto the smaller frame fits it");
+        app.toast.clear();
+        toggleBand(false);
+        fprintf(stderr, "roistatsselftest: W14c toast [%s]\n", app.toast.c_str());
+        check(app.toast.find("the y range this band was made from (y=2000 h=200)")
+                  != std::string::npos,
+              "W14c Y names its own axis' range");
+        check(a->prevY == 2000 && a->prevH == 200 && a->y == 0 && a->h == 480,
+              "W14c ...keeps it and writes nothing");
+        wSaid.push_back(app.toast);
+    }
+    // (d) a PIN off the frame: the old line told the user to select a pin
+    //     while their pin was selected. Say the reason instead.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(1, 3000, 2000, 0, 0);
+    app.hoverX = app.hoverY = -1;
+    app.toast.clear();
+    toggleBand(true);
+    fprintf(stderr, "roistatsselftest: W14d toast [%s]\n", app.toast.c_str());
+    check(app.toast.find("@3000,2000) is outside this frame (640x480)") != std::string::npos,
+          "W14d X on a pin off this frame says which pin and which frame");
+    check(app.toast.find("takes the row / column through the pin") != std::string::npos,
+          "W14d ...and what X / Y does with a pin");
+    check(app.toast.find("select a pin") == std::string::npos,
+          "W14d ...not advice for a state the user is not in");
+    check(app.anns.size() == 1, "W14d ...and makes no band");
+    wSaid.push_back(app.toast);
+
+    // ---- W15: every refusal this panel can say was said above ------------
+    // Eight wordings, eight entries, all different. A copy-paste that made two
+    // refusals identical, or a wording that stopped being reachable, lands
+    // here rather than in a bug report.
+    for (size_t i = 0; i < wSaid.size(); i++)
+        fprintf(stderr, "roistatsselftest: W15 said[%zu] %s\n", i, wSaid[i].c_str());
+    // Coverage is over WORDINGS, not over rendered strings: two refusals of the
+    // same kind carry different numbers, and the same kind reached twice (from
+    // the seam and through the real panel) is one wording. `deny` is how the
+    // band gate's two forms are told apart - one is the other plus a clause.
+    struct WSay { const char* need; const char* deny; const char* what; };
+    const WSay WANT[] = {
+        { "not written, the ROI is as it was", nullptr, "rect edit refused" },
+        { "or more, so nothing was written",   nullptr, "component is not a rectangle" },
+        { "not written, the pin is as it was", nullptr, "pin edit refused" },
+        { "bands a ROI against the frame it is on; the rect it remembers is kept",
+          nullptr, "band gate, holding a memory" },
+        { "bands a ROI against the frame it is on", "remembers",
+          "band gate, holding none" },
+        { "the x range this band was made from", nullptr, "x band memory refused" },
+        { "the y range this band was made from", nullptr, "y band memory refused" },
+        { "takes the row / column through the pin", nullptr, "pin band refused" },
+    };
+    bool wCovered = true;
+    for (const WSay& k : WANT) {
+        bool hit = false;
+        for (const std::string& t : wSaid)
+            if (t.find(k.need) != std::string::npos &&
+                (k.deny == nullptr || t.find(k.deny) == std::string::npos))
+                hit = true;
+        if (!hit) {
+            wCovered = false;
+            fprintf(stderr, "roistatsselftest: W15 NEVER RUN: %s\n", k.what);
+        }
+    }
+    check(wCovered && wSaid.size() >= 8,
+          "W15 every refusal wording this panel can say was run by a test above");
+    // the list belongs to whatever runs next in this process: leave it empty,
+    // and leave no pin hovered and no mouse button down either
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.hoverX = app.hoverY = -1;
     closeAll();
 
     g_roiRowProbeOn = false;
