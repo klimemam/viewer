@@ -334,6 +334,26 @@ struct RoiRowProbe { int id; char side; RoiStat s; ImVec2 del, lbl; double prnu;
 static std::vector<RoiRowProbe> g_roiRowProbe;
 static bool g_roiRowProbeOn = false;
 
+// ...and the same for the EDITOR at the bottom of the panel. The two defects
+// the 2026-09-30 review found there (a refused number left in the box; a
+// commit landing on whichever annotation is selected now) are reachable only
+// through real focus changes inside InputInt4's group, so the tests that pin
+// them click and type for real - and to click a field a test needs its rect.
+// `act` / `done` are what ImGui said about the group in that same frame, which
+// is the fact the first defect rests on. None of it is ever printed: this test
+// is held to byte-identical GL and NOGL output, and a rectangle depends on the
+// display it was laid out in.
+struct RoiEditProbe {
+    ImVec2 min = ImVec2(-1, -1), max = ImVec2(-1, -1);
+    bool act = false;        // ImGui::IsItemActive() on the group
+    bool done = false;       // ...and IsItemDeactivatedAfterEdit(), same frame
+    bool held = false;       // the buffer is the user's, not the annotation's
+    bool dropped = false;    // a commit was dropped: the selection had moved
+    int seededFor = 0;       // the Ann::id the buffer was filled from
+    int buf[4] = { 0, 0, 0, 0 };
+};
+static RoiEditProbe g_roiEditProbe;
+
 // What this panel SAID about the compare slots on the last frame it drew - the
 // g_histSideProbe discipline, and for the same reason: this machine cannot
 // screenshot GL, so the panel writes down the letters it named rather than a
@@ -1018,50 +1038,114 @@ static void drawPanelRois() {
             // resolved rect, so applying "5", "51", "512" as you type would rescan
             // the histogram, the ROI stats and every analyzer three times - that is
             // what made typing in these fields feel like the app had died.
+            //
+            // The buffer under these boxes is the USER's between the frame they
+            // start typing and the frame it commits, and it belongs to ONE
+            // annotation. Two facts about ImGui make that harder than it looks,
+            // and each of them cost a defect here (2026-09-30 review):
+            //
+            // 1. InputInt4 is a GROUP of four child items (InputScalarN,
+            //    imgui_widgets.cpp:3758-3790). EndGroup forwards the ACTIVE
+            //    child's id into LastItemData and, INDEPENDENTLY of that, ors
+            //    the Deactivated flag if any child was deactivated in this
+            //    frame (imgui.cpp:11666-11686; IsItemActive() reads the id,
+            //    imgui.cpp:6109-6115, IsItemDeactivated() reads the flag,
+            //    6126-6132). So moving the focus from w to h makes
+            //    IsItemActive() AND IsItemDeactivatedAfterEdit() both true in
+            //    ONE frame: "still editing" is NOT the complement of "just
+            //    committed". Deriving the buffer's life from IsItemActive()
+            //    alone left a REFUSED number sitting in the box, where the next
+            //    field's commit counted it as an edit and refused that too -
+            //    measured: after w = 500 is refused on a 640x480 frame, no
+            //    field of that ROI could be written at all until the focus left
+            //    the group entirely.
+            // 2. An active text field does not hold the mouse. InputTextEx sets
+            //    g.ActiveIdAllowOverlap = !io.MouseDown[0] on every frame it is
+            //    active (imgui_widgets.cpp:4694) and nothing in NewFrame clears
+            //    it, so a press on a ROI row above - or on the canvas, which is
+            //    drawn BEFORE this panel in the same frame - passes
+            //    ItemHoverable (imgui.cpp:4718-4726), takes ActiveId and moves
+            //    app.selectedAnn. On that same frame InputTextEx re-applies the
+            //    typed text into the buffer (imgui_widgets.cpp:5094-5105) and
+            //    IsItemDeactivatedAfterEdit() is true, so an uncommitted edit
+            //    of ROI A would be COMMITTED to whatever is selected now.
+            //
+            // Hence: the buffer is held only while it is being edited and NOT
+            // committed, it remembers the annotation it was seeded from, and a
+            // commit that arrives after the selection moved is dropped. The
+            // drop says nothing on screen - an uncommitted edit was never
+            // promised anything - but writing it to another annotation would be
+            // the reported bug with a different rectangle.
             static int xywh[4] = {};
-            static bool xywhEditing = false;
-            static int xywhId = -1;
-            if (!xywhEditing || xywhId != sel->id) {   // follow the ROI until edited
+            static bool xywhHeld = false;              // the buffer is the user's
+            static int xywhFor = -1;                   // ...for THIS annotation
+            const bool xywhMoved = xywhHeld && xywhFor != sel->id;
+            if (!xywhHeld || xywhMoved) {              // follow the ROI until edited
                 xywh[0] = sel->x; xywh[1] = sel->y; xywh[2] = sel->w; xywh[3] = sel->h;
-                xywhId = sel->id;
+                xywhFor = sel->id;
             }
             ImGui::SetNextItemWidth(-1);
             ImGui::InputInt4("##xywh", xywh);      // full width: a visible label would clip
-            xywhEditing = ImGui::IsItemActive();
+            const ImVec2 xywhMin = ImGui::GetItemRectMin(), xywhMax = ImGui::GetItemRectMax();
+            const bool xywhAct = ImGui::IsItemActive();
+            const bool xywhDone = ImGui::IsItemDeactivatedAfterEdit();
             // Only the component that was EDITED is written, and a value
             // this frame cannot hold is refused and said rather than clamped
             // into range: annWriteFields() carries the reasoning and the
             // measurement. The four std::clamps that used to be here rewrote
             // the three fields nobody touched, permanently, whenever the ROI
             // was not on this frame.
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
+            if (xywhDone && !xywhMoved) {
                 std::string why;
                 if (annWriteFields(*sel, xywh, im->w, im->h, &why)) app.annRev++;
                 else if (!why.empty()) toast(why, true);
-                // Either way the fields go back to the ROI on the next frame:
-                // xywhEditing is false now, so the seeding above re-reads it.
-                // A refused number must not sit in the box looking applied.
+            }
+            // A commit ends this buffer's life whether it was written or
+            // refused, and so does the selection moving out from under it. The
+            // next frame re-seeds from the annotation, so a refused number
+            // cannot sit in the box looking applied.
+            xywhHeld = xywhAct && !xywhDone && !xywhMoved;
+            if (g_roiRowProbeOn) {
+                g_roiEditProbe.min = xywhMin; g_roiEditProbe.max = xywhMax;
+                g_roiEditProbe.act = xywhAct; g_roiEditProbe.done = xywhDone;
+                g_roiEditProbe.held = xywhHeld; g_roiEditProbe.dropped = xywhDone && xywhMoved;
+                g_roiEditProbe.seededFor = xywhFor;
+                for (int k = 0; k < 4; k++) g_roiEditProbe.buf[k] = xywh[k];
             }
         } else {
             // The pin's two fields go through the same seam, and for the
             // same two reasons: writing per keystroke clamped BOTH numbers on
             // every edit, so raising x by one moved y as well the moment the
             // pin was not on this frame. Commit on Enter / focus loss, like
-            // the rectangle above, so a half-typed 4 of 4096 is not a write.
+            // the rectangle above - and with the same buffer discipline, for
+            // the same two ImGui facts written out above InputInt4: InputInt2
+            // is a group of two children, and an active field does not hold
+            // the mouse.
             static int pxy[2] = {};
-            static bool pxyEditing = false;
-            static int pxyId = -1;
-            if (!pxyEditing || pxyId != sel->id) {
+            static bool pxyHeld = false;
+            static int pxyFor = -1;
+            const bool pxyMoved = pxyHeld && pxyFor != sel->id;
+            if (!pxyHeld || pxyMoved) {
                 pxy[0] = sel->x; pxy[1] = sel->y;
-                pxyId = sel->id;
+                pxyFor = sel->id;
             }
             ImGui::SetNextItemWidth(-1);
             ImGui::InputInt2("##pinxy", pxy);
-            pxyEditing = ImGui::IsItemActive();
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
+            const ImVec2 pxyMin = ImGui::GetItemRectMin(), pxyMax = ImGui::GetItemRectMax();
+            const bool pxyAct = ImGui::IsItemActive();
+            const bool pxyDone = ImGui::IsItemDeactivatedAfterEdit();
+            if (pxyDone && !pxyMoved) {
                 std::string why;
                 if (annWriteFields(*sel, pxy, im->w, im->h, &why)) app.annRev++;
                 else if (!why.empty()) toast(why, true);
+            }
+            pxyHeld = pxyAct && !pxyDone && !pxyMoved;
+            if (g_roiRowProbeOn) {
+                g_roiEditProbe.min = pxyMin; g_roiEditProbe.max = pxyMax;
+                g_roiEditProbe.act = pxyAct; g_roiEditProbe.done = pxyDone;
+                g_roiEditProbe.held = pxyHeld; g_roiEditProbe.dropped = pxyDone && pxyMoved;
+                g_roiEditProbe.seededFor = pxyFor;
+                g_roiEditProbe.buf[0] = pxy[0]; g_roiEditProbe.buf[1] = pxy[1];
             }
             ImGui::TextDisabled("X / Y: select this pin's row / column");
         }
