@@ -1693,8 +1693,9 @@ headless な実行が freeze について言える唯一のことは**どのス�
 - **R9f3** —— `g_reloadArrivalThread` が**この**スレッドでなく、かつ**書かれている**
   (probe はジェスチャごとに default-construct へ戻すので、stage 2 が走らなければ
   空のまま赤になる)。`g_reloadArrivalStages` が 1 だけ進む。
-- **R9f4** —— 再読み側の id も記録され、これも UI のではなく、しかも別のスレッド
-  である (= 本当に2段ある)。**R9f5** —— それでも「1回の Reload は1回の start」。
+- **R9f4** —— 再読み側の id も記録され、これも UI のではない (2段であることの根拠は
+  id ではなく下の `g_reloadArrivalStages`)。**R9f5** —— それでも「1回の Reload は
+  1回の start」。
 - **R9g / R9g4 / R9g5** —— grow 全体で `g_fileReads == 2`。この数は
   `readFileBytes` (ファイルを丸ごと読む) で増えるので「480 MB を何回ディスクから
   取ったか」であり、正しい値は**参加枚数に関わらず 2** (再読みの group で1回、
