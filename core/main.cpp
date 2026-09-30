@@ -1209,15 +1209,46 @@ int main(int argc, char** argv) {
             uiScalePlatformName(uiGlfwPlatform()), xs, uiScale, fontScale, uis.how);
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
+    // ---- ARMED BEFORE THE FIRST UNTRUSTED BYTE (review) --------------------
+    // This used to sit below, after the GL backends were initialised, which put
+    // it AFTER the font atlas is baked - and a font file is the first input
+    // this process reads that it did not write itself. stb_truetype cannot be
+    // made safe against a truncated one (see sfntLooksSane), so the crash it
+    // can still take has to at least leave a line behind; without this, the
+    // measured failure was exit 139 with no output and no crash record.
+    //
+    // Nothing here depends on GL or on ImGui: openCrashFile() needs
+    // autosavePath(), which needs the instance slot, and that was claimed
+    // hundreds of lines above. The handler itself only write()s.
+    openCrashFile();
+    for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
     // WHICH font, and - if none - which paths were looked at. The override is
     // read from settings.jsonc / prefs.txt, both of which have already loaded
     // by the time the window is made (loadPrefs and loadSettings are hundreds
     // of lines above), so a value typed there is in force on the very next
     // start rather than the one after it.
-    g_fontChoice = jpFontChoice(g_settingsFontPath);
+    // ...and the BREADCRUMB from the last start (review P1-A layer 2). If it is
+    // there, the last run of this program did not survive baking the fonts it
+    // names, so those files are passed over now - see fontBakeCrumbWrite below
+    // and the long comment at fontBakeCrumbPath() for why no amount of checking
+    // replaces this.
+    const std::vector<std::string> crumb = fontBakeCrumbRead();
+    g_fontChoice = jpFontChoice(g_settingsFontPath, crumb);
     const std::string fontPath = g_fontChoice.path;
     static ImVector<ImWchar> fontRanges;
     cjkFontRanges(io.Fonts, fontRanges);
+    // ...and BEFORE a single byte of a font file is touched, write down which
+    // files are about to be read. If the process dies between here and
+    // fontBakeCrumbClear() below, the next start finds this and does not repeat
+    // it. Both faces go in: a merge reads two files and either can be the one
+    // that kills the process.
+    {
+        std::vector<std::string> about;
+        if (!fontPath.empty()) about.push_back(fontPath);
+        if (const std::string m = cjkMergeFontPath(fontPath); !m.empty())
+            about.push_back(m);
+        fontBakeCrumbWrite(about);
+    }
     ImFont* jp = fontPath.empty() ? nullptr
         : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
                                        fontRanges.Data);
@@ -1252,7 +1283,12 @@ int main(int argc, char** argv) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
     }
-    fontAtlasBake(fontRanges, fontScale);
+    fontAtlasBake(fontRanges, fontScale, /*fontLoadFailed=*/!fontPath.empty() && !jp);
+    // SURVIVED. The breadcrumb's whole meaning is "a start got this far and did
+    // not come back", so it is removed the instant this one does - immediately
+    // after the bake returns, before anything else can fail for its own reasons
+    // and leave a crumb that blames the font.
+    fontBakeCrumbClear();
     // ---- FOUR different things can have gone wrong, and they are four
     // different sentences (review P1 / P2-8 / P2-9). AFTER the bake, because
     // only the built atlas can tell some of them apart.
@@ -1266,7 +1302,13 @@ int main(int argc, char** argv) {
     //  4. It parsed and simply has no CJK       -> which file. fc-match answers
     //     sans:lang=ja with DejaVu Sans on a machine with no Japanese font, so
     //     this is what the fallback actually produces on the Ubuntu runner.
-    if (!jp) {
+    //  5. The LAST start died baking a font, so this one skipped it -> which
+    //     file, what is being used instead, and how to get out of it. It comes
+    //     FIRST because it is the only one of the five the user must act on to
+    //     restore what they asked for.
+    if (g_fontChoice.skippedAfterCrash) {
+        toast(cjkFontCrashSkipText(g_fontChoice), true);
+    } else if (!jp) {
         if (g_fontChoice.path.empty()) toast(cjkFontMissingText(g_fontChoice), true);
         else                           toast(cjkFontUnreadableText(g_fontChoice), true);
     } else if (g_fontAtlasCost.buildFailed) {
@@ -1304,10 +1346,6 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_Init(glslVersion);
     }
 
-    // write the session on the way out of any crash, then let it crash normally.
-    // The file is opened now, while opening files still works.
-    openCrashFile();
-    for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
 #if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);   // a dead ssh peer must not kill the viewer mid-write
 #endif

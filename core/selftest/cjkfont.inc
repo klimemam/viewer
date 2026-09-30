@@ -655,48 +655,227 @@ static int cjkFontSelftest() {
             bool named = false;
             for (const std::string& t : c.tried)
                 if (t.find("not-a-font.txt") != std::string::npos &&
-                    t.find("is not a font") != std::string::npos) named = true;
+                    t.find("unusable: it has no sfnt signature") != std::string::npos)
+                    named = true;
             check(named,
                   "C5 ...and the record says WHY, not just that it was tried");
             // ...and the search still ends somewhere usable rather than being
             // poisoned by the bad override.
             check(c.path == wouldPick,
                   "C5 ...and the search carries on to what it would have picked");
-            // A file with a CORRECT signature that stb_truetype cannot parse is
-            // a DIFFERENT failure and the signature check cannot see it: this
-            // is a well-formed sfnt header declaring zero tables, so
-            // stbtt_InitFont finds no cmap/head/hhea/hmtx and Build() returns
-            // false. That is the case CFF2 variable fonts hit for real, and it
-            // is why looksLikeSfnt() alone does not close the hole.
-            const std::string stub = (root0 / "signed-but-empty.ttf").u8string();
+            // ---- THE SHAPES THAT CRASHED, EVERY ONE OF THEM ----------------
+            // MEASURED on the build before the gate, with these exact files:
+            //   4 bytes "00 01 00 00" ............... exit 0 (survived)
+            //   8 bytes, numTables = 0xFFFF ......... EXIT 139
+            //   first 1 KB of a real arial.ttf ...... EXIT 139
+            //   first 64 KB of a real arial.ttf ..... EXIT 139
+            //   first 4 KB of a real meiryo.ttc ..... EXIT 139
+            // The signature is correct in all five. What kills the process is
+            // stbtt__find_table: it reads num_tables at fontstart+4 with no
+            // bound at all and then walks 16 bytes per entry, so a TRUNCATED
+            // REAL FONT is the worst case - its directory is genuine, every
+            // required table is "found", and each one points past the end of
+            // the file.
+            //
+            // THE FIXTURES ARE BUILT HERE, not copied from C:\Windows\Fonts.
+            // That decision is deliberate: a test that reads the machine's own
+            // fonts asserts something different on each runner (and nothing at
+            // all on the Ubuntu one, which has no arial.ttf), while a font this
+            // test assembles byte by byte is the same input everywhere. The
+            // POSITIVE control matters as much as the negatives - a gate that
+            // refused everything would pass every line below - so the same
+            // builder makes a complete font that must be ACCEPTED, and the
+            // broken ones are that same font, cut.
+            auto put16 = [](std::string& b, unsigned v) {
+                b += (char)(unsigned char)((v >> 8) & 0xFF);
+                b += (char)(unsigned char)(v & 0xFF);
+            };
+            auto put32 = [](std::string& b, unsigned long v) {
+                b += (char)(unsigned char)((v >> 24) & 0xFF);
+                b += (char)(unsigned char)((v >> 16) & 0xFF);
+                b += (char)(unsigned char)((v >> 8) & 0xFF);
+                b += (char)(unsigned char)(v & 0xFF);
+            };
+            // A minimal sfnt that satisfies every check sfntLooksSane makes:
+            // the six tables stb_truetype requires, each wholly inside the
+            // file. Their CONTENTS are not fonts - this exercises the gate,
+            // which is a bounds check, and nothing here is ever handed to
+            // stb_truetype.
+            auto buildFont = [&](const std::vector<std::string>& tags) {
+                std::string dir, body;
+                const size_t bodyAt = 12 + 16 * tags.size();
+                for (const std::string& t : tags) {
+                    const size_t off = bodyAt + body.size();
+                    const std::string content(64, 'T');
+                    dir += t;
+                    put32(dir, 0);                       // checksum
+                    put32(dir, (unsigned long)off);
+                    put32(dir, (unsigned long)content.size());
+                    body += content;
+                }
+                std::string out;
+                put32(out, 0x00010000ul);
+                put16(out, (unsigned)tags.size());
+                put16(out, 0); put16(out, 0); put16(out, 0);
+                out += dir;
+                out += body;
+                return out;
+            };
+            auto writeFile = [&](const char* nm, const std::string& bytes) {
+                const std::string fp = (root0 / nm).u8string();
+                std::ofstream f(pathFromUtf8(fp), std::ios::binary);
+                f.write(bytes.data(), (std::streamsize)bytes.size());
+                f.close();
+                return fp;
+            };
+            const std::vector<std::string> kAll =
+                { "cmap", "head", "hhea", "hmtx", "glyf", "loca" };
+            const std::string whole = buildFont(kAll);
+            // (1) THE POSITIVE CONTROL. Without this every "false" below could
+            // be a gate that simply says no to everything.
             {
-                std::ofstream f(pathFromUtf8(stub), std::ios::binary);
-                const unsigned char hdr[12] = { 0x00,0x01,0x00,0x00, 0,0, 0,0, 0,0, 0,0 };
-                f.write((const char*)hdr, 12);
-                const std::string pad(400, '\0');
-                f.write(pad.data(), (std::streamsize)pad.size());
+                const std::string fp = writeFile("whole.ttf", whole);
+                std::string why;
+                check(sfntLooksSane(fp, why),
+                      "C5 a complete sfnt with every required table IS accepted" +
+                      (why.empty() ? std::string() : " (said: " + why + ")"));
             }
-            check(looksLikeSfnt(stub),
-                  "C5 a correct sfnt signature IS accepted by the signature check");
-            ImFontAtlas probe;
-            ImVector<ImWchar> r2;
-            cjkFontRanges(&probe, r2);
-            const bool added = probe.AddFontFromFileTTF(stub.c_str(), 17.0f,
-                                                        nullptr, r2.Data) != nullptr;
-            check(added,
-                  "C5 ...and ImGui ACCEPTS it, which is why the size check is "
-                  "not the guard either");
-            check(added && !probe.Build(),
-                  "C5 ...while Build() returns false - the signal start-up now "
-                  "acts on instead of discarding");
-            probe.Clear();
-            // The sentence that failure produces names the file and says what
-            // the user is looking at instead.
+            // (2) ...and the same font, CUT. This is the truncated-real-font
+            // shape, which is the one that crashed.
+            struct Cut { const char* nm; size_t keep; const char* what; };
+            const Cut cuts[] = {
+                { "cut_half.ttf",  whole.size() / 2, "cut in half" },
+                { "cut_dir.ttf",  12 + 16 * 3,       "cut inside its table directory" },
+                { "cut_hdr.ttf",  8,                 "cut inside its header" },
+            };
+            for (const Cut& cu : cuts) {
+                const std::string fp = writeFile(cu.nm, whole.substr(0, cu.keep));
+                std::string why;
+                const bool sane = sfntLooksSane(fp, why);
+                say(std::string(cu.nm) + " -> " + (sane ? "ACCEPTED" : "refused: " + why));
+                check(!sane, std::string("C5 a font ") + cu.what + " is refused");
+                // ...and the refusal reaches the RECORD, which is the only
+                // place the user can read it.
+                const FontChoice fc2 = jpFontChoice(fp);
+                bool said2 = false;
+                for (const std::string& t : fc2.tried)
+                    if (t.find(cu.nm) != std::string::npos &&
+                        t.find("unusable: ") != std::string::npos) said2 = true;
+                check(said2, std::string("C5 ...and the record says why for ") + cu.nm);
+                check(fc2.path == wouldPick,
+                      std::string("C5 ...and the search carries on past ") + cu.nm);
+            }
+            // (3) The two hand-written headers from the measurement table.
+            {
+                std::string four; put32(four, 0x00010000ul);
+                const std::string fp = writeFile("four-bytes.ttf", four);
+                std::string why;
+                check(!sfntLooksSane(fp, why), "C5 a 4-byte file is refused");
+                say("four-bytes.ttf -> refused: " + why);
+                std::string eight; put32(eight, 0x00010000ul);
+                put16(eight, 0xFFFF); put16(eight, 0);
+                const std::string fp2 = writeFile("eight-bytes.ttf", eight);
+                check(!sfntLooksSane(fp2, why),
+                      "C5 ...and so is an 8-byte one (too small for a directory)");
+                say("eight-bytes.ttf -> refused: " + why);
+                // ...and a file that IS big enough for a header and claims
+                // 65535 tables it does not have. This is the one that reaches
+                // the directory-size check rather than the size floor, and it
+                // is the shape stbtt__find_table walks off the end of.
+                std::string liar; put32(liar, 0x00010000ul);
+                put16(liar, 0xFFFF); put16(liar, 0); put16(liar, 0); put16(liar, 0);
+                liar += std::string(400, 'L');
+                const std::string fp3 = writeFile("liar.ttf", liar);
+                check(!sfntLooksSane(fp3, why),
+                      "C5 ...and one claiming 65535 tables it has no room for");
+                say("liar.ttf -> refused: " + why);
+                check(why.find("65535") != std::string::npos,
+                      "C5 ...with the count it claimed in the reason");
+            }
+            // (4) numTables = 0, which was the ONLY shape the old test had -
+            // and the only one that was already safe.
+            {
+                std::string z; put32(z, 0x00010000ul);
+                put16(z, 0); put16(z, 0); put16(z, 0); put16(z, 0);
+                z += std::string(400, 'z');
+                const std::string fp = writeFile("no-tables.ttf", z);
+                std::string why;
+                check(!sfntLooksSane(fp, why), "C5 a font declaring no tables is refused");
+                say("no-tables.ttf -> refused: " + why);
+            }
+            // (5) Every required table present EXCEPT the outlines, which is
+            // what a CFF2 variable font looks like from here: the gate names it
+            // rather than leaving stb_truetype to fail silently in a release
+            // build (ImGui's own assert for it is compiled out).
+            {
+                const std::string fp = writeFile("no-outlines.ttf",
+                    buildFont({ "cmap", "head", "hhea", "hmtx" }));
+                std::string why;
+                check(!sfntLooksSane(fp, why),
+                      "C5 a font with no glyf and no 'CFF ' is refused (the CFF2 shape)");
+                say("no-outlines.ttf -> refused: " + why);
+                check(why.find("CFF2") != std::string::npos,
+                      "C5 ...and the reason names CFF2, which is what it will be");
+            }
+            // (6) glyf without loca - stbtt requires the pair.
+            {
+                const std::string fp = writeFile("glyf-no-loca.ttf",
+                    buildFont({ "cmap", "head", "hhea", "hmtx", "glyf" }));
+                std::string why;
+                check(!sfntLooksSane(fp, why), "C5 glyf without loca is refused");
+                say("glyf-no-loca.ttf -> refused: " + why);
+            }
+            // (7) A COLLECTION, whole and cut. `ttcf` is what meiryo.ttc is -
+            // the file whose first 4 KB crashed the process - and the collection
+            // header is a SECOND place a truncated file can point outside
+            // itself, before any font's directory is even reached.
+            //
+            // (In a real .ttc the table offsets are absolute from the start of
+            // the FILE, while `whole` was built with offsets from the start of
+            // ITSELF. That does not matter to what is under test: the gate is a
+            // bounds check, and both readings land inside this file. It is
+            // written down so the next reader does not take this fixture for a
+            // model of the format.)
+            {
+                std::string ttc;
+                put32(ttc, 0x74746366ul);        // 'ttcf'
+                put32(ttc, 0x00010000ul);        // version
+                put32(ttc, 1);                   // numFonts
+                put32(ttc, 16);                  // offset of font 0
+                ttc += whole;
+                const std::string fp = writeFile("coll.ttc", ttc);
+                std::string why;
+                check(sfntLooksSane(fp, why),
+                      "C5 a well-formed collection is accepted" +
+                      (why.empty() ? std::string() : " (said: " + why + ")"));
+                // Cut to HALF, so the cut is real: the whole thing is only a
+                // few hundred bytes, and a fixed 2048 would have cut nothing
+                // at all and asserted the opposite of what it said.
+                const std::string fp2 = writeFile("coll-cut.ttc",
+                                                  ttc.substr(0, ttc.size() / 2));
+                check(!sfntLooksSane(fp2, why), "C5 ...and a cut one is refused");
+                say("coll-cut.ttc -> refused: " + why);
+                // ...and a collection whose own header points past the end,
+                // which is the check that happens before any directory.
+                std::string bad2;
+                put32(bad2, 0x74746366ul);
+                put32(bad2, 0x00010000ul);
+                put32(bad2, 4);                  // claims four fonts
+                put32(bad2, 0x7FFFFFFFul);       // ...the first of them out there
+                bad2 += std::string(64, 'c');
+                const std::string fp3 = writeFile("coll-liar.ttc", bad2);
+                check(!sfntLooksSane(fp3, why),
+                      "C5 ...and one whose font offsets point outside the file");
+                say("coll-liar.ttc -> refused: " + why);
+            }
+            // The sentence a failure produces names the file and says what the
+            // user is looking at instead.
             FontChoice bad;
-            bad.path = stub; bad.how = "appearance.fontPath";
+            bad.path = (root0 / "cut_half.ttf").u8string();
+            bad.how = "appearance.fontPath";
             const std::string unread = cjkFontUnreadableText(bad);
             say("unreadable: " + unread);
-            check(unread.find(stub) != std::string::npos &&
+            check(unread.find("cut_half.ttf") != std::string::npos &&
                   unread.find("built-in font") != std::string::npos &&
                   unread.find("appearance.fontPath") != std::string::npos,
                   "C5 ...and the message names the file, the fallback and the way out");
@@ -960,6 +1139,197 @@ static int cjkFontSelftest() {
               pathFromUtf8BadCount() == badWas + moved,
               "C6 a well-formed name still converts, and counts nothing");
     }
+
+    // ======================================================================
+    //  C7 - THE BREADCRUMB, AND THE RECOVERY IT BACKS UP
+    //
+    //  WHY THIS EXISTS AT ALL. The gate above refuses every shape of broken
+    //  font that has been measured, and it still cannot make stb_truetype
+    //  safe: past the table directory it follows offsets inside cmap subtables
+    //  and inside loca/glyf that it has no bound for. Each check narrows the
+    //  hole; none closes it.
+    //
+    //  What closes the CONSEQUENCE is this: the path about to be baked is
+    //  written down first and erased after, so a start that did not come back
+    //  leaves a note, and the next start does not repeat it. Without it the
+    //  measured failure was permanent - appearance.fontPath persists, there is
+    //  no command-line flag that overrides it, so the only way back was to edit
+    //  a settings file with an application that would not open.
+    //
+    //  The same discipline is already in this repo, a few hundred lines from
+    //  the breadcrumb: the autosave slot lock, whose comment says "A CRASH
+    //  skips it on purpose: the stale lock left behind is what marks that
+    //  autosave reclaimable."
+    // ======================================================================
+    {
+        // The crumb lives in the CONFIG directory, which for a selftest is the
+        // shared VIEWER_TEST_HOME - so whatever this group writes there has to
+        // be gone by the time it returns, or every later test in the suite
+        // starts skipping a font.
+        const std::vector<std::string> crumbWas = fontBakeCrumbRead();
+        fontBakeCrumbClear();
+        const std::string real = jpFontChoice(std::string()).path;
+        if (real.empty()) {
+            say("no usable font on this machine, so C7 cannot show an override "
+                "being taken or skipped - the file half below still ran.");
+        } else {
+            // (1) WITH NO CRUMB the override is used. Asserted first and in the
+            // same group on purpose: an implementation that skipped the
+            // override forever would satisfy every line in (2).
+            const FontChoice ok1 = jpFontChoice(real, fontBakeCrumbRead());
+            check(ok1.path == real && !ok1.skippedAfterCrash,
+                  "C7 with no breadcrumb the override is used");
+            // (2) WITH A CRUMB naming it, it is passed over, the record says
+            // why, and the search carries on to something usable.
+            fontBakeCrumbWrite({ real });
+            const std::vector<std::string> back = fontBakeCrumbRead();
+            check(back.size() == 1 && back[0] == real,
+                  "C7 the breadcrumb survives a write and a read");
+            const FontChoice sk = jpFontChoice(real, back);
+            check(sk.skippedAfterCrash, "C7 ...and the next choice skips that file");
+            check(sk.path != real || real == jpFontChoice(std::string(), back).path,
+                  "C7 ...and does not return it as the answer");
+            bool said = false;
+            for (const std::string& t : sk.tried)
+                if (t.find(real) != std::string::npos &&
+                    t.find("the last start did not survive baking it") !=
+                        std::string::npos) said = true;
+            check(said, "C7 ...and the record says that is why");
+            // (3) THE FIFTH MESSAGE. Its whole value is the last clause - the
+            // way out - because the user's own setting is being overruled and
+            // only they can decide what to do about it.
+            const std::string m = cjkFontCrashSkipText(sk);
+            say("crash-skip: " + m);
+            check(m.find(real) != std::string::npos,
+                  "C7 the fifth message names the file that was skipped");
+            check(m.find("did not survive") != std::string::npos,
+                  "C7 ...and says why it was skipped");
+            check(m.find("appearance.fontPath") != std::string::npos &&
+                  m.find("delete that line") != std::string::npos,
+                  "C7 ...and names BOTH ways out: point it elsewhere, or remove it");
+            // ...and it is a fifth SENTENCE, not one of the four wearing a hat.
+            // All six pairs, because three comparisons out of six is not "they
+            // are all different".
+            FontChoice any; any.path = "/x.ttc"; any.how = "built-in candidate";
+            const std::string five[5] = {
+                cjkFontMissingText(any), cjkFontNoGlyphsText(any),
+                cjkFontUnreadableText(any), cjkFontChineseFallbackText(any),
+                cjkFontCrashSkipText(any),
+            };
+            int distinct = 0, pairs = 0;
+            for (int i = 0; i < 5; i++)
+                for (int k = i + 1; k < 5; k++) { pairs++; if (five[i] != five[k]) distinct++; }
+            check(pairs == 10 && distinct == 10,
+                  "C7 ...and all " + std::to_string(pairs) +
+                  " pairs of the five font messages differ");
+            // (4) SURVIVING CLEARS IT. Otherwise the first crash would disable
+            // the override for good.
+            fontBakeCrumbClear();
+            check(fontBakeCrumbRead().empty(), "C7 a completed bake clears the breadcrumb");
+            const FontChoice ok2 = jpFontChoice(real, fontBakeCrumbRead());
+            check(ok2.path == real && !ok2.skippedAfterCrash,
+                  "C7 ...and the override works again on the next start");
+        }
+        // Given back, at the one exit.
+        fontBakeCrumbClear();
+        if (!crumbWas.empty()) fontBakeCrumbWrite(crumbWas);
+    }
+
+    // ======================================================================
+    //  C8 - THE RECOVERY FROM A FAILED Build(), RUN FOR REAL
+    //
+    //  This is the branch the P1 fix is made of and nothing was exercising it.
+    //  It runs LAST because it replaces the live atlas: every group above reads
+    //  the one start-up baked, and this one deliberately destroys it.
+    //
+    //  ONLY WITH NDEBUG. Every path that makes ImFontAtlas::Build() return
+    //  false goes through an IM_ASSERT first - "stbtt_InitFont(): failed to
+    //  parse FontData" - so on a build with assertions live this would abort
+    //  instead of failing, and a test that cannot choose how it dies is worse
+    //  than a test that says it is not running. The CI matrix builds Release,
+    //  so this group runs there; a developer's default build says so by name.
+    // ======================================================================
+#if defined(NDEBUG)
+    {
+        std::error_code ec8;
+        const std::filesystem::path r8 =
+            std::filesystem::temp_directory_path(ec8) / "viewer_cjkfont_recover";
+        std::filesystem::remove_all(r8, ec8);
+        std::filesystem::create_directories(r8, ec8);
+        // A font that PASSES the gate - every required table, all in bounds -
+        // and whose contents are not a font at all. That is precisely the
+        // residue the gate cannot catch, so it is the right input for the
+        // machinery that exists because the gate cannot catch it.
+        std::string b;
+        auto p16 = [&](unsigned v) { b += (char)(unsigned char)(v >> 8); b += (char)(unsigned char)(v & 0xFF); };
+        auto p32 = [&](unsigned long v) {
+            b += (char)(unsigned char)((v >> 24) & 0xFF); b += (char)(unsigned char)((v >> 16) & 0xFF);
+            b += (char)(unsigned char)((v >> 8) & 0xFF);  b += (char)(unsigned char)(v & 0xFF);
+        };
+        const char* tags8[] = { "cmap", "head", "hhea", "hmtx", "glyf", "loca" };
+        const size_t nT = 6, bodyAt = 12 + 16 * nT;
+        p32(0x00010000ul); p16((unsigned)nT); p16(0); p16(0); p16(0);
+        for (size_t k = 0; k < nT; k++) {
+            b += tags8[k];
+            p32(0); p32((unsigned long)(bodyAt + 64 * k)); p32(64);
+        }
+        // ZERO-FILLED, and that is the whole trick of this fixture. With
+        // filler bytes stb_truetype reads `numTables` out of the middle of the
+        // cmap table, gets 21588, and walks 8 bytes per entry straight off the
+        // end of the buffer - measured, SIGSEGV, which is exactly the residue
+        // the gate cannot catch and therefore the wrong input for testing the
+        // recovery. With zeros the cmap declares NO encoding subtables, so
+        // stbtt_InitFont returns 0 at `if (info->index_map == 0) return 0;`
+        // before it dereferences anything else, and Build() returns false
+        // cleanly. One byte pattern is a crash, the other is the branch.
+        b += std::string(64 * nT, '\0');
+        const std::string fp8 = (r8 / "passes-the-gate.ttf").u8string();
+        { std::ofstream f(pathFromUtf8(fp8), std::ios::binary); f.write(b.data(), (std::streamsize)b.size()); }
+        std::string why8;
+        check(sfntLooksSane(fp8, why8),
+              "C8 the fixture passes the gate (which is what makes it the right one)");
+
+        ImFontAtlas* A = ImGui::GetIO().Fonts;
+        A->Clear();
+        ImVector<ImWchar> r8r;
+        cjkFontRanges(A, r8r);
+        const bool added8 = A->AddFontFromFileTTF(fp8.c_str(), 17.0f, nullptr,
+                                                  r8r.Data) != nullptr;
+        check(added8, "C8 ...and ImGui accepts it, so the failure is Build()'s");
+        const FontChoice keptChoice = g_fontChoice;
+        g_fontChoice.path = fp8;
+        g_fontChoice.how = "appearance.fontPath";
+        fontAtlasBake(r8r, 1.0f);
+        check(g_fontAtlasCost.buildFailed,
+              "C8 a failed Build() is RECORDED, not discarded");
+        check(g_fontAtlasCost.bakedGlyphs > 0 && g_fontAtlasCost.faces == 1,
+              "C8 ...and the atlas was rebuilt from the built-in font");
+        check(bakedFont() != nullptr && bakedFont()->FindGlyphNoFallback((ImWchar)'A'),
+              "C8 ...so text still draws: the built-in font has ASCII");
+        check(!fontAtlasHasCjk(),
+              "C8 ...and it says the CJK glyphs are gone, which they are");
+        // The summary line must not read as though that file is in use.
+        const std::string from8 = fontAtlasFromText(g_fontAtlasCost, g_fontChoice,
+                                                    std::string());
+        say("summary: from " + from8);
+        check(from8.find("built-in font") != std::string::npos,
+              "C8 the summary line names the built-in font, which is what was baked");
+        check(from8.find(fp8) != std::string::npos,
+              "C8 ...and still names the file that failed, as the file that failed");
+        // ...and the same mouth reports a font that would not even LOAD.
+        FontAtlasCost loadFail;
+        loadFail.buildFailed = true;
+        const std::string from9 = fontAtlasFromText(loadFail, g_fontChoice, std::string());
+        check(from9 == from8,
+              "C8 ...and a font that could not be read at all says the same thing");
+        g_fontChoice = keptChoice;
+        std::filesystem::remove_all(r8, ec8);
+    }
+#else
+    say("C8 SKIPPED: this build has assertions live, and every route to a false "
+        "ImFontAtlas::Build() passes an IM_ASSERT first - so the recovery would "
+        "abort rather than fail here. It runs on the Release builds CI makes.");
+#endif
 
     fprintf(stderr, "cjkfontselftest: %s\n", ok ? "ok" : "FAILED");
     return ok ? 0 : 1;

@@ -893,6 +893,64 @@ static std::string viewerConfigDir() {
     return cfg.u8string();
 }
 
+// ---- THE FONT BREADCRUMB (review P1-A, layer 2) -----------------------------
+// NO AMOUNT OF CHECKING MAKES stb_truetype SAFE. sfntLooksSane() refuses what
+// would send it outside the file at the table-directory level, and it cannot
+// follow the offsets inside a cmap subtable or inside loca/glyf that it goes on
+// to trust. Each check narrows the hole. This closes the consequence instead:
+// if the program did not survive the last attempt to bake a font, it does not
+// try the same file again, so a person can always get back in and change the
+// setting.
+//
+// Measured, and this is why it is necessary: a file holding the first 4096
+// bytes of a real meiryo.ttc crashed the process at start-up, and because
+// `appearance.fontPath` PERSISTS, every later start crashed in the same place.
+// The user could not reach the Preferences panel to undo it. Only the file on
+// disk could be edited - with an application that would not open.
+//
+// THE PRECEDENT is in this repo already, a few hundred lines below: the
+// autosave slot lock, whose comment reads "A CRASH skips it on purpose: the
+// stale lock left behind is what marks that autosave reclaimable". Same
+// discipline, same shape - write before the risky step, delete after it, and
+// treat what is left behind as information rather than as garbage.
+//
+// One path per line, because a merge bakes two files and either of them can be
+// the one that kills the process.
+static std::string fontBakeCrumbPath() {
+    const std::string dir = viewerConfigDir();
+    return dir.empty() ? std::string() : dir + "/font-baking";
+}
+static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty() || paths.empty()) return;
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : paths) f << s << "\n";
+    // Flushed and closed before the caller bakes anything: a breadcrumb still
+    // sitting in a stdio buffer when the process dies is not a breadcrumb.
+    f.flush();
+}
+static std::vector<std::string> fontBakeCrumbRead() {
+    std::vector<std::string> out;
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return out;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return out;
+    std::ifstream f(pathFromUtf8(p), std::ios::binary);
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!line.empty()) out.push_back(line);
+    }
+    return out;
+}
+static void fontBakeCrumbClear() {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(pathFromUtf8(p), ec);
+}
+
 static unsigned long currentPid() {
 #if defined(_WIN32)
     return (unsigned long)GetCurrentProcessId();
@@ -1464,10 +1522,19 @@ static void loadPrefs() {
         // two values are 0 and 1, and a hand-edited 7 is not a gesture - the
         // honest answer to it is the default, which is also today's behaviour.
         else if (key == "folderclick") { ls >> v; if (v == 0 || v == 1) app.folderClick = v; }
+        // THE KEYS WHOSE VALUE IS THE REST OF THE LINE, because a path may
+        // contain spaces. This list is the gate: a key missing from it never
+        // reaches the chain below, however carefully that chain handles it.
+        // `fontpath` was missing (review), so its `else if` twelve lines down
+        // was dead code and appearance.fontPath written into prefs.txt did
+        // nothing at all - while two of the font messages named prefs.txt as a
+        // way to set it. Measured: prefs-only `fontpath` was ignored and the
+        // search fell through to meiryo.
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent" ||
                  key == "pythonexe" || key == "readerfor" || key == "readerdir" ||
-                 key == "readerplace" || key == "repourl" || key == "editor") {
+                 key == "readerplace" || key == "repourl" || key == "editor" ||
+                 key == "fontpath") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
@@ -2737,6 +2804,36 @@ static void crashHandler(int sig) {
     static volatile sig_atomic_t inHandler = 0;
     if (!inHandler) {
         inHandler = 1;
+        // ONE LINE, UNCONDITIONALLY, before anything else is attempted.
+        //
+        // The session write below needs a snapshot that does not exist until
+        // documents are open, and this handler is now armed long before that:
+        // main() arms it before the font atlas is baked, because a font file is
+        // the first UNTRUSTED input this process reads and stb_truetype cannot
+        // be made safe against a truncated one. A crash with nothing to save
+        // still has to leave a mark - without it a start-up crash is
+        // indistinguishable from a silent exit, which is exactly what the
+        // truncated-font crash looked like from the outside (exit 139, no
+        // output at all).
+        //
+        // Built by hand rather than with snprintf: a signal handler may be
+        // running on a corrupted heap, and only write() is safe here.
+        {
+            char line[64];
+            int n = 0;
+            for (const char* q = "\nviewer: crashed on signal "; *q; q++) line[n++] = *q;
+            int v = sig < 0 ? 0 : sig;
+            char d[8]; int dn = 0;
+            if (v == 0) d[dn++] = '0';
+            while (v > 0) { d[dn++] = (char)('0' + v % 10); v /= 10; }
+            while (dn > 0) line[n++] = d[--dn];
+            line[n++] = '\n';
+#if defined(_WIN32)
+            _write(2, line, (unsigned)n);
+#else
+            ssize_t ign0 = write(2, line, (size_t)n); (void)ign0;
+#endif
+        }
         if (g_crashFd >= 0 && !g_crashText.empty()) {
             const char* p = g_crashText.data();
             size_t n = g_crashText.size();

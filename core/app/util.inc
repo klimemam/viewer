@@ -23,6 +23,10 @@ struct FontChoice {
     std::string path;                    // "" = nothing was found
     const char* how = "none";            // who decided: the override, the list, fontconfig
     std::vector<std::string> tried;      // in order, including the override
+    // At least one path was passed over because the breadcrumb said the last
+    // start died baking it. The user has to be told: their setting is being
+    // ignored, and only they can decide whether to fix or remove it.
+    bool skippedAfterCrash = false;
 };
 // The override, as settings.jsonc / prefs.txt left it. Declared here rather
 // than in settings.inc (where g_settingsEditorCmd and g_settingsRepoUrl live)
@@ -132,19 +136,142 @@ static std::string fcMatchJpFont() {
 // So the signature is checked. Four bytes, which is all an sfnt wrapper needs
 // to identify itself. This does NOT prove the font can be parsed - see the
 // Build() check in fontAtlasBake(), which is the other half of the same hole.
-static bool looksLikeSfnt(const std::string& p) {
-    std::ifstream f(pathFromUtf8(p), std::ios::binary);
-    if (!f) return false;
-    unsigned char b[4] = { 0, 0, 0, 0 };
-    f.read((char*)b, 4);
-    if (f.gcount() != 4) return false;
-    const uint32_t tag = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-                         ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+// THE SIGNATURE WAS NOT ENOUGH, measured. A file holding the FIRST 4096 BYTES
+// of a real meiryo.ttc has a correct signature, a correct collection header and
+// a correct table directory - and every table it names points past the end of
+// the file. stb_truetype follows those offsets, and `viewer --no-window` exits
+// 139 with nothing printed. That is not a contrived input: an interrupted
+// download, a half-finished copy and a partial read off a network drive all
+// produce exactly it, and because `appearance.fontPath` PERSISTS, the machine
+// then fails to start again at every subsequent launch.
+//
+// So the directory is walked. Everything here is cheap - one file size and at
+// most a few kilobytes of header - and every check is a bound, not a parse:
+// the goal is to refuse what would make stb_truetype read outside the file.
+//
+// THIS DOES NOT MAKE stb_truetype SAFE, and it cannot: past the directory it
+// goes on to follow offsets inside cmap subtables and inside loca/glyf. Each
+// check narrows the hole; none closes it. What closes it is the breadcrumb in
+// session.inc - "if the last start died while baking this file, do not bake it
+// again" - which is the only mechanism that survives a crash we did not predict.
+namespace sfnt {
+inline uint16_t be16(const unsigned char* p) {
+    return (uint16_t)(((uint32_t)p[0] << 8) | (uint32_t)p[1]);
+}
+inline uint32_t be32(const unsigned char* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+inline bool isWrapperTag(uint32_t tag) {
     return tag == 0x00010000u ||     // TrueType outlines
            tag == 0x74727565u ||     // 'true' - Apple's TrueType
            tag == 0x4F54544Fu ||     // 'OTTO' - CFF outlines
-           tag == 0x74746366u ||     // 'ttcf' - a TrueType collection (.ttc)
            tag == 0x74797031u;       // 'typ1' - a Type 1 housed in an sfnt
+}
+// One font's table directory, at `off` inside a file of `size` bytes.
+inline bool directoryOk(std::ifstream& f, uint64_t off, uint64_t size,
+                        std::string& why) {
+    unsigned char h[12];
+    f.clear();
+    f.seekg((std::streamoff)off, std::ios::beg);
+    f.read((char*)h, 12);
+    if (f.gcount() != 12) { why = "the table directory is past the end of the file"; return false; }
+    if (!isWrapperTag(be32(h))) { why = "a font inside it has no sfnt signature"; return false; }
+    const uint32_t numTables = be16(h + 4);
+    if (numTables == 0) { why = "it declares no tables at all"; return false; }
+    if (off + 12 + 16ull * numTables > size) {
+        why = "its table directory (" + std::to_string(numTables) +
+              " entries) does not fit in the file";
+        return false;
+    }
+    std::vector<unsigned char> dir((size_t)16 * numTables);
+    f.read((char*)dir.data(), (std::streamsize)dir.size());
+    if ((size_t)f.gcount() != dir.size()) { why = "the table directory is truncated"; return false; }
+    bool haveCmap = false, haveHead = false, haveHhea = false, haveHmtx = false;
+    bool haveGlyf = false, haveLoca = false, haveCff = false;
+    for (uint32_t k = 0; k < numTables; k++) {
+        const unsigned char* r = dir.data() + (size_t)16 * k;
+        const uint32_t tag = be32(r);
+        // uint64 on purpose: offset and length are each uint32 and their sum
+        // overflows in 32 bits, which is how a crafted or corrupt file slips a
+        // bounds check that adds them in the wrong type.
+        const uint64_t tOff = be32(r + 8), tLen = be32(r + 12);
+        if (tOff + tLen > size) {
+            char t[5] = { (char)r[0], (char)r[1], (char)r[2], (char)r[3], 0 };
+            for (int i = 0; i < 4; i++) if (t[i] < 0x20 || t[i] > 0x7E) t[i] = '?';
+            why = std::string("its '") + t + "' table points outside the file "
+                  "(the file is truncated)";
+            return false;
+        }
+        switch (tag) {
+            case 0x636D6170u: haveCmap = true; break;   // cmap
+            case 0x68656164u: haveHead = true; break;   // head
+            case 0x68686561u: haveHhea = true; break;   // hhea
+            case 0x686D7478u: haveHmtx = true; break;   // hmtx
+            case 0x676C7966u: haveGlyf = true; break;   // glyf
+            case 0x6C6F6361u: haveLoca = true; break;   // loca
+            case 0x43464620u: haveCff  = true; break;   // 'CFF '
+            default: break;
+        }
+    }
+    // Exactly what stbtt_InitFont requires, in its own order - so "this build
+    // cannot interpret it" is decided HERE, with a name, instead of by an
+    // assert that release builds compile out. CFF2 lands on the last line:
+    // its outlines are in a `CFF2` table, so neither glyf nor 'CFF ' is found.
+    if (!haveCmap || !haveHead || !haveHhea || !haveHmtx) {
+        why = "it is missing a table this build needs (cmap/head/hhea/hmtx)";
+        return false;
+    }
+    if (haveGlyf && !haveLoca) { why = "it has glyf but no loca"; return false; }
+    if (!haveGlyf && !haveCff) {
+        why = "its outlines are in a format this build cannot read (no glyf and "
+              "no 'CFF ' - a CFF2 variable font looks like this)";
+        return false;
+    }
+    return true;
+}
+}  // namespace sfnt
+
+static bool sfntLooksSane(const std::string& p, std::string& why) {
+    why.clear();
+    std::ifstream f(pathFromUtf8(p), std::ios::binary | std::ios::ate);
+    if (!f) { why = "it could not be opened"; return false; }
+    const std::streamoff end = f.tellg();
+    if (end < 12) { why = "it is too small to be a font"; return false; }
+    const uint64_t size = (uint64_t)end;
+    unsigned char h[12];
+    f.seekg(0, std::ios::beg);
+    f.read((char*)h, 12);
+    if (f.gcount() != 12) { why = "it could not be read"; return false; }
+    const uint32_t tag = sfnt::be32(h);
+    if (tag == 0x74746366u) {          // 'ttcf' - a collection of fonts
+        const uint32_t numFonts = sfnt::be32(h + 8);
+        if (numFonts == 0) { why = "it is a font collection holding no fonts"; return false; }
+        if (12 + 4ull * numFonts > size) {
+            why = "its collection header (" + std::to_string(numFonts) +
+                  " fonts) does not fit in the file";
+            return false;
+        }
+        std::vector<unsigned char> offs((size_t)4 * numFonts);
+        f.read((char*)offs.data(), (std::streamsize)offs.size());
+        if ((size_t)f.gcount() != offs.size()) { why = "its collection header is truncated"; return false; }
+        // Only the FIRST font is baked (ImFontConfig::FontNo defaults to 0), but
+        // all of them are checked: stb_truetype is handed the whole buffer and
+        // a collection whose other members are broken is a broken file.
+        for (uint32_t k = 0; k < numFonts; k++) {
+            const uint64_t off = sfnt::be32(offs.data() + (size_t)4 * k);
+            if (off + 12 > size) { why = "one of its fonts starts past the end of the file"; return false; }
+            if (!sfnt::directoryOk(f, off, size, why)) return false;
+        }
+        return true;
+    }
+    if (!sfnt::isWrapperTag(tag)) { why = "it has no sfnt signature"; return false; }
+    return sfnt::directoryOk(f, 0, size, why);
+}
+// The old name, kept for the one caller that only wants a yes/no.
+static bool looksLikeSfnt(const std::string& p) {
+    std::string why;
+    return sfntLooksSane(p, why);
 }
 
 // `want` is the user's override (appearance.fontPath / prefs.txt `fontPath`),
@@ -154,19 +281,31 @@ static bool looksLikeSfnt(const std::string& p) {
 // four paths the user never mentioned - and a path that is there but is not a
 // font says THAT, which is a different sentence and a different mistake.
 static std::vector<std::string> cjkMergeCandidates();   // fwd: the Chinese faces
-static FontChoice jpFontChoice(const std::string& want) {
+// `skip` is the breadcrumb's list: paths the LAST start died while baking, so
+// this start must not bake them again whatever else recommends them. Empty in
+// the ordinary case. See fontBakeCrumb* in session.inc for why this exists.
+static FontChoice jpFontChoice(const std::string& want,
+                               const std::vector<std::string>& skip = {}) {
     FontChoice c;
     std::error_code ec;
-    // Each attempt records WHY it failed, because "not found" and "found, not a
-    // font" send the user to two different places.
+    // Each attempt records WHY it failed, because "not found", "found, not a
+    // font", "found, truncated" and "found, a format we cannot read" send the
+    // user to four different places.
     auto tryPath = [&](const std::string& p, const char* how) {
         if (p.empty()) return false;
+        if (std::find(skip.begin(), skip.end(), p) != skip.end()) {
+            c.tried.push_back(p + " (skipped: the last start did not survive "
+                                  "baking it)");
+            c.skippedAfterCrash = true;
+            return false;
+        }
         if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) {
             c.tried.push_back(p);
             return false;
         }
-        if (!looksLikeSfnt(p)) {
-            c.tried.push_back(p + " (exists, but is not a font: no sfnt signature)");
+        std::string why;
+        if (!sfntLooksSane(p, why)) {
+            c.tried.push_back(p + " (unusable: " + why + ")");
             return false;
         }
         c.tried.push_back(p);
@@ -187,10 +326,20 @@ static FontChoice jpFontChoice(const std::string& want) {
     // (cjkFontChineseFallbackText, raised at start-up).
     for (const std::string& p : cjkMergeCandidates())
         if (tryPath(p, "Chinese face (no Japanese face on this machine)")) return c;
+    // ...and fontconfig's answer goes through THE SAME GATE. It used to assign
+    // c.path directly, which left the hole this whole change is about wide open
+    // on the one arm that Linux and macOS actually reach: fc-match returns a
+    // file that EXISTS, and says nothing about whether it is intact. A machine
+    // with a half-copied font installed, or a stale fontconfig cache pointing
+    // at a file that has since been replaced, would hand it straight to
+    // stb_truetype. There is ONE gate, and every arm goes through it.
     if (std::string fc = fcMatchJpFont(); !fc.empty()) {
-        c.tried.push_back("fc-match sans:lang=ja -> " + fc);
-        c.path = fc; c.how = "fc-match";
-        return c;
+        if (tryPath(fc, "fc-match")) {
+            // Keep fontconfig's name for it in the record as well, so a reader
+            // can tell "the list found this" from "fontconfig chose this".
+            c.tried.back() = "fc-match sans:lang=ja -> " + fc;
+            return c;
+        }
     }
 #if !defined(_WIN32)
     c.tried.push_back("fc-match sans:lang=ja (no answer)");
@@ -564,7 +713,34 @@ static bool fontAtlasHasCjk() {
     return a->Fonts[0]->FindGlyphNoFallback((ImWchar)0x3042) != nullptr;
 }
 
-static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale) {
+// WHAT IS ACTUALLY IN THE ATLAS, as the summary line says it (review P2).
+// Pure, and named, because it is the one sentence a bug report is most likely
+// to quote and it used to be wrong in the case that matters: after a failed
+// build the atlas is made entirely of the BUILT-IN font, and the line still
+// ended "from <path> [appearance.fontPath]" - so a reader who saw only this
+// line concluded that file was in use. The failed file is still named, as the
+// file that failed. It is the same mistake the merge path already avoided, and
+// it needs the same answer.
+static std::string fontAtlasFromText(const FontAtlasCost& c, const FontChoice& ch,
+                                     const std::string& mergePath) {
+    if (c.buildFailed) {
+        std::string s = "(built-in font)";
+        if (!ch.path.empty()) s += " after failing to read " + ch.path;
+        return s;
+    }
+    if (ch.path.empty()) return "(built-in font)";
+    std::string s = ch.path + " [" + ch.how + "]";
+    if (!mergePath.empty()) s += " + " + mergePath;
+    return s;
+}
+
+// `fontLoadFailed` = the chosen file did not even LOAD (AddFontFromFileTTF
+// returned null), so the caller has already put the built-in font in its place.
+// It is reported through the same field as a failed Build, because from the
+// user's side the two are one fact: the font they asked for is not the one on
+// screen (review P2).
+static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale,
+                          bool fontLoadFailed = false) {
     ImFontAtlas* a = ImGui::GetIO().Fonts;
     FontAtlasCost c;
     c.fontScale = fontScale;
@@ -593,7 +769,7 @@ static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale) {
     // user can use to fix this. The font that failed is NAMED: see
     // cjkFontUnreadableText(), which is what start-up puts on screen.
     const bool built = a->Build();
-    c.buildFailed = !built;
+    c.buildFailed = !built || fontLoadFailed;
     if (!built) {
         fprintf(stderr, "font atlas: FAILED to build from %s - falling back to "
                         "the built-in font (no CJK)\n",
@@ -621,16 +797,23 @@ static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale) {
     // ...and WHICH FONT, on the same line (review P3-7). The merge has exactly
     // one silent failure mode - the wrong face first - and this is the only
     // place a log from a user's machine could ever show which files were in it.
+    //
+    // NAMING WHAT WAS ACTUALLY BAKED (review P2). When the build failed, this
+    // line used to end "from <path> [appearance.fontPath]" for an atlas made
+    // entirely out of the built-in font - so a reader who saw only this line
+    // concluded that file was in use. It is the same mistake the merge path
+    // already avoided two paragraphs up, and it needs the same answer: say
+    // what is in the atlas, and name the file that failed as the file that
+    // failed. `c.buildFailed` also covers the case where the font could not be
+    // LOADED at all (AddFontFromFileTTF returned null), because main() records
+    // that through the same field.
+    const std::string from = fontAtlasFromText(c, g_fontChoice, g_fontMergePath);
     fprintf(stderr, "font atlas: %d glyph(s) of %d requested codepoint(s), "
                     "%dx%d px (%.1f MB RGBA), %d face(s), built in %.0f ms "
-                    "(font scale %.2f, kana %s) from %s [%s]%s%s\n",
+                    "(font scale %.2f, kana %s) from %s\n",
             c.bakedGlyphs, c.wantedCodepoints, c.texW, c.texH,
             c.texW * (double)c.texH * 4.0 / 1048576.0, c.faces, c.buildMs,
-            fontScale, fontAtlasHasCjk() ? "present" : "MISSING",
-            g_fontChoice.path.empty() ? "(built-in font)" : g_fontChoice.path.c_str(),
-            g_fontChoice.how,
-            g_fontMergePath.empty() ? "" : " + ",
-            g_fontMergePath.empty() ? "" : g_fontMergePath.c_str());
+            fontScale, fontAtlasHasCjk() ? "present" : "MISSING", from.c_str());
 }
 
 // The refusal, with the paths in it (板306 C). "CJK font not found" was the
@@ -675,6 +858,36 @@ static std::string cjkFontUnreadableText(const FontChoice& c) {
            "only Latin text will draw. Point \"appearance.fontPath\" in "
            "settings.jsonc (or `fontPath` in prefs.txt) at a .ttc/.ttf and "
            "restart.";
+}
+
+// ...and the FIFTH (review P1-A layer 2): the last start did not survive baking
+// this file, so this start did not try it. The whole value of the sentence is
+// the last clause - the way OUT - because the user's own setting is what is
+// being overruled and only they can decide what to do about it.
+static std::string cjkFontCrashSkipText(const FontChoice& c) {
+    // Deduplicated: one path can be reached twice in a single search - as the
+    // override and again as a built-in candidate - and naming the same file
+    // twice in one sentence reads like two different problems.
+    std::vector<std::string> names;
+    for (const std::string& t : c.tried) {
+        if (t.find("(skipped: the last start did not survive baking it)") ==
+            std::string::npos) continue;
+        const std::string one = t.substr(0, t.find(" (skipped:"));
+        if (std::find(names.begin(), names.end(), one) == names.end())
+            names.push_back(one);
+    }
+    std::string skipped;
+    for (const std::string& n : names) {
+        if (!skipped.empty()) skipped += "; ";
+        skipped += n;
+    }
+    return "the last start did not survive reading this font, so it was NOT "
+           "used this time: " + (skipped.empty() ? std::string("(unknown)") : skipped) +
+           ". This start is using " +
+           (c.path.empty() ? std::string("the built-in font") : c.path) +
+           " instead. To fix it, point \"appearance.fontPath\" in settings.jsonc "
+           "(or `fontPath` in prefs.txt) at a different file, or delete that "
+           "line to go back to the built-in search.";
 }
 
 // ...and the sentence for a machine with NO Japanese face, where a Chinese one
