@@ -3524,14 +3524,66 @@ static void handleReaderRun(Buf& in) {
     // a contender that timed out or whose Python raised deleted the file a
     // DIFFERENT session had just published, and that session's next open then
     // re-ran a reader that had already succeeded.
+    //
+    // DROPPED BEFORE THE REPLY, not on the way out of this function. That is
+    // the rule the reader DIRECTORY below already follows, in those words: "a
+    // destructor that runs after the bytes are on the wire makes that a race it
+    // can lose". The temp was the half of it nobody moved, so the answer went
+    // out while this process's `.part` was still on the disk - and a client
+    // that looks at the cache directory the moment its answer lands (which is
+    // the only moment it has) can see a temp that belongs to a run that is
+    // already over. PR #278's selftest.rreader caught exactly that on macOS,
+    // twice, with the file named and still present 60 s later.
+    //
+    // The destructor stays as the BACKSTOP for a path nobody thought of, which
+    // is what it was always good for. What it is no longer is the only thing
+    // standing between an answer and a clean directory.
+    //
+    // ...and a removal that FAILS now says so on this peer's stderr. It used to
+    // discard the error_code, so "the file is gone" and "the file could not be
+    // removed and nobody looked" produced the same silence - and that silence
+    // is the second reason the leak took two review rounds to name.
     struct TempFile {
         std::string p;
         bool keep = false;
-        ~TempFile() {
-            if (keep || p.empty()) return;
+        bool dropped = false;
+        // `where` is the call site, so the trace says whether a named exit did
+        // the dropping or whether the destructor had to catch it. "backstop"
+        // in a log means a path was missed and this struct saved it - which is
+        // a finding, not a comfort.
+        void drop(const char* where) {
+            if (keep || dropped || p.empty()) return;
+            dropped = true;
+            std::error_code be;
+            const bool was = std::filesystem::exists(std::filesystem::u8path(p), be);
             std::error_code e;
             std::filesystem::remove(std::filesystem::u8path(p), e);
+            std::error_code ae;
+            const bool still = std::filesystem::exists(std::filesystem::u8path(p), ae);
+            // WHAT THE THREE CASES MEAN, because this is the trace that decides
+            // where a leak lives:
+            //   an error            the unlink was attempted and refused. The
+            //                       reason is the answer.
+            //   gone -> still there the unlink returned success and the name is
+            //                       still resolvable. That is the filesystem or
+            //                       another writer, not this code.
+            //   was there -> gone   the ordinary success, traced anyway: it is
+            //                       the proof that this path RAN, which is the
+            //                       one thing a silent success cannot give.
+            // Nothing is said when the temp never existed - that is every exit
+            // before python wrote anything (a cache hit, a lock not taken), and
+            // narrating those would bury the three lines above.
+            if (e)
+                fprintf(stderr, "viewer-serve: reader temp %s could not be removed "
+                                "(%s): %s\n", p.c_str(), where, e.message().c_str());
+            else if (was && still)
+                fprintf(stderr, "viewer-serve: reader temp %s removed WITHOUT ERROR "
+                                "and is still there (%s)\n", p.c_str(), where);
+            else if (was)
+                fprintf(stderr, "viewer-serve: reader temp %s dropped (%s)\n",
+                        p.c_str(), where);
         }
+        ~TempFile() { drop("backstop"); }
     } temp{ tmpPath };
 
     // The cache answer, and the ONE sentence that says exactly what did and did
@@ -3547,6 +3599,14 @@ static void handleReaderRun(Buf& in) {
     auto refuseOldClientAxes = [&](const std::string& path) {
         const std::string why = readerAxesForClientError(path);
         if (why.empty()) return false;
+        // A refusal is an answer, and the same rule binds it: the verdict is
+        // read out of `path` first, this run's temp goes second, the bytes go
+        // last. Dropping at the CALL SITE could not do this - the answer is
+        // sent in here, so a drop after the call returns is already too late.
+        // `path` is only read above, so the drop cannot pull it away: when
+        // `path` IS the temp the read is done, and when it is the cache file
+        // the temp is not the subject at all.
+        temp.drop("axes refused");
         reply(RO_UNREADABLE, why, "", prov, "", "");
         return true;
     };
@@ -3639,10 +3699,12 @@ static void handleReaderRun(Buf& in) {
     // `temp` then removes. None of them touches `cachePath`: this run never
     // published anything, so there is nothing of its own there to withdraw.
     if (!r.started) {
+        temp.drop("not started");
         reply(RO_NOT_STARTED, r.fail, r.err, prov, "", "");
         return;
     }
     if (r.timedOut) {
+        temp.drop("timed out");
         reply(RO_TIMED_OUT, adapter::showCommand(argv), r.err, prov, "", "");
         return;
     }
@@ -3651,6 +3713,7 @@ static void handleReaderRun(Buf& in) {
         // client's own file's, because the file is the one the client sent -
         // which is what carrying the reader buys that a peer-side copy could
         // never promise.
+        temp.drop("reader raised");
         reply(RO_EXITED, "the reader exited with status " + std::to_string(r.exit),
               r.err, prov, "", "");
         return;
@@ -3663,13 +3726,15 @@ static void handleReaderRun(Buf& in) {
     std::string header;
     const std::string cerr = checkReaderOutput(tmpPath, header);
     if (!cerr.empty()) {
+        temp.drop("output unreadable");
         reply(RO_UNREADABLE, cerr, r.err, prov, "", "");
         return;
     }
-    if (refuseOldClientAxes(tmpPath)) return;
+    if (refuseOldClientAxes(tmpPath)) return;   // drops the temp before it answers
     ReaderKeyLock publishLock;
     std::string lockWhy;
     if (!publishLock.acquire(key, lockWhy)) {
+        temp.drop("no publish lock");
         sendErr(lockWhy);
         return;
     }
@@ -3677,6 +3742,9 @@ static void handleReaderRun(Buf& in) {
     if (std::filesystem::exists(std::filesystem::u8path(cachePath), ec)) {
         std::string winnerHeader;
         if (checkReaderOutput(cachePath, winnerHeader).empty()) {
+            // This producer publishes nothing: the canonical it found stands,
+            // and its own temp is finished with either way.
+            temp.drop("another published first");
             if (refuseOldClientAxes(cachePath)) return;
             reply(RO_OK, "",
                   r.err.empty() ? std::string("another session published this key first.")
@@ -3689,6 +3757,7 @@ static void handleReaderRun(Buf& in) {
         // same exclusion as every current producer's publish.
         std::error_code de;
         if (!std::filesystem::remove(std::filesystem::u8path(cachePath), de) || de) {
+            temp.drop("cache entry stuck");
             reply(RO_UNREADABLE,
                   "the reader ran, but an unusable cache entry could not be removed: " +
                       de.message(),
@@ -3709,6 +3778,9 @@ static void handleReaderRun(Buf& in) {
     // it answers this key and our own temp remains ours to remove.
     std::string wheader;
     const std::string werr = checkReaderOutput(cachePath, wheader);
+    // The rename did not happen, so the temp is still this process's to remove
+    // - and both answers below go out with it already gone.
+    temp.drop("rename failed");
     if (werr.empty()) {
         if (refuseOldClientAxes(cachePath)) return;
         reply(RO_OK, "",
