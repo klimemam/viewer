@@ -927,11 +927,19 @@ static int roiStatsSelftest() {
     bool wBoth = false;      // Active and DeactivatedAfterEdit in ONE frame
     bool wDrop = false;      // ...and a number commit dropped as another ROI's
     bool wNameDrop = false;  // ...and a name commit dropped the same way
+    // The box's own contents on the frame a commit landed. Every claim about a
+    // typed value is made against THIS and never against the characters the
+    // test pushed: where a click leaves the caret is a function of the glyph
+    // widths and the UI scale, so "what I typed is the whole field" is a
+    // property of the machine, while "what the field held reached this
+    // annotation" is the contract.
+    RoiEditProbe wAt;
     auto wStep = [&]() {
         roiFrame();
         if (g_roiEditProbe.act && g_roiEditProbe.done) wBoth = true;
         if (g_roiEditProbe.dropped) wDrop = true;
         if (g_roiEditProbe.nameDropped) wNameDrop = true;
+        if (g_roiEditProbe.done || g_roiEditProbe.nameDone) wAt = g_roiEditProbe;
     };
     auto wSettle = [&]() { for (int f = 0; f < 4; f++) wStep(); };
     auto wClick = [&](float x, float y) {
@@ -939,13 +947,15 @@ static int roiStatsSelftest() {
         inj.down = true;                                         wStep();
         inj.down = false;                                        wStep();
     };
-    // ctrl = hold Ctrl over the key, which is how a text field is selected
-    // all before typing over it (a click alone only places the caret).
-    auto wKey = [&](ImGuiKey k, bool ctrl = false) {
-        if (ctrl) { inj.mod = true;  wStep(); }
+    // No modifier chords. Select-all is Ctrl+A on two platforms and Cmd+A on
+    // the third (ImGuiMod_Ctrl is remapped - imgui.h:1601), and a test that
+    // needs a chord to be meaningful is a test asserting the caret. The
+    // modifier is still RE-STATED as released on every frame, for the mouse
+    // position's reason: with a window, a key the person is holding is fed by
+    // the backend and would otherwise reach the field.
+    auto wKey = [&](ImGuiKey k) {
         inj.key = k; inj.keyDown = true;   wStep();
         inj.key = k; inj.keyDown = false;  wStep();
-        if (ctrl) { inj.mod = false; wStep(); }
     };
     auto wType = [&](const char* t) {
         inj.chars = t;
@@ -978,31 +988,48 @@ static int roiStatsSelftest() {
     {
         const App::Ann* a = findAnn(eRoi);
         check(a->w == 100 && a->x == 400,
-              "W12 ...the 500 is refused, so w is still 100");
-        check(app.toast.find("500x100 @400,300 would be outside this frame (640x480)")
-                  != std::string::npos,
-              "W12 ...and the refusal names the rectangle it would have written");
+              "W12 ...the refused w is not written: w is still 100");
+        // the rectangle the refusal names is the one the BOX held, whatever the
+        // caret did with the characters - and it is not the ROI's own, or
+        // nothing was typed at all
+        char wWant[96];
+        snprintf(wWant, sizeof wWant, "%dx%d @%d,%d would be outside this frame (640x480)",
+                 wAt.buf[2], wAt.buf[3], wAt.buf[0], wAt.buf[1]);
+        fprintf(stderr, "roistatsselftest: W12 box at commit %d %d %d %d\n",
+                wAt.buf[0], wAt.buf[1], wAt.buf[2], wAt.buf[3]);
+        check(wAt.buf[2] != 100 && wAt.buf[0] + wAt.buf[2] > cur()->w,
+              "W12 ...something was typed, and what the box held does not fit");
+        check(app.toast.find(wWant) != std::string::npos,
+              "W12 ...and the refusal names the rectangle the box held");
         wSaid.push_back(app.toast);
         // The commit is this frame; the box is re-seeded on the NEXT one, which
         // is the frame the user sees. Measured: on the commit frame the buffer
         // still reads 500 (it is what was just refused).
-        check(g_roiEditProbe.buf[2] == 500,
-              "W12 ...the refused number is still in the buffer on the commit frame");
+        check(g_roiEditProbe.buf[2] != 100,
+              "W12 ...the box is NOT re-seeded on the commit frame, only after it");
         wStep();
         check(g_roiEditProbe.buf[2] == 100 && g_roiEditProbe.buf[3] == 100,
               "W12 ...and the next frame puts the ROI's own numbers back in the boxes");
     }
     app.toast.clear();
+    const int wRefusedW = wAt.buf[2];                     // what was just refused
+    wAt = RoiEditProbe();
     wType("50");                                          // h, still focused
     wKey(ImGuiKey_Enter);
     {
         const App::Ann* a = findAnn(eRoi);
-        fprintf(stderr, "roistatsselftest: W12 after h=50: %dx%d @%d,%d toast [%s]\n",
-                a->w, a->h, a->x, a->y, app.toast.c_str());
-        check(a->x == 400 && a->y == 300 && a->w == 100 && a->h == 50,
-              "W12 the NEXT edit writes its own component - h only");
-        check(app.toast.find("500") == std::string::npos,
-              "W12 ...and the refused 500 is not re-offered as this edit");
+        fprintf(stderr, "roistatsselftest: W12 after the h edit: %dx%d @%d,%d  box %d %d "
+                        "%d %d  toast [%s]\n", a->w, a->h, a->x, a->y, wAt.buf[0],
+                wAt.buf[1], wAt.buf[2], wAt.buf[3], app.toast.c_str());
+        check(wAt.buf[3] != 100, "W12 the next edit really put something in the h box");
+        check(wAt.buf[2] == 100,
+              "W12 ...and the w box is the ROI's own again, not the refused number");
+        check(a->h == wAt.buf[3] && a->x == 400 && a->y == 300 && a->w == 100,
+              "W12 ...so the commit writes h, from the box, and nothing else");
+        char wNo[32];
+        snprintf(wNo, sizeof wNo, "%d", wRefusedW);
+        check(app.toast.find(wNo) == std::string::npos,
+              "W12 ...and the refused number is not re-offered as this edit");
     }
 
     // ---- W13: a commit must not land on whichever ROI is selected now ----
@@ -1172,28 +1199,40 @@ static int roiStatsSelftest() {
     check(nMax.x > nMin.x && nMax.y > nMin.y && g_roiEditProbe.nameFor == nRoiA,
           "W16 the name field is on screen and seeded from the selected ROI");
     const float nY = (nMin.y + nMax.y) * 0.5f;
-    // a name that commits normally: click in, select all, type, Enter
+    // A name that commits normally. Where the click leaves the caret is the
+    // platform's business - a plain InputText has no AutoSelectAll, so "dark"
+    // may land in front of "ROI 1" or inside it - and it is not what is being
+    // asserted: the box's contents, whatever they came out as, must reach THIS
+    // ROI and no other.
+    const std::string nWas = findAnn(nRoiA)->label;
+    wAt = RoiEditProbe();
     wClick(nMin.x + 4.0f, nY);
-    wKey(ImGuiKey_A, true);                               // Ctrl+A: select all
     wType("dark");
     wKey(ImGuiKey_Enter);
-    fprintf(stderr, "roistatsselftest: W16 A label [%s]  B label [%s]\n",
-            findAnn(nRoiA)->label.c_str(), findAnn(nRoiB)->label.c_str());
-    check(findAnn(nRoiA)->label == "dark", "W16 a committed name lands on its own ROI");
-    check(findAnn(nRoiB)->label == "ROI 2", "W16 ...and only on that one");
+    fprintf(stderr, "roistatsselftest: W16 box at commit [%s]  A [%s]  B [%s]\n",
+            wAt.name, findAnn(nRoiA)->label.c_str(), findAnn(nRoiB)->label.c_str());
+    check(std::string(wAt.name) != nWas && std::string(wAt.name).find("dark") !=
+              std::string::npos,
+          "W16 the typed characters really reached the box");
+    check(findAnn(nRoiA)->label == wAt.name,
+          "W16 ...and what the box held is the name its own ROI now has");
+    check(findAnn(nRoiB)->label == "ROI 2", "W16 ...while the other ROI is untouched");
     // ...and one that does NOT commit, with the selection moving first
-    wDrop = false;
+    const std::string nKept = findAnn(nRoiA)->label;
+    wNameDrop = false;
+    wAt = RoiEditProbe();
     wClick(nMin.x + 4.0f, nY);
-    wKey(ImGuiKey_A, true);
     wType("bright");
     app.selectedAnn = nRoiB;                              // the canvas' press
     wKey(ImGuiKey_Enter);
-    fprintf(stderr, "roistatsselftest: W16 after the selection moved: A [%s]  B [%s]  "
-                    "nameDropped=%d\n", findAnn(nRoiA)->label.c_str(),
+    fprintf(stderr, "roistatsselftest: W16 after the selection moved: box [%s]  A [%s]  "
+                    "B [%s]  nameDropped=%d\n", wAt.name, findAnn(nRoiA)->label.c_str(),
             findAnn(nRoiB)->label.c_str(), (int)wNameDrop);
+    check(std::string(wAt.name).find("bright") != std::string::npos,
+          "W16 the second name really reached the box too");
     check(findAnn(nRoiB)->label == "ROI 2",
-          "W16 a name typed for A is NOT written to B");
-    check(findAnn(nRoiA)->label == "dark",
+          "W16 ...a name typed for A is NOT written to B");
+    check(findAnn(nRoiA)->label == nKept,
           "W16 ...and A keeps the name it had: an uncommitted edit is dropped");
     check(wNameDrop, "W16 ...and the drop is what stopped it, not a missing commit");
 
@@ -1215,19 +1254,21 @@ static int roiStatsSelftest() {
           g_roiEditProbe.buf[0] == 100 && g_roiEditProbe.buf[1] == 200,
           "W17 the pin's two fields are on screen, seeded from the pin");
     const float pY = (pMin.y + pMax.y) * 0.5f;
+    wAt = RoiEditProbe();
     wClick(pMin.x + 4.0f, pY);                            // into x
-    wKey(ImGuiKey_A, true);
-    wType("101");                                         // x + 1, y untouched
+    wType("101");                                         // ...y untouched
     wKey(ImGuiKey_Enter);
     {
         const App::Ann* a = findAnn(pA);
-        fprintf(stderr, "roistatsselftest: W17 pin @%d,%d\n", a->x, a->y);
-        check(a->x == 101, "W17 the pin's x takes the number typed into it");
-        check(a->y == 200, "W17 ...and y, which was not edited, does not move");
+        fprintf(stderr, "roistatsselftest: W17 box at commit %d %d  pin @%d,%d\n",
+                wAt.buf[0], wAt.buf[1], a->x, a->y);
+        check(wAt.buf[0] != 100, "W17 something was typed into the pin's x box");
+        check(a->x == wAt.buf[0], "W17 ...and the pin's x is what that box held");
+        check(a->y == 200, "W17 ...while y, which was not edited, does not move");
     }
     wDrop = false;
+    wAt = RoiEditProbe();
     wClick(pMin.x + 4.0f, pY);
-    wKey(ImGuiKey_A, true);
     wType("7");
     app.selectedAnn = pB;                                 // ...and the selection moves
     wKey(ImGuiKey_Enter);

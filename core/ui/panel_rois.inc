@@ -356,7 +356,7 @@ struct RoiEditProbe {
     // (core/ui/panel_analysis.inc), so a name written onto the wrong
     // annotation puts another region's numbers under this one's heading.
     ImVec2 nameMin = ImVec2(-1, -1), nameMax = ImVec2(-1, -1);
-    bool nameHeld = false, nameDropped = false;
+    bool nameHeld = false, nameDone = false, nameDropped = false;
     int nameFor = 0;
     char name[128] = { 0 };
 };
@@ -1089,6 +1089,7 @@ static void drawPanelRois() {
         if (g_roiRowProbeOn) {
             g_roiEditProbe.nameMin = nameMin; g_roiEditProbe.nameMax = nameMax;
             g_roiEditProbe.nameHeld = nameHeld;
+            g_roiEditProbe.nameDone = nameDone;
             g_roiEditProbe.nameDropped = nameDone && nameMoved;
             g_roiEditProbe.nameFor = nameFor;
             snprintf(g_roiEditProbe.name, sizeof g_roiEditProbe.name, "%s", nameBuf);
