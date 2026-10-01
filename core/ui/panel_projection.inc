@@ -65,6 +65,12 @@ static std::string g_projNoCurveProbe;
 // Both were sentences standing on A alone.
 static std::string g_projFootProbe;
 static std::string g_projXAxisProbe;
+// ...and the off-plot slot notice, which carries the same two clauses the
+// per-plot one does ("their numbers are below", "pick ONE plane above") and had
+// no gate on either, and the dimensions line, whose "(ROI)" was A's answer for
+// every side's row.
+static std::string g_projOffProbe;
+static std::string g_projDimsProbe;
 
 // Does series `s` carry a sample at profile index `i` AT ALL? The mosaic's
 // answer, not the data's: for a Bayer plane every other index is a position the
@@ -177,6 +183,29 @@ struct ProjSide {
     ImU32 ink = 0;
 };
 
+// The region EVERY side was measured over, as the TSV header says it. A
+// function because it is the one sentence in this panel that is both exported
+// and unreachable from a selftest - the clipboard is built inside a button -
+// and because `roiUsed` is per side: recomputeProjectionIfNeeded clamps the
+// selected rectangle into each side's own frame and drops it when the clamp
+// leaves nothing, so a side the ROI falls outside of is measured over its whole
+// image while A is not. One sentence naming A's region labelled every other
+// side's rows with a region they were not measured over.
+static std::string projRegionSaid(const std::vector<ProjSide>& sides) {
+    std::string out;
+    for (const ProjSide& sd : sides) {
+        char r[128];
+        if (sd.S->roiUsed)
+            snprintf(r, sizeof r, "; %s ROI (%d,%d) %dx%d", sd.name.c_str(),
+                     sd.S->rx, sd.S->ry, sd.S->rw, sd.S->rh);
+        else
+            snprintf(r, sizeof r, "; %s whole image %dx%d", sd.name.c_str(),
+                     sd.S->rw, sd.S->rh);
+        out += r;
+    }
+    return out;
+}
+
 static void drawPanelProjection() {
     g_projSideProbe.clear();
     g_projCurveProbe.clear();
@@ -185,6 +214,8 @@ static void drawPanelProjection() {
     g_projNoCurveProbe.clear();
     g_projFootProbe.clear();
     g_projXAxisProbe.clear();
+    g_projOffProbe.clear();
+    g_projDimsProbe.clear();
     ImageDoc* im = cur();
     if (!im || im->w < 1 || im->h < 1) { ImGui::TextDisabled("no image"); return; }
     const char* modes[3] = { "mean", "max", "min" };
@@ -240,13 +271,22 @@ static void drawPanelProjection() {
     {   // the sampled region of EVERY side, not of A and B: "A 512x512 B 512x512"
         // was the two-image spelling, and a third slot of another size was the
         // one thing this line existed to make visible.
+        // ...and WHOSE region is an ROI, per side. roiUsed is NOT a property
+        // of the selection: recomputeProjectionIfNeeded clamps the rectangle
+        // into each side's own frame and drops it when the clamp leaves nothing
+        // (`cw > 0 && chh > 0`), so a side smaller than the ROI, or one the ROI
+        // falls outside of, is measured over its WHOLE IMAGE while A is not.
+        // Printing A's answer for the row made this line call those sides' full
+        // frames an ROI - and the sizes beside it are exactly where a reader
+        // would go looking for the discrepancy.
         std::string dims;
         for (const ProjSide& sd : sides) {
             if (!dims.empty()) dims += "  ";
-            dims += sd.name + " " + std::to_string(sd.S->rw) + "x" + std::to_string(sd.S->rh);
+            dims += sd.name + " " + std::to_string(sd.S->rw) + "x" +
+                    std::to_string(sd.S->rh) + (sd.S->roiUsed ? " ROI" : " whole");
         }
-        if (nSides > 1) ImGui::TextDisabled("%s  (%s)", dims.c_str(),
-                                            P.roiUsed ? "ROI" : "whole image");
+        g_projDimsProbe = dims;
+        if (nSides > 1) ImGui::TextDisabled("%s", dims.c_str());
         else            ImGui::TextDisabled("%s  %dx%d", P.roiUsed ? "ROI" : "whole image",
                                             P.rw, P.rh);
     }
@@ -419,14 +459,47 @@ static void drawPanelProjection() {
     } else {
         nPlot = nSides;
     }
-    std::string offPlot, offMsg;           // the letters that get no curve
+    // ...and the letters that get no curve, SPLIT BY WHY. A slot with no
+    // profile of its own is not off the plot because the palette ran out or
+    // because four planes are on the axis - it would have nothing to draw
+    // either way - so offering it "pick ONE plane above" offers a remedy that
+    // cannot work, and promising its numbers promises a row of dashes. Both
+    // sentences are the ones the no-curve notice under each plot had to grow
+    // gates for; this is the same two gates, in the one other place the panel
+    // says it.
+    std::string offPlot, offNone, offMsg;
     for (size_t i = nPlot; i < nSides; i++) {
-        if (!offPlot.empty()) offPlot += ", ";
-        offPlot += sides[i].name;
+        std::string& into = sides[i].S->unavail.empty() ? offPlot : offNone;
+        if (!into.empty()) into += ", ";
+        into += sides[i].name;
     }
-    if (!offPlot.empty())
-        offMsg = "slot " + offPlot + ": no curve - " + offWhy +
-                 ". Their numbers are in the table below.";
+    if (!offPlot.empty()) {
+        // which of the letters the plot left off actually HAS numbers - asked
+        // of the side here, because a side is what this sentence is about
+        std::string offNums;
+        for (size_t i = nPlot; i < nSides; i++) {
+            if (!sides[i].S->unavail.empty()) continue;
+            bool any = false;
+            for (int k = 0; k < 5 && !any; k++)
+                any = sides[i].S->fStat[k].valid || sides[i].S->hStat[k].valid ||
+                      sides[i].S->vStat[k].valid;
+            if (!any) continue;
+            if (!offNums.empty()) offNums += ", ";
+            offNums += sides[i].name;
+        }
+        offMsg = "slot " + offPlot + ": no curve - " + offWhy + ".";
+        if (!offNums.empty())
+            offMsg += "  " + offNums +
+                      (offNums.find(',') == std::string::npos ? "'s numbers are"
+                                                             : "' numbers are") +
+                      " in the table below.";
+    }
+    if (!offNone.empty()) {
+        if (!offMsg.empty()) offMsg += "  ";
+        offMsg += "slot " + offNone + ": no curve - no profile at all (see above); "
+                  "the plot's limits are not what is keeping it off.";
+    }
+    g_projOffProbe = offMsg;
     // Which side the image is showing this instant, drawn HEAVY so the overlay
     // says it too (ruling 1: 「表示中のスロットが分かる状態にする(太線等)」).
     // Only on a shared axis: a pane already wears its letter in a band.
@@ -862,7 +935,12 @@ static void drawPanelProjection() {
                     // side's region does not reach, and neither is "no finite
                     // pixel in column 6", which is what a phase word of zero
                     // read as "no constraint" used to make it say.
-                    if (!projPhaseSeen(S, s2, horizontal))
+                    if (!S.unavail.empty())
+                        // the same false claim the no-curve sentence had to stop
+                        // making: no profile was computed, the region's
+                        // positions are not in question
+                        say(head + "no profile on this side - see the notice above");
+                    else if (!projPhaseSeen(S, s2, horizontal))
                         say(head + "no sample - this plane has no position in this region");
                     else
                         say(head + std::string("no sample in this ") +
@@ -981,15 +1059,25 @@ static void drawPanelProjection() {
         // per axis and a probe field is found by its first occurrence.
         {
             std::string drew, quiet, why;
-            // ...and whether any of the silent planes HAS NUMBERS in the table.
+            // ...and WHICH of the silent planes has numbers in the table, as a
+            // list rather than as a flag.
+            //
             // Asked of the PLANE, not of the side: a refused side's rows are all
-            // dashes, but so are the rows of a plane the pass never landed on
-            // ON A MEASURED SIDE - fStat is invalid because its sample count is
+            // dashes, but so are the rows of a plane the pass never landed on ON
+            // A MEASURED SIDE - fStat is invalid because its sample count is
             // zero, the profile is all NaN, and hStat/vStat are invalid at
-            // n < 2. The 1 px band fixture has exactly that, so the gate below
-            // was being passed by its own test case. Pointing a reader at a row
-            // of dashes is pointing at nothing, whichever fact emptied it.
-            bool anyWithNumbers = false;
+            // n < 2. Pointing a reader at a row of dashes is pointing at
+            // nothing, whichever fact emptied it.
+            //
+            // And asked of EACH of them, not of the set. A bool set by any one
+            // plane put "Their numbers are in the table below" under a sentence
+            // naming four, two of which had twelve dashes - the 1 px band's V
+            // axis is exactly that mixture, and it was the fixture the flag was
+            // supposed to be justified by. The subject of the clause and the
+            // set that satisfies it have to be the same set, so the clause
+            // NAMES them: the quantifier is in the sentence instead of in a
+            // boolean that cannot carry one.
+            std::string withNumbers;
             for (size_t k = probe0; k < g_projCurveProbe.size(); k++) {
                 const ProjCurveProbe& c = g_projCurveProbe[k];
                 std::string& into = c.points >= 2 ? drew : quiet;
@@ -1050,7 +1138,8 @@ static void drawPanelProjection() {
                 if (CS && c.seriesIdx >= 0 && c.seriesIdx < 5 &&
                     (CS->fStat[c.seriesIdx].valid || CS->hStat[c.seriesIdx].valid ||
                      CS->vStat[c.seriesIdx].valid))
-                    anyWithNumbers = true;
+                    withNumbers += (withNumbers.empty() ? "" : ", ") +
+                                   (c.plane + "@" + c.side);
             }
             g_projSideProbe += std::string(horizontal ? "drewH=" : "drewV=") + drew + ";";
             if (!quiet.empty()) {
@@ -1061,10 +1150,15 @@ static void drawPanelProjection() {
                 // planes each needs about 800 characters and the char[768] this
                 // was written as truncated in silence - the same shape this
                 // file had just taken out of hoverReadout for the same reason.
-                const std::string line = "no curve for: " + why + "." +
-                    (anyWithNumbers ? std::string("  Their numbers are in the "
-                                                  "table below.")
-                                    : std::string());
+                //
+                // "has"/"have" by the comma, as projSayPlaneMismatch does it a
+                // few hundred lines down - one spelling of that choice in this
+                // file, and the sentence reads for one plane and for four.
+                std::string line = "no curve for: " + why + ".";
+                if (!withNumbers.empty())
+                    line += "  " + withNumbers +
+                            (withNumbers.find(',') == std::string::npos ? " has" : " have") +
+                            " numbers in the table below.";
                 if (!g_projNoCurveProbe.empty()) g_projNoCurveProbe += "|";
                 g_projNoCurveProbe += std::string(horizontal ? "H " : "V ") + line;
                 ImGui::PushTextWrapPos(0.0f);
@@ -1371,11 +1465,7 @@ static void drawPanelProjection() {
             // setting is about scanning columns, the clipboard is about
             // reproducing numbers.
             std::string tsv = "# projection profile statistics";
-            if (P.roiUsed) {
-                char r[96];
-                snprintf(r, sizeof r, "; ROI (%d,%d) %dx%d", P.rx, P.ry, P.rw, P.rh);
-                tsv += r;
-            } else tsv += "; whole image";
+            tsv += projRegionSaid(sides);     // every side's region, not A's
             const char* pmodes[3] = { "mean", "max", "min" };
             tsv += std::string("; reduce=") + pmodes[std::clamp(app.projMode, 0, 2)] + "; DN\n";
             // Provenance (docs/features/analysis/stats-taxonomy.md §8 判断5). This is the ONE export

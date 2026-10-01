@@ -3029,6 +3029,32 @@
                       "C15 ...and never that the REGION holds no position: it holds them");
                 check(g_projNoCurveProbe.find("table below") == std::string::npos,
                       "C15 ...and the reader is not pointed at a table of dashes");
+                // ...and the HOVER says the same thing about the same side. This
+                // is the sentence that was still making the region claim three
+                // lines from the one that had stopped.
+                {
+                    const ProjCurveProbe* bc = nullptr;
+                    for (const auto& e : g_projCurveProbe)
+                        if (e.side == "B" && e.horizontal && e.plane == "R") bc = &e;
+                    check(bc != nullptr, "C15 fixture: B's R curve was laid out");
+                    if (bc) {
+                        const float t = (6.0f - bc->xmin) /
+                                        std::max(bc->xmax - bc->xmin, 1e-6f);
+                        projFrame(900.0f, 900.0f,
+                                  ImVec2(bc->px0 + t * (bc->px1 - bc->px0),
+                                         (bc->py0 + bc->py1) * 0.5f));
+                        fprintf(stderr, "abstatsselftest: C15 hover '%s'\n",
+                                g_projHoverProbe.c_str());
+                        check(g_projHoverProbe.find("A R: no profile on this side") !=
+                                  std::string::npos,
+                              "C15 hover says A has no PROFILE, side by side with B's values");
+                        check(g_projHoverProbe.find("no position in this region") ==
+                                  std::string::npos,
+                              "C15 ...and makes no claim about the region's positions");
+                        check(g_projHoverProbe.find("B R: ") != std::string::npos,
+                              "C15 ...while B's own value is still read out");
+                    }
+                }
                 // ...and the reason comes from THE SIDE IT IS ABOUT. With the
                 // refused side past B, reading sides[1] printed nothing at all.
                 addCompareSlot(app.images[0].get());       // C, the same preview doc
@@ -3044,6 +3070,22 @@
                       "C15b the refused side is C now, and the panel says C");
                 check(g_projUnavailProbe.find("C: no profile - full-resolution") == 0,
                       "C15b ...with C's own reason, which sides[1] would have left empty");
+                // ...and the OFF-PLOT notice, which carries the same two clauses
+                // the per-plot one does and had a gate on neither: C is off the
+                // shared axis, and it is off it because it has no profile - so
+                // "pick ONE plane above" is a remedy that cannot work and its
+                // numbers are a row of dashes.
+                fprintf(stderr, "abstatsselftest: C15b off-plot '%s'\n",
+                        g_projOffProbe.c_str());
+                check(field(g_projSideProbe, "said-no-curve=") == "C",
+                      "C15b fixture: the plot really did leave C off");
+                check(g_projOffProbe.find("slot C: no curve - no profile at all") !=
+                          std::string::npos,
+                      "C15b the off-plot notice names C's own reason");
+                check(g_projOffProbe.find("pick ONE plane") == std::string::npos,
+                      "C15b ...and does not offer a remedy that cannot work");
+                check(g_projOffProbe.find("in the table below") == std::string::npos,
+                      "C15b ...nor promise numbers C does not have");
                 app.cmpExtra.clear();
                 app.compareMode = App::CmpOff;
                 setCompareB(nullptr);
@@ -3362,18 +3404,27 @@
                     const std::string vLine = bar == std::string::npos
                                             ? std::string() : g_projNoCurveProbe.substr(bar);
                     fprintf(stderr, "abstatsselftest: C21 H line '%s'\n", hLine.c_str());
+                    fprintf(stderr, "abstatsselftest: C21 V line '%s'\n", vLine.c_str());
                     check(!app.proj[0].fStat[2].valid && !app.proj[0].hStat[2].valid &&
                           !app.proj[0].vStat[2].valid,
                           "C21 fixture: Gb's table row really is all dashes");
-                    check(hLine.find("table below") == std::string::npos,
-                          "C21 the H sentence does not point at Gb's and B's dashes");
-                    // ANTI-VACUOUS: on the V axis R and Gr ARE in the table
-                    // (their region statistics stand), so the clause belongs
-                    // there and the gate is not simply off.
                     check(app.proj[0].fStat[0].valid,
-                          "C21 fixture: R does have region numbers on this frame");
-                    check(vLine.find("table below") != std::string::npos,
-                          "C21 ...and the V sentence, which names R, does point at them");
+                          "C21 fixture: ...while R's region statistics stand");
+                    check(hLine.find("in the table below") == std::string::npos,
+                          "C21 the H sentence does not point at Gb's and B's dashes");
+                    // THE MIXED CASE, which is the one a bool cannot carry. The
+                    // V axis leaves all four planes silent - R and Gr with one
+                    // sample, Gb and B with no position - and only R and Gr have
+                    // numbers. A flag set by any of them put "Their numbers are
+                    // in the table below" under a sentence naming four. The
+                    // clause has to NAME its subject.
+                    check(vLine.find("  R@A, Gr@A have numbers in the table below.") !=
+                              std::string::npos,
+                          "C21 the V sentence names the two planes that DO have numbers");
+                    check(vLine.find("Gb@A have") == std::string::npos &&
+                          vLine.find("Gb@A, B@A have") == std::string::npos &&
+                          vLine.find("B@A have numbers") == std::string::npos,
+                          "C21 ...and never promises Gb's or B's twelve dashes");
                 }
                 // ...and the hover says the same thing, about the MOSAIC and not
                 // about the sensor.
@@ -3426,6 +3477,16 @@
                 check(g_projNoCurveProbe.find("no two of them next to each other") !=
                           std::string::npos,
                       "C22 ...and names the condition that actually failed");
+                // ANTI-VACUOUS for C21's clause, taken where the whole quiet set
+                // HAS numbers: R is the only silent plane here and its region
+                // statistics stand, so the clause appears, names R, and takes
+                // the singular verb. The gate is not simply off.
+                check(app.proj[0].fStat[0].valid &&
+                      field(g_projSideProbe, "said-no-curve-planeH=") == "R@A",
+                      "C22 fixture: R is the only silent plane, and it has numbers");
+                check(g_projNoCurveProbe.find("  R@A has numbers in the table below.") !=
+                          std::string::npos,
+                      "C22 ...so the clause does appear, naming R, in the singular");
             }
 
             // ======================================================================
@@ -3606,6 +3667,75 @@
                       g_projNoCurveProbe.find("no two neighbouring groups both do") !=
                           std::string::npos,
                       "C25 ...it names the decimation, which is what actually refused");
+            }
+
+            // ======================================================================
+            // C26 - "ROI" IS PER SIDE. recomputeProjectionIfNeeded clamps the
+            // selected rectangle into each side's own frame and DROPS it when
+            // the clamp leaves nothing (`cw > 0 && chh > 0`), so a side the ROI
+            // falls outside of is measured over its whole image while A is
+            // measured over the ROI. Two sentences printed A's answer for every
+            // side's row: the dimensions line called those sides' full frames an
+            // ROI - right next to the sizes a reader would check it against -
+            // and the TSV's region header labelled their rows with a region they
+            // were never measured over.
+            //
+            // This was mis-classified as "the same for every side because the
+            // rectangle comes from one annotation". The rectangle does; the
+            // ANSWER does not.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_roi_A", 4096, 32, 0, 1));  // ROI fits
+                app.images.push_back(mkFrame("pc_roi_B", 8, 8, 0, 1));      // ROI misses
+                app.current = 0;
+                app.anns.clear();
+                App::Ann a5;
+                a5.id = app.nextAnnId++;
+                a5.type = 0;
+                a5.x = 200; a5.y = 0; a5.w = 16; a5.h = 8;
+                a5.label = "pcroiside";
+                app.anns.push_back(a5);
+                app.selectedAnn = a5.id;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                draw();
+                fprintf(stderr, "abstatsselftest: C26 dims '%s'\n", g_projDimsProbe.c_str());
+                check(app.proj[0].roiUsed && !app.proj[1].roiUsed,
+                      "C26 fixture: the ROI lands on A and falls outside B entirely");
+                check(app.proj[0].rw == 16 && app.proj[1].rw == 8,
+                      "C26 ...so A is 16 columns and B is its whole 8");
+                check(g_projDimsProbe == "A 16x8 ROI  B 8x8 whole",
+                      "C26 the dimensions line says which side is an ROI, per side");
+                // ...and the TSV's region header, which is the same answer in
+                // the file that carries both sides' rows.
+                std::vector<ProjSide> two;
+                two.push_back({ &app.proj[0], "A", "a", false, 0 });
+                two.push_back({ &app.proj[1], "B", "b", false, 0 });
+                const std::string reg = projRegionSaid(two);
+                fprintf(stderr, "abstatsselftest: C26 tsv region '%s'\n", reg.c_str());
+                check(reg == "; A ROI (200,0) 16x8; B whole image 8x8",
+                      "C26 ...and so does the TSV header, for every side in the file");
+                // ANTI-VACUOUS: with no ROI at all both sides say "whole", so
+                // the word tracks the answer rather than being decoration.
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C26 no-ROI dims '%s'\n",
+                        g_projDimsProbe.c_str());
+                check(g_projDimsProbe == "A 4096x32 whole  B 8x8 whole",
+                      "C26 with no ROI selected, neither side is called one");
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
             }
 
             // ---- everything borrowed, put back ------------------------------------
