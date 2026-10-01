@@ -275,6 +275,7 @@ static int roiStatsSelftest() {
         bool down = false;
         ImGuiKey key = ImGuiKey_None;          // one key event, this frame
         bool keyDown = false;
+        bool mod = false;                      // Ctrl held (re-stated per frame)
         std::string chars;                     // ...and characters, this frame
     } inj;
     auto roiFrame = [&]() {
@@ -291,6 +292,7 @@ static int roiStatsSelftest() {
             io.AddMousePosEvent(inj.pos.x, inj.pos.y);
             io.AddMouseButtonEvent(0, inj.down);
         }
+        if (inj.on) io.AddKeyEvent(ImGuiMod_Ctrl, inj.mod);
         if (inj.key != ImGuiKey_None) {
             io.AddKeyEvent(inj.key, inj.keyDown);
             inj.key = ImGuiKey_None;
@@ -923,11 +925,13 @@ static int roiStatsSelftest() {
     addAnn(0, 400, 300, 100, 100);                        // fits, with room to fail
     const int eRoi = app.anns.back().id;
     bool wBoth = false;      // Active and DeactivatedAfterEdit in ONE frame
-    bool wDrop = false;      // ...and a commit that was dropped as another ROI's
+    bool wDrop = false;      // ...and a number commit dropped as another ROI's
+    bool wNameDrop = false;  // ...and a name commit dropped the same way
     auto wStep = [&]() {
         roiFrame();
         if (g_roiEditProbe.act && g_roiEditProbe.done) wBoth = true;
         if (g_roiEditProbe.dropped) wDrop = true;
+        if (g_roiEditProbe.nameDropped) wNameDrop = true;
     };
     auto wSettle = [&]() { for (int f = 0; f < 4; f++) wStep(); };
     auto wClick = [&](float x, float y) {
@@ -935,9 +939,13 @@ static int roiStatsSelftest() {
         inj.down = true;                                         wStep();
         inj.down = false;                                        wStep();
     };
-    auto wKey = [&](ImGuiKey k) {
+    // ctrl = hold Ctrl over the key, which is how a text field is selected
+    // all before typing over it (a click alone only places the caret).
+    auto wKey = [&](ImGuiKey k, bool ctrl = false) {
+        if (ctrl) { inj.mod = true;  wStep(); }
         inj.key = k; inj.keyDown = true;   wStep();
         inj.key = k; inj.keyDown = false;  wStep();
+        if (ctrl) { inj.mod = false; wStep(); }
     };
     auto wType = [&](const char* t) {
         inj.chars = t;
@@ -1142,6 +1150,184 @@ static int roiStatsSelftest() {
     check(app.anns.size() == 1, "W14d ...and makes no band");
     wSaid.push_back(app.toast);
 
+    // ---- W16: the name field writes to the annotation it was typed for ---
+    // The 2026-09-30 review's third finding, and the same shape as W13 three
+    // lines above it in the panel: `if (InputText(...)) sel->label = buf;`
+    // wrote on every keystroke, so the canvas press that moves
+    // app.selectedAnn landed the name being typed for A on B. Not a
+    // measurement (the rectangle and every number stay as they were, and the
+    // three places that show a label agree the moment it lands), but a write
+    // has to go where the user aimed it - and a label IS the column name of a
+    // measurement in the Analysis grid.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(0, 400, 300, 100, 100);                        // A = "ROI 1"
+    const int nRoiA = app.anns.back().id;
+    addAnn(0, 100, 100, 50, 50);                          // B = "ROI 2"
+    const int nRoiB = app.anns.back().id;
+    app.selectedAnn = nRoiA;
+    wSettle();
+    const ImVec2 nMin = g_roiEditProbe.nameMin, nMax = g_roiEditProbe.nameMax;
+    check(nMax.x > nMin.x && nMax.y > nMin.y && g_roiEditProbe.nameFor == nRoiA,
+          "W16 the name field is on screen and seeded from the selected ROI");
+    const float nY = (nMin.y + nMax.y) * 0.5f;
+    // a name that commits normally: click in, select all, type, Enter
+    wClick(nMin.x + 4.0f, nY);
+    wKey(ImGuiKey_A, true);                               // Ctrl+A: select all
+    wType("dark");
+    wKey(ImGuiKey_Enter);
+    fprintf(stderr, "roistatsselftest: W16 A label [%s]  B label [%s]\n",
+            findAnn(nRoiA)->label.c_str(), findAnn(nRoiB)->label.c_str());
+    check(findAnn(nRoiA)->label == "dark", "W16 a committed name lands on its own ROI");
+    check(findAnn(nRoiB)->label == "ROI 2", "W16 ...and only on that one");
+    // ...and one that does NOT commit, with the selection moving first
+    wDrop = false;
+    wClick(nMin.x + 4.0f, nY);
+    wKey(ImGuiKey_A, true);
+    wType("bright");
+    app.selectedAnn = nRoiB;                              // the canvas' press
+    wKey(ImGuiKey_Enter);
+    fprintf(stderr, "roistatsselftest: W16 after the selection moved: A [%s]  B [%s]  "
+                    "nameDropped=%d\n", findAnn(nRoiA)->label.c_str(),
+            findAnn(nRoiB)->label.c_str(), (int)wNameDrop);
+    check(findAnn(nRoiB)->label == "ROI 2",
+          "W16 a name typed for A is NOT written to B");
+    check(findAnn(nRoiA)->label == "dark",
+          "W16 ...and A keeps the name it had: an uncommitted edit is dropped");
+    check(wNameDrop, "W16 ...and the drop is what stopped it, not a missing commit");
+
+    // ---- W17: the pin's own two fields, driven by real input -------------
+    // The same seam as the rectangle, and until now asserted only by calling
+    // annWriteFields directly - which cannot see the buffer discipline around
+    // it. Driven here through the widget, like W12/W13.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(1, 100, 200, 0, 0);                            // a pin this frame holds
+    const int pA = app.anns.back().id;
+    addAnn(1, 300, 400, 0, 0);
+    const int pB = app.anns.back().id;
+    app.selectedAnn = pA;
+    wSettle();
+    const ImVec2 pMin = g_roiEditProbe.min, pMax = g_roiEditProbe.max;
+    check(pMax.x > pMin.x && g_roiEditProbe.seededFor == pA &&
+          g_roiEditProbe.buf[0] == 100 && g_roiEditProbe.buf[1] == 200,
+          "W17 the pin's two fields are on screen, seeded from the pin");
+    const float pY = (pMin.y + pMax.y) * 0.5f;
+    wClick(pMin.x + 4.0f, pY);                            // into x
+    wKey(ImGuiKey_A, true);
+    wType("101");                                         // x + 1, y untouched
+    wKey(ImGuiKey_Enter);
+    {
+        const App::Ann* a = findAnn(pA);
+        fprintf(stderr, "roistatsselftest: W17 pin @%d,%d\n", a->x, a->y);
+        check(a->x == 101, "W17 the pin's x takes the number typed into it");
+        check(a->y == 200, "W17 ...and y, which was not edited, does not move");
+    }
+    wDrop = false;
+    wClick(pMin.x + 4.0f, pY);
+    wKey(ImGuiKey_A, true);
+    wType("7");
+    app.selectedAnn = pB;                                 // ...and the selection moves
+    wKey(ImGuiKey_Enter);
+    {
+        const App::Ann* a = findAnn(pA);
+        const App::Ann* b2 = findAnn(pB);
+        fprintf(stderr, "roistatsselftest: W17 A @%d,%d  B @%d,%d  dropped=%d\n",
+                a->x, a->y, b2->x, b2->y, (int)wDrop);
+        check(b2->x == 300 && b2->y == 400, "W17 a number typed for one pin is not written to another");
+        check(a->x == 101 && a->y == 200, "W17 ...and the first pin is left as it was");
+        check(wDrop, "W17 ...and the drop is what stopped it");
+    }
+    wKey(ImGuiKey_Escape);
+    inj.pos = ImVec2(-FLT_MAX, -FLT_MAX); inj.down = false;
+    wSettle();
+    inj.on = false;                                       // the cursor is the user's again
+
+    // ---- W18: the write gate keeps the overflow OUT ----------------------
+    // annFits is 64-bit safe (W11), but a ROI that is already off the frame
+    // skips its gate, so w = 2147483647 used to be WRITABLE - and from there
+    // every x + w in int downstream is undefined. The gate has an upper bound
+    // now, and it refuses rather than clamps.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // 640x480
+    addAnn(0, 3000, 2000, 200, 200);                      // OFF this frame: no fit gate
+    {
+        App::Ann* a = findAnn(app.selectedAnn);
+        std::string why;
+        int g[4] = { a->x, a->y, INT_MAX, a->h };
+        check(!annWriteFields(*a, g, cur()->w, cur()->h, &why) && a->w == 200,
+              "W18 w = 2147483647 on an off-frame ROI is refused, not written");
+        fprintf(stderr, "roistatsselftest: W18 why=[%s]\n", why.c_str());
+        check(why.find("past this viewer's 32768 px limit") != std::string::npos,
+              "W18 ...naming the limit it is past");
+        wSaid.push_back(why);
+        int g2[4] = { a->x, a->y, 32768, a->h };          // the limit itself
+        check(annWriteFields(*a, g2, cur()->w, cur()->h, &why) && a->w == 32768,
+              "W18 the limit itself is writable - the biggest frame is not special");
+        int g3[4] = { a->x, a->y, 32769, a->h };
+        check(!annWriteFields(*a, g3, cur()->w, cur()->h, &why) && a->w == 32768,
+              "W18 ...and one past it is not");
+        int g4[4] = { 40000, a->y, a->w, a->h };
+        check(!annWriteFields(*a, g4, cur()->w, cur()->h, &why) && a->x == 3000,
+              "W18 the same bound holds for an origin");
+    }
+
+    // ---- W19: X / Y over a pixel of the OTHER pane, and the band it makes -
+    // Two things nothing was running. The refusal first: a bigger B beside A
+    // puts the cursor on pixels that are not A's (the readout follows the pane
+    // on purpose), and the old line answered "hover a pixel" to someone who
+    // was hovering one.
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.current = 1;                                      // A = 640x480
+    app.hoverX = 2000; app.hoverY = 1000; app.hoverInB = true;   // a pixel of B
+    app.toast.clear();
+    toggleBand(true);
+    fprintf(stderr, "roistatsselftest: W19 toast [%s]\n", app.toast.c_str());
+    check(app.toast.find("the pixel under the cursor (@2000,1000)") != std::string::npos,
+          "W19 X over a pixel of the compared pane names that pixel");
+    check(app.toast.find("on the compared pane and outside this frame (640x480)")
+              != std::string::npos,
+          "W19 ...and says it is not a pixel of the frame the ROIs are on");
+    check(app.toast.find("hover a pixel") == std::string::npos,
+          "W19 ...not advice to do what the user is already doing");
+    check(app.anns.empty(), "W19 ...and makes no band");
+    wSaid.push_back(app.toast);
+    // ...and the arm itself, which had no test at all: a hovered pixel of THIS
+    // frame makes the row band, and X again collapses it onto that one pixel.
+    app.hoverX = 40; app.hoverY = 60; app.hoverInB = false;
+    app.toast.clear();
+    toggleBand(true);
+    check(app.anns.size() == 1 && app.anns[0].x == 0 && app.anns[0].y == 60 &&
+          app.anns[0].w == 640 && app.anns[0].h == 1,
+          "W19b a hovered pixel makes the row band of THIS frame");
+    check(app.anns[0].label == "row 60", "W19b ...named by the row it is");
+    check(app.anns[0].prevX == 40 && app.anns[0].prevW == 1,
+          "W19b ...remembering the pixel to collapse back onto");
+    toggleBand(true);
+    check(app.anns.size() == 1 && app.anns[0].x == 40 && app.anns[0].w == 1,
+          "W19b X again collapses the band onto that pixel");
+    // the column band is the other axis of the same arm
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    toggleBand(false);
+    check(app.anns.size() == 1 && app.anns[0].x == 40 && app.anns[0].y == 0 &&
+          app.anns[0].w == 1 && app.anns[0].h == 480 &&
+          app.anns[0].label == "col 40",
+          "W19b ...and Y makes the column band of this frame");
+    // a pin that IS on this frame goes through the same arm
+    app.anns.clear(); app.nextAnnId = 1; app.roiSeq = 0; app.poiSeq = 0;
+    app.selectedAnn = 0;
+    app.hoverX = app.hoverY = -1;
+    addAnn(1, 11, 22, 0, 0);
+    toggleBand(true);
+    check(app.anns.size() == 2 && app.anns[1].y == 22 && app.anns[1].h == 1 &&
+          app.anns[1].w == 640, "W19c X on a pin this frame holds makes the pin's row");
+    app.hoverX = app.hoverY = -1;
+
     // ---- W15: every refusal this panel can say was said above ------------
     // Eight wordings, eight entries, all different. A copy-paste that made two
     // refusals identical, or a wording that stopped being reachable, lands
@@ -1164,6 +1350,8 @@ static int roiStatsSelftest() {
         { "the x range this band was made from", nullptr, "x band memory refused" },
         { "the y range this band was made from", nullptr, "y band memory refused" },
         { "takes the row / column through the pin", nullptr, "pin band refused" },
+        { "past this viewer's 32768 px limit", nullptr, "past the frame-size limit" },
+        { "the pixel under the cursor", nullptr, "cursor is on another pane" },
     };
     bool wCovered = true;
     for (const WSay& k : WANT) {
@@ -1177,7 +1365,7 @@ static int roiStatsSelftest() {
             fprintf(stderr, "roistatsselftest: W15 NEVER RUN: %s\n", k.what);
         }
     }
-    check(wCovered && wSaid.size() >= 8,
+    check(wCovered && wSaid.size() >= 10,
           "W15 every refusal wording this panel can say was run by a test above");
     // the list belongs to whatever runs next in this process: leave it empty,
     // and leave no pin hovered and no mouse button down either
