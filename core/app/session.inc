@@ -961,7 +961,20 @@ static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
             if (sp == std::string::npos) continue;        // pre-pid format: drop it
             const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
             if (who == me) continue;                      // ours: replaced below
-            if (!pidAlive(who)) continue;                 // its evidence is read by then
+            // A DEAD PROCESS'S LINE IS CONSUMED ONCE, and that is a choice.
+            // This start has already READ it (fontBakeCrumbRead ran before the
+            // first font byte) and acted on it - skipped that path and said so
+            // on screen - so dropping it here means the NEXT start tries the
+            // path again. The alternative, keeping it until some start bakes
+            // that file successfully, would skip a font for ever after one
+            // transient failure (a file that was mid-copy and is now fine),
+            // with no way out that the message could name.
+            //
+            // The cost of consuming it is at most ONE more crash, and the
+            // recovery then returns immediately because that crash writes a
+            // fresh line. The cost of keeping it is a font the user cannot get
+            // back. One more crash is the cheaper mistake.
+            if (!pidAlive(who)) continue;
             keep.push_back(line);
         }
     }
