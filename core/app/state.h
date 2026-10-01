@@ -3112,9 +3112,33 @@ struct App {
         // every NaN as a break drew nothing at all whenever one bucket held
         // one sample (the 2026-09-29 report).
         //
-        // An all-zero word means the pass never said - a state from before
-        // this field existed, or one never filled - and readers then walk
-        // every position, which is what the panel did before.
+        // AN ALL-ZERO WORD MEANS "THIS PLANE HAS NO POSITION HERE", and it is
+        // NOT a licence to walk every position. The pass visits exactly one
+        // plane per pixel (`lo = cfaChannelAt(x, y); hi = lo + 1`), so a plane
+        // it never landed on gets no bit at all - which is what happens to Gb
+        // and B when the ROI is one pixel tall on an RGGB frame, and to two
+        // planes of a quad Bayer frame when it is one or two. Reading the zero
+        // as "no constraint" is exactly backwards on a mosaic: it made a plane
+        // with ZERO samples claim it owned every column ("Gb@A: 16 of column
+        // 16") and made the hover say "no finite pixel in column 6" - a false
+        // statement about the sensor, in a tool whose output is trusted.
+        //
+        // So there are THREE states here, not two, and they are three
+        // different sentences on screen:
+        //   bit p set            this plane has a sample position at the
+        //                        profile indices p, p+cell, ... (above)
+        //   bit p clear, word !=0  the mosaic: this plane does not exist at
+        //                        those offsets, and a NaN there carries no
+        //                        information
+        //   word == 0            the pass never landed on this plane: it has
+        //                        no position in this region at all
+        // `projPhaseSeen` (core/ui/panel_projection.inc) is the ONE predicate
+        // for the third state; `projHasSample` and `projSampleCount` answer
+        // false and 0 for it rather than falling back to anything.
+        //
+        // There is no "from before this field existed" state to be careful
+        // about: recomputeProjectionIfNeeded zeroes all ten words at the top of
+        // every recompute, so a zero word is always this run's answer.
         int cell = 1;
         uint32_t hPhase[5] = {}, vPhase[5] = {};
         // WHICH SLOTS the pass filled, not how many. The pooled row is slot 4
