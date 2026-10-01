@@ -3134,7 +3134,19 @@ struct App {
         std::vector<float> h[5], v[5];    // per series: mean along columns / rows
         float hMin = 0, hMax = 1, vMin = 0, vMax = 1;
         // statistics of the profiles themselves (sigma of column means = column FPN)
-        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0; bool valid = false; };
+        // `n` is HOW MANY SAMPLES the row is over - the plane's finite pixels
+        // for fStat, its finite profile entries for hStat/vStat. It is not
+        // decoration: pooling per-plane means needs the per-plane WEIGHT, and
+        // with no weight published the only proxy to hand was the profile's
+        // LENGTH (rw, identical for every plane of a mosaic), which is right
+        // only while every plane contributes the same number of pixels.
+        // --verify-selftest V17 was weighting by it.
+        //
+        // It sits AFTER the six doubles: --abstats-selftest A3 memcmps that
+        // prefix to prove B's existence moves no digit of A's, and a field
+        // inserted among them would be compared as a double.
+        struct Stats { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0, pct = 0;
+                       size_t n = 0; bool valid = false; };
         Stats hStat[5], vStat[5];
         // ...and of the REGION itself. sigma of the column means says how much
         // the columns differ; this says how much the pixels do. Reading the two
@@ -3146,6 +3158,88 @@ struct App {
         std::array<profile_noise::Result, 4> noise;
         bool allRow = false;              // slot 4 holds the plane-mixed row
         bool roiUsed = false;
+        // ---- THE SAMPLE LATTICE, per series ------------------------------
+        // A mosaic plane does not exist at every position: an RGGB R plane
+        // lives on even columns only, so its H profile is a sample, a hole, a
+        // sample, and h[R] carries a NaN at every odd entry. `cell` is the
+        // mosaic period along either axis (1 = dense, 2 = Bayer, 4 = quad
+        // Bayer) and hPhase/vPhase carry ONE BIT PER OFFSET inside it: bit p
+        // of hPhase[s] means "series s has samples at h[s] indices p, p+cell,
+        // p+2*cell, ...". Offsets are in the PROFILE's own index space, so an
+        // ROI whose origin is odd is described correctly with no arithmetic at
+        // the reader's end.
+        //
+        // RECORDED BY THE PASS, out of the same cfaChannelAt call that decides
+        // which plane a pixel belongs to - never recomputed from the pattern
+        // tables. A second spelling of the phase is a second thing to get
+        // wrong, and quad Bayer is the proof: there a plane is TWO columns
+        // wide (x>>1), which an "even/odd column" formula gets exactly
+        // backwards for half of the planes.
+        //
+        // What it buys is the distinction the drawing needs. A NaN at an
+        // offset this plane HAS is a real data gap - no finite pixel there -
+        // and a curve must BREAK at it. A NaN at an offset the plane does not
+        // have is the mosaic, and carries no information whatever. Skipping
+        // every NaN alike would bridge the first kind in silence; treating
+        // every NaN as a break drew nothing at all whenever one bucket held
+        // one sample (the 2026-09-29 report).
+        //
+        // AN ALL-ZERO WORD MEANS "THIS PLANE HAS NO POSITION HERE", and it is
+        // NOT a licence to walk every position. The pass visits exactly one
+        // plane per pixel (`lo = cfaChannelAt(x, y); hi = lo + 1`), so a plane
+        // it never landed on gets no bit at all - which is what happens to Gb
+        // and B when the ROI is one pixel tall on an RGGB frame, and to two
+        // planes of a quad Bayer frame when it is one or two. Reading the zero
+        // as "no constraint" is exactly backwards on a mosaic: it made a plane
+        // with ZERO samples claim it owned every column ("Gb@A: 16 of column
+        // 16") and made the hover say "no finite pixel in column 6" - a false
+        // statement about the sensor, in a tool whose output is trusted.
+        //
+        // So there are THREE states here, not two, and they are three
+        // different sentences on screen:
+        //   bit p set            this plane has a sample position at the
+        //                        profile indices p, p+cell, ... (above)
+        //   bit p clear, word !=0  the mosaic: this plane does not exist at
+        //                        those offsets, and a NaN there carries no
+        //                        information
+        //   word == 0            the pass never landed on this plane: it has
+        //                        no position in this region at all
+        // `projPhaseSeen` (core/ui/panel_projection.inc) is the ONE predicate
+        // for the third state; `projHasSample` and `projSampleCount` answer
+        // false and 0 for it rather than falling back to anything.
+        //
+        // There is no "from before this field existed" state to be careful
+        // about: recomputeProjectionIfNeeded zeroes all ten words at the top of
+        // every recompute, so a zero word is always this run's answer.
+        int cell = 1;
+        uint32_t hPhase[5] = {}, vPhase[5] = {};
+        // WHICH SLOTS the pass filled, not how many. The pooled row is slot 4
+        // BY NAME whatever nSeries is - that is the whole point of it not being
+        // a fifth plane - so a count is only ever right when nSeries happens to
+        // be 4. Every reader that walked `nSeries + allRow` therefore read slot
+        // 3 on a 3-plane RGB image with "all" ticked: "ch3", a slot this pass
+        // never fills and that a previously open mosaic leaves its B plane in.
+        // recomputeProjectionIfNeeded already had to learn this once (the
+        // out-of-range write that killed the viewer on a checkbox); the readers
+        // now walk the same list instead of re-deriving it.
+        int fill[5] = {};
+        int nFill = 0;
+        // ...and the "all" checkbox AS ASKED FOR, which is what the cache has to
+        // be keyed on. allRow is the answer (it is false on a single-plane
+        // image whatever the checkbox says), so keying on it let a tick of the
+        // box hit the cache and do nothing until some other condition - moving
+        // the ROI, stepping a frame - happened to change too.
+        bool allReq = false;
+        // Why there is no profile at all, in one line, or empty when there is
+        // one. It exists for the decimated remote PREVIEW of a mosaic: the rows
+        // and columns a preview carries are every Nth of the sensor's, so the
+        // mosaic phase is not preserved and cfaChannelAt over preview
+        // coordinates names a plane the pixel is not from. Every plane's
+        // profile would be some other plane's values under this plane's name.
+        // Said, in the wording computeProfileNoise already uses for the same
+        // cause - and NOT pooled into one dense series, which would invite
+        // reading shading off a curve whose phase has been destroyed.
+        std::string unavail;
     } proj[2];                        // 0 = A, 1 = B (compare)
     std::vector<ProjState> projExtra;  // one per cmpExtra slot, same order
     // profile statistics table: 0 auto (wide when it fits), 1 wide, 2 per-axis rows.
