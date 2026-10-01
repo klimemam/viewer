@@ -36,6 +36,12 @@ struct ProjCurveProbe {
     int sideIdx = -1;        // this side's place in the panel's side list, so a
                              // notice about the curve can reach the side's own
                              // region size rather than A's
+    int seriesIdx = -1;      // ...and the plane's slot ON THAT SIDE, so the same
+                             // notice can ask whether THIS PLANE has numbers.
+                             // Looking the name up again where it is needed is
+                             // the re-derivation ARCHITECTURE.md forbids, and
+                             // the side's own properties are the wrong answer:
+                             // a measured side still has planes with nothing.
     float px0 = 0, px1 = 0, py0 = 0, py1 = 0;   // the plot rect, in screen px
     float xmin = 0, xmax = 0;                   // ...and the axis it carries, so
                                                 // a test can aim at a column
@@ -686,6 +692,7 @@ static void drawPanelProjection() {
             ProjCurveProbe cp;
             cp.side = sides[si].name;
             cp.sideIdx = (int)si;
+            cp.seriesIdx = s;
             cp.plane = S.seriesNames[s] ? S.seriesNames[s] : "?";
             cp.horizontal = horizontal;
             cp.px0 = pr.p0.x; cp.px1 = pr.p1.x; cp.py0 = pr.p0.y; cp.py1 = pr.p1.y;
@@ -856,7 +863,7 @@ static void drawPanelProjection() {
                     // pixel in column 6", which is what a phase word of zero
                     // read as "no constraint" used to make it say.
                     if (!projPhaseSeen(S, s2, horizontal))
-                        say(head + "no sample: this plane has no position in this region");
+                        say(head + "no sample - this plane has no position in this region");
                     else
                         say(head + std::string("no sample in this ") +
                             (cellW > 1 ? "cell" : (horizontal ? "column" : "row")));
@@ -917,8 +924,26 @@ static void drawPanelProjection() {
         std::string prevSides;
         for (size_t si : which) {
             const App::ProjState& S = *sides[si].S;
-            if (!S.unavail.empty() || S.h[0].empty()) continue;   // no curve here
             if (!S.img || S.img->src->remoteStep <= 1) continue;
+            // Does this side put any sample ON THIS AXIS? `S.h[0].empty()` was
+            // the wrong question twice over: it asks about slot 0 whichever
+            // plane is selected, it asks about H on both axes, and a side whose
+            // only drawn plane has no position here contributes nothing to the
+            // axis the note is about. Asked of the DRAWN planes, over the phase
+            // words the pass recorded - not of the side.
+            //
+            // "Contributes a sample", not "drew a line": the note is about what
+            // the x NUMBERS mean, and a side with one sample and no line has
+            // still put that sample on this axis at a preview coordinate.
+            bool onAxis = false;
+            for (int sx = 0; sx < S.nSeries && !onAxis; sx++) {
+                const int a = matchA(si, sx);
+                if (a >= 0 ? !drawn(a) : app.histPlane >= 0) continue;
+                const std::vector<float>* ser = horizontal ? S.h : S.v;
+                if (projSampleCount(S, sx, horizontal, (int)ser[sx].size()) > 0)
+                    onAxis = true;
+            }
+            if (!onAxis) continue;
             if (!prevSides.empty()) prevSides += ", ";
             prevSides += sides[si].name;
         }
@@ -956,10 +981,15 @@ static void drawPanelProjection() {
         // per axis and a probe field is found by its first occurrence.
         {
             std::string drew, quiet, why;
-            // ...and whether any of the silent planes belongs to a side that was
-            // MEASURED. A refused side's table row is all dashes, so pointing a
-            // reader at it is pointing at nothing.
-            bool anyMeasured = false;
+            // ...and whether any of the silent planes HAS NUMBERS in the table.
+            // Asked of the PLANE, not of the side: a refused side's rows are all
+            // dashes, but so are the rows of a plane the pass never landed on
+            // ON A MEASURED SIDE - fStat is invalid because its sample count is
+            // zero, the profile is all NaN, and hStat/vStat are invalid at
+            // n < 2. The 1 px band fixture has exactly that, so the gate below
+            // was being passed by its own test case. Pointing a reader at a row
+            // of dashes is pointing at nothing, whichever fact emptied it.
+            bool anyWithNumbers = false;
             for (size_t k = probe0; k < g_projCurveProbe.size(); k++) {
                 const ProjCurveProbe& c = g_projCurveProbe[k];
                 std::string& into = c.points >= 2 ? drew : quiet;
@@ -978,37 +1008,67 @@ static void drawPanelProjection() {
                 // Per plane and per SIDE: one reason built from A's rw applied
                 // it to every side's planes and told a mono frame about the
                 // mosaic.
-                char nb[176];
-                if (c.lattice == 0)
+                const App::ProjState* CS = c.sideIdx >= 0 &&
+                                           (size_t)c.sideIdx < sides.size()
+                                         ? sides[c.sideIdx].S : nullptr;
+                char nb[208];
+                if (CS && !CS->unavail.empty()) {
+                    // A REFUSED SIDE HAS NO PROFILE, which is not the same fact
+                    // as "the region holds no position of this plane" - the
+                    // region holds them, nothing was computed over it. Saying
+                    // the second about the first is a claim about the REGION
+                    // that is false, and the side's own notice above already
+                    // carries the true one.
+                    snprintf(nb, sizeof nb, "no profile on this side - see the notice above");
+                } else if (c.lattice == 0) {
                     snprintf(nb, sizeof nb, "no sample position in this region");
-                else if (c.finite == 0)
+                } else if (c.finite == 0) {
                     snprintf(nb, sizeof nb,
                              "no finite sample at any of its %d position(s)", c.lattice);
-                else if (c.finite == 1)
+                } else if (c.finite == 1) {
                     snprintf(nb, sizeof nb,
                              "1 finite sample of %d position(s), and a line needs two",
                              c.lattice);
-                else
+                } else if (c.stride <= 1) {
                     snprintf(nb, sizeof nb,
                              "%d of %d position(s) hold a finite sample, but no two of "
                              "them next to each other", c.finite, c.lattice);
+                } else {
+                    // ...and with the plot decimating, ADJACENCY IS BETWEEN
+                    // BUCKETS, not between positions: a run breaks at a bucket
+                    // with nothing finite in it, and a bucket is `stride`
+                    // positions. "No two positions next to each other" is then a
+                    // claim about the data that the data does not make.
+                    snprintf(nb, sizeof nb,
+                             "%d of %d position(s) hold a finite sample, but with the "
+                             "plot decimating %d positions to a point, no two "
+                             "neighbouring groups both do",
+                             c.finite, c.lattice, c.stride);
+                }
                 why += (why.empty() ? "" : "; ") + (c.plane + "@" + c.side + " - ") + nb;
-                if (c.sideIdx >= 0 && (size_t)c.sideIdx < sides.size() &&
-                    sides[c.sideIdx].S->unavail.empty())
-                    anyMeasured = true;
+                // THE TABLE ROW, asked of this plane on this side.
+                if (CS && c.seriesIdx >= 0 && c.seriesIdx < 5 &&
+                    (CS->fStat[c.seriesIdx].valid || CS->hStat[c.seriesIdx].valid ||
+                     CS->vStat[c.seriesIdx].valid))
+                    anyWithNumbers = true;
             }
             g_projSideProbe += std::string(horizontal ? "drewH=" : "drewV=") + drew + ";";
             if (!quiet.empty()) {
                 g_projSideProbe += std::string(horizontal ? "said-no-curve-planeH="
                                                           : "said-no-curve-planeV=") +
                                    quiet + ";";
-                char line[768];
-                snprintf(line, sizeof line, "no curve for: %s.%s", why.c_str(),
-                         anyMeasured ? "  Their numbers are in the table below." : "");
+                // A std::string, measured by nothing: A|B overlaid with four
+                // planes each needs about 800 characters and the char[768] this
+                // was written as truncated in silence - the same shape this
+                // file had just taken out of hoverReadout for the same reason.
+                const std::string line = "no curve for: " + why + "." +
+                    (anyWithNumbers ? std::string("  Their numbers are in the "
+                                                  "table below.")
+                                    : std::string());
                 if (!g_projNoCurveProbe.empty()) g_projNoCurveProbe += "|";
                 g_projNoCurveProbe += std::string(horizontal ? "H " : "V ") + line;
                 ImGui::PushTextWrapPos(0.0f);
-                ImGui::TextColored(AB_AMBER, "%s", line);
+                ImGui::TextColored(AB_AMBER, "%s", line.c_str());
                 ImGui::PopTextWrapPos();
             }
         }
@@ -1395,7 +1455,10 @@ static void drawPanelProjection() {
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
     std::string pooledMosaic;      // the sides whose "all" row is a mosaic's
     for (const ProjSide& sd : sides)
-        if (sd.S->cell > 1 && sd.S->allRow) {
+        // ...and not a REFUSED side. The sentence promises that the pooled
+        // region statistics stand, and on a side with no profile they are
+        // dashes too - its own notice is what explains that side.
+        if (sd.S->cell > 1 && sd.S->allRow && sd.S->unavail.empty()) {
             if (!pooledMosaic.empty()) pooledMosaic += ", ";
             pooledMosaic += sd.name;
         }

@@ -3021,9 +3021,12 @@
                 // dashes: every silent plane here belongs to the refused side.
                 fprintf(stderr, "abstatsselftest: C15 no-curve '%s'\n",
                         g_projNoCurveProbe.c_str());
-                check(g_projNoCurveProbe.find("no sample position in this region") !=
+                check(g_projNoCurveProbe.find("no profile on this side") !=
                           std::string::npos,
-                      "C15 A's planes are refused for having no position at all");
+                      "C15 A's planes say the SIDE has no profile");
+                check(g_projNoCurveProbe.find("no sample position in this region") ==
+                          std::string::npos,
+                      "C15 ...and never that the REGION holds no position: it holds them");
                 check(g_projNoCurveProbe.find("table below") == std::string::npos,
                       "C15 ...and the reader is not pointed at a table of dashes");
                 // ...and the reason comes from THE SIDE IT IS ABOUT. With the
@@ -3347,6 +3350,31 @@
                       "C21 ...it says the region holds no position of that plane");
                 check(g_projNoCurveProbe.find("fewer samples than") == std::string::npos,
                       "C21 ...and does not also call it 'fewer than two'");
+                // ...AND IT DOES NOT SEND THE READER TO THEIR ROWS. Gb and B
+                // are on a MEASURED side, so a per-side gate let this through -
+                // but the pass never landed on them, so fStat is invalid (zero
+                // samples), the profile is all NaN and hStat/vStat are invalid
+                // at n < 2: twelve dashes. The H sentence must therefore end at
+                // the reason.
+                {
+                    const size_t bar = g_projNoCurveProbe.find('|');
+                    const std::string hLine = g_projNoCurveProbe.substr(0, bar);
+                    const std::string vLine = bar == std::string::npos
+                                            ? std::string() : g_projNoCurveProbe.substr(bar);
+                    fprintf(stderr, "abstatsselftest: C21 H line '%s'\n", hLine.c_str());
+                    check(!app.proj[0].fStat[2].valid && !app.proj[0].hStat[2].valid &&
+                          !app.proj[0].vStat[2].valid,
+                          "C21 fixture: Gb's table row really is all dashes");
+                    check(hLine.find("table below") == std::string::npos,
+                          "C21 the H sentence does not point at Gb's and B's dashes");
+                    // ANTI-VACUOUS: on the V axis R and Gr ARE in the table
+                    // (their region statistics stand), so the clause belongs
+                    // there and the gate is not simply off.
+                    check(app.proj[0].fStat[0].valid,
+                          "C21 fixture: R does have region numbers on this frame");
+                    check(vLine.find("table below") != std::string::npos,
+                          "C21 ...and the V sentence, which names R, does point at them");
+                }
                 // ...and the hover says the same thing, about the MOSAIC and not
                 // about the sensor.
                 if (r) {
@@ -3495,6 +3523,89 @@
                 check(g_projXAxisProbe.find("PREVIEW") == std::string::npos &&
                       g_projXAxisProbe.find("column x (px)") != std::string::npos,
                       "C24 a full-resolution frame keeps the plain axis title");
+                // (d) THE PLANE SELECTOR CLOSES IT TOO. A is a full-resolution
+                // mosaic and B is a mono preview; with one of A's planes on the
+                // axis, B's ch0 is not drawn, so B puts nothing on this axis and
+                // must not annotate it. A gate that asked "does this side have a
+                // profile" answered yes and annotated an axis B is not on.
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_xf_A", 16, 16, 1, 1));   // mosaic, full
+                app.images.push_back(mkFrame("pc_xf_B", 16, 16, 0, 1));   // mono preview
+                app.images[1]->src->remoteStep = 2;
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                app.histPlane = -1;                 // every plane: B's ch0 is drawn
+                draw();
+                fprintf(stderr, "abstatsselftest: C24 all planes x '%s'\n",
+                        g_projXAxisProbe.c_str());
+                check(g_projXAxisProbe.find("B: PREVIEW grid") != std::string::npos,
+                      "C24 with ch0 drawn, B's preview grid is on the axis and says so");
+                app.histPlane = 0;                  // R only: B has no R
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C24 plane=R x '%s'\n",
+                        g_projXAxisProbe.c_str());
+                check(g_projXAxisProbe.find("PREVIEW") == std::string::npos,
+                      "C24 ...and with R only, B is not on the axis and does not annotate it");
+                app.histPlane = -1;
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C25 - WITH THE PLOT DECIMATING, ADJACENCY IS BETWEEN BUCKETS. A
+            // run breaks at a bucket holding nothing finite, and a bucket is
+            // `stride` positions - so "no two POSITIONS next to each other" is
+            // a claim about the data that the data does not make: here every
+            // finite position has a finite neighbour, and the curve is still
+            // undrawable because the pairs land in alternating buckets.
+            //
+            // 4096 columns gives R 2048 positions and, over an ~800 px plot, a
+            // stride of 2. R is made finite at positions 4m and 4m+1 and
+            // non-finite at 4m+2 and 4m+3, so bucket 2m is finite, bucket 2m+1
+            // is dead, and no two neighbouring buckets both carry a point.
+            // ======================================================================
+            {
+                ImageDoc* d = useOnly(mkFrame("pc_bucket", 4096, 8, 1, 1));
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 4096; x++)
+                        if (cfaChannelAt(*d, x, y) == 0 && ((x / 2) % 4) >= 2)
+                            d->px()[(size_t)y * 4096 + x] =
+                                std::numeric_limits<float>::quiet_NaN();
+                computeMinMax(*d);
+                d->black = 0; d->white = 4095;
+                app.proj[0] = App::ProjState{};
+                draw();
+                const ProjCurveProbe* r = curve("R", true);
+                fprintf(stderr, "abstatsselftest: C25 R lattice=%d finite=%d stride=%d "
+                                "pts=%d\n", r ? r->lattice : -1, r ? r->finite : -1,
+                        r ? r->stride : -1, r ? r->points : -1);
+                fprintf(stderr, "abstatsselftest: C25 no-curve '%s'\n",
+                        g_projNoCurveProbe.c_str());
+                check(r && r->stride > 1 && r->lattice == 2048 && r->finite == 1024,
+                      "C25 fixture: 2048 positions, half of them finite, and decimation on");
+                check(r && r->points == 0,
+                      "C25 ...and no curve, because the live pairs alternate by bucket");
+                // ANTI-VACUOUS: every finite position HAS a finite neighbour
+                // here, so the stride-1 sentence would be false. Checked on the
+                // profile itself, not on the wording.
+                check(std::isfinite(app.proj[0].h[0][0]) &&
+                      std::isfinite(app.proj[0].h[0][2]) &&
+                      !std::isfinite(app.proj[0].h[0][4]),
+                      "C25 fixture: columns 0 and 2 are both finite - they ARE neighbours");
+                check(g_projNoCurveProbe.find("no two of them next to each other") ==
+                          std::string::npos,
+                      "C25 so the sentence does not say 'no two positions next to each other'");
+                check(g_projNoCurveProbe.find("decimating 2 positions to a point") !=
+                          std::string::npos &&
+                      g_projNoCurveProbe.find("no two neighbouring groups both do") !=
+                          std::string::npos,
+                      "C25 ...it names the decimation, which is what actually refused");
             }
 
             // ---- everything borrowed, put back ------------------------------------
