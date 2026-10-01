@@ -2310,12 +2310,32 @@ static size_t reloadJobItemsForStack(App::ReloadJob* j, int seqId) {
 // their landing is a JOIN instead of a swap (watchFrameAxisJoin) rather than a
 // second decode path.
 //
-// ONE GROUP, always, and it is provable rather than hoped: every arrival is the
-// same local .npy (watchFrameAxisPlan refuses a container member, a peer frame
-// and a raw recipe by name, so reloadReadKey cannot answer "" for one of
-// these), they share npyRead, and reloadPickIndex is their fileFrame, which is
-// distinct by construction. So N joining frames are ONE stat, ONE read and ONE
-// decode pass - where the UI thread used to pay one whole-file read PER frame.
+// ONE GROUP, always, and it is provable rather than hoped - but the proof has
+// to cite the guards that EXIST. reloadReadKey answers "" (read this one on its
+// own) for three kinds of spec, and watchFrameAxisPlan has already excluded all
+// three before this function can be reached:
+//
+//   a CONTAINER/READER member (`__pixels_*`) - refused BY NAME: the plan
+//     requires `s.member.empty()` of the head and of every member.
+//   a PEER frame - refused by the PATH: the plan's `path` is
+//     watchLocalPathOf(s0), which is "" for a real remote url, and an empty
+//     path returns applies=false. (A `local://` url answers with the on-disk
+//     path, and that one really is local, which is §13.7's own line.)
+//   a RAW RECIPE - and this is the one the first version of this comment got
+//     WRONG. watchFrameAxisPlan never looks at `rawDtype`; it does not have to,
+//     and saying it did made this paragraph cite a guard that is not there.
+//     What actually excludes a raw source is the shape of the stack: a raw open
+//     yields ONE image per file (decodeRawFrame), so a raw stack is a FOLDER of
+//     one-frame files and its second member fails
+//     `watchLocalPathOf(s) != path`. A raw stack of exactly one member survives
+//     that and is then refused by watchNpyFrames, which peeks for an .npy
+//     header and answers -1.
+//
+// On top of that the arrivals share npyRead (the plan carries one, taken from
+// the head and checked against every member), and reloadPickIndex is their
+// fileFrame, which is distinct by construction. So N joining frames are ONE
+// stat, ONE read and ONE decode pass - where the UI thread used to pay one
+// whole-file read PER frame.
 //
 // `w/h/ch` are deliberately left at 0. A joining frame has no RECORDED shape to
 // re-apply: it is new. Those fields are what reloadLand's dims note and

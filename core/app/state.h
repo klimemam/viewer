@@ -3007,8 +3007,14 @@ struct App {
         // ---- §12.6: the job's SECOND STAGE, the frame-axis ARRIVALS ---------
         // The arrivals used to be watchReloadFinish's, on the UI thread, one
         // whole-file read PER joining frame - the one path PR #275 did not
-        // reach, and measured at 641 ms (3 -> 5 frames) and 1797 ms (3 -> 10)
-        // on a 480 MB .npy. They are a second pass of THIS job now:
+        // reach, and measured at 375 ms (3 -> 5 frames) and 1374 ms (3 -> 10)
+        // on a 480 MB .npy. Those are watch-design §20.1's table, which is the
+        // canonical pair: a QUIET machine, median of 3. (The same two cases
+        // measured 641 / 1797 ms while other builds were running on the same
+        // machine, and that pair is cited there as the loaded run and nowhere
+        // else - quoting the pessimistic number under the quiet method's
+        // sentence is how a reader comes to compare two different experiments.)
+        // They are a second pass of THIS job now:
         //
         //   stage 1  the resident memberships are re-read (`items`) and land.
         //            Then, and only then, the head frame's shape is a FACT and

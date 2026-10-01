@@ -1115,11 +1115,25 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
         // quietly became a stack of a different picture is not (§9 rule 3: an
         // automatic reload has nobody's click behind it, so the evidence has to
         // be MORE than a manual one leaves).
-        const std::string sh = watch::frameAxisShapeText(
-            ax.wasW > 0 ? frameShapeText(ax.wasW, ax.wasH, ax.wasCh) : std::string(),
-            ax.headRecorded() ? frameShapeText(ax.headW, ax.headH, ax.headCh)
-                              : std::string());
-        if (!sh.empty()) msg += " - " + sh;
+        //
+        // THE QUESTION IS THE PLAN'S, and it is asked through the predicate
+        // that lives beside the fields. The first version of this built the two
+        // strings and let frameAxisShapeText's `was == now` decide, which left
+        // WatchAxisPlan::shapeMoved() with no caller at all - and a predicate
+        // sitting unused at the declaration site is a trap, because the next
+        // reader takes it for the real test and reasons about the wrong code.
+        // (A refutation round did exactly that.)
+        //
+        // frameAxisShapeText KEEPS its own guard, and that is not a second
+        // decision: it is a pure function with its own direct callers and its
+        // own cases (W46f), so its guard is about ITS inputs while this one is
+        // about THIS plan.
+        if (ax.shapeMoved()) {
+            const std::string sh = watch::frameAxisShapeText(
+                frameShapeText(ax.wasW, ax.wasH, ax.wasCh),
+                frameShapeText(ax.headW, ax.headH, ax.headCh));
+            if (!sh.empty()) msg += " - " + sh;
+        }
         // ...and WHO JOINED, when not everybody did. frameAxisText's n-of-N
         // already carries the numbers; this carries the reason, which is the
         // half a faded toast used to be the only witness of.

@@ -940,9 +940,13 @@ static int asyncOpenSelftest(const std::string& root) {
     //
     // Measured before it was fixed, with freeze_probe.ps1 and the gesture
     // really made (watchFiles + watchAutoReload on, the file replaced from the
-    // side): a 480 MB .npy at 3 -> 5 frames froze the pump for 641 ms and at
-    // 3 -> 10 frames for 1797 ms, median of 3. This is what a headless run can
-    // hold down about that, and it is four separate statements:
+    // side, QUIET machine, median of 3): a 480 MB .npy at 3 -> 5 frames froze
+    // the pump for 375 ms and at 3 -> 10 frames for 1374 ms. That pair is
+    // watch-design §20.1's table and is the one to quote; the 641 / 1797 ms
+    // pair in that section is the SAME two cases measured while other builds
+    // were running on the machine, and it belongs only where it says so.
+    // This is what a headless run can hold down about it, and it is four
+    // separate statements:
     //
     //   (a) THE ARRIVALS DECODED ON THE JOB'S THREAD, not this one. rreader's
     //       R24b is the pattern and its reason: the id is recorded where the
@@ -981,7 +985,11 @@ static int asyncOpenSelftest(const std::string& root) {
             }
     };
     auto arrPx = [&](int gen, int fr) { return (float)(gen * 1000 + fr * 100); };
-    const int64_t AH = 700, AW = 900;      // 3 * 700 * 900 * 2 = 3.8 MB a frame
+    // 700 * 900 * 2 = 1,260,000 bytes A FRAME, so the three-frame generation is
+    // 3.8 MB and the eight-frame one 10.1 MB. Big enough that the worker is
+    // still working when the pump comes round (R2's (b), one stage over),
+    // small enough that six cases of it cost no wall clock worth counting.
+    const int64_t AH = 700, AW = 900;
 
     {   // ---- R9f/R9g: the arrivals go to the WORKER, and cost ONE read ------
         closeAll();
@@ -1092,18 +1100,64 @@ static int asyncOpenSelftest(const std::string& root) {
         writeArr(2, 8, AH, AW);              // FIVE joining frames, not two
         const long long reads0 = g_fileReads;
         watchReloadNow(seq, false);
-        const bool drained = driveReload(24000, -1);
+        // ---- R9g6: the PROGRESS ROW during stage 2 (review, 3-0) ------------
+        // The row is the only face the second stage has, and an automatic
+        // reload puts it up with nobody's click behind it - so "what is
+        // happening right now" is readable there or nowhere. It had no assert
+        // at all, which is how a row saying a finished fraction for the whole
+        // second half of the gesture would have shipped.
+        //
+        // Captured from a LIVE job rather than reconstructed: the row is read
+        // on the frame that stage 2 has landed its first arrival, together with
+        // the four numbers it is supposed to agree with. Five arrivals and
+        // three resident members make the two stages' fractions tell apart -
+        // "/ 5 new frame(s)" cannot be stage 1's "/ 3".
+        const std::string row1 = app.reloadJob ? reloadJobRowText(*app.reloadJob)
+                                               : std::string();
+        std::string row2;
+        int sawNum = -1, sawDen = -1, sawJoined = -1, sawOffered = -1;
+        int it = 0;
+        while ((app.reloadJob || !app.reloadQueue.empty()) && it++ < 24000) {
+            pumpReloadJob();
+            if (row2.empty() && app.reloadJob && app.reloadJob->stage == 2 &&
+                app.reloadJob->arrivalsLanded >= 1) {
+                row2 = reloadJobRowText(*app.reloadJob);
+                sawNum = app.reloadJob->arrivalsLanded;
+                sawDen = (int)app.reloadJob->arrivals.size();
+                sawJoined = app.reloadJob->axis.joined;
+                sawOffered = app.reloadJob->axis.offered();
+            }
+            if (app.reloadJob && !app.reloadJob->done.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        const bool drained = !app.reloadJob && app.reloadQueue.empty();
         const long long reads = g_fileReads - reads0;
+        const std::string want2 = std::to_string(sawNum) + " / " +
+                                  std::to_string(sawDen) + " new frame(s)";
         fprintf(stderr, "asyncopenselftest: R9g4 grew 3 -> 8 (FIVE joining): "
                         "drained=%d frames=%zu reads=%lld  (whole-file reads; must "
                         "be 2 for ANY number of arrivals - it was 1+arrivals, so "
                         "6 here)\n",
                 (int)drained, framesOfSeq(seq).size(), reads);
+        fprintf(stderr, "asyncopenselftest: R9g6 rows: stage1=\"%s\" stage2=\"%s\" "
+                        "landed=%d/%d joined=%d offered=%d\n",
+                row1.c_str(), row2.c_str(), sawNum, sawDen, sawJoined, sawOffered);
         check(drained && framesOfSeq(seq).size() == 8,
               "R9g4 a grow of FIVE frames lands all five");
         check(reads == 2,
               "R9g5 ...and still costs TWO whole-file reads: the count does not "
               "move with the number of joining frames");
+        check(row1.rfind("reloading ", 0) == 0 &&
+                  row1.find(" / 3  ") != std::string::npos &&
+                  row1.find("new frame(s)") == std::string::npos,
+              "R9g6 stage 1's row is the re-read's fraction, 3 of them");
+        check(!row2.empty() && row2.rfind("reloading ", 0) == 0 &&
+                  row2.find(want2) != std::string::npos,
+              "R9g6b ...and stage 2's row says n / N NEW frame(s), not the "
+              "finished fraction of the re-read");
+        check(sawDen == sawOffered && sawDen == 5 && sawNum == sawJoined,
+              "R9g6c ...and those numbers ARE the plan's: the denominator is "
+              "offered() and the numerator is what has joined");
     }
 
     {   // ---- R9h: the SHAPE is a RECORD, and a frame that cannot join says so
