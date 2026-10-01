@@ -6,6 +6,7 @@
 // network, and no credentials of our own - ssh owns the authentication. Passing
 // an empty host starts a local peer instead, which is how this is tested.
 #pragma once
+#include <algorithm>          // std::min - effectiveVersion()
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -30,6 +31,15 @@ struct Entry {
     bool group = false;                // synthetic row for a numbered sequence
     uint32_t frames = 0;               // member count when group
     std::vector<std::string> members;  // member file names (no directory part)
+    // Protocol 16, group rows only: the smallest and largest member, in bytes.
+    // `size` is their SUM and cannot answer "are they all one shape" - the sum
+    // of 108/110/106 is the sum of 108/108/108 - and for a HEADERLESS folder
+    // that question decides whether the bytes may be read at all (the geometry
+    // comes from a recipe, so a member of another length reads as another
+    // picture). hasMemberSizes is false from a pre-16 peer, which is not an
+    // "unknown" the client may round to yes: it refuses the open and says so.
+    bool hasMemberSizes = false;
+    uint64_t minMemberSize = 0, maxMemberSize = 0;
 };
 
 // LIST reply payload -> entries, in the shape `peerVersion` promises. Split out
@@ -377,6 +387,36 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int helloVersion_ = (int)rp::VERSION;
+    // The protocol actually IN FORCE for a field whose presence is decided by
+    // the CLIENT's announced number rather than the peer's. It is the smaller
+    // of the two, not peerVersion_ alone: a client that announced less than it
+    // can parse would otherwise read a field the peer correctly did not send,
+    // or write one the peer will not consume - and everything after it is then
+    // parsed from the wrong offset.
+    //
+    // There are THREE such fields. This comment has now been wrong twice about
+    // the count - it said one, then two - so the rule is written out instead of
+    // the number being asserted: ANY field the peer gates on g_clientVersion,
+    // or on the minimum of that and its own, is read through here. Grep
+    // serve.cpp for `g_clientVersion` and the list is the answer.
+    //
+    //   the LIST/SCAN group row's member sizes   peer sends them only to a
+    //                                            client that announced 16
+    //                                            (putGroupEntryV3)
+    //   the MEASURE keyed reading                peer reads it only from a
+    //                                            client that announced 15
+    //                                            (handleMeasure)
+    //   the META/TILE request TRAILERS           peer picks the v12 flags-word
+    //                                            form only when BOTH numbers
+    //                                            are 12 (getTrailers), and the
+    //                                            two forms are not the same
+    //                                            length - so getting this one
+    //                                            wrong shifts every byte after
+    //                                            it (review P2-2)
+    //
+    // Only setHelloVersionForTest can make the two numbers disagree today, and
+    // a seam that can desynchronise a parser is not a seam worth leaving armed.
+    int effectiveVersion() const { return std::min(peerVersion_, helloVersion_); }
     int port_ = 0;
     bool serveReaders_ = true;
     bool explainFailure_ = false;

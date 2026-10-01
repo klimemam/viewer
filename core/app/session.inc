@@ -2788,9 +2788,11 @@ static App::RestoreWait& restoreWaitFor(const ImageDoc& im) {
 static void parkRestoreWait(const ImageDoc& im, int seqFrame) {
     restoreWaitFor(im).seqFrame = seqFrame;
 }
-static void parkRestoreWait(const ImageDoc& im, int x, int y, int w, int h) {
+static void parkRestoreWait(const ImageDoc& im, int x, int y, int w, int h,
+                            bool fromSession = true) {
     App::RestoreWait& e = restoreWaitFor(im);
     e.cx = x; e.cy = y; e.cw = w; e.ch = h;
+    e.cropFromSession = fromSession;
 }
 
 // Drained from the frame loop, right after the remote fetch pump - so a frame
@@ -2833,17 +2835,18 @@ static void pumpRestoreWaits() {
             // that clears it either lands or records remoteErr, so waiting on
             // the fetcher's idle would give up on a doc whose frame arrives a
             // moment later in a busy queue.
+            const char* whose = w.cropFromSession ? "the crop this session saved"
+                                                 : "the recipe's crop";
             if (im->src->remoteStep <= 1) {
                 if (cropInPlace(*im, w.cx, w.cy, w.cw, w.ch)) {
                     if (im == cur()) app.fitRequested = true;
                 } else {
-                    toast(w.doc + ": the crop this session saved could not be "
-                          "put back", true);
+                    toast(w.doc + ": " + whose + " could not be applied", true);
                 }
                 w.cw = 0;
             } else if (!im->src->remoteErr.empty()) {
-                toast(w.doc + ": the full frame never arrived, so the crop this "
-                      "session saved was not put back", true);
+                toast(w.doc + ": the full frame never arrived, so " + whose +
+                      " was not applied", true);
                 w.cw = 0;
             } else done = false;
         }
@@ -3669,8 +3672,45 @@ static std::string loadSession(const std::string& path,
                 d.littleEndian = le != 0;
                 d.path = restOfLine(ls);
                 lineFile = d.path;
-                err = loadRaw(d);
-                if (err.empty()) cur()->cfaColorize = col != 0;
+                // A headerless frame that lived on a PEER. The line already
+                // holds every field of the recipe - that is what raw3 IS - so
+                // the restore has a declaration and never needs to ask; what it
+                // needed was a door, and it was calling the LOCAL decoder on a
+                // url (decodeRawFrame opens a file named "ssh://...", which
+                // fails, so a saved remote raw doc could not come back).
+                // 9 wrote this dispatch down and stage 4 shipped without it.
+                // M2 holds either way: the session wins, no dialog, no binding.
+                //
+                // hasUrlScheme, NOT isPeerUrl (review #7): a local:// raw doc
+                // is a url too - the peer that served it ran on this machine -
+                // and decodeRawFrame cannot open a path spelled "local://..."
+                // any more than one spelled "ssh://...", so that line came
+                // back as "cannot open" for every session that held one.
+                // openRemote's own #111 block decides which reader a local://
+                // url belongs to; this door's job is only to stop handing a url
+                // to the local decoder.
+                if (hasUrlScheme(d.path)) {
+                    const rp::RawWire rw = rawWireFrom(d);
+                    if (openRemote(d.path, false, 0, NR_NATIVE, &rw)) {
+                        // the crop the line recorded is re-applied to what came
+                        // back, because the wire carries none (3.2) - and it is
+                        // applied the way the npy3 branch below applies its own:
+                        // cropInPlace REFUSES while the source is a decimated
+                        // preview, and G10 (PR #177) is the record of what
+                        // ignoring that `false` cost. Same situation, same
+                        // answer, no second mechanism.
+                        if (d.cropOn && cur() &&
+                            !cropInPlace(*cur(), d.cropX, d.cropY, d.cropW, d.cropH)) {
+                            parkRestoreWait(*cur(), d.cropX, d.cropY, d.cropW, d.cropH);
+                            rep.note(LK_CropDeferred, cur()->name);
+                        }
+                    } else {
+                        err = "cannot reopen " + d.path;
+                    }
+                } else {
+                    err = loadRaw(d);
+                }
+                if (err.empty() && cur()) cur()->cfaColorize = col != 0;
             } else if (kind == "npy2" || kind == "npy3") {
                 int cfa = 0, pat = 0, col = 0, ccx = 0, ccy = 0, ccw = 0, cch = 0;
                 ls >> cfa >> pat >> col;

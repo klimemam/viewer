@@ -413,26 +413,39 @@
         // false, and the refusal fell to the generic "the peer serves .npy,
         // PNG, ..." - a list the operator can already see this file is not in.
         //
-        // This stage does not open the door (that is protocol 11,
-        // docs/features/remote/remote-headerless-design.md stage 2). It makes the refusal TRUE:
-        // the shape of this file is a declaration that lives on this machine
-        // and the wire has no field to carry it, which is one step more
-        // specific than the fall-through and names a door that does work.
+        // The door IS open (protocol 11, docs/features/remote/remote-headerless-design.md
+        // stage 2, shipped the same day stage 1 did) - so what this checks is
+        // no longer "the wire cannot carry a declaration", which is what the
+        // sentence said for six weeks after it stopped being true. It is the
+        // replacement: a headerless file states its shape in a RECIPE, this
+        // request carried none, and here is how to state one. The assertions
+        // below pin the ABSENCE of the old wording, because pinning only the
+        // words that stayed is how the stale half survived (PR #278).
         //
         // Walked over headerlessExts() rather than a list here, for F4c's
         // reason: an extension added to that array tomorrow is checked without
         // anybody editing this test.
         {
-            bool served = false, said = true, generic = false;
+            bool served = false, said = true, generic = false, stale = false;
             std::string worst;
             for (const std::string& e : imagefile::headerlessExts()) {
                 const std::string n = "capture" + e;
                 if (peerServesName(n)) served = true;          // stage 2 flips this
                 const std::string why = peerRefusalFor(n);
                 if (!has(why, "headerless") || !has(why, "File > Open") ||
-                    !has(why, e.c_str())) { said = false; if (worst.empty()) worst = why; }
+                    !has(why, e.c_str()) || !has(why, "no recipe") ||
+                    !has(why, "--raw-size")) { said = false; if (worst.empty()) worst = why; }
                 // ...and it must not be the fall-through wearing a new coat
                 if (why.rfind("the peer serves", 0) == 0) generic = true;
+                // ...NOR stage 1's sentence, which is the one this test let
+                // through for six weeks. "this link cannot yet carry that
+                // declaration" was true until protocol 11 shipped on the SAME
+                // DAY, and a user pasted it back on 2026-09-29. The wording
+                // was asserted here and the FACT behind it was not, so this is
+                // the fact: nothing in this refusal may say the wire is the
+                // thing that cannot carry a recipe.
+                if (has(why, "cannot yet carry") || has(why, "recipe-carrying build") ||
+                    has(why, "update both ends")) stale = true;
             }
             const size_t n = imagefile::headerlessExts().size();
             fprintf(stderr, "fmtgateselftest:   headerless: %zu ext(s), peerServes=%d "
@@ -466,6 +479,7 @@
             check(!served, "F4d the peer still does not serve a headerless file");
             check(said, "F4d ...and says so by NAME, with the door that does work");
             check(!generic, "F4d ...instead of the generic list it used to fall to");
+            check(!stale, "F4d ...and never again claims this build cannot carry a recipe");
         }
 
         // ---- F4g: a CONTAINER on a peer (issue #217, R18) --------------------
@@ -705,6 +719,991 @@
                       "F4f the second time, this session's binding opens it without asking");
                 check(has(app.toast, "recipe") || has(app.toast, "bytes"),
                       "F4f ...and says which recipe it applied, never silently");
+                g_rawSizeRecipe.clear();
+                closeAll();
+            }
+
+            // ---- F4h: THE OTHER DOORS, and the sentence when there is none ---
+            // The user's report (2026-09-29) was a toast, pasted verbatim:
+            //
+            //   [error] remote: a headerless .raw states its shape in a recipe
+            //   on this machine, and this link cannot yet carry that declaration
+            //
+            // That sentence is stage 1's, and it stopped being true when
+            // protocol 11 shipped - the wire HAS carried a recipe since #186.
+            // What was actually wrong was narrower and worse: only ONE door
+            // asked for a recipe (openRemoteRawRow, reached from a Browse
+            // row's double-click). Every other way to name a headerless file
+            // on a peer - a url on the command line, a drop, File > Open, a
+            // folder opened as a stack - called openRemote with a null recipe
+            // and got a refusal that blamed the build.
+            //
+            // So this block asserts the two halves together, because either
+            // one alone is a lie: the doors ASK, and the refusal that is left
+            // says what is actually missing.
+            {
+                // ---- (1) the SENTENCE the client is left with ---------------
+                // Reproduced where the user met it: Session::meta with no
+                // recipe, which is the call openRemote makes and the source of
+                // the "remote: " prefix in the report.
+                closeAll();
+                rawDlg.open = false;
+                g_rawSizeRecipe.clear();
+                // The session this drives, said out loud: F4f's accept left one
+                // alive on `dpath`'s host, and a test that silently inherits
+                // one it did not ask for proves nothing the day the order of
+                // these blocks changes (review: "F4h(1) depends on
+                // app.uiSession implicitly").
+                std::string uerr0;
+                const bool haveUi = ensureUiSession("", uerr0, 0) &&
+                                    app.uiSession.peerVersion() >= 11;
+                fprintf(stderr, "fmtgateselftest:   F4h session: alive=%d protocol=%d %s\n",
+                        haveUi ? 1 : 0, app.uiSession.peerVersion(), uerr0.c_str());
+                check(haveUi, "F4h (setup) a local:// peer that can be told a recipe");
+                remote::Meta mm{};
+                std::string merr;
+                const bool mok = app.uiSession.meta(dpath, mm, merr, NR_NATIVE, nullptr);
+                fprintf(stderr, "fmtgateselftest:   F4h client refusal: ok=%d \"%s\"\n",
+                        mok ? 1 : 0, merr.c_str());
+                check(!mok, "F4h a headerless request with no recipe is still refused");
+                check(!has(merr, "cannot yet carry") && !has(merr, "recipe-carrying build"),
+                      "F4h ...and the refusal no longer claims this build cannot carry one");
+                check(has(merr, "no recipe") && has(merr, "--raw-size"),
+                      "F4h ...it names what is missing and how to declare it");
+
+                // ---- (2) the SIZE, from the listing that already carries it --
+                // §5.2: no new wire. MSG_LIST has returned a byte count since
+                // protocol 3, and handleList answers for a non-directory path
+                // with that one entry. Derived: 12 B of junk header + 8*6
+                // samples * 2 B/sample = 108 bytes.
+                const uint64_t WANT = (uint64_t)DHDR + (uint64_t)DW * DH * 2;
+                std::vector<remote::Entry> le;
+                std::string lerr;
+                const bool lok = app.uiSession.list(dpath, le, lerr);
+                fprintf(stderr, "fmtgateselftest:   F4h LIST of one file: ok=%d n=%zu "
+                                "size=%llu (want %llu) %s\n",
+                        lok ? 1 : 0, le.size(),
+                        (unsigned long long)(le.empty() ? 0 : le[0].size),
+                        (unsigned long long)WANT, lerr.c_str());
+                check(lok && le.size() == 1 && le[0].size == WANT,
+                      "F4h the peer's own listing carries the byte count a dialog needs");
+
+                // ---- (2b) THE PEER's half of the same refusal ---------------
+                // Two sentences, one lead-in, chosen by WHO noticed
+                // (imagefile::RefusedBy). The peer's names THE VIEWER THE
+                // READER IS RUNNING, which is the only thing anybody can act on
+                // when a request arrives without a recipe - and it must not say
+                // "the other end", because this sentence travels back over the
+                // link and the other end, from where it is read, is the peer
+                // (the one machine that is not the problem). It must also NOT
+                // offer this build's doors, which a peer has none of. Asserted
+                // together so neither can be edited into a copy of the other.
+                {
+                    const std::string cl = imagefile::peerRefusal("capture.raw");
+                    const std::string pe = imagefile::peerRefusal(
+                        "capture.raw", imagefile::RefusedBy::Peer);
+                    fprintf(stderr, "fmtgateselftest:   F4h peer-side refusal: \"%s\"\n",
+                            pe.c_str());
+                    check(has(pe, "carries no header") && has(pe, "no recipe") &&
+                          has(pe, "protocol-11") && has(pe, "you are running") &&
+                          !has(pe, "other end"),
+                          "F4h the PEER's refusal names the viewer the READER is running");
+                    check(!has(pe, "cannot yet carry") && !has(pe, "--raw-size") &&
+                          !has(pe, "File > Open"),
+                          "F4h ...and offers no door of a build it is not running");
+                    check(cl != pe && has(cl, "carries no header"),
+                          "F4h the two sides share the lead-in and differ in the way out");
+                }
+
+                // ---- (3) the URL DOOR: it asks, on the url, for that size ---
+                // openRemoteRawDeclared is the one function every human door
+                // now goes through - the Browse row, a url named on the
+                // command line, a drop, File > Open. Called with 0 for the
+                // size, which is all a door holding a url knows: it LISTs once
+                // and puts what came back in the dialog.
+                closeAll();
+                rawDlg.open = false;
+                app.toast.clear();
+                const int raisedBefore = g_rawDialogsRaised;
+                openRemoteRawDeclared(url, 0);
+                fprintf(stderr, "fmtgateselftest:   F4h url door: dialog=%d asks=%d "
+                                "path=%s size=%zu (want %llu)\n",
+                        rawDlg.open ? 1 : 0, g_rawDialogsRaised - raisedBefore,
+                        rawDlg.path.c_str(), rawDlg.fileSize,
+                        (unsigned long long)WANT);
+                check(rawDlg.open && g_rawDialogsRaised == raisedBefore + 1 &&
+                      rawDlg.path == url && rawDlg.fileSize == (size_t)WANT,
+                      "F4h a url named on its own asks for the geometry, sized from LIST");
+                // accept it, and compare with what the LOCAL decoder makes of
+                // the same bytes - sample for sample, no tolerance. The peer
+                // normalises endianness and swaps BGR itself, so an `==` here
+                // is what proves the two ends agree rather than restating it.
+                rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                rawDlg.littleEndian = true;
+                const std::string uerr = rawDialogAccept(rawDlg);
+                rawDlg.open = false;
+                const ImageDoc* ud = app.images.empty() ? nullptr : app.images.front().get();
+                RawDialog lref;
+                lref.dtype = RD_U16; lref.interp = RI_GRAY;
+                lref.w = DW; lref.h = DH; lref.offset = DHDR; lref.littleEndian = true;
+                lref.path = dpath;
+                std::string rerr;
+                std::unique_ptr<ImageDoc> localRef = decodeRawFrame(lref, rerr);
+                // ...and that the left-hand side is the PEER's answer and not
+                // a second local decode wearing a url. Without this the whole
+                // comparison could pass with the remote door removed (review:
+                // "the bit-equality assert does not pin where the pixels came
+                // from"): a doc that came through openRemote carries the url it
+                // was fetched from and the protocol the peer announced.
+                const bool cameOverTheLink = ud && !ud->src->remoteUrl.empty() &&
+                                             ud->src->remoteUrl == url &&
+                                             ud->src->remoteProto >= 11;
+                bool bitEqual = ud && localRef && ud->w == localRef->w &&
+                                ud->h == localRef->h && ud->ch == localRef->ch &&
+                                ud->px().size() == localRef->px().size();
+                if (bitEqual)
+                    for (size_t i = 0; i < localRef->px().size(); i++)
+                        if (ud->px()[i] != localRef->px()[i]) bitEqual = false;
+                // anti-vacuity: two empty decodes agree perfectly
+                bool varied = false;
+                if (localRef && localRef->px().size() == (size_t)DW * DH)
+                    for (size_t i = 1; i < localRef->px().size(); i++)
+                        if (localRef->px()[i] != localRef->px()[0]) varied = true;
+                fprintf(stderr, "fmtgateselftest:   F4h accept: err=\"%s\" local=%s "
+                                "bit-equal=%d varied=%d\n", uerr.c_str(),
+                        localRef ? "decoded" : rerr.c_str(), bitEqual ? 1 : 0,
+                        varied ? 1 : 0);
+                check(varied, "F4h the local reference really decoded 48 varying samples");
+                check(cameOverTheLink,
+                      "F4h ...and the compared document came over the LINK, not off the disk");
+                check(uerr.empty() && bitEqual,
+                      "F4h ...and the peer's pixels are the local decoder's, bit for bit");
+
+                // ---- (4) BOUND: the second file of the same size, no dialog --
+                // #166's rule over a link. probe2.raw holds different values
+                // and exactly as many bytes, so nothing but the binding can
+                // answer for it - and the door has to SAY which recipe it
+                // applied, which is the one property that makes applying one
+                // without asking safe.
+                {
+                    std::vector<uint16_t> p2((size_t)DW * DH);
+                    for (size_t i = 0; i < p2.size(); i++) p2[i] = (uint16_t)(i * 11 + 5);
+                    const std::string p2path = (ddir / "probe2.raw").u8string();
+                    {
+                        std::ofstream f2(pathFromUtf8(p2path), std::ios::binary);
+                        const std::vector<uint8_t> junk(DHDR, 0x5A);
+                        f2.write((const char*)junk.data(), DHDR);
+                        f2.write((const char*)p2.data(), (std::streamsize)(p2.size() * 2));
+                    }
+                    std::string u2 = "local://" + p2path;
+                    std::replace(u2.begin(), u2.end(), '\\', '/');
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    const int r2 = g_rawDialogsRaised;
+                    openRemoteRawDeclared(u2, 0);
+                    const ImageDoc* bd2 = app.images.empty() ? nullptr : app.images.front().get();
+                    bool same2 = bd2 && bd2->px().size() == p2.size();
+                    if (same2)
+                        for (size_t i = 0; i < p2.size(); i++)
+                            if (bd2->px()[i] != (float)p2[i]) same2 = false;
+                    fprintf(stderr, "fmtgateselftest:   F4h bound: asks=%d docs=%zu "
+                                    "pixels=%d toast=\"%s\"\n",
+                            g_rawDialogsRaised - r2, app.images.size(), same2 ? 1 : 0,
+                            app.toast.c_str());
+                    check(g_rawDialogsRaised == r2 && same2,
+                          "F4h a second file of the same size opens from the binding");
+                    const std::string want2 = "this session's recipe for " +
+                                              std::to_string(WANT) + "-byte files";
+                    check(has(app.toast, want2.c_str()),
+                          "F4h ...and says which recipe it applied (rawRecipeAppliedLine)");
+                }
+
+                // ---- (5) a FOLDER as one stack: one question, every member --
+                // §11 stage 4: the recipe belongs to the OPEN. A stack whose
+                // members disagreed about the geometry would not be one array
+                // read N times - and a headerless file cannot defend itself, so
+                // the bytes would still make a picture.
+                //
+                // Three members of 108 bytes each, different values per frame.
+                std::filesystem::path sdir = ddir / "stk";
+                std::filesystem::create_directories(sdir, dec);
+                std::vector<std::string> sfiles;
+                std::vector<std::vector<uint16_t>> svals;
+                for (int k = 0; k < 3; k++) {
+                    std::vector<uint16_t> v((size_t)DW * DH);
+                    for (size_t i = 0; i < v.size(); i++) v[i] = (uint16_t)(i * 7 + 3 + k * 100);
+                    char nm[32];
+                    snprintf(nm, sizeof nm, "f_%03d.raw", k + 1);
+                    const std::string fp = (sdir / nm).u8string();
+                    std::ofstream f3(pathFromUtf8(fp), std::ios::binary);
+                    const std::vector<uint8_t> junk(DHDR, 0xA5);
+                    f3.write((const char*)junk.data(), DHDR);
+                    f3.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                    f3.close();
+                    std::string up = fp;
+                    std::replace(up.begin(), up.end(), '\\', '/');
+                    sfiles.push_back(up);
+                    svals.push_back(std::move(v));
+                }
+                {
+                    // (3)'s accept bound 108-byte files for this session, so
+                    // this Open must not ask at all - and the counter is what
+                    // says so: rawDlg.open alone cannot tell one question from
+                    // three asked and answered in between.
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    const int r5 = g_rawDialogsRaised;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    // the members arrive on the background fetcher; the UI
+                    // thread swaps them in, so a headless test has to be it
+                    double tw = nowSec();
+                    while (nowSec() - tw < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    // every member: the recipe on its source, and the pixels
+                    // the local decoder makes of its own bytes
+                    int withRecipe = 0, bitOk = 0;
+                    for (const auto& d3 : app.images) {
+                        if (d3->src->rawDtype == RD_U16 && d3->src->rawInterp == RI_GRAY &&
+                            d3->src->rawOffset == DHDR && d3->src->rawLE &&
+                            d3->src->srcW == DW && d3->src->srcH == DH) withRecipe++;
+                        for (int k = 0; k < 3; k++)
+                            if (d3->name == baseName(sfiles[k])) {
+                                bool eq = d3->px().size() == svals[k].size();
+                                if (eq)
+                                    for (size_t i = 0; i < svals[k].size(); i++)
+                                        if (d3->px()[i] != (float)svals[k][i]) eq = false;
+                                if (eq) bitOk++;
+                            }
+                    }
+                    fprintf(stderr, "fmtgateselftest:   F4h stack: docs=%zu seqs=%zu "
+                                    "asks=%d withRecipe=%d bitOk=%d\n",
+                            app.images.size(), app.seqs.size(),
+                            g_rawDialogsRaised - r5, withRecipe, bitOk);
+                    check(app.images.size() == 3 && app.seqs.size() == 1,
+                          "F4h a headerless folder opens as ONE stack of three frames");
+                    check(g_rawDialogsRaised == r5,
+                          "F4h ...asking nothing: this session's binding answered for the Open");
+                    check(withRecipe == 3,
+                          "F4h ...and every member carries the SAME recipe the head opened with");
+                    check(bitOk == 3,
+                          "F4h ...with every member's pixels the local decoder's, bit for bit");
+                }
+
+                // ---- (5b) ...and the same folder with NOTHING bound ---------
+                // The first-time path, which is the one a new operator takes:
+                // the Open is PARKED, the dialog comes up on the head member
+                // with the byte count the folder listing gave, and the answer
+                // opens all three. Driven the way drawRawModal's Load drives it
+                // (rawDialogAccept then resumeRemoteRawStack) because the modal
+                // itself needs ImGui and this test never draws - the same reason
+                // --rawrecipe-selftest drives rawDialogAccept rather than the
+                // button.
+                {
+                    g_rawSizeRecipe.clear();          // nothing is bound now
+                    closeAll();
+                    rawDlg.open = false;
+                    rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.toast.clear();
+                    const int r5b = g_rawDialogsRaised;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    const bool parked = rawDlg.open && rawDlg.forRemoteStack &&
+                                        app.remoteRawStack.alive &&
+                                        app.remoteRawStack.files.size() == 3 &&
+                                        rawDlg.fileSize == (size_t)WANT &&
+                                        g_rawDialogsRaised == r5b + 1;
+                    fprintf(stderr, "fmtgateselftest:   F4h unbound stack: asks=%d "
+                                    "parked=%d files=%zu size=%zu (want %llu) docs=%zu\n",
+                            g_rawDialogsRaised - r5b, app.remoteRawStack.alive ? 1 : 0,
+                            app.remoteRawStack.files.size(), rawDlg.fileSize,
+                            (unsigned long long)WANT, app.images.size());
+                    check(parked && app.images.empty(),
+                          "F4h an unbound headerless folder PARKS the Open and asks once");
+                    // the modal's Load, in two calls
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    const std::string serr = rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    double tw2 = nowSec();
+                    while (nowSec() - tw2 < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int rec2 = 0;
+                    for (const auto& d4 : app.images)
+                        if (d4->src->rawDtype == RD_U16 && d4->src->srcW == DW &&
+                            d4->src->srcH == DH && d4->src->rawOffset == DHDR) rec2++;
+                    fprintf(stderr, "fmtgateselftest:   F4h resumed: err=\"%s\" docs=%zu "
+                                    "seqs=%zu withRecipe=%d slot-cleared=%d\n",
+                            serr.c_str(), app.images.size(), app.seqs.size(), rec2,
+                            app.remoteRawStack.alive ? 0 : 1);
+                    check(serr.empty() && app.images.size() == 3 && app.seqs.size() == 1 &&
+                          rec2 == 3,
+                          "F4h ...and one answer opens all three members with it");
+                    check(!app.remoteRawStack.alive,
+                          "F4h ...and the parked slot is released, so the queue moves on");
+                    // ...and the answer BOUND the size, which is what makes (5)
+                    // above ask nothing - the two halves of #166's rule, over a
+                    // link, asserted together.
+                    check(rawRecipeForSize((size_t)WANT) != nullptr,
+                          "F4h ...and the answer bound the byte count for this session");
+                }
+
+                // ---- (6) MEMBERS OF DIFFERENT SIZES, and the two shapes that
+                //          a SUM cannot tell apart -------------------------
+                // A headerless file does not defend itself: 108 bytes and 110
+                // bytes both decode as 8x6 u16 with 12 B skipped, and the
+                // second one comes back as a PLAUSIBLE picture of the wrong
+                // bytes. So the folder is refused whole, before anything is
+                // read, and both numbers are quoted.
+                //
+                // THREE fixtures, and the last two are the review's
+                // counterexamples to the check this test first shipped with
+                // (which compared the group's SUM against count x headSize):
+                //
+                //   uneven   108 / 110 / 112   sum 330 != 3x108=324. The sum
+                //            catches this one, which is why it looked like a
+                //            check at all.
+                //   cancel   108 / 110 / 106   sum 324 == 3x108 EXACTLY. The
+                //            deviations cancel. The peer refuses 106 (its
+                //            offset+W*H*ch*elem = 108 is over that file's
+                //            size) but says nothing about 110, so the sum
+                //            check let a 110-byte member be read as its first
+                //            108 bytes.
+                //   silent   108 / 112 / 104 read at OFFSET 0, where the
+                //            recipe needs only 8*6*2 = 96 bytes. Sum 324 ==
+                //            3x108 again, and now every member is at or over
+                //            96 - so the peer refuses NOTHING and the stack
+                //            finishes with the face of a complete one while
+                //            two of its three frames were read from files of
+                //            other lengths. This is the case that has no
+                //            second line of defence anywhere, and the one that
+                //            makes min == max the check rather than the sum.
+                //
+                // All three must open nothing, ask nothing, and quote numbers.
+                {
+                    struct OddCase {
+                        const char* dir;
+                        int extra[3];        // samples added to DW*DH per member
+                        int offset;          // the recipe's header skip
+                        const char* lo;      // the two numbers the refusal owes
+                        const char* hi;
+                    };
+                    // derived: base = 12 + 8*6*2 = 108 bytes; one extra u16
+                    // sample is +2 bytes, so +1 -> 110, +2 -> 112, -1 -> 106,
+                    // -2 -> 104.
+                    const OddCase cases[] = {
+                        { "odd",    {  0,  1,  2 }, DHDR, "108", "112" },
+                        { "cancel", {  0,  1, -1 }, DHDR, "106", "110" },
+                        { "silent", {  0,  2, -2 }, 0,    "104", "112" },
+                    };
+                    for (const OddCase& c : cases) {
+                        std::filesystem::path odir = ddir / c.dir;
+                        std::filesystem::remove_all(odir, dec);
+                        std::filesystem::create_directories(odir, dec);
+                        std::vector<std::string> ofiles;
+                        uint64_t sum = 0;
+                        for (int k = 0; k < 3; k++) {
+                            const size_t n = (size_t)((int)(DW * DH) + c.extra[k]);
+                            std::vector<uint16_t> v(n, (uint16_t)(k + 1));
+                            char nm[32];
+                            snprintf(nm, sizeof nm, "g_%03d.raw", k + 1);
+                            const std::string fp = (odir / nm).u8string();
+                            std::ofstream f4(pathFromUtf8(fp), std::ios::binary);
+                            const std::vector<uint8_t> junk(DHDR, 0xA5);
+                            f4.write((const char*)junk.data(), DHDR);
+                            f4.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                            f4.close();
+                            sum += (uint64_t)DHDR + n * 2;
+                            std::string up = fp;
+                            std::replace(up.begin(), up.end(), '\\', '/');
+                            ofiles.push_back(up);
+                        }
+                        // the binding this Open would apply, so the refusal is
+                        // the ONLY thing that can stop it (the "silent" case
+                        // reads at offset 0, which is a different byte count
+                        // key - bind that one too)
+                        g_rawSizeRecipe.clear();
+                        RawDialog bind;
+                        bind.dtype = RD_U16; bind.interp = RI_GRAY;
+                        bind.w = DW; bind.h = DH; bind.offset = c.offset;
+                        bind.littleEndian = true;
+                        rawRecipeBindSize((size_t)WANT, rawRecipeFromDialog(bind));
+                        closeAll();
+                        rawDlg.open = false;
+                        app.toast.clear();
+                        const int r6 = g_rawDialogsRaised;
+                        openRemoteStack("", ofiles, std::string(c.dir) + "/g_???.raw", 0, 0);
+                        const std::string t = app.toast;
+                        const bool quiet = app.images.empty() && !rawDlg.open &&
+                                           g_rawDialogsRaised == r6;
+                        const bool numbers = has(t, c.lo) && has(t, c.hi);
+                        fprintf(stderr, "fmtgateselftest:   F4h %s (sum=%llu, 3x108=324): "
+                                        "docs=%zu asks=%d numbers=%d\n"
+                                        "fmtgateselftest:   F4h %s said: \"%s\"\n",
+                                c.dir, (unsigned long long)sum, app.images.size(),
+                                g_rawDialogsRaised - r6, numbers ? 1 : 0, c.dir, t.c_str());
+                        const std::string lab1 = std::string("F4h a folder whose members "
+                            "differ in size opens nothing and asks nothing (") + c.dir + ")";
+                        const std::string lab2 = std::string("F4h ...and quotes the two real "
+                            "byte counts (") + c.dir + ")";
+                        check(quiet, lab1.c_str());
+                        check(numbers, lab2.c_str());
+                    }
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                }
+
+                // ---- (6c) ...and when the listing names the files one by
+                //           one, the refusal names the ODD ONE --------------
+                // A numbered family comes back as a GROUP row, whose only
+                // per-member facts are the two extremes - so the refusal above
+                // can quote the numbers but not a name. Files that do NOT form
+                // a numbered run come back as their own rows, and then the
+                // refusal owes a name and gives one. Both halves are asserted
+                // because 12.1 claimed the naming for every case, which was not
+                // true of the one the fixtures happened to use (review #11).
+                {
+                    std::filesystem::path sdir2 = ddir / "singles";
+                    std::filesystem::remove_all(sdir2, dec);
+                    std::filesystem::create_directories(sdir2, dec);
+                    const char* nm2[2] = { "alpha.raw", "beta.raw" };
+                    const int extra2[2] = { 0, 1 };        // 108 and 110 bytes
+                    std::vector<std::string> pfiles;
+                    for (int k = 0; k < 2; k++) {
+                        std::vector<uint16_t> v((size_t)((int)(DW * DH) + extra2[k]), 7);
+                        const std::string fp = (sdir2 / nm2[k]).u8string();
+                        std::ofstream f5(pathFromUtf8(fp), std::ios::binary);
+                        const std::vector<uint8_t> junk(DHDR, 0xA5);
+                        f5.write((const char*)junk.data(), DHDR);
+                        f5.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                        f5.close();
+                        std::string up = fp;
+                        std::replace(up.begin(), up.end(), (char)92, '/');
+                        pfiles.push_back(up);
+                    }
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    const int r6c = g_rawDialogsRaised;
+                    openRemoteStack("", pfiles, "singles/*.raw", 0, 0);
+                    const std::string t6c = app.toast;
+                    fprintf(stderr, "fmtgateselftest:   F4h singles: docs=%zu asks=%d\n"
+                                    "fmtgateselftest:   F4h singles said: \"%s\"\n",
+                            app.images.size(), g_rawDialogsRaised - r6c, t6c.c_str());
+                    check(app.images.empty() && g_rawDialogsRaised == r6c,
+                          "F4h two loose headerless files of different sizes open nothing");
+                    check(has(t6c, "alpha.raw") && has(t6c, "beta.raw") &&
+                          has(t6c, "108") && has(t6c, "110"),
+                          "F4h ...and the refusal names BOTH files and both byte counts");
+                    closeAll();
+                }
+
+                // ---- (6d) ...and the THIRD door: a session rebuilding it -
+                // remoteSequenceSiblings is how a saved session gets a remote
+                // folder stack back, and it had no check at all - so the
+                // `silent` case went through it with no refusal anywhere and
+                // the stack came back looking complete while two of its three
+                // frames were read out of files of other lengths. Restore is
+                // the worst place for that: nobody is watching it happen
+                // (review P1). Driven with the SAME three fixtures as (6),
+                // because a check that only one door runs is not a check.
+                {
+                    struct RCase { const char* dir; const char* lo; const char* hi; };
+                    const RCase rc[] = {
+                        { "odd",    "108", "112" },
+                        { "cancel", "106", "110" },
+                        { "silent", "104", "112" },
+                    };
+                    for (const RCase& c : rc) {
+                        std::vector<std::string> rf;
+                        std::string rn, rw2;
+                        std::string u = "local://" + (ddir / c.dir / "g_001.raw").u8string();
+                        std::replace(u.begin(), u.end(), (char)92, '/');
+                        const bool got = remoteSequenceSiblings(u, rf, rn, rw2);
+                        fprintf(stderr, "fmtgateselftest:   F4h restore %s: rebuilt=%d \n"
+                                        "fmtgateselftest:   F4h restore %s said: \"%s\"\n",
+                                c.dir, got ? 1 : 0, c.dir, rw2.c_str());
+                        const std::string l1 = std::string("F4h a session does NOT rebuild "
+                            "a headerless stack whose members differ (") + c.dir + ")";
+                        const std::string l2 = std::string("F4h ...and says so in the "
+                            "RESTORE's terms, with both counts (") + c.dir + ")";
+                        check(!got && rf.empty(), l1.c_str());
+                        check(has(rw2, "saved with") && has(rw2, "not rebuilt") &&
+                              has(rw2, c.lo) && has(rw2, c.hi), l2.c_str());
+                    }
+                    // ...and the uniform folder still rebuilds, so the check is
+                    // a check and not a wall.
+                    std::vector<std::string> okf;
+                    std::string okn, okw;
+                    std::string u2 = "local://" + (sdir / "f_001.raw").u8string();
+                    std::replace(u2.begin(), u2.end(), (char)92, '/');
+                    const bool okGot = remoteSequenceSiblings(u2, okf, okn, okw);
+                    fprintf(stderr, "fmtgateselftest:   F4h restore uniform: rebuilt=%d \nmembers=%zu %s\n",
+                            okGot ? 1 : 0, okf.size(), okw.c_str());
+                    check(okGot && okf.size() == 3,
+                          "F4h ...while a folder that IS one size rebuilds all three");
+                }
+                // ---- (6b) the group row is what ANSWERS it, and a pre-16 peer
+                //           cannot -----------------------------------------
+                // min == max is the check, and it is one field pair on the LIST
+                // group row (protocol 16). Two halves, asserted together: the
+                // peer reports them, and a peer that does not is refused by
+                // name rather than approximated to "probably fine".
+                {
+                    std::vector<remote::Entry> ge;
+                    std::string gerr;
+                    const std::string gdir = (ddir / "cancel").u8string();
+                    const bool glok = app.uiSession.list(gdir, ge, gerr);
+                    const remote::Entry* grp = nullptr;
+                    for (const remote::Entry& e : ge) if (e.group) grp = &e;
+                    fprintf(stderr, "fmtgateselftest:   F4h group row: ok=%d group=%d "
+                                    "n=%u sum=%llu min=%llu max=%llu has=%d\n",
+                            glok ? 1 : 0, grp ? 1 : 0, grp ? grp->frames : 0,
+                            (unsigned long long)(grp ? grp->size : 0),
+                            (unsigned long long)(grp ? grp->minMemberSize : 0),
+                            (unsigned long long)(grp ? grp->maxMemberSize : 0),
+                            grp && grp->hasMemberSizes ? 1 : 0);
+                    // derived: 108 + 110 + 106 = 324 total, extremes 106 and 110
+                    check(glok && grp && grp->frames == 3 && grp->size == 324,
+                          "F4h the peer folds the family into one row whose size is the SUM");
+                    check(grp && grp->hasMemberSizes && grp->minMemberSize == 106 &&
+                          grp->maxMemberSize == 110,
+                          "F4h ...and protocol 16 carries the two extremes the sum lost");
+                    check(grp && grp->size == (uint64_t)grp->frames * 108,
+                          "F4h ...the sum being EXACTLY 3x108, which is why it was no check");
+                    // ...and the same fact decides a different door. An
+                    // EXPANDED MEMBER's double-click must not be handed this
+                    // row's `size`: 324 is not any member's byte count, so
+                    // rawGuessDims would offer dimensions for a file that does
+                    // not exist and the recipe would be bound to a length no
+                    // file in the folder has (review P2-1, rbOpenItemRow).
+                    check(grp && grp->size != grp->minMemberSize &&
+                          grp->size != grp->maxMemberSize,
+                          "F4h ...so a member handed the ROW's size gets a number no file has");
+                }
+
+                // ---- (7) a PREVIEW still does not ask (§5.3), and says so ---
+                // One click is selection. A geometry prompt from a single
+                // click would break the listing's own rule, so the preview
+                // door neither opens nor asks - and the sentence it is left
+                // with is the new one, asserted in F4d.
+                {
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    const bool pv = openRemote(url, true, 0, 0, nullptr);
+                    fprintf(stderr, "fmtgateselftest:   F4h preview: opened=%d docs=%zu "
+                                    "dialog=%d\n", pv ? 1 : 0, app.images.size(),
+                            rawDlg.open ? 1 : 0);
+                    check(!pv && app.images.empty() && !rawDlg.open,
+                          "F4h one click on a headerless row neither opens nor asks (§5.3)");
+                }
+                // ---- (8) THE WIRING, not just the door ---------------------
+                // The whole point of this PR is that a headerless name on a
+                // peer REACHES openRemoteRawDeclared from wherever it was
+                // named. Every assertion above drives that function directly,
+                // so the review found that the block in openRemote which routes
+                // into it could be deleted with all of them still green
+                // (review #17). g_rawDoorEntries is what makes the routing
+                // itself observable.
+                //
+                // An ssh:// url, because local:// is answered one block earlier
+                // by #111's reroute to the local door (5.4, and F4e asserts
+                // that half). The host does not resolve, so what comes back is
+                // ensureUiSession's failure - which is itself the proof: the
+                // only way to reach ssh at all from here is through the door.
+                // ssh runs with BatchMode=yes and ConnectTimeout=10, so this
+                // costs a bounded failure and no password prompt.
+                {
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    const int d0 = g_rawDoorEntries;
+                    const bool opened = openRemote("ssh://viewer.invalid/tmp/x.raw",
+                                                   false, 0, 0, nullptr);
+                    const int entered = g_rawDoorEntries - d0;
+                    const std::string t8 = app.toast;
+                    fprintf(stderr, "fmtgateselftest:   F4h routing: entries=%d opened=%d "
+                                    "docs=%zu\n"
+                                    "fmtgateselftest:   F4h routing said: \"%s\"\n",
+                            entered, opened ? 1 : 0, app.images.size(), t8.c_str());
+                    check(entered == 1 && !opened && app.images.empty(),
+                          "F4h a headerless name on a PEER is routed to the recipe door");
+                    // ...and NOT to the generic refusal it used to reach. That
+                    // sentence is the client one (peerRefusal) prefixed with
+                    // the file name; the door's own failures all begin
+                    // "remote: " or name the protocol.
+                    check(!has(t8, "carries no header") && !has(t8, "--raw-interp bayer"),
+                          "F4h ...instead of the by-name refusal that door replaced");
+                    // ...and a PREVIEW is still not routed into it: one click
+                    // may not raise a geometry prompt (5.3).
+                    const int d1 = g_rawDoorEntries;
+                    openRemote("ssh://viewer.invalid/tmp/x.raw", true, 0, 0, nullptr);
+                    fprintf(stderr, "fmtgateselftest:   F4h routing (preview): entries=%d\n",
+                            g_rawDoorEntries - d1);
+                    check(g_rawDoorEntries == d1,
+                          "F4h ...and a one-click preview is never routed into it (5.3)");
+                    // ...nor is a name that STATES its own shape.
+                    const int d2 = g_rawDoorEntries;
+                    openRemote("ssh://viewer.invalid/tmp/x.npy", false, 0, 0, nullptr);
+                    check(g_rawDoorEntries == d2,
+                          "F4h ...nor a file that states its own shape");
+                    closeAll();
+                    app.toast.clear();
+                }
+
+                // ---- (9) a second question must not orphan the park --------
+                // The park is one slot, and the Open sitting in it is waiting
+                // for an answer. A question raised over it used to take the
+                // dialog and drop only `forRemoteStack`, so App::remoteRawStack
+                // stayed alive forever and pumpRemoteOpenQueue - which holds
+                // the queue while it is alive - stopped in silence for the rest
+                // of the run (review #5/#15). The first question keeps the
+                // dialog; the second is refused by name.
+                {
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                    rawDlg.open = false;
+                    rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.toast.clear();
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    const bool parked = app.remoteRawStack.alive && rawDlg.open &&
+                                        rawDlg.forRemoteStack;
+                    const std::string parkedPath = rawDlg.path;
+                    // the interrupting question: any other headerless file
+                    app.toast.clear();
+                    const int r9 = g_rawDialogsRaised;
+                    const bool second = openRawDialogFor(url, (uint64_t)WANT);
+                    fprintf(stderr, "fmtgateselftest:   F4h second ask: parked=%d refused=%d "
+                                    "raised=%d alive=%d path-kept=%d\n"
+                                    "fmtgateselftest:   F4h second ask said: \"%s\"\n",
+                            parked ? 1 : 0, second ? 0 : 1, g_rawDialogsRaised - r9,
+                            app.remoteRawStack.alive ? 1 : 0,
+                            rawDlg.path == parkedPath ? 1 : 0, app.toast.c_str());
+                    check(parked, "F4h (setup) the folder Open is parked on its question");
+                    check(!second && g_rawDialogsRaised == r9,
+                          "F4h a second geometry question over a live park is refused");
+                    check(app.remoteRawStack.alive && rawDlg.open &&
+                          rawDlg.path == parkedPath && rawDlg.forRemoteStack,
+                          "F4h ...and the parked Open keeps its dialog, so it can still be answered");
+                    check(has(app.toast, "already being asked"),
+                          "F4h ...and the refusal says which Open is waiting");
+                    // answer it, so the slot is released and nothing leaks into
+                    // the blocks below (one selftest home, shared state)
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    double tw9 = nowSec();
+                    while (nowSec() - tw9 < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    check(!app.remoteRawStack.alive,
+                          "F4h ...and answering it releases the slot");
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                }
+
+                // ---- (10) ...and the QUEUE stops while one is parked --------
+                // pumpRemoteOpenQueue drains the folder-scan chain one stack at
+                // a time. Starting the next one while an earlier Open is still
+                // waiting to be told how to read its frames would raise a
+                // second dialog over the first and orphan whichever lost the
+                // slot - so the guard is asserted here, with a real queue,
+                // because F4h had none (review #18).
+                {
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                    rawDlg.open = false;
+                    rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.rbOpenQueue.clear();
+                    app.toast.clear();
+                    // park one Open on its question...
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    const bool parked = app.remoteRawStack.alive;
+                    // ...and queue a second folder behind it
+                    App::RemoteOpen ro;
+                    ro.host = "";
+                    ro.files = sfiles;
+                    ro.name = "stk/f_???.raw";
+                    ro.port = 0;
+                    ro.token = 0;
+                    app.rbOpenQueue.push_back(ro);
+                    const int r10 = g_rawDialogsRaised;
+                    pumpRemoteOpenQueue();
+                    const bool held = app.rbOpenQueue.size() == 1 &&
+                                      g_rawDialogsRaised == r10;
+                    fprintf(stderr, "fmtgateselftest:   F4h queue held: parked=%d queued=%zu "
+                                    "asks=%d\n", parked ? 1 : 0, app.rbOpenQueue.size(),
+                            g_rawDialogsRaised - r10);
+                    check(parked, "F4h (setup) one Open is parked on its question");
+                    check(held,
+                          "F4h the remote Open queue waits while an Open is parked on a question");
+                    // release it and confirm the queue moves again, so the
+                    // guard is a WAIT and not a wedge
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    pumpRemoteOpenQueue();
+                    double tw10 = nowSec();
+                    while (nowSec() - tw10 < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    fprintf(stderr, "fmtgateselftest:   F4h queue moved: queued=%zu docs=%zu\n",
+                            app.rbOpenQueue.size(), app.images.size());
+                    check(app.rbOpenQueue.empty(),
+                          "F4h ...and it moves again once the slot is released");
+                    app.rbOpenQueue.clear();
+                    g_rawSizeRecipe.clear();
+                    rawDlg.open = false;
+                    rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    closeAll();
+                }
+
+                // ---- (10b) "Open as frame average" over a PARKED question -
+                // THE WORST SHAPE IN THIS PROGRAM. The verb opens the stack
+                // and parks a mean over it, so it has to know what it
+                // opened - and a headerless folder with nothing bound opens
+                // NOTHING: it parks the Open on the dialog. The old code
+                // then looked for "what did that open?", found no new seq,
+                // and fell through to app.images.back()->seqId - whatever
+                // document happened to be on screen. A mean of frames
+                // nobody asked about, published as the answer to this
+                // click, cannot be traced back from the picture (review P1).
+                //
+                // The bystander is a REAL remote stack of the same folder,
+                // left open on purpose: that is what the defect reached for,
+                // so a regression averages it and this names the subject.
+                {
+                    closeAll();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.pendingAvg.clear();
+                    app.toast.clear();
+                    // the bystander, opened under a binding so it does NOT park
+                    RawRecipe bind;
+                    bind.w = DW; bind.h = DH; bind.offset = DHDR;
+                    bind.dtype = RD_U16; bind.interp = RI_GRAY; bind.littleEndian = true;
+                    g_rawSizeRecipe.clear();
+                    g_rawSizeRecipe[(size_t)WANT] = bind;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    double twB = nowSec();
+                    while (nowSec() - twB < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int bystander = 0;
+                    for (const auto& d : app.images) if (d->seqId) { bystander = d->seqId; break; }
+                    const size_t docsB = app.images.size();
+                    check(bystander != 0 && docsB == 3,
+                          "F4h (setup) a remote stack is open and on screen");
+                    // ...now UNBIND, so the next Open has to ask
+                    g_rawSizeRecipe.clear();
+                    app.pendingAvg.clear();
+                    app.toast.clear();
+                    openStackForAverage("", sfiles, "stk/f_???.raw", 0);
+                    const bool parkedAvg = app.remoteRawStack.alive &&
+                                           app.remoteRawStack.average;
+                    const size_t docsAfterAsk = app.images.size();
+                    const size_t avgAtAsk = app.pendingAvg.size();
+                    fprintf(stderr, "fmtgateselftest:   F4h avg over park: parked=%d carried=%d docs=%zu->%zu requested=%zu bystander=%d\n",
+                            app.remoteRawStack.alive ? 1 : 0,
+                            app.remoteRawStack.average ? 1 : 0,
+                            docsB, docsAfterAsk, avgAtAsk, bystander);
+                    check(parkedAvg,
+                          "F4h-P1 \"Open as frame average\" on an unbound headerless folder parks the VERB with the Open");
+                    // TWO WORLDS, and the defect lands in whichever one the
+                    // run is in - which is why both are asserted. With nothing
+                    // still streaming, requestStackAverage REDUCES on the spot
+                    // and the wrong mean appears as a new document (the
+                    // mutation run shows docs 3 -> 4); with frames in flight it
+                    // parks, and the wrong seqId shows up in pendingAvg.
+                    // `docsAfterAsk == docsB` catches the first, `onBystander`
+                    // below catches the second.
+                    check(avgAtAsk == 0 && docsAfterAsk == docsB,
+                          "F4h-P1 ...and asks for no average yet: nothing has opened to average");
+                    // answer it, and the mean must land on what came back
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    int wantSeq = 0;
+                    for (const auto& d : app.images)
+                        if (d->seqId && d->seqId != bystander) { wantSeq = d->seqId; break; }
+                    int onBystander = 0, onNew = 0;
+                    for (const auto& a : app.pendingAvg) {
+                        if (a.seqId == bystander) onBystander++;
+                        else if (a.seqId == wantSeq && wantSeq) onNew++;
+                    }
+                    fprintf(stderr, "fmtgateselftest:   F4h avg resumed: new-seq=%d parked=%zu on-new=%d on-bystander=%d\n",
+                            wantSeq, app.pendingAvg.size(), onNew, onBystander);
+                    check(wantSeq != 0 && wantSeq != bystander && onNew == 1,
+                          "F4h-P1 ...and the Load honours it against the stack that came back");
+                    check(onBystander == 0,
+                          "F4h-P1 ...and never against the document that was already on screen");
+                    double twC = nowSec();
+                    while (nowSec() - twC < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    app.pendingAvg.clear();
+                    g_rawSizeRecipe.clear();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    closeAll();
+                }
+                // ---- (11) the CFA PHASE the operator picked, over the link --
+                // RGGB and BGGR change no sample - they change which plane is
+                // which - so a phase that does not travel is not a wrong
+                // number, it is a wrong COLOUR, and that is the same class of
+                // defect (settings-inventory 4.1 measuring class). Two halves,
+                // and the review found both broken: the phase never reached a
+                // remote document at all, and a saved session came back RGGB
+                // whatever it stored (review #2 / #3).
+                //
+                // The fixture is a 1-channel Bayer read of the same 108 bytes,
+                // opened with GRBG (index 2), which is neither the default nor
+                // symmetric with it.
+                {
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    RawDialog bd;
+                    bd.dtype = RD_U16; bd.interp = RI_BAYER;
+                    bd.w = DW; bd.h = DH; bd.offset = DHDR; bd.littleEndian = true;
+                    bd.cfaPattern = 2;                   // GRBG
+                    bd.path = url;
+                    bd.fileSize = (size_t)WANT;
+                    const rp::RawWire brw = rawWireFrom(bd);
+                    const bool bopened = openRemote(url, false, 0, 0, &brw);
+                    const ImageDoc* bdoc = app.images.empty() ? nullptr
+                                                              : app.images.back().get();
+                    fprintf(stderr, "fmtgateselftest:   F4h cfa: opened=%d cfa=%d pattern=%d "
+                                    "(want 1/2) flags=0x%x\n"
+                                    "fmtgateselftest:   F4h cfa note: \"%s\"\n",
+                            bopened ? 1 : 0, bdoc ? bdoc->cfa : -1,
+                            bdoc ? bdoc->cfaPattern : -1, brw.flags,
+                            bdoc ? bdoc->note.c_str() : "-");
+                    check(rp::rawWireCfaPattern(brw.flags) == 2 &&
+                          (brw.flags & rp::RW_LITTLE_ENDIAN) != 0,
+                          "F4h the recipe carries the phase without disturbing the endian bit");
+                    check(bopened && bdoc && bdoc->cfa == 1 && bdoc->cfaPattern == 2,
+                          "F4h a remote Bayer frame is demosaiced in the phase that was PICKED");
+                    check(bdoc && has(bdoc->note, CFA_PATTERNS[2]),
+                          "F4h ...and the note declares that phase, not the default (M1)");
+                    // the SIBLINGS of a stack take the same phase: a folder
+                    // whose frames disagreed would change colour as it is
+                    // stepped
+                    closeAll();
+                    rawDlg.open = false;
+                    app.toast.clear();
+                    g_rawSizeRecipe.clear();
+                    rawRecipeBindSize((size_t)WANT, rawRecipeFromDialog(bd));
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    double twb = nowSec();
+                    while (nowSec() - twb < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int phased = 0;
+                    for (const auto& dq : app.images)
+                        if (dq->cfa == 1 && dq->cfaPattern == 2) phased++;
+                    fprintf(stderr, "fmtgateselftest:   F4h cfa siblings: docs=%zu phased=%d\n",
+                            app.images.size(), phased);
+                    check(app.images.size() == 3 && phased == 3,
+                          "F4h every frame of a remote Bayer stack is in the SAME phase");
+                    // ...and a SESSION round trip keeps it. Saved and restored
+                    // through the real doors, and the pixels compared sample
+                    // for sample - a colour that changed is a number that
+                    // changed.
+                    std::vector<float> before;
+                    int bw = 0, bh = 0, bch = 0, bpat = -1, bcfa = -1;
+                    if (!app.images.empty()) {
+                        const ImageDoc* d0 = app.images.front().get();
+                        before = d0->px();
+                        bw = d0->w; bh = d0->h; bch = d0->ch;
+                        bpat = d0->cfaPattern; bcfa = d0->cfa;
+                    }
+                    const std::string sess = (ddir / "cfa.vsession").u8string();
+                    saveSession(sess, true);          // quiet: no toast to clobber
+                    const bool wrote = std::filesystem::exists(pathFromUtf8(sess));
+                    closeAll();
+                    g_rawSizeRecipe.clear();          // nothing may answer but the LINE
+                    const std::string lerr2 = loadSession(sess);
+                    double tws = nowSec();
+                    while (nowSec() - tws < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        pumpRestoreWaits();
+                        if (app.rfPending == 0 && loadingSettled()) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    const ImageDoc* rd0 = app.images.empty() ? nullptr
+                                                             : app.images.front().get();
+                    bool same = rd0 && !before.empty() && rd0->w == bw && rd0->h == bh &&
+                                rd0->ch == bch && rd0->px().size() == before.size();
+                    if (same)
+                        for (size_t i = 0; i < before.size(); i++)
+                            if (rd0->px()[i] != before[i]) same = false;
+                    fprintf(stderr, "fmtgateselftest:   F4h session: wrote=%d load=\"%s\" "
+                                    "docs=%zu pattern=%d (was %d) cfa=%d (was %d) bits=%d\n",
+                            wrote ? 1 : 0, lerr2.c_str(), app.images.size(),
+                            rd0 ? rd0->cfaPattern : -1, bpat, rd0 ? rd0->cfa : -1, bcfa,
+                            same ? 1 : 0);
+                    check(wrote && lerr2.empty() && rd0,
+                          "F4h a remote headerless doc saves and reopens from its session line");
+                    check(rd0 && rd0->cfaPattern == bpat && rd0->cfa == bcfa,
+                          "F4h ...in the phase it was saved in, not the default");
+                    check(same,
+                          "F4h ...and the restored pixels are the saved ones, sample for sample");
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                }
+
                 g_rawSizeRecipe.clear();
                 closeAll();
             }
@@ -1167,6 +2166,184 @@
                         old.stop();
                     }
                     selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+                }
+
+                // ---- P9b: a peer that predates the MEMBER SIZES -------------
+                // "A refusal nobody runs is a refusal that rots" (the note over
+                // servedVersion, and the reason this seam exists). The check that
+                // decides whether a headerless FOLDER may be opened at all is
+                // `min == max` over the group row's members, and that pair of
+                // numbers arrived in protocol 16 - so a v15 peer cannot answer the
+                // question, and the answer to "cannot answer" is not "probably
+                // fine": a folder read under one recipe when the members disagree
+                // is a plausible picture of the wrong bytes.
+                //
+                // The three members here are EQUAL, deliberately. The refusal must
+                // therefore blame the PEER and not the files - it is the one thing
+                // that can go wrong in a sentence about a check that could not be
+                // made - and the single-file door over the same peer must still
+                // work, because one file needs no cross-member check.
+                {
+                    std::filesystem::path g15dir = rdir / "v15grp";
+                    std::filesystem::remove_all(g15dir, rec);
+                    std::filesystem::create_directories(g15dir, rec);
+                    std::vector<std::string> g15names;
+                    for (int k = 0; k < 3; k++) {
+                        std::vector<uint16_t> v((size_t)RW_W * RW_H, (uint16_t)(k + 1));
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "v_%03d.raw", k + 1);
+                        std::ofstream vf(pathFromUtf8((g15dir / nm).u8string()),
+                                         std::ios::binary);
+                        const std::vector<uint8_t> junk(HDR, 0xA5);
+                        vf.write((const char*)junk.data(), HDR);
+                        vf.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                        vf.close();
+                        g15names.push_back(nm);
+                    }
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", "15");
+                    remote::Session old15;
+                    std::string eo15;
+                    if (!old15.start("", exe, eo15)) {
+                        fprintf(stderr, "fmtgateselftest:   P9b old peer: %s\n", eo15.c_str());
+                        check(false, "P9b the protocol-15 peer starts");
+                    } else {
+                        std::vector<remote::Entry> e15;
+                        std::string le15;
+                        const bool l15 = old15.list(g15dir.u8string(), e15, le15);
+                        const remote::Entry* g15 = nullptr;
+                        for (const remote::Entry& e : e15) if (e.group) g15 = &e;
+                        uint64_t sz15 = 0;
+                        std::string why15;
+                        const bool ok15 = remoteRawSameSize(old15, old15.peerVersion(),
+                                                            g15dir.u8string(), g15names,
+                                                            sz15, why15);
+                        fprintf(stderr, "fmtgateselftest:   P9b peer speaks %d, list=%d "
+                                        "group=%d hasSizes=%d checked=%d\n"
+                                        "fmtgateselftest:   P9b refusal: \"%s\"\n",
+                                old15.peerVersion(), l15 ? 1 : 0, g15 ? 1 : 0,
+                                g15 && g15->hasMemberSizes ? 1 : 0, ok15 ? 1 : 0,
+                                why15.c_str());
+                        check(old15.peerVersion() == 15,
+                              "P9b the second peer really speaks 15");
+                        check(l15 && g15 && g15->members.size() == 3,
+                              "P9b ...and still folds the family into a group row");
+                        check(g15 && !g15->hasMemberSizes,
+                              "P9b ...without the member sizes, which is the point");
+                        check(!ok15 && has(why15, "protocol 15") &&
+                              has(why15, "each member") && has(why15, "update viewer-serve"),
+                              "P9b so a headerless FOLDER is refused by name and by number");
+                        check(!has(why15, "not all one size"),
+                              "P9b ...and not blamed on the files, which ARE all one size");
+                        remote::Meta m15{};
+                        std::string e15b;
+                        const bool got15 = old15.meta(rpath, m15, e15b, 0, &rw);
+                        fprintf(stderr, "fmtgateselftest:   P9b single file over v15: "
+                                        "meta=%d %dx%d %s\n",
+                                got15 ? 1 : 0, m15.w, m15.h, e15b.c_str());
+                        check(got15 && m15.w == RW_W && m15.h == RW_H,
+                              "P9b ...while a SINGLE headerless file still opens over it");
+                        old15.stop();
+                    }
+                    selftestSetEnv("VIEWER_SERVE_PROTOCOL", nullptr);
+                }
+
+                // ---- P9c: a CURRENT peer and a client that announced less --
+                // The other half of the version pair, and the one that had no
+                // test at all: the peer sends the member sizes only to a
+                // client that ANNOUNCED 16, so a client announcing less must
+                // not read them - and effectiveVersion() is the fix that
+                // makes it not (review P2-3). Before that fix this parse used
+                // peerVersion_ alone and would have read four u32s the peer
+                // never wrote, desynchronising the rest of the reply.
+                //
+                // The peer here is the real, current one. Only the CLIENT is
+                // lowered, which is the combination nothing else covers.
+                {
+                    std::filesystem::path c15dir = rdir / "c15grp";
+                    std::filesystem::remove_all(c15dir, rec);
+                    std::filesystem::create_directories(c15dir, rec);
+                    for (int k = 0; k < 3; k++) {
+                        std::vector<uint16_t> v((size_t)RW_W * RW_H, (uint16_t)(k + 1));
+                        char nm[32];
+                        snprintf(nm, sizeof nm, "c_%03d.raw", k + 1);
+                        std::ofstream cf(pathFromUtf8((c15dir / nm).u8string()),
+                                         std::ios::binary);
+                        const std::vector<uint8_t> junk(HDR, 0xA5);
+                        cf.write((const char*)junk.data(), HDR);
+                        cf.write((const char*)v.data(), (std::streamsize)(v.size() * 2));
+                    }
+                    remote::Session c15;
+                    c15.setHelloVersionForTest(15);
+                    std::string e15c;
+                    if (!c15.start("", exe, e15c)) {
+                        fprintf(stderr, "fmtgateselftest:   P9c client: %s\n", e15c.c_str());
+                        check(false, "P9c the lowered client connects");
+                    } else {
+                        std::vector<remote::Entry> ce;
+                        std::string cerr2;
+                        const bool cl = c15.list(c15dir.u8string(), ce, cerr2);
+                        const remote::Entry* cg = nullptr;
+                        for (const remote::Entry& e : ce) if (e.group) cg = &e;
+                        uint64_t csz = 0;
+                        std::string cwhy;
+                        const bool cok = cg && remoteRawSameSizeIn(ce, 15, c15dir.u8string(),
+                                                                   cg->members, csz, cwhy);
+                        fprintf(stderr, "fmtgateselftest:   P9c peer=%d list=%d group=%d "
+                                        "members=%zu hasSizes=%d checked=%d\n"
+                                        "fmtgateselftest:   P9c refusal: \"%s\"\n",
+                                c15.peerVersion(), cl ? 1 : 0, cg ? 1 : 0,
+                                cg ? cg->members.size() : 0,
+                                cg && cg->hasMemberSizes ? 1 : 0, cok ? 1 : 0, cwhy.c_str());
+                        check(c15.peerVersion() == (int)rp::VERSION,
+                              "P9c the peer is the CURRENT one, only the client is lowered");
+                        // the listing still parses: that is the whole point -
+                        // a field read on the wrong number breaks the reply
+                        check(cl && cg && cg->members.size() == 3,
+                              "P9c ...and its LIST still parses, group row and all");
+                        check(cg && !cg->hasMemberSizes,
+                              "P9c ...without member sizes, because 15 does not carry them");
+                        check(!cok && has(cwhy, "protocol 15"),
+                              "P9c so the folder is refused by name, not read on a guess");
+                        c15.stop();
+                    }
+                }
+                // ---- P9d: the REQUEST trailer, at a disagreeing version ----
+                // The third field whose presence the CLIENT's announced
+                // number decides, and the only one whose two forms are
+                // DIFFERENT LENGTHS. getTrailers picks the v12 flags-word
+                // form only when servedVersion() and g_clientVersion are
+                // both >= 12; a client that gated on peerVersion_ alone
+                // wrote that word to a v16 peer while announcing 11, and the
+                // peer then took its v11 "the bytes that remain are a
+                // recipe" branch and read the flags word as the first four
+                // bytes of the RawWire (review P2-2).
+                //
+                // That is not a missing feature - it is a request parsed
+                // from the wrong offset - so the assertion is on the PIXEL
+                // GEOMETRY that comes back, which is what a shifted recipe
+                // gets wrong. 11 is chosen because it is the lowest version
+                // that may carry a recipe at all: one below the flags word.
+                {
+                    remote::Session c11;
+                    c11.setHelloVersionForTest(11);
+                    std::string e11;
+                    if (!c11.start("", exe, e11)) {
+                        fprintf(stderr, "fmtgateselftest:   P9d client: %s\n", e11.c_str());
+                        check(false, "P9d the client that announced 11 connects");
+                    } else {
+                        remote::Meta m11{};
+                        std::string e11b;
+                        const bool got11 = c11.meta(rpath, m11, e11b, 0, &rw);
+                        fprintf(stderr, "fmtgateselftest:   P9d peer=%d announced=11 meta=%d %dx%d ch=%d\n"
+                                        "fmtgateselftest:   P9d err: \"%s\"\n",
+                                c11.peerVersion(), got11 ? 1 : 0, m11.w, m11.h, m11.ch,
+                                e11b.c_str());
+                        check(c11.peerVersion() == (int)rp::VERSION,
+                              "P9d the peer is the CURRENT one, only the client is lowered");
+                        check(got11 && m11.w == RW_W && m11.h == RW_H,
+                              "P9d ...and the recipe arrives whole: the trailer is written in the form the peer reads at the SMALLER of the two numbers");
+                        c11.stop();
+                    }
                 }
                 std::filesystem::remove_all(rdir, rec);
             }

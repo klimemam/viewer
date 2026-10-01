@@ -61,6 +61,26 @@
         // a future reader WHICH of the two worlds they are in - `before
         // settle=0 -> 0 in 0 ms` (the peer answered with a clean directory) or
         // `before settle=1 -> 0 in 40 ms` (the race is back).
+        //
+        // The SHAPE is PR #274's B7 - reading another subject's state at the
+        // instant of its answer - but the cause was the PEER's, not this
+        // test's, which is why the fix is in core/serve.cpp and this settle is
+        // only how it was observed. And the leak was PERMANENT, not late, which
+        // is why 60 s of settling was never going to absorb it: a client's
+        // remote::Session destructor calls stop(), stop() closes the pipe, and
+        // the peer exits on EOF - so the TempFile destructor behind the reply
+        // never ran at all (PR #285 review). Dropping before the reply closes
+        // that by construction: there is no longer a window to be killed in.
+        //
+        // THE PUBLISH SIDE HAS NO SUCH WINDOW and is deliberately left alone:
+        // handleReaderRun renames the temp onto the key and only then calls
+        // reply(), so a `.vstream` the reply speaks of is already there. The
+        // `vstream0 + 1` assertions stay absolute counts - that is a decision
+        // not to touch them, and this paragraph is its reason.
+        //
+        // The anti-vacuity for "a temp existed at all" is R17c's sawPart, taken
+        // while the runs are in flight, which this does not touch: a settle can
+        // only ever say that something went away, never that it was there.
         auto cacheNames = [&](const char* suf) {
             std::string out;
             std::error_code e;
@@ -176,11 +196,19 @@
             char b[1024];
             if (n == 0)
                 snprintf(b, sizeof b, "%s before settle=%d -> 0 in %d ms", suf, before, ms);
-            else
+            else {
+                // Named, because a number alone cannot be acted on - and the
+                // names are re-read here, so a file that vanished between the
+                // last count and this line reads as "(gone since)" rather than
+                // as an empty list. `proof` is the second opinion on those same
+                // names, and it says "(nothing matches any more)" for the same
+                // case, so the two halves of the line cannot disagree silently.
+                const std::string who = cacheNames(suf);
                 snprintf(b, sizeof b, "%s before settle=%d -> STILL %d after %d ms: %s"
                                       " | proof: %s",
-                         suf, before, n, ms, cacheNames(suf).c_str(),
+                         suf, before, n, ms, who.empty() ? "(gone since)" : who.c_str(),
                          cacheProof(suf).c_str());
+            }
             detail = b;
             return n;
         };
@@ -338,7 +366,7 @@
             remote::Session ses;
             if (!openSession(ses, true)) return 1;
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "R1a the peer speaks the protocol this build does (15)");
+                  "R1a the peer speaks the protocol this build does");
             remote::ReaderRun run;
             std::string err;
             const bool sent = ses.readerRun(origin, "load", files, run, err);
@@ -1487,11 +1515,11 @@
             remote::ReaderRun ocRun;
             std::string ocErr;
             const bool ocSent = oldClient.readerRun(origin, "load", tf, ocRun, ocErr);
-            check(oldClient.peerVersion() == 15 && ocSent &&
+            check(oldClient.peerVersion() == (int)rp::VERSION && ocSent &&
                       ocRun.outcome == rp::RO_UNREADABLE && ocRun.key.empty() &&
                       ocRun.header.empty() &&
                       ocRun.err == rp::typedAxesClientTooOldText(14, "Reader CHW"),
-                  "R21m a v15 peer refuses named typed output before issuing it to a v14 client");
+                  "R21m a current peer refuses named typed output before issuing it to a v14 client");
             remote::ReaderRun still;
             std::string stillErr;
             const bool stillSent = seed.readerRun(origin, "load", tf, still, stillErr);
@@ -2420,9 +2448,12 @@
             std::string raceText[3] = { std::string(), files[1], files[2] };
             check(slurp(rdRace, raceText[0]), "R17a (setup) the racing reader is readable");
             // Counting files in the cache directory by suffix is cacheCount,
-            // defined once beside cacheDir. A second copy of that body lived
-            // here under another name until this PR - two predicates for one
-            // question, which this project's discipline says will drift.
+            // defined once beside cacheDir. This block used to carry a second
+            // copy of that body under another name - two predicates for one
+            // question, which this project's own discipline says will drift
+            // (#282 had just made roiSideCovers defer to annFits for the same
+            // reason). There is nothing here for a local copy to know that the
+            // shared one does not, so it is the shared one.
             const int vstream0 = cacheCount(".vstream");
 
             struct Contender { bool sent = false; int outcome = -1; std::string key, err; };
@@ -3119,7 +3150,9 @@
             // THREE subjects here (A, B and C), each answering in its own
             // time, so this is R17f's question with three chances to get it
             // wrong. Same two readings: the count at the answer, and the settle
-            // behind it.
+            // behind it. `.vstream` and `.bad` stay ABSOLUTE counts below: both
+            // are put in place by a rename that precedes the reply, so there is
+            // nothing to wait for and nothing to settle.
             const int partsAtAnswer20 = cacheCount(".part");
             std::string partDetail20;
             const int parts = settleCache(".part", 60.0, partDetail20);

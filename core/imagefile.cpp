@@ -417,7 +417,12 @@ bool peerServesDeclared(const std::string& path) {
     return peerServes(path) || isHeaderless(path) || isNpz(path);
 }
 
-std::string peerRefusal(const std::string& path) {
+std::string headerlessLead(const std::string& path) {
+    return "a headerless " + lowerExt(path) + " carries no header to state its shape, "
+           "and this request carried no recipe";
+}
+
+std::string peerRefusal(const std::string& path, RefusedBy by) {
     if (peerServes(path)) return {};
     // Named, reasoned, way out attached - docs/features/adapters/input-adapters.md §3.2's three
     // parts. The way out is real for the first two cases: the file IS readable
@@ -460,22 +465,58 @@ std::string peerRefusal(const std::string& path) {
     // that headerless files cannot cross the link, they fell off the end of a
     // table they were correctly never in.
     //
-    // What is true right now is narrower and more useful than "the peer serves
-    // these formats": the shape of this file is a DECLARATION that lives on
-    // this machine, and this protocol has no field to carry it. Say that, and
-    // name the door that does work. This is one step more specific than the
-    // fall-through, which is the whole reason this branch exists - and it is
-    // still the LINK's limit rather than a claim about the file, which is the
-    // rule G9 (PR #176) settled.
+    // What is true is narrower and more useful than "the peer serves these
+    // formats": a headerless file states its shape in a RECIPE, and a request
+    // either carries one or does not. That is one step more specific than the
+    // fall-through, which is the whole reason this branch exists - and it names
+    // a limit of the REQUEST rather than making a claim about the file, which
+    // is the rule G9 (PR #176) settled.
     //
-    // The wording changes the day the wire can carry a recipe
-    // (docs/features/remote/remote-headerless-design.md §4.4, stage 2): then the fact is "this
-    // request carried no recipe", not "this link cannot carry one".
-    if (isHeaderless(path))
-        return "a headerless " + lowerExt(path) + " states its shape in a recipe on "
-               "this machine, and this link cannot yet carry that declaration"
-               "\n  copy the file here and open it with File > Open, or update both "
-               "ends when a recipe-carrying build ships";
+    // THE SENTENCE THIS BRANCH USED TO CARRY WAS STAGE 1's, and stage 1 ended
+    // on 2026-08-13: "this link cannot yet carry that declaration ... update
+    // both ends when a recipe-carrying build ships". Protocol 11 shipped that
+    // same day - META, TILE and MEASURE have carried a RawWire since #186 - and
+    // the sentence stayed for six weeks, until a user pasted it back
+    // (2026-09-29). A refusal that describes a limit the build does not have is
+    // verify-matrix G11's defect turned inside out: it sends the reader to
+    // update something already new enough, and it hides what IS missing.
+    // docs/features/remote/remote-headerless-design.md 4.4 wrote both sentences
+    // in advance and said the first would be replaced by the second; this is
+    // that replacement.
+    //
+    // What is missing is never the build and never the file: it is A RECIPE IN
+    // THIS REQUEST. Who can act on that differs, which is the whole of why
+    // `by` exists - and both spellings are built here, from one lead-in, so the
+    // two ends cannot come to describe one fact two ways (#148's rule, applied
+    // to a refusal).
+    if (isHeaderless(path)) {
+        const std::string lead = headerlessLead(path);
+        // THE PEER noticed. The recipe is the client's to send and protocol 11
+        // is what sends it, so the only thing anybody can act on is the viewer
+        // that sent this request.
+        //
+        // "the other end" was wrong, and wrong in the direction that matters:
+        // this sentence travels BACK over the link and is read by the person
+        // sitting at the client, for whom the other end is the peer - the one
+        // machine that is not the problem (review #10). The peer cannot name a
+        // number either, because it does not know what the client speaks; it
+        // knows only that this request had no recipe in it. So it names the
+        // build the reader is actually running and stops there.
+        if (by == RefusedBy::Peer)
+            return lead + "\n  a protocol-11 client sends one with every request "
+                          "- update the viewer you are running";
+        // THIS BUILD noticed, which means the request came off a road that does
+        // not ask: the command line, a session line with no geometry, a scripted
+        // run. Every INTERACTIVE door asks now (openRemoteRawDeclared in
+        // core/app/open_dispatch.inc), so what is left is exactly the roads with
+        // no human standing at them - and for those the way out is to state the
+        // shape up front, or to open the file once through a door that asks and
+        // let this session's byte-count binding answer for the rest (#166).
+        return lead +
+               "\n  declare it with --raw-size WxH --raw-dtype u16 --raw-interp bayer, "
+               "or open it once from Browse or File > Open - this session then reads "
+               "every file of that byte count the same way";
+    }
     // A container this build refuses BY NAME already has a measured sentence,
     // and it answers the question the operator actually has. Asked first,
     // because the fall-through below can only say what the peer serves - and

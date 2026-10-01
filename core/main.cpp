@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>              // remoteRawSameSize's group dedupe
 #include <atomic>
 #include <cctype>
 #include <cfloat>
@@ -2491,7 +2492,15 @@ static bool g_watchSuppressed = false;
         pumpMeasure();                // integrate server-side measurement results
         pumpRemoteBrowse();           // connect/list results from the browse worker
         pumpBrowseWatch(nowSec());    // ...and re-list a DRAWN panel's own dir (§2)
-        pumpRemoteOpenQueue();        // folder-scan stacks, opened one at a time
+        // ...and not while a RAW dialog is standing. A remote Open that needs a
+        // geometry raises the same modal the LOCAL folder queue raises, so
+        // starting one here would put a second question over the first and
+        // leave whichever Open lost the slot waiting for an answer that can
+        // never come (review #5/#15). The remote park has its own half of this
+        // inside pumpRemoteOpenQueue (App::remoteRawStack); this is the half
+        // that cannot live in core/browse/nav.cpp, which does not see rawDlg.
+        if (!rawDlg.open)
+            pumpRemoteOpenQueue();    // folder-scan stacks, opened one at a time
         pumpFolderScan();             // ...and the LOCAL walk, when it has finished
         pumpWatch();                  // source files that moved on disk (項目20)
         pumpVideoExport();            // ONE frame of the stack-to-video job (#253)

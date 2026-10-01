@@ -1,9 +1,13 @@
 # リモートのヘッダ無し RAW — レシピがリンクを渡る設計 (G1)
 
-> **状態: 実装済み (2026-08-13、protocol 11)。** §1 の決定7件と §11 の4段は
-> すべて main に実装された。§0〜§11 は実装前に判断根拠を固定した設計記録、
-> §12 は実装後の差分一覧である。現行の利用契約は
-> [remote.md](remote.md) §8 と本書 §12 を先に読む。
+> **状態: 実装済み (protocol 11、メンバーサイズの検算は 16)。wire と peer は 2026-08-13、
+> レシピを訊く扱いの扉と拒否文の差し替えは 2026-09-29 (PR #278)。**
+> §1 の決定7件はそのまま通った。§0〜§11 は実装前に判断根拠を固定した
+> 設計記録で、**本文を書き換えず**§12 が実装との差分を持つ。
+> §12.1 の**扉の表**が現行の正である —— 新しい扉を足す者はこの表に行を足す。
+> 表の範囲は**リモートの扉**。ローカルのフォルダにバイト数の検算が無いことは
+> §12.1 末尾に名指しで書いてある (この PR では直さない)。
+> 現行の利用契約は [remote.md](remote.md) §8 と本書 §12 を先に読む。
 
 **出発点はユーザーからの報告 (2026-08-11)「remoteで、.rawが開けないね」。**
 [verify-matrix.md](../../verification/matrix.md) §7 G1 が確定したとおり、これは判断ではなく
@@ -213,13 +217,50 @@ link cannot yet carry that declaration
   when a recipe-carrying build ships
 ```
 
+> **この文は 2026-08-13 に嘘になり、2026-09-29 まで出続けた。** 段2 (protocol 11)
+> は段1 と**同じ日**に main に入っている — つまりこの文が真だった期間は 1日未満で、
+> そのあと 6週間、レシピを運べるビルドが「運べない、両端を更新せよ」と言い続けた。
+> ユーザーがこの toast を貼って報告するまで誰も気付かなかった理由は 2つあり、
+> どちらも記録しておく:
+>
+> - 試験 F4d は**語** (`headerless` / `File > Open` / 拡張子) を assert していて、
+>   「**wire が運べないと言っていないこと**」という事実を assert していなかった。
+>   語だけを固定した試験は、文の差し替えを促さない。
+> - 差し替えは本節が予告していたが、**予告は試験ではない**。
+>
+> 現在は F4d が `cannot yet carry` / `recipe-carrying build` / `update both ends`
+> の**不在**を assert する (PR #278)。
+
 **第2段以降 (protocol 11) の文** — 事実が変わるので文も変わる。v11 peer が
 レシピ**無しの**要求 (旧 client) に断るとき:
 
 ```
-a headerless .raw carries no header to state its shape - this request
-carried no recipe (a protocol-11 client sends one; update this viewer)
+a headerless .raw carries no header to state its shape, and this request
+carried no recipe
+  a protocol-11 client sends one with every request - update the viewer at
+  the other end
 ```
+
+**第3の文 — client 側がレシピ無しに気付いたとき (PR #278 で追加)。** 設計時は
+「client 側は §8 の `rawTooOldText` で断る」だけを想定していたが、それは
+**peer が古いとき**の文である。**peer は十分新しく、要求にレシピが無い**場合が
+実際には残り、そのとき `imagefile::peerRefusal` が呼ばれるのは peer ではなく
+client である。同じ文を使うと「the other end を更新せよ」と自分のビルドの
+ことを言ってしまうので、文を割る (`imagefile::RefusedBy`):
+
+```
+a headerless .raw carries no header to state its shape, and this request
+carried no recipe
+  declare it with --raw-size WxH --raw-dtype u16 --raw-interp bayer, or open
+  it once from Browse or File > Open - this session then reads every file of
+  that byte count the same way
+```
+
+**2つの文は 1箇所で組む** — 導入句 (`lead`) は共有し、代替手段だけが分かれる。
+`imagefile.cpp` は**両方のバイナリがコンパイルする**場所なので、そこに両方を置く
+(§4.2 が表を移した理由と同じ)。**唯一の場所ではない** —— `remote.cpp` も
+`plugin_host.cpp` もそうで、選ぶ理由は「形式とは何かを既に持っている」ことである。**綴りを 2つ作らない**が条件で、
+F4h がそれを assert する (導入句が一致し、代替手段が一致しない)。
 
 client 側 (新 client / 旧 peer) は §8 の `rawTooOldText` で**送る前に**断る。
 G9 (PR #176) の裁定を引き継ぎ、代替手段は**リンクの限界**を述べる形を保つ —
@@ -690,16 +731,142 @@ client 側事前拒否 (§7.3 の文)。
 
 ## 12. 実装後の記録
 
-**実装完了 (2026-08-13)。4段すべて main に反映済み。** 実装が設計を訂正した点は無い ——
-§1 の決定7つはそのまま通った。実装で分かった追加が2つあるので記録する:
+> **訂正 (2026-09-29、PR #278)。** この節はもともと「**実装完了 (2026-08-13)。
+> 4段すべて main に反映済み。**」と書いていた。**それは正しくなかった** ——
+> 段4 が入れたのは **Browse の行のダブルクリック 1つ**で、ヘッダ無しの名前を
+> 名指せる**他の扉はどれもレシピを訊かなかった**。同じ日に入った段1 の拒否文
+> (§4.4 第1段) も差し替えられておらず、レシピを運べるビルドが「運べない」と
+> 言い続けた。ユーザーの報告 (2026-09-29) がその toast そのものだった。
+>
+> 「4段すべて反映済み」と書けた理由は、各段の試験が**その段の駆動点**だけを
+> 叩いていたことにある: F4f は `openRemoteRawRow` を、F4e は
+> `openRemote(..., &rw)` を、P8/P9 は `Session` を直接呼ぶ。**レシピを持たない
+> 呼び手が 1つも試験に出てこなかった**ので、扉が 1つしか無いことは緑の中に
+> 隠れていた。下の「扉の表」がその欠落を構造として書き留めるためのもので、
+> **新しい扉を足す者はこの表に行を足す**。
 
-- **リモートで開いた doc の note が M1 を破っていた。** 段2b の試験 (F4e) が
-  捕まえた。`openRemote` の note は `"remote"` だけで、幾何もヘッダ長も
-  バイト順も名乗らないまま数値が出ていた —— 同じファイルが開いた端によって
-  違う自己記述をする状態で、#148 が1段上で解消した欠陥そのもの。今は
-  `rawRecipeNote` を通すので**ローカル経路と一字一句同じ文**である。
-  §9 が「宣言が結果に付いて回る」と書いていた所は、書いただけでは
-  足りず、試験が要る箇所だった。
+### 12.1 何が入っていて、何が抜けていたか
+
+| 扉 | 2026-08-13 の実態 | 2026-09-29 (PR #278) |
+|---|---|---|
+| Browse の行のダブルクリック | **入っていた** (`openRemoteRawRow`、行の `Entry::size`) | 同じ。共有関数 `openRemoteRawDeclared` に寄せただけ |
+| Browse の複数選択 Enter | 入っていた (`rbOpenItemRow` 経由なので同じ扉) | 同じ |
+| **url を名指しで開く** (File ▸ Open / D&D / デスクトップショートカット / CLI の positional) | **抜けていた。** `openRemote(path)` を `rw == nullptr` で呼び、§4.4 第1段の拒否が出た | `openRemote` の門でヘッダ無しを `openRemoteRawDeclared(url, 0)` に回す。サイズは **LIST 1回** (§5.2、新 wire 無し) |
+| **リモートのフォルダを stack** (グループ行 / フォルダ scan の連鎖 open) | **抜けていた。** `openRemote(files[0])` が `nullptr`。先頭が断られ、メンバーも 1本ずつ断られた | `openRemoteStack` がヘッダ無しを見たら、フォルダの LIST 1回でサイズを検算し、**Open につき 1回**レシピを訊く (`App::remoteRawStack` に park、ダイアログの Load で resume。`pumpRemoteOpenQueue` はそのスロットが生きている間 queue を止める —— 止めないと次の Open がダイアログを上から立てて park した Open を孤児にする) |
+| **stack のメンバー取得** (`RFetchJob`) | **抜けていた。** ジョブにレシピの欄が無く、§6.3 が予告した `rfInheritRecipe` が存在しなかった | `RFetchJob::hasRecipe/recipe` + `rfInheritRecipe`。着地した doc の `FrameSource` にもレシピを書く (identity と M1) |
+| **全解像度の follow-up** (`requestFullRemote`) | **抜けていた。** §6.3 が「FrameSource の raw 欄から再構成」と書いた所が空。1600px を超える raw は 1/N の preview のまま固まった | `rawWireOfSource` で再構成して積む |
+| **Reload** (`ReloadJob` の remote 枝) | **抜けていた。** リモート raw doc の Reload は毎回 peer に断られた | `ReloadSpec` は raw 欄を既に持っていたので、META/TILE に渡すだけ。fresh な doc にも raw 欄を書く (landing が identity を引き直す) |
+| **Watch でメンバーが増えたとき** (`decodeJoiningMember`) | **抜けていた。** 新メンバーは参照フレームの npyRead は継いだがレシピは継がなかった。**バイト数の検算も一切無かった** | 参照フレーム (`R`) から再構成して渡す。かつ stack の扉と**同じ検算**を通す (`remoteRawSameSize`) |
+| **session 復元** (`raw3` 行が url を持つ場合) | **抜けていた。** §9 が「path に `://` があれば `openRemote(url, recipe)`」と書いた dispatch が無く、`loadRaw` が url をローカルファイルとして開こうとして失敗した | **`hasUrlScheme(d.path)`** で `openRemote(..., &rw)` —— §9 の書き方どおり `://` で判定する。`isPeerUrl` では `local://` の raw doc がこぼれ、`decodeRawFrame` に url が渡って復元できないままだった。crop は G10 の `RestoreWait` に乗せる (npy3 枝と同じ機構) |
+| **CLI `--raw-*` + url** | **入っていた** (`rawReady && isUrl`) | 同じ。ただし `--raw-size` は `rawReady` を立てないので**幾何だけ宣言した url が扉に届かなかった** —— `rawSizeGiven` を別に数える |
+| **CLI 宣言無しの ssh raw** | fall-through で §4.4 第1段の拒否 | 名指しで断る (§5.5 の文)。§10 の「LIST→ダイアログで救わない」判断は維持 |
+| **CFA の位相** (Bayer / quad の RGGB・BGGR・GRBG・GBRG) | **抜けていた。** ダイアログで選んでもリモートの絵は常に RGGB で demosaic され、note も RGGB と名乗り、session は**保存したのと違う色で戻った** | `RawWire::flags` の bit1-2 (§7.1 が「残りは 0、将来の追記用」と宣言していた所)。**サイズ不変で版数も動かない**。peer は読まない (§3.2: 位相は 1 サンプルも変えない) ので client 専用のチャンネルとして使う —— レシピは同じ画素をもう一度訊くすべての経路に既に届くので、兄弟フレーム・全解像度・Watch の新メンバーが自動で同じ位相になる |
+| **1クリック preview** | 拒否 (§5.3 の判断どおり) | **機能は足さない** (§5.3 維持)。**文だけ**新しいものに直す |
+| recipe panel の Apply (`rawRecipeReinterpretCurrent`) | ❌ **未実装で、かつ未拒否。** §7.2 が「remote 版が第4段で繋がる」と書いた所が空で、url を `decodeRawFrame` に渡して「cannot open ssh://...」と言っていた (peer は普通に serve できているファイルについて) | **まだ繋がない** —— `openRemote` に in-place の着地が無く、`replaceIdx` の契約を守れない。ただし**名指しで断り、動く扉を名指す**ようにした |
+| **peer 側 (レシピ無しの要求)** | §4.4 第1段の文 (client 用の文を peer が喋っていた) | §4.4 第2段の文。`imagefile::RefusedBy::Peer` |
+
+**レシピをどこから得るか、最終形:**
+
+| 扉 | レシピの出どころ | サイズの出どころ |
+|---|---|---|
+| Browse の行 | 束縛 (`rawRecipeForSize`) → 無ければ `RawDialog` | 行の `Entry::size` (LIST 済み、round trip 0) |
+| url 名指し (File ▸ Open / D&D / CLI positional) | 同上 | **LIST 1回** (§5.2)。取れなければサイズ不明を名乗って断る |
+| リモートのフォルダ stack | 同上、**Open につき 1回** | フォルダの LIST **1回だけ** |
+| stack のメンバー / 全解像度 / Reload / Watch の新メンバー | **訊かない。** 先頭 doc の `FrameSource` の raw 欄から `rawWireOfSource` で再構成 | 不要 |
+| session 復元 | `raw3` 行そのもの (全欄が入っている) | 不要 |
+| CLI `--raw-*` | フラグ | 不要 (`--raw-size` が幾何を宣言する) |
+| すべての扉の **CFA 位相** | レシピの `flags` bit1-2 に乗って旅する | — |
+| 1クリック preview | **訊かない・開かない** (§5.3) | — |
+
+**メンバーのバイト数の検算 (PR #278、レビューで一度差し替えた)。** ヘッダ無しは
+自分を守れない —— 108B と 110B はどちらも「12B 飛ばして 8x6 u16」で開け、後者は
+**もっともらしい絵**になる。なので**リモートの** stack の Open は**開く前に**
+全メンバーが同じバイト数かを検算する。LIST は**フォルダ 1回だけ**で、
+N 往復にしない。
+
+> **ローカルのフォルダにはこの検算が無い。これは既知の穴である。**
+> `core/app/sequence.inc` のローカル stack ワーカーは、メンバーごとに
+> `decodeRawFrame` を 1 つのレシピで呼ぶだけで、バイト数を比べない。
+> ヘッダ無しのメンバーは**常にレシピの寸法で**デコードされるので、その後ろの
+> `stackShapeRefusal`(形の不一致を断る門)は**原理的に発火しない**。
+> 結果、この節の反例 `silent` (108/112/104 を offset 0 = need 96 のレシピで) は
+> **ローカルのフォルダでは黙って誤読する** —— リモートで塞いだのと同じ穴が、
+> 同じ機械のローカル側に開いている (レビュー P1-2)。
+>
+> **PR #278 はここを直さない。** この PR の主題はリモートの扉で、検算の関数も
+> `remoteRawSameSize` というリモートの名前を持っている。ローカルの扉は
+> **この PR より前から検算が無く**、新たに壊したものではない。範囲を広げる
+> 判断はしていない —— ただし「決めたが作っていない、かつ何も言わない」は
+> この PR の出発点そのものの形なので、**言わないことはしない**。板に行が立つ
+> (ローカルの `--raw-size` 単独が無視される既存の行の隣)。
+>
+> したがって、この節と §12.1 の表で「すべての扉」と読める記述は
+> **すべてリモートの扉の話である**。
+
+> **最初に書いた検算は間違っていた。記録として残す。** 当初の検算は連番グループ行
+> について `合計 == 枚数 × 先頭サイズ` で、「合計が一致していて小さいメンバーが
+> 無いなら大きいメンバーも無く、小さいメンバーは peer が断る」という論法だった。
+> **反例が 2つある**(どちらも 108B の fixture で、レビューが見つけた):
+>
+> - `108 / 110 / 106` → 合計 324 == 3×108 で**偏差が打ち消し合う**。peer の門は
+>   `offset + W×H×ch×elem > 実サイズ` のときだけ断る (§7.1 最終行) ので、
+>   106 は名前と数字で断られるが **110 は断られず、先頭 108 バイト分が黙って
+>   読まれる**。
+> - `108 / 112 / 104` を **offset 0** のレシピ (8x6 u16 = 96 バイトしか要らない)
+>   で開くと、合計は一致し、全メンバーが 96 以上なので **peer は 1本も断らない**。
+>   stack は完成した顔で 2枚を別の長さのファイルから読む。§6.2 が頼っていた
+>   「小さいメンバーは peer が断る」という救いが**そもそも掛からない**。
+>
+> N=2 は安全 (s1+s2 == 2·s1 ⇒ s2 == s1) なので穴は N≥3。**合計は検算ではなかった。**
+
+**いまの検算: `min == max`。** そのために **protocol 16** で LIST のグループ行に
+**メンバーサイズの min と max を追記**した (メンバー名の**後ろ**に append、
+`servedVersion() >= 16 && g_clientVersion >= 16` で出し分け、pre-16 client への
+応答はバイト同一)。1bit の「全員同サイズか」ではなく min/max にしたのは、
+**拒否が実際の数字を引用できる**ようにするため。
+
+- **個別行**で返ったメンバーはサイズが直接分かる → **名前と両方の数字**で断る
+  (F4h(6c) が `alpha.raw is 108 bytes and beta.raw is 110` を固定)。
+- **連番グループ行**は min/max で断る。**名前は言えない** —— グループ行が持つ
+  per-member の事実は両端だけなので、「その名前」を言うには N 回 LIST が要る。
+  言えるのは両端の**数字**で、F4h(6) が 3ケースすべてについて固定する。
+  (以前この節は全ケースで名前が付くと書いていた。偽だった。)
+- **pre-16 の peer** はメンバーごとのサイズを報告しないので、ヘッダ無しの
+  グループの open を**名指しで断る**(「この peer は protocol N で、メンバー
+  ごとのサイズを報告しない」+ 1ファイルずつ開くか peer を更新する)。
+  N 往復に落とさない。「たぶん全部同じ」で開くのが、あるファイルのバイト列を
+  別のファイルのものとして読む経路そのものだから。
+- **検算は 3つの扉が共有する** (`remoteRawSameSize` /
+  `remoteRawSameSizeIn`)。**「2つ」と書いていたのは偽だった**:
+
+  (`openRemoteStack` の 1回は `remoteRawStackOneSize` →
+  `remoteRawSameSize` の 1本だけ。**以前この表は「先頭がグループ行内なら +1」と
+  書いていたが、そんな呼びは実装に無い**。グループ行のメンバーは個別行として
+  listing に出ないので、必要なのはフォルダの listing 1枚であって先頭への
+  2枚目ではない —— レビュー P3-4。)
+
+  | 扉 | 検算のタイミング | LIST の回数 |
+  |---|---|---|
+  | フォルダを stack として開く (`openRemoteStack`) | Open の先頭 | **1** |
+  | Watch でメンバーが増えた (`decodeJoiningMember`) | 各 arrival の前 | **1 drain に 1回** (drain が引いた listing を全メンバーで使う) |
+  | **session 復元** (`remoteSequenceSiblings`) | stack を組む前 | **0** (メンバー名を取った listing をそのまま使う) |
+
+  後の 2つには検算が**一切無かった**。Watch は参照フレームのレシピをそのまま
+  渡していたので、フォルダに落ちてきた別の長さのファイルがそのまま stack に
+  加わっていた。**session 復元はもっと悪く**、反例 `silent` (108/112/104 を
+  offset 0 = need 96 で) が拒否 1本も出ずに通り、**人が見ていない場面で**
+  stack が完成した顔で 2枚誤読していた。断るときは復元の文脈で言い
+  (`LK_StackNotRebuilt` に乗せる): 「この stack が保存されたときのフレームが
+  全て同じ大きさだと確かめられないので再構築しない」+ 検算の理由。
+
+### 12.2 段2b の試験 (F4e) が実装中に捕まえた2件
+
+- **リモートで開いた doc の note が M1 を破っていた。** `openRemote` の note は
+  `"remote"` だけで、幾何もヘッダ長もバイト順も名乗らないまま数値が出ていた ——
+  同じファイルが開いた端によって違う自己記述をする状態で、#148 が1段上で
+  解消した欠陥そのもの。今は `rawRecipeNote` を通すので**ローカル経路と
+  一字一句同じ文**である。§9 が「宣言が結果に付いて回る」と書いていた所は、
+  書いただけでは足りず、試験が要る箇所だった。
 - **レシピ無しの `local://` は「黙って何も起きない」ではない。** #111 の
   再ルートで**幾何を訊くダイアログ**に進む。それが代替手段であり、「推測
   しない」という規則の残り半分である (F4e が主張)。
@@ -711,6 +878,7 @@ client 側事前拒否 (§7.3 の文)。
 | 2b `openRemote` + CLI 経路 | #187 | F4e |
 | 3 MEASURE | #189 | P8b |
 | 4 Browse 経路 + 束縛 | #188 | F4d(行) / F4f |
+| **4b 他の扉すべて + 段1 の文の差し替え** | **#278** | **F4h** / F4d(文の不在) |
 
 **v1 で断ったもの** (§10 と併せて再訪の鍵): 1クリック preview、ファイル内
 frame 軸、set/plugin op の per-role レシピ。
