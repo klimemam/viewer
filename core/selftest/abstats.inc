@@ -3738,6 +3738,305 @@
                 app.proj[1] = App::ProjState{};
             }
 
+            // ======================================================================
+            // C27 - THE OFF-PLOT NOTICE, ASSERTED IN THE POSITIVE. C15b pinned
+            // only the NEGATIVE side of g_projOffProbe ("does not offer a
+            // remedy that cannot work", "nor promise numbers C does not have"),
+            // so the "numbers are below" clause could be stuck shut and stay
+            // green - and it was broken: the possessive branched on a comma and
+            // printed "C, D' numbers are in the table below." with the
+            // apostrophe dangling. A coordinate possessive attaches to the LAST
+            // element, so "C's" and "C, D's" are both right and there was no
+            // rule to branch on. The singular/plural of "slot" IS a rule, and
+            // it was not being applied at all.
+            // ======================================================================
+            {
+                app.images.clear();
+                for (const char* nm : { "pc_off_A", "pc_off_B", "pc_off_C", "pc_off_D" })
+                    app.images.push_back(mkFrame(nm, 16, 16, 1, 1));
+                app.current = 0;
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                addCompareSlot(app.images[2].get());      // C
+                addCompareSlot(app.images[3].get());       // D
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C27 off-plot '%s'\n",
+                        g_projOffProbe.c_str());
+                check(field(g_projSideProbe, "curves=") == "AB" &&
+                      field(g_projSideProbe, "said-no-curve=") == "CD",
+                      "C27 fixture: four mosaic sides, two on the shared axis and two off");
+                check(app.projExtra.size() == 2 && app.projExtra[0].fStat[0].valid &&
+                      app.projExtra[1].fStat[0].valid,
+                      "C27 fixture: ...and both off-plot sides really do have numbers");
+                // THE CLAUSE FIRES AT ALL - the half C15b could not see.
+                check(g_projOffProbe.find("C, D's numbers are in the table below.") !=
+                          std::string::npos,
+                      "C27 two off-plot sides with numbers are sent to the table, as \"C, D's\"");
+                check(g_projOffProbe.find("' numbers") == std::string::npos,
+                      "C27 ...with no dangling apostrophe anywhere in the sentence");
+                check(g_projOffProbe.find("slots C, D: no curve") != std::string::npos,
+                      "C27 ...and two letters are \"slots\", not \"slot\"");
+                // ...and the SINGULAR, off the same code: one letter keeps "slot"
+                // and keeps the same "'s".
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                addCompareSlot(app.images[2].get());      // C alone
+                app.abStepBusyUntil = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C27 one off-plot '%s'\n",
+                        g_projOffProbe.c_str());
+                check(field(g_projSideProbe, "said-no-curve=") == "C",
+                      "C27 fixture: three sides leave exactly C off");
+                check(g_projOffProbe.find("slot C: no curve") != std::string::npos &&
+                      g_projOffProbe.find("C's numbers are in the table below.") !=
+                          std::string::npos,
+                      "C27 one letter is \"slot C\" and \"C's\" - the same spelling, singular");
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C28 - THE POOLED FOOTNOTE'S GATE IS THE ROW, NOT THE SIDE. The
+            // footnote names the sides whose "all" row is a mosaic's and says
+            // their pooled REGION statistics stand. Its gate was
+            // `cell > 1 && allRow && unavail.empty()` - three properties of the
+            // SIDE - and the promise is fStat[4].valid, a property of the ROW.
+            // A side that is not refused but whose region holds no finite pixel
+            // was named under a sentence saying its mean and sigma stand, with
+            // twelve dashes in the row above it.
+            // ======================================================================
+            {
+                app.projAllRow = true;
+                ImageDoc* d = useOnly(mkFrame("pc_pool_nan", 16, 16, 1, 1));
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++)
+                        d->px()[(size_t)y * 16 + x] =
+                            std::numeric_limits<float>::quiet_NaN();
+                d->black = 0; d->white = 4095;
+                app.anns.clear();
+                App::Ann a8;
+                a8.id = app.nextAnnId++;
+                a8.type = 0;
+                a8.x = 0; a8.y = 0; a8.w = 8; a8.h = 8;    // the all-NaN corner
+                a8.label = "pcpoolnan";
+                app.anns.push_back(a8);
+                app.selectedAnn = a8.id;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C28 foot '%s' allRow=%d fStat4=%d\n",
+                        g_projFootProbe.c_str(), app.proj[0].allRow ? 1 : 0,
+                        app.proj[0].fStat[4].valid ? 1 : 0);
+                check(app.proj[0].cell > 1 && app.proj[0].allRow &&
+                      app.proj[0].unavail.empty(),
+                      "C28 fixture: a mosaic with the pooled row on, and NOT a refused side");
+                check(!app.proj[0].fStat[4].valid,
+                      "C28 fixture: ...whose ROI holds no finite pixel, so slot 4 is invalid");
+                check(g_projFootProbe.empty(),
+                      "C28 the footnote does not name a side whose pooled row is all dashes");
+                // ...and the per-plane notice is what covers that side, so the
+                // tighter gate opens no silence.
+                check(g_projNoCurveProbe.find("no finite sample at any of its") !=
+                          std::string::npos,
+                      "C28 ...the planes' own notice says why, so nobody is left unsaid");
+                // ANTI-VACUOUS: the same frame, the ROI moved onto the finite
+                // half, and the side is named again.
+                app.anns[0].x = 8;
+                app.annRev++;
+                app.proj[0] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C28 finite-ROI foot '%s' fStat4=%d\n",
+                        g_projFootProbe.c_str(), app.proj[0].fStat[4].valid ? 1 : 0);
+                check(app.proj[0].fStat[4].valid && g_projFootProbe == "pooled-mosaic=A",
+                      "C28 with numbers in the pooled row, the footnote names A as before");
+                app.anns.clear();
+                app.selectedAnn = 0;
+                app.annRev++;
+                app.projAllRow = false;
+                app.proj[0] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C29 - EVERY SIDE WITH FEWER PLANES SAYS ITS OWN NUMBER. The set
+            // the plane-count notice is about is {nSeries < maxSeries}, and the
+            // number it printed was the GLOBAL minimum - one number for the
+            // whole set. A Bayer (4), B RGB (3), C mono (1) came out as
+            // "B, C have 1 plane(s), not 4" with B's three planes listed in the
+            // table directly above, and "its" was singular over a list.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_pl_A", 16, 16, 1, 1));   // mosaic: 4
+                app.images.push_back(mkFrame("pc_pl_B", 16, 16, 0, 3));   // RGB:    3
+                app.images.push_back(mkFrame("pc_pl_C", 16, 16, 0, 1));   // mono:   1
+                app.current = 0;
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                addCompareSlot(app.images[2].get());       // C
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C29 mismatch '%s'\n",
+                        g_projMismatchProbe.c_str());
+                check(app.proj[0].nSeries == 4 && app.proj[1].nSeries == 3 &&
+                      app.projExtra.size() == 1 && app.projExtra[0].nSeries == 1,
+                      "C29 fixture: three sides with three different plane counts");
+                check(g_projMismatchProbe ==
+                          "B has 3 planes, C has 1 plane, not 4: "
+                          "their CFA interpretation differs",
+                      "C29 each named side carries ITS OWN count, and the pronoun is plural");
+                check(g_projMismatchProbe.find("B has 1") == std::string::npos,
+                      "C29 ...so the global minimum is never attributed to B");
+                // ...and ONE side short of the most: singular pronoun, its own
+                // number, and the plural of "plane" spelled off that number.
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                setCompareB(app.images[2].get());          // A mosaic, B mono
+                app.abStepBusyUntil = 0;
+                app.proj[1] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C29 one short '%s'\n",
+                        g_projMismatchProbe.c_str());
+                check(g_projMismatchProbe ==
+                          "B has 1 plane, not 4: its CFA interpretation differs",
+                      "C29 one side short reads \"1 plane\" and \"its\"");
+                // ANTI-VACUOUS: two sides with the SAME plane count say nothing.
+                setCompareB(app.images[0].get());
+                app.abStepBusyUntil = 0;
+                app.proj[1] = App::ProjState{};
+                draw();
+                check(g_projMismatchProbe.empty(),
+                      "C29 two mosaics raise no plane-count notice at all");
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C30 - THE y AXIS SAYS WHOSE dtype, AND onePlot RUNS PER PANE. The
+            // clause was `if (Bim && Bim->dtype != im->dtype)` built from A and
+            // B alone, so pane C's axis read "A u16 / B f32, DTYPE MISMATCH"
+            // about two sides that pane is not showing, a third dtype was never
+            // named, and A == B with a differing C was never reported at all.
+            // (The display-range clause on the same axis stays A/B: the range
+            // really is A and B's. Its subject is the range; this one's is the
+            // pane.)
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_dt_A", 16, 16, 0, 1));
+                app.images.push_back(mkFrame("pc_dt_B", 16, 16, 0, 1));
+                app.images.push_back(mkFrame("pc_dt_C", 16, 16, 0, 1));
+                // ...and one of ANOTHER WIDTH, which is how the panes are
+                // forced: side by side is reached either by the layout setting
+                // or by profiles that cannot be overlaid, and only the second
+                // survives a narrow panel ("the narrow fallback yields to
+                // correctness"). The first spelling of this fixture asked for
+                // AbSide in a 900 px window and got the overlay back, because
+                // two panes need 2 * AB_MIN_SIDE * uiScale.
+                app.images.push_back(mkFrame("pc_dt_Bw", 32, 16, 0, 1));
+                // the mirror AND the source: the panel reads the mirror, and the
+                // two must not disagree (state.h, syncMirrors)
+                app.images[2]->src->dtype = "f32";
+                app.images[2]->dtype = "f32";
+                app.images[3]->src->dtype = "f32";
+                app.images[3]->dtype = "f32";
+                app.current = 0;
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                // the y titles of this frame, in pane order, one per axis
+                auto yLabels = [&]() {
+                    std::vector<std::string> out;
+                    std::string one;
+                    for (char ch : g_projYAxisProbe) {
+                        if (ch == '|') { out.push_back(one); one.clear(); }
+                        else one += ch;
+                    }
+                    if (!one.empty()) out.push_back(one);
+                    return out;
+                };
+                // (a) SIDE BY SIDE: one pane per side, so the clause is about
+                // the one side that pane shows - named first - and about the
+                // sides it disagrees with.
+                setCompareB(app.images[3].get());          // A 16 wide u16, B 32 wide f32
+                app.abStatsLayout = App::AbSide;
+                app.abStepBusyUntil = 0;
+                draw();
+                fprintf(stderr, "abstatsselftest: C30 panes y '%s'\n",
+                        g_projYAxisProbe.c_str());
+                check(!abProjOverlayable(app.proj[0], app.proj[1]) &&
+                      field(g_projSideProbe, "layout=") == "side",
+                      "C30 fixture: profiles of two widths, so one pane per side");
+                {
+                    const std::vector<std::string> yl = yLabels();
+                    check(yl.size() == 4,
+                          "C30 fixture: two panes times two axes is four y titles");
+                    check(yl.size() == 4 &&
+                          yl[0] == "mean value (DN)  -  A u16 / B f32, DTYPE MISMATCH" &&
+                          yl[1] == yl[0],
+                          "C30 pane A's axis names A first - the side that pane is showing");
+                    check(yl.size() == 4 &&
+                          yl[2] == "mean value (DN)  -  B f32 / A u16, DTYPE MISMATCH" &&
+                          yl[3] == yl[2],
+                          "C30 pane B's axis names B first, not A - it is B's numbers on it");
+                }
+                app.abStatsLayout = App::AbOverlay;
+                // (b) A AND B AGREE AND C DIFFERS. The old gate compared A with
+                // B only, so this frame said nothing whatever about dtype.
+                setCompareB(app.images[1].get());          // A u16, B u16
+                addCompareSlot(app.images[2].get());       // C f32
+                app.abStepBusyUntil = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                draw();
+                fprintf(stderr, "abstatsselftest: C30 A==B, C differs y '%s'\n",
+                        g_projYAxisProbe.c_str());
+                check(app.proj[0].img && app.proj[1].img &&
+                      app.proj[0].img->dtype == app.proj[1].img->dtype,
+                      "C30 fixture: A and B have the SAME dtype - the old gate's blind spot");
+                check(g_projYAxisProbe.find("A u16 / B u16 / C f32, DTYPE MISMATCH") !=
+                          std::string::npos,
+                      "C30 the third dtype is named, and the mismatch is reported");
+                // ANTI-VACUOUS: all three the same dtype and the axis is plain.
+                app.images[2]->src->dtype = "u16";
+                app.images[2]->dtype = "u16";
+                app.abStepBusyUntil = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.projExtra.clear();
+                draw();
+                fprintf(stderr, "abstatsselftest: C30 all u16 y '%s'\n",
+                        g_projYAxisProbe.c_str());
+                check(g_projYAxisProbe.find("DTYPE MISMATCH") == std::string::npos,
+                      "C30 three sides of one dtype raise no mismatch");
+                check(g_projYAxisProbe.find("mean value (DN)") == 0,
+                      "C30 ...and the axis keeps the plain title");
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
             // ---- everything borrowed, put back ------------------------------------
             app.anns.clear();
             app.nextAnnId = 1;

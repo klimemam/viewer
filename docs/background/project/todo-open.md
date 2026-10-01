@@ -1297,8 +1297,8 @@ Histogram も同じ形 (`H.nSeries` ~8661)。そして:
 Histogram の表で見たのなら、これが答え (=そもそも B が居ない)。
 
 **済んだ部分 (`36cc08d`)**: 「最低限、プレーン集合が違うことを表で言う」は入った。
-`projSayPlaneMismatch` (~10243) が、少ない側の名前と
-"its CFA interpretation differs" を橙で出し、ツールチップで直し方
+`projSayPlaneMismatch` が、少ない側の名前と
+側ごとのプレーン数、"its / their CFA interpretation differs"（名指した側の数で一致させる）を橙で出し、ツールチップで直し方
 (Inspector > Interpret) を言う。サイズ違いの "size differs" (項目3) と同じ扱い。
 
 **残っている決めごと**: **CFA の解釈は doc の属性か、比較ペアの属性か、

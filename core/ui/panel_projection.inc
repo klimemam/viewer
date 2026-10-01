@@ -71,6 +71,13 @@ static std::string g_projXAxisProbe;
 // every side's row.
 static std::string g_projOffProbe;
 static std::string g_projDimsProbe;
+// ...the y axis title, whose dtype clause is about THE SIDES THIS PLOT CARRIES
+// and was built from A and B on every pane, and the plane-count notice, whose
+// set is "every side with fewer planes than the most" and which printed ONE
+// global minimum for the whole set. Both are sentences whose operands were not
+// what they were printed about, which no count of letters can show.
+static std::string g_projYAxisProbe;
+static std::string g_projMismatchProbe;
 
 // Does series `s` carry a sample at profile index `i` AT ALL? The mosaic's
 // answer, not the data's: for a Bayer plane every other index is a position the
@@ -214,6 +221,8 @@ static void drawPanelProjection() {
     g_projNoCurveProbe.clear();
     g_projFootProbe.clear();
     g_projXAxisProbe.clear();
+    g_projYAxisProbe.clear();
+    g_projMismatchProbe.clear();
     g_projOffProbe.clear();
     g_projDimsProbe.clear();
     ImageDoc* im = cur();
@@ -468,8 +477,11 @@ static void drawPanelProjection() {
     // gates for; this is the same two gates, in the one other place the panel
     // says it.
     std::string offPlot, offNone, offMsg;
+    int nOffPlot = 0, nOffNone = 0;
     for (size_t i = nPlot; i < nSides; i++) {
-        std::string& into = sides[i].S->unavail.empty() ? offPlot : offNone;
+        const bool noProfile = !sides[i].S->unavail.empty();
+        std::string& into = noProfile ? offNone : offPlot;
+        (noProfile ? nOffNone : nOffPlot)++;
         if (!into.empty()) into += ", ";
         into += sides[i].name;
     }
@@ -487,16 +499,23 @@ static void drawPanelProjection() {
             if (!offNums.empty()) offNums += ", ";
             offNums += sides[i].name;
         }
-        offMsg = "slot " + offPlot + ": no curve - " + offWhy + ".";
+        // "slot"/"slots" off the COUNT of letters in the list, not off a comma
+        // in a string: this sentence is printed for a set and said "slot C, D".
+        offMsg = std::string(nOffPlot > 1 ? "slots " : "slot ") + offPlot +
+                 ": no curve - " + offWhy + ".";
         if (!offNums.empty())
-            offMsg += "  " + offNums +
-                      (offNums.find(',') == std::string::npos ? "'s numbers are"
-                                                             : "' numbers are") +
-                      " in the table below.";
+            // "C's" and "C, D's" are BOTH right - English attaches a coordinate
+            // possessive to the last element of the list - so there is no rule
+            // here to branch on, and the branch printed "C, D' numbers are"
+            // with the apostrophe dangling. The has/have choice in the per-plot
+            // notice was REUSED from projSayPlaneMismatch (see its comment);
+            // this rule was rebuilt on the spot, and the rebuilt one was wrong.
+            offMsg += "  " + offNums + "'s numbers are in the table below.";
     }
     if (!offNone.empty()) {
         if (!offMsg.empty()) offMsg += "  ";
-        offMsg += "slot " + offNone + ": no curve - no profile at all (see above); "
+        offMsg += std::string(nOffNone > 1 ? "slots " : "slot ") + offNone +
+                  ": no curve - no profile at all (see above); "
                   "the plot's limits are not what is keeping it off.";
     }
     g_projOffProbe = offMsg;
@@ -975,19 +994,72 @@ static void drawPanelProjection() {
     auto onePlot = [&](bool horizontal, const std::vector<size_t>& which) {
         float x0, x1;
         xRange(horizontal, x0, x1);
-        char yl[176];
         // "display range" is effBlack/effWhite, which with compare on is the A/B
         // range - so say which one, exactly as the histogram's x axis does
         char yr[80] = "";
         if (app.projYMode == 1)
             snprintf(yr, sizeof yr, ", %s", abRangeSaid(Bim != nullptr));
-        if (Bim && Bim->dtype != im->dtype)
-            snprintf(yl, sizeof yl, "%s value (%s%s)  -  A %s / B %s, DTYPE MISMATCH",
-                     modes[std::clamp(app.projMode, 0, 2)], abValueUnit(im->dtype).c_str(),
-                     yr, im->dtype.c_str(), Bim->dtype.c_str());
-        else
-            snprintf(yl, sizeof yl, "%s value (%s%s)", modes[std::clamp(app.projMode, 0, 2)],
-                     abValueUnit(im->dtype).c_str(), yr);
+        // ...and WHOSE dtype. The clause was `if (Bim && Bim->dtype != im->dtype)`,
+        // built from A and B alone, and `onePlot` runs ONCE PER PANE: pane C's y
+        // axis read "A u16 / B f32, DTYPE MISMATCH" about two sides that pane is
+        // not showing, a third dtype was never named, and a frame where A and B
+        // agree and only C differs was never reported at all.
+        //
+        // The `yr` clause just above is NOT the same thing and is left exactly
+        // as it is: the display range really IS the A/B range, so naming A and B
+        // there is the true answer. The subject of `yr` is the RANGE; the subject
+        // of this one is the pane.
+        //
+        // So: the sides THIS plot carries, each with its own dtype, and then
+        // every other compared side that disagrees with all of them - the clause
+        // is then true of the axis it is printed on, and the mismatch is still
+        // reported wherever the odd dtype sits. A std::string, because the list
+        // grows with the slots and a char[176] would truncate it in silence.
+        //
+        // A side whose state holds no document yet is not named at all rather
+        // than lent A's answer: "unknown" is not a dtype to compare against.
+        //
+        // Naming a side the plot does NOT carry is right here and wrong in the x
+        // axis note below, and the two are not in conflict. That note is a claim
+        // about what the x NUMBERS on this axis mean, so a side with no sample on
+        // the axis has no business annotating it. This one is a list of letters
+        // each paired with its OWN dtype plus the word MISMATCH, which is true of
+        // every letter in it - and dropping the sides off the plot would silence
+        // the warning entirely side by side, where every pane carries one side
+        // and the panes are exactly what the reader is comparing.
+        auto sideDtype = [&](size_t si) -> const std::string* {
+            return sides[si].S->img ? &sides[si].S->img->dtype : nullptr;
+        };
+        std::string dtHere, dtElse;
+        const std::string* dtFirst = nullptr;
+        bool dtDiffer = false;
+        for (size_t si : which) {
+            const std::string* d = sideDtype(si);
+            if (!d) continue;
+            if (!dtFirst) dtFirst = d;
+            else if (*d != *dtFirst) dtDiffer = true;
+            if (!dtHere.empty()) dtHere += " / ";
+            dtHere += sides[si].name + " " + *d;
+        }
+        for (size_t si = 0; dtFirst && si < sides.size(); si++) {
+            const std::string* d = sideDtype(si);
+            bool onThisPlot = false, same = false;
+            for (size_t sj : which) {
+                if (sj == si) onThisPlot = true;
+                const std::string* dj = sideDtype(sj);
+                if (d && dj && *dj == *d) same = true;
+            }
+            if (!d || onThisPlot || same) continue;
+            if (!dtElse.empty()) dtElse += " / ";
+            dtElse += sides[si].name + " " + *d;
+            dtDiffer = true;
+        }
+        std::string ylS = std::string(modes[std::clamp(app.projMode, 0, 2)]) + " value (" +
+                          abValueUnit(dtFirst ? *dtFirst : im->dtype) + yr + ")";
+        if (dtDiffer)
+            ylS += "  -  " + dtHere + (dtElse.empty() ? std::string() : " / " + dtElse) +
+                   ", DTYPE MISMATCH";
+        const char* yl = ylS.c_str();
         // A decimated preview's columns are every Nth column OF THE SENSOR, so
         // "column x (px)" names a sensor coordinate these samples do not have -
         // and this panel's whole x-axis ruling is that x IS the sensor's column
@@ -1031,6 +1103,8 @@ static void drawPanelProjection() {
                                    : ": PREVIEW grid, every Nth sensor line, not sensor x");
         if (!g_projXAxisProbe.empty()) g_projXAxisProbe += "|";
         g_projXAxisProbe += xl;
+        if (!g_projYAxisProbe.empty()) g_projYAxisProbe += "|";
+        g_projYAxisProbe += ylS;
         PlotRect pr = beginPlot(xl, yl, x0, x1, yLo, yHi, true, false, each);
         if (!pr.ok) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1342,13 +1416,24 @@ static void drawPanelProjection() {
     {   // a diverged slot's rows are the last frame its stack had - say so with
         // the same sentence the B side gets (g_abFollowDiverged, above)
         std::string div;
+        int nDiv = 0;
         for (const ResolvedSlot& rs : xslots)
-            if (rs.diverged) { if (!div.empty()) div += ", "; div += slotName(rs.idx); }
+            if (rs.diverged) {
+                if (!div.empty()) div += ", ";
+                div += slotName(rs.idx);
+                nDiv++;
+            }
         if (!div.empty())
+            // ...agreeing with HOW MANY slots diverged. This sentence is also
+            // built from a list of names, and said "slot 1, 2 ... its rows ...
+            // it had" - the frame number is A's by definition (that is what
+            // follow-frame means, and the clause says so), but the slot is not
+            // one slot. Counted, not looked for in the string.
             ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.35f, 1),
-                               "follow-frame: slot %s: no frame %d in that stack - its "
-                               "rows show the last frame it had, not A's partner",
-                               div.c_str(), im->seqIndex);
+                               "follow-frame: %s %s: no frame %d in that stack - %s "
+                               "rows show the last frame %s had, not A's partner",
+                               nDiv > 1 ? "slots" : "slot", div.c_str(), im->seqIndex,
+                               nDiv > 1 ? "their" : "its", nDiv > 1 ? "they" : "it");
     }
     int maxSeries = 0, minSeries = 99;
     for (const auto& sr : sides) {
@@ -1357,13 +1442,39 @@ static void drawPanelProjection() {
     }
     auto projSayPlaneMismatch = [&]() {
         if (sides.size() < 2 || minSeries == maxSeries) return;
+        // EVERY side with fewer planes than the most, EACH WITH ITS OWN COUNT.
+        // The set is {nSeries < maxSeries} and the number printed was the global
+        // `minSeries` - one number for the whole set - so A Bayer (4), B RGB (3),
+        // C mono (1) read "B, C have 1 plane(s), not 4" and B has three. `its`
+        // was singular over a list of names in the same sentence.
+        //
+        // The SUBJECT is the right set (Interpret has to be set on every one of
+        // them), so the quantifier goes on the MEMBERS rather than narrowing the
+        // subject. The rule is this branch's own canon - the clause's subject and
+        // the set that satisfies it must be the same set
+        // (docs/features/analysis/stats-taxonomy.md) - and a clause naming three
+        // sides with one side's number is exactly what it forbids.
+        //
+        // Per member this also ends the comma-driven verb HERE: "B has 3 planes"
+        // has one subject however long the list is, the plural is spelled off a
+        // number this code is holding, and the only agreement left - its/their -
+        // is taken from the COUNT of named sides, not from a comma in a string.
+        // (The per-plot no-curve notice still borrows the has/have spelling from
+        // this function; what it borrows is unchanged - one subject, one verb.)
         std::string few;
+        int nFew = 0;
         for (const auto& sr : sides)
-            if (sr.S->nSeries < maxSeries) { if (!few.empty()) few += ", "; few += sr.name; }
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "%s %s %d plane(s), not %d: its CFA interpretation differs",
-                           few.c_str(), few.find(',') == std::string::npos ? "has" : "have",
-                           minSeries, maxSeries);
+            if (sr.S->nSeries < maxSeries) {
+                if (!few.empty()) few += ", ";
+                few += sr.name + " has " + std::to_string(sr.S->nSeries) +
+                       (sr.S->nSeries == 1 ? " plane" : " planes");
+                nFew++;
+            }
+        const std::string mism = few + ", not " + std::to_string(maxSeries) + ": " +
+                                 (nFew > 1 ? "their" : "its") +
+                                 " CFA interpretation differs";
+        g_projMismatchProbe = mism;
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", mism.c_str());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("\"Bayer\" is set per IMAGE (Inspector > Interpret), not per\n"
                               "sensor. A side loaded without it stays one plane, so the\n"
@@ -1545,10 +1656,22 @@ static void drawPanelProjection() {
                        "estimates for a flat field, not temporal RN. * = clamped; hover for details.");
     std::string pooledMosaic;      // the sides whose "all" row is a mosaic's
     for (const ProjSide& sd : sides)
-        // ...and not a REFUSED side. The sentence promises that the pooled
-        // region statistics stand, and on a side with no profile they are
-        // dashes too - its own notice is what explains that side.
-        if (sd.S->cell > 1 && sd.S->allRow && sd.S->unavail.empty()) {
+        // ...and only where THE ROW THIS SENTENCE IS ABOUT really has numbers.
+        // `cell`, `allRow` and `unavail` are all properties of the SIDE; what the
+        // sentence promises is that the pooled region statistics stand, and that
+        // is `fStat[4].valid` - a property of the ROW. The refused side was
+        // accounted for (no profile, so dashes, and its own notice explains it)
+        // and "not refused, but this row has no numbers" was not: an ROI whose
+        // every pixel is non-finite leaves slot 4 invalid, and the side was then
+        // named under a sentence saying its mean and sigma stand.
+        //
+        // This opens no silence. put(4) runs on exactly the pixels put(s) runs
+        // on (recomputeProjectionIfNeeded, panel_histogram.inc), so an invalid
+        // slot 4 means every plane's region statistics are invalid too - and the
+        // per-plane no-curve notice above is already saying "no finite sample at
+        // any of its N position(s)" for each of them.
+        if (sd.S->cell > 1 && sd.S->allRow && sd.S->unavail.empty() &&
+            sd.S->fStat[4].valid) {
             if (!pooledMosaic.empty()) pooledMosaic += ", ";
             pooledMosaic += sd.name;
         }
