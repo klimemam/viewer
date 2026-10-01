@@ -1109,11 +1109,20 @@ static void parseCli(int argc, char** argv) {
                 // The lead-in comes from imagefile (one spelling for all three
                 // roads); only the WAY OUT is this one's, and for a command
                 // line the way out is a flag.
-                fprintf(stderr, "%s: %s\n"
-                        "  state the geometry with --raw-size WxH (and --raw-dtype / "
-                        "--raw-interp when it is not u8 gray), or open it from the "
-                        "Browse panel - that door asks\n",
-                        a.c_str(), imagefile::headerlessLead(a).c_str());
+                const std::string why =
+                    a + ": " + imagefile::headerlessLead(a) +
+                    "\n  state the geometry with --raw-size WxH (and --raw-dtype / "
+                    "--raw-interp when it is not u8 gray), or open it from the "
+                    "Browse panel - that door asks";
+                // BOTH ROADS. stderr is for the scripted run; the toast is for
+                // the one nobody typed - a desktop shortcut, a file
+                // association, a double-clicked .raw - where the GUI build's
+                // stderr is a console no human will ever read. #268 is this
+                // project's record of what that silence costs: a refusal that
+                // only reaches stderr is, from the operator's chair, a viewer
+                // that opened nothing and said nothing (review P3-3).
+                fprintf(stderr, "%s\n", why.c_str());
+                toast(why, true);
             } else if (!special && (rawReady || rawSizeGiven) && isUrl) {
                 // A headerless file on a PEER, declared on the command line.
                 // The same six numbers the local branch below would decode
@@ -1125,6 +1134,17 @@ static void parseCli(int argc, char** argv) {
                 const rp::RawWire rw = rawWireFrom(d);
                 if (!openRemote(a, false, 0, 0, &rw))
                     fprintf(stderr, "could not open %s\n", a.c_str());
+                // ...and --raw-crop, which is NOT one of the six numbers on
+                // the wire: a crop is a view of what came back, so it is
+                // finished here exactly as the dialog's Load and the session
+                // restore finish theirs (applyRecipeCropHere). The local
+                // branch below gets it from loadRaw; this branch dropped it,
+                // which made `--raw-crop` a flag that worked on one disk and
+                // was ignored on the other without a word.
+                else
+                    applyRecipeCropHere(d.cropOn, d.cropX, d.cropY, d.cropW, d.cropH,
+                                        app.images.empty() ? nullptr
+                                                           : app.images.back().get());
             } else if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;

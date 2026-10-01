@@ -43,6 +43,24 @@ static bool openRawDialogFor(const std::string& path, uint64_t knownSize) {
     }
     size_t sz = (size_t)knownSize;
     if (!knownSize) {
+        // A URL IS NOT A PATH. With no count in hand, the ifstream below opens
+        // `path` as a file on THIS machine - and for "ssh://host/x.raw" that is
+        // a filename nothing here has, so the answer was "cannot open x.raw"
+        // about a file the peer is serving perfectly well (review P3-5).
+        //
+        // A peer's byte count never comes from a stat here; it comes from a
+        // listing (remoteRawFileSize) and is passed in. Arriving with 0 means
+        // the listing itself said 0 - a row the peer could not stat, or a file
+        // that really is empty - and neither of those is a geometry. Said from
+        // what is actually known, which is that the count is the missing fact.
+        if (hasUrlScheme(path)) {
+            toast(baseName(path) + ": the peer reports 0 bytes for it, and a headerless "
+                  "file's geometry is worked out from its byte count - so there is "
+                  "nothing to ask about yet"
+                  "\n  check the file is readable on the peer, then re-open the folder "
+                  "from Browse", true);
+            return false;
+        }
         std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
         if (!f) { toast("cannot open: " + baseName(path), true); return false; }
         sz = (size_t)f.tellg();
@@ -1680,6 +1698,21 @@ static watch::Rebuild planStackMembershipRemote(int seqId, const ReloadPeer& pee
 // and a round trip per arriving frame is the freeze this file spent two PRs
 // removing. Null (the default) means "fetch it", which is what the local doors
 // and the tests want.
+// The folder a PEER path lives in. One spelling, because the byte-count check
+// put two hand-written copies of it in and both got the same case wrong: in
+// "/cube.raw" the separator is at index 0, so `substr(0, cut)` is the EMPTY
+// string and the MSG_LIST that follows asks the peer to list "" - a listing
+// that comes back with nothing in it, so a root-level headerless file fails the
+// same-size check with "the peer would not list" and never opens at all. The
+// peer's root is "/", which is what remoteSequenceSiblings had already worked
+// out for itself; this is that answer, available to everyone who needs it.
+static std::string peerParentDir(const std::string& rpath) {
+    const size_t cut = rpath.find_last_of("/\\");
+    if (cut == std::string::npos) return ".";     // a bare name: the peer's cwd
+    if (cut == 0) return "/";                     // the peer's ROOT, never ""
+    return rpath.substr(0, cut);
+}
+
 static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
                                                      const std::string& path,
                                                      std::string& errOut,
@@ -1735,9 +1768,7 @@ static std::unique_ptr<ImageDoc> decodeJoiningMember(const ImageDoc& ref,
         // whatever N is. This check did not exist: a Watch arrival went
         // straight to META/TILE with the reference frame's recipe.
         if (haveJrw) {
-            const size_t dcut = rpath.find_last_of("/\\");
-            const std::string mdir = dcut == std::string::npos ? std::string(".")
-                                                               : rpath.substr(0, dcut);
+            const std::string mdir = peerParentDir(rpath);
             uint64_t sameSz = 0;
             std::string sameWhy;
             const std::vector<std::string> pair = { baseName(rpath), baseName(R.remoteUrl) };
@@ -2974,6 +3005,29 @@ static bool remoteRawFileSize(const std::string& host, const std::string& rpath,
     return false;
 }
 
+// THE HALF OF A RECIPE THAT DOES NOT TRAVEL. A RawWire carries six numbers and
+// a flags word; a CROP is not among them and cannot be, because the peer's job
+// is to serve the bytes a reading asks for and a crop is a view of what came
+// back (§3.2). So every door that applies a recipe to a peer's file has to
+// finish it on this side, and until this review two of them did not: the file
+// opened whole while the applied line read "... crop 10,10 100x100".
+//
+// The session restore worked this out first and wrote down the answer
+// (session.inc, the raw3 branch): cropInPlace, and when it refuses because the
+// frame on screen is still a decimated preview, park it and let the
+// full-resolution arrival finish the job - G10 / PR #177 is the record of what
+// ignoring that `false` cost. This is that answer, in one place, because two
+// spellings of "finish the recipe" is how one of them ends up not doing it.
+//
+// Returns whether the crop is DONE: false means it is parked, which the
+// caller's line has to say rather than claim a crop that is not there yet.
+static bool applyRecipeCropHere(bool on, int x, int y, int w, int h, ImageDoc* d) {
+    if (!on || w <= 0 || h <= 0 || !d) return true;
+    if (cropInPlace(*d, x, y, w, h)) return true;
+    parkRestoreWait(*d, x, y, w, h, false);     // false: the operator's, not a session's
+    return false;
+}
+
 static RawDoorAnswer openRemoteRawDeclared(const std::string& url, uint64_t sizeBytes) {
     g_rawDoorEntries++;
     std::string host, rpath;
@@ -3009,7 +3063,15 @@ static RawDoorAnswer openRemoteRawDeclared(const std::string& url, uint64_t size
         d.fileSize = (size_t)sizeBytes;
         const rp::RawWire rw = rawWireFrom(d);
         if (!openRemote(url, false, 0, 0, &rw)) return RD_Refused;
-        toast(rawRecipeAppliedLine(*r, baseName(rpath), (size_t)sizeBytes));
+        std::string line = rawRecipeAppliedLine(*r, baseName(rpath), (size_t)sizeBytes);
+        // The line names the recipe, crop and all, so the crop had better be
+        // there - and when it is only parked the line says which part of
+        // itself has not happened yet instead of over-claiming by a frame.
+        if (!applyRecipeCropHere(r->cropOn, r->cropX, r->cropY, r->cropW, r->cropH,
+                                 app.images.empty() ? nullptr : app.images.back().get()))
+            line += "\n  the crop is applied when the full-resolution frame lands "
+                    "(this view is decimated)";
+        toast(line);
         return RD_Opened;
     }
     // RD_Asked only when the dialog is actually STANDING and is this url's.
@@ -4410,7 +4472,7 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
 // 8x6 u16 with 12 B skipped and the second one comes back as a PLAUSIBLE
 // picture of the wrong bytes. Every door that opens more than one of them under
 // ONE recipe therefore has to ask this before it reads anything, and there are
-// THREE such doors:
+// THREE REMOTE doors:
 //
 //   a folder opened as a stack        openRemoteStack
 //   a member Watch saw appear         decodeJoiningMember, via the drain's
@@ -4421,6 +4483,22 @@ static int attachRemoteStack(ImageDoc* first, const std::string& host,
 // this comment said there were two - and it is the one that matters most,
 // because a restore runs with nobody watching it (review P1). Anything that
 // adds a fourth adds a row here and a call there.
+//
+// AND THE LOCAL FOLDER HAS NO SUCH CHECK. Said here, in the function whose
+// name is the check, because the sentence above reads like a rule about the
+// program and it is a rule about the LINK: core/app/sequence.inc's stack
+// worker calls decodeRawFrame once per member with the one recipe and never
+// compares byte counts. A headerless member always decodes AT the recipe's
+// dimensions, so stackShapeRefusal - the gate behind it that refuses a
+// disagreeing sibling - cannot fire on this at all, and `silent`
+// (108/112/104 read at offset 0, which needs 96) misreads two of three frames
+// on this machine's own disk in silence.
+//
+// PR #278 does not close it, by ruling: the subject here is the remote door,
+// this function is named for it, and the local door has been this way since
+// before any of it. What the PR will not do is leave it unsaid - that shape
+// ("decided, not built, and silent about it") is the exact defect this PR
+// started from. The board carries a row; the design doc names it in §12.1.
 //
 // HOW IT IS ONE ROUND TRIP. The listing answers per-file for the rows it names
 // individually, and per-GROUP for a numbered family - and since protocol 16 a
@@ -4525,8 +4603,15 @@ static bool remoteRawSameSizeIn(const std::vector<remote::Entry>& es, int peerVe
         return false;
     }
     if (lo == 0) {
-        why = "the files in " + dir + " are 0 bytes: there is no geometry a recipe "
-              "could describe";
+        // NAMED when the listing allows it, for the reason the mismatch above
+        // is named: a single row IS its own size, so the file with no bytes can
+        // be pointed at. A group row carries only its extremes, so there the
+        // folder is as far as the truth goes. 0 is also what the peer sends for
+        // a row it could not stat (serve.cpp fileSizeOr0), which is why this
+        // says "reports 0 bytes" rather than asserting the file is empty.
+        why = (loName.empty() ? "a file in " + dir : loName) +
+              " reports 0 bytes: there is no geometry a recipe could describe"
+              "\n  check it is readable on the peer, then re-open the folder from Browse";
         return false;
     }
     sizeOut = lo;
@@ -4551,9 +4636,7 @@ static bool remoteRawSameSize(remote::Session& ses, int peerVersion, const std::
 // The STACK door's form of the question: ensure the session, then ask.
 static bool remoteRawStackOneSize(const std::string& host, const std::vector<std::string>& files,
                                   int port, uint64_t& headSize, std::string& why) {
-    const std::string head = files.front();
-    const size_t cut = head.find_last_of("/\\");
-    const std::string dir = cut == std::string::npos ? std::string(".") : head.substr(0, cut);
+    const std::string dir = peerParentDir(files.front());
     std::string err;
     if (!ensureUiSession(host, err, port)) {
         why = "remote: " + err;
@@ -4593,6 +4676,9 @@ static void openRemoteStackWith(const std::string& host, const std::vector<std::
     attachRemoteStack(first, host, files, name, port, token);
 }
 
+// fwd: needs computeStackStats, defined below. The fold defaults to mean -
+// every existing door means "average", and the sum is asked for by name.
+static void requestStackAverage(int seqId, int fold = FOLD_MEAN);
 // The dialog's Load, for a parked headerless stack. Called from drawRawModal
 // after rawDialogAccept has opened the HEAD with these settings and bound the
 // byte count - so what is left is the members, which is exactly what the
@@ -4601,18 +4687,38 @@ static void resumeRemoteRawStack() {
     App::PendingRemoteRawStack p = app.remoteRawStack;      // by value: attach may re-enter
     app.remoteRawStack = App::PendingRemoteRawStack();
     if (!p.alive || app.images.empty()) return;
-    // the batch the Open that ASKED was loading into (see where it is recorded)
-    const int keep = app.loadBatchId;
-    app.loadBatchId = p.batchId;
-    struct Restore { int& slot; int to; ~Restore() { slot = to; } } r{ app.loadBatchId, keep };
     ImageDoc* first = app.images.back().get();
+    // THE BATCH IS PUT ON THE HEAD, which is the only place it can be read
+    // from. Setting app.loadBatchId around the call below - what this function
+    // used to do - could not work, and the comment that said it did was
+    // describing an effect the code does not have: the HEAD was opened by
+    // rawDialogAccept before this function was entered (so it was stamped at
+    // openRemote's batch line, outside any window here), attachRemoteStack
+    // creates no documents at all, and every member frame takes
+    // `nd->batchId = ref->batchId` off the head when it lands in
+    // pumpRemoteFetch - frames later, with app.loadBatchId long restored.
+    // Re-stamping the head is therefore the whole mechanism: the members
+    // inherit it, and the Open that asked owns all of them.
+    //
+    // Only when the asking Open HAD a batch. A Browse double-click outside a
+    // queue drain records 0, and 0 means "leave the batch openRemote chose".
+    if (p.batchId) first->batchId = p.batchId;
+    int seq = 0;
     if (first->seqId != 0) {
         if (!p.name.empty())
             if (App::SeqInfo* si = seqInfo(first->seqId)) si->name = p.name;
         noteGroupStack(p.token, first->seqId);
-        return;
+        seq = first->seqId;
+    } else {
+        seq = attachRemoteStack(first, p.host, p.files, p.name, p.port, p.token);
     }
-    attachRemoteStack(first, p.host, p.files, p.name, p.port, p.token);
+    // The parked verb, honoured against the stack that came back. "Open as
+    // frame average" that quietly produced "Open as stack" was the other half
+    // of the same defect: a verb may be refused by name, never substituted.
+    if (p.average) {
+        if (seq != 0) requestStackAverage(seq);
+        else toast("frame average: that did not open as a stack (a mean needs a time axis)", true);
+    }
 }
 
 // ...and its Cancel. A folder's worth of stacks dropped in silence is what
@@ -4653,6 +4759,23 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
             return;
         }
         if (const RawRecipe* r = rawRecipeForSize((size_t)sz)) {
+            // ...but not a CROPPING one, and it is refused by name rather than
+            // applied to half the stack. A crop is finished on this side, on a
+            // frame that has landed (applyRecipeCropHere); a folder stack's
+            // members land one at a time afterwards, so cropping the head
+            // alone would leave it a different shape from every frame behind
+            // it - and then the stack's own shape check refuses those frames
+            // one by one, N refusals for one decision. Said once, here, with
+            // the way out named.
+            if (r->cropOn && r->cropW > 0 && r->cropH > 0) {
+                toast(baseName(files[0]) + ": the recipe for " + std::to_string(sz) +
+                      "-byte files crops, and a cropped recipe cannot open a remote "
+                      "folder as ONE stack - the crop would apply to the first frame "
+                      "and to none of the others"
+                      "\n  open a frame on its own to use it, or clear the crop in the "
+                      "recipe panel and open the folder again", true);
+                return;
+            }
             // #166 over a link, and once for the whole Open: the frames of one
             // stack are one array read N times, so one recipe answers for all
             // of them or the stack is not one thing.
@@ -4690,6 +4813,11 @@ static void openRemoteStack(const std::string& host, const std::vector<std::stri
         // time the dialog is answered - frames later - the id is gone and the
         // stack landed in a batch of its own, named after a different Open
         // (review #6). The Open that asked is the Open that owns them.
+        //
+        // APPLIED by resumeRemoteRawStack, which stamps it on the HEAD. That
+        // is the only place it can be put: the members read their batch off
+        // the head when they land, and nothing in the resume path creates a
+        // document for app.loadBatchId to reach.
         app.remoteRawStack.batchId = app.loadBatchId;
         return;
     }
@@ -4715,8 +4843,11 @@ static bool remoteSequenceSiblings(const std::string& url,
     int port = 0;
     if (!remote::parseUrl(url, host, rpath, &port)) { err = "not a remote url: " + url; return false; }
     size_t sl = rpath.find_last_of('/');
+    // A restore's url is absolute or it is not a stack this door can rebuild,
+    // so "no separator" stays a refusal here rather than becoming the peer's
+    // cwd. The folder itself is peerParentDir's answer, as everywhere else.
     if (sl == std::string::npos) { err = url + ": no folder to list"; return false; }
-    const std::string dir = sl == 0 ? std::string("/") : rpath.substr(0, sl);
+    const std::string dir = peerParentDir(rpath);
     const std::string base = rpath.substr(sl + 1);
     if (!ensureUiSession(host, err, port)) return false;
     std::vector<remote::Entry> entries;
@@ -4762,9 +4893,6 @@ static bool remoteSequenceSiblings(const std::string& url,
     return false;
 }
 
-// fwd: needs computeStackStats, defined below. The fold defaults to mean -
-// every existing door means "average", and the sum is asked for by name.
-static void requestStackAverage(int seqId, int fold = FOLD_MEAN);
 // "Open as frame average" from Browse: open the stack exactly as "Open as
 // stack" does, and park the mean until its frames are here. Browse opens are
 // asynchronous by design (first frame now, the rest in the background), so
@@ -4778,13 +4906,39 @@ static void openStackForAverage(const std::string& host, const std::vector<std::
                                 const std::string& name, int port = 0) {
     if (files.empty()) return;
     const int firstNewSeq = app.nextSeqId;
+    const size_t before = app.images.size();
+    const bool parkWasLive = app.remoteRawStack.alive;
     openRemoteStack(host, files, name, port);
+    // THE PARK IS PART OF THIS DOOR'S CONTRACT (App::PendingRemoteRawStack).
+    // A headerless remote folder with no bound recipe does not open here at
+    // all: openRemoteStack raises the dialog, parks the Open and returns, and
+    // the frames exist only after the dialog is answered. Every line below
+    // asks "what did that open?", and there is nothing yet - so the verb is
+    // handed to the park and requested where the stack is born, instead of
+    // being answered now with whatever happens to be on screen.
+    //
+    // `parkWasLive` is not decoration: openRawDialogFor refuses a SECOND
+    // question over a live park, so a park that was already standing when this
+    // call began belongs to a different Open. Marking that one `average` would
+    // put this click's mean on somebody else's stack - the same wrong-subject
+    // mistake one level up.
+    if (!parkWasLive && app.remoteRawStack.alive) {
+        app.remoteRawStack.average = true;
+        return;
+    }
+    // Nothing was opened and nothing was parked: the open refused and said
+    // why, in its own words, which are more specific than anything this
+    // function could add. No verb was performed - which is the point: an
+    // average that cannot be taken is not quietly turned into a stack.
+    if (app.images.size() == before) return;
     int got = 0;
     for (const auto& s : app.seqs)
         if (s.id >= firstNewSeq) { got = s.id; break; }
     // ...or an existing stack was reused: openRemote builds the SeqInfo itself
     // for a frame-axis file, and takes an early return through openRemoteStack.
-    if (!got && !app.images.empty()) got = app.images.back()->seqId;
+    // Reached only once something WAS appended by this call, so `back()` is a
+    // document this click produced and never a bystander.
+    if (!got) got = app.images.back()->seqId;
     if (!got) {
         toast("frame average: that did not open as a stack (a mean needs a time axis)", true);
         return;

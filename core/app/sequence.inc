@@ -598,6 +598,24 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             }
             if (!doc) {
                 if (isRaw) {
+                    // NO BYTE-COUNT CHECK HERE, and the gate below cannot
+                    // stand in for one. A headerless member decodes AT the
+                    // recipe's dimensions whatever its length is, so
+                    // stackShapeRefusal always agrees and a member of another
+                    // size is read as a plausible picture of the wrong bytes -
+                    // `silent` (108/112/104 at offset 0, which needs 96) is the
+                    // counterexample, and it passes right through this line.
+                    // The REMOTE door asks the question first
+                    // (remoteRawSameSize in open_dispatch.inc, which explains
+                    // at length why it has to); this one never has.
+                    //
+                    // PR #278 scoped itself to the link and left this open
+                    // deliberately rather than quietly: the board carries a
+                    // row, beside the one about local --raw-size alone being
+                    // ignored, and the design doc names it in §12.1. What
+                    // closing it needs is a stat per member before the first
+                    // decode - cheap on a local disk - plus a refusal that
+                    // quotes both numbers, as the remote one does.
                     RawDialog d = recipe;
                     d.path = j.path;
                     doc = decodeRawFrame(d, err);

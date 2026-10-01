@@ -1217,8 +1217,23 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 // std::filesystem::file_size returns (uintmax_t)-1 on failure, and a size that
 // reaches the client is quoted back at a person: a row that could not be statted
 // used to make the headerless refusal say "18446744073709551615 bytes" (review
-// P3-8). 0 is what every other unknown size on this wire is, and the client
-// already refuses a 0-byte member by name.
+// P3-8). 0 is what every other unknown size on this wire is.
+//
+// EVERY SIZE THAT LEAVES THIS PEER GOES THROUGH HERE. There are three, and the
+// first round of this fix did two of them - the group row's sum and the group
+// row's extremes - and left the one that matters most: a SINGLE row's size is
+// the input to both of the client's new readers (remoteRawSameSizeIn's
+// per-name map, and remoteRawFileSize, which keys #166's binding), so an
+// unguarded stat there was the same sentence with the same number in it
+// (review P3-1). The v2 row went the same way. The other two file_size calls
+// in this file are not sizes on the wire: one is a source stat that already
+// has the ternary, and the reader-cache bounds check only quotes its number
+// inside `!ec`.
+//
+// The client's 0-byte refusal names the file when the listing let it - a
+// single row names itself, a group row carries only its extremes - and says
+// which folder when it cannot. This comment used to promise the name
+// unconditionally, which was the same over-claim one layer up.
 static uint64_t fileSizeOr0(const std::filesystem::path& p, std::error_code& ec) {
     const std::uintmax_t n = std::filesystem::file_size(p, ec);
     return ec || n == static_cast<std::uintmax_t>(-1) ? 0u : (uint64_t)n;
@@ -1515,7 +1530,7 @@ static void handleList(Buf& in) {
             // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
             // routinely, and a silently clamped size is the failure mode this tool
             // exists to avoid
-            uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
+            uint64_t sz = dir ? 0 : fileSizeOr0(e.path(), e2);
             out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
             out.putU32((uint32_t)(sz >> 32));
         }
@@ -1554,7 +1569,7 @@ static void handleList(Buf& in) {
         } else if (r.kind == 1) {
             const auto& f = files[r.idx];
             putListEntryV3(out, f.second, r.name, false,
-                           (uint64_t)std::filesystem::file_size(f.second, e2),
+                           fileSizeOr0(f.second, e2),
                            unixMtime(f.second), peekBudget);
         } else {
             putGroupEntryV3(out, groups[r.idx], peekBudget);

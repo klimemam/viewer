@@ -783,9 +783,18 @@ bool Session::npzServable(const std::string& path, std::string& err) const {
 // The optional blocks behind the reading, written the way the peer reads them
 // (rp::ReqTrailer). One place, because meta() and tile() have to agree byte for
 // byte about where a recipe stops and a key begins.
-static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
+//
+// `version` IS effectiveVersion, and both callers pass it (review P2-2). The
+// peer's getTrailers gates on `servedVersion() >= 12 && g_clientVersion >= 12`
+// - the MINIMUM of the two numbers - so a client that announced 11 to a v16
+// peer and gated on peerVersion_ alone wrote the v12 flags word while the peer
+// took its v11 "the bytes that remain are a recipe" branch and read the flags
+// word as the first four bytes of a RawWire. That is not a missing feature; it
+// is a request decoded from the wrong offset, which here means a picture of
+// the wrong geometry or "truncated raw recipe" for a perfectly good file.
+static void putTrailers(W& w, int version, const rp::RawWire* rw,
                         const remote::KeyedRef* rd) {
-    if (peerVersion >= 12) {
+    if (version >= 12) {
         uint32_t f = 0;
         if (rw) f |= rp::RQ_RAW_RECIPE;
         if (rd) f |= rp::RQ_KEYED;
@@ -796,7 +805,7 @@ static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
     }
     // Protocol 11 and below: one optional block, read by "if bytes remain".
     // A KeyedRef never reaches here - keyedServable refused first.
-    if (rw && peerVersion >= 11) w.blob(rw, sizeof *rw);
+    if (rw && version >= 11) w.blob(rw, sizeof *rw);
 }
 
 // What a request is ABOUT, at the door. A reader's node is not a file, so the
@@ -813,7 +822,7 @@ bool Session::meta(const std::string& path, Meta& out, std::string& err, int rea
     }
     W w; w.str(rd ? std::string() : serverPath(path));
     if (peerVersion_ >= 9) w.u32((uint32_t)read);
-    putTrailers(w, peerVersion_, rw, rd);
+    putTrailers(w, effectiveVersion(), rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -927,7 +936,7 @@ bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w,
     // Appended after the reading, in the order handleTile reads them. A peer
     // below 11 never gets a recipe and one below 12 never gets a reader key -
     // the gates above refused first, so the older wire does not move by a byte.
-    putTrailers(wr, peerVersion_, rw, rd);
+    putTrailers(wr, effectiveVersion(), rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_TILE, wr.b, err) || !recv(type, reply, err)) return false;

@@ -1286,6 +1286,15 @@
                           "F4h ...and protocol 16 carries the two extremes the sum lost");
                     check(grp && grp->size == (uint64_t)grp->frames * 108,
                           "F4h ...the sum being EXACTLY 3x108, which is why it was no check");
+                    // ...and the same fact decides a different door. An
+                    // EXPANDED MEMBER's double-click must not be handed this
+                    // row's `size`: 324 is not any member's byte count, so
+                    // rawGuessDims would offer dimensions for a file that does
+                    // not exist and the recipe would be bound to a length no
+                    // file in the folder has (review P2-1, rbOpenItemRow).
+                    check(grp && grp->size != grp->minMemberSize &&
+                          grp->size != grp->maxMemberSize,
+                          "F4h ...so a member handed the ROW's size gets a number no file has");
                 }
 
                 // ---- (7) a PREVIEW still does not ask (§5.3), and says so ---
@@ -1481,6 +1490,107 @@
                     closeAll();
                 }
 
+                // ---- (10b) "Open as frame average" over a PARKED question -
+                // THE WORST SHAPE IN THIS PROGRAM. The verb opens the stack
+                // and parks a mean over it, so it has to know what it
+                // opened - and a headerless folder with nothing bound opens
+                // NOTHING: it parks the Open on the dialog. The old code
+                // then looked for "what did that open?", found no new seq,
+                // and fell through to app.images.back()->seqId - whatever
+                // document happened to be on screen. A mean of frames
+                // nobody asked about, published as the answer to this
+                // click, cannot be traced back from the picture (review P1).
+                //
+                // The bystander is a REAL remote stack of the same folder,
+                // left open on purpose: that is what the defect reached for,
+                // so a regression averages it and this names the subject.
+                {
+                    closeAll();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.pendingAvg.clear();
+                    app.toast.clear();
+                    // the bystander, opened under a binding so it does NOT park
+                    RawRecipe bind;
+                    bind.w = DW; bind.h = DH; bind.offset = DHDR;
+                    bind.dtype = RD_U16; bind.interp = RI_GRAY; bind.littleEndian = true;
+                    g_rawSizeRecipe.clear();
+                    g_rawSizeRecipe[(size_t)WANT] = bind;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    double twB = nowSec();
+                    while (nowSec() - twB < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int bystander = 0;
+                    for (const auto& d : app.images) if (d->seqId) { bystander = d->seqId; break; }
+                    const size_t docsB = app.images.size();
+                    check(bystander != 0 && docsB == 3,
+                          "F4h (setup) a remote stack is open and on screen");
+                    // ...now UNBIND, so the next Open has to ask
+                    g_rawSizeRecipe.clear();
+                    app.pendingAvg.clear();
+                    app.toast.clear();
+                    openStackForAverage("", sfiles, "stk/f_???.raw", 0);
+                    const bool parkedAvg = app.remoteRawStack.alive &&
+                                           app.remoteRawStack.average;
+                    const size_t docsAfterAsk = app.images.size();
+                    const size_t avgAtAsk = app.pendingAvg.size();
+                    fprintf(stderr, "fmtgateselftest:   F4h avg over park: parked=%d carried=%d docs=%zu->%zu requested=%zu bystander=%d\n",
+                            app.remoteRawStack.alive ? 1 : 0,
+                            app.remoteRawStack.average ? 1 : 0,
+                            docsB, docsAfterAsk, avgAtAsk, bystander);
+                    check(parkedAvg,
+                          "F4h-P1 \"Open as frame average\" on an unbound headerless folder parks the VERB with the Open");
+                    // TWO WORLDS, and the defect lands in whichever one the
+                    // run is in - which is why both are asserted. With nothing
+                    // still streaming, requestStackAverage REDUCES on the spot
+                    // and the wrong mean appears as a new document (the
+                    // mutation run shows docs 3 -> 4); with frames in flight it
+                    // parks, and the wrong seqId shows up in pendingAvg.
+                    // `docsAfterAsk == docsB` catches the first, `onBystander`
+                    // below catches the second.
+                    check(avgAtAsk == 0 && docsAfterAsk == docsB,
+                          "F4h-P1 ...and asks for no average yet: nothing has opened to average");
+                    // answer it, and the mean must land on what came back
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    int wantSeq = 0;
+                    for (const auto& d : app.images)
+                        if (d->seqId && d->seqId != bystander) { wantSeq = d->seqId; break; }
+                    int onBystander = 0, onNew = 0;
+                    for (const auto& a : app.pendingAvg) {
+                        if (a.seqId == bystander) onBystander++;
+                        else if (a.seqId == wantSeq && wantSeq) onNew++;
+                    }
+                    fprintf(stderr, "fmtgateselftest:   F4h avg resumed: new-seq=%d parked=%zu on-new=%d on-bystander=%d\n",
+                            wantSeq, app.pendingAvg.size(), onNew, onBystander);
+                    check(wantSeq != 0 && wantSeq != bystander && onNew == 1,
+                          "F4h-P1 ...and the Load honours it against the stack that came back");
+                    check(onBystander == 0,
+                          "F4h-P1 ...and never against the document that was already on screen");
+                    double twC = nowSec();
+                    while (nowSec() - twC < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    app.pendingAvg.clear();
+                    g_rawSizeRecipe.clear();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    closeAll();
+                }
                 // ---- (11) the CFA PHASE the operator picked, over the link --
                 // RGGB and BGGR change no sample - they change which plane is
                 // which - so a phase that does not travel is not a wrong
@@ -2195,6 +2305,44 @@
                         check(!cok && has(cwhy, "protocol 15"),
                               "P9c so the folder is refused by name, not read on a guess");
                         c15.stop();
+                    }
+                }
+                // ---- P9d: the REQUEST trailer, at a disagreeing version ----
+                // The third field whose presence the CLIENT's announced
+                // number decides, and the only one whose two forms are
+                // DIFFERENT LENGTHS. getTrailers picks the v12 flags-word
+                // form only when servedVersion() and g_clientVersion are
+                // both >= 12; a client that gated on peerVersion_ alone
+                // wrote that word to a v16 peer while announcing 11, and the
+                // peer then took its v11 "the bytes that remain are a
+                // recipe" branch and read the flags word as the first four
+                // bytes of the RawWire (review P2-2).
+                //
+                // That is not a missing feature - it is a request parsed
+                // from the wrong offset - so the assertion is on the PIXEL
+                // GEOMETRY that comes back, which is what a shifted recipe
+                // gets wrong. 11 is chosen because it is the lowest version
+                // that may carry a recipe at all: one below the flags word.
+                {
+                    remote::Session c11;
+                    c11.setHelloVersionForTest(11);
+                    std::string e11;
+                    if (!c11.start("", exe, e11)) {
+                        fprintf(stderr, "fmtgateselftest:   P9d client: %s\n", e11.c_str());
+                        check(false, "P9d the client that announced 11 connects");
+                    } else {
+                        remote::Meta m11{};
+                        std::string e11b;
+                        const bool got11 = c11.meta(rpath, m11, e11b, 0, &rw);
+                        fprintf(stderr, "fmtgateselftest:   P9d peer=%d announced=11 meta=%d %dx%d ch=%d\n"
+                                        "fmtgateselftest:   P9d err: \"%s\"\n",
+                                c11.peerVersion(), got11 ? 1 : 0, m11.w, m11.h, m11.ch,
+                                e11b.c_str());
+                        check(c11.peerVersion() == (int)rp::VERSION,
+                              "P9d the peer is the CURRENT one, only the client is lowered");
+                        check(got11 && m11.w == RW_W && m11.h == RW_H,
+                              "P9d ...and the recipe arrives whole: the trailer is written in the form the peer reads at the SMALLER of the two numbers");
+                        c11.stop();
                     }
                 }
                 std::filesystem::remove_all(rdir, rec);

@@ -394,13 +394,28 @@ private:
     // or write one the peer will not consume - and everything after it is then
     // parsed from the wrong offset.
     //
-    // There are TWO such fields, not one (this comment claimed one and was
-    // wrong): the LIST/SCAN group row's member sizes, which the peer only
-    // sends to a client that announced 16 (serve.cpp putGroupEntryV3), and the
-    // MEASURE keyed reading, which the peer only reads from a client that
-    // announced 15 (serve.cpp handleMeasure). Both go through here. Only
-    // setHelloVersionForTest can make the two numbers disagree today, and a
-    // seam that can desynchronise a parser is not a seam worth leaving armed.
+    // There are THREE such fields. This comment has now been wrong twice about
+    // the count - it said one, then two - so the rule is written out instead of
+    // the number being asserted: ANY field the peer gates on g_clientVersion,
+    // or on the minimum of that and its own, is read through here. Grep
+    // serve.cpp for `g_clientVersion` and the list is the answer.
+    //
+    //   the LIST/SCAN group row's member sizes   peer sends them only to a
+    //                                            client that announced 16
+    //                                            (putGroupEntryV3)
+    //   the MEASURE keyed reading                peer reads it only from a
+    //                                            client that announced 15
+    //                                            (handleMeasure)
+    //   the META/TILE request TRAILERS           peer picks the v12 flags-word
+    //                                            form only when BOTH numbers
+    //                                            are 12 (getTrailers), and the
+    //                                            two forms are not the same
+    //                                            length - so getting this one
+    //                                            wrong shifts every byte after
+    //                                            it (review P2-2)
+    //
+    // Only setHelloVersionForTest can make the two numbers disagree today, and
+    // a seam that can desynchronise a parser is not a seam worth leaving armed.
     int effectiveVersion() const { return std::min(peerVersion_, helloVersion_); }
     int port_ = 0;
     bool serveReaders_ = true;

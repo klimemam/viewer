@@ -268,7 +268,27 @@ void rbOpenItemRow(const App::RemoteBrowse& B, const RbRow& r) {
     // this session already made, or the dialog); the panel's job ends at
     // handing over the url and the byte count it already has.
     if (!B.host.empty() && rbNameIsHeaderless(r.name())) {
-        g_browseHost.openRemoteRaw(u, r.e ? r.e->size : 0);
+        // ...and the count has to be THIS FILE'S. `Entry::size` on a group row
+        // is the SUM over its frames (the Inspector labels it "all frames"),
+        // so an EXPANDED MEMBER handed its parent's number asked the viewer to
+        // work a geometry out of N files' worth of bytes - rawGuessDims then
+        // offers dimensions for a file that does not exist, and whatever the
+        // operator picks gets bound to a byte count no file in the folder has.
+        // `ownFile()` is the predicate for "has its own size", and the sort
+        // two hundred lines down already used it for exactly this reason.
+        //
+        // A member's own size is free when the group row proves it: since
+        // protocol 16 the row carries min and max, and min == max IS that
+        // member's size. Otherwise 0, which openRemoteRawDeclared answers with
+        // one LIST of the member's own path - a listing of a single file names
+        // it individually, so the count comes back exact rather than guessed.
+        uint64_t own = 0;
+        if (r.e) {
+            if (r.ownFile()) own = r.e->size;
+            else if (r.e->hasMemberSizes && r.e->minMemberSize == r.e->maxMemberSize)
+                own = r.e->minMemberSize;
+        }
+        g_browseHost.openRemoteRaw(u, own);
         return;
     }
     g_browseHost.openRemote(u, false, 0, 0);

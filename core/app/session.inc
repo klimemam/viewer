@@ -2788,9 +2788,11 @@ static App::RestoreWait& restoreWaitFor(const ImageDoc& im) {
 static void parkRestoreWait(const ImageDoc& im, int seqFrame) {
     restoreWaitFor(im).seqFrame = seqFrame;
 }
-static void parkRestoreWait(const ImageDoc& im, int x, int y, int w, int h) {
+static void parkRestoreWait(const ImageDoc& im, int x, int y, int w, int h,
+                            bool fromSession = true) {
     App::RestoreWait& e = restoreWaitFor(im);
     e.cx = x; e.cy = y; e.cw = w; e.ch = h;
+    e.cropFromSession = fromSession;
 }
 
 // Drained from the frame loop, right after the remote fetch pump - so a frame
@@ -2833,17 +2835,18 @@ static void pumpRestoreWaits() {
             // that clears it either lands or records remoteErr, so waiting on
             // the fetcher's idle would give up on a doc whose frame arrives a
             // moment later in a busy queue.
+            const char* whose = w.cropFromSession ? "the crop this session saved"
+                                                 : "the recipe's crop";
             if (im->src->remoteStep <= 1) {
                 if (cropInPlace(*im, w.cx, w.cy, w.cw, w.ch)) {
                     if (im == cur()) app.fitRequested = true;
                 } else {
-                    toast(w.doc + ": the crop this session saved could not be "
-                          "put back", true);
+                    toast(w.doc + ": " + whose + " could not be applied", true);
                 }
                 w.cw = 0;
             } else if (!im->src->remoteErr.empty()) {
-                toast(w.doc + ": the full frame never arrived, so the crop this "
-                      "session saved was not put back", true);
+                toast(w.doc + ": the full frame never arrived, so " + whose +
+                      " was not applied", true);
                 w.cw = 0;
             } else done = false;
         }

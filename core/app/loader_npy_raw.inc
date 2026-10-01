@@ -228,6 +228,11 @@ static RawDialog g_folderRecipe;
 // frame, and --browse-keys-selftest's action list runs between frames
 static bool g_rawPopupAlive = false;
 static bool openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
+// ...and the other half of a recipe applied to a PEER's file. Defined in
+// open_dispatch.inc, where both cropInPlace and the park it falls back to are
+// in scope; declared here because the dialog's own Load is one of its callers.
+struct ImageDoc;
+static bool applyRecipeCropHere(bool on, int x, int y, int w, int h, ImageDoc* d);
 
 // The whole recipe, as the sentence that travels with the numbers it produced.
 //
@@ -607,6 +612,14 @@ static std::string rawDialogAccept(RawDialog& d) {
         // mean "the binding does not happen", which is the rule below.
         err = openRemote(d.path, false, 0, 0, &rw) ? std::string()
                                                    : std::string("could not open " + d.path);
+        // THE CROP IS NOT ON THE WIRE (§3.2: the peer serves bytes, not a view
+        // of them), so six of the dialog's fields travelled and the crop did
+        // not - the file opened whole while the dialog that opened it said
+        // crop. Finished here, with the one call the session restore already
+        // makes for the identical reason.
+        if (err.empty())
+            applyRecipeCropHere(d.cropOn, d.cropX, d.cropY, d.cropW, d.cropH,
+                                app.images.empty() ? nullptr : app.images.back().get());
     } else {
         err = loadRaw(d);
     }

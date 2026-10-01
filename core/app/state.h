@@ -1984,6 +1984,16 @@ struct App {
         std::vector<std::string> files;
         int port = 0, token = 0;
         int batchId = 0;               // the Open that asked owns the frames
+        // ...and WHICH VERB asked. "Open as frame average" opens the stack and
+        // parks a mean over it, so for a headerless folder the mean is asked
+        // for BEFORE the recipe is known and has to survive the park. Without
+        // this, openStackForAverage looked for "what did that open?" the
+        // instant the dialog went up, found nothing of its own, and fell back
+        // to the document already on screen - publishing a mean of a stack
+        // nobody asked about. A number attributed to the wrong frames is the
+        // one failure this program must never have, so the verb travels with
+        // the park and is honoured against the stack that actually comes back.
+        bool average = false;
     };
     PendingRemoteRawStack remoteRawStack;
     // Places: starred host+path urls, and the last ~10 visited (most recent
@@ -2533,6 +2543,14 @@ struct App {
         int seqFrame = -1;                     // "seqframe"; -1 = not waiting for one
         int cx = 0, cy = 0, cw = 0, ch = 0;    // "crop"; cw == 0 = not waiting for one
         std::string doc;                       // the doc's name, for the message
+        // ...and WHOSE crop it is, which only the message needs. A RECIPE's
+        // crop waits here too now: the wire carries no crop, so a cropping
+        // recipe applied to a peer's file is finished on this side with the
+        // same cropInPlace the restore uses, and it meets the same refusal
+        // while the frame on screen is a decimated preview. One mechanism for
+        // one situation - but "the crop this session saved" is not what to say
+        // about a crop the operator typed a second ago.
+        bool cropFromSession = true;
     };
     std::vector<RestoreWait> restoreWait;
     // "Open as frame average" (or sum) on a stack that is not here yet. Browse
