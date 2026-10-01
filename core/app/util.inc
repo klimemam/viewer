@@ -972,7 +972,14 @@ static std::string cjkFontCrashSkipText(const FontChoice& c) {
     for (const std::string& t : c.tried) {
         if (t.find("(skipped: the last start did not survive baking it)") ==
             std::string::npos) continue;
-        const std::string one = t.substr(0, t.find(" (skipped:"));
+        std::string one = t.substr(0, t.find(" (skipped:"));
+        // The fc-match arm records its answer as "fc-match ... -> /the/path",
+        // so the same file reached twice - once as a candidate and once as
+        // fontconfig's suggestion - escaped a dedupe that compared whole
+        // strings. Measured on the Ubuntu runner, where the message named
+        // DejaVu Sans twice. Compare the PATH.
+        if (const size_t arrow = one.rfind(" -> "); arrow != std::string::npos)
+            one = one.substr(arrow + 4);
         if (std::find(names.begin(), names.end(), one) == names.end())
             names.push_back(one);
     }

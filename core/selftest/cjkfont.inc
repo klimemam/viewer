@@ -1645,8 +1645,42 @@ static int cjkFontSelftest() {
                   "C8 the second face is named as the one that was dropped");
             check(!g_fontAtlasCost.buildFailed,
                   "C8 ...and the bake SUCCEEDED, because the primary alone works");
-            check(g_fontAtlasCost.faces == 1 && fontAtlasHasCjk(),
-                  "C8 ...with one face and the CJK glyphs still there");
+            // ONE FACE, AND IT IS THE PRIMARY'S GLYPHS - asserted against a
+            // probe of the primary ALONE rather than against "does the atlas
+            // have kana".
+            //
+            // This line read `faces == 1 && fontAtlasHasCjk()` and failed on
+            // the Ubuntu runner, correctly: there the primary is DejaVu Sans
+            // (fc-match's answer on a machine with no Japanese font) and it has
+            // no CJK of its own, so the retry succeeded and the kana were still
+            // absent. The assertion had mixed a STRUCTURAL claim - the merge is
+            // gone and the primary survived - with a FACT ABOUT THE MACHINE's
+            // font, which is the same mistake this round has been removing
+            // everywhere else. Comparing glyph counts with a probe states only
+            // the structure, and states it more precisely than kana ever did.
+            ImFontAtlas probe;
+            ImVector<ImWchar> pr;
+            cjkFontRanges(&probe, pr);
+            int aloneGlyphs = -1;
+            if (probe.AddFontFromFileTTF(keptChoice.path.c_str(), CJK_FONT_PX,
+                                         nullptr, pr.Data) && probe.Build()) {
+                aloneGlyphs = 0;
+                for (ImFont* pf : probe.Fonts) aloneGlyphs += pf->Glyphs.Size;
+            }
+            probe.Clear();
+            say("the primary alone bakes " + std::to_string(aloneGlyphs) +
+                " glyph(s); the atlas has " + std::to_string(g_fontAtlasCost.bakedGlyphs));
+            check(g_fontAtlasCost.faces == 1,
+                  "C8 ...with ONE face, the second having been dropped");
+            check(aloneGlyphs > 0 && g_fontAtlasCost.bakedGlyphs == aloneGlyphs,
+                  "C8 ...and exactly the glyphs the primary bakes on its own "
+                  "(so the primary survived and the merge is gone)");
+            // ...and what that costs is REPORTED, not asserted: whether the
+            // surviving face has CJK is a property of this machine's font.
+            say(std::string("after dropping the second face the atlas ") +
+                (fontAtlasHasCjk() ? "still has" : "does NOT have") +
+                " CJK - which is a fact about the primary font here, not about "
+                "the retry");
             check(g_fontMergePath.empty(),
                   "C8 ...and the record stops claiming a merge it does not have");
             const std::string dm = cjkFontMergeDroppedText(g_fontAtlasCost, keptChoice);
