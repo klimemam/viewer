@@ -218,10 +218,24 @@ static bool utf8SequenceAbove16Bit(const char* p, const char* e) {
 }
 
 struct UndrawableTally {
-    int noGlyph = 0;        // in the ranges, the font does not have it
+    int noGlyph = 0;        // ASKED FOR, and the font does not have it
+    int notAsked = 0;       // in no range this build asks for (review P3)
     int tooHigh = 0;        // above U+FFFF: not representable in this build
     int badBytes = 0;       // the name is not valid UTF-8
-    int total() const { return noGlyph + tooHigh + badBytes; }
+    int total() const { return noGlyph + notAsked + tooHigh + badBytes; }
+    // ADDING TWO TALLIES BELONGS HERE, beside the fields. It used to be written
+    // out field by field at the one call site, and adding `notAsked` then left
+    // that site summing three of four causes - so a name whose only problem was
+    // an unrequested script tallied to zero and the row said nothing. The same
+    // shape as this round's other defects: a set assembled in one place and
+    // re-derived in another. One more cause now means editing one function.
+    UndrawableTally& operator+=(const UndrawableTally& o) {
+        noGlyph += o.noGlyph;
+        notAsked += o.notAsked;
+        tooHigh += o.tooHigh;
+        badBytes += o.badBytes;
+        return *this;
+    }
 };
 static UndrawableTally undrawableTally(const std::string& utf8Name) {
     UndrawableTally t;
@@ -293,7 +307,16 @@ static UndrawableTally undrawableTally(const std::string& utf8Name) {
         // cannot be something the renderer cannot draw.
         if (cp < 0x20 || cp == 0x7F) continue;
         if (cp > 0xFFFF) { t.tooHigh++; continue; }   // ImWchar32 builds land here
-        if (!f->FindGlyphNoFallback((ImWchar)cp)) t.noGlyph++;
+        if (f->FindGlyphNoFallback((ImWchar)cp)) continue;          // it drew
+        // WAS IT EVEN ASKED FOR? "Point appearance.fontPath at another font"
+        // is only true for a code point this build REQUESTED and the font did
+        // not supply. For one that is in no range at all - Hangul, Thai,
+        // Hebrew, Devanagari - no font on the machine can help, because the
+        // atlas was never going to hold it whatever is installed. Offering a
+        // font as the cure there is the same kind of false instruction as the
+        // rest of this round (review P3).
+        if (cjkRangeHas(g_cjkRangesAsked, cp)) t.noGlyph++;
+        else                                   t.notAsked++;
     }
     return t;
 }
@@ -321,6 +344,7 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
             parts += b;
         };
         add(t.noGlyph,  "with no glyph in this font");
+        add(t.notAsked, "in a script this build does not load glyphs for");
         add(t.tooHigh,  "outside the range this build can draw at all "
                         "(emoji and the rarer CJK extensions)");
         add(t.badBytes, "whose bytes are not valid UTF-8");
@@ -329,7 +353,9 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
         s = b;
         s += "Two different files can look identical like this. The name on "
              "disk is untouched.";
-        // The only cause a font can fix.
+        // The only one of the four causes a different font can fix. notAsked
+        // needs this build to request the script, tooHigh needs a wider
+        // ImWchar, and badBytes is the name on disk.
         if (t.noGlyph > 0)
             s += " For the missing glyphs, \"appearance.fontPath\" "
                  "(settings.jsonc) points at another font; it takes effect at "
@@ -347,6 +373,21 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
 //
 // The label is passed in because only the caller knows it: the tooltip has
 // ImGui's "name##id" string, the Messages sweep has the stack's name.
+// THE PIECES MUST BE DISJOINT, and the first version of this list was not:
+// `d.name` is normally the LAST COMPONENT of `d.src->path`, so adding both
+// counted the file's own name twice and the sentence said "2 character(s) here
+// draw as '?'" about one bad character. Deduplicating whole strings did not
+// help, because "frame.npy" and "C:/data/frame.npy" are different strings that
+// overlap.
+//
+// WHICH ONE TO KEEP: both. The path is SPLIT at its last separator, so the
+// directory part and the leaf are two pieces that share no character and whose
+// concatenation is the whole path. Every character the tooltip shows is
+// therefore counted exactly once, and the leaf then deduplicates against the
+// row's label and against d.name when those are the same string - which is the
+// ordinary case. Dropping the directory instead would have been simpler and
+// wrong: a folder called C:/測定/ is on screen in the tooltip's first line, and
+// a '?' there is exactly as confusing as one in the file name.
 static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
                                                  const ImageDoc& d) {
     std::vector<std::string> out;
@@ -357,18 +398,20 @@ static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
     };
     add(shownLabel);          // what is drawn ON the row
     add(d.name);              // the document's own name
-    add(d.src->path);         // the tooltip's first line, in full
+    // The tooltip's first line, in full, as TWO disjoint halves.
+    const std::string& p = d.src->path;
+    if (const size_t cut = p.find_last_of("/\\"); cut == std::string::npos) {
+        add(p);                             // no separator: it is all leaf
+    } else {
+        add(p.substr(0, cut + 1));          // "C:/data/"  - the separator rides here
+        add(p.substr(cut + 1));             // "frame.npy" - deduped above if repeated
+    }
     add(d.src->member);       // ...and the npz member, where there is one
     return out;
 }
 static UndrawableTally undrawableTallyOf(const std::vector<std::string>& pieces) {
     UndrawableTally t;
-    for (const std::string& v : pieces) {
-        const UndrawableTally one = undrawableTally(v);
-        t.noGlyph += one.noGlyph;
-        t.tooHigh += one.tooHigh;
-        t.badBytes += one.badBytes;
-    }
+    for (const std::string& v : pieces) t += undrawableTally(v);
     return t;
 }
 
@@ -517,6 +560,12 @@ static void undrawableReportNewDocs() {
         // a hundred loose files picked at once - so that the cap holds whatever
         // the shape of the open was.
         if (hits.size() > 5) {
+            // `gs` IS THIS OPEN, not the batch. batchReuse() hands back an
+            // existing batch id when the same folder is opened again, so the
+            // batch can hold rows from several gestures - but `gs` was built
+            // only from rows not yet reported, which is what "just opened"
+            // means. Counting app.images or the batch's size here would have
+            // said "6 of 400" after a second open of a big folder (review P3).
             char b[192];
             snprintf(b, sizeof b, "%d of the %d item(s) just opened have "
                                   "characters that draw as '?' - hover a row to "
@@ -1373,10 +1422,26 @@ static void drawFileList() {
                     if (const size_t h = shown.find("##"); h != std::string::npos)
                         shown.resize(h);
                     while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
-                    const UndrawableTally rowT =
-                        undrawableTallyOf(undrawablePieces(shown, d));
-                    if (std::string ud = undrawableNoteOf(rowT); !ud.empty())
-                        tip += "\n\n" + ud;
+                    // CACHED PER ROW. undrawableNote() has a cache but this
+                    // path no longer goes through it, so every row was decoding
+                    // its label, its name and both halves of its path on every
+                    // frame - the cost review P3-11 removed, back again by a
+                    // different door (review P3). Keyed on the pieces
+                    // themselves, because that is exactly what the answer
+                    // depends on; the atlas cannot change after start-up.
+                    static std::unordered_map<std::string, std::string> rowCache;
+                    const std::vector<std::string> pieces = undrawablePieces(shown, d);
+                    std::string key;
+                    for (const std::string& q : pieces) { key += q; key += '\x01'; }
+                    std::string ud;
+                    if (auto it = rowCache.find(key); it != rowCache.end()) {
+                        ud = it->second;
+                    } else {
+                        ud = undrawableNoteOf(undrawableTallyOf(pieces));
+                        if (rowCache.size() > 4096) rowCache.clear();
+                        rowCache.emplace(key, ud);
+                    }
+                    if (!ud.empty()) tip += "\n\n" + ud;
                 }
                 g_filesRowTipProbe = tip;      // the value, not a second derivation
                 if (hov) ImGui::SetTooltip("%s", tip.c_str());

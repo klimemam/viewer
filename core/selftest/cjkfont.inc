@@ -504,6 +504,20 @@ static int cjkFontSelftest() {
                 " badBytes=" + std::to_string(te.badBytes));
             check(te.total() == 1,
                   "C4 ...while a real emoji is still counted exactly once");
+            // ...AND IN THE RIGHT BUCKET. This was measured and not asserted,
+            // which meant the simpler implementation - "every failed decode is
+            // badBytes" - passed every line here. It is not good enough: with a
+            // 16-bit ImWchar ImGui reports a VALID emoji as a decode error, so
+            // that implementation tells a user with a 4-byte character in a
+            // filename that their bytes are broken, and offers a fix that
+            // cannot apply. Only reading the bytes again separates the two.
+            check(te.tooHigh == 1 && te.badBytes == 0,
+                  "C4 ...as tooHigh, NOT as bad bytes (the bytes are valid)");
+            // ...and the sentence that comes out says the build, not the file.
+            const std::string ne = undrawableNoteOf(te);
+            check(ne.find("this build can draw at all") != std::string::npos &&
+                  ne.find("not valid UTF-8") == std::string::npos,
+                  "C4 ...and its sentence blames the build, not the bytes");
             // The SENTENCE must not offer a font as the cure for either of
             // those two, because no font can be.
             const std::string n4 = undrawableNoteOf(t4);
@@ -559,8 +573,41 @@ static int cjkFontSelftest() {
               note.find("0x") == std::string::npos &&
               note.find(thai) == std::string::npos,
               "C4 ...and the sentence never re-prints the name, escaped or not");
-        check(note.find("appearance.fontPath") != std::string::npos,
-              "C4 ...and it names the way out");
+        // THE WAY OUT IS OFFERED ONLY WHERE IT WORKS (review P3). Thai is in
+        // NO range this build asks for, so no font on the machine can draw it -
+        // the atlas was never going to hold it. Naming appearance.fontPath
+        // there is a false instruction, the same type as the rest of this
+        // round, so the sentence must NOT name it.
+        check(note.find("in a script this build does not load glyphs for") !=
+                  std::string::npos &&
+              note.find("appearance.fontPath") == std::string::npos,
+              "C4 ...and for a script this build never asks for, it does NOT "
+              "offer a font (no font could help)");
+        // ...and the opposite case, which is the one a font CAN fix: a code
+        // point this build DOES ask for and the font happens not to have.
+        // U+29C9 is exactly that on a stock Windows - cjkFontRanges adds it by
+        // hand for the Files panel's share mark, and neither Meiryo nor YaHei
+        // carries it, which is why shareGlyph() has a word fallback. Gated on
+        // the observation, because a machine whose font HAS it would measure 0.
+        {
+            const std::string shareName = "\xE2\xA7\x89" ".npy";   // U+29C9
+            const UndrawableTally st = undrawableTally(shareName);
+            say("U+29C9 -> noGlyph=" + std::to_string(st.noGlyph) +
+                " notAsked=" + std::to_string(st.notAsked));
+            check(st.notAsked == 0,
+                  "C4 U+29C9 is a code point this build DOES ask for");
+            if (st.noGlyph > 0) {
+                const std::string sn = undrawableNoteOf(st);
+                check(sn.find("no glyph in this font") != std::string::npos &&
+                      sn.find("appearance.fontPath") != std::string::npos,
+                      "C4 ...and for a glyph the FONT is missing, the way out "
+                      "IS offered");
+            } else {
+                say("this machine's font has U+29C9, so the 'a font can fix it' "
+                    "half cannot be shown here - the 'no font can fix it' half "
+                    "above did run.");
+            }
+        }
         // ---- the Messages door (板306 D), ONE LINE PER OPEN ----------------
         // Driven off app.imagesRev rather than off any one of the six places
         // that push a document, and grouped by BATCH because a batch is the
@@ -676,6 +723,73 @@ static int cjkFontSelftest() {
             check(got2.size() == 1 && got2[0].find("2 of 6 frame(s)") != std::string::npos,
                   "C4 ...and a stack whose FRAMES carry it says 2 of 6");
         }
+        // ---- THE PIECES MUST BE DISJOINT (review, new critical) -----------
+        // `d.name` is normally the LAST COMPONENT of `d.src->path`, so a list
+        // holding both counted the file's own name TWICE and the sentence said
+        // "2 character(s)" about one bad character. Nothing asserted N, so the
+        // double count was green.
+        //
+        // The fixture puts ONE undrawable character in the directory and ONE in
+        // the leaf, so the right answer is 2. A list that counts the leaf twice
+        // gives 3; one that counts the whole path and the leaf gives 3; one
+        // that drops the directory gives 1.
+        {
+            auto doc = std::make_unique<ImageDoc>();
+            doc->src->w = 4; doc->src->h = 4; doc->src->ch = 1;
+            doc->src->dtype = "u16";
+            doc->uid = app.nextUid++;
+            // thai is one undrawable code point; one in the folder, one in the
+            // file name, and nothing undrawable anywhere else.
+            const std::string thaiCh = thai.substr(0, 3);
+            doc->src->path = "C:/data" + thaiCh + "/frame" + thaiCh + ".npy";
+            doc->name = "frame" + thaiCh + ".npy";
+            const std::vector<std::string> pieces =
+                undrawablePieces(doc->name, *doc);
+            for (const std::string& q : pieces) say("piece: " + q);
+            const UndrawableTally pt = undrawableTallyOf(pieces);
+            say("pieces tally -> noGlyph=" + std::to_string(pt.noGlyph) +
+                " total=" + std::to_string(pt.total()));
+            check(pt.total() == 2,
+                  "C4 one bad character in the folder and one in the file name "
+                  "counts 2, not 4 (the pieces do not overlap)");
+            // ...and the pieces really do partition the path: their lengths add
+            // up to it, so no character is dropped either. Asserted as the
+            // PROPERTY rather than as a count of pieces, because the number of
+            // pieces legitimately changes with how many of them coincide.
+            size_t covered = 0;
+            for (const std::string& q : pieces)
+                if (doc->src->path.find(q) != std::string::npos) covered += q.size();
+            check(covered >= doc->src->path.size(),
+                  "C4 ...and together they cover the whole path, so nothing is "
+                  "counted zero times either");
+            app.images.clear();
+        }
+
+        // ---- A SECOND OPEN OF THE SAME BATCH STILL SPEAKS (review P3) ----
+        // batchReuse() returns an EXISTING batch id when the same folder is
+        // opened again, so a per-BATCH "already said" flag silenced every later
+        // open from a folder that had been reported once. Keyed per ROW instead.
+        // Nothing asserted that, so putting the flag back on the batch stayed
+        // green - this is the line that notices.
+        {
+            const size_t before4 = app.msgLog.size();
+            mkDoc(thai, 109, 0);                 // first row of batch 109
+            app.imagesRev++;
+            sweep(); sweep();
+            const size_t afterFirst = app.msgLog.size();
+            check(afterFirst > before4, "C4 the first row of an open is reported");
+            // A SECOND row arriving in the SAME batch, with a different name.
+            const std::string other = "\xE0\xB8\x82" "2.npy";   // U+0E02, also unasked
+            mkDoc(other, 109, 0);
+            app.imagesRev++;
+            sweep(); sweep();
+            const std::vector<std::string> got4 = linesSince(afterFirst);
+            for (const std::string& l : got4) say("msg: " + l);
+            check(got4.size() == 1 && got4[0].find(other) != std::string::npos,
+                  "C4 ...and so is a NEW row that arrives in the same batch "
+                  "(a per-batch flag would have silenced it)");
+        }
+
         // ---- A CLEAN FOLDER SAYS NOTHING (review, new critical 1) --------
         // THE DEFECT THIS FIXES: the tooltip's tally was computed over the
         // whole concatenated tooltip, which is multi-line - and the atlas has
@@ -1318,13 +1432,52 @@ static int cjkFontSelftest() {
                   "C7 with no breadcrumb the override is used");
             // (2) WITH A CRUMB naming it, it is passed over, the record says
             // why, and the search carries on to something usable.
-            fontBakeCrumbWrite({ real });
+            //
+            // THE LINE HAS TO COME FROM A DEAD PROCESS. A breadcrumb line whose
+            // writer is still running means "that process is baking right now",
+            // which says nothing about whether the font is safe - so this
+            // process's own line is deliberately not evidence, and writing one
+            // with fontBakeCrumbWrite() here would prove nothing. The test
+            // writes the line itself, in the format the reader parses, under a
+            // pid it has CHECKED is gone.
+            unsigned long deadPid = 0;
+            for (unsigned long cand = 0x7FFFFFF0ul; cand > 0x7FFF0000ul; cand -= 7ul)
+                if (!pidAlive(cand)) { deadPid = cand; break; }
+            say("using pid " + std::to_string(deadPid) + " as a process that is gone");
+            check(deadPid != 0, "C7 a pid that is not running could be found");
+            auto writeRawCrumb = [&](const std::string& body) {
+                std::ofstream f(pathFromUtf8(fontBakeCrumbPath()),
+                                std::ios::binary | std::ios::trunc);
+                f << body;
+            };
+            writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
             const std::vector<std::string> back = fontBakeCrumbRead();
             check(back.size() == 1 && back[0] == real,
-                  "C7 the breadcrumb survives a write and a read");
+                  "C7 a line from a process that is GONE is read as evidence");
+            // ...and the other direction, which is the half two windows need:
+            // a line from a process that is STILL RUNNING is not evidence. Our
+            // own pid is the one live pid a test can name for certain.
+            writeRawCrumb(std::to_string(currentPid()) + " " + real + "\n");
+            check(fontBakeCrumbRead().empty(),
+                  "C7 ...while a line from a LIVE process is not (a second "
+                  "window mid-bake must not disable this one's font)");
+            // ...and clearing takes OUR lines only. B finishing its bake used
+            // to delete the whole file, which threw away A's in-flight record.
+            writeRawCrumb(std::to_string(currentPid()) + " " + real + "\n" +
+                          std::to_string(deadPid) + " /someone/elses.ttc\n");
+            fontBakeCrumbClear();
+            const std::vector<std::string> left = fontBakeCrumbRead();
+            check(left.size() == 1 && left[0] == "/someone/elses.ttc",
+                  "C7 ...and clearing removes only this process's lines");
+            writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
             const FontChoice sk = jpFontChoice(real, back);
             check(sk.skippedAfterCrash, "C7 ...and the next choice skips that file");
-            check(sk.path != real || real == jpFontChoice(std::string(), back).path,
+            // ONE claim, not a disjunction. The right-hand side used to be
+            // `real == jpFontChoice("", back).path`, which is TRUE precisely
+            // when the breadcrumb was ignored and the search returned the
+            // skipped font anyway - so the assertion passed in the one case it
+            // existed to catch.
+            check(sk.path != real,
                   "C7 ...and does not return it as the answer");
             bool said = false;
             for (const std::string& t : sk.tried)
@@ -1362,6 +1515,10 @@ static int cjkFontSelftest() {
                   " pairs of the six font messages differ");
             // (4) SURVIVING CLEARS IT. Otherwise the first crash would disable
             // the override for good.
+            // (4) SURVIVING CLEARS IT. Written as this process's own line
+            // first, because that is what a real bake leaves behind and what
+            // fontBakeCrumbClear() is responsible for.
+            fontBakeCrumbWrite({ real });
             fontBakeCrumbClear();
             check(fontBakeCrumbRead().empty(), "C7 a completed bake clears the breadcrumb");
             const FontChoice ok2 = jpFontChoice(real, fontBakeCrumbRead());
@@ -1460,6 +1617,44 @@ static int cjkFontSelftest() {
         const std::string from9 = fontAtlasFromText(loadFail, g_fontChoice, std::string());
         check(from9 == from8,
               "C8 ...and a font that could not be read at all says the same thing");
+        // ---- AND THE RETRY THAT DROPS THE SECOND FACE (review P3) --------
+        // `mergeDropped` was only ever set by hand in a message test, so the
+        // branch that produces it - "two faces would not bake, the primary
+        // alone did" - ran nowhere. Driven for real here: a GOOD primary plus
+        // the gate-passing-but-unbakeable file as the second face. The atlas
+        // must come back with the primary, one face, and mergeDropped naming
+        // the one that was left out.
+        if (!keptChoice.path.empty()) {
+            ImFontAtlas* B = ImGui::GetIO().Fonts;
+            B->Clear();
+            ImVector<ImWchar> rr;
+            cjkFontRanges(B, rr);
+            g_fontChoice = keptChoice;             // a font that really bakes
+            g_fontMergePath = fp8;                 // ...and one that cannot
+            const bool p1 = B->AddFontFromFileTTF(keptChoice.path.c_str(),
+                                                  CJK_FONT_PX, nullptr, rr.Data) != nullptr;
+            ImFontConfig mc; mc.MergeMode = true;
+            const bool p2 = B->AddFontFromFileTTF(fp8.c_str(), CJK_FONT_PX,
+                                                  &mc, rr.Data) != nullptr;
+            check(p1 && p2, "C8 both faces were accepted, so Build() is the judge");
+            fontAtlasBake(rr, 1.0f);
+            say("after the two-face bake: faces=" + std::to_string(g_fontAtlasCost.faces) +
+                " glyphs=" + std::to_string(g_fontAtlasCost.bakedGlyphs) +
+                " dropped=" + g_fontAtlasCost.mergeDropped);
+            check(g_fontAtlasCost.mergeDropped == fp8,
+                  "C8 the second face is named as the one that was dropped");
+            check(!g_fontAtlasCost.buildFailed,
+                  "C8 ...and the bake SUCCEEDED, because the primary alone works");
+            check(g_fontAtlasCost.faces == 1 && fontAtlasHasCjk(),
+                  "C8 ...with one face and the CJK glyphs still there");
+            check(g_fontMergePath.empty(),
+                  "C8 ...and the record stops claiming a merge it does not have");
+            const std::string dm = cjkFontMergeDroppedText(g_fontAtlasCost, keptChoice);
+            say("merge-dropped: " + dm);
+            check(dm.find(fp8) != std::string::npos &&
+                  dm.find(keptChoice.path) != std::string::npos,
+                  "C8 ...and the message names both files");
+        }
         g_fontChoice = keptChoice;
         std::filesystem::remove_all(r8, ec8);
     }

@@ -916,20 +916,64 @@ static std::string viewerConfigDir() {
 //
 // One path per line, because a merge bakes two files and either of them can be
 // the one that kills the process.
+static bool pidAlive(unsigned long pid);            // fwd (with the lock code below)
 static std::string fontBakeCrumbPath() {
     const std::string dir = viewerConfigDir();
     return dir.empty() ? std::string() : dir + "/font-baking";
 }
+// EVERY LINE CARRIES THE PID THAT WROTE IT: "<pid> <path>".
+//
+// Two windows can run at once and they share this file, so a bare list of paths
+// is wrong in both directions. A reads its crumb while B is mid-bake and would
+// skip B's perfectly good font ("nothing crashed, yet the fifth message
+// appeared"); and B finishing its bake used to delete the WHOLE file, which
+// threw away A's in-flight breadcrumb - so a crash in A left no record at all.
+//
+// A LINE WHOSE PID IS STILL ALIVE IS NOT EVIDENCE. It means "that process is
+// baking right now", which says nothing about whether the font is safe. Only a
+// line whose writer is gone means "a start did not come back". pidAlive() is
+// the same predicate the autosave slot lock uses a few hundred lines below;
+// there is deliberately no second spelling of it.
+//
+// AND CLEARING REMOVES ONLY OUR OWN LINES, for the same reason in reverse.
+//
+// WHY NOT KEY THIS ON THE INSTANCE SLOT: the slot is not stable across starts.
+// claimAutosaveSlot takes the lowest FREE slot, so a run that died in slot 2
+// while slot 1 was alive is followed, once slot 1 exits, by a lone start that
+// claims slot 1 - which would read an empty slot-1 record and bake the same
+// font again. Keying on the slot fails towards MISSING the evidence; keying on
+// the pid fails only if a pid is reused inside one start, and the cost of that
+// is one more crash, which is what happened before this existed.
 static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
     const std::string p = fontBakeCrumbPath();
     if (p.empty() || paths.empty()) return;
+    // Other processes' lines are KEPT - this is an append in effect, written as
+    // a rewrite so a dead process's lines can be dropped at the same time.
+    std::vector<std::string> keep;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) continue;        // pre-pid format: drop it
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who == me) continue;                      // ours: replaced below
+            if (!pidAlive(who)) continue;                 // its evidence is read by then
+            keep.push_back(line);
+        }
+    }
     std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
     if (!f) return;
-    for (const std::string& s : paths) f << s << "\n";
+    for (const std::string& s : keep) f << s << "\n";
+    for (const std::string& s : paths) f << currentPid() << " " << s << "\n";
     // Flushed and closed before the caller bakes anything: a breadcrumb still
     // sitting in a stdio buffer when the process dies is not a breadcrumb.
     f.flush();
 }
+// The paths a start DID NOT come back from: lines whose writer is gone.
 static std::vector<std::string> fontBakeCrumbRead() {
     std::vector<std::string> out;
     const std::string p = fontBakeCrumbPath();
@@ -938,17 +982,48 @@ static std::vector<std::string> fontBakeCrumbRead() {
     if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return out;
     std::ifstream f(pathFromUtf8(p), std::ios::binary);
     std::string line;
+    const unsigned long me = currentPid();
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (!line.empty()) out.push_back(line);
+        if (line.empty()) continue;
+        const size_t sp = line.find(' ');
+        if (sp == std::string::npos) continue;
+        const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+        // Our own line cannot be evidence either: this process is the one
+        // baking, and it has not finished yet.
+        if (who == me || pidAlive(who)) continue;
+        const std::string path = line.substr(sp + 1);
+        if (!path.empty() && std::find(out.begin(), out.end(), path) == out.end())
+            out.push_back(path);
     }
     return out;
 }
+// OUR LINES ONLY. A second window finishing its bake must not delete the
+// breadcrumb this one is still flying on.
 static void fontBakeCrumbClear() {
     const std::string p = fontBakeCrumbPath();
     if (p.empty()) return;
     std::error_code ec;
-    std::filesystem::remove(pathFromUtf8(p), ec);
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    std::vector<std::string> keep;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) continue;
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who == me) continue;                      // the lines we are clearing
+            keep.push_back(line);
+        }
+    }
+    if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
 }
 
 static unsigned long currentPid() {
@@ -2821,12 +2896,20 @@ static void crashHandler(int sig) {
         {
             char line[64];
             int n = 0;
-            for (const char* q = "\nviewer: crashed on signal "; *q; q++) line[n++] = *q;
+            // SIGTERM IS NOT A CRASH (review P3). It is what a window manager,
+            // a service stop or `kill` sends to ask a process to go away, and
+            // this handler is registered for it so the session still gets
+            // written - but calling it "crashed" sends a reader looking for a
+            // defect that did not happen.
+            const char* head = (sig == SIGTERM) ? "\nviewer: asked to stop (signal "
+                                                : "\nviewer: crashed on signal ";
+            for (const char* q = head; *q; q++) line[n++] = *q;
             int v = sig < 0 ? 0 : sig;
             char d[8]; int dn = 0;
             if (v == 0) d[dn++] = '0';
             while (v > 0) { d[dn++] = (char)('0' + v % 10); v /= 10; }
             while (dn > 0) line[n++] = d[--dn];
+            if (sig == SIGTERM) line[n++] = ')';
             line[n++] = '\n';
 #if defined(_WIN32)
             _write(2, line, (unsigned)n);

@@ -27,6 +27,10 @@ struct FontChoice {
     // start died baking it. The user has to be told: their setting is being
     // ignored, and only they can decide whether to fix or remove it.
     bool skippedAfterCrash = false;
+    // ...and whether the thing skipped was the USER'S setting or one of this
+    // build's own candidates. The two need different advice: only one of them
+    // has a line the user can delete (review P3).
+    bool skippedWasOverride = false;
 };
 // The override, as settings.jsonc / prefs.txt left it. Declared here rather
 // than in settings.inc (where g_settingsEditorCmd and g_settingsRepoUrl live)
@@ -292,6 +296,18 @@ static bool sfntLooksSane(const std::string& p, std::string& why) {
                   " fonts) does not fit in the file";
             return false;
         }
+        // ...and a CEILING, because "it fits in the file" is not a bound worth
+        // having here: a 40 MB file can claim ten million fonts and each one
+        // costs a seek and a directory walk, so a start-up could be made to
+        // spend minutes inside this check (review P3). Real collections hold a
+        // handful - meiryo.ttc has 2, the largest shipped CJK collections are
+        // in the tens - so 64 refuses nothing anyone has and bounds the work at
+        // a few hundred reads.
+        if (numFonts > 64) {
+            why = "it claims " + std::to_string(numFonts) +
+                  " fonts in one collection, which no real font file does";
+            return false;
+        }
         std::vector<unsigned char> offs((size_t)4 * numFonts);
         f.read((char*)offs.data(), (std::streamsize)offs.size());
         if ((size_t)f.gcount() != offs.size()) { why = "its collection header is truncated"; return false; }
@@ -337,6 +353,7 @@ static FontChoice jpFontChoice(const std::string& want,
             c.tried.push_back(p + " (skipped: the last start did not survive "
                                   "baking it)");
             c.skippedAfterCrash = true;
+            if (strcmp(how, "appearance.fontPath") == 0) c.skippedWasOverride = true;
             return false;
         }
         if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) {
@@ -374,12 +391,21 @@ static FontChoice jpFontChoice(const std::string& want,
     // at a file that has since been replaced, would hand it straight to
     // stb_truetype. There is ONE gate, and every arm goes through it.
     if (std::string fc = fcMatchJpFont(); !fc.empty()) {
+        const size_t before = c.tried.size();
         if (tryPath(fc, "fc-match")) {
             // Keep fontconfig's name for it in the record as well, so a reader
             // can tell "the list found this" from "fontconfig chose this".
             c.tried.back() = "fc-match sans:lang=ja -> " + fc;
             return c;
         }
+        // IT ANSWERED AND THE ANSWER WAS REFUSED, which is not the same as "no
+        // answer" (review P3). The record used to say the latter, which sent a
+        // reader looking for a fontconfig problem when the problem was the file
+        // fontconfig named. tryPath already appended the path and the reason;
+        // this only marks whose suggestion it was.
+        if (c.tried.size() > before)
+            c.tried.back() = "fc-match sans:lang=ja -> " + c.tried.back();
+        return c;
     }
 #if !defined(_WIN32)
     c.tried.push_back("fc-match sans:lang=ja (no answer)");
@@ -648,6 +674,13 @@ static void selftestSetEnv(const char* name, const char* value) {
     else       unsetenv(name);
 #endif
 }
+// THE RANGES THIS START ACTUALLY ASKED FOR, kept so that "the font does not
+// have it" and "this build never asked for it" can be told apart downstream
+// (review P3). Filled by cjkFontRanges(); empty before start-up has run, which
+// makes cjkRangeHas() answer false and the tally fall back to "not asked" -
+// the conservative side, since it offers no cure that cannot work.
+static ImVector<ImWchar> g_cjkRangesAsked;
+
 // ---- WHICH CODE POINTS ARE ASKED FOR (板306 A) ------------------------------
 // The user report was 「日本語とか中国語のファイル名が文字化けする」, and
 // widening this set is the first half of the answer. Measured, by expanding
@@ -702,6 +735,7 @@ static void cjkFontRanges(ImFontAtlas* atlas, ImVector<ImWchar>& out) {
     b.AddChar((ImWchar)0x03C3);        // sigma
     b.AddChar((ImWchar)0x03BC);        // mu
     b.BuildRanges(&out);
+    g_cjkRangesAsked = out;      // see g_cjkRangesAsked for why this is kept
 }
 
 // Is this code point one the ranges ASKED for? A different question from "did
@@ -947,13 +981,29 @@ static std::string cjkFontCrashSkipText(const FontChoice& c) {
         if (!skipped.empty()) skipped += "; ";
         skipped += n;
     }
-    return "the last start did not survive reading this font, so it was NOT "
-           "used this time: " + (skipped.empty() ? std::string("(unknown)") : skipped) +
-           ". This start is using " +
-           (c.path.empty() ? std::string("the built-in font") : c.path) +
-           " instead. To fix it, point \"appearance.fontPath\" in settings.jsonc "
-           "(or `fontPath` in prefs.txt) at a different file, or delete that "
-           "line to go back to the built-in search.";
+    std::string s = "the last start did not survive reading this font, so it "
+                    "was NOT used this time: " +
+                    (skipped.empty() ? std::string("(unknown)") : skipped) +
+                    ". This start is using " +
+                    (c.path.empty() ? std::string("the built-in font") : c.path) +
+                    " instead.";
+    // THE WAY OUT HAS TO EXIST. "delete that line" is an instruction, and it is
+    // false when what was skipped is a BUILT-IN CANDIDATE rather than the
+    // user's own setting - there is no line to delete, and a reader who goes
+    // looking for one learns nothing except that the message lies. Which case
+    // this is, is known: `skippedWasOverride` is set where the skip happened.
+    // (Same type as the Files-panel defect this round: never print an
+    // instruction that cannot be carried out.)
+    if (c.skippedWasOverride)
+        s += " To fix it, point \"appearance.fontPath\" in settings.jsonc (or "
+             "`fontPath` in prefs.txt) at a different file, or delete that line "
+             "to go back to the built-in search.";
+    else
+        s += " That file is one this build looks for on its own, not something "
+             "you set - if it is broken, replace it, or name a different font "
+             "with \"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
+             "prefs.txt).";
+    return s;
 }
 
 // ...and the SIXTH: the two faces would not bake together, the primary alone
