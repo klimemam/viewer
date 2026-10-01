@@ -1069,7 +1069,16 @@ static int cjkFontSelftest() {
               "C5 ...and 'the font has no CJK in it' names the font and the way out");
         // The candidate list is not empty on any platform this builds for, or
         // the refusal above would have nothing to print.
-        check(jpFontCandidates().size() >= 3,
+        //
+        // NOT-EMPTY, never a count. This used to read `>= 3` and that number was
+        // the length of the OLD macOS list: giving every candidate an explicit
+        // ja/zh tag moved Hiragino Sans GB to the Chinese side - which is the
+        // point of the tag, and the reason the Chinese-primary sentence can be
+        // raised at all - leaving two Japanese rows there and this assert red on
+        // macOS only. A threshold is the wrong shape for what the comment above
+        // actually claims, and re-pinning it at 2 would fail again the next time
+        // the table is re-sorted for a good reason.
+        check(!jpFontCandidates().empty(),
               "C5 this platform has a candidate list to look through");
         std::filesystem::remove_all(root0, ec0);    // the fixtures are this test's
     }
