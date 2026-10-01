@@ -87,6 +87,20 @@ static bool annWriteFields(App::Ann& a, const int* f, int W, int H, std::string*
             if (why) *why = b;
             return false;
         }
+        // ...and an upper bound, which is not a nicety. annFits is 64-bit safe
+        // now, but a ROI that is ALREADY off the frame skips its gate - so
+        // w = 2147483647 used to be writable, and from there every `x + w` in
+        // int downstream (the canvas' hit test and overlay among them) is
+        // signed overflow that this file cannot reach. MAX_DIM is the viewer's
+        // own limit on a frame (core/imagefile.h, enforced by every loader), so
+        // "no annotation is bigger than the biggest image we would open" costs
+        // nothing real and makes x + w <= 65536 everywhere, for good.
+        if (f[i] > (int)imagefile::MAX_DIM) {
+            snprintf(b, sizeof b, "%s = %d: past this viewer's %d px limit, so nothing "
+                                  "was written", NM[i], f[i], (int)imagefile::MAX_DIM);
+            if (why) *why = b;
+            return false;
+        }
         *out[i] = f[i];
     }
     if (!any) return false;                       // a commit with no edit in it
@@ -231,7 +245,22 @@ static void toggleBand(bool horizontal) {
     int px = -1, py = -1;
     if (a && a->type == 1) { px = a->x; py = a->y; }          // the selected pin
     else if (app.hoverX >= 0) { px = app.hoverX; py = app.hoverY; }
-    if (px < 0 || px >= im->w || py < 0 || py >= im->h) {
+    // A pixel IS hovered, and it is not a pixel of this frame. That happens
+    // every time a bigger B is compared beside A: the readout follows the pane
+    // under the cursor on purpose (core/ui/canvas.inc sets hoverX/hoverY from
+    // the hovered pane's own document), while an annotation is always in A's
+    // pixels. The old line answered "hover a pixel" to someone who was hovering
+    // one. A pin cannot arrive here - the gate above returns first - so this is
+    // the cursor, and it says so.
+    if (px >= 0 && (px >= im->w || py >= im->h)) {
+        snprintf(b, sizeof b, "the pixel under the cursor (@%d,%d) is %soutside this "
+                              "frame (%dx%d) - X / Y bands the row / column of the frame "
+                              "the ROIs are measured on", px, py,
+                 app.hoverInB ? "on the compared pane and " : "", im->w, im->h);
+        toast(b, true);
+        return;
+    }
+    if (px < 0 || py < 0) {
         // ...so this one now means what it says: nothing is selected and
         // nothing is hovered.
         toast("select a pin, or hover a pixel, then press X or Y");
