@@ -723,45 +723,113 @@ static int cjkFontSelftest() {
             check(got2.size() == 1 && got2[0].find("2 of 6 frame(s)") != std::string::npos,
                   "C4 ...and a stack whose FRAMES carry it says 2 of 6");
         }
-        // ---- THE PIECES MUST BE DISJOINT (review, new critical) -----------
-        // `d.name` is normally the LAST COMPONENT of `d.src->path`, so a list
-        // holding both counted the file's own name TWICE and the sentence said
-        // "2 character(s)" about one bad character. Nothing asserted N, so the
-        // double count was green.
+        // ---- WHAT IS COUNTED IS A SET OF CHARACTERS (review round 5) ------
+        // THE CONTRACT, in the manual's words (§8c): the same character is
+        // never counted twice. Two rounds tried to deliver that by making the
+        // STRINGS disjoint - splitting the path at its last separator, then
+        // deduplicating whole strings - and the arms kept coming: `d.name` is a
+        // strict SUPERSTRING of the path's leaf for an npz member, a remote
+        // frame, a decorated row and a stack name, and whole-string dedup sees
+        // none of them. The npz shape said "8 character(s)" about 4.
         //
-        // The fixture puts ONE undrawable character in the directory and ONE in
-        // the leaf, so the right answer is 2. A list that counts the leaf twice
-        // gives 3; one that counts the whole path and the leaf gives 3; one
-        // that drops the directory gives 1.
+        // These are the shapes, each with an EXACT N. Before the fix only (1)
+        // passed: the npz case counted 5 where the answer is 3, and no fixture
+        // for it existed because nothing in this file ever set `src->member`.
         {
-            auto doc = std::make_unique<ImageDoc>();
-            doc->src->w = 4; doc->src->h = 4; doc->src->ch = 1;
-            doc->src->dtype = "u16";
-            doc->uid = app.nextUid++;
-            // thai is one undrawable code point; one in the folder, one in the
-            // file name, and nothing undrawable anywhere else.
-            const std::string thaiCh = thai.substr(0, 3);
-            doc->src->path = "C:/data" + thaiCh + "/frame" + thaiCh + ".npy";
-            doc->name = "frame" + thaiCh + ".npy";
+            const std::string kA = thai.substr(0, 3);     // U+0E01, asked nowhere
+            const std::string kB = "\xE0\xB8\x82";         // U+0E02
+            const std::string kC = "\xE0\xB8\x83";         // U+0E03
+            const std::string bad1 = std::string(1, (char)0xFF);   // not UTF-8
+            const std::string bad2 = std::string(1, (char)0xFE);
+            auto mk = [&](const std::string& path, const std::string& name,
+                          const std::string& member) {
+                auto d = std::make_unique<ImageDoc>();
+                d->src->w = 4; d->src->h = 4; d->src->ch = 1;
+                d->src->dtype = "u16";
+                d->uid = app.nextUid++;
+                d->src->path = path;
+                d->name = name;
+                d->src->member = member;      // the field no fixture ever set
+                return d;
+            };
+            auto countOf = [&](const ImageDoc& d, const std::string& label) {
+                const std::vector<std::string> pieces = undrawablePieces(label, d);
+                for (const std::string& q : pieces) say("piece: " + q);
+                const UndrawableTally t = undrawableTallyOf(pieces);
+                say("  -> notAsked=" + std::to_string(t.notAsked) +
+                    " badBytes=" + std::to_string(t.badBytes) +
+                    " total=" + std::to_string(t.total()));
+                return t.total();
+            };
+            // (1) ONE bad character in the folder and a DIFFERENT one in the
+            // leaf: 2. A list that counts the leaf twice gives 3; one that
+            // drops the directory gives 1.
+            const auto d1 = mk("C:/data" + kA + "/frame" + kB + ".npy",
+                               "frame" + kB + ".npy", std::string());
+            check(countOf(*d1, d1->name) == 2,
+                  "C4 one bad character in the folder and a different one in "
+                  "the file name counts 2");
+            // (2) THE SAME character in both halves: 1, and this is the number
+            // the contract decides. It is not "one per place on screen" - the
+            // sentence says how many CHARACTERS of this row cannot be drawn,
+            // and there is one such character here however often it appears.
+            // THIS NUMBER CHANGED WITH THIS ROUND: it used to be 2.
+            const auto d2 = mk("C:/data" + kA + "/frame" + kA + ".npy",
+                               "frame" + kA + ".npy", std::string());
+            check(countOf(*d2, d2->name) == 1,
+                  "C4 ...while the SAME character in both halves counts 1 "
+                  "(the same character is never counted twice)");
+            // (3) THE npz SHAPE, which is the one that said 8 about 4.
+            // loader_npz builds `d.name` as baseName(path) + ":" + member, so
+            // the leaf is a strict PREFIX of the name and the member a strict
+            // SUFFIX of it - three distinct characters, each of them in two
+            // pieces at once.
+            const auto d3 = mk("C:/" + kA + "/" + kB + ".npz",
+                               kB + ".npz:" + kC, kC);
+            check(countOf(*d3, d3->name) == 3,
+                  "C4 ...and an npz member row counts its three characters "
+                  "once each, though every one of them is in two pieces");
+            // (4) A DECORATED LABEL, which is what a preview or a stale row
+            // draws: the label is no longer EQUAL to d.name, so whole-string
+            // dedup lets it in - and the answer must not move.
+            check(countOf(*d3, "  " + d3->name + "  [preview]") == 3,
+                  "C4 ...and a decorated label does not change the count");
+            // (5) A STACK NAME that CONTAINS the leaf, which is the Messages
+            // sweep's shape (it passes the stack's name, not the frame's).
+            check(countOf(*d3, "stack of " + kB + ".npz") == 3,
+                  "C4 ...nor does a stack name that contains the file name");
+            // (6) ...and the unit that is NOT a code point. `badBytes` is
+            // counted in the RUN OF BYTES the decoder consumed - see the note
+            // on undrawableUnitKey - so two different runs are two, and one
+            // run reached through two pieces is one. The unit was left open
+            // to decide, and it is asserted rather than only written down
+            // because an undecided unit is how a fix lands on three arms of a
+            // defect and not on the fourth.
+            const auto d4 = mk("C:/a" + bad1 + "/b" + bad2 + ".npy",
+                               "b" + bad2 + ".npy", std::string());
+            check(countOf(*d4, d4->name) == 2,
+                  "C4 ...two DIFFERENT ill-formed byte runs count 2");
+            const auto d5 = mk("C:/a" + bad1 + "/b" + bad1 + ".npy",
+                               "b" + bad1 + ".npy", std::string());
+            check(countOf(*d5, d5->name) == 1,
+                  "C4 ...and the SAME ill-formed run in both halves counts 1");
+            // ...and the old lower bound, kept and labelled. IT DOES NOT PROVE
+            // THE PIECES ARE DISJOINT, and that is exactly how this round's
+            // critical finding stayed green: in the npz shape the pieces
+            // `kB.npz:kC` and `kC` are not substrings of the path, so they add
+            // nothing to `covered`, the path alone already reaches its own
+            // length, and the assert passed while the count said 8 for 4
+            // characters. All it says is that no piece is counted ZERO times.
+            // The exact-N lines above are what says the rest.
             const std::vector<std::string> pieces =
-                undrawablePieces(doc->name, *doc);
-            for (const std::string& q : pieces) say("piece: " + q);
-            const UndrawableTally pt = undrawableTallyOf(pieces);
-            say("pieces tally -> noGlyph=" + std::to_string(pt.noGlyph) +
-                " total=" + std::to_string(pt.total()));
-            check(pt.total() == 2,
-                  "C4 one bad character in the folder and one in the file name "
-                  "counts 2, not 4 (the pieces do not overlap)");
-            // ...and the pieces really do partition the path: their lengths add
-            // up to it, so no character is dropped either. Asserted as the
-            // PROPERTY rather than as a count of pieces, because the number of
-            // pieces legitimately changes with how many of them coincide.
+                undrawablePieces(d3->name, *d3);
             size_t covered = 0;
             for (const std::string& q : pieces)
-                if (doc->src->path.find(q) != std::string::npos) covered += q.size();
-            check(covered >= doc->src->path.size(),
-                  "C4 ...and together they cover the whole path, so nothing is "
-                  "counted zero times either");
+                if (d3->src->path.find(q) != std::string::npos) covered += q.size();
+            check(covered >= d3->src->path.size(),
+                  "C4 ...and the pieces still cover the whole path, so nothing "
+                  "is counted zero times either (which says NOTHING about "
+                  "double counting - see the comment)");
             app.images.clear();
         }
 
@@ -1450,6 +1518,34 @@ static int cjkFontSelftest() {
                                 std::ios::binary | std::ios::trunc);
                 f << body;
             };
+            auto readRawCrumb = [&]() {
+                std::ifstream f(pathFromUtf8(fontBakeCrumbPath()), std::ios::binary);
+                std::ostringstream os; os << f.rdbuf();
+                return os.str();
+            };
+            // ...AND A LIVE PID THAT IS NOT OURS. The two properties that make
+            // this design different from "truncate the file and write your own
+            // line" are both about ANOTHER process's line, and until this round
+            // every check here used currentPid() for "alive" - which takes the
+            // `who == me` arm of `who == me || pidAlive(who)` and never reaches
+            // pidAlive() at all. Deleting pidAlive() from that condition passed
+            // the whole group.
+            //
+            // Found by asking, not assumed: pid 4 on Windows (System, which
+            // answers ERROR_ACCESS_DENIED and so counts as alive) and pid 1 on
+            // Linux and macOS (init / launchd, EPERM) are hit on the first few
+            // candidates, and the parent is tried first where it can be asked
+            // for. If none can be found the two lines below say so and are
+            // skipped rather than asserting something about this machine.
+            unsigned long livePid = 0;
+#if !defined(_WIN32)
+            if (const unsigned long pp = (unsigned long)getppid();
+                pp && pp != currentPid() && pidAlive(pp)) livePid = pp;
+#endif
+            for (unsigned long cand = 1; !livePid && cand < 70000ul; cand++)
+                if (cand != currentPid() && pidAlive(cand)) livePid = cand;
+            say("using pid " + std::to_string(livePid) +
+                " as a process that is NOT us and is running");
             writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
             const std::vector<std::string> back = fontBakeCrumbRead();
             check(back.size() == 1 && back[0] == real,
@@ -1469,6 +1565,67 @@ static int cjkFontSelftest() {
             const std::vector<std::string> left = fontBakeCrumbRead();
             check(left.size() == 1 && left[0] == "/someone/elses.ttc",
                   "C7 ...and clearing removes only this process's lines");
+            if (!livePid) {
+                say("no second live pid could be named on this machine, so the "
+                    "two ANOTHER-PROCESS properties below cannot be shown here "
+                    "- everything else in C7 did run.");
+            } else {
+                // ---- (2a) A LIVE LINE IS NOT EVIDENCE, and the line that
+                // makes it so is `pidAlive(who)` in fontBakeCrumbRead. The
+                // check above this one used OUR pid, which short-circuits on
+                // `who == me`; this one cannot be satisfied that way. Without
+                // it, a second window mid-bake disables this one's font and
+                // the suite stays green.
+                writeRawCrumb(std::to_string(livePid) + " " + real + "\n");
+                check(fontBakeCrumbRead().empty(),
+                      "C7 ...and a line from ANOTHER process that is still "
+                      "running is not evidence either");
+                // ...and the dead/alive pair, on the SAME shape, so the line
+                // above cannot pass by reading nothing at all.
+                writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
+                check(fontBakeCrumbRead().size() == 1,
+                      "C7 ...while the same line under a DEAD pid is");
+                // ---- (2b) ANOTHER PROCESS'S LINE SURVIVES OUR WRITE. The
+                // write is an append in effect - "A reads its crumb while B is
+                // mid-bake" needs B's line to still be there afterwards - and
+                // a write that simply truncated the file passed every line in
+                // this group before this one existed.
+                writeRawCrumb(std::to_string(livePid) + " /someone/elses.ttc\n");
+                fontBakeCrumbWrite({ real });
+                const std::string raw = readRawCrumb();
+                say("crumb after our write: " + raw);
+                check(raw.find("/someone/elses.ttc") != std::string::npos,
+                      "C7 ...and a live other process's line is STILL THERE "
+                      "after this process writes its own (the rewrite is an "
+                      "append, not a truncate)");
+                check(raw.find(std::to_string(currentPid()) + " " + real) !=
+                          std::string::npos,
+                      "C7 ...alongside this start's own line");
+            }
+            // ---- (3) A START THAT CHOSE NO FONT AT ALL still consumes the
+            // dead line (review round 5 P2). Consumption used to live inside
+            // fontBakeCrumbWrite, which returns early on `paths.empty()`, so a
+            // start whose breadcrumb named every candidate it had skipped them
+            // all, baked nothing, wrote nothing - and left the line. The next
+            // start read it, skipped the same paths, and was empty again: the
+            // font skipped FOR EVER that the comment on fontBakeCrumbConsume
+            // rejects by name, down the one route where no message can offer a
+            // way out either.
+            //
+            // Run in main()'s order for that start: read, choose (nothing),
+            // consume, write (nothing).
+            writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
+            const std::vector<std::string> ev0 = fontBakeCrumbRead();
+            check(ev0.size() == 1 && ev0[0] == real,
+                  "C7 a start reads the dead line before it chooses");
+            fontBakeCrumbConsume();
+            fontBakeCrumbWrite({});           // nothing was chosen: nothing to bake
+            check(fontBakeCrumbRead().empty(),
+                  "C7 ...and a start that chose NO font consumes it anyway "
+                  "(otherwise that font is skipped for ever)");
+            const FontChoice again = jpFontChoice(real, fontBakeCrumbRead());
+            check(again.path == real && !again.skippedAfterCrash,
+                  "C7 ...so the next start tries that file again");
             writeRawCrumb(std::to_string(deadPid) + " " + real + "\n");
             const FontChoice sk = jpFontChoice(real, back);
             check(sk.skippedAfterCrash, "C7 ...and the next choice skips that file");
@@ -1497,6 +1654,33 @@ static int cjkFontSelftest() {
             check(m.find("appearance.fontPath") != std::string::npos &&
                   m.find("delete that line") != std::string::npos,
                   "C7 ...and names BOTH ways out: point it elsewhere, or remove it");
+            // ...AND THE OTHER BRANCH OF THAT SENTENCE (review round 5 P3).
+            // What was skipped here is the user's own setting, so "delete that
+            // line" can be carried out. When a BUILT-IN candidate is what was
+            // skipped there is no such line, and only `skippedWasOverride`
+            // knows which case it is - so the false side needs its own
+            // assertion or the branch can be deleted with the suite green.
+            //
+            // NOT asserted on "appearance.fontPath": BOTH sentences name it
+            // (the built-in one offers it as a way to choose something else),
+            // so that substring cannot tell the two apart. The clause that can
+            // is the one about whose decision it was.
+            {
+                FontChoice bi;
+                bi.skippedAfterCrash = true;
+                bi.skippedWasOverride = false;
+                bi.tried.push_back("/usr/share/fonts/x.ttc (skipped: the last "
+                                   "start did not survive baking it)");
+                const std::string bm = cjkFontCrashSkipText(bi);
+                say("crash-skip (built-in): " + bm);
+                check(bm.find("not something you set") != std::string::npos,
+                      "C7 ...and for a BUILT-IN candidate it says so instead");
+                check(bm.find("delete that line") == std::string::npos,
+                      "C7 ...and does NOT tell the reader to delete a line "
+                      "that does not exist");
+                check(bm.find("/usr/share/fonts/x.ttc") != std::string::npos,
+                      "C7 ...while still naming the file that was skipped");
+            }
             // ...and it is a fifth SENTENCE, not one of the four wearing a hat.
             // All six pairs, because three comparisons out of six is not "they
             // are all different".
@@ -1518,6 +1702,12 @@ static int cjkFontSelftest() {
             // (4) SURVIVING CLEARS IT. Written as this process's own line
             // first, because that is what a real bake leaves behind and what
             // fontBakeCrumbClear() is responsible for.
+            // ...with the dead line consumed first, because that is what the
+            // start which goes on to bake has already done (main() consumes
+            // between the choice and the write). Without this line the file
+            // still holds the skipped path from the group above, and
+            // fontBakeCrumbWrite deliberately keeps lines that are not ours.
+            fontBakeCrumbConsume();
             fontBakeCrumbWrite({ real });
             fontBakeCrumbClear();
             check(fontBakeCrumbRead().empty(), "C7 a completed bake clears the breadcrumb");

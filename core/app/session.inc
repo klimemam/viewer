@@ -948,7 +948,7 @@ static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
     const std::string p = fontBakeCrumbPath();
     if (p.empty() || paths.empty()) return;
     // Other processes' lines are KEPT - this is an append in effect, written as
-    // a rewrite so a dead process's lines can be dropped at the same time.
+    // a rewrite only so that OUR line can be replaced rather than repeated.
     std::vector<std::string> keep;
     {
         std::ifstream in(pathFromUtf8(p), std::ios::binary);
@@ -961,20 +961,13 @@ static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
             if (sp == std::string::npos) continue;        // pre-pid format: drop it
             const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
             if (who == me) continue;                      // ours: replaced below
-            // A DEAD PROCESS'S LINE IS CONSUMED ONCE, and that is a choice.
-            // This start has already READ it (fontBakeCrumbRead ran before the
-            // first font byte) and acted on it - skipped that path and said so
-            // on screen - so dropping it here means the NEXT start tries the
-            // path again. The alternative, keeping it until some start bakes
-            // that file successfully, would skip a font for ever after one
-            // transient failure (a file that was mid-copy and is now fine),
-            // with no way out that the message could name.
-            //
-            // The cost of consuming it is at most ONE more crash, and the
-            // recovery then returns immediately because that crash writes a
-            // fresh line. The cost of keeping it is a font the user cannot get
-            // back. One more crash is the cheaper mistake.
-            if (!pidAlive(who)) continue;
+            // EVERY OTHER PROCESS'S LINE IS KEPT HERE, alive or dead. Dropping
+            // the dead ones is a separate act with its own meaning - "this
+            // start read that line and acted on it" - and it is done by
+            // fontBakeCrumbConsume() below, at the one place that does the
+            // reading. It used to be done here, and this function returns
+            // early when there is nothing to bake, which is what made it
+            // wrong; the comment on that function has the measurement.
             keep.push_back(line);
         }
     }
@@ -985,6 +978,61 @@ static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
     // Flushed and closed before the caller bakes anything: a breadcrumb still
     // sitting in a stdio buffer when the process dies is not a breadcrumb.
     f.flush();
+}
+// ...and the lines a start HAS ACTED ON are dropped here (review round 5 P2).
+//
+// A DEAD PROCESS'S LINE IS CONSUMED ONCE, and that is a choice. The start that
+// calls this has already READ it (fontBakeCrumbRead, just above it in main())
+// and acted on it - skipped that path, and said so on screen in the fifth font
+// message - so dropping it means the NEXT start tries the path again. The
+// alternative, keeping it until some start bakes that file successfully, would
+// skip a font for ever after one transient failure (a file that was mid-copy
+// and is now fine), with no way out that the message could name.
+//
+// The cost of consuming it is at most ONE more crash, and the recovery then
+// returns immediately because that crash writes a fresh line. The cost of
+// keeping it is a font the user cannot get back. One more crash is the cheaper
+// mistake.
+//
+// WHY THIS IS NOT PART OF fontBakeCrumbWrite, which is where it used to live:
+// that function returns early when there is nothing to bake (`paths.empty()`),
+// so a start whose breadcrumb named EVERY candidate skipped them all, had an
+// empty list, wrote nothing - and never consumed the lines. The next start read
+// the same lines, skipped the same paths, and was empty again: the font skipped
+// FOR EVER that the paragraph above rejects by name, reached by the one route
+// where no message could offer a way out either, because no bake was attempted.
+// Consumption belongs where the line is read and acted on, and that is one
+// call, in main(), on every start - not where the next bake happens to be
+// recorded. C7 covers the zero-fonts-chosen start.
+//
+// Our own lines are left alone: this process is mid-bake and its line is the
+// record of that, which only fontBakeCrumbClear() may remove.
+static void fontBakeCrumbConsume() {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    std::vector<std::string> keep;
+    bool dropped = false;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) { dropped = true; continue; }  // pre-pid format
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who != me && !pidAlive(who)) { dropped = true; continue; }
+            keep.push_back(line);
+        }
+    }
+    if (!dropped) return;                     // nothing was evidence: leave the file alone
+    if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
 }
 // The paths a start DID NOT come back from: lines whose writer is gone.
 static std::vector<std::string> fontBakeCrumbRead() {
@@ -2943,11 +2991,27 @@ static void crashHandler(int sig) {
             while (n) { ssize_t w = write(g_crashFd, p, n); if (w <= 0) break; p += w; n -= (size_t)w; }
             if (ftruncate(g_crashFd, (off_t)g_crashText.size()) != 0) { /* best effort */ }
 #endif
-            static const char msg[] = "\nviewer crashed; session written to the autosave file\n";
+            // SIGTERM IS NOT A CRASH HERE EITHER (review round 5 P2). The
+            // branch at the top of this handler was given its own word and
+            // this one was not, so a window manager's stop printed "viewer:
+            // asked to stop (signal 15)" and then "viewer crashed" immediately
+            // under it - one handler contradicting itself in two lines.
+            //
+            // THE AXIS IS EVERY STRING IN THIS HANDLER THAT NAMES THE EVENT,
+            // not the line a review pointed at: there are exactly two, the
+            // head above and this one, and a third has to be written as a
+            // branch from the start or it will be the next of these.
+            static const char crashed[] =
+                "\nviewer crashed; session written to the autosave file\n";
+            static const char stopped[] =
+                "\nviewer stopped; session written to the autosave file\n";
+            const bool term = (sig == SIGTERM);
+            const char* msg = term ? stopped : crashed;
+            const size_t mn = (term ? sizeof stopped : sizeof crashed) - 1;
 #if defined(_WIN32)
-            _write(2, msg, (unsigned)(sizeof msg - 1));
+            _write(2, msg, (unsigned)mn);
 #else
-            ssize_t ign = write(2, msg, sizeof msg - 1); (void)ign;
+            ssize_t ign = write(2, msg, mn); (void)ign;
 #endif
         }
     }

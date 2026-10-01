@@ -237,7 +237,60 @@ struct UndrawableTally {
         return *this;
     }
 };
-static UndrawableTally undrawableTally(const std::string& utf8Name) {
+// ---- WHAT IS COUNTED IS A SET OF CHARACTERS, not a list of strings --------
+// (review round 5, the critical finding - and it is round 3's critical finding
+// a second time, on the arm next door.)
+//
+// The contract is the one the manual states in §8c: THE SAME CHARACTER IS
+// NEVER COUNTED TWICE. For two rounds that was implemented by trying to make
+// the STRINGS handed in disjoint - splitting the path at its last separator so
+// the directory part and the leaf shared no character, whole-string dedup for
+// the rest. That is reasoning about one instance, and the instances never ran
+// out: `d.name` is a strict SUPERSTRING of the path's leaf for an npz member
+// ("試験.npz:温度", loader_npz.inc), for a remote frame ("frame.npy #3",
+// open_dispatch.inc), for a decorated preview or stale row, for a series member
+// and for a stack name - and no amount of splitting the path sees any of them.
+// The npz shape said "8 character(s) here draw as '?'" about 4 characters.
+//
+// So the dedup moves DOWN to the unit, and the pieces are allowed to overlap
+// freely. `seen` carries the units already counted for one row, so a character
+// that appears in the row's label, in `d.name`, in the path and in the member
+// name is counted once - and every superstring case above stops being a case.
+//
+// THE UNIT IS THE UTF-8 BYTE SEQUENCE THE DECODER CONSUMED. That is the one
+// choice here that is not forced by anything above, so here is the reasoning:
+//
+//   * noGlyph / notAsked / tooHigh are code points, and well-formed UTF-8 is a
+//     BIJECTION - each code point has exactly one encoding, overlong forms
+//     being ill-formed - so for those three, "the same byte sequence" and "the
+//     same character" are the same statement. Keying on the bytes is not an
+//     approximation of the contract; it is the contract. It is also the only
+//     key that stays honest where `cp` is unavailable: a 4-byte emoji comes
+//     back from ImTextCharFromUtf8 as U+FFFD on this 16-bit build, so a key
+//     made from `cp` would collapse EVERY emoji in one name into one character
+//     - which the contract does not say and the reader can see is false.
+//   * `badBytes` IS NOT A CODE POINT, and this is the unit it gets: the run of
+//     bytes the decoder consumed. A run that is not UTF-8 has no character to
+//     be "the same character" as, so its bytes are the only identity it has.
+//     Two ill-formed runs are ONE unit when they are byte-for-byte equal and
+//     two units otherwise - a name carrying a stray FF byte and a stray FE
+//     byte counts 2 because the bytes differ, while one stray FF that the path
+//     and `d.name` both carry counts 1, which is the character rule applied to
+//     the only thing those bytes can be compared by. Counting every occurrence instead would have left this very defect
+//     alive on the badBytes arm while the other three were fixed - the failure
+//     type ("a fix round leaves the same defect next door") this round exists
+//     to stop.
+//
+// A unit is at most 4 bytes: ImTextCharFromUtf8 never reports more, on its
+// success path or on its error path, so the key is those bytes and their count.
+static uint64_t undrawableUnitKey(const char* p, int used) {
+    const int n = used < 1 ? 1 : (used > 4 ? 4 : used);
+    uint64_t k = (uint64_t)(unsigned)n << 32;
+    for (int i = 0; i < n; i++) k |= (uint64_t)(unsigned char)p[i] << (i * 8);
+    return k;
+}
+static UndrawableTally undrawableTallyUnseen(const std::string& utf8Name,
+                                             std::vector<uint64_t>& seen) {
     UndrawableTally t;
     ImFont* f = bakedFont();
     if (!f) return t;                  // nothing baked: nothing to claim
@@ -247,6 +300,15 @@ static UndrawableTally undrawableTally(const std::string& utf8Name) {
         unsigned int cp = 0;
         const int used = ImTextCharFromUtf8(&cp, p, e);
         if (used <= 0) break;                 // only at a NUL or the end
+        // ONE UNIT, COUNTED ONCE for this row - the whole of the note above.
+        // Before the classification and not inside it, so no single cause can
+        // be given a counting rule of its own by accident.
+        const uint64_t key = undrawableUnitKey(p, used);
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            p += used;
+            continue;
+        }
+        seen.push_back(key);
         // A DECODE THAT FAILED is a lost character EVEN WHERE THE FONT HAS A
         // GLYPH for what came out of it, and this is the case the Ubuntu runner
         // caught. ImTextCharFromUtf8 answers U+FFFD REPLACEMENT CHARACTER for
@@ -320,6 +382,11 @@ static UndrawableTally undrawableTally(const std::string& utf8Name) {
     }
     return t;
 }
+// ONE string on its own, with nothing counted before it.
+static UndrawableTally undrawableTally(const std::string& utf8Name) {
+    std::vector<uint64_t> seen;
+    return undrawableTallyUnseen(utf8Name, seen);
+}
 static int undrawableCount(const std::string& utf8Name) {
     return undrawableTally(utf8Name).total();
 }
@@ -373,45 +440,51 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
 //
 // The label is passed in because only the caller knows it: the tooltip has
 // ImGui's "name##id" string, the Messages sweep has the stack's name.
-// THE PIECES MUST BE DISJOINT, and the first version of this list was not:
-// `d.name` is normally the LAST COMPONENT of `d.src->path`, so adding both
-// counted the file's own name twice and the sentence said "2 character(s) here
-// draw as '?'" about one bad character. Deduplicating whole strings did not
-// help, because "frame.npy" and "C:/data/frame.npy" are different strings that
-// overlap.
+// THE PIECES DO NOT HAVE TO BE DISJOINT, and TRYING TO MAKE THEM SO IS THE
+// MISTAKE THIS LIST MADE TWICE (review round 5).
 //
-// WHICH ONE TO KEEP: both. The path is SPLIT at its last separator, so the
-// directory part and the leaf are two pieces that share no character and whose
-// concatenation is the whole path. Every character the tooltip shows is
-// therefore counted exactly once, and the leaf then deduplicates against the
-// row's label and against d.name when those are the same string - which is the
-// ordinary case. Dropping the directory instead would have been simpler and
-// wrong: a folder called C:/測定/ is on screen in the tooltip's first line, and
-// a '?' there is exactly as confusing as one in the file name.
+// The first version added both `d.name` and the whole path and counted the
+// file's own name twice. The second split the path at its last separator so
+// that the directory part and the leaf shared no character, and deduplicated
+// whole strings for the rest - which is reasoning about the instances in front
+// of it, and the instances did not run out: `d.name` is a strict SUPERSTRING
+// of the leaf for an npz member, a remote frame, a decorated preview or stale
+// row, a series member and a stack name, and whole-string dedup sees none of
+// those. "試験.npz:温度" said 8 about 4 characters.
+//
+// So this list is now just THE STRINGS THIS ROW CAN SHOW, in full, overlapping
+// however they like. What makes the count right is one level down, in
+// undrawableTallyUnseen(): the unit is counted once per row whatever string it
+// came in. Add a new string here freely - that is the whole point of the
+// change - and note that nothing here needs to know how the strings relate.
+//
+// The whole path is one piece, not two. The directory part is on screen in the
+// tooltip's first line (a folder called C:/測定/ with a '?' in it is exactly
+// as confusing as a file name with one), and keeping it whole is now free.
 static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
                                                  const ImageDoc& d) {
     std::vector<std::string> out;
     auto add = [&](const std::string& v) {
         if (v.empty()) return;
-        if (std::find(out.begin(), out.end(), v) != out.end()) return;  // not twice
+        // A cheap short-circuit, and NOT what makes the count right: equal
+        // strings are the ordinary case and decoding one twice is waste. The
+        // count would be the same with this line deleted.
+        if (std::find(out.begin(), out.end(), v) != out.end()) return;
         out.push_back(v);
     };
     add(shownLabel);          // what is drawn ON the row
     add(d.name);              // the document's own name
-    // The tooltip's first line, in full, as TWO disjoint halves.
-    const std::string& p = d.src->path;
-    if (const size_t cut = p.find_last_of("/\\"); cut == std::string::npos) {
-        add(p);                             // no separator: it is all leaf
-    } else {
-        add(p.substr(0, cut + 1));          // "C:/data/"  - the separator rides here
-        add(p.substr(cut + 1));             // "frame.npy" - deduped above if repeated
-    }
+    add(d.src->path);         // the tooltip's first line, in full
     add(d.src->member);       // ...and the npz member, where there is one
     return out;
 }
+// ONE set of characters over ALL the pieces: `seen` is shared, so a character
+// in two of them is one character. This is the line that closes the npz,
+// remote-frame, stack-name and decorated-label shapes at once.
 static UndrawableTally undrawableTallyOf(const std::vector<std::string>& pieces) {
     UndrawableTally t;
-    for (const std::string& v : pieces) t += undrawableTally(v);
+    std::vector<uint64_t> seen;
+    for (const std::string& v : pieces) t += undrawableTallyUnseen(v, seen);
     return t;
 }
 
@@ -542,10 +615,21 @@ static void undrawableReportNewDocs() {
             app.wakeFrames = std::max(app.wakeFrames, 2);
             continue;
         }
-        // The rows worth a line at all, and not yet said.
+        // The rows worth a line at all, and not yet said - and, counted at the
+        // same time and in the same place, HOW MANY ROWS THIS OPEN ADDED. The
+        // summary below is a sentence about rows "just opened", and the only
+        // set that matches those words is the one this loop is already walking
+        // past: the rows of this batch that saidKey has not seen. `gs` is not
+        // it - it is built from every row in app.images carrying this batchId
+        // (see the loop above), and batchReuse() hands back an existing batch
+        // id when the same folder is opened again, so `gs` can hold rows from
+        // several gestures. Using gs.size() said "6 of 400" on a second open of
+        // a big folder, which is the thing the P3 before it asked to avoid.
         std::vector<const Group*> hits;
+        int justOpened = 0;
         for (const Group& g : gs) {
             if (saidKey.count(g.key)) continue;
+            justOpened++;
             const bool own = g.rep &&
                 undrawableTallyOf(undrawablePieces(g.name, *g.rep)).total() > 0;
             if (own || g.affected > 0) hits.push_back(&g);
@@ -560,17 +644,17 @@ static void undrawableReportNewDocs() {
         // a hundred loose files picked at once - so that the cap holds whatever
         // the shape of the open was.
         if (hits.size() > 5) {
-            // `gs` IS THIS OPEN, not the batch. batchReuse() hands back an
-            // existing batch id when the same folder is opened again, so the
-            // batch can hold rows from several gestures - but `gs` was built
-            // only from rows not yet reported, which is what "just opened"
-            // means. Counting app.images or the batch's size here would have
-            // said "6 of 400" after a second open of a big folder (review P3).
+            // THE DENOMINATOR IS `justOpened`, built two loops up by the same
+            // `saidKey.count(g.key)` test that decides what may be reported at
+            // all - so the number and the words "just opened" name one set, and
+            // hits.size() <= justOpened holds by construction. Neither
+            // app.images.size() nor gs.size() is that set; both include rows
+            // from earlier opens of the same folder (review round 5 P2).
             char b[192];
             snprintf(b, sizeof b, "%d of the %d item(s) just opened have "
                                   "characters that draw as '?' - hover a row to "
                                   "see which, and why.",
-                     (int)hits.size(), (int)gs.size());
+                     (int)hits.size(), justOpened);
             logMsg(b, true);
             continue;
         }
@@ -1411,8 +1495,10 @@ static void drawFileList() {
                 // And `tip` never contained the one string the review asked
                 // for: a stack row DRAWS the stack's name, which is in `label`
                 // and not in the tooltip's body at all (review P2-7). The list
-                // names each piece once, so the stack name is counted, the full
-                // path is counted (review P3-12), and nothing is counted twice.
+                // names every string the row can show, so the stack name is
+                // counted and the full path is counted (review P3-12); that no
+                // CHARACTER is counted twice is undrawableTallyUnseen()'s job
+                // and not this list's - see the note on the unit there.
                 {
                     // The row's own label, with ImGui's "##id" suffix and the
                     // leading indent removed - what is left is what a reader
@@ -1424,8 +1510,8 @@ static void drawFileList() {
                     while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
                     // CACHED PER ROW. undrawableNote() has a cache but this
                     // path no longer goes through it, so every row was decoding
-                    // its label, its name and both halves of its path on every
-                    // frame - the cost review P3-11 removed, back again by a
+                    // its label, its name, its path and its member name on
+                    // every frame - the cost review P3-11 removed, back by a
                     // different door (review P3). Keyed on the pieces
                     // themselves, because that is exactly what the answer
                     // depends on; the atlas cannot change after start-up.

@@ -1234,6 +1234,16 @@ int main(int argc, char** argv) {
     // replaces this.
     const std::vector<std::string> crumb = fontBakeCrumbRead();
     g_fontChoice = jpFontChoice(g_settingsFontPath, crumb);
+    // READ, ACTED ON, CONSUMED - in that order and in one place (review round
+    // 5 P2). `crumb` is what the rest of this start reasons from (the choice
+    // above, cjkMergeFontPath below, and the fifth font message), so the lines
+    // on disk have done their whole job the moment the choice is made, and a
+    // start that skipped EVERY candidate must drop them exactly like one that
+    // skipped a single file - or the font it skipped is skipped for ever. This
+    // used to be done inside fontBakeCrumbWrite(), which is skipped entirely
+    // when there is nothing left to bake; see the comment on
+    // fontBakeCrumbConsume().
+    fontBakeCrumbConsume();
     const std::string fontPath = g_fontChoice.path;
     static ImVector<ImWchar> fontRanges;
     cjkFontRanges(io.Fonts, fontRanges);
