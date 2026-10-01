@@ -891,6 +891,31 @@ static std::string rbElideMiddle(const std::string& s, float maxW) {
     return build(lo);
 }
 
+// ...and the same binary search cutting the TAIL instead of the middle, for the
+// poll mark. Middle-out is right for the status line because both of its ends
+// carry a fact (the machine at the head, the counts at the tail); the mark's
+// facts are all at the head - "auto-refresh: off", "every 3 s" - and what
+// follows is the detail, so narrowing drops the detail and keeps the verdict.
+static std::string rbElideTail(const std::string& s, float maxW) {
+    if (s.empty()) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    if (ImGui::CalcTextSize("...").x > maxW) return std::string();
+    auto onBoundary = [&s](size_t i) {         // never cut a UTF-8 sequence
+        return i == 0 || i >= s.size() || (s[i] & 0xC0) != 0x80;
+    };
+    auto build = [&](size_t keep) {
+        while (keep > 0 && !onBoundary(keep)) keep--;
+        return s.substr(0, keep) + "...";
+    };
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (ImGui::CalcTextSize(build(mid).c_str()).x <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    return build(lo);
+}
+
 void drawPanelRemote(App::BrowseInstance& I) {
     App::RemoteBrowse& B = I.b;
     // watch-design §2, second row: THIS INSTANCE IS BEING DRAWN, and that is the
@@ -1529,7 +1554,14 @@ void drawPanelRemote(App::BrowseInstance& I) {
         //
         // Off while Watch itself is off, and it SAYS so rather than sitting
         // there looking armed: the poll is what opens anything, and there is no
-        // poll without Watch (rbPollDue's first line).
+        // poll without Watch (rbPollStateNow's first line).
+        //
+        // This item being disabled was for a long time the ONLY thing on screen
+        // that admitted Watch was off, and it is behind a click - which is what
+        // §19 and the 2026-09-29 report were about. The sentence now lives at
+        // the right end of the status line, where a glance reaches it; this
+        // stays because a disabled item with a reason on it is still the right
+        // shape for a verb that cannot work.
         if (!app.watchEnabled) ImGui::BeginDisabled();
         if (ImGui::MenuItem("Watch: open new stacks", nullptr, I.watchOpenNew)) {
             I.watchOpenNew = !I.watchOpenNew;
@@ -1553,9 +1585,20 @@ void drawPanelRemote(App::BrowseInstance& I) {
                       "and its right-click menu runs it.\n\n"
                       "It follows the poll, so it stops while this panel is not\n"
                       "being drawn."
-                    : "Needs File > Watch > \"Watch source files on disk\":\n"
+                    // The second sentence POINTS somewhere, so it is said only
+                    // when that somewhere exists. This menu is drawn on the
+                    // toolbar, which is above the search-results view's own
+                    // return - so during a search the status line the sentence
+                    // named is not on screen at all, and the review caught it
+                    // pointing at a row that was not there.
+                    : I.search.active
+                    ? "Needs File > \"Watch source files on disk\":\n"
                       "nothing polls this folder while that is off, so there is\n"
-                      "nothing for this to notice.");
+                      "nothing for this to notice."
+                    : "Needs File > \"Watch source files on disk\":\n"
+                      "nothing polls this folder while that is off, so there is\n"
+                      "nothing for this to notice. The status line at the bottom\n"
+                      "of this panel says the same thing without opening a menu.");
         if (!app.watchEnabled) ImGui::EndDisabled();
         ImGui::Separator();
         // Radio pairs, not toggles: the state is visible without clicking.
@@ -2807,7 +2850,12 @@ void drawPanelRemote(App::BrowseInstance& I) {
         // will open a stack nobody asked for is stated NOWHERE ELSE on screen.
         // The count is there because "3 opened" is what makes the claim checkable
         // afterwards; it is left off at zero, like the selection count above.
-        if (I.watchOpenNew && app.watchEnabled) {
+        // `watchPaused` is in the condition for the reason the review found:
+        // without it this clause promised "opening new stacks" on the same row
+        // as a mark saying the poll is stopped, and the poll is what opens
+        // anything. The three terms are rbPollStateNow's first three, which is
+        // what "this panel will open a stack" actually depends on.
+        if (I.watchOpenNew && app.watchEnabled && !app.watchPaused) {
             line += DOT;
             line += "opening new stacks";
             if (I.openNewOpened > 0) {
@@ -2830,15 +2878,42 @@ void drawPanelRemote(App::BrowseInstance& I) {
             warn = true;
         }
         I.toolbar.statusFull = line;
+        // ---- watch-design §19: DOES THIS LISTING REFRESH ITSELF -------------
+        // At the right end of this same row, and that is the whole of the
+        // ruling's "no new rows": the 2026-09-28 report was that a reload put
+        // rows in, #275 folded them away, and a band or a line saying "watching"
+        // would have put one straight back.
+        //
+        // Its OWN item and not another clause of `line`, because it is the one
+        // thing on this row that has to carry a tooltip of its own - the line's
+        // tooltip is the untruncated line plus the way to the failure text, and
+        // §19's second and third clauses (what the feature is, and how it
+        // differs from an open stack's reload) belong to this mark and nowhere
+        // else. Right-aligned so it does not move when the counts change.
+        //
+        // The clock is `I.pollClock`, left here by the pump that owns it: this
+        // TU has no clock, and the reason a second nowSec() would be worse than
+        // none is written on that field.
+        const std::string pollSaid = rbPollStateText(I, I.pollClock, app.uiFrame);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        // The COUNTS keep the row. At 300 px the sentence would push the item
+        // count off the left edge, so the mark is elided first and its tooltip
+        // carries the whole of it - the counts are what a glance is for, and
+        // this is what a question is for.
+        std::string markShown =
+            pollSaid.empty() ? std::string() : rbElideTail(pollSaid, avail * 0.55f);
+        const float markW =
+            markShown.empty() ? 0.0f : ImGui::CalcTextSize(markShown.c_str()).x + gap;
         // One row, always - the line elides, it does not wrap (300 px is a width
         // this panel has to work at, and a status line that becomes two lines is
         // another moving row).
-        const float avail = ImGui::GetContentRegionAvail().x;
-        float textW = avail;
+        float textW = avail - markW;
         std::string shownLine = rbElideMiddle(line, textW);
         I.toolbar.statusText  = shownLine;
         I.toolbar.statusAvailW = textW;
         I.toolbar.statusTextW  = ImGui::CalcTextSize(shownLine.c_str()).x;
+        const float lineX0 = ImGui::GetCursorPosX();
         if (warn) ImGui::PushStyleColor(ImGuiCol_Text, AB_AMBER);
         else      ImGui::PushStyleColor(ImGuiCol_Text,
                                         ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -2852,6 +2927,17 @@ void drawPanelRemote(App::BrowseInstance& I) {
                               B.err.empty() ? "" : "\n\nclick for the full failure text");
             if (!B.err.empty() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 app.showRemoteError = true;
+        }
+        if (!markShown.empty()) {
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorPosX(lineX0 + avail - markW + gap);
+            ImGui::TextDisabled("%s", markShown.c_str());
+            if (ImGui::IsItemHovered())
+                // §19's clauses 2 and 3, worded in nav.cpp beside the state it
+                // describes: it quotes two menu labels and two intervals, and a
+                // claim that lives inside a draw call is one no test can hold.
+                ImGui::SetTooltip("%s",
+                                  rbPollTipText(I, I.pollClock, app.uiFrame).c_str());
         }
     }
     if (rbPropsOpen) { ImGui::OpenPopup("Remote properties"); rbPropsOpen = false; }

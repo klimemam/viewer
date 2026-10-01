@@ -2157,6 +2157,274 @@
                 closeAll();
                 settle();
             }
+            {   // ---- B9: watch-design §19 - the panel SAYS whether this
+                // listing refreshes itself, and NAMES the gate when it does not.
+                //
+                // The 2026-09-29 report was 「以前あったフォルダ監視がなくなった?
+                // F5 おさないと更新されなくなった」 and every gate above was
+                // exactly where it had been. What was missing was the sentence:
+                // a listing that re-reads itself and one that does not look
+                // identical, so "is this broken, is it my setting, or did it
+                // never exist" could not be answered from the screen.
+                //
+                // WHAT THIS BLOCK MAY CLAIM (the 2026-09-30 review's ruling).
+                // Five of the eight states reach the status line; three cannot,
+                // because drawPanelRemote has already returned before that row
+                // exists - `if (!B.connected)` draws the empty state and
+                // returns, `if (I.search.active)` draws the results view and
+                // returns, and a panel that is not drawn was never called. For
+                // those three the assertion is that the state has NO SURFACE
+                // (rbPollStateText answers empty), never that a sentence
+                // appears; a string a test can assert and a reader can never
+                // see is exactly the shape §19.3 exists to forbid, and it had
+                // grown here in three states before the review took it out.
+                //
+                // BORROWED STATE, given back at the single exit below. The one
+                // that matters is `app.watchEnabled`: it is the prefs key
+                // `watchfiles`, so a run that left it false would turn Watch
+                // off for every later test in that home and for the user whose
+                // home it is (settings.inc's a9b7973 is the recorded case).
+                const bool wasOn = app.watchEnabled;
+                const bool wasPaused = app.watchPaused;
+                const bool wasSearch = I.search.active;
+                const bool wasConn = I.b.connected;
+                const bool wasPending = I.pollPending;
+                const double wasEvery = app.browseWatchIntervalSec;
+                const double wasPolledAt = I.polledAt;
+                const uint64_t wasDrawn = I.drawnFrame;
+                const std::string wasHost = I.b.host;
+                settle();                     // nothing in flight: Working is a state
+                                              // this block SETS, never one it inherits
+                // The states, as a TABLE, because B9, B9c and B9d must all be
+                // about the same eight: each case shuts exactly one gate and the
+                // last shuts none. All eight of RbPollState are here - a state
+                // left out of the table is a gate nothing holds.
+                enum { N_CASE = 8 };
+                auto setCase = [&](int c) {
+                    app.watchEnabled = true;
+                    app.watchPaused = false;
+                    I.b.connected = true;
+                    I.search.active = false;
+                    I.drawnFrame = FR;
+                    I.pollPending = false;
+                    I.polledAt = clk - 99.0;  // long overdue: the clock is not the gate
+                    switch (c) {
+                        case 0: app.watchEnabled = false; break;   // gate 1
+                        case 1: app.watchPaused = true;   break;   // gate 1b
+                        case 2: I.b.connected = false;    break;   // gate 2
+                        case 3: I.search.active = true;   break;   // gate 3
+                        case 4: I.drawnFrame = FR - 2;    break;   // gate 4
+                        case 5: I.polledAt = 0;           break;   // gate 7a: arming
+                        case 6: I.pollPending = true;     break;   // gates 5/6
+                        default: break;                            // 7: nothing shut
+                    }
+                };
+                // What each one has to SAY, or "" for the three that have no
+                // surface to say it on. Case 0 names the menu item that owns
+                // the switch - "auto-refresh is off" without a way to turn it
+                // on is the defect one layer up, and B9d checks that the name
+                // it gives is the one menus.inc actually draws. Case 7 is the
+                // running sentence, and " ago" is its signature: it is the only
+                // state with an AGE, because it is the only one in which a
+                // round has happened.
+                const char* WANT[N_CASE] = {
+                    "File > \"Watch source files on disk\"",   // 0 WatchOff
+                    "suppressed for this run",                 // 1 Paused
+                    "", "", "",                                // 2/3/4 no surface
+                    "starting",                                // 5 Arming
+                    "skipped while busy",                      // 6 Working
+                    " ago",                                    // 7 On
+                };
+                clk += 100.0;
+                bool named = true;
+                std::vector<std::string> said;
+                for (int c = 0; c < N_CASE; c++) {
+                    setCase(c);
+                    const std::string t = rbPollStateText(I, clk, FR);
+                    said.push_back(t);
+                    // NEGATIVE TERMS, not just `contains` (the review's #11):
+                    // the sentence has to be empty exactly when the state has
+                    // no surface, and " ago" - the mark of a round having
+                    // happened - may appear in the running state and nowhere
+                    // else. `contains` alone passes for a function that returns
+                    // one long string naming every gate at once.
+                    const bool want = WANT[c][0] != '\0';
+                    const bool hit = want ? (!t.empty() && t.find(WANT[c]) != std::string::npos)
+                                          : t.empty();
+                    const bool ago = t.find(" ago") != std::string::npos;
+                    if (!hit || ago != (c == N_CASE - 1)) named = false;
+                    fprintf(stderr, "browseselftest: B9 state %d -> \"%s\" (wants %s%s%s, "
+                                    "age=%d): %s\n", c, t.c_str(),
+                            want ? "\"" : "", want ? WANT[c] : "NO SURFACE", want ? "\"" : "",
+                            ago ? 1 : 0,
+                            (hit && ago == (c == N_CASE - 1)) ? "ok" : "FAIL");
+                }
+                // ...and no two of the five sentences are the same sentence. A
+                // switch that fell through would otherwise name one gate for
+                // two states and B9's `contains` would never notice.
+                bool distinct = true;
+                for (size_t a = 0; a < said.size(); a++)
+                    for (size_t b = a + 1; b < said.size(); b++)
+                        if (!said[a].empty() && said[a] == said[b]) distinct = false;
+                check(named && distinct,
+                      "B9 five states name their own gate; three have NO SURFACE and say so");
+                {   // ---- B9b: the interval comes from the CONSTANT ------------
+                    // Move it and the sentence moves. Without this, a "3 s"
+                    // typed into the string passes B9 for as long as the
+                    // constant happens to be 3 - and then lies for ever.
+                    setCase(N_CASE - 1);
+                    const std::string t3 = rbPollStateText(I, clk, FR);
+                    app.browseWatchIntervalSec = 7.0;
+                    const std::string t7 = rbPollStateText(I, clk, FR);
+                    app.browseWatchIntervalSec = wasEvery;
+                    const bool moved =
+                        t3.find("every 3 s") != std::string::npos &&
+                        t3.find("every 7 s") == std::string::npos &&
+                        t7.find("every 7 s") != std::string::npos &&
+                        t7.find("every 3 s") == std::string::npos;
+                    // ...and the AGE is a FIXED-WIDTH field, which is not a
+                    // nicety: this mark sets the width the status line elides
+                    // into, so an age that grew a character moved the line's
+                    // "..." under the reader's eye once a second - #275's
+                    // 「目の下で動く」, in the panel that closed it. Two digits,
+                    // zero-padded, 99 the ceiling.
+                    setCase(N_CASE - 1);
+                    I.polledAt = clk - 2.0;
+                    const std::string a2 = rbPollStateText(I, clk, FR);
+                    I.polledAt = clk - 37.0;
+                    const std::string a37 = rbPollStateText(I, clk, FR);
+                    I.polledAt = clk - 4000.0;
+                    const std::string aBig = rbPollStateText(I, clk, FR);
+                    I.polledAt = clk - 99.0;
+                    const bool widths =
+                        a2.find("last 02 s ago") != std::string::npos &&
+                        a37.find("last 37 s ago") != std::string::npos &&
+                        a2.size() == a37.size() &&
+                        aBig.find("last 99+ s ago") != std::string::npos;
+                    fprintf(stderr, "browseselftest: B9b 3 s -> \"%s\"; the constant at 7 s "
+                                    "-> \"%s\"; ages 2/37/4000 -> \"%s\" / \"%s\" / \"%s\" "
+                                    "(same width=%d): %s\n", t3.c_str(), t7.c_str(),
+                            a2.c_str(), a37.c_str(), aBig.c_str(),
+                            a2.size() == a37.size() ? 1 : 0,
+                            (moved && widths) ? "ok" : "FAIL");
+                    check(moved && widths,
+                          "B9b the interval IS browseWatchInterval, and the age is a "
+                          "fixed-width field");
+                }
+                {   // ---- B9c: THE LOAD-BEARING ONE ---------------------------
+                    // The sentence and the decision may not disagree. All eight
+                    // states, and in every one of them the clock is left LONG
+                    // OVERDUE - so "the sentence says a round is happening" and
+                    // "rbPollDue says a round is due" are the same claim and
+                    // agreement is an equality, not an implication. A panel that
+                    // transcribed the gates into words would pass B9 and fail
+                    // here the first time one of them moved.
+                    bool agree = true;
+                    for (int c = 0; c < N_CASE; c++) {
+                        setCase(c);
+                        const std::string t = rbPollStateText(I, clk, FR);
+                        const bool saysRunning = t.find(" ago") != std::string::npos;
+                        const bool due = rbPollDue(I, clk, FR);
+                        if (saysRunning != due) agree = false;
+                        fprintf(stderr, "browseselftest: B9c state %d: says running=%d, "
+                                        "rbPollDue=%d: %s\n", c, saysRunning ? 1 : 0,
+                                due ? 1 : 0, saysRunning == due ? "ok" : "FAIL");
+                    }
+                    // ANTI-VACUITY: "nothing is ever running" agrees with
+                    // "nothing is ever due" in all eight. The last must be BOTH.
+                    setCase(N_CASE - 1);
+                    const bool live = rbPollDue(I, clk, FR) &&
+                                      rbPollStateText(I, clk, FR).find(" ago") !=
+                                          std::string::npos;
+                    check(agree && live,
+                          "B9c the sentence and rbPollDue cannot disagree (one set of gates)");
+                }
+                {   // ---- B9d: the tooltip's CLAIMS, against their sources -----
+                    // Two menu labels and two intervals. The labels are the
+                    // reason this defect existed at all: the panel's own menu
+                    // had been telling people to go to "File > Watch > ..." for
+                    // months, a path that does not exist, and nothing noticed
+                    // because a string in a draw call is a string nobody can
+                    // reach. So every `File > "..."` this feature quotes is
+                    // pulled back out of the text and looked up in menus.inc -
+                    // rename the item there and this fails, with the name.
+                    setCase(N_CASE - 1);
+                    const std::string tip = rbPollTipText(I, clk, FR);
+                    std::vector<std::string> labels;
+                    for (size_t p = tip.find("File > \""); p != std::string::npos;
+                         p = tip.find("File > \"", p + 1)) {
+                        const size_t a = p + 8, b = tip.find('"', a);
+                        if (b != std::string::npos) labels.push_back(tip.substr(a, b - a));
+                    }
+                    // menus.inc, from the source tree. The fixture path this
+                    // test was handed is relative to the same working
+                    // directory, so if that resolved this resolves; the second
+                    // form is the belt for a run started from somewhere else.
+                    auto slurp = [](const std::string& p, std::string& out) {
+                        std::ifstream f(pathFromUtf8(p), std::ios::binary);
+                        if (!f) return false;
+                        out.assign(std::istreambuf_iterator<char>(f),
+                                   std::istreambuf_iterator<char>());
+                        return !out.empty();
+                    };
+                    std::string menus;
+                    bool haveMenus = slurp("core/ui/menus.inc", menus) ||
+                                     slurp(dir + "/../../core/ui/menus.inc", menus) ||
+                                     slurp(dir + "/../../../core/ui/menus.inc", menus);
+                    bool found = haveMenus && labels.size() >= 2;
+                    for (const std::string& L : labels) {
+                        const bool in = haveMenus && menus.find(L) != std::string::npos;
+                        if (!in) found = false;
+                        fprintf(stderr, "browseselftest: B9d tooltip says File > \"%s\" -> "
+                                        "in menus.inc: %s\n", L.c_str(), in ? "ok" : "FAIL");
+                    }
+                    if (!haveMenus)
+                        fprintf(stderr, "browseselftest: B9d could not read core/ui/menus.inc "
+                                        "(cwd is not the source tree?) - the contract is "
+                                        "UNCHECKED, which counts as a failure\n");
+                    check(found, "B9d every menu item the tooltip names exists in menus.inc");
+                    // ...and the intervals. THIS panel's first: the mark beside
+                    // the tooltip says "every 12 s" on a peer's panel, so a
+                    // tooltip that opened with the local 3 s would be two
+                    // numbers for one fact (the review asked for exactly this).
+                    const std::string tipHere = rbPollTipText(I, clk, FR);
+                    I.b.host = "peer-under-test";          // a PEER's panel, for one call
+                    const std::string sayPeer = rbPollStateText(I, clk, FR);
+                    const std::string tipPeer = rbPollTipText(I, clk, FR);
+                    I.b.host = wasHost;
+                    app.browseWatchIntervalSec = 7.0;      // ...and both come from the constant
+                    const std::string tip7 = rbPollTipText(I, clk, FR);
+                    app.browseWatchIntervalSec = wasEvery;
+                    const bool peerOk =
+                        sayPeer.find("every 12 s") != std::string::npos &&
+                        tipPeer.find("re-reads the folder it is showing\nevery 12 s")
+                            != std::string::npos &&
+                        tipPeer.find("every 3 s") != std::string::npos &&
+                        tipHere.find("re-reads the folder it is showing\nevery 3 s")
+                            != std::string::npos &&
+                        tip7.find("every 7 s") != std::string::npos &&
+                        tip7.find("every 3 s") == std::string::npos;
+                    fprintf(stderr, "browseselftest: B9d peer mark \"%s\"; tip opens local=%d "
+                                    "peer=%d; constant at 7 s moves the tip=%d: %s\n",
+                            sayPeer.c_str(),
+                            tipHere.find("every 3 s") != std::string::npos ? 1 : 0,
+                            tipPeer.find("every 12 s") != std::string::npos ? 1 : 0,
+                            tip7.find("every 7 s") != std::string::npos ? 1 : 0,
+                            peerOk ? "ok" : "FAIL");
+                    check(peerOk, "B9d the tooltip opens with THIS panel's interval, both "
+                                  "read off the constants");
+                }
+                app.watchEnabled = wasOn;     // the user's prefs (`watchfiles`), back
+                app.watchPaused = wasPaused;
+                I.search.active = wasSearch;
+                I.b.connected = wasConn;
+                I.pollPending = wasPending;
+                I.b.host = wasHost;
+                app.browseWatchIntervalSec = wasEvery;
+                I.polledAt = wasPolledAt;     // as found, not as guessed
+                I.drawnFrame = wasDrawn;
+                settle();
+            }
             I.cursor = -1;
             I.cursorKey.clear();
             I.sel.clear();
