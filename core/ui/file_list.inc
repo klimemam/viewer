@@ -337,6 +337,41 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
     }
     return s;
 }
+// ---- WHICH STRINGS A ROW SHOWS, in ONE place (review: sweep the shape) -----
+// Found by sweeping "a caller counts a different set of strings from the other
+// callers": the tooltip had been moved to an explicit list while the Messages
+// sweep still counted only the row's name, so a row whose PATH carried
+// undrawable characters got a tooltip note and no Messages line - the two
+// surfaces saying different things about the same row, which is the state this
+// list exists to prevent. Both callers now build their pieces here.
+//
+// The label is passed in because only the caller knows it: the tooltip has
+// ImGui's "name##id" string, the Messages sweep has the stack's name.
+static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
+                                                 const ImageDoc& d) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& v) {
+        if (v.empty()) return;
+        if (std::find(out.begin(), out.end(), v) != out.end()) return;  // not twice
+        out.push_back(v);
+    };
+    add(shownLabel);          // what is drawn ON the row
+    add(d.name);              // the document's own name
+    add(d.src->path);         // the tooltip's first line, in full
+    add(d.src->member);       // ...and the npz member, where there is one
+    return out;
+}
+static UndrawableTally undrawableTallyOf(const std::vector<std::string>& pieces) {
+    UndrawableTally t;
+    for (const std::string& v : pieces) {
+        const UndrawableTally one = undrawableTally(v);
+        t.noGlyph += one.noGlyph;
+        t.tooHigh += one.tooHigh;
+        t.badBytes += one.badBytes;
+    }
+    return t;
+}
+
 // ...and the same sentence for ONE string. Cached because the atlas cannot
 // change after start-up and the Files panel asks this for every row on every
 // frame (review P3-11).
@@ -428,6 +463,7 @@ static void undrawableReportNewDocs() {
     struct Group {
         std::string key, name;
         int seqId = 0, members = 0, affected = 0;
+        const ImageDoc* rep = nullptr;    // for undrawablePieces(), as the row draws it
     };
     std::unordered_map<int, std::vector<Group>> byBatch;   // batchId -> its rows
     std::unordered_map<int, int> nowSize;
@@ -443,12 +479,12 @@ static void undrawableReportNewDocs() {
         std::vector<Group>& gs = byBatch[d->batchId];
         Group* g = nullptr;
         for (Group& q : gs) if (q.key == key) { g = &q; break; }
-        if (!g) { gs.push_back({ key, shown, d->seqId, 0, 0 }); g = &gs.back(); }
+        if (!g) { gs.push_back({ key, shown, d->seqId, 0, 0, d.get() }); g = &gs.back(); }
         g->members++;
-        // A FRAME's own name, which is what that frame's tooltip will show.
-        // Counted separately from the row's name: the two are different
-        // strings and only one of them is on the row.
-        if (undrawableCount(d->name) > 0) g->affected++;
+        // A FRAME's own strings, which is what that frame's tooltip will show -
+        // the same list, so a frame the tooltip reports is a frame this counts.
+        if (undrawableTallyOf(undrawablePieces(std::string(), *d)).total() > 0)
+            g->affected++;
     }
     for (auto& [batchId, gs] : byBatch) {
         // Still growing? Wait one more sweep, so the count is the final one and
@@ -467,7 +503,9 @@ static void undrawableReportNewDocs() {
         std::vector<const Group*> hits;
         for (const Group& g : gs) {
             if (saidKey.count(g.key)) continue;
-            if (!undrawableNote(g.name).empty() || g.affected > 0) hits.push_back(&g);
+            const bool own = g.rep &&
+                undrawableTallyOf(undrawablePieces(g.name, *g.rep)).total() > 0;
+            if (own || g.affected > 0) hits.push_back(&g);
         }
         // Every row in this batch is accounted for now, said or not - otherwise
         // the clean ones would be re-examined on every later sweep of a batch
@@ -489,7 +527,9 @@ static void undrawableReportNewDocs() {
         }
         for (const Group* g : hits) {
             std::string line = g->name + ": ";
-            const std::string own = undrawableNote(g->name);
+            const std::string own = g->rep
+                ? undrawableNoteOf(undrawableTallyOf(undrawablePieces(g->name, *g->rep)))
+                : undrawableNote(g->name);
             if (!own.empty()) line += own;
             // The MEMBER clause, for a stack whose frames carry it too (or
             // instead). Its own numbers, because they are about other strings.
@@ -1325,29 +1365,16 @@ static void drawFileList() {
                 // names each piece once, so the stack name is counted, the full
                 // path is counted (review P3-12), and nothing is counted twice.
                 {
-                    UndrawableTally rowT;
                     // The row's own label, with ImGui's "##id" suffix and the
                     // leading indent removed - what is left is what a reader
-                    // sees on the row.
+                    // sees on the row. The pieces themselves come from
+                    // undrawablePieces(), which the Messages sweep also uses.
                     std::string shown = label ? label : "";
                     if (const size_t h = shown.find("##"); h != std::string::npos)
                         shown.resize(h);
                     while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
-                    // Deduplicated: on a loose row the label IS d.name, and on
-                    // a stack row the path's leaf usually is too. Counting a
-                    // string twice would double the number in the sentence.
-                    std::vector<std::string> pieces;
-                    for (const std::string& piece : { shown, d.name, d.src->path,
-                                                      d.src->member }) {
-                        if (piece.empty()) continue;
-                        if (std::find(pieces.begin(), pieces.end(), piece) != pieces.end())
-                            continue;
-                        pieces.push_back(piece);
-                        const UndrawableTally one = undrawableTally(piece);
-                        rowT.noGlyph += one.noGlyph;
-                        rowT.tooHigh += one.tooHigh;
-                        rowT.badBytes += one.badBytes;
-                    }
+                    const UndrawableTally rowT =
+                        undrawableTallyOf(undrawablePieces(shown, d));
                     if (std::string ud = undrawableNoteOf(rowT); !ud.empty())
                         tip += "\n\n" + ud;
                 }

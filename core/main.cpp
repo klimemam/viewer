@@ -1245,7 +1245,7 @@ int main(int argc, char** argv) {
     {
         std::vector<std::string> about;
         if (!fontPath.empty()) about.push_back(fontPath);
-        if (const std::string m = cjkMergeFontPath(fontPath); !m.empty())
+        if (const std::string m = cjkMergeFontPath(fontPath, crumb); !m.empty())
             about.push_back(m);
         fontBakeCrumbWrite(about);
     }
@@ -1270,7 +1270,7 @@ int main(int argc, char** argv) {
     // below report - either the atlas has the kana or it says which font does
     // not have them.
     std::string mergePath;
-    if (jp) mergePath = cjkMergeFontPath(fontPath);
+    if (jp) mergePath = cjkMergeFontPath(fontPath, crumb);
     if (!mergePath.empty()) {
         ImFontConfig m;
         m.MergeMode = true;

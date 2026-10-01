@@ -420,10 +420,20 @@ static std::vector<std::string> cjkMergeCandidates() {
 // ...and which one to MERGE on top of `primary`. `primary` is the face already
 // added, so a machine that had no Japanese face and fell through to a Chinese
 // one (above) does not then merge it onto itself.
-static std::string cjkMergeFontPath(const std::string& primary) {
+//
+// `skip` IS THE BREADCRUMB, and it belongs here as much as in jpFontChoice.
+// Found by sweeping the shape "a path is chosen for baking without being
+// checked against the crumb": the primary route honoured it and THIS one did
+// not, so a machine whose SECOND face was the one that killed the process
+// would have written a breadcrumb naming it, skipped nothing, and crashed
+// again at every subsequent start - the exact failure the breadcrumb exists to
+// end, surviving in the arm next to the one that was fixed.
+static std::string cjkMergeFontPath(const std::string& primary,
+                                    const std::vector<std::string>& skip = {}) {
     std::error_code ec;
     for (const std::string& m : cjkMergeCandidates()) {
         if (primary == m) continue;
+        if (std::find(skip.begin(), skip.end(), m) != skip.end()) continue;
         if (std::filesystem::is_regular_file(pathFromUtf8(m), ec) && looksLikeSfnt(m))
             return m;
     }
