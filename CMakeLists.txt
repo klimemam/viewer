@@ -1309,6 +1309,22 @@ viewer_selftest(framesize   NOGL --framesize-selftest)
 # It also covers the restore half - a 4000x3000 saved window clamped into a
 # 1920x1080 work area, with and without the window positions Wayland has none of.
 viewer_selftest(uiscale     NOGL --uiscale-selftest)
+# Japanese and Chinese filenames draw as themselves (板306, the 2026-09-29
+# report 「日本語とか中国語のファイル名が文字化けする」). Two failures with one
+# symptom, and the test keeps them apart because they can promise different
+# things: which code points this build ASKS for is pure and is therefore the
+# same on every runner, while whether a glyph got BAKED is a fact about the font
+# file on the machine - so that half runs where a CJK font exists and says by
+# name where one does not. A pass on the Ubuntu runner (no Japanese font
+# installed) is a smaller claim than a pass on a Windows desktop, and the
+# printed lines are what tell them apart.
+#
+# NOGL and fixture-free for uiscale's reasons, plus the one this test alone has:
+# its subject IS the font atlas, and the atlas is rasterised on the CPU by
+# stb_truetype - fontAtlasBake() builds it at start-up rather than leaving it to
+# the renderer, so a windowless run interrogates the very atlas a user would be
+# looking at.
+viewer_selftest(cjkfont     NOGL --cjkfont-selftest)
 # A stack written out as a LOSSLESS VIDEO (#253): the AVI container read back by
 # a RIFF parser the test writes itself, the three refusals (a preview frame, a
 # stack over AVI 1.0's 4 GB, a .mkv where no ffmpeg exists), and the claim the

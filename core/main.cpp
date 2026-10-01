@@ -797,6 +797,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // pure, and both have existed since the include block above.
 #include "selftest/uiscale.inc"
 
+// Japanese and Chinese filenames draw as themselves (板306). Here rather than
+// earlier because it needs BOTH ends of the spine: cjkFontRanges / jpFontChoice
+// from app/util.inc at the top, and undrawableCount / undrawableNote from
+// ui/file_list.inc, which is one of the last fragments in.
+#include "selftest/cjkfont.inc"
+
 // A stack out as a lossless video (#253). Here beside framesize for its reason:
 // it is a function like frameSizeSelftest(), its documents are built in memory,
 // and everything it drives - startStackVideoExport, pumpVideoExport,
@@ -1203,35 +1209,133 @@ int main(int argc, char** argv) {
             uiScalePlatformName(uiGlfwPlatform()), xs, uiScale, fontScale, uis.how);
     app.uiScale = uiScale;
     ui_theme::apply(app.themeVariant, app.themeAccent, uiScale, app.compactUi);
-    std::string fontPath = jpFontPath();
-    // The Japanese ranges plus U+2025 TWO DOT LEADER: stack names carry it
-    // (frame_000‥023.npy - see rp::patternWithExtent), and a glyph the atlas
-    // does not hold renders as a fallback '?', which is precisely the
-    // uninformative character the extent exists to remove.
+    // ---- ARMED BEFORE THE FIRST UNTRUSTED BYTE (review) --------------------
+    // This used to sit below, after the GL backends were initialised, which put
+    // it AFTER the font atlas is baked - and a font file is the first input
+    // this process reads that it did not write itself. stb_truetype cannot be
+    // made safe against a truncated one (see sfntLooksSane), so the crash it
+    // can still take has to at least leave a line behind; without this, the
+    // measured failure was exit 139 with no output and no crash record.
+    //
+    // Nothing here depends on GL or on ImGui: openCrashFile() needs
+    // autosavePath(), which needs the instance slot, and that was claimed
+    // hundreds of lines above. The handler itself only write()s.
+    openCrashFile();
+    for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
+    // WHICH font, and - if none - which paths were looked at. The override is
+    // read from settings.jsonc / prefs.txt, both of which have already loaded
+    // by the time the window is made (loadPrefs and loadSettings are hundreds
+    // of lines above), so a value typed there is in force on the very next
+    // start rather than the one after it.
+    // ...and the BREADCRUMB from the last start (review P1-A layer 2). If it is
+    // there, the last run of this program did not survive baking the fonts it
+    // names, so those files are passed over now - see fontBakeCrumbWrite below
+    // and the long comment at fontBakeCrumbPath() for why no amount of checking
+    // replaces this.
+    const std::vector<std::string> crumb = fontBakeCrumbRead();
+    g_fontChoice = jpFontChoice(g_settingsFontPath, crumb);
+    // READ, ACTED ON, CONSUMED - in that order and in one place (review round
+    // 5 P2). `crumb` is what the rest of this start reasons from (the choice
+    // above, cjkMergeFontPath below, and the fifth font message), so the lines
+    // on disk have done their whole job the moment the choice is made, and a
+    // start that skipped EVERY candidate must drop them exactly like one that
+    // skipped a single file - or the font it skipped is skipped for ever. This
+    // used to be done inside fontBakeCrumbWrite(), which is skipped entirely
+    // when there is nothing left to bake; see the comment on
+    // fontBakeCrumbConsume().
+    fontBakeCrumbConsume();
+    const std::string fontPath = g_fontChoice.path;
     static ImVector<ImWchar> fontRanges;
+    cjkFontRanges(io.Fonts, fontRanges);
+    // ...and BEFORE a single byte of a font file is touched, write down which
+    // files are about to be read. If the process dies between here and
+    // fontBakeCrumbClear() below, the next start finds this and does not repeat
+    // it. Both faces go in: a merge reads two files and either can be the one
+    // that kills the process.
     {
-        ImFontGlyphRangesBuilder b;
-        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
-        b.AddChar((ImWchar)0x2025);
-        // ...and U+29C9 TWO JOINED SQUARES, the Files panel's share mark (§4).
-        // Not every CJK font carries it: shareGlyph() checks the built atlas
-        // and falls back to the word "shared" rather than showing '?'.
-        b.AddChar((ImWchar)0x29C9);
-        // GetGlyphRangesJapanese covers Latin-1 and the kana/kanji but NOT
-        // Greek, so a table of noise figures could only write "sigma_f" where
-        // it means one symbol. (Unicode has no subscript f or v, so the axis
-        // letter rides alongside the symbol rather than under it.)
-        b.AddChar((ImWchar)0x03C3);        // sigma
-        b.AddChar((ImWchar)0x03BC);        // mu
-        b.BuildRanges(&fontRanges);
+        std::vector<std::string> about;
+        if (!fontPath.empty()) about.push_back(fontPath);
+        if (const std::string m = cjkMergeFontPath(fontPath, crumb); !m.empty())
+            about.push_back(m);
+        fontBakeCrumbWrite(about);
     }
     ImFont* jp = fontPath.empty() ? nullptr
-        : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 17.0f * fontScale, nullptr,
+        : io.Fonts->AddFontFromFileTTF(fontPath.c_str(), CJK_FONT_PX * fontScale, nullptr,
                                        fontRanges.Data);
+    // ---- the SECOND face, merged on top of the first (板306 B) --------------
+    // THE ORDER IS THE POINT, and it is why this is a merge rather than a
+    // choice. ImFontAtlas merges FIRST COME FIRST SERVED - imgui_draw.cpp's
+    // builder skips a code point the earlier face already claimed
+    // ("if (dst_tmp.GlyphsSet.TestBit(codepoint)) continue;") - so with Meiryo
+    // added first and YaHei merged after it, every Japanese kana and kanji is
+    // still drawn by MEIRYO and only the characters Meiryo does not have come
+    // from YaHei. Swap the two lines and Japanese text quietly changes typeface
+    // to a Chinese face's shapes for the same code points, which is the defect
+    // this arrangement exists to avoid. See cjkMergeFontPath() for why Windows
+    // needs a second file at all.
+    //
+    // Nothing is said when there is no second file: the merge is an improvement
+    // where it is possible and its absence is not a new failure. What the user
+    // is owed is the state of the RESULT, and that is what the two messages
+    // below report - either the atlas has the kana or it says which font does
+    // not have them.
+    std::string mergePath;
+    if (jp) mergePath = cjkMergeFontPath(fontPath, crumb);
+    if (!mergePath.empty()) {
+        ImFontConfig m;
+        m.MergeMode = true;
+        if (!io.Fonts->AddFontFromFileTTF(mergePath.c_str(), CJK_FONT_PX * fontScale, &m,
+                                          fontRanges.Data))
+            mergePath.clear();          // unreadable: one face, and say nothing
+    }
+    g_fontMergePath = mergePath;
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
-        toast("CJK font not found - Japanese filenames may not display correctly", true);
+    }
+    fontAtlasBake(fontRanges, fontScale, /*fontLoadFailed=*/!fontPath.empty() && !jp);
+    // SURVIVED. The breadcrumb's whole meaning is "a start got this far and did
+    // not come back", so it is removed the instant this one does - immediately
+    // after the bake returns, before anything else can fail for its own reasons
+    // and leave a crumb that blames the font.
+    fontBakeCrumbClear();
+    // ---- FOUR different things can have gone wrong, and they are four
+    // different sentences (review P1 / P2-8 / P2-9). AFTER the bake, because
+    // only the built atlas can tell some of them apart.
+    //
+    //  1. Nothing was found at all              -> the list of paths looked at.
+    //  2. A file WAS chosen and would not load  -> which file. (This used to
+    //     say "no CJK font found", which sent the reader to look for a font
+    //     they already had.)
+    //  3. It loaded and stb_truetype could not parse it -> which file, and that
+    //     only Latin will draw. CFF2 is the case with a name.
+    //  4. It parsed and simply has no CJK       -> which file. fc-match answers
+    //     sans:lang=ja with DejaVu Sans on a machine with no Japanese font, so
+    //     this is what the fallback actually produces on the Ubuntu runner.
+    //  5. The LAST start died baking a font, so this one skipped it -> which
+    //     file, what is being used instead, and how to get out of it. It comes
+    //     FIRST because it is the only one of the five the user must act on to
+    //     restore what they asked for.
+    if (g_fontChoice.skippedAfterCrash) {
+        toast(cjkFontCrashSkipText(g_fontChoice), true);
+    } else if (!jp) {
+        if (g_fontChoice.path.empty()) toast(cjkFontMissingText(g_fontChoice), true);
+        else                           toast(cjkFontUnreadableText(g_fontChoice), true);
+    } else if (g_fontAtlasCost.buildFailed) {
+        toast(cjkFontUnreadableText(g_fontChoice), true);
+    } else if (!g_fontAtlasCost.mergeDropped.empty()) {
+        //  6. Two faces would not bake together and the primary alone did, so
+        //     the second face's characters are gone. Before the "no CJK" check
+        //     below because the atlas DOES have CJK in this case - it is the
+        //     simplified half that is missing, and only this sentence says so.
+        toast(cjkFontMergeDroppedText(g_fontAtlasCost, g_fontChoice), true);
+    } else if (!fontAtlasHasCjk()) {
+        toast(cjkFontNoGlyphsText(g_fontChoice), true);
+    } else if (strcmp(g_fontChoice.how, "Chinese face (no Japanese face on this machine)") == 0) {
+        // Not an error: the names DRAW. But 板306 B exists to keep Japanese
+        // glyphs in a Japanese face, and this is the one path where that is
+        // impossible - so it is said rather than left to be discovered.
+        toast(cjkFontChineseFallbackText(g_fontChoice), true);
     }
     // ...and the settings file's refusal, held since loadSettings() because
     // that ran before there was a context to draw a toast in (see the function).
@@ -1258,10 +1362,6 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_Init(glslVersion);
     }
 
-    // write the session on the way out of any crash, then let it crash normally.
-    // The file is opened now, while opening files still works.
-    openCrashFile();
-    for (int sig : { SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGTERM }) signal(sig, crashHandler);
 #if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);   // a dead ssh peer must not kill the viewer mid-write
 #endif
@@ -1367,6 +1467,13 @@ int main(int argc, char** argv) {
     // the platform under test is one no machine in this project can run, so the
     // decision is a pure function and this asserts it as one.
     if (g_uiScaleSelftest) return uiScaleSelftest();
+
+    // Japanese and Chinese filenames draw as themselves (板306). Windowless for
+    // the uiScaleSelftest reasons and one that is stronger here: the subject IS
+    // the font atlas, the atlas is rasterised on the CPU by stb_truetype, and
+    // start-up builds it whether or not there is a renderer to hand it to - so
+    // this test interrogates the very atlas the user would be looking at.
+    if (g_cjkFontSelftest) return cjkFontSelftest();
     if (g_videoSelftest) return videoSelftest();
 
     // The open worker (#232 stage 2): openPath returns with nothing read, the
@@ -2282,6 +2389,18 @@ static bool g_watchSuppressed = false;
 
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = nowSec();
+        // 板306 D: a name this atlas cannot draw gets one line in Messages.
+        // Here rather than at any of the six places that push onto app.images,
+        // because a notice added to one of those doors is a notice the other
+        // five do not give.
+        //
+        // AT THE TOP OF THE LOOP, above the two `continue`s that skip an idle
+        // frame (review P1-B). Below them it was not merely late - on an idle
+        // frame it was never reached at all, which is half of why the line for
+        // the batch just opened never appeared. It returns immediately on every
+        // frame where nothing was opened and nothing is pending, so the cost of
+        // being here is a counter comparison.
+        undrawableReportNewDocs();
         // work that must keep animating even without input
         // rbBusy / mPending: a connect, a peer install or a server measurement is
         // in flight. Without these the idle path draws NOTHING while they run -

@@ -217,9 +217,22 @@ static void prefWidget(const PrefRow& r) {
                 snprintf(buf, sizeof buf, "%s", s->c_str());
                 if (ImGui::InputText("##v", buf, sizeof buf)) {
                     *s = buf;
+                    // 板306: InputText returns true ONCE PER CHARACTER, so a
+                    // row whose change is worth a sentence would say it thirty
+                    // times for one typed path. The value is committed here
+                    // every keystroke, as before - nothing typed is lost if the
+                    // panel closes - and the sentence waits below.
+                    g_prefTextMidEdit = true;
                     prefAfterChange(r.id);
+                    g_prefTextMidEdit = false;
                     settingsWarnIfSticky(r.id, r.path);
                 }
+                // ...and here it is, once, when the box is left. Only
+                // appearance.fontPath has a sentence to say; the Reset menu
+                // reaches the same words through prefAfterChange, which is why
+                // they live there and not in this branch.
+                if (r.id == SK_fontPath && ImGui::IsItemDeactivatedAfterEdit())
+                    toast(fontPathNextStartText());
             }
             break;
         }

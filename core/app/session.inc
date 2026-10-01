@@ -893,6 +893,200 @@ static std::string viewerConfigDir() {
     return cfg.u8string();
 }
 
+// ---- THE FONT BREADCRUMB (review P1-A, layer 2) -----------------------------
+// NO AMOUNT OF CHECKING MAKES stb_truetype SAFE. sfntLooksSane() refuses what
+// would send it outside the file at the table-directory level, and it cannot
+// follow the offsets inside a cmap subtable or inside loca/glyf that it goes on
+// to trust. Each check narrows the hole. This closes the consequence instead:
+// if the program did not survive the last attempt to bake a font, it does not
+// try the same file again, so a person can always get back in and change the
+// setting.
+//
+// Measured, and this is why it is necessary: a file holding the first 4096
+// bytes of a real meiryo.ttc crashed the process at start-up, and because
+// `appearance.fontPath` PERSISTS, every later start crashed in the same place.
+// The user could not reach the Preferences panel to undo it. Only the file on
+// disk could be edited - with an application that would not open.
+//
+// THE PRECEDENT is in this repo already, a few hundred lines below: the
+// autosave slot lock, whose comment reads "A CRASH skips it on purpose: the
+// stale lock left behind is what marks that autosave reclaimable". Same
+// discipline, same shape - write before the risky step, delete after it, and
+// treat what is left behind as information rather than as garbage.
+//
+// One path per line, because a merge bakes two files and either of them can be
+// the one that kills the process.
+static bool pidAlive(unsigned long pid);            // fwd (with the lock code below)
+static std::string fontBakeCrumbPath() {
+    const std::string dir = viewerConfigDir();
+    return dir.empty() ? std::string() : dir + "/font-baking";
+}
+// EVERY LINE CARRIES THE PID THAT WROTE IT: "<pid> <path>".
+//
+// Two windows can run at once and they share this file, so a bare list of paths
+// is wrong in both directions. A reads its crumb while B is mid-bake and would
+// skip B's perfectly good font ("nothing crashed, yet the fifth message
+// appeared"); and B finishing its bake used to delete the WHOLE file, which
+// threw away A's in-flight breadcrumb - so a crash in A left no record at all.
+//
+// A LINE WHOSE PID IS STILL ALIVE IS NOT EVIDENCE. It means "that process is
+// baking right now", which says nothing about whether the font is safe. Only a
+// line whose writer is gone means "a start did not come back". pidAlive() is
+// the same predicate the autosave slot lock uses a few hundred lines below;
+// there is deliberately no second spelling of it.
+//
+// AND CLEARING REMOVES ONLY OUR OWN LINES, for the same reason in reverse.
+//
+// WHY NOT KEY THIS ON THE INSTANCE SLOT: the slot is not stable across starts.
+// claimAutosaveSlot takes the lowest FREE slot, so a run that died in slot 2
+// while slot 1 was alive is followed, once slot 1 exits, by a lone start that
+// claims slot 1 - which would read an empty slot-1 record and bake the same
+// font again. Keying on the slot fails towards MISSING the evidence; keying on
+// the pid fails only if a pid is reused inside one start, and the cost of that
+// is one more crash, which is what happened before this existed.
+static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty() || paths.empty()) return;
+    // Other processes' lines are KEPT - this is an append in effect, written as
+    // a rewrite only so that OUR line can be replaced rather than repeated.
+    std::vector<std::string> keep;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) continue;        // pre-pid format: drop it
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who == me) continue;                      // ours: replaced below
+            // EVERY OTHER PROCESS'S LINE IS KEPT HERE, alive or dead. Dropping
+            // the dead ones is a separate act with its own meaning - "this
+            // start read that line and acted on it" - and it is done by
+            // fontBakeCrumbConsume() below, at the one place that does the
+            // reading. It used to be done here, and this function returns
+            // early when there is nothing to bake, which is what made it
+            // wrong; the comment on that function has the measurement.
+            keep.push_back(line);
+        }
+    }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
+    for (const std::string& s : paths) f << currentPid() << " " << s << "\n";
+    // Flushed and closed before the caller bakes anything: a breadcrumb still
+    // sitting in a stdio buffer when the process dies is not a breadcrumb.
+    f.flush();
+}
+// ...and the lines a start HAS ACTED ON are dropped here (review round 5 P2).
+//
+// A DEAD PROCESS'S LINE IS CONSUMED ONCE, and that is a choice. The start that
+// calls this has already READ it (fontBakeCrumbRead, just above it in main())
+// and acted on it - skipped that path, and said so on screen in the fifth font
+// message - so dropping it means the NEXT start tries the path again. The
+// alternative, keeping it until some start bakes that file successfully, would
+// skip a font for ever after one transient failure (a file that was mid-copy
+// and is now fine), with no way out that the message could name.
+//
+// The cost of consuming it is at most ONE more crash, and the recovery then
+// returns immediately because that crash writes a fresh line. The cost of
+// keeping it is a font the user cannot get back. One more crash is the cheaper
+// mistake.
+//
+// WHY THIS IS NOT PART OF fontBakeCrumbWrite, which is where it used to live:
+// that function returns early when there is nothing to bake (`paths.empty()`),
+// so a start whose breadcrumb named EVERY candidate skipped them all, had an
+// empty list, wrote nothing - and never consumed the lines. The next start read
+// the same lines, skipped the same paths, and was empty again: the font skipped
+// FOR EVER that the paragraph above rejects by name, reached by the one route
+// where no message could offer a way out either, because no bake was attempted.
+// Consumption belongs where the line is read and acted on, and that is one
+// call, in main(), on every start - not where the next bake happens to be
+// recorded. C7 covers the zero-fonts-chosen start.
+//
+// Our own lines are left alone: this process is mid-bake and its line is the
+// record of that, which only fontBakeCrumbClear() may remove.
+static void fontBakeCrumbConsume() {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    std::vector<std::string> keep;
+    bool dropped = false;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) { dropped = true; continue; }  // pre-pid format
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who != me && !pidAlive(who)) { dropped = true; continue; }
+            keep.push_back(line);
+        }
+    }
+    if (!dropped) return;                     // nothing was evidence: leave the file alone
+    if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
+}
+// The paths a start DID NOT come back from: lines whose writer is gone.
+static std::vector<std::string> fontBakeCrumbRead() {
+    std::vector<std::string> out;
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return out;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return out;
+    std::ifstream f(pathFromUtf8(p), std::ios::binary);
+    std::string line;
+    const unsigned long me = currentPid();
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        const size_t sp = line.find(' ');
+        if (sp == std::string::npos) continue;
+        const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+        // Our own line cannot be evidence either: this process is the one
+        // baking, and it has not finished yet.
+        if (who == me || pidAlive(who)) continue;
+        const std::string path = line.substr(sp + 1);
+        if (!path.empty() && std::find(out.begin(), out.end(), path) == out.end())
+            out.push_back(path);
+    }
+    return out;
+}
+// OUR LINES ONLY. A second window finishing its bake must not delete the
+// breadcrumb this one is still flying on.
+static void fontBakeCrumbClear() {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    std::vector<std::string> keep;
+    {
+        std::ifstream in(pathFromUtf8(p), std::ios::binary);
+        std::string line;
+        const unsigned long me = currentPid();
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.empty()) continue;
+            const size_t sp = line.find(' ');
+            if (sp == std::string::npos) continue;
+            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
+            if (who == me) continue;                      // the lines we are clearing
+            keep.push_back(line);
+        }
+    }
+    if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
+}
+
 static unsigned long currentPid() {
 #if defined(_WIN32)
     return (unsigned long)GetCurrentProcessId();
@@ -1161,6 +1355,10 @@ struct PrefsBase {
     // settings.inc owns the variables - so loadPrefs fills them HERE and that
     // is the layer settings.inc falls back to when the file stops naming them.
     std::string repoUrl, editorCmd;
+    // ...and 板306's font override, for the same reason: util.inc owns the
+    // variable (it is the file that reads it), so this is the layer
+    // settings.inc falls back to when settings.jsonc stops naming it.
+    std::string fontPath;
 };
 static PrefsBase g_prefsBase;
 // Inactive until the lower layer has actually been captured. main() captures it
@@ -1267,6 +1465,10 @@ static void writePrefsTo(std::ostream& f) {
     // "not set" for both (判断9), and an empty line would be a third state.
     if (!P.repoUrl.empty()) f << "repourl " << P.repoUrl << "\n";
     if (!P.editorCmd.empty()) f << "editor " << P.editorCmd << "\n";
+    // appearance.fontPath (板306 C), written for those same two reasons. Only
+    // when set: empty means "search the usual places", so an empty line would
+    // be a third state that means neither.
+    if (!P.fontPath.empty()) f << "fontpath " << P.fontPath << "\n";
     // paths may contain spaces: value is the rest of the line
     if (!P.remoteExe.empty()) f << "remoteexe " << P.remoteExe << "\n";
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
@@ -1343,6 +1545,7 @@ static void loadPrefs() {
     // "no lower layer" rather than "whatever the last read left here".
     g_prefsBase.repoUrl.clear();
     g_prefsBase.editorCmd.clear();
+    g_prefsBase.fontPath.clear();
     std::vector<uint8_t> buf;
     std::string p = prefsPath();
     if (p.empty() || !readFileBytes(p, buf)) return;
@@ -1455,10 +1658,19 @@ static void loadPrefs() {
         // two values are 0 and 1, and a hand-edited 7 is not a gesture - the
         // honest answer to it is the default, which is also today's behaviour.
         else if (key == "folderclick") { ls >> v; if (v == 0 || v == 1) app.folderClick = v; }
+        // THE KEYS WHOSE VALUE IS THE REST OF THE LINE, because a path may
+        // contain spaces. This list is the gate: a key missing from it never
+        // reaches the chain below, however carefully that chain handles it.
+        // `fontpath` was missing (review), so its `else if` twelve lines down
+        // was dead code and appearance.fontPath written into prefs.txt did
+        // nothing at all - while two of the font messages named prefs.txt as a
+        // way to set it. Measured: prefs-only `fontpath` was ignored and the
+        // search fell through to meiryo.
         else if (key == "remoteexe" || key == "remoteurl" ||
                  key == "rbookmark" || key == "rbrecent" ||
                  key == "pythonexe" || key == "readerfor" || key == "readerdir" ||
-                 key == "readerplace" || key == "repourl" || key == "editor") {
+                 key == "readerplace" || key == "repourl" || key == "editor" ||
+                 key == "fontpath") {
             std::string s;
             std::getline(ls, s);
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(0, 1);
@@ -1470,6 +1682,7 @@ static void loadPrefs() {
             // next and is the one place that resolves file-over-prefs for them.
             else if (key == "repourl")   g_prefsBase.repoUrl = s;
             else if (key == "editor")    g_prefsBase.editorCmd = s;
+            else if (key == "fontpath")  g_prefsBase.fontPath = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
             else if (key == "pythonexe") app.pythonExe = s;
@@ -2727,6 +2940,44 @@ static void crashHandler(int sig) {
     static volatile sig_atomic_t inHandler = 0;
     if (!inHandler) {
         inHandler = 1;
+        // ONE LINE, UNCONDITIONALLY, before anything else is attempted.
+        //
+        // The session write below needs a snapshot that does not exist until
+        // documents are open, and this handler is now armed long before that:
+        // main() arms it before the font atlas is baked, because a font file is
+        // the first UNTRUSTED input this process reads and stb_truetype cannot
+        // be made safe against a truncated one. A crash with nothing to save
+        // still has to leave a mark - without it a start-up crash is
+        // indistinguishable from a silent exit, which is exactly what the
+        // truncated-font crash looked like from the outside (exit 139, no
+        // output at all).
+        //
+        // Built by hand rather than with snprintf: a signal handler may be
+        // running on a corrupted heap, and only write() is safe here.
+        {
+            char line[64];
+            int n = 0;
+            // SIGTERM IS NOT A CRASH (review P3). It is what a window manager,
+            // a service stop or `kill` sends to ask a process to go away, and
+            // this handler is registered for it so the session still gets
+            // written - but calling it "crashed" sends a reader looking for a
+            // defect that did not happen.
+            const char* head = (sig == SIGTERM) ? "\nviewer: asked to stop (signal "
+                                                : "\nviewer: crashed on signal ";
+            for (const char* q = head; *q; q++) line[n++] = *q;
+            int v = sig < 0 ? 0 : sig;
+            char d[8]; int dn = 0;
+            if (v == 0) d[dn++] = '0';
+            while (v > 0) { d[dn++] = (char)('0' + v % 10); v /= 10; }
+            while (dn > 0) line[n++] = d[--dn];
+            if (sig == SIGTERM) line[n++] = ')';
+            line[n++] = '\n';
+#if defined(_WIN32)
+            _write(2, line, (unsigned)n);
+#else
+            ssize_t ign0 = write(2, line, (size_t)n); (void)ign0;
+#endif
+        }
         if (g_crashFd >= 0 && !g_crashText.empty()) {
             const char* p = g_crashText.data();
             size_t n = g_crashText.size();
@@ -2740,11 +2991,27 @@ static void crashHandler(int sig) {
             while (n) { ssize_t w = write(g_crashFd, p, n); if (w <= 0) break; p += w; n -= (size_t)w; }
             if (ftruncate(g_crashFd, (off_t)g_crashText.size()) != 0) { /* best effort */ }
 #endif
-            static const char msg[] = "\nviewer crashed; session written to the autosave file\n";
+            // SIGTERM IS NOT A CRASH HERE EITHER (review round 5 P2). The
+            // branch at the top of this handler was given its own word and
+            // this one was not, so a window manager's stop printed "viewer:
+            // asked to stop (signal 15)" and then "viewer crashed" immediately
+            // under it - one handler contradicting itself in two lines.
+            //
+            // THE AXIS IS EVERY STRING IN THIS HANDLER THAT NAMES THE EVENT,
+            // not the line a review pointed at: there are exactly two, the
+            // head above and this one, and a third has to be written as a
+            // branch from the start or it will be the next of these.
+            static const char crashed[] =
+                "\nviewer crashed; session written to the autosave file\n";
+            static const char stopped[] =
+                "\nviewer stopped; session written to the autosave file\n";
+            const bool term = (sig == SIGTERM);
+            const char* msg = term ? stopped : crashed;
+            const size_t mn = (term ? sizeof stopped : sizeof crashed) - 1;
 #if defined(_WIN32)
-            _write(2, msg, (unsigned)(sizeof msg - 1));
+            _write(2, msg, (unsigned)mn);
 #else
-            ssize_t ign = write(2, msg, sizeof msg - 1); (void)ign;
+            ssize_t ign = write(2, msg, mn); (void)ign;
 #endif
         }
     }

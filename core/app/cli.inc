@@ -167,6 +167,15 @@ static bool g_frameSizeSelftest = false;
 // pure function and this is its table. See uiScaleSelftest().
 static bool g_uiScaleSelftest = false;
 
+// --cjkfont-selftest: Japanese and Chinese filenames draw as themselves
+// (板306) - the code points this build ASKS for, the glyphs that got baked, the
+// order of the two merged faces, the count of characters that are still '?',
+// and that a name which is not UTF-8 is a name rather than a crash. Takes no
+// directory and no window for the --uiscale-selftest reasons and one of its
+// own: the font atlas is pure CPU (stb_truetype), so it is built and
+// interrogated with no GL context at all. See cjkFontSelftest().
+static bool g_cjkFontSelftest = false;
+
 // --video-selftest: a whole stack out as a lossless video (#253) - the AVI
 // container read back by a RIFF parser the test writes itself, the three
 // refusals (preview frame / over 4 GB / .mkv with no ffmpeg), and the claim the
@@ -725,6 +734,9 @@ static void printUsage() {
         "  --uiscale-selftest          how big to draw the UI (#257): logical vs\n"
         "                              physical window coordinates, the override,\n"
         "                              and the restored window clamped to the screen\n"
+        "  --cjkfont-selftest          Japanese/Chinese filenames draw as themselves:\n"
+        "                              the glyph ranges, the baked atlas, the order of\n"
+        "                              the merged faces, and the names still left '?'\n"
         "  --video-selftest            a stack written as a lossless video (#253): the\n"
         "                              AVI container, the refusals, and that a video\n"
         "                              frame IS the PNG export of that frame\n"
@@ -922,6 +934,8 @@ static void parseCli(int argc, char** argv) {
             g_frameSizeSelftest = true;            // handled in main()
         } else if (a == "--uiscale-selftest") {
             g_uiScaleSelftest = true;              // handled in main()
+        } else if (a == "--cjkfont-selftest") {
+            g_cjkFontSelftest = true;              // handled in main()
         } else if (a == "--video-selftest") {
             g_videoSelftest = true;                // handled in main()
         } else if (a == "--anaprov-selftest") {
