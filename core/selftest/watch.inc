@@ -1326,6 +1326,38 @@
                   "W46c a frame the header declared and that would not decode is n/N");
             check(watch::frameAxisText(4, 4, 4).empty(),
                   "W46d ...and a count that did not move says NOTHING");
+            // ---- §12.6's two sentences the COUNT alone cannot make -----------
+            // The GEOMETRY moved under the reload. The joining frames were
+            // measured against the new head, which is correct, and a stack that
+            // quietly became a stack of a different picture is not.
+            check(watch::frameAxisShapeText("4000x3000 1ch", "2000x1500 1ch") ==
+                    "this stack's geometry changed: its frames are 2000x1500 1ch "
+                    "now, was 4000x3000 1ch - the joining frame(s) were measured "
+                    "against the new shape",
+                  "W46e the sentence a stack whose geometry moved leaves");
+            check(watch::frameAxisShapeText("4000x3000 1ch", "4000x3000 1ch").empty() &&
+                      watch::frameAxisShapeText("", "4000x3000 1ch").empty() &&
+                      watch::frameAxisShapeText("4000x3000 1ch", "").empty(),
+                  "W46f ...and a shape that did NOT move, or that was never "
+                  "recorded, says nothing");
+            // WHO JOINED, and why the first one that did not, did not - with the
+            // frames behind the refusal COUNTED, which is the clause that stops
+            // "one frame was refused" from hiding "and four more are out too".
+            check(watch::frameAxisJoinText(4, 1, 5, "8x8 1ch and c.npy is 4x4 1ch") ==
+                    "1 of 4 new frame(s) joined - frame 5 did not: 8x8 1ch and "
+                    "c.npy is 4x4 1ch, and the 2 frame(s) after it are not in the "
+                    "measurement either (a stack's frames are the file's first N)",
+                  "W46g the sentence a refused arrival leaves: both counts, the "
+                  "reason, and the frames behind it");
+            check(watch::frameAxisJoinText(2, 1, 4, "").find("decode failed") !=
+                      std::string::npos &&
+                      watch::frameAxisJoinText(2, 1, 4, "").find(
+                          "after it are not in the measurement") == std::string::npos,
+                  "W46h ...a refusal with no words still names one, and the LAST "
+                  "offered frame has nothing behind it to count");
+            check(watch::frameAxisJoinText(2, 2, 5, "x").empty() &&
+                      watch::frameAxisJoinText(0, 0, 3, "x").empty(),
+                  "W46i ...and every frame joining, or none offered, says NOTHING");
         }
         {   // ---- W47/W48/W49: the real file, the real Reload ------------------
             closeAll();

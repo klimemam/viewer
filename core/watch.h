@@ -455,6 +455,66 @@ inline std::string frameAxisText(int before, int resident, int expected) {
            " frame(s)";
 }
 
+// ---- §12.6: the two things the COUNT alone cannot say -----------------------
+//
+// frameAxisText above answers "how many frames are in the measurement now".
+// Two facts it cannot carry, and both of them are about the frames that JOINED.
+
+// THE STACK'S GEOMETRY MOVED, and the arrivals were measured against the new
+// one.
+//
+// A joining frame is measured against the head frame's shape, and the re-read
+// can have CHANGED that shape: the script that wrote five frames where it had
+// written three may perfectly well have written them at a different size.
+// Measuring the arrivals against the new head is right - they are the frames of
+// the file that is there NOW - but doing it in silence leaves the reader with a
+// stack whose time axis is over a different picture than the one they were
+// looking at, and nothing anywhere to tell them. An automatic reload has
+// nobody's click behind it, so this is exactly the class of change that must
+// not be quiet (§9 rule 3).
+//
+// The words are frameShapeText's - "4000x3000 1ch", the same three numbers in
+// the same order every stack line and every stackShapeRefusal prints - so this
+// sentence and the refusal beside it describe a frame the same way.
+//
+// "" = the shape did not move, or there is no record to compare (a reload that
+// did not grow never takes one), and then this has nothing to say.
+inline std::string frameAxisShapeText(const std::string& was, const std::string& now) {
+    if (was.empty() || now.empty() || was == now) return {};
+    return "this stack's geometry changed: its frames are " + now + " now, was " +
+           was + " - the joining frame(s) were measured against the new shape";
+}
+
+// HOW MANY of the offered frames joined, and WHY the first one that did not,
+// did not.
+//
+// "" = every frame the header offered joined, and then frameAxisText's n-of-N
+// is the whole story. Otherwise both numbers and the reason, because the two
+// failures this is written against are "the frames were dropped silently" and
+// "the reason was a toast that faded".
+//
+// A refusal ENDS the growth rather than being stepped over, and that is an
+// invariant rather than laziness: watchFrameAxisPlan applies only to a stack
+// whose frames are the file's contiguous prefix 0..N-1, so a stack that
+// accepted frame 4 after refusing frame 3 would be refused by the NEXT plan
+// outright and this whole mechanism would quietly stop working for it. So there
+// is exactly one reason to print - and the frames behind it are COUNTED, which
+// is this sentence's second clause and the difference between "one frame was
+// refused" and "one frame was refused and four more are not in the measurement
+// either".
+inline std::string frameAxisJoinText(int offered, int joined, int firstRefused,
+                                     const std::string& why) {
+    if (offered <= 0 || joined >= offered) return {};
+    std::string s = std::to_string(joined) + " of " + std::to_string(offered) +
+                    " new frame(s) joined - frame " + std::to_string(firstRefused) +
+                    " did not: " + (why.empty() ? std::string("decode failed") : why);
+    const int behind = offered - joined - 1;
+    if (behind > 0)
+        s += ", and the " + std::to_string(behind) + " frame(s) after it are not "
+             "in the measurement either (a stack's frames are the file's first N)";
+    return s;
+}
+
 // ---- §5's third item: "Watch: open new stacks" -------------------------------
 //
 // Is this stack one the caller has NOT seen before? The whole of the decision,

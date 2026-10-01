@@ -910,6 +910,44 @@ struct WatchAxisPlan {
     int have = 0;                      // frames the stack holds now
     int want = 0;                      // frames the header declares now
     bool moved() const { return applies && want != have; }
+    // How many frames the header is OFFERING this stack. 0 unless it grew.
+    int offered() const { return moved() && want > have ? want - have : 0; }
+
+    // ---- THE SHAPE, and it is DECIDED ONCE (§12.6, board row 319) ----------
+    // A joining frame is measured against the head frame's shape. §12 used to
+    // read that shape AT THE MOMENT the frame joined, and that is the defect
+    // this pair of fields exists to remove: a shape read at landing time makes
+    // the same Reload answer differently depending on how the items happened to
+    // be scheduled - a frame that joins before the head's own re-read has
+    // landed is measured against yesterday's shape, one that joins after it is
+    // measured against today's. This project has closed that defect twice under
+    // other names (the ROI band memory used across a change of dimensions, the
+    // Projection phase lattice inferred from finiteness instead of recorded),
+    // and the rule that came out of both is one rule: a shape is decided in ONE
+    // place, ONCE, written down, and read from the record afterwards.
+    //
+    // `was*` is the head's shape when the plan was taken - before a byte was
+    // re-read - and `head*` is the head's shape AS IT LANDED, written by
+    // watchFrameAxisHead at the one moment the re-read is over. The pair is
+    // kept rather than just the record because a stack whose geometry moved
+    // must SAY so (watch::frameAxisShapeText), and "moved" is a comparison.
+    int wasW = 0, wasH = 0, wasCh = 0;
+    int headW = 0, headH = 0, headCh = 0;
+    bool headRecorded() const { return headW > 0 && headH > 0 && headCh > 0; }
+    bool shapeMoved() const {
+        return headRecorded() && wasW > 0 &&
+               (headW != wasW || headH != wasH || headCh != wasCh);
+    }
+
+    // ---- ...and what the ARRIVALS actually did ------------------------------
+    // `arrived` = these arrivals are not watchReloadFinish's business, because
+    // the job that does the reading owns them (§12.6's stage 2). It is set by
+    // startStackReload, where the asynchronous door commits to a worker, and
+    // stays false on the synchronous door - which has no worker at all and so
+    // lands them itself, on the UI thread, exactly as it always did.
+    bool arrived = false;
+    int joined = 0;                    // how many of offered() joined
+    std::string firstRefusal;          // ...and why the first one that did not, did not
 };
 // ---- what a session could NOT round-trip, said BY TYPE (board row 126) -------
 // A .vsession is a list of things to re-open, and a live session holds things
@@ -2963,10 +3001,44 @@ struct App {
         // P1-2): a gesture that is folded into a running job does no reading, so
         // a plan taken there would apply its departures against a stack whose
         // re-read is somebody else's and then lose its arrivals with the fold.
-        // Its departures are applied there too, immediately after it is taken,
-        // and watchReloadFinish is handed it when the job ends and applies the
-        // arrivals. Default-constructed = not that shape of stack.
+        // Its departures are applied there too, immediately after it is taken.
+        // Default-constructed = not that shape of stack.
         WatchAxisPlan axis;
+        // ---- §12.6: the job's SECOND STAGE, the frame-axis ARRIVALS ---------
+        // The arrivals used to be watchReloadFinish's, on the UI thread, one
+        // whole-file read PER joining frame - the one path PR #275 did not
+        // reach, and measured at 375 ms (3 -> 5 frames) and 1374 ms (3 -> 10)
+        // on a 480 MB .npy. Those are watch-design §20.1's table, which is the
+        // canonical pair: a QUIET machine, median of 3. (The same two cases
+        // measured 641 / 1797 ms while other builds were running on the same
+        // machine, and that pair is cited there as the loaded run and nowhere
+        // else - quoting the pessimistic number under the quiet method's
+        // sentence is how a reader comes to compare two different experiments.)
+        // They are a second pass of THIS job now:
+        //
+        //   stage 1  the resident memberships are re-read (`items`) and land.
+        //            Then, and only then, the head frame's shape is a FACT and
+        //            watchFrameAxisHead writes it into `axis`.
+        //   stage 2  the joining frames are decoded from that record
+        //            (`arrivals`) and land as joins. The UI thread reads
+        //            nothing in either stage.
+        //
+        // The SAME job rather than a second mechanism, because app.reloadJob is
+        // the one field everything asks "is a reload running?" about -
+        // watchAutoBusy, reloadInFlightFor, startStackReload's folding, the
+        // Files row's progress and Stop, closeAll's cancel, waitForReloadJob -
+        // and a second object would need a second term in every one of them.
+        // The gesture is one Reload and is not over until the new frames are in.
+        //
+        // `arrivals` are items with a NULL `src`: a joining frame has no
+        // membership yet, and everything reloadDecodeGroup needs is a
+        // ReloadSpec, which is built from the plan. They are therefore ONE
+        // group of one file, so any number of joining frames is ONE read.
+        int stage = 1;
+        std::vector<Item> arrivals;
+        std::vector<int> arrivalEnd;   // as groupEnd is, for the same reason
+        int arrivalsLanded = 0;
+        std::thread::id arrivalThread; // which thread decoded THEM (see below)
         uint64_t pinWas = 0;           // §12.5: a compare pin sampled across it
         // Quitting mid-reload. ~OpenJob's reason exactly: a joinable thread
         // that is DESTROYED is std::terminate, and this object is owned by the
@@ -3219,6 +3291,20 @@ inline int g_reloadPumps = 0;
 // ReaderJob::decodeThread's probe and its reason: it is the only thing a
 // headless selftest can assert about a freeze that is about to not happen.
 inline std::thread::id g_reloadDecodeThread;
+// ...and WHICH THREAD decoded the frame-axis ARRIVALS (§12.6's stage 2),
+// published by pumpReloadJob after it has joined that stage's worker.
+//
+// A SEPARATE probe from g_reloadDecodeThread on purpose. The board row this
+// answers is specifically about the arrivals, and an assert that read the
+// RE-READ's thread id would go green on a build where the arrivals had come
+// back to the UI thread - which is precisely the state the row describes. Both
+// are reset to a default-constructed id at the start of every reload gesture,
+// so a stale id left by an earlier reload cannot make a test pass either.
+inline std::thread::id g_reloadArrivalThread;
+// ...and how many times stage 2 has run, so a test can say "the arrivals
+// really went to a worker" rather than "nothing broke". g_reloadStarts counts
+// GESTURES and deliberately does not move for a stage: one Reload is one start.
+inline int g_reloadArrivalStages = 0;
 
 // ---- "all stacks below": HOW FAR DOWN, asked in ONE place --------------------
 // Issue #204, ruled 2026-08-17: the depth is a SETTING (loading.folderScanDepth)

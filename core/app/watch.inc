@@ -717,7 +717,102 @@ static WatchAxisPlan watchFrameAxisPlan(int seqId) {
     p.npyRead = s0.npyRead;
     p.have = (int)fr.size();
     p.want = want;
+    // The shape this stack HAS, before a byte is re-read, off the head frame
+    // in memory. Half of §12.6's record: the other half is written when the
+    // re-read lands (watchFrameAxisHead), and the two are compared so that a
+    // stack whose geometry moved under the reload can say so.
+    const ImageDoc& head0 = *app.images[fr.front()];
+    p.wasW = head0.w; p.wasH = head0.h; p.wasCh = head0.ch;
     return p;
+}
+
+// §12.6: THE SHAPE, recorded ONCE.
+//
+// Called at exactly one moment - the instant the re-read of the resident
+// frames has finished landing - and never again. Everything that joins
+// afterwards is measured against what this wrote down, on whichever thread
+// decoded it. `framesOfSeq` is sorted by seqIndex, so `front()` is the stack's
+// frame 0, which is the reference frame §6's join has always measured against.
+//
+// WHY A RECORD AND NOT A LOOK: see the note at WatchAxisPlan::headW. In one
+// line - a shape read at landing time makes the same Reload answer differently
+// depending on how the items happened to be scheduled, and the discipline this
+// project arrived at twice under other names is that a shape is decided in one
+// place, once, and read from the record afterwards.
+//
+// false = the stack has no frames left to be the head of, and then nothing
+// joins and the summary says what actually happened.
+static bool watchFrameAxisHead(int seqId, WatchAxisPlan& p) {
+    const std::vector<int> fr = framesOfSeq(seqId);
+    if (fr.empty()) return false;
+    const ImageDoc& head = *app.images[fr.front()];
+    p.headW = head.w; p.headH = head.h; p.headCh = head.ch;
+    return p.headRecorded();
+}
+
+// §12.6: ONE JOIN, and every decision about whether a frame may join is in it.
+//
+// `nd` is a decoded, MEASURED document for frame `f` of the plan's file, or
+// null with `err` saying why there is none. Measured is part of the contract,
+// exactly as it is reloadLand's ("`pre` already holds a measured, cropped
+// document"), and for the same reason: computeMinMax is a pass over every
+// sample of the frame, which is 24 million of them on the file this change was
+// measured against, and this function runs on the UI thread. npyDecodeFrames
+// measures on the worker; the synchronous door measures at its own decode site.
+//
+// WHO decoded it is the one thing that differs between the two doors and is the
+// one thing this function does not ask:
+//
+//   the SYNCHRONOUS door  decodes on this thread, in watchFrameAxisGrow below,
+//                         because it has no worker at all.
+//   the ASYNCHRONOUS door decodes on the reload worker (§12.6's stage 2) and
+//                         hands the finished document to this same function
+//                         from pumpReloadJob.
+//
+// That is reloadSource / (reloadDecodeGroup + reloadLand)'s own split, one
+// feature over, and for its reason: two spellings of "may this frame join, and
+// with what" is the second set of decisions §15.1 forbids.
+//
+// false = it did not join, and the CALLER STOPS. The growth has to stay
+// contiguous - watchFrameAxisPlan applies only to a stack whose frames are the
+// file's first N - so a stack that accepted frame 4 after refusing frame 3
+// would be refused by the next plan outright and this mechanism would quietly
+// stop working for it. The frames behind the refusal are counted and said
+// (watch::frameAxisJoinText), not skipped over in silence.
+static bool watchFrameAxisJoin(int seqId, WatchAxisPlan& p, int f,
+                               std::unique_ptr<ImageDoc> nd, std::string err) {
+    const std::vector<int> fr = framesOfSeq(seqId);
+    if (fr.empty()) return false;
+    const ImageDoc* ref = app.images[fr.front()].get();
+    // ...against THE RECORD, never against a fresh look at the head. This is
+    // the whole of board row 319's ruling in one expression.
+    if (nd && p.headRecorded()) {
+        const std::string bad = stackShapeRefusal(nd->w, nd->h, nd->ch,
+                                                  p.headW, p.headH, p.headCh,
+                                                  baseName(p.path));
+        if (!bad.empty()) { err = bad; nd.reset(); }
+    }
+    if (!nd) {
+        if (p.firstRefusal.empty())
+            p.firstRefusal = err.empty() ? std::string("decode failed") : err;
+        toast(baseName(p.path) + ": frame " + std::to_string(f) + ": " +
+                  p.firstRefusal, true);
+        return false;
+    }
+    nd->seqId = seqId;
+    nd->seqIndex = f;
+    nd->batchId = ref->batchId;
+    nd->black = ref->black; nd->white = ref->white;
+    nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
+    nd->cfaColorize = ref->cfaColorize;
+    nd->displayLut = ref->displayLut;
+    nd->texDirty = true;
+    nd->uid = app.nextUid++;
+    app.images.push_back(std::move(nd));
+    app.imagesRev++;
+    shareOrRegisterSource(*app.images.back());   // §6.2: identity, then bytes
+    p.joined++;
+    return true;
 }
 
 // F SHRANK: the tail leaves, before a byte is re-read.
@@ -745,41 +840,31 @@ static void watchFrameAxisDrop(int seqId, int keep) {
 // beside it. A frame that will not decode ENDS the growth and is not a failure -
 // it is the n-of-N §12.4 already prints, and `expected` below is what the header
 // declared while the membership is what read.
-static void watchFrameAxisGrow(int seqId, const WatchAxisPlan& p) {
-    const std::vector<int> fr = framesOfSeq(seqId);
-    if (fr.empty()) return;
-    const ImageDoc* ref = app.images[fr.front()].get();
+//
+// THIS IS THE SYNCHRONOUS DOOR'S DECODE SITE (§12.6), and it is all that is
+// left here: the record is watchFrameAxisHead's and the join is
+// watchFrameAxisJoin's, so the door that has a worker (stage 2) reaches exactly
+// the same decisions with exactly the same record and nothing is written twice.
+// It still reads on the CALLING thread, which for this door is the point: a
+// scripted run without --async-open has no frame loop to pump a worker with,
+// so "off the UI thread" is not available and not needed - nobody is looking
+// at a window.
+static void watchFrameAxisGrow(int seqId, WatchAxisPlan& p) {
+    if (!watchFrameAxisHead(seqId, p)) return;
     for (int f = p.have; f < p.want; f++) {
         std::string err;
         int frames = 1;
         int64_t fstride = 0;
         std::unique_ptr<ImageDoc> nd =
             decodeNpyFrame(p.path, err, f, frames, fstride, p.npyRead);
-        if (nd) {
-            const std::string bad = stackShapeRefusal(nd->w, nd->h, nd->ch,
-                                                     ref->w, ref->h, ref->ch,
-                                                     baseName(p.path));
-            if (!bad.empty()) { err = bad; nd.reset(); }
-        }
-        if (!nd) {
-            toast(baseName(p.path) + ": frame " + std::to_string(f) + ": " +
-                      (err.empty() ? std::string("decode failed") : err), true);
-            break;
-        }
-        computeMinMax(*nd);
-        nd->seqId = seqId;
-        nd->seqIndex = f;
-        nd->batchId = ref->batchId;
-        nd->black = ref->black; nd->white = ref->white;
-        nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
-        nd->cfaColorize = ref->cfaColorize;
-        nd->displayLut = ref->displayLut;
-        nd->texDirty = true;
-        nd->uid = app.nextUid++;
-        app.images.push_back(std::move(nd));
-        app.imagesRev++;
-        shareOrRegisterSource(*app.images.back());   // §6.2: identity, then bytes
+        // MEASURED here, which is the join's contract: decodeNpyBuffer does not
+        // measure and npyDecodeFrames (the worker's decode) does, so the door
+        // that decodes owes the pass. Doing it inside the join instead would
+        // make the asynchronous door pay a second one on the UI thread.
+        if (nd) computeMinMax(*nd);
+        if (!watchFrameAxisJoin(seqId, p, f, std::move(nd), err)) break;
     }
+    p.arrived = true;
 }
 
 // ============================================================================
@@ -977,7 +1062,7 @@ static bool watchAutoDue() {
 // and calls this - and a second copy of the record, the clearing and the toast
 // is the one place §9 could not afford one.
 static void watchReloadFinish(int seqId, bool automatic, const std::string& summary,
-                              int failed, uint64_t pinWas, const WatchAxisPlan& ax) {
+                              int failed, uint64_t pinWas, WatchAxisPlan& ax) {
     const std::string name = seqInfo(seqId) ? seqInfo(seqId)->name : std::string();
     std::string msg = summary;
     // §12's frame-axis half, SECOND HALF (board row 222). The plan was decided
@@ -991,7 +1076,14 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
     // call, and re-asking watchFrameAxisPlan here would answer about the stack
     // the reload has already rebuilt (want == have, nothing moved).
     if (ax.moved()) {
-        if (ax.want > ax.have) watchFrameAxisGrow(seqId, ax);
+        // ---- the ARRIVALS, and WHOSE they are (§12.6) ------------------------
+        // `arrived` means the job that did the reading owns them and they are
+        // already in: the asynchronous door lands them on its stage 2, having
+        // decoded them on a worker, so this thread must not read the file a
+        // second time - which is the whole of board row 319. The synchronous
+        // door has no worker, so it lands them here, on this thread, exactly as
+        // it always did. One join, one record, one set of refusals.
+        if (ax.want > ax.have && !ax.arrived) watchFrameAxisGrow(seqId, ax);
         const int resident = (int)framesOfSeq(seqId).size();
         if (App::SeqInfo* si = seqInfo(seqId)) {
             si->expectedFrames = ax.want;
@@ -1017,6 +1109,50 @@ static void watchReloadFinish(int seqId, bool automatic, const std::string& summ
         app.watchTargetsDirty = true;   // ...and the watcher's seed is a new set
         const std::string ft = watch::frameAxisText(ax.have, resident, ax.want);
         if (!ft.empty()) msg += " - " + ft;
+        // ---- §12.6's two statements the count alone cannot make --------------
+        // The GEOMETRY, when the re-read moved it. The joining frames were
+        // measured against the new head, which is right, and a stack that
+        // quietly became a stack of a different picture is not (§9 rule 3: an
+        // automatic reload has nobody's click behind it, so the evidence has to
+        // be MORE than a manual one leaves).
+        //
+        // THE QUESTION IS THE PLAN'S, and it is asked through the predicate
+        // that lives beside the fields. The first version of this built the two
+        // strings and let frameAxisShapeText's `was == now` decide, which left
+        // WatchAxisPlan::shapeMoved() with no caller at all - and a predicate
+        // sitting unused at the declaration site is a trap, because the next
+        // reader takes it for the real test and reasons about the wrong code.
+        // (A refutation round did exactly that.)
+        //
+        // frameAxisShapeText KEEPS its own guard, and that is not a second
+        // decision: it is a pure function with its own direct callers and its
+        // own cases (W46f), so its guard is about ITS inputs while this one is
+        // about THIS plan.
+        if (ax.shapeMoved()) {
+            const std::string sh = watch::frameAxisShapeText(
+                frameShapeText(ax.wasW, ax.wasH, ax.wasCh),
+                frameShapeText(ax.headW, ax.headH, ax.headCh));
+            if (!sh.empty()) msg += " - " + sh;
+        }
+        // ...and WHO JOINED, when not everybody did. frameAxisText's n-of-N
+        // already carries the numbers; this carries the reason, which is the
+        // half a faded toast used to be the only witness of.
+        const std::string jn = watch::frameAxisJoinText(ax.offered(), ax.joined,
+                                                        ax.have + ax.joined,
+                                                        ax.firstRefusal);
+        if (!jn.empty()) msg += " - " + jn;
+        // The DETAIL line: the numbers this reload actually moved, in the log a
+        // headless run and a selftest both read, so "how many joined and how
+        // many did not" is answerable after the fact and not only from a toast.
+        fprintf(stderr, "watch: frame axis %d -> %d  offered=%d joined=%d "
+                        "refused=%d resident=%d shape=%s->%s%s%s\n",
+                ax.have, ax.want, ax.offered(), ax.joined,
+                ax.offered() - ax.joined, resident,
+                ax.wasW > 0 ? frameShapeText(ax.wasW, ax.wasH, ax.wasCh).c_str() : "?",
+                ax.headRecorded()
+                    ? frameShapeText(ax.headW, ax.headH, ax.headCh).c_str() : "?",
+                ax.firstRefusal.empty() ? "" : "  refusal=",
+                ax.firstRefusal.c_str());
     }
     const bool pinDropped = pinWas != 0 && app.compareBUid != pinWas;
     char hm[16] = "";
@@ -1070,7 +1206,10 @@ static void reloadStackSync(int seqId, bool automatic) {
     // frame the file no longer holds must not reach reloadSource and be counted
     // as a refusal. `applies` is false for every other shape of stack, and then
     // these two lines are one predicate and nothing else.
-    const WatchAxisPlan ax = watchFrameAxisPlan(seqId);
+    // Not const: §12.6's join records into it (the head's landed shape, how
+    // many joined, the first refusal), and the summary below is built out of
+    // what it holds afterwards.
+    WatchAxisPlan ax = watchFrameAxisPlan(seqId);
     // §12.5's other half, sampled BEFORE them (they are a closeImages): a pin
     // on a frame that VANISHES is dropped by closeImages, exactly as closing
     // that frame drops it.
