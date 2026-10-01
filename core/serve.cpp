@@ -3535,9 +3535,24 @@ static void handleReaderRun(Buf& in) {
     // already over. PR #278's selftest.rreader caught exactly that on macOS,
     // twice, with the file named and still present 60 s later.
     //
+    // AND 60 s IS NOT A WINDOW, which is the half of this that the first
+    // reading got wrong. The temp was not removed LATE; it was never removed
+    // at all. core/remote.cpp:340 `Session::~Session()` calls `stop()`, which
+    // calls `pipeClose()`, and closing this peer's stdin ends THIS PROCESS. So
+    // the sequence was: reply goes out -> the client's readerRun returns -> its
+    // Session goes out of scope -> this process is handed EOF and exits -> the
+    // destructor below NEVER RUNS -> the `.part` stays for good. That is why
+    // the leak was intermittent (it is a race between the exit and the
+    // destructor), why it showed on macOS (where the exit won more often), and
+    // why no amount of waiting found the file gone. Dropping before the reply
+    // closes it completely: the client cannot learn the answer, and so cannot
+    // close the session, until the directory is already clean.
+    //
     // The destructor stays as the BACKSTOP for a path nobody thought of, which
     // is what it was always good for. What it is no longer is the only thing
-    // standing between an answer and a clean directory.
+    // standing between an answer and a clean directory - and, per the paragraph
+    // above, it is a backstop that a process exit can take away, so it cannot
+    // be the thing relied on.
     //
     // ...and a removal that FAILS now says so on this peer's stderr. It used to
     // discard the error_code, so "the file is gone" and "the file could not be
