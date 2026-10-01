@@ -33,3 +33,9 @@ docs/diagnostics/auto/
 
 # agent worktrees (created and removed per task; never part of a commit)
 viewer_work/
+# The selftests' own HOME. CMake points VIEWER_TEST_HOME at
+# ${CMAKE_BINARY_DIR}/selftest-home, so a configured build keeps it inside an
+# ignored build dir - but a selftest run by hand with a relative APPDATA drops
+# one at the repo root, and a tracked file in a selftest home is the shared-state
+# trap with a worse face: the test finds something it was supposed to create.
+selftest-home/
