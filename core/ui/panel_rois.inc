@@ -351,6 +351,14 @@ struct RoiEditProbe {
     bool dropped = false;    // a commit was dropped: the selection had moved
     int seededFor = 0;       // the Ann::id the buffer was filled from
     int buf[4] = { 0, 0, 0, 0 };
+    // ...and the name field, which is the same widget with the same two
+    // hazards and a worse consequence: a label is an analysis COLUMN name
+    // (core/ui/panel_analysis.inc), so a name written onto the wrong
+    // annotation puts another region's numbers under this one's heading.
+    ImVec2 nameMin = ImVec2(-1, -1), nameMax = ImVec2(-1, -1);
+    bool nameHeld = false, nameDropped = false;
+    int nameFor = 0;
+    char name[128] = { 0 };
 };
 static RoiEditProbe g_roiEditProbe;
 
@@ -1025,14 +1033,66 @@ static void drawPanelRois() {
     // editor block: fixed height so the window never shrinks with the selection
     ImGui::Separator();
     ImGui::BeginChild("roiedit", ImVec2(0, editH));
+    // Three fields, one rule: each buffer is the USER's between the frame they
+    // start typing and the frame it commits, each belongs to ONE annotation,
+    // and each one's life ends when it commits, when it is refused, or when the
+    // selection moves out from under it. The reasoning and the two ImGui facts
+    // behind it are written out above InputInt4 below.
+    //
+    // Asked twice in review, so it is written down: a buffer does NOT outlive
+    // the frame its field stops being drawn in, even though the static would.
+    // Every route out of "this annotation is selected" is a mouse PRESS - the
+    // All row and the ROI rows are Selectables (pressed on release, so the
+    // press frame still draws this arm), the canvas sets selectedAnn in its own
+    // press and release handlers, and Clear all and the row's x are buttons -
+    // and a press takes ActiveId from the live field, which fires
+    // IsItemDeactivatedAfterEdit() in that same frame, while `sel` is still the
+    // annotation being edited. The commit therefore happens, and the buffer
+    // dies, before the selection moves. The keyboard cannot do it at all: every
+    // shortcut in core/main.cpp is gated on !io.WantTextInput, which an active
+    // text field sets. And if some future caller did move the selection with no
+    // press and no key, `*For` still binds the text to the annotation it was
+    // typed for, so the worst case is a stale box - never a write to another
+    // annotation.
     if (App::Ann* sel = findAnn(app.selectedAnn)) {
-        char buf[128];
-        snprintf(buf, sizeof buf, "%s", sel->label.c_str());
+        // The name is the same widget as the numbers, with the same two
+        // hazards - and the worst consequence of the three, because
+        // core/ui/panel_analysis.inc uses a->label as the COLUMN NAME of a
+        // measurement. A name written onto the wrong annotation therefore
+        // reports one region's numbers under another region's heading, in a
+        // grid that gets pasted into reports. It used to write `sel->label` on
+        // every keystroke, so the canvas press that moves app.selectedAnn (see
+        // fact 2 below) landed the name being typed for A on B.
+        //
+        // "live update is cheap" was true and beside the point: what a label
+        // costs to apply is not what it costs to apply to the wrong ROI. It
+        // commits on Enter / focus loss now, which is where app.annRev++
+        // already was.
+        static char nameBuf[128] = {};
+        static bool nameHeld = false;              // the buffer is the user's
+        static int nameFor = -1;                   // ...for THIS annotation
+        const bool nameMoved = nameHeld && nameFor != sel->id;
+        if (!nameHeld || nameMoved) {
+            snprintf(nameBuf, sizeof nameBuf, "%s", sel->label.c_str());
+            nameFor = sel->id;
+        }
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##rename", buf, sizeof buf))
-            sel->label = buf;                       // live update is cheap...
-        if (ImGui::IsItemDeactivatedAfterEdit())
-            app.annRev++;                           // ...but re-analyze only on commit
+        ImGui::InputText("##rename", nameBuf, sizeof nameBuf);
+        const ImVec2 nameMin = ImGui::GetItemRectMin(), nameMax = ImGui::GetItemRectMax();
+        const bool nameAct = ImGui::IsItemActive();
+        const bool nameDone = ImGui::IsItemDeactivatedAfterEdit();
+        if (nameDone && !nameMoved && sel->label != nameBuf) {
+            sel->label = nameBuf;
+            app.annRev++;                          // re-analyze on commit, as before
+        }
+        nameHeld = nameAct && !nameDone && !nameMoved;
+        if (g_roiRowProbeOn) {
+            g_roiEditProbe.nameMin = nameMin; g_roiEditProbe.nameMax = nameMax;
+            g_roiEditProbe.nameHeld = nameHeld;
+            g_roiEditProbe.nameDropped = nameDone && nameMoved;
+            g_roiEditProbe.nameFor = nameFor;
+            snprintf(g_roiEditProbe.name, sizeof g_roiEditProbe.name, "%s", nameBuf);
+        }
         if (sel->type == 0) {
             // Commit on Enter/focus-loss, not per keystroke. The caches key on the
             // resolved rect, so applying "5", "51", "512" as you type would rescan
