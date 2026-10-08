@@ -236,6 +236,13 @@ std::vector<RbAvgStack> rbSelectionStacks(const std::vector<RbRow>& view,
 // therefore could not open. Free so --browse-selftest drives the routing the
 // panel's key handler drives, rather than a second copy of it.
 std::string rbReaderKey(const App::RemoteBrowse& B, const RbRow& r);
+// How many bytes THIS ROW'S OWN FILE has, or 0 for "the listing does not say".
+// A free function beside rbOpenItemRow, and not an expression inside it,
+// because it is the number a headerless open works a geometry out of and binds
+// a recipe to - so it is worth being able to ask it in a test. It answered the
+// GROUP's sum for an expanded member once (review P2-1), which is a byte count
+// no file in the folder has.
+uint64_t rbRowOwnBytes(const RbRow& r);
 void rbOpenItemRow(const App::RemoteBrowse& B, const RbRow& r);
 int  rbOpenSelection(const App::RemoteBrowse& B, const std::vector<RbRow>& view,
                      const std::vector<char>& sel);

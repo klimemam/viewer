@@ -6,6 +6,7 @@
 // network, and no credentials of our own - ssh owns the authentication. Passing
 // an empty host starts a local peer instead, which is how this is tested.
 #pragma once
+#include <algorithm>          // std::min - effectiveVersion()
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -30,6 +31,15 @@ struct Entry {
     bool group = false;                // synthetic row for a numbered sequence
     uint32_t frames = 0;               // member count when group
     std::vector<std::string> members;  // member file names (no directory part)
+    // Protocol 16, group rows only: the smallest and largest member, in bytes.
+    // `size` is their SUM and cannot answer "are they all one shape" - the sum
+    // of 108/110/106 is the sum of 108/108/108 - and for a HEADERLESS folder
+    // that question decides whether the bytes may be read at all (the geometry
+    // comes from a recipe, so a member of another length reads as another
+    // picture). hasMemberSizes is false from a pre-16 peer, which is not an
+    // "unknown" the client may round to yes: it refuses the open and says so.
+    bool hasMemberSizes = false;
+    uint64_t minMemberSize = 0, maxMemberSize = 0;
 };
 
 // LIST reply payload -> entries, in the shape `peerVersion` promises. Split out
@@ -377,6 +387,39 @@ private:
     uint64_t rx_ = 0;
     int peerVersion_ = 0;
     int helloVersion_ = (int)rp::VERSION;
+    // The protocol actually IN FORCE for a field whose presence is decided by
+    // the CLIENT's announced number rather than the peer's. It is the smaller
+    // of the two, not peerVersion_ alone: a client that announced less than it
+    // can parse would otherwise read a field the peer correctly did not send,
+    // or write one the peer will not consume - and everything after it is then
+    // parsed from the wrong offset.
+    //
+    // THE PREDICATE, and no count. This comment asserted a number three times
+    // and was wrong three times (one, then two, then three), which is what a
+    // number in a comment does - so what is written here is the test a field
+    // has to pass, and the reader greps:
+    //
+    //   a field belongs here when the PEER decides its PRESENCE OR ITS SHAPE
+    //   on the wire from g_clientVersion - alone, or min'd with
+    //   servedVersion(). Mentions of g_clientVersion that only pick a REFUSAL
+    //   TEXT, or answer "may this client ask for that at all", do not qualify:
+    //   nothing in the byte stream moves, so no offset can shift. (An earlier
+    //   version of this sent the reader to `grep g_clientVersion core/serve.cpp`
+    //   and called the result the answer. It is not - most of those hits are
+    //   exactly the refusals this paragraph excludes.)
+    //
+    // Known members, as examples of the predicate rather than as a census:
+    // the LIST/SCAN group row's member sizes (putGroupEntryV3 sends them only
+    // to a client that announced 16), the MEASURE keyed reading (handleMeasure
+    // reads it only from a client that announced 15), and the META/TILE
+    // request TRAILERS (getTrailers picks the v12 flags-word form only when
+    // BOTH numbers are 12, and the two forms are DIFFERENT LENGTHS - so this
+    // one shifts every byte after it when it is wrong: review P2-2, pinned by
+    // selftest P9d, which is where the number lives now).
+    //
+    // Only setHelloVersionForTest can make the two numbers disagree today, and
+    // a seam that can desynchronise a parser is not a seam worth leaving armed.
+    int effectiveVersion() const { return std::min(peerVersion_, helloVersion_); }
     int port_ = 0;
     bool serveReaders_ = true;
     bool explainFailure_ = false;

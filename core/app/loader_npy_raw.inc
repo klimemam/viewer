@@ -205,6 +205,12 @@ struct RawDialog {
     bool open = false;
     bool forQueue = false;            // settings will be applied to every queued stack
     int queueCount = 0;               // stacks waiting on these settings (for the prompt)
+    // ...and the same thing for a folder on a PEER, which has its own parked
+    // Open (g_remoteRawStack in open_dispatch.inc). A separate flag rather than
+    // reuse of forQueue, because forQueue's Load and Cancel both reach into
+    // app.seqQueue - a remote folder is not in that queue, and sharing the flag
+    // would make one Open's Cancel drop the other's stacks.
+    bool forRemoteStack = false;
     std::string path;
     size_t fileSize = 0;
     int w = 1920, h = 1080, offset = 0;
@@ -221,7 +227,12 @@ static RawDialog g_folderRecipe;
 // published by drawRawModal each frame: ImGui::IsPopupOpen(name) needs a live
 // frame, and --browse-keys-selftest's action list runs between frames
 static bool g_rawPopupAlive = false;
-static void openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
+static bool openRawDialogFor(const std::string& path, uint64_t knownSize = 0);
+// ...and the other half of a recipe applied to a PEER's file. Defined in
+// open_dispatch.inc, where both cropInPlace and the park it falls back to are
+// in scope; declared here because the dialog's own Load is one of its callers.
+struct ImageDoc;
+static bool applyRecipeCropHere(bool on, int x, int y, int w, int h, ImageDoc* d);
 
 // The whole recipe, as the sentence that travels with the numbers it produced.
 //
@@ -280,12 +291,14 @@ static std::string rawRecipeNote(const RawDialog& d, int cfa, int cfaPattern) {
 // therefore applies to what came back, not to what was fetched.
 static rp::RawWire rawWireFrom(const RawDialog& d) {
     rp::RawWire w{};
-    w.dtype = (uint32_t)std::clamp(d.dtype, 0, RD_COUNT - 1);
-    w.interp = (uint32_t)std::clamp(d.interp, 0, RI_COUNT - 1);
-    w.w = (uint32_t)std::max(1, d.w);
-    w.h = (uint32_t)std::max(1, d.h);
-    w.offset = (uint32_t)std::max(0, d.offset);
-    w.flags = d.littleEndian ? rp::RW_LITTLE_ENDIAN : 0u;
+    // rawWireOf (core/app/state.h) and not a second assignment of the same six
+    // fields: a follow-up request rebuilds the recipe from a FrameSource
+    // through that function, and two spellings of one struct are two places to
+    // forget the endian flag. The clamps stay here because only a DIALOG can
+    // hold an out-of-range index - a source was written from a wire that was
+    // already checked.
+    rawWireOf(std::clamp(d.dtype, 0, RD_COUNT - 1), std::clamp(d.interp, 0, RI_COUNT - 1),
+              d.w, d.h, d.offset, d.littleEndian, d.cfaPattern, w);
     return w;
 }
 
@@ -586,6 +599,47 @@ static bool rawDialogIsRemote(const RawDialog& d) {
     return hasUrlScheme(d.path);
 }
 
+// CAN A CROPPING RECIPE OPEN A REMOTE FOLDER AS ONE STACK? No, and this is the
+// only place that decides it. Returns the refusal, or "" when there is nothing
+// to refuse.
+//
+// WHY, truthfully. The crop is not on the wire (3.2: the peer serves the bytes a
+// reading asks for, and a crop is a view of what came back), so it is finished
+// on this side by cropInPlace - against a document that has LANDED. A folder
+// stack's members land one at a time, afterwards, so a crop applied at the
+// stack's head reaches the head and nothing else.
+//
+// And NOTHING DOWNSTREAM NOTICES. That is the whole of the danger, and the
+// first version of this comment got it backwards by claiming the stack's own
+// shape check would refuse the members: it refuses none of them.
+// attachRemoteStack takes si.refW/refH/refCh from the head's remoteFullW/H/Ch -
+// the dimensions the PEER's META reported - and cropInPlace changes S.w/S.h and
+// the crop origin while leaving remoteFull* exactly as it was. So the reference
+// shape stays the uncropped one, every member matches it, stackShapeRefusal
+// agrees every time, and the result is a stack wearing the face of a complete
+// one whose first frame is a 4x4 window and whose others are whole 8x6 frames.
+// A broken stack that says nothing is worse than a refusal, which is why this
+// is a refusal.
+//
+// ONE DECIDER, TWO MOMENTS. The crop becomes known either from a binding
+// (before anything opens) or from the dialog the operator just filled in (at
+// Load). Those are two entry points, not two judgments - so both ask this, and
+// the rule and its reason exist once. Having the check in only one of them was
+// worse than having it in neither: the same folder refused on the second open
+// (the binding) what it had quietly half-applied on the first (the dialog).
+static std::string remoteStackCropRefusal(bool cropOn, int cropW, int cropH,
+                                          const std::string& headName,
+                                          size_t frames, size_t sizeBytes) {
+    if (!cropOn || cropW <= 0 || cropH <= 0) return std::string();
+    return headName + ": this recipe crops, and a cropped recipe cannot open a "
+           "remote folder as ONE stack - the crop is applied to a frame that has "
+           "landed, so it would reach the first of " + std::to_string(frames) +
+           " frame(s) and none of the others, and nothing downstream would say so"
+           "\n  clear the crop to open the stack, or open one frame on its own and "
+           "crop that (the recipe for " + std::to_string(sizeBytes) +
+           "-byte files is yours to change in the recipe panel)";
+}
+
 static std::string rawDialogAccept(RawDialog& d) {
     // ONE branch, at the landing. The dialog itself is not taught about peers:
     // rawGuessDims works from a byte count, and a byte count is a byte count on
@@ -593,12 +647,33 @@ static std::string rawDialogAccept(RawDialog& d) {
     // the same six fields to be asked for, and the two would drift.
     std::string err;
     if (rawDialogIsRemote(d)) {
+        // ...and the one judgment a remote FOLDER's dialog has to pass before
+        // anything opens. Returning non-empty leaves the dialog standing with
+        // this message and the park intact (core/ui/canvas.inc's Load branch),
+        // so the operator clears the crop and presses Load again - and because
+        // nothing opened, nothing was bound either, which is what kept the
+        // second open of the same folder from being refused for a recipe this
+        // one quietly made.
+        if (d.forRemoteStack) {
+            const std::string no = remoteStackCropRefusal(
+                d.cropOn, d.cropW, d.cropH, baseName(d.path),
+                app.remoteRawStack.files.size(), d.fileSize);
+            if (!no.empty()) return no;
+        }
         const rp::RawWire rw = rawWireFrom(d);
         // openRemote SAYS what it did (toasts on refusal), so a bare false is
         // not silence - but this call site still needs a non-empty string to
         // mean "the binding does not happen", which is the rule below.
         err = openRemote(d.path, false, 0, 0, &rw) ? std::string()
                                                    : std::string("could not open " + d.path);
+        // THE CROP IS NOT ON THE WIRE (§3.2: the peer serves bytes, not a view
+        // of them), so six of the dialog's fields travelled and the crop did
+        // not - the file opened whole while the dialog that opened it said
+        // crop. Finished here, with the one call the session restore already
+        // makes for the identical reason.
+        if (err.empty())
+            applyRecipeCropHere(d.cropOn, d.cropX, d.cropY, d.cropW, d.cropH,
+                                app.images.empty() ? nullptr : app.images.back().get());
     } else {
         err = loadRaw(d);
     }
@@ -619,6 +694,17 @@ static std::string rawRecipeReinterpretCurrent(const RawRecipe& r) {
     if (!im) return "no image is open";
     if (im->src->rawDtype < 0 || im->src->path.empty())
         return "this document did not come in through the headerless dialog";
+    // ...and it must be on THIS disk. Over a link the re-read is a round trip
+    // that appends a document - openRemote has no in-place landing - so the
+    // replaceIdx contract below cannot be honoured, and decodeRawFrame would
+    // simply fail to open a path spelled "ssh://...". Refused BY NAME, with the
+    // door that does work, rather than left to say "cannot open ssh://host/x.raw"
+    // about a file the peer is serving perfectly well
+    // (docs/features/remote/remote-headerless-design.md 7.2 named this as the
+    // remaining piece; it is still unbuilt, and now it says so).
+    if (hasUrlScheme(im->src->path))
+        return "re-reading in place is not wired over a link yet - close this "
+               "frame and open it again from Browse, which asks for the geometry";
     RawDialog d;
     rawRecipeIntoDialog(r, d);
     d.path = im->src->path;

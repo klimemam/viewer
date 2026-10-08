@@ -163,11 +163,37 @@ const std::vector<Backend>& backends();
 // bytes yet. What actually decodes is still decided by the content (`decode`).
 bool peerServes(const std::string& path);
 
+// WHICH END is refusing. For every format but a headerless one the answer is
+// the same sentence either way - "this build has no decoder for it" is a fact
+// about the build, and both ends run this one. A headerless file is the
+// exception, and the reason is protocol 11: the wire CARRIES a recipe, so the
+// only thing that can be missing is a recipe in THIS request, and what to do
+// about that depends on who noticed. The peer noticing means the client that
+// called it is too old; the client noticing means the operator has not said
+// the shape yet, and the ways to say it are this build's own doors.
+//
+// One enum rather than two functions, so the two sentences are built in one
+// place and cannot drift into two spellings of one fact (#148's rule applied
+// to a refusal). imagefile.cpp holds both because it is a translation unit
+// BOTH BINARIES COMPILE - not the only one (remote.cpp and plugin_host.cpp are
+// too), but the one that already owns what a format is, which is the same
+// reason 4.2 moved the headerless extension table here.
+enum class RefusedBy { Client, Peer };
+
 // Why the peer will not serve it, as a sentence; "" when it will. The reason a
 // format is refused over the link is not always the reason it is refused here -
 // vendor RAW is READ on this machine - so the sentence is built where the
 // column that knows lives, in the register of docs/features/adapters/input-adapters.md §3.2.
-std::string peerRefusal(const std::string& path);
+std::string peerRefusal(const std::string& path, RefusedBy by = RefusedBy::Client);
+
+// The NAMING half of a headerless refusal, on its own - "a headerless .raw
+// carries no header to state its shape, and this request carried no recipe".
+// Published because there is a THIRD road that has to say it and cannot use
+// either sentence above: the command line, whose way out is its own flags
+// (core/app/cli.inc). Three ways out, one lead-in, built here - which is the
+// whole rule this enum exists to keep (#148 applied to a refusal, and the
+// review found cli.inc had quietly grown a second spelling of it).
+std::string headerlessLead(const std::string& path);
 
 // Which format the NAME claims (extension, lower-cased). Null = not one of ours,
 // and the caller falls through to whatever it did before. This is dispatch, not

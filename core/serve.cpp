@@ -1056,16 +1056,60 @@ static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
         // the loser of the race simply overwrites with the same content.
         const std::string tmp = memberPath + ".part" +
                                 std::to_string((unsigned long long)(uintptr_t)&n);
+        // ...and the temp goes away on EVERY exit, saying so if it cannot.
+        // PR #285's discipline, which this door was next to and did not have:
+        // a write that failed used to `return false` straight out of the block
+        // below and leave `<member>.part<n>` in the peer's cache for ever, in
+        // silence - and silence is what made the reader's version of this leak
+        // take two review rounds to name. The three cases are the same three
+        // (an error, gone-but-still-there, an ordinary drop that is traced
+        // anyway because a silent success cannot prove the path ran), and
+        // nothing is said when there is no file, which is every exit above.
+        struct NpzTemp {
+            std::string p;
+            bool keep = false, dropped = false;
+            void drop(const char* where) {
+                if (keep || dropped || p.empty()) return;
+                dropped = true;
+                std::error_code be;
+                const bool was = std::filesystem::exists(std::filesystem::u8path(p), be);
+                std::error_code e;
+                std::filesystem::remove(std::filesystem::u8path(p), e);
+                std::error_code ae;
+                const bool still = std::filesystem::exists(std::filesystem::u8path(p), ae);
+                if (e)
+                    fprintf(stderr, "viewer-serve: npz member temp %s could not be "
+                                    "removed (%s): %s\n", p.c_str(), where,
+                            e.message().c_str());
+                else if (was && still)
+                    fprintf(stderr, "viewer-serve: npz member temp %s removed WITHOUT "
+                                    "ERROR and is still there (%s)\n", p.c_str(), where);
+                else if (was)
+                    fprintf(stderr, "viewer-serve: npz member temp %s dropped (%s)\n",
+                            p.c_str(), where);
+            }
+            ~NpzTemp() { drop("backstop"); }
+        } ntemp{ tmp };
         {
             std::ofstream f(std::filesystem::u8path(tmp), std::ios::binary);
-            if (!f) { err = "cannot write into this peer's cache"; return false; }
+            if (!f) {
+                ntemp.drop("cache not writable");
+                err = "cannot write into this peer's cache";
+                return false;
+            }
             f.write((const char*)member.data(), (std::streamsize)member.size());
-            if (!f) { err = "cannot write into this peer's cache"; return false; }
+            if (!f) {
+                f.close();                      // before the unlink, not after
+                ntemp.drop("write failed");
+                err = "cannot write into this peer's cache";
+                return false;
+            }
         }
         std::filesystem::rename(std::filesystem::u8path(tmp),
                                 std::filesystem::u8path(memberPath), ec);
+        if (!ec) ntemp.keep = true;             // it is the member now, not a temp
         if (ec) {
-            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            ntemp.drop("rename failed");
             err = "cannot place the member in this peer's cache";
             return false;
         }
@@ -1091,7 +1135,13 @@ static bool openServed(ServedFile& n, const std::string& path, std::string& err,
     // asked, so it is refused - the mirror of openPicture's declared-reading
     // refusal, and for the identical reason.
     if (!isNpySuffix(path) && imagefile::isHeaderless(path)) {
-        if (!rw) { err = imagefile::peerRefusal(path); return false; }
+        // THE PEER's half of the protocol-11 refusal. Said with RefusedBy::Peer
+        // because only the peer can know which half applies: the client that
+        // sent this request did not put a recipe in it, so the sentence names
+        // the build at the other end rather than the doors of this one (which
+        // a peer has none of). One function, two sentences -
+        // core/imagefile.h RefusedBy.
+        if (!rw) { err = imagefile::peerRefusal(path, imagefile::RefusedBy::Peer); return false; }
         if (read != NR_NATIVE) {
             err = "a declared .npy reading does not apply to a headerless file";
             return false;
@@ -1128,14 +1178,22 @@ static bool readRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& ou
 // carries a recipe, so a listing that hid it would say "there is nothing here"
 // about a folder the very next double-click opens (verify-matrix G1 / #148).
 //
-// GATED ON THE CLIENT'S OWN NUMBER, not on this peer's. A v10 client cannot
-// send a recipe, so a group row of .raw files would arrive somewhere it cannot
-// be opened - a listing offering an open that is refused is the defect this
-// gate exists to avoid, pointed the other way. g_clientVersion is what HELLO
-// left behind, so no new plumbing is needed: the fact was already here.
+// GATED ON THE CLIENT'S OWN NUMBER - that is the half that was easy to miss. A
+// v10 client cannot send a recipe, so a group row of .raw files would arrive
+// somewhere it cannot be opened, and a listing offering an open that is refused
+// is the defect this gate exists to avoid, pointed the other way.
+// g_clientVersion is what HELLO left behind, so no new plumbing is needed: the
+// fact was already here.
+//
+// ...and on this peer's, for the reason every other row-shaping gate here has
+// both terms: a peer told to behave as an older one (VIEWER_SERVE_PROTOCOL)
+// must not put a row in the reply that its announced number predates, or the
+// seam tests a peer that could not exist. Being one-sided only showed up under
+// that env var, which is exactly where nobody looks (this round's sweep (iii)).
 static bool isScannableSuffix(const std::string& name) {
     if (isServedSuffix(name)) return true;
-    return g_clientVersion >= 11 && imagefile::isHeaderless(name);
+    return servedVersion() >= 11 && g_clientVersion >= 11 &&
+           imagefile::isHeaderless(name);
 }
 
 
@@ -1208,10 +1266,46 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 
 // ---- numbered-sequence grouping ------------------------------------------
 
+// std::filesystem::file_size returns (uintmax_t)-1 on failure, and a size that
+// reaches the client is quoted back at a person: a row that could not be statted
+// used to make the headerless refusal say "18446744073709551615 bytes" (review
+// P3-8). 0 is what every other unknown size on this wire is.
+//
+// EVERY SIZE THAT LEAVES THIS PEER GOES THROUGH HERE, and the rule is the
+// predicate, not a tally: a file_size whose result is WRITTEN INTO A REPLY
+// calls this; one that is only compared against inside this process does not
+// have to (and the two that do not are each correct another way - one has the
+// ternary inline, the other quotes its number only inside `!ec`). An earlier
+// version of this paragraph counted the sites instead, and the count was
+// wrong in both directions.
+//
+// The round that added this did the group row's sum and extremes and missed
+// the one that mattered most: a SINGLE row's size is the input to both of the
+// client's readers of this fact (remoteRawSameSizeIn's per-name map, and
+// remoteRawFileSize, which keys #166's binding), so an unguarded stat there
+// put the same number in the same sentence (review P3-1). The v2 row went the
+// same way.
+//
+// The client's 0-byte refusal names the file when the listing let it - a
+// single row names itself, a group row carries only its extremes - and says
+// which folder when it cannot. This comment used to promise the name
+// unconditionally, which was the same over-claim one layer up.
+static uint64_t fileSizeOr0(const std::filesystem::path& p, std::error_code& ec) {
+    const std::uintmax_t n = std::filesystem::file_size(p, ec);
+    return ec || n == static_cast<std::uintmax_t>(-1) ? 0u : (uint64_t)n;
+}
+
 struct SeqGroup {
     std::string pattern;                // frame_###.npy - display name
     std::vector<std::string> names;     // member file names, numeric order
     uint64_t bytes = 0;                 // sum over members
+    // ...and the two numbers the sum cannot reconstruct (protocol 16). A
+    // headerless folder may only be opened as one stack when every member is
+    // the same length, and the sum of 108/110/106 is the sum of 108/108/108 -
+    // so the client needs the extremes, and needs them in the SAME round trip
+    // (a LIST per member is a round trip per frame). min/max rather than one
+    // "uniform" bit because the client's refusal quotes the real numbers.
+    uint64_t minBytes = 0, maxBytes = 0;
     int64_t mtime = 0;                  // newest member
     std::filesystem::path first;        // header peek target
 };
@@ -1323,11 +1417,16 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
         } else {
             g.pattern = fallbackPattern;      // degenerate bucket: stage-1 view
         }
+        bool first = true;
         for (size_t i : mem) {
             g.names.push_back(files[i].first);
             used[i] = 1;
             std::error_code ec;
-            g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, ec);
+            const uint64_t sz = fileSizeOr0(files[i].second, ec);
+            g.bytes += sz;
+            g.minBytes = first ? sz : std::min(g.minBytes, sz);
+            g.maxBytes = first ? sz : std::max(g.maxBytes, sz);
+            first = false;
             g.mtime = std::max(g.mtime, unixMtime(files[i].second));
         }
         // "????.npy" says nothing; "0000..0003.npy" says what the stack is. The
@@ -1339,7 +1438,9 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
         // rule was enforced only downward (a newer client updates an older
         // peer); this is the mirror case, and the peer is the only end that
         // can act on it.
-        if (frameAxis >= 0 && g_clientVersion >= 5)
+        // ...and on this peer's number too, same rule as every other gate that
+        // shapes a row: a peer announcing 4 must not put v5 text in the reply.
+        if (frameAxis >= 0 && servedVersion() >= 5 && g_clientVersion >= 5)
             g.pattern = rp::patternWithExtent(g.pattern, g.names);
         g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
@@ -1448,6 +1549,16 @@ static void putGroupEntryV3(Buf& out, const SeqGroup& g, int& peekBudget) {
     }
     out.putU32((uint32_t)g.names.size());
     for (const auto& nm : g.names) out.putStr(nm);
+    // Protocol 16, appended after the names so a pre-16 client's reply is byte
+    // for byte what it was. Gated on BOTH numbers, as the reader door is: the
+    // client must be able to parse it, and a peer told to behave as an older
+    // one (VIEWER_SERVE_PROTOCOL) must not send a field that number predates.
+    if (servedVersion() >= 16 && g_clientVersion >= 16) {
+        out.putU32((uint32_t)(g.minBytes & 0xFFFFFFFFu));
+        out.putU32((uint32_t)(g.minBytes >> 32));
+        out.putU32((uint32_t)(g.maxBytes & 0xFFFFFFFFu));
+        out.putU32((uint32_t)(g.maxBytes >> 32));
+    }
 }
 
 static void handleList(Buf& in) {
@@ -1467,7 +1578,13 @@ static void handleList(Buf& in) {
               [](const std::filesystem::directory_entry& a, const std::filesystem::directory_entry& b) {
                   return a.path().filename().u8string() < b.path().filename().u8string();
               });
-    if (g_clientVersion < 3) {
+    // BOTH TERMS, as putGroupEntryV3's own gate has. The client must be able
+    // to parse the shape AND a peer told to behave as an older one
+    // (VIEWER_SERVE_PROTOCOL) must not send a shape that number postdates -
+    // otherwise the seam tests a peer that cannot exist, which is the one thing
+    // the seam is for. The client reads this with effectiveVersion(), the
+    // minimum of the two, so the three numbers agree.
+    if (!(servedVersion() >= 3 && g_clientVersion >= 3)) {
         out.putU32((uint32_t)entries.size());
         for (auto& e : entries) {
             std::error_code e2;
@@ -1477,7 +1594,7 @@ static void handleList(Buf& in) {
             // 64-bit size as lo/hi: a 300-frame 12-bit 4K stack file passes 4 GB
             // routinely, and a silently clamped size is the failure mode this tool
             // exists to avoid
-            uint64_t sz = dir ? 0 : (uint64_t)e.file_size(e2);
+            uint64_t sz = dir ? 0 : fileSizeOr0(e.path(), e2);
             out.putU32((uint32_t)(sz & 0xFFFFFFFFu));
             out.putU32((uint32_t)(sz >> 32));
         }
@@ -1516,7 +1633,7 @@ static void handleList(Buf& in) {
         } else if (r.kind == 1) {
             const auto& f = files[r.idx];
             putListEntryV3(out, f.second, r.name, false,
-                           (uint64_t)std::filesystem::file_size(f.second, e2),
+                           fileSizeOr0(f.second, e2),
                            unixMtime(f.second), peekBudget);
         } else {
             putGroupEntryV3(out, groups[r.idx], peekBudget);
@@ -1722,10 +1839,20 @@ static void handleScan(Buf& in) {
             } else {
                 g.pattern = files[mem[0]].first;
             }
+            bool firstMem = true;
             for (size_t i : mem) {
                 g.names.push_back(files[i].first);
+                // ...and the extremes, which this fold left at 0 - so every
+                // group SCAN produced announced min = max = 0 and the client's
+                // headerless check refused it as "0 bytes" rather than opening
+                // it. The measured half of the row has to be measured on every
+                // road that builds one (review P2-1).
                 std::error_code e2;
-                g.bytes += (uint64_t)std::filesystem::file_size(files[i].second, e2);
+                const uint64_t sz = fileSizeOr0(files[i].second, e2);
+                g.bytes += sz;
+                g.minBytes = firstMem ? sz : std::min(g.minBytes, sz);
+                g.maxBytes = firstMem ? sz : std::max(g.maxBytes, sz);
+                firstMem = false;
                 g.mtime = std::max(g.mtime, unixMtime(files[i].second));
             }
             g.first = files[mem.front()].second;

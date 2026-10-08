@@ -794,6 +794,14 @@ static void printUsage() {
 static void parseCli(int argc, char** argv) {
     RawDialog d;                       // accumulates --raw-* options for positional raw files
     bool rawReady = false, cliQuad = false;
+    // --raw-size on its own, tracked apart from rawReady. GEOMETRY is the one
+    // thing that cannot be defaulted for a headerless file - dtype and
+    // interpretation have the same defaults the dialog opens with - so a url
+    // given a size IS a complete declaration and may cross the link, while the
+    // LOCAL branch keeps its old meaning (rawReady) and still raises the dialog.
+    // The two are separate because they answer different questions: "is there
+    // enough here to decode" and "did the operator state a shape at all".
+    bool rawSizeGiven = false;
     bool haveZoom = false, haveCenter = false;
     float zoom = 1, cx = 0, cy = 0;
     int cliCompare = -1;
@@ -827,6 +835,7 @@ static void parseCli(int argc, char** argv) {
             if (x != std::string::npos) {
                 d.w = std::clamp(atoi(v.substr(0, x).c_str()), 1, 32768);
                 d.h = std::clamp(atoi(v.substr(x + 1).c_str()), 1, 32768);
+                rawSizeGiven = true;
             }
         } else if (a == "--raw-crop") {            // x,y,WxH
             std::string v = next();
@@ -1088,7 +1097,33 @@ static void parseCli(int argc, char** argv) {
                            // line is for the files that carry none
                            imagefile::forPath(a) != nullptr;
             const bool isUrl = hasUrlScheme(low);
-            if (!special && rawReady && isUrl) {
+            // A headerless url with NO declaration at all. Refused BY NAME,
+            // here, rather than left to the door: the command line is the
+            // non-interactive road, and 5.5's judgment was that naming the
+            // flags beats raising a dialog nobody is sitting in front of. The
+            // Browse door raises one (openRemoteRawDeclared), which is what
+            // makes this refusal cheap to obey rather than a dead end - 10's
+            // revisit key for this row, now met.
+            if (!special && isUrl && !rawReady && !rawSizeGiven &&
+                imagefile::isHeaderless(a) && isPeerUrl(a)) {
+                // The lead-in comes from imagefile (one spelling for all three
+                // roads); only the WAY OUT is this one's, and for a command
+                // line the way out is a flag.
+                const std::string why =
+                    a + ": " + imagefile::headerlessLead(a) +
+                    "\n  state the geometry with --raw-size WxH (and --raw-dtype / "
+                    "--raw-interp when it is not u8 gray), or open it from the "
+                    "Browse panel - that door asks";
+                // BOTH ROADS. stderr is for the scripted run; the toast is for
+                // the one nobody typed - a desktop shortcut, a file
+                // association, a double-clicked .raw - where the GUI build's
+                // stderr is a console no human will ever read. #268 is this
+                // project's record of what that silence costs: a refusal that
+                // only reaches stderr is, from the operator's chair, a viewer
+                // that opened nothing and said nothing (review P3-3).
+                fprintf(stderr, "%s\n", why.c_str());
+                toast(why, true);
+            } else if (!special && (rawReady || rawSizeGiven) && isUrl) {
                 // A headerless file on a PEER, declared on the command line.
                 // The same six numbers the local branch below would decode
                 // with, put on the wire (protocol 11) instead of applied here:
@@ -1099,6 +1134,17 @@ static void parseCli(int argc, char** argv) {
                 const rp::RawWire rw = rawWireFrom(d);
                 if (!openRemote(a, false, 0, 0, &rw))
                     fprintf(stderr, "could not open %s\n", a.c_str());
+                // ...and --raw-crop, which is NOT one of the six numbers on
+                // the wire: a crop is a view of what came back, so it is
+                // finished here exactly as the dialog's Load and the session
+                // restore finish theirs (applyRecipeCropHere). The local
+                // branch below gets it from loadRaw; this branch dropped it,
+                // which made `--raw-crop` a flag that worked on one disk and
+                // was ignored on the other without a word.
+                else
+                    applyRecipeCropHere(d.cropOn, d.cropX, d.cropY, d.cropW, d.cropH,
+                                        app.images.empty() ? nullptr
+                                                           : app.images.back().get());
             } else if (!special && rawReady) {   // raw params given: load directly, no dialog
                 if (cliQuad && RAW_INTERP_CH[d.interp] == 1) d.interp = RI_QUAD;
                 d.path = a;
