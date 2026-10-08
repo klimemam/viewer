@@ -2292,20 +2292,11 @@ static std::string mergedStackName(const std::vector<App::PendingGroup>& sel) {
                tolower((unsigned char)p[n]) == tolower((unsigned char)g.name[n])) n++;
         p.resize(n);
     }
-    // ...so cut back to a whole character. Walk off the continuation bytes to
-    // whatever starts the last sequence, and drop that sequence entirely if the
-    // prefix stopped before its end.
-    {
-        size_t k = p.size();
-        while (k > 0 && ((unsigned char)p[k - 1] & 0xC0) == 0x80) k--;
-        if (k > 0 && ((unsigned char)p[k - 1] & 0x80)) {
-            const unsigned char c = (unsigned char)p[k - 1];
-            const size_t want = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4;
-            if (p.size() - (k - 1) != want) p.resize(k - 1);
-        } else if (k != p.size()) {
-            p.resize(k);          // continuation bytes with no lead: all orphans
-        }
-    }
+    // ...so cut back to a whole character. ONE spelling of that, in util.inc,
+    // because the same mistake turned up in a second place (a unit truncated
+    // into a 16-byte field) and two copies of this would have been two places
+    // to get it wrong.
+    utf8CutToBoundary(p);
     while (!p.empty() && strchr("?*_-/. ", p.back())) p.pop_back();
     // BYTES, and the comment used to call them characters (review round 6).
     // The test is "is there anything here worth putting on a row", and three

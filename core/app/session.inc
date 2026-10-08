@@ -921,7 +921,10 @@ static std::string fontBakeCrumbPath() {
     const std::string dir = viewerConfigDir();
     return dir.empty() ? std::string() : dir + "/font-baking";
 }
-// EVERY LINE CARRIES THE PID THAT WROTE IT: "<pid> <path>".
+// EVERY LINE CARRIES THE PID THAT WROTE IT, and a death count:
+// `<pid>[#<deaths>] <path>`. The format is stated once, where it is parsed
+// (fontBakeParse, below); this heading had kept the first version of it
+// (review round 7 P3).
 //
 // Two windows can run at once and they share this file, so a bare list of paths
 // is wrong in both directions. A reads its crumb while B is mid-bake and would
@@ -1035,31 +1038,61 @@ static std::vector<FontBakeLine> fontBakeCrumbLines() {
 // in fontBakeCrumbPath() - so it is now the end state rather than the thing to
 // avoid.
 static const int kFontBakeDeathsMax = 2;
-// The paths this start must NOT bake.
-static std::vector<std::string> fontBakeCrumbRead() {
-    std::vector<std::string> out;
+// ---- WHAT THE EVIDENCE SAYS, PER PATH - and ONE function says it ----------
+//
+// `deaths` is the count this path will carry ONCE THIS START HAS ACCOUNTED what
+// it just read. Every user of the breadcrumb needs that same number, and before
+// this they each computed their own: `fontBakeCrumbForever` read `deaths` off
+// the line while `fontBakeCrumbAccount` wrote `deaths + 1`, so the start that
+// recorded the SECOND death told the user "not used this time, it will be tried
+// again" - and then no start ever tried it again. One off, and the two halves
+// of one sentence disagreeing (review round 7).
+//
+// A DEATH IS COUNTED PER LINE, not per path. Two starts can die on one file
+// before either is accounted - two windows, or a crash during the retry - and
+// taking the maximum of their counts made that one death, which let a file kill
+// three starts while the policy above promises two (review round 7 P3).
+struct FontBakeEvidence {
+    std::string path;
+    int deaths = 0;        // after this start accounts what it has read
+    bool fresh = false;    // at least one of those deaths is not yet a record
+};
+static std::vector<FontBakeEvidence> fontBakeCrumbEvidence() {
+    std::vector<FontBakeEvidence> out;
     const unsigned long me = currentPid();
+    auto at = [&out](const std::string& p) -> FontBakeEvidence& {
+        for (FontBakeEvidence& e : out) if (e.path == p) return e;
+        out.push_back(FontBakeEvidence{ p, 0, false });
+        return out.back();
+    };
     for (const FontBakeLine& L : fontBakeCrumbLines()) {
         // Our own line cannot be evidence: this process is the one baking, and
         // it has not finished yet. Nor can a live other window's.
         if (L.who == me) continue;
         if (L.who != 0 && pidAlive(L.who)) continue;
-        // ...and a record of exactly one death is the RETRY. Not skipping here
-        // is the whole of the round-6 fix: without this line the file is either
-        // skipped for ever or re-baked on every other start.
-        if (L.who == 0 && L.deaths < kFontBakeDeathsMax) continue;
-        if (std::find(out.begin(), out.end(), L.path) == out.end()) out.push_back(L.path);
+        FontBakeEvidence& e = at(L.path);
+        if (L.who == 0) { e.deaths = std::max(e.deaths, L.deaths); continue; }
+        e.deaths = std::max(e.deaths, L.deaths) + 1;
+        e.fresh = true;
     }
     return out;
 }
-// ...and the subset of those that will never be tried again, which is a
-// different sentence on screen and so a different list here.
+// The paths this start must NOT bake: a death nobody has acted on yet, or a
+// file that is finished with. A RECORD with no fresh death and fewer than
+// `kFontBakeDeathsMax` deaths is the RETRY, and leaving it out of this list is
+// what makes the policy converge instead of either looping or giving up.
+static std::vector<std::string> fontBakeCrumbRead() {
+    std::vector<std::string> out;
+    for (const FontBakeEvidence& e : fontBakeCrumbEvidence())
+        if (e.fresh || e.deaths >= kFontBakeDeathsMax) out.push_back(e.path);
+    return out;
+}
+// ...and the subset that will never be tried again, which is a different
+// sentence on screen and so a different list here.
 static std::vector<std::string> fontBakeCrumbForever() {
     std::vector<std::string> out;
-    for (const FontBakeLine& L : fontBakeCrumbLines()) {
-        if (L.who != 0 || L.deaths < kFontBakeDeathsMax) continue;
-        if (std::find(out.begin(), out.end(), L.path) == out.end()) out.push_back(L.path);
-    }
+    for (const FontBakeEvidence& e : fontBakeCrumbEvidence())
+        if (e.deaths >= kFontBakeDeathsMax) out.push_back(e.path);
     return out;
 }
 static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
@@ -1117,26 +1150,24 @@ static void fontBakeCrumbAccount() {
     if (p.empty()) return;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    const std::vector<FontBakeEvidence> ev = fontBakeCrumbEvidence();
+    bool fresh = false;
+    for (const FontBakeEvidence& e : ev) if (e.fresh) fresh = true;
+    if (!fresh) return;                  // nothing new: leave the file alone
+    // The lines that are NOT evidence are the ones that stay as they are: this
+    // process's own in-flight line, and other live windows'.
     const unsigned long me = currentPid();
     std::vector<std::string> keep;
-    std::vector<std::pair<std::string, int>> rec;       // path -> deaths, first-seen order
-    bool fresh = false;
-    auto note = [&](const std::string& path, int deaths) {
-        for (auto& r : rec) if (r.first == path) { r.second = std::max(r.second, deaths); return; }
-        rec.push_back({ path, deaths });
-    };
-    for (const FontBakeLine& L : fontBakeCrumbLines()) {
-        if (L.who == me || (L.who != 0 && pidAlive(L.who))) { keep.push_back(L.raw); continue; }
-        if (L.who == 0) { note(L.path, L.deaths); continue; }   // already a record
-        note(L.path, L.deaths + 1);                             // a death, counted now
-        fresh = true;
-    }
-    if (!fresh) return;                  // nothing new: leave the file alone
-    if (keep.empty() && rec.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    for (const FontBakeLine& L : fontBakeCrumbLines())
+        if (L.who == me || (L.who != 0 && pidAlive(L.who))) keep.push_back(L.raw);
+    // No "remove the file" branch: `fresh` is true, so the evidence is not
+    // empty, so there is at least one record to write. The branch that used to
+    // be here could not be reached (review round 7 P3); the file is removed by
+    // fontBakeCrumbClear(), which is the function whose job that is.
     std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
     if (!f) return;
     for (const std::string& s : keep) f << s << "\n";
-    for (const auto& r : rec) f << "0#" << r.second << " " << r.first << "\n";
+    for (const FontBakeEvidence& e : ev) f << "0#" << e.deaths << " " << e.path << "\n";
 }
 // OUR LINES ONLY. A second window finishing its bake must not delete the
 // breadcrumb this one is still flying on.
@@ -1145,20 +1176,15 @@ static void fontBakeCrumbClear() {
     if (p.empty()) return;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    // THROUGH THE ONE PARSER, which is what the heading above claims and what
+    // this function used to disprove: it read the lines by hand, which is a
+    // second spelling of the format and treated a malformed line differently
+    // from every other reader (review round 7 P3).
     std::vector<std::string> keep;
     {
-        std::ifstream in(pathFromUtf8(p), std::ios::binary);
-        std::string line;
         const unsigned long me = currentPid();
-        while (std::getline(in, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-            if (line.empty()) continue;
-            const size_t sp = line.find(' ');
-            if (sp == std::string::npos) continue;
-            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
-            if (who == me) continue;                      // the lines we are clearing
-            keep.push_back(line);           // other windows' lines AND records
-        }
+        for (const FontBakeLine& L : fontBakeCrumbLines())
+            if (L.who != me) keep.push_back(L.raw);   // other windows' lines AND records
     }
     if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
     std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
@@ -1690,6 +1716,11 @@ static void loadPrefs() {
             // never silently becomes "lx" on an axis.
             if (!u.empty())
                 snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str());
+                // prefs.txt is outside this program and this field is 16 bytes,
+                // so the copy can stop inside a character. The Files panel
+                // would then report a '?' this program created with the one
+                // sentence that blames the disk (review round 7 P3).
+                utf8CutToBoundary(app.lin.unit);
         }
         else if (key == "gamma")       {
             double candidate = 0;

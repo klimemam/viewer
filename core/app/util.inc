@@ -31,11 +31,24 @@ struct FontChoice {
     // build's own candidates. The two need different advice: only one of them
     // has a line the user can delete (review P3).
     bool skippedWasOverride = false;
-    // ...and the paths that will NEVER be tried again, because they have each
-    // killed `kFontBakeDeathsMax` starts. A different fact from
-    // `skippedAfterCrash`, and a different sentence: one says "not this time",
-    // the other says "not again, and here is how to undo that" (review round 6
-    // P2). Empty whenever the skip is the ordinary one-start-ago kind.
+    // ...and the paths that were skipped, SPLIT BY WHICH SENTENCE THEY GET.
+    // Two facts, so two lists, so two groups on screen: "not used this time,
+    // it will be tried again" and "not tried any more, and here is how to undo
+    // that".
+    //
+    // THE SPLIT IS PER PATH AND THE MESSAGE READS IT PER PATH (review round 7
+    // P2). It used to be one bool - `!skippedForever.empty()` - choosing one
+    // sentence for the whole set, so a search that skipped one file for good
+    // and another for one start told the user that BOTH were finished with.
+    // The code knew the difference: tryPath decides it per path, a few lines
+    // below. Only the printing threw it away, which is the shape #281 closed
+    // ("the subject of the clause is on screen; the set that built it is not").
+    //
+    // These hold PATHS, not the decorated strings in `tried`: re-deriving them
+    // by searching `tried` for " (skipped: " is how the aggregate got read in
+    // the first place, and the fc-match arm's "fc-match ... -> /path" form made
+    // that parsing wrong twice.
+    std::vector<std::string> skippedOnce;
     std::vector<std::string> skippedForever;
 };
 // The override, as settings.jsonc / prefs.txt left it. Declared here rather
@@ -343,9 +356,13 @@ static bool looksLikeSfnt(const std::string& p) {
 // four paths the user never mentioned - and a path that is there but is not a
 // font says THAT, which is a different sentence and a different mistake.
 static std::vector<std::string> cjkMergeCandidates();   // fwd: the Chinese faces
-// `skip` is the breadcrumb's list: paths the LAST start died while baking, so
-// this start must not bake them again whatever else recommends them. Empty in
-// the ordinary case. See fontBakeCrumb* in session.inc for why this exists.
+// `skip` is the breadcrumb's list: every path this start must NOT bake, because
+// a start has died reading it. `forever` is the SUBSET of those that have died
+// `kFontBakeDeathsMax` times and will not be tried again at all - it changes no
+// decision here (a skip is a skip) and decides only WHICH SENTENCE the user
+// gets, which is why it is a separate list rather than a flag. Both are empty
+// in the ordinary case. See fontBakeCrumb* in session.inc for the policy and
+// for why "not again" is an end state rather than a thing to avoid.
 static FontChoice jpFontChoice(const std::string& want,
                                const std::vector<std::string>& skip = {},
                                const std::vector<std::string>& forever = {}) {
@@ -362,19 +379,21 @@ static FontChoice jpFontChoice(const std::string& want,
             // build has stopped offering it. `forever` is a subset of `skip`,
             // so the order here is "the stronger statement first".
             const bool perm = std::find(forever.begin(), forever.end(), p) != forever.end();
+            // Deduplicated as it is recorded: one path is reachable twice in a
+            // single search - as the override and again as a built-in
+            // candidate - and the sentence must name it once.
+            auto note = [&p](std::vector<std::string>& v) {
+                if (std::find(v.begin(), v.end(), p) == v.end()) v.push_back(p);
+            };
             if (perm) {
                 c.tried.push_back(p + " (skipped: it did not survive baking on "
                                       "two separate starts, so it is not tried "
                                       "again)");
-                // Deduplicated here for the same reason the message
-                // deduplicates below: one path is reachable twice in a single
-                // search - as the override and again as a built-in candidate.
-                if (std::find(c.skippedForever.begin(), c.skippedForever.end(),
-                              p) == c.skippedForever.end())
-                    c.skippedForever.push_back(p);
+                note(c.skippedForever);
             } else {
                 c.tried.push_back(p + " (skipped: the last start did not survive "
                                       "baking it)");
+                note(c.skippedOnce);
             }
             c.skippedAfterCrash = true;
             if (strcmp(how, "appearance.fontPath") == 0) c.skippedWasOverride = true;
@@ -479,11 +498,22 @@ static std::vector<std::string> cjkMergeCandidates() {
 // again at every subsequent start - the exact failure the breadcrumb exists to
 // end, surviving in the arm next to the one that was fixed.
 static std::string cjkMergeFontPath(const std::string& primary,
-                                    const std::vector<std::string>& skip = {}) {
+                                    const std::vector<std::string>& skip = {},
+                                    std::vector<std::string>* skipped = nullptr) {
     std::error_code ec;
     for (const std::string& m : cjkMergeCandidates()) {
         if (primary == m) continue;
-        if (std::find(skip.begin(), skip.end(), m) != skip.end()) continue;
+        if (std::find(skip.begin(), skip.end(), m) != skip.end()) {
+            // SAID, NOT DROPPED IN SILENCE (review round 7 P3). The breadcrumb
+            // can take the second face away, and the second face is the whole
+            // of the simplified-Chinese coverage on Windows - so losing it is a
+            // change the reader can see on their rows and had no sentence for.
+            // `mergeDropped` covers "it would not bake"; this covers "a start
+            // died while it was open and this one did not read it again", which
+            // is a different fact with a different way out.
+            if (skipped) skipped->push_back(m);
+            continue;
+        }
         if (std::filesystem::is_regular_file(pathFromUtf8(m), ec) && looksLikeSfnt(m))
             return m;
     }
@@ -585,6 +615,37 @@ std::string baseName(const std::string& p) {
 // Windows API takes '/' as readily as '\\', and a path copied out of here
 // pastes into Python, CMake and a shell unescaped. Storage is untouched: this
 // is display only.
+// ---- A BYTE PREFIX IS NOT A CHARACTER PREFIX -----------------------------
+// Cut a string back to the last WHOLE UTF-8 character, in one place, because
+// this program has now built an invalid name twice by taking a prefix in bytes:
+// mergedStackName's common prefix of two folder names, and a unit copied into
+// a fixed 16-byte field from prefs.txt. A name this program broke is reported
+// by the Files panel with the one sentence of §8c that says the bytes on disk
+// are at fault - so the program must not make one (review round 7 P3, and
+// round 6 for the first half).
+//
+// Walks off the continuation bytes to whatever starts the last sequence and
+// drops that sequence whole if the string stopped before its end. An invalid
+// lead byte (0xF8..0xFF) has no length, so it is dropped too.
+static void utf8CutToBoundary(std::string& p) {
+    size_t k = p.size();
+    while (k > 0 && ((unsigned char)p[k - 1] & 0xC0) == 0x80) k--;
+    if (k == 0) { if (!p.empty() && ((unsigned char)p[0] & 0xC0) == 0x80) p.clear(); return; }
+    const unsigned char c = (unsigned char)p[k - 1];
+    if (!(c & 0x80)) { if (k != p.size()) p.resize(k); return; }   // ASCII + orphans
+    const size_t want = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 :
+                        (c & 0xF8) == 0xF0 ? 4 : 0;
+    if (want == 0 || p.size() - (k - 1) != want) p.resize(k - 1);
+}
+// ...and the same for a fixed buffer, which is where the second instance came
+// from: snprintf truncates at a BYTE and says nothing about it.
+static void utf8CutToBoundary(char* buf) {
+    if (!buf) return;
+    std::string s(buf);
+    const size_t was = s.size();
+    utf8CutToBoundary(s);
+    if (s.size() != was) buf[s.size()] = '\0';
+}
 static std::string dispPath(std::string p) {
     std::replace(p.begin(), p.end(), '\\', '/');
     return p;
@@ -990,43 +1051,33 @@ static std::string cjkFontUnreadableText(const FontChoice& c) {
 // being overruled and only they can decide what to do about it.
 static std::string cjkFontCrashSkipText(const FontChoice& c,
                                         const std::string& crumbPath = {}) {
-    // Deduplicated: one path can be reached twice in a single search - as the
-    // override and again as a built-in candidate - and naming the same file
-    // twice in one sentence reads like two different problems.
-    std::vector<std::string> names;
-    for (const std::string& t : c.tried) {
-        // ANY skip reason, not one of them by its full text. There are two now
-        // ("the last start did not survive" and "two separate starts"), and
-        // matching the first one's whole sentence made the permanent case print
-        // "(unknown)" for a file it had just named (review round 6).
-        if (t.find(" (skipped: ") == std::string::npos) continue;
-        std::string one = t.substr(0, t.find(" (skipped:"));
-        // The fc-match arm records its answer as "fc-match ... -> /the/path",
-        // so the same file reached twice - once as a candidate and once as
-        // fontconfig's suggestion - escaped a dedupe that compared whole
-        // strings. Measured on the Ubuntu runner, where the message named
-        // DejaVu Sans twice. Compare the PATH.
-        if (const size_t arrow = one.rfind(" -> "); arrow != std::string::npos)
-            one = one.substr(arrow + 4);
-        if (std::find(names.begin(), names.end(), one) == names.end())
-            names.push_back(one);
-    }
-    std::string skipped;
-    for (const std::string& n : names) {
-        if (!skipped.empty()) skipped += "; ";
-        skipped += n;
-    }
-    // WHICH SENTENCE: "not this time" or "not again". They are different facts
-    // and the way out of the second one includes a file the first one has no
-    // reason to name (review round 6 P2).
-    const bool forever = !c.skippedForever.empty();
-    std::string s = forever
-        ? "this font has stopped start-up more than once, so it is no longer "
-          "tried: "
-        : "the last start did not survive reading this font, so it "
-          "was NOT used this time: ";
-    s += (skipped.empty() ? std::string("(unknown)") : skipped) +
-         ". This start is using " +
+    // ---- TWO FACTS, TWO GROUPS, READ PER PATH (review round 7 P2) ---------
+    // This used to build ONE list of every skipped path and then pick the
+    // sentence from `!skippedForever.empty()` - a property of the whole set.
+    // A search that skips one file for good and another for a single start
+    // then told the reader that both were finished with. The choice already
+    // decides it per path (tryPath, above); nothing here re-derives it.
+    auto join = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (const std::string& n : v) { if (!s.empty()) s += "; "; s += n; }
+        return s;
+    };
+    const std::string once = join(c.skippedOnce);
+    const std::string gone = join(c.skippedForever);
+    std::string s;
+    if (!once.empty())
+        s += "the last start did not survive reading " + once +
+             ", so it was NOT used this time - it will be tried once more on "
+             "the next start. ";
+    if (!gone.empty())
+        s += gone + " has stopped start-up more than once, so it is no longer "
+                    "tried. ";
+    // No "the record does not name which" arm: tryPath is the only thing that
+    // sets `skippedAfterCrash`, and it records the path in one of the two lists
+    // in the same breath, so one of them is non-empty whenever this function is
+    // called at all. An arm for a state that cannot arise is an arm nothing can
+    // check - see fontBakeCrumbAccount for the one this round removed.
+    s += "This start is using " +
          (c.path.empty() ? std::string("the built-in font") : c.path) +
          " instead.";
     // THE WAY OUT HAS TO EXIST. "delete that line" is an instruction, and it is
@@ -1034,8 +1085,7 @@ static std::string cjkFontCrashSkipText(const FontChoice& c,
     // user's own setting - there is no line to delete, and a reader who goes
     // looking for one learns nothing except that the message lies. Which case
     // this is, is known: `skippedWasOverride` is set where the skip happened.
-    // (Same type as the Files-panel defect this round: never print an
-    // instruction that cannot be carried out.)
+    // (Never print an instruction that cannot be carried out.)
     if (c.skippedWasOverride)
         s += " To fix it, point \"appearance.fontPath\" in settings.jsonc (or "
              "`fontPath` in prefs.txt) at a different file, or delete that line "
@@ -1045,14 +1095,19 @@ static std::string cjkFontCrashSkipText(const FontChoice& c,
              "you set - if it is broken, replace it, or name a different font "
              "with \"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
              "prefs.txt).";
-    // ...AND THE WAY BACK FROM "not again", which is the one the first version
-    // of this mechanism could not name and was refused for. It is a file, and
-    // its path is known, so the instruction can be carried out: deleting the
-    // record is how a user who has replaced the file says "try it again".
-    if (forever && !crumbPath.empty())
-        s += " It will not be offered again until that record is removed: "
-             "delete " + dispPath(crumbPath) +
-             " (or just the line naming this file).";
+    // ...AND THE WAY BACK FROM "not again" - WITH ITS PRECONDITION, which is
+    // the other half of "never print an instruction that cannot be carried
+    // out" (review round 7 P2). The instruction used to be a bare "delete
+    // <crumb>", and carrying it out deletes the death count as well: the loop
+    // that the count exists to stop starts over, which is the message telling
+    // the reader to spend two more crashes. It is a real way back, but only
+    // for somebody who has fixed the file, so it is said with that condition
+    // attached and with what it costs if the condition is false.
+    if (!gone.empty() && !crumbPath.empty())
+        s += " If you have REPLACED that file, delete the line naming it in " +
+             dispPath(crumbPath) + " and it will be tried again. Deleting that "
+             "record without replacing the file only spends the same two "
+             "crashes over again.";
     return s;
 }
 
@@ -1071,6 +1126,31 @@ static std::string cjkFontMergeDroppedText(const FontAtlasCost& c,
            "it at the next start.";
 }
 
+// ...and the SECOND FACE that the breadcrumb took away, which is not the same
+// sentence as "it would not bake" (cjkFontMergeDroppedText, just above).
+//
+// IT ALSO SAYS WHAT CANNOT BE KNOWN, and that is the point of it. Both faces
+// are handed to the atlas and read inside ONE Build(), so when a start dies
+// there is no way to tell which of the two files killed it: the breadcrumb
+// names both, and two deaths retire both. Retiring a face that may never have
+// been at fault is a real cost, and the honest thing is to name it where the
+// reader can act on it rather than to pick a guess and print it as a fact.
+static std::string cjkFontMergeSkippedText(const std::vector<std::string>& skipped,
+                                           const FontChoice& c) {
+    std::string names;
+    for (const std::string& n : skipped) {
+        if (!names.empty()) names += "; ";
+        names += n;
+    }
+    return "a second font was not read this time, because a start did not "
+           "survive reading it: " + names + ". " +
+           (c.path.empty() ? std::string("The font in use") : c.path) +
+           " is on its own, which draws Japanese correctly but has fewer "
+           "simplified-Chinese characters - some Chinese filenames will show "
+           "'?'. Both faces are read together, so a crash cannot be blamed on "
+           "one of them: if this file is intact, point \"appearance.fontPath\" "
+           "at a font that covers both instead.";
+}
 // ...and the sentence for a machine with NO Japanese face, where a Chinese one
 // was taken as the primary (review P2-8). Not a refusal - the names will draw -
 // but it must not be silent: 板306 B exists precisely to keep Japanese glyphs

@@ -834,13 +834,79 @@ static int cjkFontSelftest() {
                 d->src->member = member;      // the field no fixture ever set
                 return d;
             };
+            // ---- THE EQUATION, held by an oracle (review round 7 P2) -----
+            // The sentence promises "N character(s) here draw as '?'", so N has
+            // to be what the reader sees. The unit has moved three times, and
+            // the tests for those moves DECLARED the unit instead of checking
+            // that equation - so round 6 could count 4 where the screen shows 1
+            // and stay green.
+            //
+            // This walks the pieces THE WAY THE RENDERER WALKS TEXT: ImGui
+            // decodes one step at a time and draws exactly one glyph per step,
+            // advancing by whatever the decoder consumed. It counts GLYPH
+            // POSITIONS the intended character cannot appear at, and it merges
+            // repeats of the same CHARACTER because the sentence counts
+            // characters; an ill-formed step is not a character, so it is never
+            // merged. Nothing here calls into the tally's own code - no
+            // undrawableUnitKey, no undrawableTally - which is what makes a
+            // disagreement possible to see.
+            auto questionMarks = [&](const std::vector<std::string>& pieces) {
+                ImFont* ff = bakedFont();
+                std::vector<uint32_t> chars;     // distinct characters shown as '?'
+                int steps = 0;                   // decode steps that are no character
+                for (const std::string& s : pieces) {
+                    const char* p = s.c_str();
+                    const char* e = p + s.size();
+                    while (p < e) {
+                        unsigned int cp = 0;
+                        const int used = ImTextCharFromUtf8(&cp, p, e);
+                        if (used <= 0) break;
+                        const bool realFffd =
+                            used == 3 && (unsigned char)p[0] == 0xEF &&
+                            (unsigned char)p[1] == 0xBF && (unsigned char)p[2] == 0xBD;
+                        const bool err =
+                            cp == (unsigned)IM_UNICODE_CODEPOINT_INVALID && !realFffd;
+                        auto want = [&chars](uint32_t v) {
+                            if (std::find(chars.begin(), chars.end(), v) == chars.end())
+                                chars.push_back(v);
+                        };
+                        if (err) {
+                            if (utf8SequenceAbove16Bit(p, e)) {
+                                const unsigned char* u = (const unsigned char*)p;
+                                want(((uint32_t)(u[0] & 0x07u) << 18) |
+                                     ((uint32_t)(u[1] & 0x3Fu) << 12) |
+                                     ((uint32_t)(u[2] & 0x3Fu) << 6) |
+                                     (uint32_t)(u[3] & 0x3Fu));
+                                p += 4;
+                            } else {
+                                steps++;          // one step, one glyph, one '?'
+                                p += used;
+                            }
+                            continue;
+                        }
+                        p += used;
+                        if (cp < 0x20 || cp == 0x7F) continue;   // no glyph is asked for
+                        if (cp <= 0xFFFF && ff &&
+                            ff->FindGlyphNoFallback((ImWchar)cp)) continue;   // it drew
+                        want((uint32_t)cp);
+                    }
+                }
+                return (int)chars.size() + steps;
+            };
             auto countOf = [&](const ImageDoc& d, const std::string& label) {
                 const std::vector<std::string> pieces = undrawablePieces(label, d);
                 for (const std::string& q : pieces) say("piece: " + q);
                 const UndrawableTally t = undrawableTallyOf(pieces);
+                const int shown = questionMarks(pieces);
                 say("  -> notAsked=" + std::to_string(t.notAsked) +
                     " badBytes=" + std::to_string(t.badBytes) +
-                    " total=" + std::to_string(t.total()));
+                    " total=" + std::to_string(t.total()) +
+                    "  (the row shows " + std::to_string(shown) + ")");
+                // EVERY fixture in this group checks the equation, not just the
+                // ones written for it.
+                check(t.total() == shown,
+                      "C4 the number equals the '?' this row shows (" +
+                      std::to_string(t.total()) + " vs " + std::to_string(shown) + ")");
                 return t.total();
             };
             // (1) ONE bad character in the folder and a DIFFERENT one in the
@@ -887,40 +953,42 @@ static int cjkFontSelftest() {
             check(countOf(*d3, "stack of " + kB + ".npz") == 2,
                   "C4 ...while a STACK row counts only what the stack row "
                   "shows: its own label and its tooltip's first line");
-            // (6) ...and the unit that is NOT a code point. `badBytes` is
-            // counted in the RUN OF BYTES the decoder consumed - see the note
-            // on undrawableUnitKey - so two different runs are two, and one
-            // run reached through two pieces is one. The unit was left open
-            // to decide, and it is asserted rather than only written down
-            // because an undecided unit is how a fix lands on three arms of a
-            // defect and not on the fourth.
+            // (6) ...AND THE THING THAT IS NOT A CHARACTER. An ill-formed run
+            // is one decode step, one glyph, one count - never merged with
+            // another, because there is no "the same character" to merge it
+            // with (the ruling; manual.md §8c says it in the canon). The
+            // numbers here are what the renderer draws, which `countOf` now
+            // checks independently for every fixture.
             const auto d4 = mk("C:/a" + bad1 + "/b" + bad2 + ".npy",
                                "b" + bad2 + ".npy", std::string());
-            check(countOf(*d4, d4->name) == 2,
-                  "C4 ...two DIFFERENT ill-formed byte runs count 2");
+            check(countOf(*d4, d4->name) == 3,
+                  "C4 ...three stray bytes across the label and the path count 3");
             const auto d5 = mk("C:/a" + bad1 + "/b" + bad1 + ".npy",
                                "b" + bad1 + ".npy", std::string());
-            check(countOf(*d5, d5->name) == 1,
-                  "C4 ...and the SAME ill-formed run in both halves counts 1");
-            // ...AND THE UNIT MUST NOT DEPEND ON WHAT FOLLOWS IT (review round
-            // 6 P3). On its error path ImTextCharFromUtf8 returns the number of
-            // non-zero bytes it looked at, so the same stray FF keyed as one
-            // byte at the end of a string and as four bytes when ASCII follows
-            // it - two keys for one byte, counted twice. Here the label ends
-            // with the byte and the path has it mid-string, twice.
-            const auto d6 = mk("C:/a" + bad1 + "cd/b" + bad1, "b" + bad1,
-                               std::string());
-            check(countOf(*d6, d6->name) == 1,
-                  "C4 ...and one stray byte is ONE unit wherever it sits - at "
-                  "the end of one piece and mid-string in another");
-            // ...and the bytes AFTER a bad lead byte are still read on their
-            // own merits, instead of being swallowed as part of it.
+            check(countOf(*d5, d5->name) == 3,
+                  "C4 ...and the same byte value in three places is still 3: "
+                  "bytes that are not a character are not deduplicated");
+            // ...AND ONE STEP IS ONE '?' HOWEVER MANY BYTES IT EATS. This is
+            // the case round 6 got wrong: counting one byte at a time, an
+            // ill-formed four-byte sequence came out as 4 while the renderer
+            // draws a single glyph for it and swallows the other three bytes.
+            // `\xF0\x80\x80\x80` is a valid-looking 4-byte lead with valid
+            // continuation bytes and an overlong value, so the decoder consumes
+            // all four and reports an error.
+            const auto d6 = mk("C:/x/a\xF0\x80\x80\x80" "b.npy",
+                               "a\xF0\x80\x80\x80" "b.npy", std::string());
+            check(countOf(*d6, d6->name) == 2,
+                  "C4 ...so one ill-formed FOUR-byte step is ONE '?' in each "
+                  "piece that carries it, not four");
+            // ...and the bytes a bad lead byte DOES swallow are not counted
+            // again as drawable characters, which is the other direction of the
+            // same equation.
             const UndrawableTally tl = undrawableTally("x\xF0" "ABC.npy");
             say("F0+ASCII -> badBytes=" + std::to_string(tl.badBytes) +
                 " total=" + std::to_string(tl.total()));
             check(tl.badBytes == 1 && tl.total() == 1,
-                  "C4 ...and an ill-formed lead byte does not swallow the "
-                  "ASCII that follows it");
+                  "C4 ...and an ill-formed lead byte is one count, with the "
+                  "bytes it consumed inside it");
             // ...and the old lower bound, kept and labelled with what it is
             // now worth, which is very little.
             //
@@ -969,6 +1037,51 @@ static int cjkFontSelftest() {
                   "(a per-batch flag would have silenced it)");
         }
 
+        // ---- A STACK IS NOT REPORTED WHILE IT IS STILL LOADING -----------
+        // The settle rule used to be "the size is the same as it was last
+        // sweep", which rode on a universal that is false: that every
+        // `imagesRev++` comes with a push. Plenty of sites bump the counter
+        // with no push - a grouping invalidation, a series edit, an export, a
+        // modal closing - so one of those landing mid-load made two sweeps see
+        // the same size and
+        // the batch was reported with the frames that had arrived so far. A
+        // 400-frame stack said "N of 4" and was never corrected, which is the
+        // exact failure the comment above the rule says it exists to prevent
+        // (review round 7 P2).
+        //
+        // The fixture is the mechanism: push two of six frames, then move the
+        // revision counter WITHOUT pushing, which is what those sites do.
+        {
+            const size_t before7 = app.msgLog.size();
+            App::SeqInfo si4;
+            si4.id = app.nextSeqId++;
+            si4.name = thai;                  // the stack's own name is undrawable
+            si4.expectedFrames = 6;           // what the loader wrote down
+            app.seqs.push_back(si4);
+            for (int k = 0; k < 2; k++) {
+                mkDoc("part_" + std::to_string(k) + ".npy", 130, si4.id);
+                app.imagesRev++;
+            }
+            sweep();
+            app.imagesRev++;                  // a bump with no push, twice
+            sweep();
+            app.imagesRev++;
+            sweep();
+            check(linesSince(before7).empty(),
+                  "C4 a stack with 2 of its 6 frames says NOTHING yet, however "
+                  "often the revision counter moves without a push");
+            for (int k = 2; k < 6; k++) {
+                mkDoc("part_" + std::to_string(k) + ".npy", 130, si4.id);
+                app.imagesRev++;
+            }
+            sweep(); sweep();
+            const std::vector<std::string> got7 = linesSince(before7);
+            for (const std::string& l : got7) say("msg: " + l);
+            check(got7.size() == 1,
+                  "C4 ...and exactly ONE line once all six have arrived");
+            check(!got7.empty() && got7[0].find(thai) != std::string::npos,
+                  "C4 ...naming the stack");
+        }
         // ---- THE PROGRAM MUST NOT MAKE A NAME THAT IS NOT UTF-8 ----------
         // §8c says, flatly, that bytes which are not UTF-8 are a property of
         // the name ON DISK, and offers no remedy because none exists for a
@@ -1866,6 +1979,21 @@ static int cjkFontSelftest() {
             check(m.find("appearance.fontPath") != std::string::npos &&
                   m.find("delete that line") != std::string::npos,
                   "C7 ...and names BOTH ways out: point it elsewhere, or remove it");
+            // ...AND THE SECOND FACE'S OWN SENTENCE, which did not exist: a
+            // breadcrumb that took the merge face away produced no message at
+            // all, so the simplified-Chinese half went missing in silence
+            // (review round 7 P3).
+            {
+                const std::string ms = cjkFontMergeSkippedText({ "/second/face.ttc" }, sk);
+                say("merge-skipped: " + ms);
+                check(ms.find("/second/face.ttc") != std::string::npos,
+                      "C7 the skipped second face is named");
+                check(ms.find("simplified-Chinese") != std::string::npos,
+                      "C7 ...and what it costs is said");
+                check(ms.find("cannot be blamed") != std::string::npos,
+                      "C7 ...and so is the thing that cannot be known: both "
+                      "faces are read together, so the death is not attributable");
+            }
             // ...AND THE OTHER BRANCH OF THAT SENTENCE (review round 5 P3).
             // What was skipped here is the user's own setting, so "delete that
             // line" can be carried out. When a BUILT-IN candidate is what was
@@ -1881,6 +2009,7 @@ static int cjkFontSelftest() {
                 FontChoice bi;
                 bi.skippedAfterCrash = true;
                 bi.skippedWasOverride = false;
+                bi.skippedOnce.push_back("/usr/share/fonts/x.ttc");
                 bi.tried.push_back("/usr/share/fonts/x.ttc (skipped: the last "
                                    "start did not survive baking it)");
                 const std::string bm = cjkFontCrashSkipText(bi);
@@ -1897,18 +2026,30 @@ static int cjkFontSelftest() {
             // All six pairs, because three comparisons out of six is not "they
             // are all different".
             FontChoice any; any.path = "/x.ttc"; any.how = "built-in candidate";
+            any.skippedOnce.push_back("/x.ttc");
+            FontChoice gone = any;
+            gone.skippedOnce.clear();
+            gone.skippedForever.push_back("/x.ttc");
             FontAtlasCost dropCost; dropCost.mergeDropped = "/y.ttc";
-            const std::string msgs[6] = {
+            // EVERY SENTENCE THIS BUILD CAN RAISE AT START-UP, and the two
+            // forms of the crash-skip message are two of them: C5 names this
+            // matrix as the thing that keeps the set honest "as messages are
+            // added", and the sentence added for a file that is finished with
+            // was not in it (review round 7 P3). A form is a sentence here, not
+            // a function.
+            const std::string msgs[8] = {
                 cjkFontMissingText(any), cjkFontNoGlyphsText(any),
                 cjkFontUnreadableText(any), cjkFontChineseFallbackText(any),
                 cjkFontCrashSkipText(any), cjkFontMergeDroppedText(dropCost, any),
+                cjkFontCrashSkipText(gone, "/cfg/font-baking"),
+                cjkFontMergeSkippedText({ "/y.ttc" }, any),
             };
             int distinct = 0, pairs = 0;
-            for (int i = 0; i < 6; i++)
-                for (int k = i + 1; k < 6; k++) { pairs++; if (msgs[i] != msgs[k]) distinct++; }
-            check(pairs == 15 && distinct == 15,
+            for (int i = 0; i < 8; i++)
+                for (int k = i + 1; k < 8; k++) { pairs++; if (msgs[i] != msgs[k]) distinct++; }
+            check(pairs == 28 && distinct == 28,
                   "C7 ...and all " + std::to_string(pairs) +
-                  " pairs of the six font messages differ");
+                  " pairs of the start-up font sentences differ");
             // (4) SURVIVING CLEARS IT, which is what keeps one crash from
             // disabling the override for good. Written as this process's own
             // line - that is what a real bake leaves behind, and what
@@ -1960,10 +2101,21 @@ static int cjkFontSelftest() {
                     if (baking) die(real);          // ...and it did not come back
                 }
                 say("six starts on a machine with one usable font: " + pattern);
-                check(pattern == "BsBsSS",
+                check(pattern == "BsBSSS",
                       "C7 a file that kills start-up is retried ONCE and then "
-                      "skipped for good - BsBsSS, not the BsBsBs loop that "
+                      "skipped for good - BsBSSS, not the BsBsBs loop that "
                       "deleting the line produced");
+                // THE FOURTH LETTER IS 'S' AND NOT 's', and that is round 7's
+                // one-off fix: the start that RECORDS the second death is the
+                // one the user is sitting in front of, so it has to say "this
+                // is finished with" rather than "it will be tried again" about
+                // a file no start will ever try again. Forever() used to read
+                // the death count off the line while Account() wrote count + 1,
+                // so that start promised a retry and the next start silently
+                // broke the promise.
+                check(pattern.find('s') == 1 && pattern.find('S') == 3,
+                      "C7 ...with exactly one 'try it again' start, and the "
+                      "start that records the second death saying so itself");
                 check(pattern.find('B') < pattern.find('S'),
                       "C7 ...and no start bakes it again after the first "
                       "permanent skip (the sequence converges)");
@@ -1991,10 +2143,70 @@ static int cjkFontSelftest() {
                 // ...and the two forms are not the same sentence.
                 FontChoice one = pf;
                 one.skippedForever.clear();
+                one.skippedOnce.push_back(real);
                 check(cjkFontCrashSkipText(one, fontBakeCrumbPath()) != pm,
                       "C7 ...and 'not this time' and 'not again' are different "
                       "sentences");
+                // ---- AND A MIXED SEARCH SAYS BOTH, ABOUT THE RIGHT FILE ----
+                // One file finished with and one skipped for a single start is
+                // the ordinary shape on a machine with several candidates, and
+                // the message used to pick ONE sentence for the whole set from
+                // `!skippedForever.empty()` - telling the user that a file due
+                // to be retried on the next start was never going to be tried
+                // again (review round 7 P2).
+                FontChoice mix;
+                mix.path = "/in/use.ttc";
+                mix.skippedAfterCrash = true;
+                mix.skippedForever.push_back("/gone/for/good.ttc");
+                mix.skippedOnce.push_back("/one/death.ttc");
+                const std::string mm = cjkFontCrashSkipText(mix, fontBakeCrumbPath());
+                say("crash-skip (mixed): " + mm);
+                const size_t atGone = mm.find("/gone/for/good.ttc");
+                const size_t atOnce = mm.find("/one/death.ttc");
+                const size_t atAgain = mm.find("no longer tried");
+                const size_t atRetry = mm.find("tried once more on the next start");
+                check(atGone != std::string::npos && atOnce != std::string::npos,
+                      "C7 a mixed search names BOTH files");
+                check(atAgain != std::string::npos && atRetry != std::string::npos,
+                      "C7 ...and makes BOTH statements");
+                check(atOnce < atRetry && atGone < atAgain && atRetry < atGone,
+                      "C7 ...with each file next to the statement about IT - "
+                      "one sentence per path, not one flag for the set");
+                // ...and the way out that is only true of the permanent one
+                // carries its precondition, because carrying it out on an
+                // unreplaced file spends the two crashes again.
+                check(mm.find("If you have REPLACED that file") != std::string::npos,
+                      "C7 ...and the record-deleting way out says what it "
+                      "costs if the file has not been replaced");
                 writeRawCrumb("");          // nothing of this is left behind
+                // ---- THE RETRY'S RECORD IS ABSORBED, which is what makes a
+                // transient failure recoverable and which no test held (review
+                // round 7 P3). Deleting the absorb from fontBakeCrumbWrite left
+                // the whole suite green and put production back on the
+                // every-other-start loop: the record would survive our own
+                // line, so surviving the bake would clear our line and leave
+                // the `0#1` behind for the next start to count again.
+                writeRawCrumb("0#1 " + real + "\n");
+                check(fontBakeCrumbRead().empty(),
+                      "C7 a record of one death is the retry, not a skip");
+                fontBakeCrumbWrite({ real });
+                const std::string absorbed = readRawCrumb();
+                say("crumb while retrying: " + absorbed);
+                // A LINE that starts with `0#`, not the substring: a pid
+                // ending in 0 makes "1200#1 " contain "0#1 ".
+                check(absorbed.compare(0, 2, "0#") != 0 &&
+                          absorbed.find("\n0#") == std::string::npos,
+                      "C7 ...and writing the in-flight line TAKES that record "
+                      "(it is this attempt's own count now)");
+                check(absorbed.find(std::to_string(currentPid()) + "#1 ") !=
+                          std::string::npos,
+                      "C7 ...carrying the count, so a crash here is the second "
+                      "death and not the first");
+                fontBakeCrumbClear();
+                check(fontBakeCrumbRead().empty() && fontBakeCrumbForever().empty(),
+                      "C7 ...and surviving the bake clears the record with it, "
+                      "so a transient failure leaves nothing behind");
+                writeRawCrumb("");
             }
         }
         // Given back, at the one exit - and the file is REMOVED, not cleared.

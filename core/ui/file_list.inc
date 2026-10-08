@@ -191,11 +191,13 @@ static ImFont* bakedFont() {
     return (a && a->Fonts.Size) ? a->Fonts[0] : nullptr;
 }
 // THE CAUSES ARE COUNTED SEPARATELY (review P2-6), because one number forces
-// one sentence and that sentence is false for all but one of them. (It said
-// "the three causes" and there are four - a comment that counts the code is a
-// second copy of the code, and this is the one it was a copy of: the field list
-// below. See the note on operator+=.) A different font fixes `noGlyph` and
-// cannot touch the others: `tooHigh` is a
+// one sentence and that sentence is false for all but one of them. (This used
+// to open by counting the causes, and the count was stale; the field list below
+// is the set, and C4 asserts that every field in it has a sentence - see the
+// note on operator+=. A comment that counts the code is a second copy of the
+// code, including in the sentence that says not to write one, which is where
+// the last two went.) A different font fixes `noGlyph` and cannot touch the
+// others: `tooHigh` is a
 // property of THIS BUILD (ImWchar is 16-bit here, so a code point above U+FFFF
 // cannot even be asked for, whatever font is installed), and `badBytes` is a
 // property of the FILENAME ON DISK. Telling somebody to change their font
@@ -269,41 +271,53 @@ struct UndrawableTally {
 // that appears in the row's label, in `d.name`, in the path and in the member
 // name is counted once - and every superstring case above stops being a case.
 //
-// THE UNIT IS THE UTF-8 BYTE SEQUENCE THE DECODER CONSUMED. That is the one
-// choice here that is not forced by anything above, so here is the reasoning:
+// THE CONSTRAINT THE UNIT HAS TO MEET, which is not a unit (review round 7):
 //
-//   * noGlyph / notAsked / tooHigh are code points, and well-formed UTF-8 is a
-//     BIJECTION - each code point has exactly one encoding, overlong forms
-//     being ill-formed - so for those three, "the same byte sequence" and "the
-//     same character" are the same statement. Keying on the bytes is not an
-//     approximation of the contract; it is the contract. It is also the only
-//     key that stays honest where `cp` is unavailable: a 4-byte emoji comes
-//     back from ImTextCharFromUtf8 as U+FFFD on this 16-bit build, so a key
-//     made from `cp` would collapse EVERY emoji in one name into one character
-//     - which the contract does not say and the reader can see is false.
-//   * `badBytes` IS NOT A CODE POINT, and this is the unit it gets: THE ONE
-//     BYTE at which the name stops being UTF-8. A run that is not UTF-8 has no
-//     character to be "the same character" as, so a byte is the only identity
-//     it has. Two stray bytes with different values count 2; one stray FF that
-//     the label and the path both carry counts 1, which is the character rule
-//     applied to the only thing those bytes can be compared by.
+//     THE NUMBER MUST BE THE NUMBER OF '?' THE READER SEES FOR THIS ROW.
 //
-//     IT IS ONE BYTE AND NOT `used` BYTES, and that is a correction (review
-//     round 6): on its error path ImTextCharFromUtf8 returns the number of
-//     NON-ZERO BYTES IT LOOKED AT, which depends on what FOLLOWS the bad byte
-//     and on where the string ends. So the same stray FF keyed as (1,FF) at the
-//     end of one piece and as (4,FF,'a','b') inside another - two keys for one
-//     byte, counted twice, which is this round's defect surviving on the one
-//     arm the unit had not been pinned down on. A byte has no context, so the
-//     key has none either. Advancing one byte instead of `used` also stops the
-//     decoder swallowing the ASCII that follows a bad lead byte, which the
-//     paragraph below already names as a defect of reading `used` at all. Counting every occurrence instead would have left this very defect
-//     alive on the badBytes arm while the other three were fixed - the failure
-//     type ("a fix round leaves the same defect next door") this round exists
-//     to stop.
+// The sentence promises it - "N character(s) here draw as '?'" - and the unit
+// has now moved three times without that equation being written down, so it is
+// written down here and a test holds it (C4's `questionMarks` oracle walks the
+// pieces the way the renderer walks text and counts glyph positions, with
+// nothing from this function).
 //
-// A unit is at most 4 bytes: ImTextCharFromUtf8 never reports more, on its
-// success path or on its error path, so the key is those bytes and their count.
+// WHAT THE RENDERER DOES, because that is what fixes the unit: ImGui's text
+// drawing decodes one step at a time and emits EXACTLY ONE GLYPH PER STEP,
+// advancing by whatever ImTextCharFromUtf8 consumed. An ill-formed sequence is
+// one step, one glyph, however many bytes it ate - so `\xF0\x80\x80\x80` is a
+// single '?' on screen and takes the three bytes after the lead with it.
+//
+// So there are two kinds of thing to count, and they are counted differently
+// because they ARE different:
+//
+//   * A CHARACTER (noGlyph / notAsked / tooHigh) is counted ONCE PER DISTINCT
+//     CODE POINT. The sentence counts characters, so a name with the same
+//     undrawable character twice has one character the reader cannot read. The
+//     key is the bytes of the sequence, which for well-formed UTF-8 is the same
+//     statement as the code point (the encoding is a bijection; overlong forms
+//     are ill-formed). Keying on `cp` instead would be wrong where `cp` is not
+//     available: on this 16-bit build a valid 4-byte emoji comes back as
+//     U+FFFD, so every emoji in one name would collapse into one character.
+//   * AN ILL-FORMED RUN (`badBytes`) IS NOT A CHARACTER, and is counted ONCE
+//     PER DECODE STEP, never deduplicated. There is no "the same character" to
+//     apply the rule to - that is the ruling, and it is also the end of two
+//     rounds of trying: round 5 keyed it on the bytes the decoder consumed and
+//     round 6 on one byte, and the second made the count say 4 where the screen
+//     says 1. A step is what the screen shows, so a step is what is counted.
+//     manual.md §8c says the same thing in the canon.
+//
+// WHY NOT ONE BYTE, since that was this round's predecessor: `used` was said to
+// depend on what follows the bad byte. It does not. ImTextCharFromUtf8 takes
+// the length from a table indexed by the LEAD BYTE alone, so a stray 0xFF is
+// one step wherever it sits and a 0xF0 with three continuation bytes is one
+// step of four; the worked example in the old comment here, "(4, FF, 'a', 'b')",
+// cannot occur. Advancing by `used` is not just safe, it is the only advance
+// that tracks the renderer - with one byte, the ASCII the renderer swallows
+// after a bad lead byte came back as separately drawable characters.
+//
+// A CHARACTER's key: at most 4 bytes, because ImTextCharFromUtf8 never reports
+// more on either path, so the key is those bytes and their count. Ill-formed
+// runs do not come here - they have no identity to key on.
 static uint64_t undrawableUnitKey(const char* p, int used) {
     const int n = used < 1 ? 1 : (used > 4 ? 4 : used);
     uint64_t k = (uint64_t)(unsigned)n << 32;
@@ -378,17 +392,19 @@ static UndrawableTally undrawableTallyUnseen(const std::string& utf8Name,
         // and offer them a fix that cannot apply. Both sentences have to be
         // true, so both need a fact the decoder does not carry.
         if (substituted) {
-            // A WELL-FORMED SEQUENCE ABOVE U+FFFF is a character, so it keeps
-            // the character's unit: its four bytes, which encode exactly one
-            // code point. Anything else is not UTF-8 and takes the one-byte
-            // unit - see the note above for why the two cannot share a rule.
+            // A WELL-FORMED SEQUENCE ABOVE U+FFFF is a character this build
+            // cannot hold, so it keeps the character's rule: keyed on its four
+            // bytes, which encode exactly one code point, and counted once.
             if (utf8SequenceAbove16Bit(p, e)) {
                 if (fresh(undrawableUnitKey(p, 4))) t.tooHigh++;
                 p += 4;
-            } else {
-                if (fresh(undrawableUnitKey(p, 1))) t.badBytes++;
-                p += 1;
+                continue;
             }
+            // ...and anything else is NOT A CHARACTER. One step, one glyph on
+            // screen, one count - and no key, because there is nothing for two
+            // of these to be "the same" as. See the note above.
+            t.badBytes++;
+            p += used;
             continue;
         }
         p += used;
@@ -480,12 +496,25 @@ static std::string undrawableNoteOf(const UndrawableTally& t) {
     }
     return s;
 }
-// THE FIRST LINE OF A ROW'S TOOLTIP, in one place, because two things need the
-// same answer: the tooltip draws it and undrawablePieces() counts it. A
+// THE LINE THAT STANDS IN FOR THE PATH, in one place, because two things need
+// the same answer: the tooltip draws it and undrawablePieces() counts it. A
 // COMPUTED frame has no path at all - its provenance note takes the path's
 // place, which is what the note is for - so "the path" is not the answer to
-// "what does the first line say".
-static std::string filesRowLeadLine(const ImageDoc& d) {
+// "what does this row say it is".
+//
+// IT IS NOT "THE TOOLTIP'S FIRST LINE", which is what this was called for one
+// round (review round 7 P3). The drawer puts things ABOVE it - a (stale)
+// warning, Watch's finding, a reload note - and things below it, so on those
+// rows the first line is one of those instead. A function made so that two
+// surfaces cannot disagree should not itself be named after something it is
+// not.
+//
+// The strings prefixed above it are deliberately NOT pieces: they are this
+// program's own sentences, and the one of them that carries a name from
+// somewhere else ("same picture as ...", another row's name) was raised in
+// round 4 and dropped there as a finding. If that is revisited, this is the
+// list to add it to - which is the whole point of the list.
+static std::string filesRowPathLine(const ImageDoc& d) {
     return d.src->path.empty() && !d.note.empty() ? d.note : dispPath(d.src->path);
 }
 // ---- WHICH STRINGS A ROW SHOWS, in ONE place (review: sweep the shape) -----
@@ -551,7 +580,7 @@ static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
         out.push_back(v);
     };
     add(shownLabel);               // what is drawn ON the row
-    add(filesRowLeadLine(d));      // ...and the first line of its tooltip
+    add(filesRowPathLine(d));      // ...and the line that names the file
     // ...and the SERIES UNIT, which a member row's label carries and which no
     // caller passes: the Files panel builds that label with
     // filesSeriesMemberLead() and the Messages sweep has only the document, so
@@ -559,12 +588,22 @@ static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
     // surfaces disagreeing about one row, which is the state this list exists
     // to prevent. Found here rather than passed in, so both callers get it.
     // app.series is a handful of entries; this is not the sweep's cost.
+    // ...ONLY WHEN THE ROW DRAWS IT, which is the same test the rest of this
+    // list passes (review round 7 P3). filesSeriesMemberLead() appends the unit
+    // only for a member whose value is SET - "value unset" has no unit after it
+    // - so a member with no value had the unit counted as being "here" when the
+    // row shows no unit at all. That is the mistake `d.name` was dropped for,
+    // one field over.
     for (const App::Series& S : app.series) {
-        bool mine = false;
-        for (const App::Series::Member& m : S.members)
-            if ((d.seqId && m.seqId == d.seqId) ||
-                (!d.seqId && m.frameUid && m.frameUid == d.uid)) { mine = true; break; }
-        if (mine) { add(S.unit); break; }
+        bool drawn = false;
+        for (const App::Series::Member& m : S.members) {
+            const bool mine = (d.seqId && m.seqId == d.seqId) ||
+                              (!d.seqId && m.frameUid && m.frameUid == d.uid);
+            if (!mine) continue;
+            drawn = std::isfinite(m.value);
+            break;
+        }
+        if (drawn) { add(S.unit); break; }
     }
     return out;
 }
@@ -594,10 +633,11 @@ static std::string undrawableNote(const std::string& text) {
 // ...and the Messages line, once per document.
 //
 // Driven off app.imagesRev rather than hooked into an open: documents are
-// pushed onto app.images from MANY places - the npz loader, the remote client,
-// sequence building, a plugin, Watch's reload, the derive modal - and a notice
-// added to one of those doors is a notice none of the others give. The revision
-// counter is the one thing every one of them bumps.
+// pushed onto app.images from many separate places, and a notice added to one
+// of those doors is a notice none of the others give. The revision counter is
+// the one thing every one of them bumps. (How many doors there are is not
+// stated: this sentence had a count in it and the count was wrong, twice. What
+// matters is that no door is the hook - which is why the counter is.)
 //
 // NO NUMBER, deliberately: this said "six separate places" and named six, and
 // grep finds nine pushes in seven files (review round 6). The claim worth
@@ -638,23 +678,51 @@ static std::string undrawableNote(const std::string& text) {
 // program's own name for the thing the user did. Within a batch, stacks are
 // reported by stack, which is what the Files panel actually draws.
 //
-// WHEN: on the first sweep where the batch has stopped growing. A stack pushes
-// members over many frames, so counting at the first sight of one would print
-// "1 frame" for a load that ends with 400. One frame of delay buys a count
-// that is true.
-// WAITING FOR THE BATCH TO SETTLE MEANS ASKING FOR ANOTHER FRAME (review P1-B).
+// WHEN: once nothing more can be pushed into the batch. A stack pushes members
+// over many frames, so counting at the first sight of one would print "1 frame"
+// for a load that ends with 400.
 //
-// The settle rule was right and the way it waited was not. This used to return
-// immediately unless app.imagesRev had moved, and EVERY `imagesRev++` in the
-// program happens WITH a push - there is no periodic increment anywhere in the
-// frame loop. (The count that used to be here, "the thirty", was wrong by
-// fifteen - review round 6. The universal is the part that matters and the part
-// that can be checked.) So the sizes observed during a load are
-// strictly increasing, the last push's sweep recorded a size, and no further
-// sweep ever came: the batch that was just opened was never reported at all.
-// The line only appeared when something ELSE later moved the counter, which
-// meant the most recently opened thing was permanently silent - the exact
-// opposite of the intent.
+// AND THAT IS ASKED, NOT INFERRED FROM THE SIZE STANDING STILL (review round 7
+// P2). The test used to be "the size is the same as it was last sweep", which
+// only means "nothing arrived between two sweeps" - and that is the final
+// answer only if a sweep can happen for no reason other than a push. Round 6
+// wrote that as a universal, in this paragraph:
+//
+//     EVERY `imagesRev++` in the program happens WITH a push
+//
+// IT IS FALSE, and here is how to see that without taking a number on trust:
+// `grep -n 'imagesRev++'` and read the ones that are not next to a push.
+// compare.inc bumps it when the Files GROUPING is invalidated; series_model.inc
+// bumps it on every member edit, rename and reorder; export.inc bumps it when a
+// document is dropped from the caches; the derive and series modals bump it
+// when they close. None of those pushes anything. Six lines below this one the
+// file says so itself ("The line only appeared when something ELSE later moved
+// the counter"), and so does `:1268`. One of those bumps landing mid-load makes
+// two consecutive sweeps see the same size, so a 400-frame stack was reported
+// as "N of 4" and never corrected - the exact failure the paragraph above says
+// this delay exists to prevent.
+//
+// (This paragraph replaced a wrong COUNT with a wrong UNIVERSAL, and the
+// universal was worse: a reader can check a number with grep and nobody checks
+// an "every". So the universal that replaced it is checked - by the test below
+// in C4, which moves the counter without pushing and asserts the silence.)
+//
+// WHY THIS SHAPE AND NOT A CORRECTION LINE. The ruling allowed either: ask the
+// question directly, or say the number again when it turns out larger. Asking
+// is better here because the answer EXISTS - a stack load records how many
+// frames it is going to have (`SeqInfo::expectedFrames`), so "can more arrive
+// for this row" is a fact the loader already wrote down, not an inference. A
+// correction line would also have to be bounded (a load that grows in steps
+// would correct itself in steps), and it would spend the one line per open that
+// this whole mechanism exists to keep.
+//
+// WHAT IS LEFT, said out loud: `expectedFrames` is 0 when no loader recorded
+// one - a hand-picked set of loose files, a plugin's product. There the
+// size-stability delay is all there is, and it can still fire early. For loose
+// rows that costs nothing for the per-row lines, because `saidKey` is keyed on
+// the row and a row that arrives later gets its own line (C4 asserts exactly
+// that); the one number that can still be early is the summary's denominator
+// when more than five rows arrive in two bursts.
 //
 // So when a batch is still growing this asks to be run again: `wantAnother`
 // gets it past the rev gate on the next frame, and app.wakeFrames guarantees
@@ -709,25 +777,36 @@ static void undrawableReportNewDocs() {
         // this number appears in: "N of M frame(s) in this stack have such
         // characters IN THEIR OWN NAMES" (review round 6 P2).
         //
-        // It used to be the frame's whole piece list, path included, and that
-        // made the sentence false in every case it could occur in. The frames
-        // of a folder stack share a directory, so one '?' in the folder name
-        // makes EVERY frame affected and the clause always reads "N of N" - and
-        // sequence.inc's sibling rule requires the non-numeric segments of the
-        // leaf names to match, so even counting leaves can only ever give 0 or
-        // N. The shape this clause exists to report - SOME frames and not
-        // others - cannot arise from a path, only from names, which is the
-        // other half of the same argument. Worse, the folder's characters are
-        // already in the row's own clause one sentence earlier, so the pair
-        // reported one character twice and blamed the frames for it.
+        // It used to be the frame's whole piece list, path included. Two
+        // things were wrong with that. The words say "their own names", and a
+        // path is not a name; and the frames of a stack share a directory, so
+        // one '?' in the folder made EVERY frame affected and the clause read
+        // "N of N" while the row's own clause, one sentence earlier, had
+        // already reported that same single character - one character counted
+        // twice, with the frames blamed for it.
+        //
+        // (Round 6 argued this from a universal - "the sibling rule makes the
+        // non-numeric segments of the leaves match, so counting leaves can only
+        // give 0 or N". That is false for a MERGED load, whose members come
+        // from different groups and legitimately have unrelated leaves. The
+        // clause is still right and the two reasons above do not need it;
+        // review round 7 P3 caught the reasoning, not the behaviour.)
         if (undrawableTally(d->name).total() > 0)
             g->affected++;
     }
     for (auto& [batchId, gs] : byBatch) {
-        // Still growing? Wait one more sweep, so the count is the final one and
-        // not "1 frame" for a load that ends with 400.
+        // CAN MORE STILL ARRIVE? Asked of the loader's own record first - a
+        // stack knows how many frames it expects - and only then of the size,
+        // which is a delay and not an answer. See the note above.
+        bool filling = false;
+        for (const Group& g : gs) {
+            if (!g.seqId) continue;
+            const App::SeqInfo* si = seqInfo(g.seqId);
+            if (si && si->expectedFrames > 0 && g.members < si->expectedFrames)
+                filling = true;
+        }
         const int was = batchSize.count(batchId) ? batchSize[batchId] : -1;
-        if (was != nowSize[batchId]) {
+        if (filling || was != nowSize[batchId]) {
             batchSize[batchId] = nowSize[batchId];
             // Come back even if nothing else moves the revision counter, and
             // make sure a frame happens at all. Without both of these the
@@ -1567,7 +1646,7 @@ static void drawFileList() {
             // the mouse. So the row composes it once, the probe is that value,
             // and the hover only decides whether to SHOW it.
             {
-                std::string lead = filesRowLeadLine(d);
+                std::string lead = filesRowPathLine(d);
                 // the generation statements, where the provenance is read
                 // (§10.1 / §10.2): stale leads - it is the warning; "same
                 // picture" trails - it is the reassurance two results of one
@@ -1639,13 +1718,18 @@ static void drawFileList() {
                     if (const size_t h = shown.find("##"); h != std::string::npos)
                         shown.resize(h);
                     while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
-                    // CACHED PER ROW. undrawableNote() has a cache but this
-                    // path no longer goes through it, so every row was decoding
-                    // its label, its name, its path and its member name on
+                    // CACHED PER ROW, and this is the ONLY cache on this path.
+                    // Without it every row decodes every string it shows on
                     // every frame - the cost review P3-11 removed, back by a
-                    // different door (review P3). Keyed on the pieces
-                    // themselves, because that is exactly what the answer
-                    // depends on; the atlas cannot change after start-up.
+                    // different door. Keyed on the pieces themselves, because
+                    // that is exactly what the answer depends on; the atlas
+                    // cannot change after start-up.
+                    //
+                    // (This used to say "undrawableNote() has a cache but this
+                    // path no longer goes through it". Round 6 removed that
+                    // cache - for being unreachable - and left the sentence
+                    // here pointing at it: review round 7 P3, type (d), in the
+                    // same commit that deleted the thing it names.)
                     static std::unordered_map<std::string, std::string> rowCache;
                     const std::vector<std::string> pieces = undrawablePieces(shown, d);
                     std::string key;

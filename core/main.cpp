@@ -1285,7 +1285,8 @@ int main(int argc, char** argv) {
     // below report - either the atlas has the kana or it says which font does
     // not have them.
     std::string mergePath;
-    if (jp) mergePath = cjkMergeFontPath(fontPath, crumb);
+    std::vector<std::string> mergeSkipped;       // ...and what the crumb took
+    if (jp) mergePath = cjkMergeFontPath(fontPath, crumb, &mergeSkipped);
     if (!mergePath.empty()) {
         ImFontConfig m;
         m.MergeMode = true;
@@ -1304,9 +1305,17 @@ int main(int argc, char** argv) {
     // after the bake returns, before anything else can fail for its own reasons
     // and leave a crumb that blames the font.
     fontBakeCrumbClear();
-    // ---- EVERY WAY THIS CAN HAVE GONE WRONG IS ITS OWN SENTENCE, and the
-    // list below is that set (review P1 / P2-8 / P2-9). AFTER the bake, because
-    // only the built atlas can tell some of them apart.
+    // ---- EVERY WAY THIS CAN HAVE GONE WRONG REACHES A SENTENCE OF ITS OWN,
+    // except for the one pair that is deliberately one sentence (review P1 /
+    // P2-8 / P2-9, corrected in round 7). AFTER the bake, because only the
+    // built atlas can tell some of them apart.
+    //
+    // THE PAIR: items 2 and 3 below are two routes to cjkFontUnreadableText -
+    // a file that would not load at all and a file stb_truetype could not
+    // parse. They are one sentence on purpose, because what the reader must do
+    // is the same and the sentence names the file; the earlier wording claimed
+    // the list was a set of distinct sentences, which it never was. C7's
+    // pairwise matrix is over the SENTENCES, so it does not contradict this.
     //
     // THE HEADING DOES NOT COUNT THEM, and that is deliberate: it said "FOUR"
     // while listing five, a sixth was added inside the chain, and the fifth
@@ -1352,6 +1361,11 @@ int main(int argc, char** argv) {
         // impossible - so it is said rather than left to be discovered.
         toast(cjkFontChineseFallbackText(g_fontChoice), true);
     }
+    // ...and the SECOND FACE the breadcrumb took away, which is independent of
+    // every branch above: the primary can be perfectly fine and the merge face
+    // still gone, and until round 7 that happened in silence.
+    if (!mergeSkipped.empty())
+        toast(cjkFontMergeSkippedText(mergeSkipped, g_fontChoice), true);
     // ...and the settings file's refusal, held since loadSettings() because
     // that ran before there was a context to draw a toast in (see the function).
     // After the font toast, so that "your settings file would not parse" is the
