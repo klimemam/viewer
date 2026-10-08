@@ -599,12 +599,20 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             if (!doc) {
                 if (isRaw) {
                     // NO BYTE-COUNT CHECK HERE, and the gate below cannot
-                    // stand in for one. A headerless member decodes AT the
-                    // recipe's dimensions whatever its length is, so
-                    // stackShapeRefusal always agrees and a member of another
-                    // size is read as a plausible picture of the wrong bytes -
-                    // `silent` (108/112/104 at offset 0, which needs 96) is the
-                    // counterexample, and it passes right through this line.
+                    // stand in for one. Precisely: decodeRawFrame refuses a
+                    // member TOO SMALL for the recipe (offset + W*H*ch*elem
+                    // past its end), so the hole is not every wrong length -
+                    // it is every wrong length that is still BIG ENOUGH. Such
+                    // a member decodes at the recipe's dimensions, which are
+                    // the reference frame's dimensions, so stackShapeRefusal
+                    // compares two identical shapes, agrees, and the member
+                    // joins as a plausible picture of another file's first
+                    // W*H*ch samples. `silent` is exactly that shape:
+                    // 108/112/104 under an 8x6 u16 recipe at offset 0 needs
+                    // 96, so all three clear the size bar and two of them are
+                    // misread. An earlier version of this paragraph said
+                    // "whatever its length is", which claimed a wider hole
+                    // than exists and contradicted itself two lines down.
                     // The REMOTE door asks the question first
                     // (remoteRawSameSize in open_dispatch.inc, which explains
                     // at length why it has to); this one never has.

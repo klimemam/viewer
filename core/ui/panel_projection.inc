@@ -1278,8 +1278,10 @@ static StackStats computeFrameStats(const ImageDoc* d, int rx, int ry, int rw, i
 }
 
 // ---- frame average / frame sum: a stack's time axis, folded to ONE frame ----
-// One tooltip for every door into it: the five Browse entry points and the
-// Files panel item must not describe the same operation five different ways.
+// One tooltip for every door into it: the Browse entry points and the Files
+// panel item must not describe the same operation several different ways. (The
+// count of those doors is deliberately not written here - a number in a comment
+// is a number nobody re-checks; grep AVG_TIP for the list.)
 // non-static since P7: the Browse ctx menus show the same tooltip (host.h)
 const char* AVG_TIP =
     "Open the stack's PER-PIXEL MEAN across frames as one frame -\n"

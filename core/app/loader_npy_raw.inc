@@ -599,6 +599,47 @@ static bool rawDialogIsRemote(const RawDialog& d) {
     return hasUrlScheme(d.path);
 }
 
+// CAN A CROPPING RECIPE OPEN A REMOTE FOLDER AS ONE STACK? No, and this is the
+// only place that decides it. Returns the refusal, or "" when there is nothing
+// to refuse.
+//
+// WHY, truthfully. The crop is not on the wire (3.2: the peer serves the bytes a
+// reading asks for, and a crop is a view of what came back), so it is finished
+// on this side by cropInPlace - against a document that has LANDED. A folder
+// stack's members land one at a time, afterwards, so a crop applied at the
+// stack's head reaches the head and nothing else.
+//
+// And NOTHING DOWNSTREAM NOTICES. That is the whole of the danger, and the
+// first version of this comment got it backwards by claiming the stack's own
+// shape check would refuse the members: it refuses none of them.
+// attachRemoteStack takes si.refW/refH/refCh from the head's remoteFullW/H/Ch -
+// the dimensions the PEER's META reported - and cropInPlace changes S.w/S.h and
+// the crop origin while leaving remoteFull* exactly as it was. So the reference
+// shape stays the uncropped one, every member matches it, stackShapeRefusal
+// agrees every time, and the result is a stack wearing the face of a complete
+// one whose first frame is a 4x4 window and whose others are whole 8x6 frames.
+// A broken stack that says nothing is worse than a refusal, which is why this
+// is a refusal.
+//
+// ONE DECIDER, TWO MOMENTS. The crop becomes known either from a binding
+// (before anything opens) or from the dialog the operator just filled in (at
+// Load). Those are two entry points, not two judgments - so both ask this, and
+// the rule and its reason exist once. Having the check in only one of them was
+// worse than having it in neither: the same folder refused on the second open
+// (the binding) what it had quietly half-applied on the first (the dialog).
+static std::string remoteStackCropRefusal(bool cropOn, int cropW, int cropH,
+                                          const std::string& headName,
+                                          size_t frames, size_t sizeBytes) {
+    if (!cropOn || cropW <= 0 || cropH <= 0) return std::string();
+    return headName + ": this recipe crops, and a cropped recipe cannot open a "
+           "remote folder as ONE stack - the crop is applied to a frame that has "
+           "landed, so it would reach the first of " + std::to_string(frames) +
+           " frame(s) and none of the others, and nothing downstream would say so"
+           "\n  clear the crop to open the stack, or open one frame on its own and "
+           "crop that (the recipe for " + std::to_string(sizeBytes) +
+           "-byte files is yours to change in the recipe panel)";
+}
+
 static std::string rawDialogAccept(RawDialog& d) {
     // ONE branch, at the landing. The dialog itself is not taught about peers:
     // rawGuessDims works from a byte count, and a byte count is a byte count on
@@ -606,6 +647,19 @@ static std::string rawDialogAccept(RawDialog& d) {
     // the same six fields to be asked for, and the two would drift.
     std::string err;
     if (rawDialogIsRemote(d)) {
+        // ...and the one judgment a remote FOLDER's dialog has to pass before
+        // anything opens. Returning non-empty leaves the dialog standing with
+        // this message and the park intact (core/ui/canvas.inc's Load branch),
+        // so the operator clears the crop and presses Load again - and because
+        // nothing opened, nothing was bound either, which is what kept the
+        // second open of the same folder from being refused for a recipe this
+        // one quietly made.
+        if (d.forRemoteStack) {
+            const std::string no = remoteStackCropRefusal(
+                d.cropOn, d.cropW, d.cropH, baseName(d.path),
+                app.remoteRawStack.files.size(), d.fileSize);
+            if (!no.empty()) return no;
+        }
         const rp::RawWire rw = rawWireFrom(d);
         // openRemote SAYS what it did (toasts on refusal), so a bare false is
         // not silence - but this call site still needs a non-empty string to

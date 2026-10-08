@@ -1480,8 +1480,10 @@
             // typed header/key to a v14 CLIENT, which would ignore layout and
             // ask for native pixels.  The carrier stays v3 in both directions.
 
-            // Seed a valid canonical under the exact same hash with a v15
-            // client. The old-client refusal must not classify/delete it.
+            // Seed a valid canonical under the exact same hash with the
+            // CURRENT client (openSession, whatever rp::VERSION is today - this
+            // said "a v15 client" and `seed` has never been lowered). The
+            // old-client refusal must not classify/delete it.
             remote::ReaderRun seeded;
             std::string seedErr;
             const bool seedSent = seed.readerRun(origin, "load", tf, seeded, seedErr);
@@ -1489,7 +1491,7 @@
             check(seedSent && seeded.outcome == rp::RO_OK && !seeded.key.empty() &&
                       has(seeded.header, "VIEWERSTREAM 3") &&
                       std::filesystem::exists(pathFromUtf8(seededPath), ec),
-                  "R21l a v15 client first publishes the typed v3 carrier canonical");
+                  "R21l the current client first publishes the typed v3 carrier canonical");
             closeAll();
             const std::string v3Land = seedSent && seeded.outcome == rp::RO_OK
                                      ? remoteReaderLand(url, spec, std::string(), seeded)

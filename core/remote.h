@@ -394,25 +394,28 @@ private:
     // or write one the peer will not consume - and everything after it is then
     // parsed from the wrong offset.
     //
-    // There are THREE such fields. This comment has now been wrong twice about
-    // the count - it said one, then two - so the rule is written out instead of
-    // the number being asserted: ANY field the peer gates on g_clientVersion,
-    // or on the minimum of that and its own, is read through here. Grep
-    // serve.cpp for `g_clientVersion` and the list is the answer.
+    // THE PREDICATE, and no count. This comment asserted a number three times
+    // and was wrong three times (one, then two, then three), which is what a
+    // number in a comment does - so what is written here is the test a field
+    // has to pass, and the reader greps:
     //
-    //   the LIST/SCAN group row's member sizes   peer sends them only to a
-    //                                            client that announced 16
-    //                                            (putGroupEntryV3)
-    //   the MEASURE keyed reading                peer reads it only from a
-    //                                            client that announced 15
-    //                                            (handleMeasure)
-    //   the META/TILE request TRAILERS           peer picks the v12 flags-word
-    //                                            form only when BOTH numbers
-    //                                            are 12 (getTrailers), and the
-    //                                            two forms are not the same
-    //                                            length - so getting this one
-    //                                            wrong shifts every byte after
-    //                                            it (review P2-2)
+    //   a field belongs here when the PEER decides its PRESENCE OR ITS SHAPE
+    //   on the wire from g_clientVersion - alone, or min'd with
+    //   servedVersion(). Mentions of g_clientVersion that only pick a REFUSAL
+    //   TEXT, or answer "may this client ask for that at all", do not qualify:
+    //   nothing in the byte stream moves, so no offset can shift. (An earlier
+    //   version of this sent the reader to `grep g_clientVersion core/serve.cpp`
+    //   and called the result the answer. It is not - most of those hits are
+    //   exactly the refusals this paragraph excludes.)
+    //
+    // Known members, as examples of the predicate rather than as a census:
+    // the LIST/SCAN group row's member sizes (putGroupEntryV3 sends them only
+    // to a client that announced 16), the MEASURE keyed reading (handleMeasure
+    // reads it only from a client that announced 15), and the META/TILE
+    // request TRAILERS (getTrailers picks the v12 flags-word form only when
+    // BOTH numbers are 12, and the two forms are DIFFERENT LENGTHS - so this
+    // one shifts every byte after it when it is wrong: review P2-2, pinned by
+    // selftest P9d, which is where the number lives now).
     //
     // Only setHelloVersionForTest can make the two numbers disagree today, and
     // a seam that can desynchronise a parser is not a seam worth leaving armed.

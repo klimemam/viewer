@@ -1591,6 +1591,155 @@
                     app.remoteRawStack = App::PendingRemoteRawStack();
                     closeAll();
                 }
+                // ---- (12) a CROPPING recipe cannot open a folder as ONE stack
+                // The crop is not on the wire (3.2) - it is finished on this
+                // side, against a document that has LANDED - and a folder
+                // stack's members land one at a time afterwards. So a crop
+                // reaches the head and nothing else, and NOTHING DOWNSTREAM
+                // NOTICES: attachRemoteStack takes the reference shape from
+                // the head's remoteFullW/H/Ch (the peer's META) and
+                // cropInPlace leaves those alone, so every member matches
+                // and stackShapeRefusal agrees every time. The result would
+                // be a stack wearing the face of a complete one whose first
+                // frame is a 4x4 window.
+                //
+                // TWO ENTRY POINTS, ONE DECIDER. The crop is known either
+                // from a binding (before anything opens) or from the dialog
+                // at Load. Having the check in only one of them was worse
+                // than having it in neither: the same folder refused on the
+                // second open what it had half-applied on the first.
+                {
+                    g_rawSizeRecipe.clear();
+                    closeAll();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    app.toast.clear();
+
+                    // (a) THE DIALOG BRANCH. Park the Open, then answer with
+                    // a crop ticked - the gesture a person actually makes.
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    const bool parkedC = app.remoteRawStack.alive && rawDlg.open &&
+                                         rawDlg.forRemoteStack;
+                    const std::string keptPath = rawDlg.path;
+                    rawDlg.dtype = RD_U16; rawDlg.interp = RI_GRAY;
+                    rawDlg.w = DW; rawDlg.h = DH; rawDlg.offset = DHDR;
+                    rawDlg.littleEndian = true;
+                    rawDlg.cropOn = true;
+                    rawDlg.cropX = 2; rawDlg.cropY = 2; rawDlg.cropW = 4; rawDlg.cropH = 4;
+                    const std::string dlgNo = rawDialogAccept(rawDlg);
+                    fprintf(stderr, "fmtgateselftest:   F4h crop dialog: parked=%d refused=%d docs=%zu bound=%zu alive=%d kept=%d\n"
+                                    "fmtgateselftest:   F4h crop said: \"%s\"\n",
+                            parkedC ? 1 : 0, dlgNo.empty() ? 0 : 1, app.images.size(),
+                            g_rawSizeRecipe.size(), app.remoteRawStack.alive ? 1 : 0,
+                            rawDlg.path == keptPath ? 1 : 0, dlgNo.c_str());
+                    check(parkedC, "F4h (setup) the folder Open is parked on its question");
+                    check(!dlgNo.empty() && has(dlgNo, "cannot open a remote folder as ONE stack"),
+                          "F4h-crop the dialog's Load refuses a cropping recipe for a folder stack");
+                    check(app.images.empty(),
+                          "F4h-crop ...and opens nothing, so no head is cropped on its own");
+                    check(g_rawSizeRecipe.empty(),
+                          "F4h-crop ...and binds nothing, so the next open is not refused for this one");
+                    check(app.remoteRawStack.alive && rawDlg.path == keptPath,
+                          "F4h-crop ...and the park survives, so clearing the crop and pressing Load works");
+
+                    // (b) ...and it does: same park, crop cleared.
+                    rawDlg.cropOn = false;
+                    rawDlg.cropX = rawDlg.cropY = rawDlg.cropW = rawDlg.cropH = 0;
+                    const std::string yes = rawDialogAccept(rawDlg);
+                    rawDlg.forRemoteStack = false;
+                    rawDlg.open = false;
+                    resumeRemoteRawStack();
+                    double twc = nowSec();
+                    while (nowSec() - twc < 60.0) {
+                        pumpRemoteFetch();
+                        pumpSequenceAndQueue();
+                        if (app.rfPending == 0) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    pumpRemoteFetch();
+                    int wholeC = 0;
+                    for (const auto& d : app.images)
+                        if (d->w == DW && d->h == DH) wholeC++;
+                    fprintf(stderr, "fmtgateselftest:   F4h crop cleared: err=\"%s\" docs=%zu whole=%d seqs=%zu\n",
+                            yes.c_str(), app.images.size(), wholeC, app.seqs.size());
+                    check(yes.empty() && app.images.size() == 3 && wholeC == 3 &&
+                          app.seqs.size() == 1,
+                          "F4h-crop ...the SAME dialog with the crop cleared opens all three, whole");
+
+                    // (c) THE BOUND BRANCH, and it must say the same thing.
+                    // A different sentence from the other entry point would
+                    // mean two judgments, which is the defect this closed.
+                    closeAll();
+                    rawDlg.open = false; rawDlg.forRemoteStack = false;
+                    app.remoteRawStack = App::PendingRemoteRawStack();
+                    RawRecipe cr;
+                    cr.w = DW; cr.h = DH; cr.offset = DHDR;
+                    cr.dtype = RD_U16; cr.interp = RI_GRAY; cr.littleEndian = true;
+                    cr.cropOn = true; cr.cropX = 2; cr.cropY = 2; cr.cropW = 4; cr.cropH = 4;
+                    g_rawSizeRecipe.clear();
+                    g_rawSizeRecipe[(size_t)WANT] = cr;
+                    app.toast.clear();
+                    const int rC = g_rawDialogsRaised;
+                    openRemoteStack("", sfiles, "stk/f_???.raw", 0, 0);
+                    fprintf(stderr, "fmtgateselftest:   F4h crop bound: docs=%zu asks=%d parked=%d\n"
+                                    "fmtgateselftest:   F4h crop bound said: \"%s\"\n",
+                            app.images.size(), g_rawDialogsRaised - rC,
+                            app.remoteRawStack.alive ? 1 : 0, app.toast.c_str());
+                    check(app.images.empty() && g_rawDialogsRaised == rC &&
+                          !app.remoteRawStack.alive,
+                          "F4h-crop a BOUND cropping recipe opens nothing and parks nothing");
+                    check(app.toast == dlgNo,
+                          "F4h-crop ...and refuses in the SAME words as the dialog: one decider, two entry points");
+                    g_rawSizeRecipe.clear();
+                    rawDlg.cropOn = false;
+                    rawDlg.cropX = rawDlg.cropY = rawDlg.cropW = rawDlg.cropH = 0;
+                    closeAll();
+                }
+
+                // ---- (12b) a row's OWN byte count, from a real listing ------
+                // rbRowOwnBytes is what the Browse double-click hands the
+                // headerless door, and what that door binds a recipe to. An
+                // expanded MEMBER was handed its group row's `size`, which is
+                // the SUM over the frames - a number no file in the folder
+                // has (review P2-1). Driven here against the peer's own
+                // listing rather than a hand-built row, because the thing
+                // being tested is which field of a real Entry is read.
+                {
+                    std::vector<remote::Entry> se;
+                    std::string serr2;
+                    const std::string sdirU = (ddir / "stk").u8string();
+                    const bool slok = app.uiSession.list(sdirU, se, serr2);
+                    const remote::Entry* sgrp = nullptr;
+                    for (const remote::Entry& e : se) if (e.group) sgrp = &e;
+                    // The FLAT view is where member rows live (the grouped one
+                    // shows the family as a single row), so both are built: the
+                    // defect was about a member row, and the group row is the
+                    // other half of the same question.
+                    std::vector<RbRow> sv = rbBuildView(rbMain(), &sdirU, se, true, false);
+                    std::vector<RbRow> gvv = rbBuildView(rbMain(), &sdirU, se, false, false);
+                    uint64_t memberBytes = 0, groupBytes = 0;
+                    int members = 0;
+                    for (const RbRow& r : sv) {
+                        if (r.ph || r.up) continue;
+                        if (r.member >= 0) { members++; memberBytes = rbRowOwnBytes(r); }
+                    }
+                    for (const RbRow& r : gvv) {
+                        if (r.ph || r.up) continue;
+                        if (r.e && r.e->group && r.member < 0) groupBytes = rbRowOwnBytes(r);
+                    }
+                    fprintf(stderr, "fmtgateselftest:   F4h row bytes: list=%d group=%d sum=%llu min=%llu members=%d member-own=%llu group-own=%llu\n",
+                            slok ? 1 : 0, sgrp ? 1 : 0,
+                            (unsigned long long)(sgrp ? sgrp->size : 0),
+                            (unsigned long long)(sgrp ? sgrp->minMemberSize : 0),
+                            members, (unsigned long long)memberBytes,
+                            (unsigned long long)groupBytes);
+                    check(slok && sgrp && sgrp->frames == 3 && sgrp->size == 3 * WANT,
+                          "F4h (setup) the peer folds the three members into one row whose size is the SUM");
+                    check(members == 3 && memberBytes == WANT,
+                          "F4h-P1 an expanded member row reports ITS OWN byte count, not the group's sum");
+                    check(groupBytes == 0,
+                          "F4h-P1 ...and a group row reports 0 rather than a sum no file has");
+                }
                 // ---- (11) the CFA PHASE the operator picked, over the link --
                 // RGGB and BGGR change no sample - they change which plane is
                 // which - so a phase that does not travel is not a wrong

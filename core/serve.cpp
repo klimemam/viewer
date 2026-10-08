@@ -1056,16 +1056,60 @@ static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
         // the loser of the race simply overwrites with the same content.
         const std::string tmp = memberPath + ".part" +
                                 std::to_string((unsigned long long)(uintptr_t)&n);
+        // ...and the temp goes away on EVERY exit, saying so if it cannot.
+        // PR #285's discipline, which this door was next to and did not have:
+        // a write that failed used to `return false` straight out of the block
+        // below and leave `<member>.part<n>` in the peer's cache for ever, in
+        // silence - and silence is what made the reader's version of this leak
+        // take two review rounds to name. The three cases are the same three
+        // (an error, gone-but-still-there, an ordinary drop that is traced
+        // anyway because a silent success cannot prove the path ran), and
+        // nothing is said when there is no file, which is every exit above.
+        struct NpzTemp {
+            std::string p;
+            bool keep = false, dropped = false;
+            void drop(const char* where) {
+                if (keep || dropped || p.empty()) return;
+                dropped = true;
+                std::error_code be;
+                const bool was = std::filesystem::exists(std::filesystem::u8path(p), be);
+                std::error_code e;
+                std::filesystem::remove(std::filesystem::u8path(p), e);
+                std::error_code ae;
+                const bool still = std::filesystem::exists(std::filesystem::u8path(p), ae);
+                if (e)
+                    fprintf(stderr, "viewer-serve: npz member temp %s could not be "
+                                    "removed (%s): %s\n", p.c_str(), where,
+                            e.message().c_str());
+                else if (was && still)
+                    fprintf(stderr, "viewer-serve: npz member temp %s removed WITHOUT "
+                                    "ERROR and is still there (%s)\n", p.c_str(), where);
+                else if (was)
+                    fprintf(stderr, "viewer-serve: npz member temp %s dropped (%s)\n",
+                            p.c_str(), where);
+            }
+            ~NpzTemp() { drop("backstop"); }
+        } ntemp{ tmp };
         {
             std::ofstream f(std::filesystem::u8path(tmp), std::ios::binary);
-            if (!f) { err = "cannot write into this peer's cache"; return false; }
+            if (!f) {
+                ntemp.drop("cache not writable");
+                err = "cannot write into this peer's cache";
+                return false;
+            }
             f.write((const char*)member.data(), (std::streamsize)member.size());
-            if (!f) { err = "cannot write into this peer's cache"; return false; }
+            if (!f) {
+                f.close();                      // before the unlink, not after
+                ntemp.drop("write failed");
+                err = "cannot write into this peer's cache";
+                return false;
+            }
         }
         std::filesystem::rename(std::filesystem::u8path(tmp),
                                 std::filesystem::u8path(memberPath), ec);
+        if (!ec) ntemp.keep = true;             // it is the member now, not a temp
         if (ec) {
-            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+            ntemp.drop("rename failed");
             err = "cannot place the member in this peer's cache";
             return false;
         }
@@ -1134,14 +1178,22 @@ static bool readRegion(ServedFile& n, const TileReq& r, std::vector<uint8_t>& ou
 // carries a recipe, so a listing that hid it would say "there is nothing here"
 // about a folder the very next double-click opens (verify-matrix G1 / #148).
 //
-// GATED ON THE CLIENT'S OWN NUMBER, not on this peer's. A v10 client cannot
-// send a recipe, so a group row of .raw files would arrive somewhere it cannot
-// be opened - a listing offering an open that is refused is the defect this
-// gate exists to avoid, pointed the other way. g_clientVersion is what HELLO
-// left behind, so no new plumbing is needed: the fact was already here.
+// GATED ON THE CLIENT'S OWN NUMBER - that is the half that was easy to miss. A
+// v10 client cannot send a recipe, so a group row of .raw files would arrive
+// somewhere it cannot be opened, and a listing offering an open that is refused
+// is the defect this gate exists to avoid, pointed the other way.
+// g_clientVersion is what HELLO left behind, so no new plumbing is needed: the
+// fact was already here.
+//
+// ...and on this peer's, for the reason every other row-shaping gate here has
+// both terms: a peer told to behave as an older one (VIEWER_SERVE_PROTOCOL)
+// must not put a row in the reply that its announced number predates, or the
+// seam tests a peer that could not exist. Being one-sided only showed up under
+// that env var, which is exactly where nobody looks (this round's sweep (iii)).
 static bool isScannableSuffix(const std::string& name) {
     if (isServedSuffix(name)) return true;
-    return g_clientVersion >= 11 && imagefile::isHeaderless(name);
+    return servedVersion() >= 11 && g_clientVersion >= 11 &&
+           imagefile::isHeaderless(name);
 }
 
 
@@ -1219,16 +1271,20 @@ static void putListEntryV3(Buf& out, const std::filesystem::path& full,
 // used to make the headerless refusal say "18446744073709551615 bytes" (review
 // P3-8). 0 is what every other unknown size on this wire is.
 //
-// EVERY SIZE THAT LEAVES THIS PEER GOES THROUGH HERE. There are three, and the
-// first round of this fix did two of them - the group row's sum and the group
-// row's extremes - and left the one that matters most: a SINGLE row's size is
-// the input to both of the client's new readers (remoteRawSameSizeIn's
-// per-name map, and remoteRawFileSize, which keys #166's binding), so an
-// unguarded stat there was the same sentence with the same number in it
-// (review P3-1). The v2 row went the same way. The other two file_size calls
-// in this file are not sizes on the wire: one is a source stat that already
-// has the ternary, and the reader-cache bounds check only quotes its number
-// inside `!ec`.
+// EVERY SIZE THAT LEAVES THIS PEER GOES THROUGH HERE, and the rule is the
+// predicate, not a tally: a file_size whose result is WRITTEN INTO A REPLY
+// calls this; one that is only compared against inside this process does not
+// have to (and the two that do not are each correct another way - one has the
+// ternary inline, the other quotes its number only inside `!ec`). An earlier
+// version of this paragraph counted the sites instead, and the count was
+// wrong in both directions.
+//
+// The round that added this did the group row's sum and extremes and missed
+// the one that mattered most: a SINGLE row's size is the input to both of the
+// client's readers of this fact (remoteRawSameSizeIn's per-name map, and
+// remoteRawFileSize, which keys #166's binding), so an unguarded stat there
+// put the same number in the same sentence (review P3-1). The v2 row went the
+// same way.
 //
 // The client's 0-byte refusal names the file when the listing let it - a
 // single row names itself, a group row carries only its extremes - and says
@@ -1382,7 +1438,9 @@ static void groupNumbered(const std::vector<std::pair<std::string, std::filesyst
         // rule was enforced only downward (a newer client updates an older
         // peer); this is the mirror case, and the peer is the only end that
         // can act on it.
-        if (frameAxis >= 0 && g_clientVersion >= 5)
+        // ...and on this peer's number too, same rule as every other gate that
+        // shapes a row: a peer announcing 4 must not put v5 text in the reply.
+        if (frameAxis >= 0 && servedVersion() >= 5 && g_clientVersion >= 5)
             g.pattern = rp::patternWithExtent(g.pattern, g.names);
         g.first = files[mem.front()].second;
         groups.push_back(std::move(g));
@@ -1520,7 +1578,13 @@ static void handleList(Buf& in) {
               [](const std::filesystem::directory_entry& a, const std::filesystem::directory_entry& b) {
                   return a.path().filename().u8string() < b.path().filename().u8string();
               });
-    if (g_clientVersion < 3) {
+    // BOTH TERMS, as putGroupEntryV3's own gate has. The client must be able
+    // to parse the shape AND a peer told to behave as an older one
+    // (VIEWER_SERVE_PROTOCOL) must not send a shape that number postdates -
+    // otherwise the seam tests a peer that cannot exist, which is the one thing
+    // the seam is for. The client reads this with effectiveVersion(), the
+    // minimum of the two, so the three numbers agree.
+    if (!(servedVersion() >= 3 && g_clientVersion >= 3)) {
         out.putU32((uint32_t)entries.size());
         for (auto& e : entries) {
             std::error_code e2;
