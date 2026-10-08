@@ -847,9 +847,32 @@ static int cjkFontSelftest() {
             // POSITIONS the intended character cannot appear at, and it merges
             // repeats of the same CHARACTER because the sentence counts
             // characters; an ill-formed step is not a character, so it is never
-            // merged. Nothing here calls into the tally's own code - no
-            // undrawableUnitKey, no undrawableTally - which is what makes a
-            // disagreement possible to see.
+            // merged.
+            //
+            // WHAT IT READS, AND FROM WHERE - because round 7 claimed this was
+            // independent and it was not (review round 8). It shares three
+            // PRIMITIVES with the thing it checks (ImTextCharFromUtf8,
+            // FindGlyphNoFallback, utf8SequenceAbove16Bit) and no POLICY. The
+            // control-character rule below is the one it used to copy verbatim
+            // from undrawableTallyUnseen, so both sides excluded every control
+            // character and the equation said nothing about any of them; it is
+            // now transcribed from the renderer instead:
+            //
+            //     imgui_draw.cpp, ImFont::RenderText:
+            //         if (c < 32) { if (c == '\n') {...continue;}
+            //                       if (c == '\r') continue; }
+            //         const ImFontGlyph* glyph = FindGlyph((ImWchar)c);
+            //
+            // (RenderText asks FindGlyph, which answers with the FALLBACK glyph
+            // - the '?' - where the atlas has nothing. Asking
+            // FindGlyphNoFallback here is how you ask "is the intended
+            // character absent", which is the same question with the answer the
+            // other way round.)
+            //
+            // What is still shared cannot be checked from here: if
+            // utf8SequenceAbove16Bit were wrong, both sides would be wrong
+            // together. What this does check is the COUNTING RULE - the axis
+            // the unit has moved on four times.
             auto questionMarks = [&](const std::vector<std::string>& pieces) {
                 ImFont* ff = bakedFont();
                 std::vector<uint32_t> chars;     // distinct characters shown as '?'
@@ -885,7 +908,8 @@ static int cjkFontSelftest() {
                             continue;
                         }
                         p += used;
-                        if (cp < 0x20 || cp == 0x7F) continue;   // no glyph is asked for
+                        // The renderer's own two exceptions, and only those.
+                        if (cp == '\n' || cp == '\r') continue;
                         if (cp <= 0xFFFF && ff &&
                             ff->FindGlyphNoFallback((ImWchar)cp)) continue;   // it drew
                         want((uint32_t)cp);
@@ -980,6 +1004,37 @@ static int cjkFontSelftest() {
             check(countOf(*d6, d6->name) == 2,
                   "C4 ...so one ill-formed FOUR-byte step is ONE '?' in each "
                   "piece that carries it, not four");
+            // ---- AND THE FIXTURES THAT TELL THE UNITS APART ---------------
+            // The one written for this in round 7 (d6, above) gives the SAME
+            // answer under the unit before it, so it could not have caught the
+            // change it was written for - and the "4" its comment claimed was
+            // really 2, because that unit deduplicated (review round 8). These
+            // two do tell them apart, and the numbers for all three units are
+            // written down so the next change has to come here.
+            //
+            // The bad bytes are in the NAME ONLY (the path is clean), so the
+            // piece list does not double anything and the three units are the
+            // only thing that can move the answer.
+            //
+            //   (A) the same stray byte TWICE in one piece
+            //         unit "the consumed run, deduplicated"  -> 1
+            //         unit "one byte, deduplicated"          -> 1
+            //         unit "one decode step, never merged"   -> 2   <- this one
+            const auto d7 = mk("C:/ok/clean.npy",
+                               "a" + bad1 + "b" + bad1 + "c.npy", std::string());
+            check(countOf(*d7, d7->name) == 2,
+                  "C4 the same stray byte twice is 2 - one count per decode "
+                  "step, which is one '?' per step on screen");
+            //   (B) ONE ill-formed four-byte step
+            //         unit "the consumed run, deduplicated"  -> 1
+            //         unit "one byte, deduplicated"          -> 2  (0xF0 + 0x80)
+            //         unit "one decode step, never merged"   -> 1   <- this one
+            const auto d8 = mk("C:/ok/clean.npy",
+                               "a" + std::string("\xF0\x80\x80\x80") + "b.npy",
+                               std::string());
+            check(countOf(*d8, d8->name) == 1,
+                  "C4 ...and one ill-formed four-byte step is 1, not one per "
+                  "byte it ate");
             // ...and the bytes a bad lead byte DOES swallow are not counted
             // again as drawable characters, which is the other direction of the
             // same equation.
@@ -1037,50 +1092,73 @@ static int cjkFontSelftest() {
                   "(a per-batch flag would have silenced it)");
         }
 
-        // ---- A STACK IS NOT REPORTED WHILE IT IS STILL LOADING -----------
-        // The settle rule used to be "the size is the same as it was last
-        // sweep", which rode on a universal that is false: that every
-        // `imagesRev++` comes with a push. Plenty of sites bump the counter
-        // with no push - a grouping invalidation, a series edit, an export, a
-        // modal closing - so one of those landing mid-load made two sweeps see
-        // the same size and
-        // the batch was reported with the frames that had arrived so far. A
-        // 400-frame stack said "N of 4" and was never corrected, which is the
-        // exact failure the comment above the rule says it exists to prevent
-        // (review round 7 P2).
+        // ---- A STACK IS NOT REPORTED WHILE A LOADER IS STILL WORKING -----
+        // ...AND IT IS REPORTED THE MOMENT ONE STOPS, WHICH IS THE HALF ROUND 7
+        // LOST (review round 8, critical).
         //
-        // The fixture is the mechanism: push two of six frames, then move the
-        // revision counter WITHOUT pushing, which is what those sites do.
+        // Round 7 asked `members < expectedFrames`. That field counts the NAMES
+        // the load planned, not the frames still coming, and nothing ever
+        // lowers it - so after one Stop click, after a sibling that will not
+        // decode, after the memory budget, and for every budget-limited remote
+        // stack, it stayed true for ever. Two things followed: the batch was
+        // never reported at all, and the sweep re-armed `wantAnother` and
+        // `wakeFrames` on every frame, so the idle-driven loop spun at full
+        // frame rate until the process ended.
+        //
+        // Both halves are asserted here, and the SECOND one is what no test in
+        // this file was looking at: a settled batch must not ask for another
+        // frame. `expectedFrames` is left deliberately ABOVE the membership for
+        // the whole group, because that is the state the defect lived in.
         {
             const size_t before7 = app.msgLog.size();
+            const bool runWas = app.seqRunning;
+            const int rfWas = app.rfPending;
             App::SeqInfo si4;
             si4.id = app.nextSeqId++;
             si4.name = thai;                  // the stack's own name is undrawable
-            si4.expectedFrames = 6;           // what the loader wrote down
+            si4.expectedFrames = 6;           // the names the load planned...
             app.seqs.push_back(si4);
-            for (int k = 0; k < 2; k++) {
+            for (int k = 0; k < 2; k++) {     // ...and two of them decoded
                 mkDoc("part_" + std::to_string(k) + ".npy", 130, si4.id);
                 app.imagesRev++;
             }
+            app.seqRunning = true;            // a loader IS working
             sweep();
             app.imagesRev++;                  // a bump with no push, twice
             sweep();
             app.imagesRev++;
             sweep();
             check(linesSince(before7).empty(),
-                  "C4 a stack with 2 of its 6 frames says NOTHING yet, however "
+                  "C4 nothing is said while a loader is still working, however "
                   "often the revision counter moves without a push");
-            for (int k = 2; k < 6; k++) {
-                mkDoc("part_" + std::to_string(k) + ".npy", 130, si4.id);
-                app.imagesRev++;
-            }
+            // THE LOADER STOPS SHORT - Stop pressed, or the budget, or a
+            // sibling that would not decode. `expectedFrames` still says 6 and
+            // the membership is still 2, which is the permanent state round 7
+            // read as "more are coming".
+            app.seqRunning = false;
+            app.rfPending = 0;
             sweep(); sweep();
             const std::vector<std::string> got7 = linesSince(before7);
             for (const std::string& l : got7) say("msg: " + l);
             check(got7.size() == 1,
-                  "C4 ...and exactly ONE line once all six have arrived");
+                  "C4 ...and the line comes out as soon as the loader stops, "
+                  "even though the stack never reached the frame count it "
+                  "planned (one Stop click used to silence it for ever)");
             check(!got7.empty() && got7[0].find(thai) != std::string::npos,
                   "C4 ...naming the stack");
+            // ...AND THE LOOP GOES BACK TO SLEEP. A sweep over a settled batch
+            // must not ask for another frame; round 7's condition asked on
+            // every frame for ever, which is the spin half of the defect and is
+            // invisible to every other assertion here.
+            app.wakeFrames = 0;
+            app.imagesRev++;                  // a bump with no push: one sweep
+            sweep();
+            sweep();
+            check(app.wakeFrames == 0,
+                  "C4 ...and a settled batch does not ask for another frame, so "
+                  "the idle-driven loop stays idle");
+            app.seqRunning = runWas;
+            app.rfPending = rfWas;
         }
         // ---- THE PROGRAM MUST NOT MAKE A NAME THAT IS NOT UTF-8 ----------
         // §8c says, flatly, that bytes which are not UTF-8 are a property of
@@ -1178,8 +1256,31 @@ static int cjkFontSelftest() {
             check(undrawableNote("C:/data/frame_000.npy\n256x256 1ch u16").empty(),
                   "C4 ...and a multi-line tooltip body full of drawable "
                   "characters is not reported either");
-            check(undrawableNote("a\tb\r\nc").empty(),
-                  "C4 ...nor are tabs and carriage returns");
+            // ...and the OTHER control characters are not in that company.
+            // Round 3 excluded every code point under 0x20 and the oracle
+            // copied the exclusion verbatim, so both sides agreed and the
+            // equation said nothing about any of them (review round 8). The
+            // renderer skips exactly \n and \r; everything else goes to the
+            // atlas, which answers for each one on its own:
+            //
+            //   TAB    is DRAWN - ImGui synthesises a tab glyph from the space
+            //          glyph when it builds the lookup table - so it is not
+            //          counted, and the reason is the ordinary one ("it drew")
+            //   0x01   has no glyph and no synthesised one, so FindGlyph gives
+            //          the fallback and the reader sees '?'
+            const UndrawableTally tc = undrawableTally("a\tb\r\nc");
+            say("tab/CR/LF -> total=" + std::to_string(tc.total()));
+            check(tc.total() == 0,
+                  "C4 ...while a TAB, a CR and an LF are all still 0 - two "
+                  "because the renderer skips them, the tab because ImGui "
+                  "builds it a glyph");
+            const UndrawableTally t1 = undrawableTally("a\x01" "b.npy");
+            say("0x01 -> noGlyph=" + std::to_string(t1.noGlyph) +
+                " notAsked=" + std::to_string(t1.notAsked) +
+                " total=" + std::to_string(t1.total()));
+            check(t1.total() == 1,
+                  "C4 ...and a control character the atlas has NO glyph for is "
+                  "counted, because that is what the reader sees");
         }
         app.images.clear();
         app.seqs.clear();
@@ -1997,9 +2098,9 @@ static int cjkFontSelftest() {
             // ...AND THE OTHER BRANCH OF THAT SENTENCE (review round 5 P3).
             // What was skipped here is the user's own setting, so "delete that
             // line" can be carried out. When a BUILT-IN candidate is what was
-            // skipped there is no such line, and only `skippedWasOverride`
-            // knows which case it is - so the false side needs its own
-            // assertion or the branch can be deleted with the suite green.
+            // skipped there is no such line, and only `skippedOverride` knows
+            // which path it was - so this side needs its own assertion or the
+            // branch can be deleted with the suite green.
             //
             // NOT asserted on "appearance.fontPath": BOTH sentences name it
             // (the built-in one offers it as a way to choose something else),
@@ -2178,6 +2279,83 @@ static int cjkFontSelftest() {
                 check(mm.find("If you have REPLACED that file") != std::string::npos,
                       "C7 ...and the record-deleting way out says what it "
                       "costs if the file has not been replaced");
+                // ---- THE ADVICE IS PER PATH TOO (review round 8 P2) --------
+                // `skippedWasOverride` was a bool over the whole search, so a
+                // mixed skip - the user's setting AND a built-in candidate,
+                // which is the ordinary shape once a machine has two records -
+                // printed the override's remedy and swallowed the other. The
+                // same shape as the sentence above it, left next door by the
+                // round that fixed that one.
+                FontChoice both = mix;
+                both.skippedOverride = "/gone/for/good.ttc";
+                both.skippedWasOverride = true;
+                const std::string bm2 = cjkFontCrashSkipText(both, fontBakeCrumbPath());
+                say("crash-skip (override + built-in): " + bm2);
+                check(bm2.find("/gone/for/good.ttc is YOUR setting") !=
+                          std::string::npos,
+                      "C7 a mixed skip says which file is the user's setting");
+                check(bm2.find("delete that line") != std::string::npos &&
+                      bm2.find("not something you set") != std::string::npos,
+                      "C7 ...and gives BOTH remedies, because both kinds were "
+                      "skipped");
+                // ---- AND THE SENTENCES AGREE IN NUMBER ---------------------
+                // Both were written for one path and joined with "; ", so two
+                // paths read "A; B has stopped start-up ... it will be tried".
+                FontChoice two;
+                two.path = "/in/use.ttc";
+                two.skippedAfterCrash = true;
+                two.skippedForever.push_back("/a.ttc");
+                two.skippedForever.push_back("/b.ttc");
+                const std::string tm = cjkFontCrashSkipText(two, fontBakeCrumbPath());
+                say("crash-skip (two permanent): " + tm);
+                check(tm.find("have stopped start-up") != std::string::npos &&
+                      tm.find("has stopped start-up") == std::string::npos,
+                      "C7 two paths take a plural verb");
+                check(tm.find("they are no longer tried") != std::string::npos,
+                      "C7 ...and a plural pronoun");
+                FontChoice twoOnce;
+                twoOnce.skippedAfterCrash = true;
+                twoOnce.skippedOnce.push_back("/a.ttc");
+                twoOnce.skippedOnce.push_back("/b.ttc");
+                const std::string tm2 = cjkFontCrashSkipText(twoOnce);
+                say("crash-skip (two retried): " + tm2);
+                check(tm2.find("they were NOT used this time") != std::string::npos &&
+                      tm2.find("they will be tried once more") != std::string::npos,
+                      "C7 ...and so does the other sentence");
+                // ---- A SKIP SOMETHING ELSE COVERED IS NOT A LOSS ----------
+                // cjkMergeFontPath used to hand back every candidate it passed
+                // over, so a machine with two Chinese faces - skip the first,
+                // merge the second - was told the simplified half was gone
+                // while the atlas had it (review round 8 P2/P3).
+                {
+                    const std::vector<std::string> mc = cjkMergeCandidates();
+                    std::vector<std::string> usable;
+                    std::error_code mec;
+                    for (const std::string& c : mc)
+                        if (std::filesystem::is_regular_file(pathFromUtf8(c), mec) &&
+                            looksLikeSfnt(c)) usable.push_back(c);
+                    if (usable.size() >= 2) {
+                        std::vector<std::string> took;
+                        const std::string got =
+                            cjkMergeFontPath(std::string(), { usable[0] }, &took);
+                        say("merge with the first candidate skipped -> " + got +
+                            " (reported as lost: " + std::to_string(took.size()) + ")");
+                        check(!got.empty() && got != usable[0],
+                              "C7 a skipped merge candidate is replaced by the next");
+                        check(took.empty(),
+                              "C7 ...and nothing is reported as lost, because "
+                              "nothing is");
+                    } else {
+                        say("fewer than two usable Chinese faces here, so the "
+                            "'a later candidate covered it' half cannot be "
+                            "shown - the reporting half below did run.");
+                    }
+                    std::vector<std::string> took2;
+                    const std::string none =
+                        cjkMergeFontPath(std::string(), usable, &took2);
+                    check(none.empty() && took2.size() == usable.size(),
+                          "C7 ...while skipping ALL of them does report them");
+                }
                 writeRawCrumb("");          // nothing of this is left behind
                 // ---- THE RETRY'S RECORD IS ABSORBED, which is what makes a
                 // transient failure recoverable and which no test held (review

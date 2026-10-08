@@ -27,10 +27,17 @@ struct FontChoice {
     // start died baking it. The user has to be told: their setting is being
     // ignored, and only they can decide whether to fix or remove it.
     bool skippedAfterCrash = false;
-    // ...and whether the thing skipped was the USER'S setting or one of this
-    // build's own candidates. The two need different advice: only one of them
-    // has a line the user can delete (review P3).
-    bool skippedWasOverride = false;
+    // ...and WHICH of the skipped paths was the USER'S setting, because the
+    // two kinds need different advice and only one of them has a line the user
+    // can delete (review P3).
+    //
+    // A PATH AND NOT A FLAG (review round 8 P2). It was a bool over the whole
+    // search, so a mixed skip - the override and a built-in candidate, which is
+    // the ordinary shape once a machine has two records - offered the
+    // override's remedy and swallowed the other one. At most one path can be
+    // the override (it is `want`), so naming it is enough to say both things.
+    std::string skippedOverride;
+    bool skippedWasOverride = false;      // == !skippedOverride.empty()
     // ...and the paths that were skipped, SPLIT BY WHICH SENTENCE THEY GET.
     // Two facts, so two lists, so two groups on screen: "not used this time,
     // it will be tried again" and "not tried any more, and here is how to undo
@@ -396,7 +403,10 @@ static FontChoice jpFontChoice(const std::string& want,
                 note(c.skippedOnce);
             }
             c.skippedAfterCrash = true;
-            if (strcmp(how, "appearance.fontPath") == 0) c.skippedWasOverride = true;
+            if (strcmp(how, "appearance.fontPath") == 0) {
+                c.skippedOverride = p;
+                c.skippedWasOverride = true;
+            }
             return false;
         }
         if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) {
@@ -514,8 +524,15 @@ static std::string cjkMergeFontPath(const std::string& primary,
             if (skipped) skipped->push_back(m);
             continue;
         }
-        if (std::filesystem::is_regular_file(pathFromUtf8(m), ec) && looksLikeSfnt(m))
+        if (std::filesystem::is_regular_file(pathFromUtf8(m), ec) && looksLikeSfnt(m)) {
+            // A SKIP THAT SOMETHING ELSE COVERED IS NOT A LOSS (review round 8
+            // P3). The list is "what the breadcrumb took away", and once a
+            // later candidate has been taken there is nothing to report: the
+            // simplified-Chinese half is present. Cleared HERE rather than at
+            // the caller so the caller cannot get it wrong - the caller did.
+            if (skipped) skipped->clear();
             return m;
+        }
     }
     return {};
 }
@@ -1064,14 +1081,21 @@ static std::string cjkFontCrashSkipText(const FontChoice& c,
     };
     const std::string once = join(c.skippedOnce);
     const std::string gone = join(c.skippedForever);
+    // AGREEMENT COMES FROM THE COUNT, not from the comma (review round 8 P2):
+    // both of these sentences were written for one path and joined with "; ",
+    // so two paths read "A; B has stopped start-up" and "it will be tried".
+    const bool once1 = c.skippedOnce.size() == 1;
+    const bool gone1 = c.skippedForever.size() == 1;
     std::string s;
     if (!once.empty())
-        s += "the last start did not survive reading " + once +
-             ", so it was NOT used this time - it will be tried once more on "
-             "the next start. ";
+        s += std::string("the last start did not survive reading ") + once +
+             ", so " + (once1 ? "it was" : "they were") + " NOT used this time "
+             "- " + (once1 ? "it" : "they") + " will be tried once more on the "
+             "next start. ";
     if (!gone.empty())
-        s += gone + " has stopped start-up more than once, so it is no longer "
-                    "tried. ";
+        s += gone + (gone1 ? " has" : " have") +
+             " stopped start-up more than once, so " +
+             (gone1 ? "it is" : "they are") + " no longer tried. ";
     // No "the record does not name which" arm: tryPath is the only thing that
     // sets `skippedAfterCrash`, and it records the path in one of the two lists
     // in the same breath, so one of them is non-empty whenever this function is
@@ -1084,16 +1108,32 @@ static std::string cjkFontCrashSkipText(const FontChoice& c,
     // false when what was skipped is a BUILT-IN CANDIDATE rather than the
     // user's own setting - there is no line to delete, and a reader who goes
     // looking for one learns nothing except that the message lies. Which case
-    // this is, is known: `skippedWasOverride` is set where the skip happened.
-    // (Never print an instruction that cannot be carried out.)
-    if (c.skippedWasOverride)
-        s += " To fix it, point \"appearance.fontPath\" in settings.jsonc (or "
-             "`fontPath` in prefs.txt) at a different file, or delete that line "
-             "to go back to the built-in search.";
-    else
-        s += " That file is one this build looks for on its own, not something "
-             "you set - if it is broken, replace it, or name a different font "
-             "with \"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
+    // this is, is known PER PATH: `skippedOverride` is the path, recorded where
+    // the skip happened. (Never print an instruction that cannot be carried
+    // out - and never print one about the wrong file, which a bool over the
+    // whole search did.)
+    // ...AND THE ADVICE IS PER PATH TOO. Whether a path is the user's setting
+    // is a fact about THAT path, so both sentences can be needed at once and
+    // each names its own file. This used to be one `if/else` over a bool for
+    // the whole search, which gave a mixed skip the override's remedy only
+    // (review round 8 P2 - the same shape as the sentence above it, left next
+    // door by the round that fixed that one).
+    int builtIns = 0;
+    for (const std::string& p : c.skippedOnce)
+        if (p != c.skippedOverride) builtIns++;
+    for (const std::string& p : c.skippedForever)
+        if (p != c.skippedOverride) builtIns++;
+    if (!c.skippedOverride.empty())
+        s += " " + c.skippedOverride + " is YOUR setting: point "
+             "\"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
+             "prefs.txt) at a different file, or delete that line to go back to "
+             "the built-in search.";
+    if (builtIns > 0)
+        s += std::string(builtIns == 1 ? " The other file is one" : " The others are ones") +
+             " this build looks for on its own, not something you set - if " +
+             (builtIns == 1 ? "it is" : "they are") + " broken, replace " +
+             (builtIns == 1 ? "it" : "them") + ", or name a different font with "
+             "\"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
              "prefs.txt).";
     // ...AND THE WAY BACK FROM "not again" - WITH ITS PRECONDITION, which is
     // the other half of "never print an instruction that cannot be carried

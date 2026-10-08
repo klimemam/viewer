@@ -1364,7 +1364,15 @@ int main(int argc, char** argv) {
     // ...and the SECOND FACE the breadcrumb took away, which is independent of
     // every branch above: the primary can be perfectly fine and the merge face
     // still gone, and until round 7 that happened in silence.
-    if (!mergeSkipped.empty())
+    //
+    // ONLY WHEN THERE IS NO SECOND FACE AT ALL. Round 7 toasted on "a candidate
+    // was skipped", and a machine with two Chinese faces skips the first and
+    // merges the second - so it said "baked one face, simplified Chinese will
+    // show '?'" about an atlas that had both (review round 8 P2).
+    // cjkMergeFontPath now clears the list when it takes a later candidate, and
+    // this says the same thing a second way, because the toast is the half the
+    // reader sees.
+    if (mergePath.empty() && !mergeSkipped.empty())
         toast(cjkFontMergeSkippedText(mergeSkipped, g_fontChoice), true);
     // ...and the settings file's refusal, held since loadSettings() because
     // that ran before there was a context to draw a toast in (see the function).

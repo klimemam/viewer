@@ -2117,6 +2117,12 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                     // Series::unit is documented empty-means-unset and the panel
                     // lets the user type it in. §4.3.2 - the values stay either way.
                     snprintf(s.unit, sizeof s.unit, "%s", v.condUnit.c_str());
+                    // ...and the copy can stop INSIDE a character: this field
+                    // is 16 bytes and the value comes out of a file. The round
+                    // that fixed the other two copies of this left this one
+                    // (review round 8 P3); a unit this program truncated is a
+                    // '?' on a row that §8c blames on the name on disk.
+                    utf8CutToBoundary(s.unit);
                 }
             continue;
         }

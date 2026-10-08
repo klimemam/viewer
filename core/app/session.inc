@@ -1714,13 +1714,21 @@ static void loadPrefs() {
             // An empty value is not a unit. Leaving the default in place is the
             // same rule the series modal follows: an empty box stays empty and
             // never silently becomes "lx" on an axis.
-            if (!u.empty())
+            // prefs.txt is outside this program and this field is 16 bytes, so
+            // the copy can stop inside a character. The Files panel would then
+            // report a '?' this program created with the one sentence that
+            // blames the disk (review round 7 P3).
+            //
+            // BRACED. Round 7 wrote the trim under an unbraced `if` with the
+            // comment between the two statements, so it ran whether or not the
+            // key had a value (review round 8 P3). It is idempotent, so nothing
+            // was wrong on screen today - the defect is that the next statement
+            // added here would also have escaped the `if`, and that a reader
+            // cannot tell which was meant.
+            if (!u.empty()) {
                 snprintf(app.lin.unit, sizeof app.lin.unit, "%s", u.c_str());
-                // prefs.txt is outside this program and this field is 16 bytes,
-                // so the copy can stop inside a character. The Files panel
-                // would then report a '?' this program created with the one
-                // sentence that blames the disk (review round 7 P3).
                 utf8CutToBoundary(app.lin.unit);
+            }
         }
         else if (key == "gamma")       {
             double candidate = 0;

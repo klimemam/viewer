@@ -271,15 +271,22 @@ struct UndrawableTally {
 // that appears in the row's label, in `d.name`, in the path and in the member
 // name is counted once - and every superstring case above stops being a case.
 //
-// THE CONSTRAINT THE UNIT HAS TO MEET, which is not a unit (review round 7):
+// THE CONSTRAINT THE UNIT HAS TO MEET, which is not a unit (review round 7,
+// corrected in round 8):
 //
-//     THE NUMBER MUST BE THE NUMBER OF '?' THE READER SEES FOR THIS ROW.
+//     THE NUMBER MUST BE THE NUMBER OF DISTINCT THINGS THIS ROW CANNOT DRAW,
+//     where a CHARACTER is one thing however many times it appears, and a run
+//     of bytes that is not UTF-8 is one thing per occurrence.
 //
-// The sentence promises it - "N character(s) here draw as '?'" - and the unit
-// has now moved three times without that equation being written down, so it is
-// written down here and a test holds it (C4's `questionMarks` oracle walks the
-// pieces the way the renderer walks text and counts glyph positions, with
-// nothing from this function).
+// IT IS NOT "the number of '?' glyphs on screen", which is how round 7 wrote
+// it, and that sentence was false for six of the eight fixtures that check it:
+// a character in both the row's label and its path is drawn twice and counted
+// once, on purpose, because the sentence counts CHARACTERS ("N character(s)
+// here draw as '?'") and there is one character there that the reader cannot
+// read. The equation that holds is the one above, and it is the one C4's
+// `questionMarks` oracle computes - by walking the pieces the way the renderer
+// walks text, counting glyph positions, and then merging repeats of the same
+// character exactly as the sentence does.
 //
 // WHAT THE RENDERER DOES, because that is what fixes the unit: ImGui's text
 // drawing decodes one step at a time and emits EXACTLY ONE GLYPH PER STEP,
@@ -306,14 +313,33 @@ struct UndrawableTally {
 //     says 1. A step is what the screen shows, so a step is what is counted.
 //     manual.md §8c says the same thing in the canon.
 //
-// WHY NOT ONE BYTE, since that was this round's predecessor: `used` was said to
-// depend on what follows the bad byte. It does not. ImTextCharFromUtf8 takes
-// the length from a table indexed by the LEAD BYTE alone, so a stray 0xFF is
-// one step wherever it sits and a 0xF0 with three continuation bytes is one
-// step of four; the worked example in the old comment here, "(4, FF, 'a', 'b')",
-// cannot occur. Advancing by `used` is not just safe, it is the only advance
-// that tracks the renderer - with one byte, the ASCII the renderer swallows
-// after a bad lead byte came back as separately drawable characters.
+// WHY NOT ONE BYTE, since that was the predecessor of this: because one byte
+// is not what the renderer advances by, so counting one byte at a time made the
+// number disagree with the screen - `\xF0" + three continuation bytes is ONE
+// glyph and came out as more than one count.
+//
+// AND THE REASON ROUND 7 GAVE FOR THIS WAS WRONG (review round 8). It said
+// `used` does not depend on what follows the bad byte, because the length comes
+// from a table indexed by the lead byte. That is true on the SUCCESS path and
+// false on the ERROR path, which is the only path badBytes is on. imgui.cpp,
+// ImTextCharFromUtf8, in the `if (e)` branch:
+//
+//     // All available bytes (at most `len` bytes) are consumed on
+//     // incomplete/invalid second to last bytes.
+//     wanted = ImMin(wanted, !!s[0] + !!s[1] + !!s[2] + !!s[3]);
+//
+// `s[1..3]` are the FOLLOWING BYTES (zero past the end of the string), so a
+// lone 0xF0 at the end of a name consumes 1 and the same 0xF0 with three bytes
+// after it consumes 4. The round-6 comment that said so was right and this file
+// called it wrong; the retraction is here rather than in a commit message
+// because this is where the next reader will look.
+//
+// IT DOES NOT MATTER FOR THIS DESIGN, and that is the point of recording it:
+// `used` is an ADVANCE here, never an identity. The renderer advances by the
+// same `used` over the same bytes, so the step count matches the screen however
+// context-dependent each step's length is. The context dependence only bites a
+// unit that uses `used` as a KEY - which is what round 5 did, and why round 6
+// went looking for another key at all.
 //
 // A CHARACTER's key: at most 4 bytes, because ImTextCharFromUtf8 never reports
 // more on either path, so the key is those bytes and their count. Ill-formed
@@ -408,14 +434,38 @@ static UndrawableTally undrawableTallyUnseen(const std::string& utf8Name,
             continue;
         }
         p += used;
-        // CONTROL CHARACTERS ARE NOT COUNTED, and this is not a nicety: ImGui
-        // does not ASK the atlas for a glyph for U+000A, it breaks the line -
-        // and the glyph ranges start at U+0020, so the atlas has none. Counting
-        // one as "no glyph in the font" put a false "1 character here draws as
-        // '?'" on EVERY row of the Files panel the moment this function was
-        // handed a multi-line string. Something the renderer never looks up
-        // cannot be something the renderer cannot draw.
-        if (cp < 0x20 || cp == 0x7F) continue;
+        // ONLY \n AND \r ARE NOT DRAWN, and that is the RENDERER'S rule, not a
+        // judgement made here. imgui_draw.cpp, ImFont::RenderText:
+        //
+        //     if (c < 32)
+        //     {
+        //         if (c == '\n') { ... continue; }
+        //         if (c == '\r') continue;
+        //     }
+        //     const ImFontGlyph* glyph = FindGlyph((ImWchar)c);
+        //
+        // Everything else under 0x20, and 0x7F, goes to FindGlyph - which
+        // answers with the FALLBACK glyph where the atlas has nothing - so a
+        // 0x01 in a file name really is drawn as '?' and really is a character
+        // the reader cannot read.
+        //
+        // A TAB IS NOT ONE OF THOSE, and the atlas is what says so rather than
+        // a rule here: ImGui SYNTHESISES a tab glyph out of the space glyph
+        // when it builds the lookup table (imgui_draw.cpp, ImFont::
+        // BuildLookupTable - "tab_glyph = *FindGlyph((ImWchar)' ');
+        // tab_glyph.Codepoint = '\t'; tab_glyph.AdvanceX *= IM_TABSIZE;"), so
+        // FindGlyphNoFallback finds it and the loop below passes over it for
+        // the ordinary reason: it drew.
+        //
+        // Round 3 excluded ALL control characters, to stop a multi-line TOOLTIP
+        // counting the newlines this code had just put in it. The two the
+        // renderer skips are exactly the two that a concatenation adds, so
+        // narrowing the rule to those two keeps that fix and lets the ATLAS
+        // answer for the rest - which is the same question this function asks
+        // about every other code point (review round 8: the oracle shared this
+        // exclusion verbatim, so both sides agreed and the equation proved
+        // nothing about any of them).
+        if (cp == '\n' || cp == '\r') continue;
         const uint64_t key = undrawableUnitKey(p - used, used);
         if (cp > 0xFFFF) {                            // ImWchar32 builds land here
             if (fresh(key)) t.tooHigh++;
@@ -694,35 +744,67 @@ static std::string undrawableNote(const std::string& text) {
 // `grep -n 'imagesRev++'` and read the ones that are not next to a push.
 // compare.inc bumps it when the Files GROUPING is invalidated; series_model.inc
 // bumps it on every member edit, rename and reorder; export.inc bumps it when a
-// document is dropped from the caches; the derive and series modals bump it
-// when they close. None of those pushes anything. Six lines below this one the
-// file says so itself ("The line only appeared when something ELSE later moved
-// the counter"), and so does `:1268`. One of those bumps landing mid-load makes
-// two consecutive sweeps see the same size, so a 400-frame stack was reported
-// as "N of 4" and never corrected - the exact failure the paragraph above says
-// this delay exists to prevent.
+// document is dropped from the caches; the series modal bumps it when it
+// closes. None of those pushes anything. (The derive modal, which an earlier
+// version of this paragraph also named, bumps it immediately AFTER a push - so
+// it is not a witness, and naming it was the same carelessness as the line
+// numbers this paragraph used to quote for a sentence that is no longer in the
+// file: review round 8 P3.) One of those bumps landing mid-load makes two
+// consecutive sweeps see the same size, which is why the size standing still
+// was never the answer.
 //
 // (This paragraph replaced a wrong COUNT with a wrong UNIVERSAL, and the
 // universal was worse: a reader can check a number with grep and nobody checks
 // an "every". So the universal that replaced it is checked - by the test below
 // in C4, which moves the counter without pushing and asserts the silence.)
 //
-// WHY THIS SHAPE AND NOT A CORRECTION LINE. The ruling allowed either: ask the
-// question directly, or say the number again when it turns out larger. Asking
-// is better here because the answer EXISTS - a stack load records how many
-// frames it is going to have (`SeqInfo::expectedFrames`), so "can more arrive
-// for this row" is a fact the loader already wrote down, not an inference. A
-// correction line would also have to be bounded (a load that grows in steps
-// would correct itself in steps), and it would spend the one line per open that
-// this whole mechanism exists to keep.
+// WHAT TO ASK, and this is where round 7 asked the wrong thing (review round
+// 8, critical). It asked `g.members < si->expectedFrames`, which reads as "more
+// are coming" and is not what that field means. The loader says so itself, in
+// open_dispatch.inc beside the only place that sets it:
 //
-// WHAT IS LEFT, said out loud: `expectedFrames` is 0 when no loader recorded
-// one - a hand-picked set of loose files, a plugin's product. There the
-// size-stability delay is all there is, and it can still fire early. For loose
-// rows that costs nothing for the per-row lines, because `saidKey` is keyed on
-// the row and a row that arrives later gets its own line (C4 asserts exactly
-// that); the one number that can still be early is the summary's denominator
-// when more than five rows arrive in two bursts.
+//     expectedFrames counts the NAMES, the membership counts WHAT DECODED, and
+//     the Files row says "4/5f" until it reads. That statement OUTLIVES the
+//     toast, which is the point.
+//
+// So `members < expectedFrames` is a PERMANENT, LEGITIMATE state - no writer
+// ever lowers it - and every one of these reaches it: Stop pressed on a folder
+// load (stopLocalStackLoad clears the queue and cancels the worker and leaves
+// the field alone), a sibling the rule names but cannot decode, the memory
+// budget stopping a load short, and a remote stack whose budget deliberately
+// keeps a fraction of its frames resident. Asking it here cost two things at
+// once: the batch was NEVER reported (`saidKey` is written after the `continue`
+// below), which is the exact failure this mechanism exists to prevent, and
+// `wantAnother` + `wakeFrames` were re-armed on every frame for ever, so the
+// idle-driven loop this file promises spun at full frame rate until the process
+// ended. One Stop click was enough.
+//
+// THE RIGHT QUESTION IS ABOUT THE LOADER, NOT ABOUT A PLAN: is anything still
+// working that could push into this list? That is a lifecycle, so it ENDS -
+// including when it ends early, which is the whole point. `app.seqRunning` and
+// `app.seqQueue` are the local stack loader's, `seqReadyPending()` is a group
+// that has produced a stack this sweep has not seen yet, and `app.rfPending` is
+// the outstanding remote fetches. Stop makes all of them false in bounded time,
+// and so does the budget, and so does a load that simply finishes.
+//
+// It is deliberately NOT per batch. A load in flight anywhere delays every
+// batch's line by the length of that load, which is a delay; a predicate that
+// cannot end is a silence. The ruling's other option - report early and correct
+// the number later - was not taken because it spends the one line per open this
+// mechanism exists to keep, and because the correction would itself need a
+// bound (a load that grows in steps corrects in steps).
+//
+// WHAT IS LEFT, said out loud: a push from something that is not a loader - the
+// derive modal, a plugin, a series edit - is not covered by this, so a batch
+// built that way is reported on the first sweep where its size holds still.
+// Those produce their rows in one go, and the per-row `saidKey` means a row
+// that arrives later still gets its own line (C4 asserts that); the number that
+// can still be early is the summary's denominator when more than five rows
+// arrive in two bursts.
+static bool filesLoadersBusy() {
+    return app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
+           app.rfPending > 0;
+}
 //
 // So when a batch is still growing this asks to be run again: `wantAnother`
 // gets it past the rev gate on the next frame, and app.wakeFrames guarantees
@@ -795,16 +877,9 @@ static void undrawableReportNewDocs() {
             g->affected++;
     }
     for (auto& [batchId, gs] : byBatch) {
-        // CAN MORE STILL ARRIVE? Asked of the loader's own record first - a
-        // stack knows how many frames it expects - and only then of the size,
-        // which is a delay and not an answer. See the note above.
-        bool filling = false;
-        for (const Group& g : gs) {
-            if (!g.seqId) continue;
-            const App::SeqInfo* si = seqInfo(g.seqId);
-            if (si && si->expectedFrames > 0 && g.members < si->expectedFrames)
-                filling = true;
-        }
+        // CAN MORE STILL ARRIVE? Asked of the loaders' own lifecycle, which
+        // ends - not of a planned total, which does not. See the note above.
+        const bool filling = filesLoadersBusy();
         const int was = batchSize.count(batchId) ? batchSize[batchId] : -1;
         if (filling || was != nowSize[batchId]) {
             batchSize[batchId] = nowSize[batchId];
