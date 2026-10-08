@@ -31,6 +31,12 @@ struct FontChoice {
     // build's own candidates. The two need different advice: only one of them
     // has a line the user can delete (review P3).
     bool skippedWasOverride = false;
+    // ...and the paths that will NEVER be tried again, because they have each
+    // killed `kFontBakeDeathsMax` starts. A different fact from
+    // `skippedAfterCrash`, and a different sentence: one says "not this time",
+    // the other says "not again, and here is how to undo that" (review round 6
+    // P2). Empty whenever the skip is the ordinary one-start-ago kind.
+    std::vector<std::string> skippedForever;
 };
 // The override, as settings.jsonc / prefs.txt left it. Declared here rather
 // than in settings.inc (where g_settingsEditorCmd and g_settingsRepoUrl live)
@@ -341,7 +347,8 @@ static std::vector<std::string> cjkMergeCandidates();   // fwd: the Chinese face
 // this start must not bake them again whatever else recommends them. Empty in
 // the ordinary case. See fontBakeCrumb* in session.inc for why this exists.
 static FontChoice jpFontChoice(const std::string& want,
-                               const std::vector<std::string>& skip = {}) {
+                               const std::vector<std::string>& skip = {},
+                               const std::vector<std::string>& forever = {}) {
     FontChoice c;
     std::error_code ec;
     // Each attempt records WHY it failed, because "not found", "found, not a
@@ -350,8 +357,25 @@ static FontChoice jpFontChoice(const std::string& want,
     auto tryPath = [&](const std::string& p, const char* how) {
         if (p.empty()) return false;
         if (std::find(skip.begin(), skip.end(), p) != skip.end()) {
-            c.tried.push_back(p + " (skipped: the last start did not survive "
-                                  "baking it)");
+            // TWO REASONS TO SKIP, and the record says which: a death the last
+            // start left behind, or a file that has died often enough that this
+            // build has stopped offering it. `forever` is a subset of `skip`,
+            // so the order here is "the stronger statement first".
+            const bool perm = std::find(forever.begin(), forever.end(), p) != forever.end();
+            if (perm) {
+                c.tried.push_back(p + " (skipped: it did not survive baking on "
+                                      "two separate starts, so it is not tried "
+                                      "again)");
+                // Deduplicated here for the same reason the message
+                // deduplicates below: one path is reachable twice in a single
+                // search - as the override and again as a built-in candidate.
+                if (std::find(c.skippedForever.begin(), c.skippedForever.end(),
+                              p) == c.skippedForever.end())
+                    c.skippedForever.push_back(p);
+            } else {
+                c.tried.push_back(p + " (skipped: the last start did not survive "
+                                      "baking it)");
+            }
             c.skippedAfterCrash = true;
             if (strcmp(how, "appearance.fontPath") == 0) c.skippedWasOverride = true;
             return false;
@@ -964,14 +988,18 @@ static std::string cjkFontUnreadableText(const FontChoice& c) {
 // this file, so this start did not try it. The whole value of the sentence is
 // the last clause - the way OUT - because the user's own setting is what is
 // being overruled and only they can decide what to do about it.
-static std::string cjkFontCrashSkipText(const FontChoice& c) {
+static std::string cjkFontCrashSkipText(const FontChoice& c,
+                                        const std::string& crumbPath = {}) {
     // Deduplicated: one path can be reached twice in a single search - as the
     // override and again as a built-in candidate - and naming the same file
     // twice in one sentence reads like two different problems.
     std::vector<std::string> names;
     for (const std::string& t : c.tried) {
-        if (t.find("(skipped: the last start did not survive baking it)") ==
-            std::string::npos) continue;
+        // ANY skip reason, not one of them by its full text. There are two now
+        // ("the last start did not survive" and "two separate starts"), and
+        // matching the first one's whole sentence made the permanent case print
+        // "(unknown)" for a file it had just named (review round 6).
+        if (t.find(" (skipped: ") == std::string::npos) continue;
         std::string one = t.substr(0, t.find(" (skipped:"));
         // The fc-match arm records its answer as "fc-match ... -> /the/path",
         // so the same file reached twice - once as a candidate and once as
@@ -988,12 +1016,19 @@ static std::string cjkFontCrashSkipText(const FontChoice& c) {
         if (!skipped.empty()) skipped += "; ";
         skipped += n;
     }
-    std::string s = "the last start did not survive reading this font, so it "
-                    "was NOT used this time: " +
-                    (skipped.empty() ? std::string("(unknown)") : skipped) +
-                    ". This start is using " +
-                    (c.path.empty() ? std::string("the built-in font") : c.path) +
-                    " instead.";
+    // WHICH SENTENCE: "not this time" or "not again". They are different facts
+    // and the way out of the second one includes a file the first one has no
+    // reason to name (review round 6 P2).
+    const bool forever = !c.skippedForever.empty();
+    std::string s = forever
+        ? "this font has stopped start-up more than once, so it is no longer "
+          "tried: "
+        : "the last start did not survive reading this font, so it "
+          "was NOT used this time: ";
+    s += (skipped.empty() ? std::string("(unknown)") : skipped) +
+         ". This start is using " +
+         (c.path.empty() ? std::string("the built-in font") : c.path) +
+         " instead.";
     // THE WAY OUT HAS TO EXIST. "delete that line" is an instruction, and it is
     // false when what was skipped is a BUILT-IN CANDIDATE rather than the
     // user's own setting - there is no line to delete, and a reader who goes
@@ -1010,6 +1045,14 @@ static std::string cjkFontCrashSkipText(const FontChoice& c) {
              "you set - if it is broken, replace it, or name a different font "
              "with \"appearance.fontPath\" in settings.jsonc (or `fontPath` in "
              "prefs.txt).";
+    // ...AND THE WAY BACK FROM "not again", which is the one the first version
+    // of this mechanism could not name and was refused for. It is a file, and
+    // its path is known, so the instruction can be carried out: deleting the
+    // record is how a user who has replaced the file says "try it again".
+    if (forever && !crumbPath.empty())
+        s += " It will not be offered again until that record is removed: "
+             "delete " + dispPath(crumbPath) +
+             " (or just the line naming this file).";
     return s;
 }
 

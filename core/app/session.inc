@@ -944,120 +944,199 @@ static std::string fontBakeCrumbPath() {
 // font again. Keying on the slot fails towards MISSING the evidence; keying on
 // the pid fails only if a pid is reused inside one start, and the cost of that
 // is one more crash, which is what happened before this existed.
-static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
-    const std::string p = fontBakeCrumbPath();
-    if (p.empty() || paths.empty()) return;
-    // Other processes' lines are KEPT - this is an append in effect, written as
-    // a rewrite only so that OUR line can be replaced rather than repeated.
-    std::vector<std::string> keep;
-    {
-        std::ifstream in(pathFromUtf8(p), std::ios::binary);
-        std::string line;
-        const unsigned long me = currentPid();
-        while (std::getline(in, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-            if (line.empty()) continue;
-            const size_t sp = line.find(' ');
-            if (sp == std::string::npos) continue;        // pre-pid format: drop it
-            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
-            if (who == me) continue;                      // ours: replaced below
-            // EVERY OTHER PROCESS'S LINE IS KEPT HERE, alive or dead. Dropping
-            // the dead ones is a separate act with its own meaning - "this
-            // start read that line and acted on it" - and it is done by
-            // fontBakeCrumbConsume() below, at the one place that does the
-            // reading. It used to be done here, and this function returns
-            // early when there is nothing to bake, which is what made it
-            // wrong; the comment on that function has the measurement.
-            keep.push_back(line);
-        }
-    }
-    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    for (const std::string& s : keep) f << s << "\n";
-    for (const std::string& s : paths) f << currentPid() << " " << s << "\n";
-    // Flushed and closed before the caller bakes anything: a breadcrumb still
-    // sitting in a stdio buffer when the process dies is not a breadcrumb.
-    f.flush();
+// ---- WHAT A LINE SAYS, and the ONE place that parses it -------------------
+// A line is `<pid>[#<deaths>] <path>`. The first token never contains a space,
+// so the death count rides inside it and the path may contain spaces - which on
+// Windows it routinely does.
+//
+// `pid` is WHO, and it has FOUR meanings, not three:
+//   * our own pid       - this process is baking that file right now
+//   * a live other pid  - another window is baking it right now
+//   * a dead pid        - a start did not come back from baking it: EVIDENCE
+//   * pid 0             - not a process at all, but a RECORD this program wrote
+//                         about a death it has ALREADY ACCOUNTED FOR. pidAlive
+//                         returns false for 0 on its first line and no process
+//                         is pid 0, so a record can never be read as any of the
+//                         three above.
+//
+// `deaths` is how many starts that path had already killed when the line was
+// written. Absent in the format this PR shipped first, which reads as 0.
+struct FontBakeLine {
+    unsigned long who = 0;
+    int deaths = 0;
+    std::string path;
+    std::string raw;
+};
+static bool fontBakeParse(const std::string& line, FontBakeLine& out) {
+    const size_t sp = line.find(' ');
+    if (sp == std::string::npos) return false;        // pre-pid format: inert
+    const std::string lead = line.substr(0, sp);
+    const size_t hash = lead.find('#');
+    out.who = strtoul(lead.substr(0, hash).c_str(), nullptr, 10);
+    out.deaths = hash == std::string::npos ? 0 : atoi(lead.c_str() + hash + 1);
+    if (out.deaths < 0) out.deaths = 0;
+    out.path = line.substr(sp + 1);
+    out.raw = line;
+    return !out.path.empty();
 }
-// ...and the lines a start HAS ACTED ON are dropped here (review round 5 P2).
-//
-// A DEAD PROCESS'S LINE IS CONSUMED ONCE, and that is a choice. The start that
-// calls this has already READ it (fontBakeCrumbRead, just above it in main())
-// and acted on it - skipped that path, and said so on screen in the fifth font
-// message - so dropping it means the NEXT start tries the path again. The
-// alternative, keeping it until some start bakes that file successfully, would
-// skip a font for ever after one transient failure (a file that was mid-copy
-// and is now fine), with no way out that the message could name.
-//
-// The cost of consuming it is at most ONE more crash, and the recovery then
-// returns immediately because that crash writes a fresh line. The cost of
-// keeping it is a font the user cannot get back. One more crash is the cheaper
-// mistake.
-//
-// WHY THIS IS NOT PART OF fontBakeCrumbWrite, which is where it used to live:
-// that function returns early when there is nothing to bake (`paths.empty()`),
-// so a start whose breadcrumb named EVERY candidate skipped them all, had an
-// empty list, wrote nothing - and never consumed the lines. The next start read
-// the same lines, skipped the same paths, and was empty again: the font skipped
-// FOR EVER that the paragraph above rejects by name, reached by the one route
-// where no message could offer a way out either, because no bake was attempted.
-// Consumption belongs where the line is read and acted on, and that is one
-// call, in main(), on every start - not where the next bake happens to be
-// recorded. C7 covers the zero-fonts-chosen start.
-//
-// Our own lines are left alone: this process is mid-bake and its line is the
-// record of that, which only fontBakeCrumbClear() may remove.
-static void fontBakeCrumbConsume() {
-    const std::string p = fontBakeCrumbPath();
-    if (p.empty()) return;
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
-    std::vector<std::string> keep;
-    bool dropped = false;
-    {
-        std::ifstream in(pathFromUtf8(p), std::ios::binary);
-        std::string line;
-        const unsigned long me = currentPid();
-        while (std::getline(in, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-            if (line.empty()) continue;
-            const size_t sp = line.find(' ');
-            if (sp == std::string::npos) { dropped = true; continue; }  // pre-pid format
-            const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
-            if (who != me && !pidAlive(who)) { dropped = true; continue; }
-            keep.push_back(line);
-        }
-    }
-    if (!dropped) return;                     // nothing was evidence: leave the file alone
-    if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
-    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    for (const std::string& s : keep) f << s << "\n";
-}
-// The paths a start DID NOT come back from: lines whose writer is gone.
-static std::vector<std::string> fontBakeCrumbRead() {
-    std::vector<std::string> out;
+static std::vector<FontBakeLine> fontBakeCrumbLines() {
+    std::vector<FontBakeLine> out;
     const std::string p = fontBakeCrumbPath();
     if (p.empty()) return out;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return out;
-    std::ifstream f(pathFromUtf8(p), std::ios::binary);
+    std::ifstream in(pathFromUtf8(p), std::ios::binary);
     std::string line;
-    const unsigned long me = currentPid();
-    while (std::getline(f, line)) {
+    while (std::getline(in, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line.empty()) continue;
-        const size_t sp = line.find(' ');
-        if (sp == std::string::npos) continue;
-        const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
-        // Our own line cannot be evidence either: this process is the one
-        // baking, and it has not finished yet.
-        if (who == me || pidAlive(who)) continue;
-        const std::string path = line.substr(sp + 1);
-        if (!path.empty() && std::find(out.begin(), out.end(), path) == out.end())
-            out.push_back(path);
+        FontBakeLine L;
+        if (fontBakeParse(line, L)) out.push_back(L);
     }
     return out;
+}
+// ---- THE POLICY, and it is a CONVERGENT one (review round 6 P2) -----------
+//
+// WHAT WAS WRONG. The first shape of this deleted a dead process's line the
+// moment a start had read and acted on it. On a machine with exactly ONE usable
+// font that produced a cycle with no end:
+//
+//   start 1  no record -> bakes X -> CRASH, leaves `pid1 X`
+//   start 2  reads it  -> skips X -> built-in font -> DELETES the line -> opens
+//   start 3  no record -> bakes X -> CRASH
+//   start 4  opens.  start 5 crashes.  ...
+//
+// EVERY OTHER START DIED, for ever. The comment defending the delete said "the
+// cost of consuming it is at most ONE more crash", which is true of one cycle
+// and says nothing about the cycle repeating. A viewer that fails to open every
+// second time is worse than a viewer running on a substitute font, so the
+// weighting was wrong as well as the reasoning.
+//
+// THE CONTRACT, restated: the breadcrumb's job is to not REPEAT a read that
+// killed a start. Repeating it once is right - a file that was mid-copy when it
+// was first read is whole now, and a font the user chose should not be dropped
+// over one transient failure. Repeating it for ever is not. So the record has
+// to tell "died once" from "died twice", which a line that gets deleted cannot.
+//
+//   * a DEAD WRITER'S line is a death nobody has counted yet: skip the path on
+//     this start, and ACCOUNT it (`fontBakeCrumbAccount`) by turning it into a
+//     record `0#<deaths+1>` instead of deleting it
+//   * a RECORD of ONE death is the RETRY: one start has already skipped the
+//     file, so it gets one more attempt. `fontBakeCrumbWrite` absorbs that
+//     record into its own in-flight line, so surviving the bake and clearing
+//     the line rehabilitates the file completely
+//   * a RECORD of TWO deaths is kept and the path is skipped from then on, and
+//     the message says so and names both ways out - the setting to change and
+//     THIS FILE to delete
+//
+// That converges: at most two crashes for any one file, ever. "Skip for ever"
+// was rejected the first time because no message could name a way out of it;
+// that premise was false - the way out is this file, whose path is right here
+// in fontBakeCrumbPath() - so it is now the end state rather than the thing to
+// avoid.
+static const int kFontBakeDeathsMax = 2;
+// The paths this start must NOT bake.
+static std::vector<std::string> fontBakeCrumbRead() {
+    std::vector<std::string> out;
+    const unsigned long me = currentPid();
+    for (const FontBakeLine& L : fontBakeCrumbLines()) {
+        // Our own line cannot be evidence: this process is the one baking, and
+        // it has not finished yet. Nor can a live other window's.
+        if (L.who == me) continue;
+        if (L.who != 0 && pidAlive(L.who)) continue;
+        // ...and a record of exactly one death is the RETRY. Not skipping here
+        // is the whole of the round-6 fix: without this line the file is either
+        // skipped for ever or re-baked on every other start.
+        if (L.who == 0 && L.deaths < kFontBakeDeathsMax) continue;
+        if (std::find(out.begin(), out.end(), L.path) == out.end()) out.push_back(L.path);
+    }
+    return out;
+}
+// ...and the subset of those that will never be tried again, which is a
+// different sentence on screen and so a different list here.
+static std::vector<std::string> fontBakeCrumbForever() {
+    std::vector<std::string> out;
+    for (const FontBakeLine& L : fontBakeCrumbLines()) {
+        if (L.who != 0 || L.deaths < kFontBakeDeathsMax) continue;
+        if (std::find(out.begin(), out.end(), L.path) == out.end()) out.push_back(L.path);
+    }
+    return out;
+}
+static void fontBakeCrumbWrite(const std::vector<std::string>& paths) {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty() || paths.empty()) return;
+    const unsigned long me = currentPid();
+    std::vector<std::string> keep;
+    std::vector<std::pair<std::string, int>> carried;   // path -> deaths taken over
+    for (const FontBakeLine& L : fontBakeCrumbLines()) {
+        if (L.who == me) continue;                      // ours: replaced below
+        // EVERY OTHER PROCESS'S LINE IS KEPT, alive or dead. Turning a dead
+        // one into a record is a separate act with its own meaning - "this
+        // start read that line and acted on it" - and it is done by
+        // fontBakeCrumbAccount() below, at the one place that does the reading.
+        // It used to be done here, and this function returns early when there
+        // is nothing to bake, which is what made it wrong.
+        //
+        // The exception is a RECORD for a path we are about to bake: this
+        // attempt IS that record's retry, so the count moves into our own line
+        // and the record goes. If we come back, fontBakeCrumbClear() takes our
+        // line and the file is rehabilitated; if we do not, our line carries
+        // the count and the next start accounts the second death.
+        if (L.who == 0 &&
+            std::find(paths.begin(), paths.end(), L.path) != paths.end()) {
+            carried.push_back({ L.path, L.deaths });
+            continue;
+        }
+        keep.push_back(L.raw);
+    }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
+    for (const std::string& s : paths) {
+        int d = 0;
+        for (const auto& c : carried) if (c.first == s) d = std::max(d, c.second);
+        f << me << "#" << d << " " << s << "\n";
+    }
+    // Flushed and closed before the caller bakes anything: a breadcrumb still
+    // sitting in a stdio buffer when the process dies is not a breadcrumb.
+    f.flush();
+}
+// ...and the deaths this start has READ AND ACTED ON become records here.
+//
+// Called from main() between the choice and the bake, on every start - a start
+// that chose NO font at all must account exactly like one that chose a file,
+// or the start after it reads the same evidence and takes the same decision for
+// ever. (That is why this is not part of fontBakeCrumbWrite, which returns
+// early when there is nothing to bake.)
+//
+// Our own line and other live windows' lines are left exactly as they are: the
+// first is this bake in progress, which only fontBakeCrumbClear() may remove,
+// and the second is somebody else's.
+static void fontBakeCrumbAccount() {
+    const std::string p = fontBakeCrumbPath();
+    if (p.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pathFromUtf8(p), ec)) return;
+    const unsigned long me = currentPid();
+    std::vector<std::string> keep;
+    std::vector<std::pair<std::string, int>> rec;       // path -> deaths, first-seen order
+    bool fresh = false;
+    auto note = [&](const std::string& path, int deaths) {
+        for (auto& r : rec) if (r.first == path) { r.second = std::max(r.second, deaths); return; }
+        rec.push_back({ path, deaths });
+    };
+    for (const FontBakeLine& L : fontBakeCrumbLines()) {
+        if (L.who == me || (L.who != 0 && pidAlive(L.who))) { keep.push_back(L.raw); continue; }
+        if (L.who == 0) { note(L.path, L.deaths); continue; }   // already a record
+        note(L.path, L.deaths + 1);                             // a death, counted now
+        fresh = true;
+    }
+    if (!fresh) return;                  // nothing new: leave the file alone
+    if (keep.empty() && rec.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }
+    std::ofstream f(pathFromUtf8(p), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const std::string& s : keep) f << s << "\n";
+    for (const auto& r : rec) f << "0#" << r.second << " " << r.first << "\n";
 }
 // OUR LINES ONLY. A second window finishing its bake must not delete the
 // breadcrumb this one is still flying on.
@@ -1078,7 +1157,7 @@ static void fontBakeCrumbClear() {
             if (sp == std::string::npos) continue;
             const unsigned long who = strtoul(line.substr(0, sp).c_str(), nullptr, 10);
             if (who == me) continue;                      // the lines we are clearing
-            keep.push_back(line);
+            keep.push_back(line);           // other windows' lines AND records
         }
     }
     if (keep.empty()) { std::filesystem::remove(pathFromUtf8(p), ec); return; }

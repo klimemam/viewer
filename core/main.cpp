@@ -1233,17 +1233,22 @@ int main(int argc, char** argv) {
     // and the long comment at fontBakeCrumbPath() for why no amount of checking
     // replaces this.
     const std::vector<std::string> crumb = fontBakeCrumbRead();
-    g_fontChoice = jpFontChoice(g_settingsFontPath, crumb);
-    // READ, ACTED ON, CONSUMED - in that order and in one place (review round
-    // 5 P2). `crumb` is what the rest of this start reasons from (the choice
-    // above, cjkMergeFontPath below, and the fifth font message), so the lines
-    // on disk have done their whole job the moment the choice is made, and a
-    // start that skipped EVERY candidate must drop them exactly like one that
-    // skipped a single file - or the font it skipped is skipped for ever. This
-    // used to be done inside fontBakeCrumbWrite(), which is skipped entirely
-    // when there is nothing left to bake; see the comment on
-    // fontBakeCrumbConsume().
-    fontBakeCrumbConsume();
+    const std::vector<std::string> crumbForever = fontBakeCrumbForever();
+    g_fontChoice = jpFontChoice(g_settingsFontPath, crumb, crumbForever);
+    // READ, ACTED ON, ACCOUNTED - in that order and in one place (review round
+    // 5 P2, corrected in round 6). `crumb` is what the rest of this start
+    // reasons from (the choice above, cjkMergeFontPath below, and the font
+    // message), so the lines on disk have done their whole job the moment the
+    // choice is made, and a start that skipped EVERY candidate must account
+    // them exactly like one that skipped a single file - the round-5 reason,
+    // which still holds.
+    //
+    // What round 5 got wrong was the ACT: it DELETED the line, so the start
+    // after it had no record and baked the same file again, and on a machine
+    // with one usable font every other start died for ever. Accounting turns
+    // the line into a record instead, which is what lets the retry happen once
+    // and then stop. The whole policy is beside fontBakeCrumbRead().
+    fontBakeCrumbAccount();
     const std::string fontPath = g_fontChoice.path;
     static ImVector<ImWchar> fontRanges;
     cjkFontRanges(io.Fonts, fontRanges);
@@ -1299,9 +1304,16 @@ int main(int argc, char** argv) {
     // after the bake returns, before anything else can fail for its own reasons
     // and leave a crumb that blames the font.
     fontBakeCrumbClear();
-    // ---- FOUR different things can have gone wrong, and they are four
-    // different sentences (review P1 / P2-8 / P2-9). AFTER the bake, because
+    // ---- EVERY WAY THIS CAN HAVE GONE WRONG IS ITS OWN SENTENCE, and the
+    // list below is that set (review P1 / P2-8 / P2-9). AFTER the bake, because
     // only the built atlas can tell some of them apart.
+    //
+    // THE HEADING DOES NOT COUNT THEM, and that is deliberate: it said "FOUR"
+    // while listing five, a sixth was added inside the chain, and the fifth
+    // item's own text then said "one of the five" - three statements of the
+    // size of one set, two of them wrong (review round 6). A number here is a
+    // second copy of something the code below already says; the test is what
+    // asserts that every cause has a sentence of its own.
     //
     //  1. Nothing was found at all              -> the list of paths looked at.
     //  2. A file WAS chosen and would not load  -> which file. (This used to
@@ -1312,12 +1324,15 @@ int main(int argc, char** argv) {
     //  4. It parsed and simply has no CJK       -> which file. fc-match answers
     //     sans:lang=ja with DejaVu Sans on a machine with no Japanese font, so
     //     this is what the fallback actually produces on the Ubuntu runner.
-    //  5. The LAST start died baking a font, so this one skipped it -> which
-    //     file, what is being used instead, and how to get out of it. It comes
-    //     FIRST because it is the only one of the five the user must act on to
-    //     restore what they asked for.
+    //  5. A START DIED baking a font, so this one skipped it -> which file,
+    //     what is being used instead, and how to get out of it. It comes FIRST
+    //     because it is the only one here the user must act on to restore what
+    //     they asked for. It has two forms, and the breadcrumb file's path is
+    //     passed in because the second one names it: a file that has killed two
+    //     starts is not tried again, and deleting that record is one of the two
+    //     ways back.
     if (g_fontChoice.skippedAfterCrash) {
-        toast(cjkFontCrashSkipText(g_fontChoice), true);
+        toast(cjkFontCrashSkipText(g_fontChoice, fontBakeCrumbPath()), true);
     } else if (!jp) {
         if (g_fontChoice.path.empty()) toast(cjkFontMissingText(g_fontChoice), true);
         else                           toast(cjkFontUnreadableText(g_fontChoice), true);
@@ -2390,9 +2405,10 @@ static bool g_watchSuppressed = false;
     while (!glfwWindowShouldClose(win)) {
         double frameT0 = nowSec();
         // 板306 D: a name this atlas cannot draw gets one line in Messages.
-        // Here rather than at any of the six places that push onto app.images,
-        // because a notice added to one of those doors is a notice the other
-        // five do not give.
+        // Here rather than at any of the places that push onto app.images,
+        // because a notice added to one of those doors is a notice none of the
+        // others give. (How many doors there are is not written down any more:
+        // the number here was six and grep says nine - review round 6.)
         //
         // AT THE TOP OF THE LOOP, above the two `continue`s that skip an idle
         // frame (review P1-B). Below them it was not merely late - on an idle

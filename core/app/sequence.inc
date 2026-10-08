@@ -2271,7 +2271,19 @@ static void pumpFolderScan() {
 
 // Stack name for a merged load: the common prefix of the merged group names,
 // trimmed of separator/placeholder debris; the root folder's name when the
-// prefix says nothing (three characters or less).
+// prefix is too short to say anything.
+//
+// A BYTE PREFIX IS NOT A CHARACTER PREFIX, and this function used to hand back
+// a name that is not valid UTF-8 (review round 6 P3). The scan below compares
+// BYTES, so two folders called ...測 and ...湯 share the first byte of a
+// three-byte character and nothing after it: the prefix ended mid-sequence,
+// the debris trim only knows ASCII separators, and the result went on screen
+// as a stack name with a '?' in it. The Files panel then reported that '?'
+// with the one sentence of the four that says the file name on disk is at
+// fault - and it was not: THIS PROGRAM made the name. manual.md §8c states
+// flatly that invalid UTF-8 is a property of the name on disk, so the
+// instruction that sentence gives was false, which is why a display-name
+// builder is the right place to fix it rather than the counting.
 static std::string mergedStackName(const std::vector<App::PendingGroup>& sel) {
     std::string p = sel.empty() ? std::string() : sel[0].name;
     for (const auto& g : sel) {
@@ -2280,7 +2292,26 @@ static std::string mergedStackName(const std::vector<App::PendingGroup>& sel) {
                tolower((unsigned char)p[n]) == tolower((unsigned char)g.name[n])) n++;
         p.resize(n);
     }
+    // ...so cut back to a whole character. Walk off the continuation bytes to
+    // whatever starts the last sequence, and drop that sequence entirely if the
+    // prefix stopped before its end.
+    {
+        size_t k = p.size();
+        while (k > 0 && ((unsigned char)p[k - 1] & 0xC0) == 0x80) k--;
+        if (k > 0 && ((unsigned char)p[k - 1] & 0x80)) {
+            const unsigned char c = (unsigned char)p[k - 1];
+            const size_t want = (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4;
+            if (p.size() - (k - 1) != want) p.resize(k - 1);
+        } else if (k != p.size()) {
+            p.resize(k);          // continuation bytes with no lead: all orphans
+        }
+    }
     while (!p.empty() && strchr("?*_-/. ", p.back())) p.pop_back();
+    // BYTES, and the comment used to call them characters (review round 6).
+    // The test is "is there anything here worth putting on a row", and three
+    // bytes of a CJK name is one character - which is not nothing, but it is
+    // not a name either, and raising the bar to code points would change which
+    // stacks get the folder's name instead. Left as bytes, said as bytes.
     if (p.size() <= 3) p = baseName(app.folderPickRoot);
     return p + " (merged)";
 }
