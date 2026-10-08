@@ -963,14 +963,28 @@
                 check(allPlanes, "V17 every CFA plane is sampled by both passes");
                 check(T2.nSeries == 4 && T2.allRow,
                       "V17 the pooled row does not become a fifth plane");
-                // the pooled mean is the sample-weighted mean of the planes
+                // The pooled mean is the SAMPLE-WEIGHTED mean of the planes, and
+                // the weight is each plane's own sample count - fStat[i].n.
+                // This used to weight by T2.h[i].size(), the H profile's
+                // LENGTH, which is rw and therefore the same number for all
+                // four planes of a mosaic: an equal-weight mean wearing a
+                // weighted mean's name. It agrees here only because an RGGB
+                // frame gives every plane the same pixel count, so the check
+                // was passing for a reason it did not state - and would go on
+                // passing if the pooling started weighting wrongly.
                 double num = 0; size_t den = 0;
                 bool allValid = T2.fStat[4].valid;
                 for (int i = 0; i < 4; i++) {
                     if (!T2.fStat[i].valid) continue;
-                    num += T2.fStat[i].mean * (double)T2.h[i].size();
-                    den += T2.h[i].size();
+                    num += T2.fStat[i].mean * (double)T2.fStat[i].n;
+                    den += T2.fStat[i].n;
                 }
+                // ...and the weights ARE the pooled row's own sample count,
+                // which is the half of "pooled from the planes" that a mean
+                // cannot show: four equal weights summing to the pooled n is a
+                // statement about the pass, not about the arithmetic.
+                check(den == T2.fStat[4].n && den > 0,
+                      "V17 the plane sample counts sum to the pooled row's");
                 double want = den ? num / den : 0;
                 double got = T2.fStat[4].mean;
                 fprintf(stderr, "verifyselftest: V17 pooled mean %.9g, planes combined %.9g\n",
