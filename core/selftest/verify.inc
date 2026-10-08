@@ -3580,6 +3580,13 @@
                     if (e->seqId != 0 && e->seqId != twin->seqId &&
                         e->seqIndex == twin->seqIndex &&
                         e->src.get() != twin->src.get()) { other = e.get(); break; }
+                // ASSERTED: with no counterpart found, setCompareB(nullptr)
+                // empties the slot and the control check below passes because
+                // there is no chip at all - the scan finding nothing would have
+                // read as the feature working (review round 7, axis 3).
+                check(other != nullptr,
+                      "V23 the fixture has a frame with DIFFERENT pixels to "
+                      "put in B as the control");
                 setCompareB(other);
                 std::string chip2 = abStatusChipText();
                 fprintf(stderr, "verifyselftest: V23 chip '%s' | control '%s'\n",

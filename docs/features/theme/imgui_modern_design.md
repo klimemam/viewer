@@ -178,11 +178,16 @@ ImGui とはほぼ分からなくなる**」ことです。残りは仕上げの
 
 ## フォントについて
 
-本体は **17px** で、OS ごとの候補(Windows: Meiryo / Yu Gothic / MS Gothic、
-macOS: ヒラギノ角ゴシック、Linux: Noto Sans CJK)から先に見つかったものを
-`jpFontPath()` が自動検出します(`core/main.cpp`)。撤去済みデモは同梱の
+本体は **17px** で、`appearance.fontPath` → OS ごとの候補(Windows: Meiryo /
+Yu Gothic / MS Gothic / NotoSansJP-VF、macOS: ヒラギノ角ゴシック、Linux: Noto
+Sans CJK)→ (Windows 以外) `fc-match sans:lang=ja` の順に `jpFontChoice()` が
+決めます(`core/app/util.inc`)。Windows と macOS は**2枚目**を同じ atlas に
+重ねます(YaHei / Hiragino Sans GB) —— 日本語フォントが簡体字を持たないためで、
+**先着優先なので日本語の字形は1枚目のまま**です。撤去済みデモは同梱の
 **Roboto Regular 16px** + FontAwesome(アイコン)でした。
-ImGui 1.92 以降はグリフを動的に読み込むため、グリフ範囲の指定は不要です。
+このビルドの ImGui は 1.91 系なので**グリフ範囲は起動時に一度だけ焼きます**
+(1.92 以降の動的読み込みではありません)。範囲と代償は
+[manual §8c](../../guides/manual.md)。
 
 ## C++ 本体への適用状況
 
