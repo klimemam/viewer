@@ -14,6 +14,7 @@ static int selftestMakeSeries(int batchId, const char* unitPrefill) {
         S->paramName = "level";
         snprintf(S->unit, sizeof S->unit, "%s",
                  unitPrefill && *unitPrefill ? unitPrefill : "lx");
+        utf8CutToBoundary(S->unit);      // snprintf truncates at a byte
     }
     for (const auto& si : app.seqs) {
         if (batchOfStack(si.id) != batchId) continue;
@@ -184,11 +185,15 @@ static int seriesModalAccept() {
         S->name = E.name[0] ? E.name : batchNameOf(E.batchId) + " 掃引";
         S->paramName = E.param;
         snprintf(S->unit, sizeof S->unit, "%s", E.unit);
+        utf8CutToBoundary(S->unit);
         S->kind = std::clamp(E.kind, 0, 3);
         S->members = std::move(ms);
     }
     // the next new series starts from the unit this one ended with
-    if (E.unit[0]) snprintf(app.lin.unit, sizeof app.lin.unit, "%s", E.unit);
+    if (E.unit[0]) {
+        snprintf(app.lin.unit, sizeof app.lin.unit, "%s", E.unit);
+        utf8CutToBoundary(app.lin.unit);
+    }
     app.prefsDirty = true;
     pruneEmptySeries();
     if (seriesById(id)) app.curSeriesId = id;

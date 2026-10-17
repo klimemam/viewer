@@ -110,6 +110,11 @@ static int settingsSelftest() {
         snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx");
         g_settingsRepoUrl.clear();
         g_settingsEditorCmd.clear();
+        // 板306 C, and it belongs here for the reason every field above it
+        // does: group S feeds this key its sample and the template groups run
+        // afterwards, so a leftover path would put an extra key in the template
+        // and make T3's count measure the previous group.
+        g_settingsFontPath.clear();
         // The recipe library (#166) is a value this file owns outright, like the
         // two above, so its built-in default is EMPTY. It has to be cleared here
         // as well as in the reader: the schema walk (S1) feeds every readable row
@@ -1392,10 +1397,14 @@ static int settingsSelftest() {
         // scanDepth's and uiScale's reason: the panel edits it) - and it opens the
         // `watch` section, which had no rows at all: 30 readable over 36 rows,
         // with the 4 "later" and 2 "not here" untouched.
-        check(readable == 30, "W1 ...and 30 of them are editable today");
+        // 板306 adds appearance.fontPath - which font file the CJK glyphs are
+        // baked from, the way out when this machine's font is somewhere the
+        // built-in search does not look. A 31st readable row over 37, with the
+        // 4 "later" and 2 "not here" untouched again.
+        check(readable == 31, "W1 ...and 31 of them are editable today");
         check(later == 4 && notHere == 2,
-              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 36");
-        check(rows.size() == 36, "W1 ...over 36 rows, which is the whole table");
+              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 37");
+        check(rows.size() == 37, "W1 ...over 37 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1997,11 +2006,12 @@ static int settingsSelftest() {
         fprintf(stderr, "settingsselftest: W6 %d row(s) moved off the default, "
                         "%d came back%s%s\n", moved, reset,
                 stuck.empty() ? "" : "; stuck: ", stuck.c_str());
-        // 30 readable rows, and every one of them has a sample (S1 feeds them
-        // all). `moved` is the anti-vacuity number: a sample equal to the default
-        // would make that row's reset meaningless, and W1's own count is what
-        // says how many rows there are to move.
-        check(moved == 30 && reset == 30 && stuck.empty(),
+        // 31 readable rows (板306 added appearance.fontPath), and every one of
+        // them has a sample (S1 feeds them all). `moved` is the anti-vacuity
+        // number: a sample equal to the default would make that row's reset
+        // meaningless, and W1's own count is what says how many rows there are
+        // to move.
+        check(moved == 31 && reset == 31 && stuck.empty(),
               "W6 every readable key is moved off its default by its sample, and resets back");
 
         // W7: the reset is a CHANGE, so it owes what a change owes - this machine's
@@ -2069,7 +2079,12 @@ static int settingsSelftest() {
                                     "loading.watchAutoReload", "loading.folderScanDepth",
                                     // board row 297: the one thing a number in a
                                     // box cannot say is when it takes effect
-                                    "watch.intervalSec" };
+                                    "watch.intervalSec",
+                                    // 板306: and the one thing a path in a box
+                                    // cannot say is that the glyphs are baked
+                                    // once, so the change waits for the next
+                                    // start - plus what an empty value means
+                                    "appearance.fontPath" };
         int found = 0;
         for (const char* w : wantNotes)
             for (const PrefRow& r : rows)

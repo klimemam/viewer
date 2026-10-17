@@ -141,7 +141,7 @@ static std::string g_filesRowTipProbe;
 static std::string g_filesBusyRowProbe;
 
 // §4: the share mark. U+29C9 (two joined squares) when the atlas has it - the
-// CJK fonts jpFontPath picks vary here - else the plain word, which is longer
+// CJK fonts jpFontChoice picks vary here - else the plain word, which is longer
 // but never a '?' box. Checked once: the font file does not change at runtime.
 static const char* shareGlyph() {
     static int have = -1;
@@ -150,6 +150,822 @@ static const char* shareGlyph() {
         have = (f && f->FindGlyphNoFallback((ImWchar)0x29C9)) ? 1 : 0;
     }
     return have ? "\xE2\xA7\x89" : "";
+}
+
+// §4.1: the characters of a NAME this atlas cannot draw (板306 D).
+//
+// A code point the font does not hold renders as the fallback '?' - a half
+// width question mark, not a tofu box, because none of the candidate fonts
+// carry U+FFFD either and ImGui's FallbackChar is '?'. So 测试1.npy and
+// 试测1.npy both read "??1.npy": two different files, identical on screen, in
+// the Files panel and in every tooltip, message and export header built from
+// the same name. Nothing in the program is wrong at that point - the bytes are
+// right, the file opens, the pixels are the file's - and the one thing the user
+// cannot do is tell the two rows apart.
+//
+// THIS NOTICE IS NEEDED EVEN THOUGH THE RANGES WERE WIDENED (板306 A), and the
+// reason is that the two fix different things. Widening the ranges removes the
+// characters this build forgot to ASK for. What is left over is the characters
+// the FONT does not have - Meiryo has 1819 of the 2500 common simplified
+// Chinese characters, measured - and every code point outside the BMP, which
+// does not fit in ImWchar at all and so can never be asked for by this build of
+// ImGui. Those cannot be removed by asking for more; they can only be declared.
+//
+// WHAT IS DELIBERATELY NOT DONE: the name on screen is never rewritten. An
+// escaped row reading "测试1.npy" is a row nobody can match against
+// their own folder, which trades one unreadable string for another. The name
+// stays exactly as the file gave it and a COUNT is added beside it, in the two
+// places a reader is already looking - the row's tooltip and one Messages line
+// per document.
+//
+// Same shape as shareGlyph() above: it asks the BUILT ATLAS rather than the
+// range table, because what the user sees is what was baked and nothing else.
+static ImFont* bakedFont() {
+    if (!ImGui::GetCurrentContext()) return nullptr;
+    // ImGui::GetFont() is only set from NewFrame() onwards, so a windowless run
+    // - every NOGL selftest - would see no font at all and could not tell "this
+    // name cannot be drawn" from "nothing has been baked". The atlas itself is
+    // built at start-up either way (fontAtlasBake), so ask it directly.
+    if (ImFont* f = ImGui::GetFont()) return f;
+    ImFontAtlas* a = ImGui::GetIO().Fonts;
+    return (a && a->Fonts.Size) ? a->Fonts[0] : nullptr;
+}
+// THE CAUSES ARE COUNTED SEPARATELY (review P2-6), because one number forces
+// one sentence and that sentence is false for all but one of them. (This used
+// to open by counting the causes, and the count was stale; the field list below
+// is the set, and C4 asserts that every field in it has a sentence - see the
+// note on operator+=. A comment that counts the code is a second copy of the
+// code, including in the sentence that says not to write one, which is where
+// the last two went.) A different font fixes `noGlyph` and cannot touch the
+// others: `tooHigh` is a
+// property of THIS BUILD (ImWchar is 16-bit here, so a code point above U+FFFF
+// cannot even be asked for, whatever font is installed), and `badBytes` is a
+// property of the FILENAME ON DISK. Telling somebody to change their font
+// because a file has an emoji in it is advice that cannot work.
+// Do the bytes at `p` form a WELL-FORMED UTF-8 sequence for a code point above
+// U+FFFF? Written out by hand because it is the one question ImGui's decoder
+// cannot answer on this build: with a 16-bit ImWchar it reports every such
+// sequence as an error, so "valid bytes this build cannot hold" and "invalid
+// bytes" arrive identical. Only the 4-byte forms can exceed U+FFFF, and the
+// overlong / surrogate / out-of-range rules are checked on the VALUE, because
+// a byte pattern can be correct and still not be a character.
+static bool utf8SequenceAbove16Bit(const char* p, const char* e) {
+    const unsigned char* u = (const unsigned char*)p;
+    if (e - p < 4) return false;
+    if (u[0] < 0xF0 || u[0] > 0xF4) return false;
+    for (int k = 1; k <= 3; k++)
+        if (u[k] < 0x80 || u[k] > 0xBF) return false;
+    const uint32_t cp = ((uint32_t)(u[0] & 0x07u) << 18) |
+                        ((uint32_t)(u[1] & 0x3Fu) << 12) |
+                        ((uint32_t)(u[2] & 0x3Fu) << 6) |
+                        (uint32_t)(u[3] & 0x3Fu);
+    return cp > 0xFFFF && cp <= 0x10FFFF;
+}
+
+struct UndrawableTally {
+    int noGlyph = 0;        // ASKED FOR, and the font does not have it
+    int notAsked = 0;       // in no range this build asks for (review P3)
+    int tooHigh = 0;        // above U+FFFF: not representable in this build
+    int badBytes = 0;       // the name is not valid UTF-8
+    int total() const { return noGlyph + notAsked + tooHigh + badBytes; }
+    // ADDING TWO TALLIES BELONGS HERE, beside the fields. It used to be written
+    // out field by field at the one call site, and adding `notAsked` then left
+    // that site summing every cause but the new one - so a name whose only
+    // problem was
+    // an unrequested script tallied to zero and the row said nothing. The same
+    // shape as other defects on this PR: a set assembled in one place and
+    // re-derived in another.
+    //
+    // A NEW CAUSE IS A FIELD AND EVERY PLACE THAT WALKS THE FIELDS, and this
+    // comment used to put a number on that ("one function"), which was false -
+    // `total()`, this operator and undrawableNoteOf's `add` column all walk
+    // them, and forgetting the last one reproduces exactly the defect the
+    // paragraph above describes. A comment cannot keep a count of the code
+    // honest; a test can, and C4 has one that fails when a field is added
+    // without a sentence for it.
+    UndrawableTally& operator+=(const UndrawableTally& o) {
+        noGlyph += o.noGlyph;
+        notAsked += o.notAsked;
+        tooHigh += o.tooHigh;
+        badBytes += o.badBytes;
+        return *this;
+    }
+};
+// ---- WHAT IS COUNTED IS A SET OF CHARACTERS, not a list of strings --------
+// (review round 5, the critical finding - and it is round 3's critical finding
+// a second time, on the arm next door.)
+//
+// The contract is the one the manual states in §8c: THE SAME CHARACTER IS
+// NEVER COUNTED TWICE. For two rounds that was implemented by trying to make
+// the STRINGS handed in disjoint - splitting the path at its last separator so
+// the directory part and the leaf shared no character, whole-string dedup for
+// the rest. That is reasoning about one instance, and the instances never ran
+// out: `d.name` is a strict SUPERSTRING of the path's leaf for an npz member
+// ("試験.npz:温度", loader_npz.inc), for a remote frame ("frame.npy #3",
+// open_dispatch.inc), for a decorated preview or stale row, for a series member
+// and for a stack name - and no amount of splitting the path sees any of them.
+// The npz shape said "8 character(s) here draw as '?'" about 4 characters.
+//
+// So the dedup moves DOWN to the unit, and the pieces are allowed to overlap
+// freely. `seen` carries the units already counted for one row, so a character
+// that appears in the row's label, in `d.name`, in the path and in the member
+// name is counted once - and every superstring case above stops being a case.
+//
+// THE CONSTRAINT THE UNIT HAS TO MEET, which is not a unit (review round 7,
+// corrected in round 8):
+//
+//     THE NUMBER MUST BE THE NUMBER OF DISTINCT THINGS THIS ROW CANNOT DRAW,
+//     where a CHARACTER is one thing however many times it appears, and a run
+//     of bytes that is not UTF-8 is one thing per occurrence.
+//
+// IT IS NOT "the number of '?' glyphs on screen", which is how round 7 wrote
+// it, and that sentence was false for six of the eight fixtures that check it:
+// a character in both the row's label and its path is drawn twice and counted
+// once, on purpose, because the sentence counts CHARACTERS ("N character(s)
+// here draw as '?'") and there is one character there that the reader cannot
+// read. The equation that holds is the one above, and it is the one C4's
+// `questionMarks` oracle computes - by walking the pieces the way the renderer
+// walks text, counting glyph positions, and then merging repeats of the same
+// character exactly as the sentence does.
+//
+// WHAT THE RENDERER DOES, because that is what fixes the unit: ImGui's text
+// drawing decodes one step at a time and emits EXACTLY ONE GLYPH PER STEP,
+// advancing by whatever ImTextCharFromUtf8 consumed. An ill-formed sequence is
+// one step, one glyph, however many bytes it ate - so `\xF0\x80\x80\x80` is a
+// single '?' on screen and takes the three bytes after the lead with it.
+//
+// So there are two kinds of thing to count, and they are counted differently
+// because they ARE different:
+//
+//   * A CHARACTER (noGlyph / notAsked / tooHigh) is counted ONCE PER DISTINCT
+//     CODE POINT. The sentence counts characters, so a name with the same
+//     undrawable character twice has one character the reader cannot read. The
+//     key is the bytes of the sequence, which for well-formed UTF-8 is the same
+//     statement as the code point (the encoding is a bijection; overlong forms
+//     are ill-formed). Keying on `cp` instead would be wrong where `cp` is not
+//     available: on this 16-bit build a valid 4-byte emoji comes back as
+//     U+FFFD, so every emoji in one name would collapse into one character.
+//   * AN ILL-FORMED RUN (`badBytes`) IS NOT A CHARACTER, and is counted ONCE
+//     PER DECODE STEP, never deduplicated. There is no "the same character" to
+//     apply the rule to - that is the ruling, and it is also the end of two
+//     rounds of trying: round 5 keyed it on the bytes the decoder consumed and
+//     round 6 on one byte, and the second made the count say 4 where the screen
+//     says 1. A step is what the screen shows, so a step is what is counted.
+//     manual.md §8c says the same thing in the canon.
+//
+// WHY NOT ONE BYTE, since that was the predecessor of this: because one byte
+// is not what the renderer advances by, so counting one byte at a time made the
+// number disagree with the screen - `\xF0" + three continuation bytes is ONE
+// glyph and came out as more than one count.
+//
+// AND THE REASON ROUND 7 GAVE FOR THIS WAS WRONG (review round 8). It said
+// `used` does not depend on what follows the bad byte, because the length comes
+// from a table indexed by the lead byte. That is true on the SUCCESS path and
+// false on the ERROR path, which is the only path badBytes is on. imgui.cpp,
+// ImTextCharFromUtf8, in the `if (e)` branch:
+//
+//     // All available bytes (at most `len` bytes) are consumed on
+//     // incomplete/invalid second to last bytes.
+//     wanted = ImMin(wanted, !!s[0] + !!s[1] + !!s[2] + !!s[3]);
+//
+// `s[1..3]` are the FOLLOWING BYTES (zero past the end of the string), so a
+// lone 0xF0 at the end of a name consumes 1 and the same 0xF0 with three bytes
+// after it consumes 4. The round-6 comment that said so was right and this file
+// called it wrong; the retraction is here rather than in a commit message
+// because this is where the next reader will look.
+//
+// IT DOES NOT MATTER FOR THIS DESIGN, and that is the point of recording it:
+// `used` is an ADVANCE here, never an identity. The renderer advances by the
+// same `used` over the same bytes, so the step count matches the screen however
+// context-dependent each step's length is. The context dependence only bites a
+// unit that uses `used` as a KEY - which is what round 5 did, and why round 6
+// went looking for another key at all.
+//
+// A CHARACTER's key: at most 4 bytes, because ImTextCharFromUtf8 never reports
+// more on either path, so the key is those bytes and their count. Ill-formed
+// runs do not come here - they have no identity to key on.
+static uint64_t undrawableUnitKey(const char* p, int used) {
+    const int n = used < 1 ? 1 : (used > 4 ? 4 : used);
+    uint64_t k = (uint64_t)(unsigned)n << 32;
+    for (int i = 0; i < n; i++) k |= (uint64_t)(unsigned char)p[i] << (i * 8);
+    return k;
+}
+// ...and WHAT `seen` IS. A hash set, not a sorted or linear vector, because
+// the number of units in one row is not bounded by anything: a path is as long
+// as the filesystem allows and `d.note` is a sentence. A linear scan is O(n^2)
+// in the length of the name, which is fine for the 40-odd units of an ordinary
+// row and is not a bound anyone enforces (review round 6 P3 - the "<= 40" was
+// an estimate in a report, which is not a guarantee in a loop).
+static UndrawableTally undrawableTallyUnseen(const std::string& utf8Name,
+                                             std::unordered_set<uint64_t>& seen) {
+    UndrawableTally t;
+    ImFont* f = bakedFont();
+    if (!f) return t;                  // nothing baked: nothing to claim
+    const char* p = utf8Name.c_str();
+    const char* e = p + utf8Name.size();
+    while (p < e) {
+        unsigned int cp = 0;
+        const int used = ImTextCharFromUtf8(&cp, p, e);
+        if (used <= 0) break;                 // only at a NUL or the end
+        // ONE UNIT, COUNTED ONCE for this row - the whole of the note above.
+        // Asked at the classification, not before it, because the two kinds of
+        // unit have two different lengths and only the classification knows
+        // which one is in front of it. Every `t.<cause>++` below is guarded by
+        // this and by nothing else.
+        auto fresh = [&seen](uint64_t k) { return seen.insert(k).second; };
+        // A DECODE THAT FAILED is a lost character EVEN WHERE THE FONT HAS A
+        // GLYPH for what came out of it, and this is the case the Ubuntu runner
+        // caught. ImTextCharFromUtf8 answers U+FFFD REPLACEMENT CHARACTER for
+        // three different inputs - bytes that are not UTF-8, a truncated
+        // sequence, and any code point above U+FFFF (this build's ImWchar is
+        // 16-bit, so an emoji cannot be represented at all) - and ImGui's own
+        // GetGlyphRangesJapanese ASKS for U+FFFD ("0xFFFD, 0xFFFD // Invalid"),
+        // so a font that has the glyph draws a diamond and the atlas lookup
+        // below would answer "nothing wrong with this name". DejaVu Sans has
+        // it; Meiryo and YaHei do not - which is why this was invisible here
+        // and a failure there.
+        //
+        // What separates a substitution from a name that really does contain
+        // U+FFFD is the BYTES: the genuine article is exactly EF BF BD.
+        const bool substituted =
+            cp == (unsigned)IM_UNICODE_CODEPOINT_INVALID &&
+            !(used == 3 && (unsigned char)p[0] == 0xEF &&
+              (unsigned char)p[1] == 0xBF && (unsigned char)p[2] == 0xBD);
+        // A FAILED DECODE IS ALWAYS `badBytes`, and `used` must not be asked
+        // which kind it was. This was wrong, and ImGui's own source says why -
+        // imgui.cpp, ImTextCharFromUtf8, on the error path:
+        //
+        //     wanted = ImMin(wanted, !!s[0] + !!s[1] + !!s[2] + !!s[3]);
+        //     *out_char = IM_UNICODE_CODEPOINT_INVALID;
+        //
+        // so the return is the number of NON-ZERO BYTES it looked at, not 1,
+        // and an ILL-FORMED sequence whose first byte is in the 4-byte range
+        // returns 4 as readily as a well-formed one. The old code read that 4
+        // as "a real code point above U+FFFF" and told the user about emoji
+        // when the truth was broken bytes - and swallowed the following three
+        // bytes, ASCII included, as one character. `*out_char` cannot separate
+        // them either: on every error path it is U+FFFD.
+        //
+        // So `used` is not asked. The two are separated by READING THE BYTES
+        // AGAIN, independently: if they form a well-formed UTF-8 sequence whose
+        // value is above U+FFFF, the name is fine and this BUILD cannot hold
+        // the character; anything else is a name that is not UTF-8.
+        //
+        // That extra decode is not zeal. On this build ImWchar is 16 bits, so
+        // ImTextCharFromUtf8 reports a perfectly valid emoji as an ERROR - it
+        // is out of ITS range - and a split that trusted the decoder alone
+        // would tell a user with 🙂 in a filename that their bytes are broken
+        // and offer them a fix that cannot apply. Both sentences have to be
+        // true, so both need a fact the decoder does not carry.
+        if (substituted) {
+            // A WELL-FORMED SEQUENCE ABOVE U+FFFF is a character this build
+            // cannot hold, so it keeps the character's rule: keyed on its four
+            // bytes, which encode exactly one code point, and counted once.
+            if (utf8SequenceAbove16Bit(p, e)) {
+                if (fresh(undrawableUnitKey(p, 4))) t.tooHigh++;
+                p += 4;
+                continue;
+            }
+            // ...and anything else is NOT A CHARACTER. One step, one glyph on
+            // screen, one count - and no key, because there is nothing for two
+            // of these to be "the same" as. See the note above.
+            t.badBytes++;
+            p += used;
+            continue;
+        }
+        p += used;
+        // ONLY \n AND \r ARE NOT DRAWN, and that is the RENDERER'S rule, not a
+        // judgement made here. imgui_draw.cpp, ImFont::RenderText:
+        //
+        //     if (c < 32)
+        //     {
+        //         if (c == '\n') { ... continue; }
+        //         if (c == '\r') continue;
+        //     }
+        //     const ImFontGlyph* glyph = FindGlyph((ImWchar)c);
+        //
+        // Everything else under 0x20, and 0x7F, goes to FindGlyph - which
+        // answers with the FALLBACK glyph where the atlas has nothing - so a
+        // 0x01 in a file name really is drawn as '?' and really is a character
+        // the reader cannot read.
+        //
+        // A TAB IS NOT ONE OF THOSE, and the atlas is what says so rather than
+        // a rule here: ImGui SYNTHESISES a tab glyph out of the space glyph
+        // when it builds the lookup table (imgui_draw.cpp, ImFont::
+        // BuildLookupTable - "tab_glyph = *FindGlyph((ImWchar)' ');
+        // tab_glyph.Codepoint = '\t'; tab_glyph.AdvanceX *= IM_TABSIZE;"), so
+        // FindGlyphNoFallback finds it and the loop below passes over it for
+        // the ordinary reason: it drew.
+        //
+        // Round 3 excluded ALL control characters, to stop a multi-line TOOLTIP
+        // counting the newlines this code had just put in it. The two the
+        // renderer skips are exactly the two that a concatenation adds, so
+        // narrowing the rule to those two keeps that fix and lets the ATLAS
+        // answer for the rest - which is the same question this function asks
+        // about every other code point (review round 8: the oracle shared this
+        // exclusion verbatim, so both sides agreed and the equation proved
+        // nothing about any of them).
+        if (cp == '\n' || cp == '\r') continue;
+        const uint64_t key = undrawableUnitKey(p - used, used);
+        if (cp > 0xFFFF) {                            // ImWchar32 builds land here
+            if (fresh(key)) t.tooHigh++;
+            continue;
+        }
+        if (f->FindGlyphNoFallback((ImWchar)cp)) continue;          // it drew
+        // WAS IT EVEN ASKED FOR? "Point appearance.fontPath at another font"
+        // is only true for a code point this build REQUESTED and the font did
+        // not supply. For one that is in no range at all - Hangul, Thai,
+        // Hebrew, Devanagari - no font on the machine can help, because the
+        // atlas was never going to hold it whatever is installed. Offering a
+        // font as the cure there is the same kind of false instruction as the
+        // rest of this round (review P3).
+        if (!fresh(key)) continue;
+        if (cjkRangeHas(g_cjkRangesAsked, cp)) t.noGlyph++;
+        else                                   t.notAsked++;
+    }
+    return t;
+}
+// ONE string on its own, with nothing counted before it.
+//
+// The set is REUSED rather than built per call: the Messages sweep asks this
+// once per document and a stack is thousands of documents, so a fresh hash
+// table per document is thousands of allocation pairs per sweep for a table
+// that is thrown away immediately. One buffer, cleared at entry. Not
+// re-entrant and not thread-safe, which it does not need to be - every caller
+// is the UI thread or a selftest running in its place - and said here because
+// a `static` in a leaf function is exactly the kind of thing a later caller
+// breaks by accident.
+static std::unordered_set<uint64_t>& undrawableSeenBuf() {
+    static std::unordered_set<uint64_t> buf;
+    buf.clear();
+    return buf;
+}
+static UndrawableTally undrawableTally(const std::string& utf8Name) {
+    return undrawableTallyUnseen(utf8Name, undrawableSeenBuf());
+}
+static int undrawableCount(const std::string& utf8Name) {
+    return undrawableTally(utf8Name).total();
+}
+// The sentence the tally turns into. ONE function, so the tooltip and the
+// Messages line cannot drift into two different claims about one name.
+//
+// Built cause by cause, and the WAY OUT is only offered for the cause it can
+// actually fix (review P2-6): "point appearance.fontPath at another font" is
+// true for a glyph the font is missing, and false for an emoji and for broken
+// bytes - no font on earth changes either of those. (This function has never
+// had a cache; the sentence claiming one was copied from undrawableNote, which
+// no longer has one either - review round 6 P3.)
+static std::string undrawableNoteOf(const UndrawableTally& t) {
+    std::string s;
+    if (t.total() > 0) {
+        char b[256];
+        std::string parts;
+        auto add = [&](int n, const char* what) {
+            if (n <= 0) return;
+            if (!parts.empty()) parts += ", ";
+            snprintf(b, sizeof b, "%d %s", n, what);
+            parts += b;
+        };
+        add(t.noGlyph,  "with no glyph in this font");
+        add(t.notAsked, "in a script this build does not load glyphs for");
+        add(t.tooHigh,  "outside the range this build can draw at all "
+                        "(emoji and the rarer CJK extensions)");
+        add(t.badBytes, "whose bytes are not valid UTF-8");
+        snprintf(b, sizeof b, "%d character(s) here draw as '?' - %s. ",
+                 t.total(), parts.c_str());
+        s = b;
+        s += "Two different files can look identical like this. The name on "
+             "disk is untouched.";
+        // The only cause a different font can fix. notAsked
+        // needs this build to request the script, tooHigh needs a wider
+        // ImWchar, and badBytes is the name on disk.
+        if (t.noGlyph > 0)
+            s += " For the missing glyphs, \"appearance.fontPath\" "
+                 "(settings.jsonc) points at another font; it takes effect at "
+                 "the next start.";
+    }
+    return s;
+}
+// THE LINE THAT STANDS IN FOR THE PATH, in one place, because two things need
+// the same answer: the tooltip draws it and undrawablePieces() counts it. A
+// COMPUTED frame has no path at all - its provenance note takes the path's
+// place, which is what the note is for - so "the path" is not the answer to
+// "what does this row say it is".
+//
+// IT IS NOT "THE TOOLTIP'S FIRST LINE", which is what this was called for one
+// round (review round 7 P3). The drawer puts things ABOVE it - a (stale)
+// warning, Watch's finding, a reload note - and things below it, so on those
+// rows the first line is one of those instead. A function made so that two
+// surfaces cannot disagree should not itself be named after something it is
+// not.
+//
+// The strings prefixed above it are deliberately NOT pieces: they are this
+// program's own sentences, and the one of them that carries a name from
+// somewhere else ("same picture as ...", another row's name) was raised in
+// round 4 and dropped there as a finding. If that is revisited, this is the
+// list to add it to - which is the whole point of the list.
+static std::string filesRowPathLine(const ImageDoc& d) {
+    return d.src->path.empty() && !d.note.empty() ? d.note : dispPath(d.src->path);
+}
+// ---- WHICH STRINGS A ROW SHOWS, in ONE place (review: sweep the shape) -----
+// Found by sweeping "a caller counts a different set of strings from the other
+// callers": the tooltip had been moved to an explicit list while the Messages
+// sweep still counted only the row's name, so a row whose PATH carried
+// undrawable characters got a tooltip note and no Messages line - the two
+// surfaces saying different things about the same row, which is the state this
+// list exists to prevent. Both callers now build their pieces here.
+//
+// The label is passed in because only the caller knows it: the tooltip has
+// ImGui's "name##id" string, the Messages sweep has the stack's name.
+// THE PIECES DO NOT HAVE TO BE DISJOINT, and TRYING TO MAKE THEM SO IS THE
+// MISTAKE THIS LIST MADE TWICE (review round 5).
+//
+// The first version added both `d.name` and the whole path and counted the
+// file's own name twice. The second split the path at its last separator so
+// that the directory part and the leaf shared no character, and deduplicated
+// whole strings for the rest - which is reasoning about the instances in front
+// of it, and the instances did not run out: `d.name` is a strict SUPERSTRING
+// of the leaf for an npz member, a remote frame, a decorated preview or stale
+// row, a series member and a stack name, and whole-string dedup sees none of
+// those. "試験.npz:温度" said 8 about 4 characters.
+//
+// So this list is now just THE STRINGS THIS ROW SHOWS, overlapping however
+// they like. What makes the count right is one level down, in
+// undrawableTallyUnseen(): the unit is counted once per row whatever string it
+// came in. Add a new string here freely - that is the whole point of the
+// change - and note that nothing here needs to know how the strings relate.
+//
+// "SHOWS" IS THE WHOLE TEST, and round 5 wrote "the strings this row CAN show,
+// in full" while adding two strings that a row does not always show and
+// missing one it does (review round 6):
+//
+//   * `d.name` is not a surface. It reaches the screen as a row's LABEL, and
+//     the label is what the caller passes in - which for a stack row is the
+//     STACK's name, not the head frame's. Adding `d.name` here made the row's
+//     sentence say "N character(s) HERE draw as '?'" about a frame name the
+//     row does not draw anywhere. Dropped: a loose row's label IS `d.name`, so
+//     nothing is lost, and the frames of a stack are the member clause's
+//     subject, counted there by their own names.
+//   * `d.src->member` reaches the screen the same way and only that way (an
+//     npz row's `d.name` is `<file>:<member>`), so it was a second copy of
+//     part of the label. Dropped for the same reason.
+//   * the path was added "in full" with the tooltip as the stated reason, and
+//     the tooltip does not always show the path: a COMPUTED frame has none, and
+//     its first line is `d.note` instead. So the piece is now the tooltip's
+//     first line AS THE TOOLTIP BUILDS IT - one function, called by both, which
+//     is the only arrangement in which this cannot drift again.
+//
+// Tooltip-shown and row-shown are both "shown", and that is why the directory
+// part counts: a folder called C:/測定/ with a '?' in it is exactly as
+// confusing as a file name with one, and it is on screen in the tooltip.
+static std::vector<std::string> undrawablePieces(const std::string& shownLabel,
+                                                 const ImageDoc& d) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& v) {
+        if (v.empty()) return;
+        // A cheap short-circuit, and NOT what makes the count right: equal
+        // strings are the ordinary case and decoding one twice is waste. The
+        // count would be the same with this line deleted.
+        if (std::find(out.begin(), out.end(), v) != out.end()) return;
+        out.push_back(v);
+    };
+    add(shownLabel);               // what is drawn ON the row
+    add(filesRowPathLine(d));      // ...and the line that names the file
+    // ...and the SERIES UNIT, which a member row's label carries and which no
+    // caller passes: the Files panel builds that label with
+    // filesSeriesMemberLead() and the Messages sweep has only the document, so
+    // the tooltip was counting the unit and the Messages line was not - two
+    // surfaces disagreeing about one row, which is the state this list exists
+    // to prevent. Found here rather than passed in, so both callers get it.
+    // app.series is a handful of entries; this is not the sweep's cost.
+    // ...ONLY WHEN THE ROW DRAWS IT, which is the same test the rest of this
+    // list passes (review round 7 P3). filesSeriesMemberLead() appends the unit
+    // only for a member whose value is SET - "value unset" has no unit after it
+    // - so a member with no value had the unit counted as being "here" when the
+    // row shows no unit at all. That is the mistake `d.name` was dropped for,
+    // one field over.
+    for (const App::Series& S : app.series) {
+        bool drawn = false;
+        for (const App::Series::Member& m : S.members) {
+            const bool mine = (d.seqId && m.seqId == d.seqId) ||
+                              (!d.seqId && m.frameUid && m.frameUid == d.uid);
+            if (!mine) continue;
+            drawn = std::isfinite(m.value);
+            break;
+        }
+        if (drawn) { add(S.unit); break; }
+    }
+    return out;
+}
+// ONE set of characters over ALL the pieces: `seen` is shared, so a character
+// in two of them is one character. This is the line that closes the npz,
+// remote-frame, stack-name and decorated-label shapes at once.
+static UndrawableTally undrawableTallyOf(const std::vector<std::string>& pieces) {
+    UndrawableTally t;
+    std::unordered_set<uint64_t>& seen = undrawableSeenBuf();
+    for (const std::string& v : pieces) t += undrawableTallyUnseen(v, seen);
+    return t;
+}
+
+// ...and the same sentence for ONE string, which is what the selftests ask for
+// when they are checking the sentence rather than a row.
+//
+// NOT CACHED, and not called from the panel. It used to be both: it was the
+// Files panel's per-row path and the cache was what review P3-11 added to stop
+// the panel decoding every name on every frame. The panel moved to an explicit
+// piece list and its cache went with it (`rowCache`, at the tooltip), and this
+// function was left behind with a comment still naming the caller it had lost
+// (review round 6 P3). A cache for a handful of calls from a test is a cache
+// whose reason cannot be written down truthfully, so it is gone.
+static std::string undrawableNote(const std::string& text) {
+    return undrawableNoteOf(undrawableTally(text));
+}
+// ...and the Messages line, once per document.
+//
+// Driven off app.imagesRev rather than hooked into an open: documents are
+// pushed onto app.images from many separate places, and a notice added to one
+// of those doors is a notice none of the others give. The revision counter is
+// the one thing every one of them bumps. (How many doors there are is not
+// stated: this sentence had a count in it and the count was wrong, twice. What
+// matters is that no door is the hook - which is why the counter is.)
+//
+// NO NUMBER, deliberately: this said "six separate places" and named six, and
+// grep finds nine pushes in seven files (review round 6). The claim worth
+// making is that there is no single door, which is what makes a counter the
+// hook; counting the doors in a comment just adds something else to be wrong.
+//
+// SAID ONCE PER ROW, and the key is the ROW's identity - `"s"+seqId` for a
+// stack, `"u"+uid` for a loose file - held in `saidKey` below.
+//
+// This paragraph used to say "once per NAME" and the one after it used to say
+// "each document is examined once, by uid", and both described machinery this
+// PR removed: `said` (a name-keyed set) and `seenUid` (a uid-keyed memo) were
+// real, and the per-BATCH rework that made this one line per OPEN deleted them
+// and left the prose (review round 6 - text following code, not a finding
+// closed by writing a comment).
+//
+// What the row key buys and what it costs, as the code now stands:
+//   * a REOPEN of the same file is a NEW uid, so it is a new row and it is
+//     reported again. That is the behaviour the second-open test in C4 relies
+//     on, and it is the opposite of what "the same file reopened is the same
+//     sentence" claimed.
+//   * nothing is memoised per document, so every sweep walks all of
+//     app.images and tallies every row that `saidKey` has not seen. During a
+//     stack load the batch is still growing, nothing is in `saidKey` yet, and
+//     the sweep repeats for each frame pushed. Whether that is worth a memo is
+//     a measurement nobody has taken; it is not claimed here either way.
+// ONE LINE PER OPEN, not one per document (review P2-5).
+//
+// The per-document version was a defect, not a verbosity preference: a folder
+// of 400 numbered frames with a CJK name is ONE gesture that produced 400
+// identical-shaped lines, and app.msgLog is capped at 300 - so the log that
+// exists to diagnose this pushed out everything else in it, including the
+// start-up font messages that say WHICH font is in use. A diagnostic that
+// erases the diagnosis is worse than silence.
+//
+// The unit is the BATCH, because a batch is defined as one open action
+// ("ONE batch per OPEN ACTION" - see newBatch in compare.inc), so it is the
+// program's own name for the thing the user did. Within a batch, stacks are
+// reported by stack, which is what the Files panel actually draws.
+//
+// WHEN: once nothing more can be pushed into the batch. A stack pushes members
+// over many frames, so counting at the first sight of one would print "1 frame"
+// for a load that ends with 400.
+//
+// AND THAT IS ASKED, NOT INFERRED FROM THE SIZE STANDING STILL (review round 7
+// P2). The test used to be "the size is the same as it was last sweep", which
+// only means "nothing arrived between two sweeps" - and that is the final
+// answer only if a sweep can happen for no reason other than a push. Round 6
+// wrote that as a universal, in this paragraph:
+//
+//     EVERY `imagesRev++` in the program happens WITH a push
+//
+// IT IS FALSE, and here is how to see that without taking a number on trust:
+// `grep -n 'imagesRev++'` and read the ones that are not next to a push.
+// compare.inc bumps it when the Files GROUPING is invalidated; series_model.inc
+// bumps it on every member edit, rename and reorder; export.inc bumps it when a
+// document is dropped from the caches; the series modal bumps it when it
+// closes. None of those pushes anything. (The derive modal, which an earlier
+// version of this paragraph also named, bumps it immediately AFTER a push - so
+// it is not a witness, and naming it was the same carelessness as the line
+// numbers this paragraph used to quote for a sentence that is no longer in the
+// file: review round 8 P3.) One of those bumps landing mid-load makes two
+// consecutive sweeps see the same size, which is why the size standing still
+// was never the answer.
+//
+// (This paragraph replaced a wrong COUNT with a wrong UNIVERSAL, and the
+// universal was worse: a reader can check a number with grep and nobody checks
+// an "every". So the universal that replaced it is checked - by the test below
+// in C4, which moves the counter without pushing and asserts the silence.)
+//
+// WHAT TO ASK, and this is where round 7 asked the wrong thing (review round
+// 8, critical). It asked `g.members < si->expectedFrames`, which reads as "more
+// are coming" and is not what that field means. The loader says so itself, in
+// open_dispatch.inc beside the only place that sets it:
+//
+//     expectedFrames counts the NAMES, the membership counts WHAT DECODED, and
+//     the Files row says "4/5f" until it reads. That statement OUTLIVES the
+//     toast, which is the point.
+//
+// So `members < expectedFrames` is a PERMANENT, LEGITIMATE state - no writer
+// ever lowers it - and every one of these reaches it: Stop pressed on a folder
+// load (stopLocalStackLoad clears the queue and cancels the worker and leaves
+// the field alone), a sibling the rule names but cannot decode, the memory
+// budget stopping a load short, and a remote stack whose budget deliberately
+// keeps a fraction of its frames resident. Asking it here cost two things at
+// once: the batch was NEVER reported (`saidKey` is written after the `continue`
+// below), which is the exact failure this mechanism exists to prevent, and
+// `wantAnother` + `wakeFrames` were re-armed on every frame for ever, so the
+// idle-driven loop this file promises spun at full frame rate until the process
+// ended. One Stop click was enough.
+//
+// THE RIGHT QUESTION IS ABOUT THE LOADER, NOT ABOUT A PLAN: is anything still
+// working that could push into this list? That is a lifecycle, so it ENDS -
+// including when it ends early, which is the whole point. `app.seqRunning` and
+// `app.seqQueue` are the local stack loader's, `seqReadyPending()` is a group
+// that has produced a stack this sweep has not seen yet, and `app.rfPending` is
+// the outstanding remote fetches. Stop makes all of them false in bounded time,
+// and so does the budget, and so does a load that simply finishes.
+//
+// It is deliberately NOT per batch. A load in flight anywhere delays every
+// batch's line by the length of that load, which is a delay; a predicate that
+// cannot end is a silence. The ruling's other option - report early and correct
+// the number later - was not taken because it spends the one line per open this
+// mechanism exists to keep, and because the correction would itself need a
+// bound (a load that grows in steps corrects in steps).
+//
+// WHAT IS LEFT, said out loud: a push from something that is not a loader - the
+// derive modal, a plugin, a series edit - is not covered by this, so a batch
+// built that way is reported on the first sweep where its size holds still.
+// Those produce their rows in one go, and the per-row `saidKey` means a row
+// that arrives later still gets its own line (C4 asserts that); the number that
+// can still be early is the summary's denominator when more than five rows
+// arrive in two bursts.
+static bool filesLoadersBusy() {
+    return app.seqRunning || !app.seqQueue.empty() || seqReadyPending() ||
+           app.rfPending > 0;
+}
+//
+// So when a batch is still growing this asks to be run again: `wantAnother`
+// gets it past the rev gate on the next frame, and app.wakeFrames guarantees
+// there IS a next frame (the loop is idle-driven and would otherwise sit in
+// glfwWaitEventsTimeout until the user moved the mouse). A frame with neither
+// a rev change nor that flag still returns at once, so the cost this avoided -
+// walking app.images every frame - stays avoided.
+static void undrawableReportNewDocs() {
+    static uint64_t seenRev = (uint64_t)-1;
+    static bool wantAnother = false;
+    // The batch is the SETTLE unit; the ROW is the "already said" unit. They
+    // have to be different things (review P2). batchReuse() hands back an
+    // EXISTING batch id whenever the same source directory is opened again -
+    // that is deliberate, it is what makes "clicked three files in a row" one
+    // batch - so a permanent per-batch flag silenced every later open from a
+    // folder that had already been reported once. Keyed on the row instead, a
+    // second open of the same folder reports its NEW rows and stays quiet
+    // about the ones it already named.
+    static std::unordered_map<int, int> batchSize;        // batchId -> size last sweep
+    static std::unordered_map<std::string, char> saidKey; // row key -> already reported
+    if (app.imagesRev == seenRev && !wantAnother) return;
+    seenRev = app.imagesRev;
+    wantAnother = false;
+    if (!bakedFont()) return;
+
+    // Group this sweep's documents into ROWS as the Files panel groups them:
+    // one group per stack, one per loose document. `key` is what the panel's
+    // own identity is - a stack is its seqId, a loose file is its uid - so a
+    // 400-frame stack is one group and three files picked by hand are three.
+    struct Group {
+        std::string key, name;
+        int seqId = 0, members = 0, affected = 0;
+        const ImageDoc* rep = nullptr;    // for undrawablePieces(), as the row draws it
+    };
+    std::unordered_map<int, std::vector<Group>> byBatch;   // batchId -> its rows
+    std::unordered_map<int, int> nowSize;
+    for (const auto& d : app.images) {
+        nowSize[d->batchId]++;
+        // The name the PANEL DRAWS is the one that matters: a stack row draws
+        // the STACK's name, not its head frame's (review P2-7).
+        const App::SeqInfo* si = d->seqId ? seqInfo(d->seqId) : nullptr;
+        const std::string shown = si ? si->name : d->name;
+        if (shown.empty()) continue;
+        const std::string key = d->seqId ? ("s" + std::to_string(d->seqId))
+                                         : ("u" + std::to_string(d->uid));
+        std::vector<Group>& gs = byBatch[d->batchId];
+        Group* g = nullptr;
+        for (Group& q : gs) if (q.key == key) { g = &q; break; }
+        if (!g) { gs.push_back({ key, shown, d->seqId, 0, 0, d.get() }); g = &gs.back(); }
+        g->members++;
+        // A FRAME'S OWN NAME, because that is the subject of the only sentence
+        // this number appears in: "N of M frame(s) in this stack have such
+        // characters IN THEIR OWN NAMES" (review round 6 P2).
+        //
+        // It used to be the frame's whole piece list, path included. Two
+        // things were wrong with that. The words say "their own names", and a
+        // path is not a name; and the frames of a stack share a directory, so
+        // one '?' in the folder made EVERY frame affected and the clause read
+        // "N of N" while the row's own clause, one sentence earlier, had
+        // already reported that same single character - one character counted
+        // twice, with the frames blamed for it.
+        //
+        // (Round 6 argued this from a universal - "the sibling rule makes the
+        // non-numeric segments of the leaves match, so counting leaves can only
+        // give 0 or N". That is false for a MERGED load, whose members come
+        // from different groups and legitimately have unrelated leaves. The
+        // clause is still right and the two reasons above do not need it;
+        // review round 7 P3 caught the reasoning, not the behaviour.)
+        if (undrawableTally(d->name).total() > 0)
+            g->affected++;
+    }
+    for (auto& [batchId, gs] : byBatch) {
+        // CAN MORE STILL ARRIVE? Asked of the loaders' own lifecycle, which
+        // ends - not of a planned total, which does not. See the note above.
+        const bool filling = filesLoadersBusy();
+        const int was = batchSize.count(batchId) ? batchSize[batchId] : -1;
+        if (filling || was != nowSize[batchId]) {
+            batchSize[batchId] = nowSize[batchId];
+            // Come back even if nothing else moves the revision counter, and
+            // make sure a frame happens at all. Without both of these the
+            // batch just opened is never reported - see the comment above.
+            wantAnother = true;
+            app.wakeFrames = std::max(app.wakeFrames, 2);
+            continue;
+        }
+        // The rows worth a line at all, and not yet said - and, counted at the
+        // same time and in the same place, HOW MANY ROWS THIS OPEN ADDED. The
+        // summary below is a sentence about rows "just opened", and the only
+        // set that matches those words is the one this loop is already walking
+        // past: the rows of this batch that saidKey has not seen. `gs` is not
+        // it - it is built from every row in app.images carrying this batchId
+        // (see the loop above), and batchReuse() hands back an existing batch
+        // id when the same folder is opened again, so `gs` can hold rows from
+        // several gestures. Using gs.size() said "6 of 400" on a second open of
+        // a big folder, which is the thing the P3 before it asked to avoid.
+        std::vector<const Group*> hits;
+        int justOpened = 0;
+        for (const Group& g : gs) {
+            if (saidKey.count(g.key)) continue;
+            justOpened++;
+            const bool own = g.rep &&
+                undrawableTallyOf(undrawablePieces(g.name, *g.rep)).total() > 0;
+            if (own || g.affected > 0) hits.push_back(&g);
+        }
+        // Every row in this batch is accounted for now, said or not - otherwise
+        // the clean ones would be re-examined on every later sweep of a batch
+        // that keeps being reopened.
+        for (const Group& g : gs) saidKey[g.key] = 1;
+        if (hits.empty()) continue;
+        // ...and a bound on the lines ONE BATCH can produce: at most five, or
+        // one summary. A stack is already one line; this is for the case that
+        // is not a stack - a hundred loose files picked at once.
+        //
+        // THE BOUND IS PER BATCH AND NOT PER GESTURE, which is what this said
+        // before (review round 6 P3). They are the same thing only while one
+        // open action makes one batch, and the picker's footer has a setting
+        // that breaks that: with `app.pickBatchMode == 1` a selection spanning
+        // K top-level folders becomes K batches, so one Load produces up to
+        // K x 5 lines, or K summaries. Capping per gesture would need a gesture
+        // id that nothing here has; what is true is written instead.
+        if (hits.size() > 5) {
+            // THE DENOMINATOR IS `justOpened`, built two loops up by the same
+            // `saidKey.count(g.key)` test that decides what may be reported at
+            // all - so the number and the words "just opened" name one set, and
+            // hits.size() <= justOpened holds by construction. Neither
+            // app.images.size() nor gs.size() is that set; both include rows
+            // from earlier opens of the same folder (review round 5 P2).
+            char b[192];
+            snprintf(b, sizeof b, "%d of the %d item(s) just opened have "
+                                  "characters that draw as '?' - hover a row to "
+                                  "see which, and why.",
+                     (int)hits.size(), justOpened);
+            logMsg(b, true);
+            continue;
+        }
+        for (const Group* g : hits) {
+            std::string line = g->name + ": ";
+            // `rep` is set when the group is created and never cleared, so
+            // there is no second arm here. There used to be one -
+            // `undrawableNote(g->name)` - and it was unreachable, which made
+            // the cache behind it unreachable too and left two comments
+            // justifying a cost that nothing was paying (review round 6 P3).
+            const std::string own =
+                undrawableNoteOf(undrawableTallyOf(undrawablePieces(g->name, *g->rep)));
+            if (!own.empty()) line += own;
+            // The MEMBER clause, for a stack whose frames carry it too (or
+            // instead). Its own numbers, because they are about other strings.
+            if (g->seqId && g->affected > 0) {
+                char b[192];
+                snprintf(b, sizeof b, "%s%d of %d frame(s) in this stack have "
+                                      "such characters in their own names.",
+                         own.empty() ? "" : " Also: ", g->affected, g->members);
+                line += b;
+            }
+            logMsg(line, true);
+        }
+    }
+    // Per RUN, and bounded: a session that opens and closes folders all day
+    // would otherwise grow these without end, so they are capped the way
+    // msgLog is. At worst one row is reported twice.
+    if (saidKey.size() > 8192) { saidKey.clear(); batchSize.clear(); }
 }
 // The tooltip's counterpart sentence for a row whose pixels are shared (§4):
 // `shared` = the row's frames whose source has another holder. Counterparts
@@ -905,8 +1721,7 @@ static void drawFileList() {
             // the mouse. So the row composes it once, the probe is that value,
             // and the hover only decides whether to SHOW it.
             {
-                std::string lead = d.src->path.empty() && !d.note.empty()
-                                 ? d.note : dispPath(d.src->path);
+                std::string lead = filesRowPathLine(d);
                 // the generation statements, where the provenance is read
                 // (§10.1 / §10.2): stale leads - it is the warning; "same
                 // picture" trails - it is the reassurance two results of one
@@ -944,6 +1759,66 @@ static void drawFileList() {
                     lead = rn + "\n" + lead;
                 std::string tip = lead + "\n" + meta;
                 if (!share.empty()) tip += "\n\n" + share;
+                // §4.1 (板306 D): and if this cannot be DRAWN, say so on the
+                // row that cannot draw it. Last, because it is a statement
+                // about the text above rather than about the pixels - and
+                // because the row it lands on is the one the reader is already
+                // trying to tell apart from its neighbour.
+                //
+                // Counted over an EXPLICIT LIST of the strings this row draws,
+                // and not over `tip`.
+                //
+                // Handing it `tip` was worse than handing it d.name. `tip` is
+                // multi-line by construction, the atlas has no glyph for
+                // U+000A because the ranges begin at U+0020, and so every row
+                // in the panel - including every plain ASCII one - grew a
+                // "1 character here draws as '?'" that was simply false. (The
+                // control-character rule in undrawableTally now closes that
+                // too; both halves are needed, because a concatenation also
+                // mixes in the separators this code adds itself.)
+                //
+                // And `tip` never contained the one string the review asked
+                // for: a stack row DRAWS the stack's name, which is in `label`
+                // and not in the tooltip's body at all (review P2-7). The list
+                // names every string the row can show, so the stack name is
+                // counted and the full path is counted (review P3-12); that no
+                // CHARACTER is counted twice is undrawableTallyUnseen()'s job
+                // and not this list's - see the note on the unit there.
+                {
+                    // The row's own label, with ImGui's "##id" suffix and the
+                    // leading indent removed - what is left is what a reader
+                    // sees on the row. The pieces themselves come from
+                    // undrawablePieces(), which the Messages sweep also uses.
+                    std::string shown = label ? label : "";
+                    if (const size_t h = shown.find("##"); h != std::string::npos)
+                        shown.resize(h);
+                    while (!shown.empty() && shown.front() == ' ') shown.erase(0, 1);
+                    // CACHED PER ROW, and this is the ONLY cache on this path.
+                    // Without it every row decodes every string it shows on
+                    // every frame - the cost review P3-11 removed, back by a
+                    // different door. Keyed on the pieces themselves, because
+                    // that is exactly what the answer depends on; the atlas
+                    // cannot change after start-up.
+                    //
+                    // (This used to say "undrawableNote() has a cache but this
+                    // path no longer goes through it". Round 6 removed that
+                    // cache - for being unreachable - and left the sentence
+                    // here pointing at it: review round 7 P3, type (d), in the
+                    // same commit that deleted the thing it names.)
+                    static std::unordered_map<std::string, std::string> rowCache;
+                    const std::vector<std::string> pieces = undrawablePieces(shown, d);
+                    std::string key;
+                    for (const std::string& q : pieces) { key += q; key += '\x01'; }
+                    std::string ud;
+                    if (auto it = rowCache.find(key); it != rowCache.end()) {
+                        ud = it->second;
+                    } else {
+                        ud = undrawableNoteOf(undrawableTallyOf(pieces));
+                        if (rowCache.size() > 4096) rowCache.clear();
+                        rowCache.emplace(key, ud);
+                    }
+                    if (!ud.empty()) tip += "\n\n" + ud;
+                }
                 g_filesRowTipProbe = tip;      // the value, not a second derivation
                 if (hov) ImGui::SetTooltip("%s", tip.c_str());
             }

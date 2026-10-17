@@ -518,6 +518,10 @@
             ImageDoc* bDoc = nullptr;
             for (const auto& d : app.images)
                 if (d->seqId == seqOther) { bDoc = d.get(); break; }
+            // ASSERTED, not gated: `if (bDoc)` would leave the compare path
+            // below measuring nothing and the checks after it passing on an
+            // empty B (review round 7, axis 3 - a gate IS the vacuity).
+            check(bDoc != nullptr, "M6 the other stack has a frame to put in B");
             if (bDoc) setCompareB(bDoc);
             app.compareMode = App::CmpSplit;
             selectStack(seqCur);                       // A <- X, the slot still Y's

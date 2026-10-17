@@ -863,10 +863,11 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 `File > Preferences...`、出所バッジ、Copy as JSONC / Copy template / Reset to
 default、`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
 `loading.folderScanDepth`、`appearance.uiScale`、`browse.folderClick`、
-`watch.intervalSec` まで実装されている。
-`SETTING_KEYS` の現行照合は **30 Read / 4 Later / 2 NotHere = 36行**。`prefs.txt` は
-`writePrefsTo` が33キーを書き、`loadPrefs` が互換入力を含む35キーを読む
-(板 297 が `watchinterval` を足した。phase④ が `folderclick` / `repourl` /
+`watch.intervalSec`、`appearance.fontPath` まで実装されている。
+`SETTING_KEYS` の現行照合は **31 Read / 4 Later / 2 NotHere = 37行**。`prefs.txt` は
+`writePrefsTo` が34キーを書き、`loadPrefs` が互換入力を含む36キーを読む
+(板 306 が `fontpath` を足した。板 297 が `watchinterval` を足して
+30 Read / 33書き/35読み。phase④ が `folderclick` / `repourl` /
 `editor` を足して 29 Read / 32書き/34読み。28 Read / 5 Later と
 29書き/31読みは phase④ 直前の値で、当時の記録として書き換えない)。
 
@@ -901,6 +902,23 @@ platform (X11 / Win32) では倍率をアプリが持つが、論理座標の pl
 toast で言う。起動時に stderr へ1行、
 `ui scale: platform=wayland content=2.00 -> ui 1.00 font 2.00 (auto)` が出るので、
 次に同種の報告が来たらログで即答できる。
+
+`appearance.fontPath` (板 306) は**値域の形が他と違う**ので、ここに1段落置く。
+値は「CJK のファイル名を描くフォントファイルのパス」で、既定は空 ——
+組み込みの候補列を探す。値域は**空でない文字列**、それだけである。
+**ファイルが実在するかどうかは値域に入れない**: それはこのマシンの事実であって
+パースしているファイルの事実ではなく、しかも「入れている途中」という状態が
+現実にある —— インストールしながら行を書くユーザーを設定 reader が断るのは
+おかしい。だから「無い」と「CJK が入っていない」の2つは、**フォントを読む
+時点で**、探したパスを全部並べて名指しする (`cjkFontMissingText` /
+`cjkFontNoGlyphsText`)。空文字列だけは判断8 どおり**行・列を名指しで断る** ——
+`""` は「パスを書こうとして書かなかった」形であり、探索に戻す方法は判断9 の
+**キーを消す**である。反映は次回起動 —— 字形はウィンドウ生成時の一度きりなので、
+`appearance.uiScale` と同じ形でパネルの行がその旨を toast で言う。起動時に
+stderr へ 1 行、`font atlas: 4963 glyph(s) of 5075 requested codepoint(s),
+1024x2048 px (8.0 MB RGBA), 2 face(s), built in 35 ms (font scale 1.00, kana
+present)` が出るので、代償と結果をあとから読める。字形範囲と 2枚重ねの側は
+`docs/guides/manual.md §8c`。
 
 出所は通常の `default` / `this machine` / `settings.jsonc:<line>` /
 `command line (--flag)` に、gamma と grid だけ `session (.vsession)` が加わる。

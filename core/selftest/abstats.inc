@@ -1079,6 +1079,15 @@
                     int away = -1;
                     for (int i = 0; i < (int)app.images.size(); i++)
                         if (app.images[i]->uid != pin && app.images[i]->seqId != 0) { away = i; break; }
+                    // THE FIXTURE HAS TO HAVE BOTH, and this used to be a
+                    // bare gate: when either scan found nothing the three
+                    // checks below simply did not run and A8 passed without
+                    // testing anything. (Reported as "the sentinel makes a
+                    // later check fail rather than pass" in round 6's axis-3
+                    // table, which was wrong about this site - review round 7.)
+                    check(bIdx >= 0 && away >= 0,
+                          "A8 the fixture has a pinned B and another stack to "
+                          "step onto");
                     if (bIdx >= 0 && away >= 0) {
                         selectImage(bIdx);                 // stand on B
                         bool kept = app.compareBUid == pin;

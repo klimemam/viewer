@@ -432,6 +432,10 @@ enum SKey {
     // above; its ROW sits with the other two watch keys, because what a reader
     // wants next to "watch source files on disk" is "how often".
     SK_watchInterval,
+    // 板306: WHICH FONT FILE the glyphs are baked from. Appended at the end for
+    // the reason above; its ROW sits with the appearance keys, because that is
+    // what a font is from the reader's side.
+    SK_fontPath,
     // The end marker, and it is not bookkeeping. The origin ledger and the
     // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
     // used to be SK_defaultUnit - the last id on the day they were written. Any
@@ -478,6 +482,23 @@ static const SKeyDef SETTING_KEYS[] = {
     // display"), so the sample is deliberately a real multiplier: the schema
     // walk has to feed this row a number that actually lands.
     { SK_uiScale,     "appearance.uiScale",      SS_Read, nullptr, "1.5" },
+    // 板306 C. The way out when this machine's CJK font is somewhere the
+    // built-in candidate list does not look - an English Windows with no
+    // Japanese language pack has none of the three fonts the list started
+    // with, and Noto CJK on Linux keeps being repackaged under new file names.
+    //
+    // The DOMAIN is "a non-empty path", and nothing more: whether the file is
+    // there, and whether it has any CJK in it, are facts about the machine
+    // rather than about the file being parsed, and they are reported where they
+    // can be reported usefully - by name, at the moment the font is loaded,
+    // with the whole list of paths that were looked at (cjkFontMissingText).
+    // A settings reader that refused a path because the font is not installed
+    // yet would refuse the line a user writes while installing it.
+    { SK_fontPath,    "appearance.fontPath",     SS_Read,
+      "A font file for Japanese/Chinese filenames, used INSTEAD of the built-in "
+      "search. Takes effect at the next start - the glyphs are baked once, while "
+      "the window is being created. Empty = search the usual places.",
+      "\"C:/Windows/Fonts/msgothic.ttc\"" },
 
     { SK_dragPans,    "input.dragPans",          SS_Read, nullptr, "true" },
     { SK_wheelZoom,   "input.wheelZoomPlain",    SS_Read, nullptr, "true" },
@@ -1177,6 +1198,22 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
             A.setS(g_settingsEditorCmd, s, path);
             break;
         }
+        // 板306 C. An empty string is REFUSED BY NAME rather than taken as
+        // "search the usual places": "" is how a key is spelled when somebody
+        // meant to type a path and did not, and the way to ask for the search
+        // back is 判断9's own way - delete the key. rangeErr prints the line
+        // and column of the value, so the refusal points at the line to fix.
+        case SK_fontPath: {
+            std::string s;
+            if (!A.wantStr(v, path, s)) break;
+            if (s.empty()) {
+                A.rangeErr(v, path, "a path to a font file - \"\" names nothing; "
+                                    "delete the key to get the built-in search back");
+                break;
+            }
+            A.setS(g_settingsFontPath, s, path);
+            break;
+        }
         case SK_memBudget: {
             double n = 0;
             if (!A.wantNum(v, path, n)) break;
@@ -1398,6 +1435,7 @@ static SettingsReport loadSettingsRead(const std::string& path) {
     // itself stays.)
     g_settingsRepoUrl = g_prefsBase.repoUrl;
     g_settingsEditorCmd = g_prefsBase.editorCmd;
+    g_settingsFontPath = g_prefsBase.fontPath;
     // ...and the recipe library, for the same reason and one more. It has no
     // prefs.txt layer under it either, so "absent" here means "empty"; and a
     // recipe left over from a previous read would be a named recipe the user
@@ -1580,8 +1618,11 @@ static SWidget settingsWidgetFor(SKey id) {
         // series.defaultUnit is a free string, not an enumeration: the
         // applier accepts any name that fits (a lab measures in whatever it
         // measures in), so a combo would refuse units the file accepts.
+        // 板306: a path, so a free text box for readers.pythonExecutable's own
+        // reason - the answer is wherever this machine keeps its fonts, and a
+        // combo could only offer the places the search already looked at.
         case SK_peerExe: case SK_repoUrl: case SK_pythonExe: case SK_editor:
-        case SK_defaultUnit:
+        case SK_defaultUnit: case SK_fontPath:
             return SW_Text;
         case SK_rawRecipes: case SK_searchPath:
             return SW_Link;
@@ -1681,6 +1722,7 @@ static std::string* prefTextField(SKey id) {
         case SK_repoUrl:   return &g_settingsRepoUrl;
         case SK_pythonExe: return &app.pythonExe;
         case SK_editor:    return &g_settingsEditorCmd;
+        case SK_fontPath:  return &g_settingsFontPath;
         // ...and the one text field that is a fixed buffer rather than a
         // std::string. Handed back through the same door by the caller below.
         default: return nullptr;
@@ -1773,6 +1815,7 @@ static void prefsRecordFrom(PrefsBase& B, SKey id) {
         case SK_pythonExe:   B.pythonExe = app.pythonExe; break;
         case SK_searchPath:  B.readerPlaces = app.readerPlaces; break;
         case SK_editor:      B.editorCmd = g_settingsEditorCmd; break;
+        case SK_fontPath:    B.fontPath = g_settingsFontPath; break;
         case SK_defaultUnit: B.linUnit = app.lin.unit; break;
         case SK_memBudget:   B.memBudgetGB = app.memBudgetGB; break;
         case SK_watchFiles:  B.watchEnabled = app.watchEnabled; break;
@@ -1824,6 +1867,21 @@ static PrefsBase prefsToWrite() {
     }
     return P;
 }
+
+// 板306 C: the "takes effect at the next start" sentence, in one place, so the
+// row's own toast and the Reset menu's cannot become two different promises.
+static std::string fontPathNextStartText() {
+    if (g_settingsFontPath.empty())
+        return "Font is back to the built-in search at the next start.";
+    return "Font \"" + g_settingsFontPath + "\" takes effect at the next start "
+           "(the glyphs are baked once, while the window is being created).";
+}
+// ...and TRUE while a Preferences text box is mid-edit. Set by the panel around
+// its commit, and consulted by exactly one case below: the value is stored on
+// every keystroke (so nothing typed is lost) while the SENTENCE waits for the
+// edit to finish. Here rather than in the panel because prefAfterChange is what
+// decides what a change owes, and "say it once" is part of that.
+static bool g_prefTextMidEdit = false;
 
 // The side effect a change owes the rest of the program. The SAME helpers the
 // menu calls - the helper is the shared thing, and a panel that re-implemented
@@ -1880,6 +1938,20 @@ static void prefAfterChange(SKey id) {
                                                      : window_frame::System);
             break;
         case SK_editor: adapter::setSettingsEditor(g_settingsEditorCmd); break;
+        // 板306 C, the same shape appearance.uiScale has: the change does NOT
+        // take effect now. The glyphs are baked once, while the window is being
+        // created, and a control that silently did nothing is the "I set it and
+        // nothing happened" this panel exists to end.
+        //
+        // Not said WHILE the box is being typed into - see the flag. This is
+        // the only text row whose change is worth a sentence, and InputText
+        // returns true once per character, so a path typed by hand would
+        // otherwise leave one toast and one Messages line per letter: thirty
+        // lines about one change, which is the log made useless by the thing
+        // that was supposed to make the change visible.
+        case SK_fontPath:
+            if (!g_prefTextMidEdit) toast(fontPathNextStartText());
+            break;
         default: break;
     }
     prefsBaseUpdate(id);
@@ -1920,6 +1992,7 @@ static void prefResetToDefault(SKey id) {
         case SK_pythonExe:   app.pythonExe.clear(); break;
         case SK_searchPath:  app.readerPlaces.clear(); break;
         case SK_editor:      g_settingsEditorCmd.clear(); break;
+        case SK_fontPath:    g_settingsFontPath.clear(); break;
         case SK_defaultUnit: snprintf(app.lin.unit, sizeof app.lin.unit, "%s", "lx"); break;
         case SK_memBudget:   app.memBudgetGB = 0; break;
         case SK_watchFiles:  app.watchEnabled = true; break;
@@ -2157,6 +2230,7 @@ static std::string settingsCurrentValue(SKey id) {
             return s + "]";
         }
         case SK_editor: return g_settingsEditorCmd.empty() ? "" : sjQuote(g_settingsEditorCmd);
+        case SK_fontPath: return g_settingsFontPath.empty() ? "" : sjQuote(g_settingsFontPath);
         case SK_defaultUnit:
             return strcmp(app.lin.unit, "lx") == 0 ? "" : sjQuote(app.lin.unit);
         case SK_None: case SK_Count: return "";   // not keys; see the enum
