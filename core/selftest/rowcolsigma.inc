@@ -50,6 +50,15 @@
 //       shift invariant) and only the DENOMINATORS part, by an exact factor.
 //   S4  a spread of one float ulp on a dyadic pedestal: #1 reports exactly 0
 //       for a column-to-column difference #2 and #3 both measure.
+//   S5  a MOSAIC. Every stage above is one plane, so the CFA path through all
+//       four sites had no assertion of any kind - and it is the path the
+//       Projection panel is mostly used on. A mosaic plane's column means are
+//       over its OWN columns (half of the frame's, at its own phase), so the
+//       one thing this stage exists to catch is a site that divides by the
+//       frame's column count, folds the other planes' NaNs in, or reads the
+//       profile at the wrong phase. The fixture is four independent bilinear
+//       ramps at four levels, so every number is in closed form per plane and
+//       any phase error shows up as the WRONG LEVEL, which is unmissable.
 //
 // NOGL and fixture-free, for --histhl-selftest's reasons: every claim is a
 // number, the documents are analytic and built in memory, and the expected
@@ -106,7 +115,10 @@ if (g_rowColSigmaSelftest) {
     // frame is a stack of one; the block reads px() and the ROI convention and
     // nothing else about the sequence.
     struct Row2 { double mean = 0, sd0 = 0, colPct = 0, rowPct = 0; bool got = false; };
-    auto perFrame2 = [&](ImageDoc* d) {
+    // `sfx` is the per-plane column suffix the block writes ("_R" on a mosaic,
+    // "" on a plain 1-channel frame) - the export names its columns per plane
+    // and this is how a caller asks for one.
+    auto perFrame2 = [&](ImageDoc* d, const char* sfx = "") {
         Row2 r;
         App::SeqInfo si;
         si.id = app.nextSeqId++;
@@ -145,10 +157,11 @@ if (g_rowColSigmaSelftest) {
                 if (head[i] == name) return atof(cell[i].c_str());
             return std::numeric_limits<double>::quiet_NaN();
         };
-        r.mean = at("mean [DN]");
-        r.sd0 = at("sigma [DN](ddof=0)");
-        r.colPct = at("sigma_col [%](ddof=1)");
-        r.rowPct = at("sigma_row [%](ddof=1)");
+        const std::string sf = sfx;
+        r.mean = at(("mean" + sf + " [DN]").c_str());
+        r.sd0 = at(("sigma" + sf + " [DN](ddof=0)").c_str());
+        r.colPct = at(("sigma_col" + sf + " [%](ddof=1)").c_str());
+        r.rowPct = at(("sigma_row" + sf + " [%](ddof=1)").c_str());
         r.got = std::isfinite(r.mean);
         return finish(r);
     };
@@ -166,7 +179,9 @@ if (g_rowColSigmaSelftest) {
     // same mouth every other caller uses. Numbers only - the row keys are
     // "ch0.*" for a 1-channel non-mosaic frame.
     struct Row4 { double mean = 0, rowFpn = 0, colFpn = 0; std::string note; bool got = false; };
-    auto prnu4 = [&](ImageDoc& d) {
+    // `key` is the row-key prefix: "ch0" for a plain 1-channel frame, the plane
+    // name ("R", "Gr", ...) on a mosaic.
+    auto prnu4 = [&](ImageDoc& d, const char* key = "ch0") {
         Row4 r;
         const auto& anas = plugin_host::analyzers();
         const AnalyzerPluginInfo* a = nullptr;
@@ -180,11 +195,12 @@ if (g_rowColSigmaSelftest) {
         const int32_t rc = bunRunRaw(*a, &fr, nullptr, perr, sizeof perr);
         g_bunRows = nullptr; g_bunSeries = nullptr;
         if (rc != 0) { r.note = perr; return r; }
+        const std::string k = key;
         for (const auto& kv : rows) {
-            if (kv.first == "ch0.mean") { r.mean = atof(kv.second.c_str()); r.got = true; }
-            else if (kv.first == "ch0.row_fpn_pct") r.rowFpn = atof(kv.second.c_str());
-            else if (kv.first == "ch0.col_fpn_pct") r.colFpn = atof(kv.second.c_str());
-            else if (kv.first == "ch0") r.note = kv.second;        // a refusal, in words
+            if (kv.first == k + ".mean") { r.mean = atof(kv.second.c_str()); r.got = true; }
+            else if (kv.first == k + ".row_fpn_pct") r.rowFpn = atof(kv.second.c_str());
+            else if (kv.first == k + ".col_fpn_pct") r.colFpn = atof(kv.second.c_str());
+            else if (kv.first == k) r.note = kv.second;            // a refusal, in words
         }
         return r;
     };
@@ -502,6 +518,143 @@ if (g_rowColSigmaSelftest) {
         // real column-to-column difference and one prints nothing.
         check(S.hStat[0].sd == 0.0 && r2.colPct > 0.0 && planeA(N) > 0.0,
               "S4 same pixels: #1 says 0, #2 and #3 both measure it");
+    }
+
+    // =====================================================================
+    // S5 - A MOSAIC, which none of S1-S4 is. 32x32 RGGB, and each plane is an
+    // INDEPENDENT 16x16 bilinear ramp on its own pedestal:
+    //
+    //   i = x >> 1, j = y >> 1              (both 0..15, whatever the phase)
+    //   p = cfaChannelAt(x, y)              (RGGB: p = (y&1)*2 + (x&1))
+    //   v = 1000 + 100*p + i + 4*j + 8*e    with e = +1 when (i+j) is even,
+    //                                            -1 when it is odd
+    //
+    // e sums to zero along every i and along every j of a plane (16 alternating
+    // terms), so it leaves EVERY column mean and EVERY row mean of every plane
+    // untouched while adding pixel variance - S1's trick, so that p > 0 and the
+    // decomposition is not clamped. Its cross terms with i and with 4j vanish
+    // for the same reason.
+    //
+    // Per plane, over that plane's OWN 16 columns and 16 rows:
+    //   column means  c_i = 1030   + 100p + i     (slope 1)
+    //   row means     r_j = 1007.5 + 100p + 4j    (slope 4)
+    //   plane mean    M_p = 1037.5 + 100p
+    //   A = Var_ddof1(c) = 16*17/12       = 68/3
+    //   B = Var_ddof1(r) = 16 * 68/3      = 1088/3
+    //   Var_pop(plane) = 255/12 + 16*255/12 + 64 = 425.25
+    //   T = Var_ddof1(plane) = 425.25 * 256/255   = 36288/85
+    //   denom = 1 - 1/16 - 1/16 = 7/8
+    //   p = (T - A - B) * 8/7             = 84832/1785 (> 0)
+    //   rowVariance = B - p/16 ; colVariance = A - p/16
+    //
+    // A and B do NOT depend on p, and the MEAN does - by exactly 100 per plane.
+    // That is the fixture's whole design: a site reading the profile at the
+    // wrong phase gets another plane's pedestal and misses by 100 DN, a site
+    // folding the interleaved NaNs in gets a different n, and a site dividing
+    // by the frame's 32 columns instead of the plane's 16 gets neither A nor B.
+    // =====================================================================
+    {
+        const double A5 = 68.0 / 3, B5 = 1088.0 / 3;
+        const double T5 = 36288.0 / 85;
+        const double P5 = (T5 - A5 - B5) * 8.0 / 7;
+        const double ROWV5 = B5 - P5 / 16, COLV5 = A5 - P5 / 16;
+        ImageDoc* d = mk("rcs_s5", 32, 32);
+        d->cfa = 1; d->cfaPattern = 0;                 // RGGB
+        for (int y = 0; y < 32; y++)
+            for (int x = 0; x < 32; x++) {
+                const int i = x >> 1, j = y >> 1;
+                const int pl = cfaChannelAt(*d, x, y);
+                d->px()[(size_t)y * 32 + x] =
+                    (float)(1000 + 100 * pl + i + 4 * j + (((i + j) & 1) ? -8 : 8));
+            }
+        computeMinMax(*d);
+        App::ProjState S;
+        proj1(*d, S);
+        check(S.nSeries == 4 && S.cell == 2,
+              "S5 fixture: four planes on a 2x2 mosaic");
+        check(P5 > 0, "S5 fixture: the residual keeps p positive, as S1's does");
+        static const char* PN[4] = { "R", "Gr", "Gb", "B" };
+        for (int pl = 0; pl < 4; pl++) {
+            const profile_noise::Result& N = S.noise[(size_t)pl];
+            const Row2 r2 = perFrame2(d, (std::string("_") + PN[pl]).c_str());
+            const Row4 r4 = prnu4(*d, PN[pl]);
+            const double M5 = 1037.5 + 100.0 * pl;
+            fprintf(stderr, "rowcolsigmaselftest: S5 %-2s #1 sigma_col=%.12g "
+                            "sigma_row=%.12g mean=%.12g (profile %zu long)\n",
+                    PN[pl], S.hStat[pl].sd, S.vStat[pl].sd, S.hStat[pl].mean,
+                    S.h[pl].size());
+            fprintf(stderr, "rowcolsigmaselftest: S5 %-2s #2 mean=%.12g col%%=%.12g "
+                            "row%%=%.12g   #3 %dx%d A=%.12g B=%.12g p=%.12g   "
+                            "#4 mean=%.12g row=%.12g col=%.12g%s\n",
+                    PN[pl], r2.mean, r2.colPct, r2.rowPct, N.width, N.height,
+                    planeA(N), planeB(N), N.pVariance,
+                    r4.mean, r4.rowFpn, r4.colFpn,
+                    r4.note.empty() ? "" : (" note=" + r4.note).c_str());
+
+            char what[160];
+            // ---- #1, over the PLANE'S OWN samples ----------------------
+            // The profile is 32 long with a NaN at every column the plane does
+            // not own, and the statistic is over the 16 it does. n = 16 is the
+            // claim: fold the NaNs in and the mean is the same but the ddof=1
+            // factor is 32/31 instead of 16/15, and A comes out 3.4% low.
+            snprintf(what, sizeof what,
+                     "S5 #1 %s: mean %.1f - the plane's OWN pedestal, not a neighbour's",
+                     PN[pl], M5);
+            check(S.hStat[pl].valid && S.hStat[pl].mean == M5 &&
+                  S.vStat[pl].mean == M5, what);
+            snprintf(what, sizeof what,
+                     "S5 #1 %s: sigma_col = sqrt(68/3) and sigma_row = sqrt(1088/3)",
+                     PN[pl]);
+            check(near_(S.hStat[pl].sd, std::sqrt(A5), 1e-12) &&
+                  near_(S.vStat[pl].sd, std::sqrt(B5), 1e-12), what);
+            snprintf(what, sizeof what,
+                     "S5 #1 %s: 32 entries, and the 16 the plane owns are the sample",
+                     PN[pl]);
+            check(S.h[pl].size() == 32 && S.v[pl].size() == 32 &&
+                  near_(S.hStat[pl].pct, std::sqrt(A5) / M5 * 100.0, 1e-12), what);
+            // ---- #2, the export's per-plane columns --------------------
+            snprintf(what, sizeof what,
+                     "S5 #2 %s: the same two percentages, in double, over the full plane",
+                     PN[pl]);
+            check(r2.got && near9(r2.mean, M5) &&
+                  near9(r2.colPct, std::sqrt(A5) / M5 * 100.0) &&
+                  near9(r2.rowPct, std::sqrt(B5) / M5 * 100.0), what);
+            // ---- #3, the decomposition, per plane ----------------------
+            snprintf(what, sizeof what,
+                     "S5 #3 %s: a 16x16 PLANE, not a 32x32 frame", PN[pl]);
+            check(N.valid() && N.width == 16 && N.height == 16, what);
+            snprintf(what, sizeof what,
+                     "S5 #3 %s: A = 68/3, B = 1088/3, p = 84832/1785, nothing clamped",
+                     PN[pl]);
+            check(near_(planeA(N), A5, 1e-12) && near_(planeB(N), B5, 1e-12) &&
+                  near_(N.pVariance, P5, 1e-12) && !N.clamped(), what);
+            snprintf(what, sizeof what,
+                     "S5 #3 %s: rowVariance = B - p/16 and colVariance = A - p/16",
+                     PN[pl]);
+            check(near_(N.rowVariance, ROWV5, 1e-12) &&
+                  near_(N.colVariance, COLV5, 1e-12), what);
+            // ---- the RELATION #1 <-> #3, on the mosaic path ------------
+            // S1 pins this for one plane; here it is pinned four times over,
+            // at four phases, which is the part that had no assertion at all.
+            snprintf(what, sizeof what,
+                     "S5 %s: #1's sigma_col squared IS #3's A - same plane, same samples",
+                     PN[pl]);
+            check(near_(S.hStat[pl].sd * S.hStat[pl].sd, planeA(N), 1e-11) &&
+                  near_(S.vStat[pl].sd * S.vStat[pl].sd, planeB(N), 1e-11), what);
+            // ---- #4 reaches the mosaic and answers PER PLANE -----------
+            // Its value is a 9-tap high-pass of the profile and has no short
+            // closed form on a ramp, so what is asserted is that the mosaic
+            // path reaches it and that the plane it answers about is this one -
+            // the mean is the pedestal, and the pedestals are 100 apart.
+            snprintf(what, sizeof what,
+                     "S5 #4 %s: answers under the PLANE's key, about the plane's level",
+                     PN[pl]);
+            check(r4.got && near_(r4.mean, M5, 1e-6), what);
+        }
+        // ...and the four planes really are four different levels, so none of
+        // the checks above could have passed by reading a neighbour.
+        check(S.hStat[0].mean == 1037.5 && S.hStat[3].mean == 1337.5,
+              "S5 the pedestals are 100 DN apart: a phase error cannot hide");
     }
 
     // The home is shared: put back every mode this file borrowed.

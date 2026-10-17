@@ -478,6 +478,46 @@
             check(!one.ok, "E12 one sample is not a spread");
             check(zm.ok && !zm.hasPct && fabs(zm.pp - 10) < 1e-9,
                   "E12 a curve with no positive mean reports p-p and refuses the ratio");
+
+            // ---- E12b: THE WINDOW AND THE SERIES MUST BE ONE COORDINATE
+            // SYSTEM. An index-only series is positions 0..n-1, so the window
+            // handed to it has to be positions too. The projection panel was
+            // handing it a window in absolute COLUMNS (pr.xmin/pr.xmax, which
+            // under an ROI start at the ROI's x) against a profile indexed from
+            // zero, and the two agreed only while the ROI origin was 0 - which
+            // is why it never showed. With the origin past the end of the
+            // profile every sample falls outside the window and the answer is
+            // "not ok", so the p-p line simply did not appear: silence, not a
+            // wrong number. With the origin merely shifted it is worse - a real
+            // number computed over the wrong samples, printed under the label
+            // of the range the reader can see.
+            //
+            // Pinned here, on the helper, as the shape of the mistake: the
+            // panel-side behaviour is pinned by --abstats-selftest C6.
+            {
+                const int origin = 1000;             // the ROI's x
+                // the plot's axis: columns 1000..1004, the series: 0..4
+                const PlotSpread absWin = plotSpreadIn({}, ys, (float)origin,
+                                                       (float)(origin + 4));
+                const PlotSpread idxWin = plotSpreadIn({}, ys, (float)origin - origin,
+                                                       (float)(origin + 4 - origin));
+                fprintf(stderr, "exporttsvselftest: E12b origin=%d absolute window "
+                                "ok=%d n=%d | shifted window ok=%d n=%d mean=%.9g\n",
+                        origin, absWin.ok ? 1 : 0, absWin.n,
+                        idxWin.ok ? 1 : 0, idxWin.n, idxWin.mean);
+                check(!absWin.ok && absWin.n == 0,
+                      "E12b an absolute-column window over an index series finds NOTHING");
+                check(idxWin.ok && idxWin.n == 5 && fabs(idxWin.mean - 100) < 1e-9,
+                      "E12b ...and shifted by the origin it finds the whole curve");
+                // ...and the half-overlapping case, which is the one that
+                // returns a number instead of falling silent: columns 2..4 of
+                // the plot land on indices 2..4, not on the samples at 2..4 of
+                // a series that starts at column 1000.
+                const PlotSpread part = plotSpreadIn({}, ys, 2, 4);
+                check(part.ok && part.n == 3 &&
+                      fabs(part.mean - (90.0 + 105.0 + 95.0) / 3.0) < 1e-9,
+                      "E12b a shifted window answers over the samples it really covers");
+            }
         }
 
         // ---- E8: the axis survives a session round-trip ----

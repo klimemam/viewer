@@ -796,11 +796,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     }
     if (P.uid == im->uid && P.dataRev == im->dataRev && P.mode == app.projMode &&
         P.cfa == im->cfa && P.cfaPattern == im->cfaPattern &&
+        P.allReq == app.projAllRow &&
         P.rx == rx && P.ry == ry && P.rw == rw && P.rh == rh)
         return;
     if (app.annBusy && P.uid == im->uid) return;   // mid-drag: keep the last profile
     P.img = im; P.uid = im->uid; P.dataRev = im->dataRev;
     P.mode = app.projMode; P.cfa = im->cfa; P.cfaPattern = im->cfaPattern;
+    P.allReq = app.projAllRow;     // the ASK, keyed on above; allRow is the answer
     P.rx = rx; P.ry = ry; P.rw = rw; P.rh = rh; P.roiUsed = roiUsed;
     // Always a mean-based decomposition of this frame/ROI, independent of the
     // plot's reduce mode. Do not combine the orthogonally strided plot samples.
@@ -824,9 +826,51 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // out-of-range write, on a checkbox, on every non-CFA image with more than
     // one plane - the viewer died the moment it was ticked. CFA hid it because
     // there nSeries IS 4 and the count is accidentally the right answer.
+    // ...and whether there is a profile to compute AT ALL. A decimated remote
+    // preview of a mosaic carries every Nth row and column of the sensor, so
+    // the mosaic phase is gone: cfaChannelAt over preview coordinates would
+    // name a plane the pixel is not from, and every plane's curve would be
+    // another plane's values under this plane's name. Refused in the wording
+    // computeProfileNoise already uses for the same cause, rather than pooled
+    // into one dense series - a curve whose phase has been destroyed is not
+    // something to read shading off, and an empty plot with a reason is the
+    // better of the two. The real planes arrive with the full-resolution frame.
+    P.unavail.clear();
+    if (cfa && im->src->remoteStep > 1)
+        P.unavail = "full-resolution remote pixels required: this is a decimated "
+                    "preview, and it does not keep the mosaic phase - no plane's "
+                    "profile can be told from the others'. The planes appear when "
+                    "the full-resolution frame lands.";
+    //
+    // TWO LISTS, because the pooled row does not get the same treatment as a
+    // plane on a mosaic. `fillSlot` is the slots that get a PROFILE (P.h/P.v);
+    // `momSlot` is the slots that get REGION moments (fStat).
+    //
+    // ON A MOSAIC THE POOLED ROW GETS NO PROFILE AT ALL. Pooling the planes
+    // makes a DENSE column mean out of their level difference, so the profile
+    // exists, is drawable, and means the inter-plane offset rather than
+    // anything about the columns: `all in view [0 .. 15]: p-p 415` on a 16x16
+    // RGGB frame, of which 400 is the level step between the planes and 15 is
+    // the only column structure there is. Nothing may draw it, its sigma and
+    // p-p are refused, and the per-axis mean it would carry is the pooled
+    // REGION mean computed a second time - so there is nothing to keep and a
+    // dense array no reader is allowed to touch is a trap. The region moments
+    // are the whole of what "all" means on a mosaic.
     int fillSlot[5], nAcc = 0;
-    for (int s = 0; s < P.nSeries; s++) fillSlot[nAcc++] = s;
-    if (P.allRow) fillSlot[nAcc++] = 4;
+    int momSlot[5], nMom = 0;
+    if (P.unavail.empty()) {
+        for (int s = 0; s < P.nSeries; s++) { fillSlot[nAcc++] = s; momSlot[nMom++] = s; }
+        if (P.allRow) {
+            momSlot[nMom++] = 4;
+            if (!cfa) fillSlot[nAcc++] = 4;
+        }
+    }
+    bool hasProfile[5] = {};
+    for (int i = 0; i < nAcc; i++) hasProfile[fillSlot[i]] = true;
+    // ...and the list itself goes into the state, so the panel's readers walk
+    // the slots the pass filled instead of counting them (ProjState::fill).
+    for (int i = 0; i < nAcc; i++) P.fill[i] = fillSlot[i];
+    P.nFill = nAcc;
 
     // ...and everything below is indexed BY SLOT, never by position, so the
     // five-slot arrays and the loops cannot drift apart again.
@@ -851,7 +895,21 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         hN[s].assign(rw, 0);
         vN[s].assign(rh, 0);
     }
-    if (!P.allRow) { P.h[4].clear(); P.v[4].clear(); P.fStat[4] = {}; P.hStat[4] = {}; P.vStat[4] = {}; }
+    {   // EVERY slot the pass did not fill is cleared, not just slot 4. An
+        // unfilled slot keeps the PREVIOUS document's profile and statistics
+        // under this document's names: open a Bayer frame, then a 3-channel
+        // one, and slot 3 still held the mosaic's B plane while the readers
+        // that counted rather than walked went looking for it as "ch3".
+        bool moments[5] = {};
+        for (int i = 0; i < nMom; i++) moments[momSlot[i]] = true;
+        for (int s = 0; s < 5; s++) {
+            if (!hasProfile[s]) {
+                P.h[s].clear(); P.v[s].clear();
+                P.hStat[s] = {}; P.vStat[s] = {};
+            }
+            if (!moments[s]) P.fStat[s] = {};
+        }
+    }
     // Region moments, gathered from the SAME samples the H pass visits (every
     // column, every step-th row). So the region statistics and the H profile
     // describe one and the same set of pixels, and - every column of a
@@ -892,6 +950,13 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // ...and the budget has to know that each step now covers `cell` lines
     int step = (int)std::max<size_t>(1, ((size_t)rw * rh * cell) / PROJ_MAX_SAMPLES);
     if (cell > 1) step = ((step + cell - 1) / cell) * cell;   // whole cells only
+    // WHERE each plane's samples land, recorded as the pass visits them
+    // (ProjState::hPhase, core/app/state.h). The reader of a mosaic profile has
+    // to tell a hole in the lattice from a hole in the data, and this is the
+    // pass's own answer to the first half - taken from cfaChannelAt below, so
+    // the panel never spells the phase a second time.
+    P.cell = cell;
+    for (int s = 0; s < 5; s++) { P.hPhase[s] = 0; P.vPhase[s] = 0; }
     auto accumulate = [&](int x, int y, bool toH) {
         const float* src = &im->px()[((size_t)(ry + y) * im->w + (rx + x)) * im->ch];
         int lo = 0, hi = P.nSeries;
@@ -900,18 +965,38 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         // into the pooled "all" row as well. Pooling here rather than in a
         // second pass keeps the two rows over EXACTLY the same samples.
         auto put = [&](int slot, float val) {
-            double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
-            if (useMax) acc = std::max(acc, (double)val);
-            else if (useMin) acc = std::min(acc, (double)val);
-            else acc += val;
-            (toH ? hN[slot][x] : vN[slot][y])++;
+            if (hasProfile[slot]) {         // a slot with no profile - the pooled
+                                            // row on a mosaic - still has moments
+                double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
+                if (useMax) acc = std::max(acc, (double)val);
+                else if (useMin) acc = std::min(acc, (double)val);
+                else acc += val;
+                (toH ? hN[slot][x] : vN[slot][y])++;
+            }
             if (toH) {           // one pass only, or every pixel counts twice
                 fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
                 fMn[slot] = std::min(fMn[slot], (double)val);
                 fMx[slot] = std::max(fMx[slot], (double)val);
             }
         };
+        // THE LATTICE IS WHERE THE PASS LOOKED, NOT WHERE IT FOUND SOMETHING.
+        // Recorded here, before the finiteness test, from the cfaChannelAt call
+        // above (ProjState::hPhase, core/app/state.h). Recording it inside
+        // put() - after the test - made an offset whose samples are ALL
+        // non-finite look like an offset the plane does not have, and then the
+        // stroke walked straight past it and JOINED THE TWO SIDES OF A REAL
+        // GAP. That is exactly the distinction the lattice exists to draw, lost
+        // in the one case it matters: a quad-Bayer frame with one phase dead,
+        // or any plane whose every sample at one offset is NaN.
         for (int s = lo; s < hi; s++) {
+            if (hasProfile[s]) {
+                if (toH) P.hPhase[s] |= 1u << (x % cell);
+                else     P.vPhase[s] |= 1u << (y % cell);
+            }
+            if (P.allRow && hasProfile[4]) {
+                if (toH) P.hPhase[4] |= 1u << (x % cell);
+                else     P.vPhase[4] |= 1u << (y % cell);
+            }
             float val = cfa ? src[0] : src[std::min(s, im->ch - 1)];
             if (!std::isfinite(val)) continue;
             put(s, val);
@@ -920,12 +1005,16 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     };
     // Each step lands on a mosaic cell and takes ALL of its lines, so every
     // plane is sampled the same number of times whatever the stride.
-    for (int y = 0; y < rh; y += step)          // H profile: every column
-        for (int dy = 0; dy < cell && y + dy < rh; dy++)
-            for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
-    for (int y = 0; y < rh; y++)                // V profile: every row
-        for (int x = 0; x < rw; x += step)
-            for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
+    if (nMom) {           // ...and nothing to gather means no pass at all: the
+                          // refused preview, where accumulate would write into
+                          // vectors that were never sized
+        for (int y = 0; y < rh; y += step)          // H profile: every column
+            for (int dy = 0; dy < cell && y + dy < rh; dy++)
+                for (int x = 0; x < rw; x++) accumulate(x, y + dy, true);
+        for (int y = 0; y < rh; y++)                // V profile: every row
+            for (int x = 0; x < rw; x += step)
+                for (int dx = 0; dx < cell && x + dx < rw; dx++) accumulate(x + dx, y, false);
+    }
     P.hMin = P.vMin = FLT_MAX; P.hMax = P.vMax = -FLT_MAX;
     // The one place the profile narrows to float: the mean is DIVIDED in double
     // and rounded once, on its way into the vector the plot draws. One rounding
@@ -950,11 +1039,12 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
-    for (int i = 0; i < nAcc; i++) {
-        const int s = fillSlot[i];
+    for (int i = 0; i < nMom; i++) {       // ...including the pooled row on a
+        const int s = momSlot[i];          // mosaic, which has ONLY these
         App::ProjState::Stats& f = P.fStat[s];
         f = {};
         if (!fN[s]) continue;
+        f.n = fN[s];                   // the pooling weight, published
         f.mean = fSum[s] / fN[s];
         double var = fSum2[s] / fN[s] - f.mean * f.mean;
         f.sd = sqrt(var > 0 ? var : 0);
@@ -971,6 +1061,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             const std::vector<float>& d = axis == 0 ? P.h[s] : P.v[s];
             App::ProjState::Stats& st = axis == 0 ? P.hStat[s] : P.vStat[s];
             st = {};
+            // (The pooled row on a mosaic never reaches here: it is not in
+            // fillSlot, because it has no profile at all. See the two lists.)
             double sum = 0, sum2 = 0;
             double mn = DBL_MAX, mx = -DBL_MAX;
             size_t n = 0;
@@ -980,7 +1072,14 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
                 mn = std::min(mn, (double)v); mx = std::max(mx, (double)v);
                 n++;
             }
-            if (!n) continue;
+            // n < 2, not n == 0: with one sample the variance below is 0 by
+            // construction and `valid` would publish that exact zero as a
+            // measurement. One column of a Bayer plane - a 2-wide ROI, or a
+            // 3x3 one - then reported sigma_col = 0, which reads as a perfectly
+            // uniform sensor. A single sample has a mean and no spread, and
+            // this structure carries both together, so neither is published.
+            if (n < 2) continue;
+            st.n = n;
             st.mean = sum / n;
             // ddof=1 (docs/features/analysis/stats-taxonomy.md §8 判断2). These are the row and column
             // MEANS, not the pixels: sigma of them is A and B of the flat-field
