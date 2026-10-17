@@ -699,7 +699,7 @@
                 return 1;
             }
             check(ses.peerVersion() == (int)rp::VERSION,
-                  "M5a (setup) the peer speaks the protocol this build does (14)");
+                  "M5a (setup) the peer speaks the protocol this build does");
             remote::NpzScan sc;
             std::string err;
             const bool listed = ses.npzScan(cont, sc, err);

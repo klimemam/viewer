@@ -479,6 +479,50 @@ inline std::string srcIdentityKey(const FrameSource& s) {
     return srcKeyPath(s.path.empty() ? s.remoteUrl : s.path) + "\n" +
            std::to_string(s.member.size()) + ":" + s.member + t;
 }
+// The recipe a source already carries, in the shape the WIRE takes (protocol
+// 11). ONE spelling, right beside the identity key that is built from the same
+// six fields, because everything that asks the peer again for the SAME pixels
+// has to send the six numbers the open sent: the full-resolution swap after a
+// decimated first view, a sibling frame joining the stack, a Reload, a server
+// MEASURE. A follow-up that dropped them does not get "no picture" - it gets
+// the peer's refusal, and the stack silently loses a frame it already showed.
+//
+// srcW/srcH and not w/h: those two are what is on SCREEN (a crop re-scopes
+// them), and the declaration is about the file. A crop does not travel
+// (remote-headerless-design.md 3.2) - it is re-applied to what comes back.
+//
+// Returns false when this source is not a headerless read at all, which is the
+// only honest answer for one: there is no recipe to reconstruct.
+//
+// `cfaPattern` is the CFA PHASE (RGGB/BGGR/GRBG/GBRG), and it is here rather
+// than beside it because the peer never reads it: the phase relabels planes and
+// changes no sample, so it is the CLIENT's to apply, and the recipe is the one
+// channel that already reaches every follow-up request for the same pixels.
+// Without it a remote Bayer frame demosaiced as RGGB whatever the operator
+// picked, and a saved session came back a different colour - which is the same
+// class of defect as a changed number (docs/features/settings/settings-inventory.md 4.1).
+// It lives in the flags word that was declared "reserved, 0" for this kind of
+// append, so RawWire is the same 24 bytes and no protocol version moves.
+inline bool rawWireOf(int dtype, int interp, int w, int h, int offset, bool le,
+                      int cfaPattern, rp::RawWire& out) {
+    if (dtype < 0) return false;
+    out = rp::RawWire{};
+    out.dtype = (uint32_t)dtype;
+    out.interp = (uint32_t)interp;
+    out.w = (uint32_t)std::max(1, w);
+    out.h = (uint32_t)std::max(1, h);
+    out.offset = (uint32_t)std::max(0, offset);
+    out.flags = (le ? rp::RW_LITTLE_ENDIAN : 0u) | rp::rawWireCfaFlags(cfaPattern);
+    return true;
+}
+// The source half. It takes the phase as an ARGUMENT because a FrameSource does
+// not hold one: the phase is an ImageDoc field (it is display, not identity -
+// remote-headerless-design.md 3.2 keeps it out of srcIdentityKey deliberately),
+// so the caller passes the doc's, and every caller here has a doc.
+inline bool rawWireOfSource(const FrameSource& s, int cfaPattern, rp::RawWire& out) {
+    return rawWireOf(s.rawDtype, s.rawInterp, s.srcW > 0 ? s.srcW : s.w,
+                     s.srcH > 0 ? s.srcH : s.h, s.rawOffset, s.rawLE, cfaPattern, out);
+}
 // What may satisfy (or seed) a lookup: full-frame pixels that still mirror
 // their origin. A crop re-scoped them; a decimated remote preview and a failed
 // fetch are not the frame; no identity or no disk baseline means no tuple.
@@ -1959,6 +2003,37 @@ struct App {
                         std::string name; int batchId = 0; int port = 0;
                         int token = 0; };
     std::vector<RemoteOpen> rbOpenQueue;
+    // ...and the Open at the FRONT of that queue when it is a HEADERLESS folder
+    // whose recipe is still being asked for (protocol 11, stage 4). It has to
+    // live here rather than beside openRemoteStack because pumpRemoteOpenQueue
+    // (core/browse/nav.cpp, a different translation unit) must not start the
+    // NEXT queued stack while this one is waiting: that would raise a second
+    // RAW dialog over the first and orphan this request, which is the shape of
+    // failure startNextQueuedGroup's `|| rawDlg.open` guard already prevents
+    // for a local folder queue.
+    //
+    // `alive` is the whole predicate: one Open waits at a time, because one
+    // modal is up at a time. The dialog's Load resumes it
+    // (resumeRemoteRawStack) and its Cancel drops it, saying how many frames
+    // did not open.
+    struct PendingRemoteRawStack {
+        bool alive = false;
+        std::string host, name;
+        std::vector<std::string> files;
+        int port = 0, token = 0;
+        int batchId = 0;               // the Open that asked owns the frames
+        // ...and WHICH VERB asked. "Open as frame average" opens the stack and
+        // parks a mean over it, so for a headerless folder the mean is asked
+        // for BEFORE the recipe is known and has to survive the park. Without
+        // this, openStackForAverage looked for "what did that open?" the
+        // instant the dialog went up, found nothing of its own, and fell back
+        // to the document already on screen - publishing a mean of a stack
+        // nobody asked about. A number attributed to the wrong frames is the
+        // one failure this program must never have, so the verb travels with
+        // the park and is honoured against the stack that actually comes back.
+        bool average = false;
+    };
+    PendingRemoteRawStack remoteRawStack;
     // Places: starred host+path urls, and the last ~10 visited (most recent
     // first). Both persist in prefs - a lab machine's data layout outlives any
     // one session.
@@ -2368,6 +2443,15 @@ struct App {
         int node = 0, keyKind = 0, keyedRead = 0;
         bool keyRequires15 = false;
         uint64_t materializedRunId = 0;
+        // ...and the DECLARED GEOMETRY, for a headerless stack (protocol 11).
+        // It travels for npyRead's reason exactly: a sibling frame that dropped
+        // the recipe is not this stack read again, it is a refusal - so the
+        // stack would show its head and then lose every other frame, which is
+        // what happened between #188 and this. Carried on the job and not read
+        // off the head document on the worker, because the documents live on
+        // the UI thread (MJob's hasRecipe says the same thing for MEASURE).
+        bool hasRecipe = false;
+        rp::RawWire recipe{};
     };
     struct RFetchDone {
         uint64_t uid = 0;
@@ -2389,6 +2473,12 @@ struct App {
         int node = 0, keyKind = 0, keyedRead = 0; // + its wire axes (see RFetchJob)
         bool keyRequires15 = false;
         uint64_t materializedRunId = 0;
+        // The recipe the frame was fetched under, back from the job. It is put
+        // on the minted source for the OPEN's own reason: srcIdentityKey's raw
+        // branch keys on exactly these fields, so a sibling that landed without
+        // them would offer to share pixels with an .npy tuple.
+        bool hasRecipe = false;
+        rp::RawWire recipe{};
         // ...and what float32 cost THESE samples, measured on the worker where
         // the peer's exact bytes still existed. It cannot be recomputed on the
         // UI thread - by then the only copy is the float one.
@@ -2491,6 +2581,14 @@ struct App {
         int seqFrame = -1;                     // "seqframe"; -1 = not waiting for one
         int cx = 0, cy = 0, cw = 0, ch = 0;    // "crop"; cw == 0 = not waiting for one
         std::string doc;                       // the doc's name, for the message
+        // ...and WHOSE crop it is, which only the message needs. A RECIPE's
+        // crop waits here too now: the wire carries no crop, so a cropping
+        // recipe applied to a peer's file is finished on this side with the
+        // same cropInPlace the restore uses, and it meets the same refusal
+        // while the frame on screen is a decimated preview. One mechanism for
+        // one situation - but "the crop this session saved" is not what to say
+        // about a crop the operator typed a second ago.
+        bool cropFromSession = true;
     };
     std::vector<RestoreWait> restoreWait;
     // "Open as frame average" (or sum) on a stack that is not here yet. Browse

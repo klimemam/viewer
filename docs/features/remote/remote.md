@@ -1,7 +1,7 @@
 # リモートのデータを手元から見る (`ssh://`)
 
 計算機に置いた大量の画像・配列を、手元のマシンの viewer から開いて測るための仕組みです。
-稼働中の機能です(プロトコル `VERSION = 15`、
+稼働中の機能です(プロトコル `VERSION = 16`、
 [core/remote_proto.h](../../../core/remote_proto.h) /
 [core/serve.cpp](../../../core/serve.cpp) / [core/remote.cpp](../../../core/remote.cpp))。
 現在の対応範囲は `.npy`、PNG、JPEG、TIFF、単一 document の OpenEXR、y4m、
@@ -351,10 +351,17 @@ viewer ssh://user@host/data/run42
 
 ## 8. 制限と今後
 
-現時点(プロトコル `VERSION = 15`、
+現時点(プロトコル `VERSION = 16`、
 [core/remote_proto.h](../../../core/remote_proto.h))の状態。
 **残っている制限だけ**を書く節です。実装済みの項目を、未実装であるかのように
 残さないでください。この節には過去にその誤記がありました。
+
+protocol 16 は LIST / SCAN のグループ行に**メンバーサイズの min と max**を足す。
+ヘッダ無しのフォルダを 1 つのレシピで開けるのは全メンバーが同じバイト数のときだけで、
+合計ではそれを答えられない (108/110/106 の合計は 108/108/108 の合計と同じ) ため。
+メンバー名の**後ろ**に append するので pre-16 client への応答はバイト同一で、
+pre-16 peer に対してはヘッダ無しフォルダの open を名指しで断る (単独ファイルは不変)。
+詳細は [remote-headerless-design.md](remote-headerless-design.md) §12.1。
 
 Readerのcarrier generationとremote wire protocolは別の版境界である。
 [Issue #242](https://github.com/klimemam/viewer/issues/242) は2026-09-08のユーザー裁定Bで

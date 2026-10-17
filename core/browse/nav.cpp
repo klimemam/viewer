@@ -1085,6 +1085,12 @@ void remoteScanFolder(App::BrowseInstance& I, const std::string& root) {
 // the previous stack actually loaded.
 void pumpRemoteOpenQueue() {
     if (app.rbOpenQueue.empty() || app.rfPending > 0 || app.seqRunning) return;
+    // ...and not while an earlier Open from this very queue is still waiting to
+    // be told how to read its frames (App::remoteRawStack). Starting the next
+    // one would raise a second RAW dialog over the first and orphan the Open
+    // that is already parked - which is why startNextQueuedGroup has carried
+    // `|| rawDlg.open` since the local folder queue learned the same lesson.
+    if (app.remoteRawStack.alive) return;
     App::RemoteOpen ro = std::move(app.rbOpenQueue.front());
     app.rbOpenQueue.erase(app.rbOpenQueue.begin());
     sortFramesNumerically(ro.files);

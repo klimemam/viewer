@@ -501,7 +501,7 @@ bool Session::recv(uint32_t& type, std::vector<uint8_t>& payload, std::string& e
 }
 
 // One v3 entry (shared by the LIST and SCAN replies).
-static bool parseEntryV3(R& r, Entry& e) {
+static bool parseEntryV3(R& r, Entry& e, int peerVersion) {
     uint32_t d = 0, lo = 0, hi = 0, mlo = 0, mhi = 0;
     if (!r.str(e.name) || !r.u32(d) || !r.u32(lo) || !r.u32(hi) ||
         !r.u32(mlo) || !r.u32(mhi))
@@ -537,6 +537,19 @@ static bool parseEntryV3(R& r, Entry& e) {
         e.members.resize(cnt);
         for (auto& m : e.members)
             if (!r.str(m)) return false;
+        // Protocol 16, appended after the names: the smallest and largest
+        // member. Read from the PEER's number rather than by "are there bytes
+        // left", because this is the last field of an entry and the next
+        // entry's name would parse as a length - the same reason the v2/v3
+        // split above is a version test and not a length test.
+        if (peerVersion >= 16) {
+            uint32_t mnlo = 0, mnhi = 0, mxlo = 0, mxhi = 0;
+            if (!r.u32(mnlo) || !r.u32(mnhi) || !r.u32(mxlo) || !r.u32(mxhi))
+                return false;
+            e.minMemberSize = ((uint64_t)mnhi << 32) | mnlo;
+            e.maxMemberSize = ((uint64_t)mxhi << 32) | mxlo;
+            e.hasMemberSizes = true;
+        }
     }
     return true;
 }
@@ -556,7 +569,7 @@ bool parseListPayload(const std::vector<uint8_t>& payload, int peerVersion,
             }
             e.dir = d != 0;
             e.size = ((uint64_t)hi << 32) | lo;
-        } else if (!parseEntryV3(r, e)) {
+        } else if (!parseEntryV3(r, e, peerVersion)) {
             err = "bad LIST reply";
             return false;
         }
@@ -571,7 +584,7 @@ bool Session::list(const std::string& path, std::vector<Entry>& out, std::string
     uint32_t type = 0;
     if (!send(rp::MSG_LIST, w.b, err) || !recv(type, reply, err)) return false;
     if (type != rp::MSG_OK) { R r(reply); r.str(err); return false; }
-    return parseListPayload(reply, peerVersion_, out, err);
+    return parseListPayload(reply, effectiveVersion(), out, err);
 }
 
 bool Session::scan(const std::string& root, int depth, int maxGroups,
@@ -601,7 +614,7 @@ bool Session::scan(const std::string& root, int depth, int maxGroups,
     out.clear();
     for (uint32_t i = 0; i < n; i++) {
         ScanGroup g;
-        if (!r.str(g.dir) || !parseEntryV3(r, g.entry)) {
+        if (!r.str(g.dir) || !parseEntryV3(r, g.entry, effectiveVersion())) {
             err = "bad SCAN reply";
             return false;
         }
@@ -713,7 +726,12 @@ bool Session::recipeServable(const std::string& path, const rp::RawWire* rw,
     const size_t slash = path.find_last_of("/\\");
     const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
     if (peerVersion_ < 11) { err = rp::rawTooOldText(peerVersion_, name); return false; }
-    if (!rw) { err = imagefile::peerRefusal(path); return false; }
+    // ...and THIS BUILD's half. RefusedBy::Client, explicitly: what is left
+    // here after every interactive door learned to ask (openRemoteRawDeclared)
+    // is the scripted roads - the command line, a session line with no
+    // geometry, a selftest - so the way out this sentence names is --raw-*
+    // and the doors that bind a recipe for this session.
+    if (!rw) { err = imagefile::peerRefusal(path, imagefile::RefusedBy::Client); return false; }
     return true;
 }
 
@@ -765,9 +783,18 @@ bool Session::npzServable(const std::string& path, std::string& err) const {
 // The optional blocks behind the reading, written the way the peer reads them
 // (rp::ReqTrailer). One place, because meta() and tile() have to agree byte for
 // byte about where a recipe stops and a key begins.
-static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
+//
+// `version` IS effectiveVersion, and both callers pass it (review P2-2). The
+// peer's getTrailers gates on `servedVersion() >= 12 && g_clientVersion >= 12`
+// - the MINIMUM of the two numbers - so a client that announced 11 to a v16
+// peer and gated on peerVersion_ alone wrote the v12 flags word while the peer
+// took its v11 "the bytes that remain are a recipe" branch and read the flags
+// word as the first four bytes of a RawWire. That is not a missing feature; it
+// is a request decoded from the wrong offset, which here means a picture of
+// the wrong geometry or "truncated raw recipe" for a perfectly good file.
+static void putTrailers(W& w, int version, const rp::RawWire* rw,
                         const remote::KeyedRef* rd) {
-    if (peerVersion >= 12) {
+    if (version >= 12) {
         uint32_t f = 0;
         if (rw) f |= rp::RQ_RAW_RECIPE;
         if (rd) f |= rp::RQ_KEYED;
@@ -778,7 +805,7 @@ static void putTrailers(W& w, int peerVersion, const rp::RawWire* rw,
     }
     // Protocol 11 and below: one optional block, read by "if bytes remain".
     // A KeyedRef never reaches here - keyedServable refused first.
-    if (rw && peerVersion >= 11) w.blob(rw, sizeof *rw);
+    if (rw && version >= 11) w.blob(rw, sizeof *rw);
 }
 
 // What a request is ABOUT, at the door. A reader's node is not a file, so the
@@ -795,7 +822,7 @@ bool Session::meta(const std::string& path, Meta& out, std::string& err, int rea
     }
     W w; w.str(rd ? std::string() : serverPath(path));
     if (peerVersion_ >= 9) w.u32((uint32_t)read);
-    putTrailers(w, peerVersion_, rw, rd);
+    putTrailers(w, effectiveVersion(), rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_META, w.b, err) || !recv(type, reply, err)) return false;
@@ -909,7 +936,7 @@ bool Session::tileBytes(const std::string& path, int frame, int x, int y, int w,
     // Appended after the reading, in the order handleTile reads them. A peer
     // below 11 never gets a recipe and one below 12 never gets a reader key -
     // the gates above refused first, so the older wire does not move by a byte.
-    putTrailers(wr, peerVersion_, rw, rd);
+    putTrailers(wr, effectiveVersion(), rw, rd);
     std::vector<uint8_t> reply;
     uint32_t type = 0;
     if (!send(rp::MSG_TILE, wr.b, err) || !recv(type, reply, err)) return false;
@@ -1170,7 +1197,14 @@ bool Session::measure(const MeasureReq& q, MeasureResult& out, std::string& err)
     if (q.hasKeyed) {
         w.str(q.keyed.key);
         w.u32((uint32_t)std::max(0, q.keyed.node));
-        if (peerVersion_ >= 15) w.u32((uint32_t)q.keyedRead);
+        // effectiveVersion, not peerVersion_ (review P2-2): the PEER reads this
+        // field only when the client ANNOUNCED 15 or better (serve.cpp's
+        // `servedVersion() >= 15 && g_clientVersion >= 15`), so writing it on
+        // the peer's number alone can put four bytes on the wire that the peer
+        // will not consume - and everything after them is then parsed from the
+        // wrong offset. The same asymmetry the LIST member sizes had, in the
+        // request direction.
+        if (effectiveVersion() >= 15) w.u32((uint32_t)q.keyedRead);
     }
     // the parity block, last, so that the three older ops send the same bytes
     // they always sent (remote_proto.h)

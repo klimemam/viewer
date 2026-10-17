@@ -26,6 +26,13 @@ static void drawRawModal() {
     if (rawDlg.forQueue)
         ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
                            "these settings apply to all %d queued stack(s)", rawDlg.queueCount);
+    // ...and the same warning for a folder on a peer. The count is the frames,
+    // not the stacks: one remote group row is one stack, and what the operator
+    // needs to know is how many files this one answer decodes.
+    if (rawDlg.forRemoteStack)
+        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
+                           "these settings apply to all %d frame(s) of this stack",
+                           (int)app.remoteRawStack.files.size());
     // The library, at the moment it is useful (#166). It fills the fields in and
     // stops there: Load is where the choice is made, so a mis-click is one
     // combo away from being undone and nothing has been decoded yet.
@@ -120,6 +127,10 @@ static void drawRawModal() {
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120 * app.uiScale, 0))) {
         rawDlg.replaceIdx = -1;
+        // A parked REMOTE folder, dropped - and said, for the reason the local
+        // queue's Cancel says it: a folder's worth of frames vanishing without
+        // a word is not something to do.
+        if (rawDlg.forRemoteStack) { rawDlg.forRemoteStack = false; dropRemoteRawStack(); }
         if (rawDlg.forQueue) {
             rawDlg.forQueue = false;
             // Only the Open that ASKED. A blanket clear threw away the stacks a
@@ -145,6 +156,18 @@ static void drawRawModal() {
         // the same code the button does.
         std::string err = rawDialogAccept(rawDlg);
         if (!err.empty()) toast(err, true);
+        else if (rawDlg.forRemoteStack) {
+            // The head frame is open (rawDialogAccept put it there, over the
+            // link, with these settings) and the byte count is bound for this
+            // session. What is left is the members, and resumeRemoteRawStack
+            // hands them to the SAME attachRemoteStack the bound path uses - so
+            // the note, the batch, the memory budget and the sibling rule are
+            // one implementation whether the recipe was asked for or remembered.
+            rawDlg.forRemoteStack = false;
+            rawDlg.open = false;
+            resumeRemoteRawStack();
+            ImGui::CloseCurrentPopup();
+        }
         else if (rawDlg.forQueue) {
             // first frame of the first queued stack: reuse these settings for the rest
             g_folderRecipe = rawDlg;

@@ -598,6 +598,32 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
             }
             if (!doc) {
                 if (isRaw) {
+                    // NO BYTE-COUNT CHECK HERE, and the gate below cannot
+                    // stand in for one. Precisely: decodeRawFrame refuses a
+                    // member TOO SMALL for the recipe (offset + W*H*ch*elem
+                    // past its end), so the hole is not every wrong length -
+                    // it is every wrong length that is still BIG ENOUGH. Such
+                    // a member decodes at the recipe's dimensions, which are
+                    // the reference frame's dimensions, so stackShapeRefusal
+                    // compares two identical shapes, agrees, and the member
+                    // joins as a plausible picture of another file's first
+                    // W*H*ch samples. `silent` is exactly that shape:
+                    // 108/112/104 under an 8x6 u16 recipe at offset 0 needs
+                    // 96, so all three clear the size bar and two of them are
+                    // misread. An earlier version of this paragraph said
+                    // "whatever its length is", which claimed a wider hole
+                    // than exists and contradicted itself two lines down.
+                    // The REMOTE door asks the question first
+                    // (remoteRawSameSize in open_dispatch.inc, which explains
+                    // at length why it has to); this one never has.
+                    //
+                    // PR #278 scoped itself to the link and left this open
+                    // deliberately rather than quietly: the board carries a
+                    // row, beside the one about local --raw-size alone being
+                    // ignored, and the design doc names it in §12.1. What
+                    // closing it needs is a stat per member before the first
+                    // decode - cheap on a local disk - plus a refusal that
+                    // quotes both numbers, as the remote one does.
                     RawDialog d = recipe;
                     d.path = j.path;
                     doc = decodeRawFrame(d, err);
