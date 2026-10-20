@@ -108,11 +108,18 @@ static size_t slotInkCount() { return 7; }
 // the legend actually takes and adding a slot never moves the plot out from
 // under the cursor.
 struct SlotLegendEntry { std::string text; ImU32 ink; };
-static float slotLegendRow(const std::vector<SlotLegendEntry>& e, bool draw) {
+// `width` is the row's width when it is measured BEFORE the pane it will be
+// drawn in exists: the projection sizes its side-by-side panes around this
+// row, and a legend measured at the panel's full width wraps at a different
+// place than the same legend drawn in a pane a third as wide. 0 = the current
+// content width, which is right whenever the row is drawn where it is measured.
+static float slotLegendRow(const std::vector<SlotLegendEntry>& e, bool draw,
+                           float width = 0.0f) {
     if (e.empty()) return 0.0f;
     const float sw = abLegendSw(), gap = abLegendGap(), sep = 18 * app.uiScale;
     const float fh = ImGui::GetFontSize(), adv = ImGui::GetTextLineHeightWithSpacing();
-    const float availW = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
+    const float availW = width > 0.0f ? width
+                                      : std::max(ImGui::GetContentRegionAvail().x, 1.0f);
     ImDrawList* dl = draw ? ImGui::GetWindowDrawList() : nullptr;
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const ImU32 txt = IM_COL32(215, 222, 228, 255);
@@ -138,12 +145,15 @@ static float slotLegendRow(const std::vector<SlotLegendEntry>& e, bool draw) {
 
 // The heading strip over one half of a side-by-side pair. Neutral colour: which
 // side you are looking at is the message, not which channel.
+// The height drawABBand consumes (strip plus the 2*s it leaves under it), so a
+// layout that sizes a pane around the band budgets what the band takes.
+static float abBandH() { return ImGui::GetTextLineHeight() + 6 * app.uiScale; }
 static void drawABBand(const char* side, const std::string& name, bool stale = false) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float s = app.uiScale;
     ImVec2 p = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    float h = ImGui::GetTextLineHeight() + 4 * s;
+    float h = abBandH() - 2 * s;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(52, 58, 66, 255), 3 * s);
     std::string t = std::string(side) + "   " + elideFront(name, 34);
     dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);

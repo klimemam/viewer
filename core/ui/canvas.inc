@@ -1870,8 +1870,12 @@ static PlotSpread plotSpreadIn(const std::vector<float>& xs, const std::vector<f
 }
 // ...and the sentence it owes the reader. Under the plot, in the plot's own
 // units, naming the window - because the number moves when the window does.
-static void plotSpreadLine(const PlotSpread& s, const char* what) {
-    if (!s.ok) return;
+// The sentence and the printing are two functions so that a panel which has
+// to RECORD what it printed (the projection's spread probe, which pins whose
+// numbers each pane prints) prints the very string it records, with no second
+// spelling of the sentence. Empty when there is no spread to speak of.
+static std::string plotSpreadText(const PlotSpread& s, const char* what) {
+    if (!s.ok) return std::string();
     char b[224];
     if (s.hasPct)
         snprintf(b, sizeof b, "%s in view [%.6g .. %.6g]: p-p %.4g (%.4g%% of mean %.6g), "
@@ -1881,7 +1885,11 @@ static void plotSpreadLine(const PlotSpread& s, const char* what) {
         snprintf(b, sizeof b, "%s in view [%.6g .. %.6g]: p-p %.4g (no positive mean to "
                               "take a ratio against), %d point(s)",
                  what, (double)s.x0, (double)s.x1, s.pp, s.n);
-    ImGui::TextDisabled("%s", b);
+    return b;
+}
+static void plotSpreadLine(const PlotSpread& s, const char* what) {
+    if (!s.ok) return;
+    ImGui::TextDisabled("%s", plotSpreadText(s, what).c_str());
 }
 
 // A drag rectangle in screen space -> the data ranges it spans. Pure, so the
@@ -2060,6 +2068,13 @@ static void fmtTick(char* buf, size_t n, double v, bool integer) {
 }
 
 // xLabel / yLabel must carry the quantity and its unit, e.g. "frequency (cycles/px)"
+// What beginPlot adds above and below the plot body: the y axis title on top,
+// the x tick labels and x axis title underneath. Named so that a layout which
+// sizes a fixed-height pane around a plot (the projection's side-by-side
+// panes) budgets exactly what the plot will consume, rather than carrying a
+// second spelling of these two sums.
+static float plotMarginT() { return ImGui::GetFontSize() + 4 * app.uiScale; }
+static float plotMarginB() { return ImGui::GetFontSize() * 2 + 6 * app.uiScale; }
 static PlotRect beginPlot(const char* xLabel, const char* yLabel,
                           float xmin, float xmax, float ymin, float ymax,
                           bool xInt, bool yInt, float height) {
@@ -2082,8 +2097,8 @@ static PlotRect beginPlot(const char* xLabel, const char* yLabel,
         wy = std::max(wy, ImGui::CalcTextSize(tb).x);
     }
     const float marginL = wy + 9 * s;   // 5*s tick gap + breathing room
-    const float marginB = fh * 2 + 6 * s;          // x tick labels + x axis title
-    const float marginT = fh + 4 * s;              // y axis title sits on top
+    const float marginB = plotMarginB();           // x tick labels + x axis title
+    const float marginT = plotMarginT();           // y axis title sits on top
 
     float wid = ImGui::GetContentRegionAvail().x;
     ImVec2 org = ImGui::GetCursorScreenPos();

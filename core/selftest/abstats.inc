@@ -2626,9 +2626,9 @@
                 // VISIBLE x range. That range is column numbers while the profile is
                 // indexed from 0, so at an ROI origin of 1000 every sample fell outside
                 // the window and the line said nothing at all.
-                check(field(g_projSideProbe, "spreadH=") == "4",
+                check(field(g_projSideProbe, "spreadH@A=") == "4",
                       "C6 all four planes get a spread line under the H plot");
-                check(field(g_projSideProbe, "spreadV=") == "4",
+                check(field(g_projSideProbe, "spreadV@A=") == "4",
                       "C6 ...and under the V plot");
 
                 roi(1001);
@@ -2963,7 +2963,7 @@
                 dump("C10 RGB 16x16 with the pooled row on");
                 check(app.proj[0].nSeries == 3 && app.proj[0].allRow,
                       "C10 fixture: three channels plus the pooled row");
-                check(field(g_projSideProbe, "spreadH=") == "4",
+                check(field(g_projSideProbe, "spreadH@A=") == "4",
                       "C10 four spread lines: the three channels AND the pooled row");
                 check(g_projCurveProbe.size() == 6,
                       "C10 ...while the pooled row is still not a CURVE: three planes, two axes");
@@ -3140,8 +3140,8 @@
                       "C16 the pooled PROFILE is not built on a mosaic");
                 check(PP.nFill == 4,
                       "C16 ...so the walk that draws p-p lines never reaches it");
-                check(field(g_projSideProbe, "spreadH=") == "4" &&
-                      field(g_projSideProbe, "spreadV=") == "4",
+                check(field(g_projSideProbe, "spreadH@A=") == "4" &&
+                      field(g_projSideProbe, "spreadV@A=") == "4",
                       "C16 four p-p lines under each plot - the planes, and not 'all'");
                 check(!PP.hStat[4].valid && !PP.vStat[4].valid,
                       "C16 no axis-direction statistics either: unavailable: pooled planes");
@@ -3161,7 +3161,7 @@
                       "C16 a non-mosaic pooled row DOES get a profile");
                 check(app.proj[0].hStat[4].valid && app.proj[0].vStat[4].valid,
                       "C16 ...and keeps its profile sigma");
-                check(field(g_projSideProbe, "spreadH=") == "4",
+                check(field(g_projSideProbe, "spreadH@A=") == "4",
                       "C16 ...and its p-p line: three channels plus 'all'");
                 app.projAllRow = false;
             }
@@ -3306,33 +3306,33 @@
                 useOnly(mkFrame("pc_reserve", 16, 16, 1, 1));       // a mosaic: four
                 app.projAllRow = false;
                 draw();
-                fprintf(stderr, "abstatsselftest: C20 mosaic pprows=%s spreadH=%s "
+                fprintf(stderr, "abstatsselftest: C20 mosaic pprows=%s spreadH@A=%s "
                                 "(plot %.1f px)\n",
                         field(g_projSideProbe, "pprows=").c_str(),
-                        field(g_projSideProbe, "spreadH=").c_str(),
+                        field(g_projSideProbe, "spreadH@A=").c_str(),
                         curve("R", true) ? curve("R", true)->py1 - curve("R", true)->py0 : 0.0f);
                 check(field(g_projSideProbe, "pprows=") == "4" &&
-                      field(g_projSideProbe, "spreadH=") == "4",
+                      field(g_projSideProbe, "spreadH@A=") == "4",
                       "C20 a mosaic reserves four p-p rows and draws four");
                 useOnly(mkFrame("pc_reserve_rgb", 16, 16, 0, 3));   // three + pooled
                 app.projAllRow = true;
                 draw();
-                fprintf(stderr, "abstatsselftest: C20 RGB+all pprows=%s spreadH=%s\n",
+                fprintf(stderr, "abstatsselftest: C20 RGB+all pprows=%s spreadH@A=%s\n",
                         field(g_projSideProbe, "pprows=").c_str(),
-                        field(g_projSideProbe, "spreadH=").c_str());
+                        field(g_projSideProbe, "spreadH@A=").c_str());
                 check(field(g_projSideProbe, "pprows=") == "4" &&
-                      field(g_projSideProbe, "spreadH=") == "4",
+                      field(g_projSideProbe, "spreadH@A=") == "4",
                       "C20 ...and three channels plus the pooled row reserve four too");
                 // ANTI-VACUOUS: a single plane reserves ONE, so "4" above is not
                 // a constant the panel always prints.
                 app.projAllRow = false;
                 useOnly(mkFrame("pc_reserve_mono", 16, 16, 0, 1));
                 draw();
-                fprintf(stderr, "abstatsselftest: C20 mono pprows=%s spreadH=%s\n",
+                fprintf(stderr, "abstatsselftest: C20 mono pprows=%s spreadH@A=%s\n",
                         field(g_projSideProbe, "pprows=").c_str(),
-                        field(g_projSideProbe, "spreadH=").c_str());
+                        field(g_projSideProbe, "spreadH@A=").c_str());
                 check(field(g_projSideProbe, "pprows=") == "1" &&
-                      field(g_projSideProbe, "spreadH=") == "1",
+                      field(g_projSideProbe, "spreadH@A=") == "1",
                       "C20 one plane reserves one - the budget follows the series count");
             }
 
@@ -4043,6 +4043,206 @@
                 app.projExtra.clear();
                 app.compareMode = App::CmpOff;
                 setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C31 - EVERY PANE PRINTS ITS OWN SIDE'S p-p LINES, AND THE PANES
+            // START LEVEL (#286). The spread block ran for pane A only and read
+            // A's profiles ("no room for a letter - the table below is where
+            // every side's numbers are"), so side by side B's pane printed
+            // nothing, A's V plot started four lines lower than B's, and the
+            // pane height, which budgeted no lines at all, clipped A's tail.
+            // The asserts that covered the lines read "spreadH=" by its FIRST
+            // occurrence - field() finds the key and reads to the ';' - which
+            // was A's, so B's zero was never looked at. The key now carries the
+            // side, and the old key finds nothing.
+            //
+            // Three fixtures. Two mosaics side by side - the report's case:
+            // four lines each, B's numbers under B, level. A mosaic beside a
+            // mono frame: four against one, a legend row against none, and
+            // STILL level, because every pane pads to the one budget. The two
+            // mosaics overlaid: both sides' lines under the one plot, each
+            // named with its letter, and the numbers are the ones the panes
+            // printed - the layout chooses where a number is said, not what it
+            // is.
+            // ======================================================================
+            {
+                app.images.clear();
+                app.images.push_back(mkFrame("pc_sp_A", 16, 16, 1, 1));   // mosaic
+                app.images.push_back(mkFrame("pc_sp_B", 16, 16, 1, 1));   // mosaic
+                app.images.push_back(mkFrame("pc_sp_M", 16, 16, 0, 1));   // mono
+                // B at twice A's level: its p-p is then twice A's, so a line
+                // under B's pane is B's by its number, not by its position
+                {
+                    ImageDoc& B = *app.images[1];
+                    for (float& v : B.px()) v *= 2.0f;
+                    computeMinMax(B);
+                }
+                app.current = 0;
+                app.cmpExtra.clear();
+                app.projExtra.clear();
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                // A side's own answer, from the side's own state, as the text
+                // the panel prints for it - plotSpreadText is the one spelling
+                // of that sentence. The first filled slot: R on a mosaic, ch0
+                // on a mono frame. The window is the plot's axis, 0..15.
+                auto ownLine = [&](const App::ProjState& S, bool horiz, const char* what) {
+                    const int sl = S.nFill > 0 ? S.fill[0] : 0;
+                    PlotSpread sp = plotSpreadIn({}, horiz ? S.h[sl] : S.v[sl], 0.0f, 15.0f);
+                    sp.x0 = 0.0f; sp.x1 = 15.0f;
+                    return plotSpreadText(sp, what);
+                };
+                // the spread probe's lines for one axis of one side ("H@B "),
+                // in print order, with that prefix taken off
+                auto spreadOf = [&](const char* axisSide) {
+                    std::vector<std::string> out;
+                    std::string one;
+                    auto flush = [&]() {
+                        if (one.rfind(axisSide, 0) == 0)
+                            out.push_back(one.substr(strlen(axisSide)));
+                        one.clear();
+                    };
+                    for (char ch : g_projSpreadProbe) { if (ch == '|') flush(); else one += ch; }
+                    if (!one.empty()) flush();
+                    return out;
+                };
+                // the V plot's top edge in one side's pane, from the paint
+                auto vTop = [&](const char* sd) -> float {
+                    for (const auto& c : g_projCurveProbe)
+                        if (c.side == sd && !c.horizontal) return c.py0;
+                    return -1.0f;
+                };
+                auto fnum = [&](const char* key) -> float {
+                    const std::string v = field(g_projSideProbe, key);
+                    return v.empty() ? -1.0f : (float)atof(v.c_str());
+                };
+                // two panes need 2 * AB_MIN_SIDE * uiScale of window (C30)
+                const float wide2 = (AB_MIN_SIDE * 2 + 200.0f) * app.uiScale;
+                const float lineH = ImGui::GetTextLineHeightWithSpacing();
+
+                // (a) two mosaics, one pane each
+                setCompareB(app.images[1].get());
+                app.abStatsLayout = App::AbSide;
+                projFrame(wide2, 900.0f * app.uiScale, NO_MOUSE);
+                dump("C31 two mosaics side by side");
+                fprintf(stderr, "abstatsselftest: C31 spread '%s'\n",
+                        g_projSpreadProbe.c_str());
+                check(field(g_projSideProbe, "layout=") == "side" &&
+                      field(g_projSideProbe, "curves=") == "AB" &&
+                      app.proj[0].nFill == 4 && app.proj[1].nFill == 4,
+                      "C31 fixture: two mosaics, one pane each, four planes a side");
+                check(field(g_projSideProbe, "spreadH@A=") == "4" &&
+                      field(g_projSideProbe, "spreadH@B=") == "4",
+                      "C31 B's pane prints B's four H lines - it printed none");
+                check(field(g_projSideProbe, "spreadV@A=") == "4" &&
+                      field(g_projSideProbe, "spreadV@B=") == "4",
+                      "C31 ...and its four V lines");
+                check(field(g_projSideProbe, "spreadH=").empty() &&
+                      field(g_projSideProbe, "spreadV=").empty(),
+                      "C31 the un-sided key is gone: a reader of it found A's count and stopped");
+                std::string lineB_R;   // B's R line as B's pane printed it
+                {
+                    const std::vector<std::string> hA = spreadOf("H@A "), hB = spreadOf("H@B ");
+                    check(hA.size() == 4 && hB.size() == 4,
+                          "C31 the probe holds four H lines under each pane");
+                    check(hA.size() == 4 && hA[0] == ownLine(app.proj[0], true, "R"),
+                          "C31 pane A's R line is A's R, named without a letter - the band has it");
+                    check(hB.size() == 4 && hB[0] == ownLine(app.proj[1], true, "R"),
+                          "C31 pane B's R line is B's R - B's numbers, under B");
+                    check(hA.size() == 4 && hB.size() == 4 && hA[0] != hB[0],
+                          "C31 ANTI-VACUOUS: B's level is twice A's, so the two lines differ");
+                    if (hB.size() == 4) lineB_R = hB[0];
+                }
+                check(vTop("A") > 0 && fabsf(vTop("A") - vTop("B")) < 0.5f,
+                      "C31 the V plot starts at the same y in both panes");
+                {
+                    const float paneH = fnum("paneH="), uA = fnum("paneUsed@A="),
+                                uB = fnum("paneUsed@B=");
+                    fprintf(stderr, "abstatsselftest: C31 pane %.1f holds A %.1f B %.1f\n",
+                            paneH, uA, uB);
+                    check(paneH > 0 && uA > 0 && uA <= paneH + 0.5f && uB <= paneH + 0.5f,
+                          "C31 what a pane holds fits the height it was given - nothing is clipped");
+                    check(uA > paneH - lineH,
+                          "C31 ...and the height IS what it holds, to under a line - not a guess");
+                    check(fabsf(uA - uB) < 0.5f,
+                          "C31 ...and the two panes hold the same height");
+                }
+                check(field(g_projSideProbe, "pprows=") == "4",
+                      "C31 side by side reserves the larger side's count - four, not eight");
+
+                // (b) a mosaic beside a mono frame: four lines against one
+                setCompareB(app.images[2].get());
+                app.abStepBusyUntil = 0;
+                app.proj[1] = App::ProjState{};
+                projFrame(wide2, 900.0f * app.uiScale, NO_MOUSE);
+                dump("C31 mosaic beside mono");
+                fprintf(stderr, "abstatsselftest: C31 mixed spread '%s'\n",
+                        g_projSpreadProbe.c_str());
+                check(field(g_projSideProbe, "layout=") == "side" &&
+                      app.proj[0].nFill == 4 && app.proj[1].nFill == 1,
+                      "C31 fixture: a mosaic beside a mono frame, four planes against one");
+                check(field(g_projSideProbe, "spreadH@A=") == "4" &&
+                      field(g_projSideProbe, "spreadH@B=") == "1",
+                      "C31 each pane prints its own side's count: four, and one");
+                check(field(g_projSideProbe, "pprows=") == "4",
+                      "C31 ...reserving the larger");
+                {
+                    const std::vector<std::string> hB = spreadOf("H@B ");
+                    check(hB.size() == 1 && hB[0] == ownLine(app.proj[1], true, "ch0"),
+                          "C31 the mono pane's one line is the mono side's ch0");
+                }
+                check(vTop("A") > 0 && fabsf(vTop("A") - vTop("B")) < 0.5f,
+                      "C31 the V plot STILL starts level - the mono pane pads a row and three lines");
+                {
+                    const float paneH = fnum("paneH="), uA = fnum("paneUsed@A="),
+                                uB = fnum("paneUsed@B=");
+                    fprintf(stderr, "abstatsselftest: C31 mixed pane %.1f holds A %.1f B %.1f\n",
+                            paneH, uA, uB);
+                    check(paneH > 0 && uA <= paneH + 0.5f && uB <= paneH + 0.5f &&
+                          uA > paneH - lineH && fabsf(uA - uB) < 0.5f,
+                          "C31 ...and both panes fit, at one height");
+                }
+                app.abStatsLayout = App::AbOverlay;
+
+                // (c) the two mosaics overlaid: both sides speak under the one plot
+                setCompareB(app.images[1].get());
+                app.abStepBusyUntil = 0;
+                app.proj[1] = App::ProjState{};
+                draw();
+                dump("C31 two mosaics overlaid");
+                fprintf(stderr, "abstatsselftest: C31 overlay spread '%s'\n",
+                        g_projSpreadProbe.c_str());
+                check(field(g_projSideProbe, "layout=") == "overlay" &&
+                      field(g_projSideProbe, "curves=") == "AB",
+                      "C31 fixture: the same two mosaics on one axis");
+                check(field(g_projSideProbe, "spreadH@A=") == "4" &&
+                      field(g_projSideProbe, "spreadH@B=") == "4" &&
+                      field(g_projSideProbe, "pprows=") == "8",
+                      "C31 overlaid, both sides' lines are under the plot and all eight are reserved");
+                {
+                    const std::vector<std::string> hA = spreadOf("H@A "), hB = spreadOf("H@B ");
+                    check(hA.size() == 4 && hA[0].rfind("R@A in view", 0) == 0,
+                          "C31 overlaid, A's line carries its letter: R@A");
+                    check(hB.size() == 4 && hB[0].rfind("R@B in view", 0) == 0,
+                          "C31 ...and B's: R@B - the no-curve clause's spelling");
+                    check(hB.size() == 4 && !lineB_R.empty() &&
+                          hB[0].substr(3) == lineB_R.substr(1),
+                          "C31 B's numbers overlaid are B's numbers side by side - the layout moves no digit");
+                }
+                // ANTI-VACUOUS: alone, the line is the plane's name and no letter
+                setCompareB(nullptr);
+                app.compareMode = App::CmpOff;
+                app.proj[1] = App::ProjState{};
+                draw();
+                {
+                    const std::vector<std::string> hA = spreadOf("H@A ");
+                    check(hA.size() == 4 && hA[0].rfind("R in view", 0) == 0,
+                          "C31 one side alone names the plane and nothing else");
+                }
                 app.proj[1] = App::ProjState{};
             }
 

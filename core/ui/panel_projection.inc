@@ -60,6 +60,12 @@ static std::string g_projUnavailProbe;
 // letters say WHICH plane was left off and the sentence says why, and the why
 // is the part that was making claims about the sensor that were not true.
 static std::string g_projNoCurveProbe;
+// ...and the p-p ("in view") lines, as PRINTED, in print order, joined by '|'
+// and each prefixed with its axis and the side it is about ("H@B R in view [0
+// .. 15]: p-p 28 ..."). They used to be A's lines whichever pane they were
+// under, and absent from every other pane (#286): the count alone cannot say
+// WHOSE numbers a pane printed, and the sentence can.
+static std::string g_projSpreadProbe;
 // ...the pooled-row footnote, which has to name every side it is about, and the
 // x axis titles, which have to name the side whose grid they are warning about.
 // Both were sentences standing on A alone.
@@ -219,6 +225,7 @@ static void drawPanelProjection() {
     g_projHoverProbe.clear();
     g_projUnavailProbe.clear();
     g_projNoCurveProbe.clear();
+    g_projSpreadProbe.clear();
     g_projFootProbe.clear();
     g_projXAxisProbe.clear();
     g_projYAxisProbe.clear();
@@ -684,18 +691,33 @@ static void drawPanelProjection() {
         std::vector<size_t> everySide;
         for (size_t i = 0; i < nPlot; i++) everySide.push_back(i);
         const std::vector<SlotLegendEntry> pl0 = planeLegend(everySide, nPlot > 1);
-        if (!pl0.empty()) legendH += slotLegendRow(pl0, false);
+        // ...measured at the width it will be DRAWN at. Side by side that is a
+        // pane, a fraction of the panel, and a row that fits the panel on one
+        // line can need two in the pane; the pane is sized to this number, so
+        // it has to be the pane's (#286).
+        if (!pl0.empty()) legendH += slotLegendRow(pl0, false, side ? paneW : 0.0f);
     }
     float avail = ImGui::GetContentRegionAvail().y - statsH - legendH * plots;
-    if (side) avail -= (ImGui::GetTextLineHeight() + 6 * app.uiScale);   // heading band
+    if (side) avail -= abBandH();                                      // heading band
     // One p-p ("in view") line PER SERIES under each plot, not one line per
     // plot: a mosaic draws four, a 3-channel frame with the pooled row draws
     // four as well, and the budget of one pushed the statistics table below the
-    // visible panel exactly where the numbers are read. P.nFill is how many the
-    // spread loop will draw - the slots that got a PROFILE - so the two cannot
-    // drift, and on a mosaic that correctly excludes the pooled row, which has
-    // no profile to take a p-p of.
-    const int ppRows = std::max(1, P.nFill);
+    // visible panel exactly where the numbers are read. nFill is how many the
+    // spread loop will draw for a side - the slots that got a PROFILE - so the
+    // two cannot drift, and on a mosaic that correctly excludes the pooled row,
+    // which has no profile to take a p-p of.
+    //
+    // ...and PER SIDE, because every side prints its own lines (#286). This
+    // was A's count, and A's lines were the only ones printed - under A's pane
+    // alone, side by side. Side by side the reservation is the LARGEST side's:
+    // the panes share one height and each pads its spread block up to this, so
+    // the plot under it starts at the same y in every pane (onePlot). Overlaid
+    // it is the SUM over the sides the plot carries, which all speak under the
+    // one plot.
+    int ppRows = 0;
+    for (size_t i = 0; i < nPlot; i++)
+        ppRows = side ? std::max(ppRows, sides[i].S->nFill) : ppRows + sides[i].S->nFill;
+    ppRows = std::max(1, ppRows);
     float each = std::max((avail - lineH * (float)ppRows * plots) / plots
                           - (ImGui::GetFontSize() * 3 + 12 * app.uiScale), 60.0f * app.uiScale);
 
@@ -1243,6 +1265,7 @@ static void drawPanelProjection() {
         // ...and WHICH HUE IS WHICH PLANE. Four planes were overlaid in four
         // hues with nothing naming them: Gr and Gb are two greens, and this is
         // the panel whose purpose with a mosaic is to compare the planes.
+        float legendDrewH = 0.0f;   // ...and how tall it was, for the pad below
         {
             const std::vector<SlotLegendEntry> pl = planeLegend(which, overlaid);
             if (!pl.empty()) {
@@ -1253,7 +1276,7 @@ static void drawPanelProjection() {
                 }
                 g_projSideProbe += std::string(horizontal ? "planelegH=" : "planelegV=") +
                                    names + ";";
-                slotLegendRow(pl, true);
+                legendDrewH = slotLegendRow(pl, true);
             }
         }
         // How flat is what I am looking at? Per SERIES, because the canon
@@ -1261,12 +1284,29 @@ static void drawPanelProjection() {
         // mosaic have four answers and one pooled number would be the
         // inter-plane level difference wearing the profile's name. Over the
         // VISIBLE x range, and it says so: the number moves when the window
-        // does, so the window is part of the statement. A's, because the spread
-        // lines have no room for a letter - the table below is where every
-        // side's numbers are.
-        if (!which.empty() && which[0] == 0) {
-            const std::vector<float>* srcs = horizontal ? P.h : P.v;
-            const int origin0 = horizontal ? P.rx : P.ry;
+        // does, so the window is part of the statement.
+        //
+        // PER SIDE, of the sides THIS PLOT carries (#286). This ran for pane A
+        // only and read A's profiles, on the grounds that a spread line had no
+        // room for a letter and the table below held every side's numbers.
+        // Neither held. Side by side onePlot runs once per pane, so B's and
+        // C's panes printed nothing and A's V plot started four lines lower
+        // than theirs - the layout defect the report is about - and the
+        // table's p-p is over the whole ROI while this one is over the visible
+        // window, so a zoomed B had its window p-p nowhere on the panel. The
+        // letter goes where this file already puts it for the same ambiguity -
+        // "R@B", the no-curve clause's spelling - and only when sides share
+        // the plot: side by side the pane's band names the side, so the line
+        // carries the plane alone.
+        //
+        // The operands are the SIDE'S: its profiles, its ROI origin (the ROI is
+        // clamped into each side's own frame, so B's rx need not be A's), its
+        // fill list and its series names.
+        int nSpreadPane = 0;   // every side's lines under this plot, for the pad
+        for (size_t si : which) {
+            const App::ProjState& S = *sides[si].S;
+            const std::vector<float>* srcs = horizontal ? S.h : S.v;
+            const int origin0 = horizontal ? S.rx : S.ry;
             // BY SLOT, never by count. The pooled row is slot 4 whatever
             // nSeries is - that is the whole point of it not being a fifth
             // plane - so `k < nSeries + allRow` read slot 3 on a 3-plane RGB
@@ -1278,30 +1318,57 @@ static void drawPanelProjection() {
             // why the list it built is now in the state and walked from here
             // (ProjState::fill) rather than re-derived.
             int nSpread = 0;
-            for (int k = 0; k < P.nFill && k < 5; k++) {
-                const int sl = P.fill[k];
+            for (int k = 0; k < S.nFill && k < 5; k++) {
+                const int sl = S.fill[k];
                 // ...and the window in the PROFILE'S OWN index space. pr.xmin
                 // is a column number - rx..rx+rw-1 under an ROI - while the
                 // series is indexed from 0, so an ROI at x=1000 put every
                 // sample outside the window and the line said NOTHING. It
                 // failed silently, because a PlotSpread that is not ok draws
-                // nothing: measured spreadH=0 against spreadV=4 on the same
-                // frame, the V axis being at origin 0 and therefore accidentally
-                // right. (Not an xs vector: that is one allocation per series
-                // per plot per frame for a window this maps exactly.)
+                // nothing: the probe measured no H line against four V lines
+                // on the same frame, the V axis being at origin 0 and therefore
+                // accidentally right. (Not an xs vector: that is one allocation
+                // per series per plot per frame for a window this maps exactly.)
                 PlotSpread sp = plotSpreadIn({}, srcs[sl], pr.xmin - (float)origin0,
                                              pr.xmax - (float)origin0);
                 if (!sp.ok) continue;
                 sp.x0 = pr.xmin; sp.x1 = pr.xmax;   // ...spoken as the plot's axis
-                const char* nm = P.seriesNames[sl] ? P.seriesNames[sl] : "value";
-                plotSpreadLine(sp, nm);
+                const char* nm = S.seriesNames[sl] ? S.seriesNames[sl] : "value";
+                const std::string what = overlaid ? std::string(nm) + "@" + sides[si].name
+                                                  : std::string(nm);
+                // the string that is printed is the string that is recorded
+                const std::string line = plotSpreadText(sp, what.c_str());
+                ImGui::TextDisabled("%s", line.c_str());
+                if (!g_projSpreadProbe.empty()) g_projSpreadProbe += "|";
+                g_projSpreadProbe += std::string(horizontal ? "H@" : "V@") + sides[si].name +
+                                     " " + line;
                 nSpread++;
             }
-            // how many of them SPOKE, in the probe's own grammar: a spread line
-            // that quietly declines to appear is the failure mode this number
-            // exists to catch
-            g_projSideProbe += std::string(horizontal ? "spreadH=" : "spreadV=") +
-                               std::to_string(nSpread) + ";";
+            // how many of them SPOKE, in the probe's own grammar and PER SIDE
+            // ("spreadH@B=4"): a spread line that quietly declines to appear is
+            // the failure mode this number exists to catch, and one "spreadH="
+            // for the plot was read by its first occurrence - A's - which is
+            // how B's zero stayed green for as long as it did.
+            g_projSideProbe += std::string(horizontal ? "spreadH@" : "spreadV@") +
+                               sides[si].name + "=" + std::to_string(nSpread) + ";";
+            nSpreadPane += nSpread;
+        }
+        // Side by side, what follows every pane's plot is the SAME height -
+        // the legend row and the spread block as budgeted for the widest side
+        // (legendH, ppRows) - whatever this side printed: a mono B beside a
+        // mosaic A has no legend row and one line against A's four, and
+        // without the pad its V plot would start a row and three lines higher
+        // than A's. The panes exist to be read against each other, so their
+        // rows start level (#286). The pad is the rows not printed, consumed
+        // exactly as they would have been - one Dummy per missing line, a text
+        // line tall, because ImGui truncates the cursor after every item and
+        // one Dummy of the difference lands a pixel off at a fractional scale.
+        if (side) {
+            if (legendH > legendDrewH + 0.5f)
+                ImGui::Dummy(ImVec2(0.0f, std::max(legendH - legendDrewH -
+                                                   ImGui::GetStyle().ItemSpacing.y, 1.0f)));
+            for (int k = nSpreadPane; k < ppRows; k++)
+                ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
         }
         if (overlaid) {
             // ...and the fixed A/B row only when B is really the second side:
@@ -1320,9 +1387,26 @@ static void drawPanelProjection() {
         if (app.showProjV) onePlot(false, which);
     } else {
         // equal widths, slot order, A first (docs/features/compare/ab-stats-plan.md 3 at N):
-        // arming a letter appends a pane and moves nobody
-        float childH = ImGui::GetTextLineHeight() + 8 * app.uiScale
-                     + plots * (each + ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+        // arming a letter appends a pane and moves nobody.
+        //
+        // The height is what a pane HOLDS, term by term, because the child is
+        // NoScrollbar: whatever the fixed height does not cover is clipped in
+        // silence. It covered the band and the plot frames and nothing under
+        // them, so the spread lines - A's four, in A's pane alone (#286) - ran
+        // off the end. The band (drawABBand's own Dummy), then per plot: the
+        // frame beginPlot consumes (the body, the y title above it, the x ticks
+        // and title below it), the plane legend row and the spread block, both
+        // of which every pane pads to (onePlot). One ItemSpacing follows the
+        // band and each plot frame; lineH and legendH carry their own.
+        const float itemSp = ImGui::GetStyle().ItemSpacing.y;
+        const float childH = abBandH() + itemSp
+                           + plots * (each + plotMarginT() + plotMarginB() + itemSp
+                                      + legendH + lineH * (float)ppRows);
+        {
+            char b[48];
+            snprintf(b, sizeof b, "paneH=%.1f;", childH);
+            g_projSideProbe += b;
+        }
         for (size_t i = 0; i < nSides; i++) {
             if (i) ImGui::SameLine();
             ImGui::BeginChild(("##projSide" + sides[i].name).c_str(),
@@ -1331,6 +1415,14 @@ static void drawPanelProjection() {
             drawABBand(sides[i].name.c_str(), sides[i].label, sides[i].stale);
             if (app.showProjH) onePlot(true, { i });
             if (app.showProjV) onePlot(false, { i });
+            {   // ...and what the pane DID hold, so the two can be asserted
+                // against each other: the cursor after the last item is that
+                // item's bottom plus one ItemSpacing.
+                char b[64];
+                snprintf(b, sizeof b, "paneUsed@%s=%.1f;", sides[i].name.c_str(),
+                         ImGui::GetCursorPosY() - itemSp);
+                g_projSideProbe += b;
+            }
             ImGui::EndChild();
         }
     }
