@@ -2885,12 +2885,29 @@ static std::string selfExePath() {
     wchar_t buf[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n > 0 && n < MAX_PATH) return std::filesystem::path(buf).u8string();
+#elif defined(__APPLE__)
+    // No /proc on macOS: dyld answers, the same call plugin_host::exeDir makes.
+    // Until this branch existed the macOS fallback below was argv[0], and the
+    // --localbrowse-selftest child (argv[0] = `./viewer` from a foreign cwd)
+    // is what noticed - on the macOS runner, with Windows and Linux green
+    // (#289). canonical(): dyld may hand back a symlink or a `./` segment.
+    uint32_t sz = 0;
+    _NSGetExecutablePath(nullptr, &sz);
+    std::vector<char> buf(sz + 1, 0);
+    if (sz && _NSGetExecutablePath(buf.data(), &sz) == 0) {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::canonical(buf.data(), ec);
+        return (ec ? std::filesystem::path(buf.data()) : p).u8string();
+    }
 #else
-    char buf[4096];                    // Windows-primary; keep the Linux path built
+    char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
     if (n > 0) { buf[n] = 0; return buf; }
 #endif
-    return app.exePath;                // argv[0]: right unless the cwd changed
+    // The OS would not say. app.exePath is what main() fell back to when THIS
+    // query failed at startup - argv[0], right unless the cwd changed - and
+    // never anything else, so the two cannot disagree (#289).
+    return app.exePath;
 }
 
 // The command line that makes "the same image look the same" in the child:

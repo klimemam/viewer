@@ -2067,7 +2067,9 @@ struct App {
     // what the old shared app.remoteSession + app.sesMtx amounted to.
     remote::Session uiSession;                     // the UI thread's, exclusively
     std::string remoteExe;            // empty = ~/.viewer/viewer-serve (self-installed)
-    std::string exePath;              // argv[0], for the local:// test peer
+    std::string exePath;              // THIS binary, absolute and UTF-8 (selfExePath();
+                                      // argv[0] only when the OS would not say): what
+                                      // every local peer is started by (#289)
     bool remoteDlgOpen = false;       // File > Start Remote (ssh)...
     std::string lastRemoteUrl;        // last host, prefilled next time (prefs)
     // ---- Browse (rb) state types: core/browse/browse_state.h since P7 ------
