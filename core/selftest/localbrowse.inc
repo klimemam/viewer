@@ -102,8 +102,9 @@
             // `<that> --serve` through CreateProcessW(nullptr, cmd) / execvp,
             // which resolve a relative first token against the cwd AT THAT
             // MOMENT. So the value has to be absolute; it has to be the OS's own
-            // answer (selfExePath: GetModuleFileNameW / /proc/self/exe) and not
-            // argv[0]'s spelling; and - the ACP half of the same report - it has
+            // answer (selfExePath: GetModuleFileNameW / _NSGetExecutablePath /
+            // /proc/self/exe) and not argv[0]'s spelling; and - the ACP half of
+            // the same report - it has
             // to name a file that EXISTS when read as UTF-8, which the cp932
             // bytes of a Japanese path do not. remoteExe is the formula's other
             // operand and is asserted unset, or the three facts above would be

@@ -59,6 +59,7 @@
 #endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>           // sysctlbyname for the physical-memory budget
+#include <mach-o/dyld.h>          // _NSGetExecutablePath: selfExePath has no /proc here
 #endif
 #include <memory>
 #include <unordered_map>
@@ -843,7 +844,8 @@ int main(int argc, char** argv) {
     // THE FILE THIS PROCESS IS, for everything below that starts a peer by it:
     // the local Browse reader, a local:// open, the reload and watch workers and
     // the selftests that run `<this> --serve`. selfExePath() asks the OS
-    // (GetModuleFileNameW / readlink /proc/self/exe): absolute, and UTF-8.
+    // (GetModuleFileNameW / _NSGetExecutablePath / readlink /proc/self/exe):
+    // absolute, and UTF-8.
     // argv[0] is neither - it is the launcher's SPELLING (`viewer.exe`,
     // `.\viewer.exe`, `build-mingw\viewer.exe`), which CreateProcessW then
     // resolves against whatever the cwd is when the peer is spawned, and on
