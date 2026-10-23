@@ -46,6 +46,22 @@ Run run(const std::vector<std::string>& argv, int timeoutMs = 300000,
         const std::string& errFile = std::string(),
         bool captureStdout = true);
 
+// The same run, for a caller that has to say more than the command line: WHERE
+// the child starts (`cwd`) and WHAT IT SEES as its argv[0] (`argv0`). The file
+// run is still argv[0] of `argv`; `argv0` is the spelling the child is told -
+// the way a launcher types `.\viewer.exe` from a folder that does not hold it.
+// A test that asserts "this binary finds itself however it was started" has to
+// be able to start it that way (--localbrowse-selftest, #289).
+struct RunOpts {
+    int timeoutMs = 300000;
+    std::atomic<bool>* cancel = nullptr;
+    std::string outFile, errFile;
+    bool captureStdout = true;
+    std::string cwd;          // the child's working directory; empty = this process's
+    std::string argv0;        // the child's argv[0]; empty = argv[0] as given
+};
+Run run(const std::vector<std::string>& argv, const RunOpts& o);
+
 // The interpreter to use, or "" with `why` naming what was tried. `configured`
 // wins when it is set. Probed by RUNNING it: on Windows the bare python3 on PATH
 // is a Microsoft Store stub that prints an advert and exits non-zero, and numpy

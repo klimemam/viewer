@@ -20,6 +20,8 @@
 #include <sys/wait.h>
 #include <poll.h>      // the timed pipe reads in runSshCommand
 #include <time.h>      // clock_gettime for their deadline
+#include <fcntl.h>     // FD_CLOEXEC on spawn's exec-error pipe
+#include <errno.h>
 #endif
 
 namespace remote {
@@ -46,23 +48,66 @@ struct Pipe {
     uint64_t bytesRead = 0;
 };
 
-static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err) {
+// What the OS said, as one UTF-8 clause that ENDS WITH THE NUMBER: the text is
+// in the user's language (FormatMessageW's / strerror's) and is what they read;
+// the number is what a report can be searched by, and the one part of the
+// clause a selftest can assert on from any locale.
 #if defined(_WIN32)
-    SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
-    HANDLE childIn = nullptr, childOut = nullptr;
-    if (!CreatePipe(&childIn, &p.inW, &sa, 0)) { err = "cannot create pipes"; return false; }
-    if (!CreatePipe(&p.outR, &childOut, &sa, 0)) {
-        CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
-        err = "cannot create pipes";
-        return false;
+static std::string osErrorText(DWORD e) {
+    std::string s;
+    wchar_t* w = nullptr;
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS,
+                             nullptr, e, 0, (LPWSTR)&w, 0, nullptr);
+    if (n && w) {
+        while (n && (w[n - 1] == L'\r' || w[n - 1] == L'\n' || w[n - 1] == L' ')) n--;
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, w, (int)n, nullptr, 0, nullptr, nullptr);
+        if (bytes > 0) {
+            s.resize((size_t)bytes);
+            WideCharToMultiByte(CP_UTF8, 0, w, (int)n, &s[0], bytes, nullptr, nullptr);
+        }
+        LocalFree(w);
     }
-    SetHandleInformation(p.inW, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(p.outR, HANDLE_FLAG_INHERIT, 0);
+    if (!s.empty()) s += ' ';
+    s += "(windows error " + std::to_string((unsigned)e) + ")";
+    return s;
+}
+#else
+static std::string osErrorText(int e) {
+    return std::string(strerror(e)) + " (errno " + std::to_string(e) + ")";
+}
+#endif
+
+// Start argv as a child with its stdin/stdout on the pipe. On failure `err` is
+// the whole sentence ("cannot start: <command line>: <what the OS said>") and
+// `why`, when asked for, is the OS clause alone - for the caller that knows
+// WHICH FILE the first token was and words the failure around it (startOn's
+// local peer). The OS clause is captured before any handle is closed: CloseHandle
+// and close() overwrite GetLastError / errno.
+static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err,
+                  std::string* why = nullptr) {
     std::string cmd;
     for (const auto& a : argv) {          // quote: paths have spaces
         if (!cmd.empty()) cmd += ' ';
         cmd += a.find(' ') != std::string::npos ? "\"" + a + "\"" : a;
     }
+    auto fail = [&](const char* what, const std::string& os) {
+        err = std::string(what) + ": " + cmd + ": " + os;
+        if (why) *why = os;
+        return false;
+    };
+#if defined(_WIN32)
+    SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+    HANDLE childIn = nullptr, childOut = nullptr;
+    if (!CreatePipe(&childIn, &p.inW, &sa, 0))
+        return fail("cannot create pipes", osErrorText(GetLastError()));
+    if (!CreatePipe(&p.outR, &childOut, &sa, 0)) {
+        std::string os = osErrorText(GetLastError());
+        CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
+        return fail("cannot create pipes", os);
+    }
+    SetHandleInformation(p.inW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(p.outR, HANDLE_FLAG_INHERIT, 0);
     // CreateProcessW, not A: this user's profile directory is Japanese, and the
     // ANSI entry point garbles any non-ASCII path to the binary or the data
     int wn = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
@@ -76,33 +121,53 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     si.hStdOutput = childOut;
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
+    // lpApplicationName stays null ON PURPOSE: the ssh callers hand this a
+    // command line whose first token is resolved by Windows (`ssh` on PATH), and
+    // the local peer is started by an ABSOLUTE path (app.exePath is
+    // selfExePath()'s answer, #289), which the same resolution takes as is.
     BOOL ok = CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    const DWORD startErr = ok ? 0 : GetLastError();
     CloseHandle(childIn);
     CloseHandle(childOut);
     if (!ok) {
         CloseHandle(p.inW);  p.inW = nullptr;
         CloseHandle(p.outR); p.outR = nullptr;
-        err = "cannot start: " + cmd;
-        return false;
+        return fail("cannot start", osErrorText(startErr));
     }
     CloseHandle(pi.hThread);
     p.proc = pi.hProcess;
     return true;
 #else
-    int toChild[2], fromChild[2];
-    if (pipe(toChild) != 0) { err = "cannot create pipes"; return false; }
+    int toChild[2], fromChild[2], execErr[2];
+    if (pipe(toChild) != 0) return fail("cannot create pipes", osErrorText(errno));
     if (pipe(fromChild) != 0) {
+        int e = errno;
         close(toChild[0]); close(toChild[1]);
-        err = "cannot create pipes";
-        return false;
+        return fail("cannot create pipes", osErrorText(e));
     }
-    pid_t pid = fork();
-    if (pid < 0) {
+    // The exec-error pipe: fork() succeeding says nothing about the FILE, and
+    // without this a missing or non-executable binary surfaced here as a child
+    // that "started" and then "did not answer" the HELLO - the remote-shaped
+    // sentence, for a file on this disk. Close-on-exec on both ends, so a
+    // successful exec closes the write end and the read below returns 0 bytes;
+    // a failed exec writes errno into it first. The only way the parent learns
+    // the child's errno without a wait that would block on a peer that DID start.
+    if (pipe(execErr) != 0) {
+        int e = errno;
         close(toChild[0]); close(toChild[1]);
         close(fromChild[0]); close(fromChild[1]);
-        err = "cannot fork";
-        return false;
+        return fail("cannot create pipes", osErrorText(e));
+    }
+    fcntl(execErr[0], F_SETFD, FD_CLOEXEC);
+    fcntl(execErr[1], F_SETFD, FD_CLOEXEC);
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        close(toChild[0]); close(toChild[1]);
+        close(fromChild[0]); close(fromChild[1]);
+        close(execErr[0]); close(execErr[1]);
+        return fail("cannot fork", osErrorText(e));
     }
     if (pid == 0) {
         dup2(toChild[0], STDIN_FILENO);
@@ -113,10 +178,25 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
         args.push_back(nullptr);
         execvp(args[0], args.data());
+        int e = errno;
+        ssize_t wr = write(execErr[1], &e, sizeof e);
+        (void)wr;
         _exit(127);
     }
+    close(execErr[1]);
+    int childErrno = 0;
+    ssize_t got;
+    do { got = read(execErr[0], &childErrno, sizeof childErrno); } while (got < 0 && errno == EINTR);
+    close(execErr[0]);
     close(toChild[0]);
     close(fromChild[1]);
+    if (got == (ssize_t)sizeof childErrno) {
+        int st = 0;
+        waitpid(pid, &st, 0);             // it _exit(127)ed: reap it now, no zombie
+        close(toChild[1]);
+        close(fromChild[0]);
+        return fail("cannot start", osErrorText(childErrno));
+    }
     p.inW = toChild[1];
     p.outR = fromChild[0];
     p.pid = pid;
@@ -425,7 +505,21 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         argv.push_back("--serve");
         if (serveReaders_) argv.push_back("--serve-readers");
     }
-    if (!spawn(*p, argv, err)) { stop(); return false; }
+    std::string why;
+    if (!spawn(*p, argv, err, &why)) {
+        // THE LOCAL PEER IS A FILE ON THIS DISK, so its failure to start is a
+        // sentence about that file: which one was looked for (the absolute
+        // path this binary was handed, #289) and what the OS said about it.
+        // "cannot start: <command line>" named neither in a way a user could
+        // act on - the path in it was argv[0]'s spelling, and the reason was
+        // not there at all. The ssh callers keep spawn's own sentence: their
+        // first token is `ssh`, and what failed is the shell, not a peer.
+        if (host.empty())
+            err = "the local reader (" + exe + ") could not be started: " +
+                  (why.empty() ? err : why);
+        stop();
+        return false;
+    }
     alive_ = true;
     W w; w.u32((uint32_t)helloVersion_);
     std::vector<uint8_t> reply;
@@ -437,7 +531,13 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         // round trip below can explain. The pipe knows: not a byte arrived.
         const bool noAnswer = (p->bytesRead == 0);
         if (noAnswer || err.empty())
-            err = "no answer from the remote viewer (is it installed there?)";
+            // ...and for a LOCAL peer the question "is it installed there?" is
+            // the wrong one: the file started (spawn said so, by name), so what
+            // is left is a binary that exited before HELLO - a missing DLL, a
+            // Peer executable setting that names something other than a viewer.
+            err = host.empty()
+                ? "the local reader (" + exe + ") started but did not answer"
+                : "no answer from the remote viewer (is it installed there?)";
         // ...and what the peer ACTUALLY said - but only when all four hold:
         //   the caller opted in (setExplainFailure: a worker that shows it),
         //   there is a host to ask (a local peer writes to this process's own

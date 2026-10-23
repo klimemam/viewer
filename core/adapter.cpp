@@ -112,6 +112,21 @@ std::string showCommand(const std::vector<std::string>& argv) {
 // Files cost one temp write and cannot deadlock at all.
 Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* cancel,
         const std::string& outFile, const std::string& errFile, bool captureStdout) {
+    RunOpts o;
+    o.timeoutMs = timeoutMs;
+    o.cancel = cancel;
+    o.outFile = outFile;
+    o.errFile = errFile;
+    o.captureStdout = captureStdout;
+    return run(argv, o);
+}
+
+Run run(const std::vector<std::string>& argv, const RunOpts& o) {
+    const int timeoutMs = o.timeoutMs;
+    std::atomic<bool>* cancel = o.cancel;
+    const std::string& outFile = o.outFile;
+    const std::string& errFile = o.errFile;
+    const bool captureStdout = o.captureStdout;
     Run r;
     if (argv.empty()) { r.fail = "no command"; return r; }
     std::filesystem::path outPath = outFile.empty() ? scratch("out")
@@ -136,12 +151,17 @@ Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* 
         return r;
     }
     std::wstring cmd;
-    for (const auto& a : argv) {
+    for (size_t i = 0; i < argv.size(); i++) {
         if (!cmd.empty()) cmd += L' ';
-        cmd += quoteArg(wide(a));
+        cmd += quoteArg(wide(i == 0 && !o.argv0.empty() ? o.argv0 : argv[i]));
     }
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(0);                       // CreateProcessW may write into it
+    // With a spelling in the first token, the FILE goes to lpApplicationName -
+    // the one case this call names it, because the token is no longer the file.
+    // Without one, null as ever: the first token is resolved by Windows.
+    const std::wstring appFile = o.argv0.empty() ? std::wstring() : wide(argv[0]);
+    const std::wstring cwd = o.cwd.empty() ? std::wstring() : wide(o.cwd);
     STARTUPINFOW si{};
     si.cb = sizeof si;
     // Belt and braces, exactly as core/remote.cpp spawns the peer: CREATE_NO_WINDOW
@@ -153,8 +173,9 @@ Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* 
     si.hStdOutput = hOut;
     si.hStdError = hErr;
     PROCESS_INFORMATION pi{};
-    BOOL started = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE,
-                                  CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    BOOL started = CreateProcessW(appFile.empty() ? nullptr : appFile.c_str(), buf.data(),
+                                  nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                                  cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
     CloseHandle(hOut);
     CloseHandle(hErr);
     if (!started) {
@@ -204,10 +225,12 @@ Run run(const std::vector<std::string>& argv, int timeoutMs, std::atomic<bool>* 
         if (fe >= 0) dup2(fe, STDERR_FILENO);
         int fi = open("/dev/null", O_RDONLY);
         if (fi >= 0) dup2(fi, STDIN_FILENO);
+        if (!o.cwd.empty() && chdir(o.cwd.c_str()) != 0) _exit(127);
         std::vector<char*> av;
         for (const auto& a : argv) av.push_back(const_cast<char*>(a.c_str()));
+        if (!o.argv0.empty()) av[0] = const_cast<char*>(o.argv0.c_str());
         av.push_back(nullptr);
-        execvp(av[0], av.data());
+        execvp(argv[0].c_str(), av.data());   // the file; av[0] is what it is told
         _exit(127);
     }
     r.started = true;

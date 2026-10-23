@@ -840,6 +840,17 @@ int main(int argc, char** argv) {
                 if (!strcmp(argv[k], "--serve-readers")) rp::setServeReaders(true);
             return rp::runServeMode();
         }
+    // THE FILE THIS PROCESS IS, for everything below that starts a peer by it:
+    // the local Browse reader, a local:// open, the reload and watch workers and
+    // the selftests that run `<this> --serve`. selfExePath() asks the OS
+    // (GetModuleFileNameW / readlink /proc/self/exe): absolute, and UTF-8.
+    // argv[0] is neither - it is the launcher's SPELLING (`viewer.exe`,
+    // `.\viewer.exe`, `build-mingw\viewer.exe`), which CreateProcessW then
+    // resolves against whatever the cwd is when the peer is spawned, and on
+    // Windows it is ACP bytes that spawn() reads as UTF-8 (#289). It is kept
+    // only as the fallback for an OS query that failed, where it is all there is.
+    app.exePath = selfExePath();
+    if (app.exePath.empty()) app.exePath = argv[0];
     {   // --remote-exe must reach the selftest too, or "test the standalone peer"
         // silently tests this binary against itself
         const char* rexe = nullptr;
@@ -847,13 +858,13 @@ int main(int argc, char** argv) {
             if (!strcmp(argv[i], "--remote-exe")) rexe = argv[i + 1];
         for (int i = 1; i + 1 < argc; i++)
             if (!strcmp(argv[i], "--remote-selftest"))
-                return remoteSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
+                return remoteSelfTest(rexe ? rexe : app.exePath.c_str(), argv[i + 1]);
         // ...and the same for ABI v3 §10: it starts a peer of its own and must
         // reach the standalone one for the identical reason - a client talking
         // to itself cannot tell "the peer has that plugin" from "I do".
         for (int i = 1; i + 1 < argc; i++)
             if (!strcmp(argv[i], "--rplugin-selftest"))
-                return rpluginSelfTest(rexe ? rexe : argv[0], argv[i + 1]);
+                return rpluginSelfTest(rexe ? rexe : app.exePath.c_str(), argv[i + 1]);
     }
     // Asked before prefs are read and before an autosave slot is claimed: a
     // question ABOUT the machine must not alter the machine it is asking about.
@@ -977,7 +988,6 @@ int main(int argc, char** argv) {
     bool benchPanels = benchFrames > 0;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-panels")) benchPanels = true;
-    app.exePath = argv[0];
     // the out-of-the-box A/B range mode, read before anything can override it:
     // --range-selftest checks it, and prefs on the machine running the test
     // would otherwise decide what "the default" is

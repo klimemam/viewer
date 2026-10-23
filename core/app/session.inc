@@ -2890,7 +2890,10 @@ static std::string selfExePath() {
     ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
     if (n > 0) { buf[n] = 0; return buf; }
 #endif
-    return app.exePath;                // argv[0]: right unless the cwd changed
+    // The OS would not say. app.exePath is what main() fell back to when THIS
+    // query failed at startup - argv[0], right unless the cwd changed - and
+    // never anything else, so the two cannot disagree (#289).
+    return app.exePath;
 }
 
 // The command line that makes "the same image look the same" in the child:

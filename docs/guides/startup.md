@@ -225,6 +225,11 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@server "cat >> ~/.ssh/autho
 
 ローカルのフォルダも**同じパネル**で見られます: **File > Browse Folder (Local)...**。
 peer がこのマシンで動くだけで、操作も見え方も一切変わりません(接続表示は `local peer`)。
+このときの peer は **viewer 自身**(OS に訊いた自分の絶対パス)を `--serve` で起動するので、
+どのフォルダから・どんな綴りで起動したかには依存しません。それでも起動できなければ Browse パネルに
+`the local reader (<絶対パス>) could not be started: <OS の文>` と出ます ——
+探したファイルと OS の答えがそのまま書いてあるので、そこから辿れます
+(`settings.jsonc` の `remote.peerExecutable` が別のファイルを指しているときも同じ文で、そのパスが出ます)。
 
 > **`File > Open File (Remote)...` と `Open Folder (Remote)...` は廃止されました。**
 > ファイルを開くのもフォルダを丸ごと開くのも Browse パネルの中でやります ——
