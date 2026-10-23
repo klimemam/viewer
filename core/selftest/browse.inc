@@ -2458,6 +2458,187 @@
                     same ? 1 : 0, portOk ? "ok" : "FAIL");
             if (!portOk) ok = false;
         }
+        {   // ---- COLUMN WIDTHS: computed until dragged, whatever the file says --
+            // #288. The listing's column edges are draggable again. The accident
+            // that took the drag away had two halves - an auto-fit width latched
+            // on a column before any row had arrived, and the layout file handing
+            // that number back at every start - and each is pinned here on its
+            // own, plus the contracts that go with them: a dragged width survives
+            // a listing change, until there is a drag the computed widths follow
+            // the panel (the short "modified" form grows back), and the sort the
+            // layout file carries still comes back at start.
+            //
+            // Headless frames of the REAL panel (the seriespanel recipe), drawn
+            // last so nothing above sees them; the table reports what it laid out
+            // through I.toolbar.col*. A drag is injected as mouse events, so the
+            // mark is set by ImGui's own border hit-test and not by a flag the
+            // test could have set itself.
+            App::BrowseInstance& I = rbMain();
+            ImGuiIO& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2(1600, 1000);
+            io.DisplayFramebufferScale = ImVec2(1, 1);
+            io.DeltaTime = 1.0f / 60.0f;
+            if (!io.Fonts->IsBuilt()) io.Fonts->Build();
+            // the widths the panel computes, measured the way it measures them:
+            // inside a frame, from the same sample text (browse.h, one spelling)
+            float wShape = 0, wSize = 0, wDate = 0, wDateS = 0;
+            auto frame = [&](float panelW) {
+                ImGui::NewFrame();
+                wShape = ImGui::CalcTextSize(RB_COL_SAMPLE_SHAPE).x;
+                wSize  = ImGui::CalcTextSize(RB_COL_SAMPLE_SIZE).x;
+                wDate  = ImGui::CalcTextSize(RB_COL_SAMPLE_DATE).x;
+                wDateS = std::max(ImGui::CalcTextSize(RB_COL_SAMPLE_DATE_S1).x,
+                                  ImGui::CalcTextSize(RB_COL_SAMPLE_DATE_S2).x);
+                ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(panelW, 700), ImGuiCond_Always);
+                // NOT ImGuiWindowFlags_NoSavedSettings, unlike the other probe
+                // windows: a table inherits that flag from its root window
+                // (imgui_tables.cpp, TableFixFlags) and then neither saves nor
+                // LOADS settings, and (c) / (e) below are about what a loaded
+                // layout file does to the table. The run has no ini file
+                // (scriptedRun), so nothing reaches disk either way.
+                ImGui::Begin("BrowseColsProbe", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
+                drawPanelRemote(I);
+                ImGui::End();
+                ImGui::EndFrame();
+            };
+            auto about = [](float a, float b) { return std::fabs(a - b) <= 1.5f; };
+            const RbToolbarGeom& g = I.toolbar;
+            // (a) THE ORIGINAL DEFECT. The table's first frames, before any row:
+            // the listing is held back for three frames (ImGui's auto-fit window
+            // is three frames) and the metadata columns must already be as wide
+            // as their sample text, not as wide as an empty cell.
+            bool emptyOk = false, fullOk = false;
+            {
+                auto held = std::move(I.b.entries);
+                I.b.entries.clear(); I.b.rev++;
+                for (int n = 0; n < 3; n++) frame(900);
+                emptyOk = about(g.colW[RB_COL_SHAPE], wShape) && about(g.colW[RB_COL_SIZE], wSize) &&
+                          about(g.colW[RB_COL_MTIME], wDate) && g.colTableId != 0;
+                float emptyShape = g.colW[RB_COL_SHAPE], emptyDate = g.colW[RB_COL_MTIME];
+                I.b.entries = std::move(held); I.b.rev++;
+                frame(900);
+                fullOk = about(g.colW[RB_COL_SHAPE], wShape) && about(g.colW[RB_COL_MTIME], wDate);
+                fprintf(stderr, "browseselftest: column widths before the listing: shape %.0f "
+                                "size %.0f modified %.0f (sample text %.0f / %.0f / %.0f); "
+                                "after it: shape %.0f modified %.0f: %s\n",
+                        emptyShape, g.colW[RB_COL_SIZE], emptyDate, wShape, wSize, wDate,
+                        g.colW[RB_COL_SHAPE], g.colW[RB_COL_MTIME],
+                        (emptyOk && fullOk) ? "ok" : "FAIL");
+            }
+            // (d) UNTOUCHED, THE COLUMNS FOLLOW THE PANEL. Narrow it until
+            // "modified" drops to its short form, then widen it: the column has
+            // to grow back to the full stamp. (Re-applying the width through
+            // TableSetColumnWidth cannot do this - it clamps the right-most
+            // column to the room it already has.)
+            bool shortOk = false, regrowOk = false;
+            {
+                float atW = 0;
+                for (float w = 880; w >= 240 && !shortOk; w -= 20) {
+                    frame(w);
+                    if (g.colW[RB_COL_MTIME] > 0 && about(g.colW[RB_COL_MTIME], wDateS)) {
+                        shortOk = true; atW = w;
+                    }
+                }
+                frame(900); frame(900);
+                regrowOk = about(g.colW[RB_COL_MTIME], wDate);
+                fprintf(stderr, "browseselftest: modified column at a narrow panel: short form "
+                                "%.0f (%.0f) reached at w=%.0f=%d, back at 900: %.0f (%.0f)=%d, "
+                                "untouched=%d: %s\n",
+                        wDateS, wDateS, atW, shortOk ? 1 : 0, g.colW[RB_COL_MTIME], wDate,
+                        regrowOk ? 1 : 0, I.colTouched ? 0 : 1,
+                        (shortOk && regrowOk && !I.colTouched) ? "ok" : "FAIL");
+            }
+            // (b) A DRAG IS THE USER'S WORD. Take hold of the border between
+            // name and shape and pull it 40 px left (ImGui: resizing a stretch
+            // column from its right edge is resizing the fixed column after it,
+            // so shape widens by 40); then change the listing for real - list
+            // the first folder - and the width must still be the dragged one.
+            bool dragOk = false, keptOk = false;
+            float shapeDragged = 0;
+            {
+                const float x = g.colEdgeX[RB_COL_NAME];
+                const float y = g.colHdrY0 + g.colHdrH * 0.5f;
+                // one event per frame: ImGui trickles a press that follows a
+                // move in the same frame into the next one
+                io.AddMousePosEvent(x, y);        frame(900);     // over the border
+                io.AddMouseButtonEvent(0, true);  frame(900);     // take hold
+                io.AddMousePosEvent(x - 40, y);   frame(900);     // pull
+                frame(900);                                       // the width lands
+                io.AddMouseButtonEvent(0, false); frame(900);     // let go
+                io.AddMousePosEvent(-1, -1);      frame(900);
+                shapeDragged = g.colW[RB_COL_SHAPE];
+                dragOk = about(shapeDragged, wShape + 40) && I.colTouched;
+                // wherever the blocks above left the listing, this is a change
+                // of directory: the fixture root, or its first folder on disk
+                const std::string from = I.b.dir;
+                std::string want = dir;
+                if (from == dir) {
+                    std::error_code fec;
+                    for (const auto& e : std::filesystem::directory_iterator(pathFromUtf8(dir), fec))
+                        if (e.is_directory(fec)) { want = dir + "/" + e.path().filename().u8string(); break; }
+                }
+                App::RbJob j;
+                j.kind = App::RbList; j.host = I.b.host; j.port = I.b.port; j.dir = want;
+                rbEnqueue(I, std::move(j));
+                double t2 = nowSec();
+                while (nowSec() - t2 < 120.0) {
+                    pumpRemoteBrowse();
+                    if (I.b.dir == want) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                frame(900); frame(900);
+                keptOk = want != from && I.b.dir == want && about(g.colW[RB_COL_SHAPE], shapeDragged);
+                fprintf(stderr, "browseselftest: dragged name|shape 40 px left: shape %.0f "
+                                "(computed %.0f), touched=%d; listed %s -> %s: shape %.0f: %s\n",
+                        shapeDragged, wShape, I.colTouched ? 1 : 0, from.c_str(), want.c_str(),
+                        g.colW[RB_COL_SHAPE], (dragOk && keptOk) ? "ok" : "FAIL");
+            }
+            // (c) THE OTHER HALF OF THE ACCIDENT: a width the layout file hands
+            // the table. ImGui saves a Resizable table's widths and its sort (the
+            // drag above has just had it write this table's entry - logged, not
+            // asserted), and users' files still carry the widths the old accident
+            // latched. A new process - the table forgotten, the session mark
+            // clear - that loads such a file must show the COMPUTED widths on its
+            // very first frame; and (e) the sort the file carries, which is what
+            // the listing has always come back with, must come back too. The
+            // stale numbers are the ones in the real file.
+            bool staleOk = false, stillOk = false, sortOk = false;
+            {
+                char key[64];
+                snprintf(key, sizeof key, "[Table][0x%08X,4]", g.colTableId);
+                size_t n = 0;
+                const char* saved = ImGui::SaveIniSettingsToMemory(&n);
+                const bool written = std::string(saved, n).find(key) != std::string::npos;
+                char ini[512];
+                snprintf(ini, sizeof ini,
+                         "%s\nColumn 0  Weight=1.0000\nColumn 1  Width=113\n"
+                         "Column 2  Width=57\nColumn 3  Width=152 Sort=0^\n", key);
+                if (ImGuiTable* t = ImGui::TableFindByID((ImGuiID)g.colTableId)) ImGui::TableRemove(t);
+                ImGui::LoadIniSettingsFromMemory(ini);
+                I.colTouched = false;
+                frame(900);
+                const float f1Shape = g.colW[RB_COL_SHAPE], f1Size = g.colW[RB_COL_SIZE],
+                            f1Date = g.colW[RB_COL_MTIME];
+                staleOk = about(f1Shape, wShape) && about(f1Size, wSize) && about(f1Date, wDate);
+                sortOk = I.sortCol == RB_COL_MTIME && I.sortDesc;
+                frame(900);
+                stillOk = about(g.colW[RB_COL_SHAPE], wShape) && about(g.colW[RB_COL_MTIME], wDate) &&
+                          I.sortCol == RB_COL_MTIME && I.sortDesc;
+                fprintf(stderr, "browseselftest: layout file (entry %s written by the drag=%d) "
+                                "reloaded with stale widths 113/57/152 and Sort=0^ on modified, into "
+                                "a new table: first frame shape %.0f size %.0f modified %.0f "
+                                "(computed %.0f / %.0f / %.0f)=%d, sort col %d desc %d (want %d 1)=%d, "
+                                "second frame same=%d: %s\n",
+                        key, written ? 1 : 0, f1Shape, f1Size, f1Date, wShape, wSize, wDate,
+                        staleOk ? 1 : 0, I.sortCol, I.sortDesc ? 1 : 0, (int)RB_COL_MTIME,
+                        sortOk ? 1 : 0, stillOk ? 1 : 0,
+                        (staleOk && sortOk && stillOk) ? "ok" : "FAIL");
+            }
+            if (!(emptyOk && fullOk && shortOk && regrowOk && dragOk && keptOk &&
+                  staleOk && sortOk && stillOk)) ok = false;
+        }
         {   // ---- THE FIXTURE THIS TEST WAS HANDED IS NOT THIS TEST'S TO EDIT --
             // tools/testdata/rb is shared: --browse-keys-selftest navigates it by
             // POSITION (home, then N x down), so one extra row shifts every

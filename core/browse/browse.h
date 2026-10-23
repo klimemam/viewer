@@ -163,6 +163,17 @@ struct RbRow {
 // earlier). A sort change therefore lands on the next frame - invisible, and
 // far cheaper than building the view twice.
 enum { RB_COL_NAME = 0, RB_COL_SHAPE, RB_COL_SIZE, RB_COL_MTIME };
+// What each metadata column is wide enough to print: the widest value it
+// shows, and the table's initial width is CalcTextSize of it (panel.cpp, the
+// rblist table). One spelling, because the selftest that pins "the column is
+// that wide before any row has arrived" (#288) has to measure the same text.
+constexpr const char* RB_COL_SAMPLE_SHAPE = "(3000,4000) u16";
+constexpr const char* RB_COL_SAMPLE_SIZE  = "1023.9 MB";
+constexpr const char* RB_COL_SAMPLE_DATE  = "2026-07-27 14:03";
+// fmtUnixTimeShort has two forms; the column takes the wider, so it does not
+// clip on the day a file crosses the six-month line
+constexpr const char* RB_COL_SAMPLE_DATE_S1 = "2026-07-27";
+constexpr const char* RB_COL_SAMPLE_DATE_S2 = "07-27 14:03";
 
 // ---- #111: WHOSE disk is on screen decides which question a row asks ---------
 // A Browse panel showing THIS machine (empty host) is listing files this

@@ -33,6 +33,16 @@ struct RbToolbarGeom {
     // whatever ends the toolbar row must still be inside the panel at any width.
     float x0 = 0, x1 = 0, filterL = 0, filterR = 0, menuR = 0;
     float dateCellW = 0, dateTextW = 0;    // the listing's "modified" column
+    // ---- the listing's columns, as the table laid them out this frame -------
+    // Recorded from the table itself (#288): the width each column was GIVEN
+    // (RB_COL_* order; 0 = the column is dropped for want of room), the right
+    // edge of each - the border a drag takes hold of - the header row's top and
+    // height, which is where that border is hit-tested, and the table's own id,
+    // the key its [Table] entry in layout.ini carries.
+    float colW[4] = { 0, 0, 0, 0 };
+    float colEdgeX[4] = { 0, 0, 0, 0 };
+    float colHdrY0 = 0, colHdrH = 0;
+    unsigned colTableId = 0;
     int   emptyLocalBtn = 0;               // the not-connected state's local entry
     float rowX = 0, rowY = 0;              // centre of the first row submitted
     // ---- the bottom status line, and the star that ends the path line -------
@@ -292,6 +302,15 @@ struct Instance {
     // sort spec, stashed from the table one frame late (see RB_COL_NAME)
     int sortCol = 0;              // RB_COL_NAME
     bool sortDesc = false;
+    // The metadata columns' widths are COMPUTED (panel.cpp, the rblist table)
+    // and written into the table every frame - until the user drags a column
+    // edge or asks for an auto-fit, after which the widths are theirs for the
+    // rest of the session. This is the mark that tells the two apart (#288).
+    // Session-only by construction: a new process starts with it false, so
+    // whatever width the layout file hands the table on its first frame (ImGui
+    // saves a Resizable table's widths, and the stale ones of the old accident
+    // are still in users' files) is overwritten before it is ever laid out.
+    bool colTouched = false;
     // multi-select, by row index; sig says which listing it was built for
     std::vector<char> sel;
     // the NAMES of the ticked rows, for the same reason cursorKey exists: a

@@ -3,6 +3,8 @@
 // S3 が置いた BrowseHost 注記 40 箇所はここで潰れた。RbRow と view builder 群
 // は NOGL selftest が直接叩くので browse.h に出ている。
 #include "imgui.h"
+#include "imgui_internal.h"          // ImGuiTable: the rblist columns' widths and
+                                     // the marks a drag / auto-fit leaves (#288)
 #include "../app/state.h"
 #include "../remote_proto.h"         // rp::naturalLess / rp::VERSION
 #include "host.h"                    // the browse -> viewer seam (g_browseHost)
@@ -1981,29 +1983,42 @@ void drawPanelRemote(App::BrowseInstance& I) {
     float rbFootH = ImGui::GetTextLineHeightWithSpacing() +
                     ImGui::GetStyle().ItemSpacing.y * 2 + 1;
     // Column widths, measured from the widest thing each column actually
-    // prints. They were all TableSetupColumn(..., 0.0f) - "auto-fit" - and a
-    // SCROLLING table auto-fits over its first frames, which for this table are
-    // the frames before the listing has arrived. "modified" was therefore sized
-    // against an empty column and kept that width for good: a 16-character
-    // timestamp clipped to "202" even with the panel dragged out to 1150 px.
-    // ImGuiTableFlags_Resizable then wrote the number into the layout file, so
-    // it survived restarts too.
-    // A metadata column is WidthFixed | NoResize with an explicit width, which
-    // is the one combination ImGui re-applies on EVERY frame (TableUpdateLayout:
-    // a non-resizable fixed column takes InitStretchWeightOrWidth as its width).
-    // With Resizable the width was latched on the initialising frame instead and
-    // then written to the layout file, which is exactly how a stale number
-    // outlived every resize. The panel is what the user drags now, not the
-    // column edges - and the columns follow it.
+    // prints, and handed to the table as its INITIAL widths. The history,
+    // because the shape of this block is the shape of an accident: the columns
+    // were once TableSetupColumn(..., 0.0f) - "auto-fit" - and a SCROLLING table
+    // auto-fits over its first frames, which for this table were the frames
+    // before the listing had arrived. "modified" was therefore sized against an
+    // empty column and kept that width: a 16-character timestamp clipped to
+    // "202" even with the panel dragged out to 1150 px. The table was Resizable,
+    // so ImGui wrote that number into the layout file and it outlived every
+    // restart. The fix at the time took Resizable away - WidthFixed | NoResize,
+    // the one combination ImGui re-applies on every frame - and made the panel
+    // the thing the user drags.
+    //
+    // The column edges are draggable again (#288). ONE thing keeps the accident
+    // from coming back: until the user touches a column in this session, the
+    // computed widths are written into the table every frame - the first frame
+    // included, over whatever the layout file handed it. So there is no
+    // auto-fit to latch (an explicit initial width also has ImGui skip the
+    // measurement: TableSetupColumn clears AutoFitQueue when a width is given),
+    // and a width the file carries is on screen for no frame at all - the
+    // widths the old accident latched are still in users' files, and a dragged
+    // width is written there now, as for any Resizable table. A restart
+    // therefore starts from the computed widths by construction, with no flag
+    // about saving involved; and the table's sort goes on living in the layout
+    // file as it always has (ImGuiTableFlags_NoSavedSettings would have taken
+    // that away with the widths). The computed widths follow the font and the
+    // panel's width, which is how "modified" drops to its short form on a
+    // narrow panel and grows back. After a drag or an auto-fit the widths are
+    // the user's for the rest of the session and the writing stops:
+    // I.colTouched, set below from the table's own state.
     const ImGuiStyle& tSt = ImGui::GetStyle();
     const float tCell  = tSt.CellPadding.x * 2 + 1;              // + inner border
-    const float wShape = ImGui::CalcTextSize("(3000,4000) u16").x;
-    const float wSize  = ImGui::CalcTextSize("1023.9 MB").x;
-    const float wDate  = ImGui::CalcTextSize("2026-07-27 14:03").x;
-    // the wider of fmtUnixTimeShort's two forms, so the column does not clip on
-    // the day a file crosses the six-month line
-    const float wDateS = std::max(ImGui::CalcTextSize("2026-07-27").x,
-                                  ImGui::CalcTextSize("07-27 14:03").x);
+    const float wShape = ImGui::CalcTextSize(RB_COL_SAMPLE_SHAPE).x;
+    const float wSize  = ImGui::CalcTextSize(RB_COL_SAMPLE_SIZE).x;
+    const float wDate  = ImGui::CalcTextSize(RB_COL_SAMPLE_DATE).x;
+    const float wDateS = std::max(ImGui::CalcTextSize(RB_COL_SAMPLE_DATE_S1).x,
+                                  ImGui::CalcTextSize(RB_COL_SAMPLE_DATE_S2).x);
     // The name IS the row, so it keeps a readable minimum and the metadata is
     // paid for out of what is left, dropping from the right. A column that
     // cannot hold its own value is worth less than the name it is taking the
@@ -2022,7 +2037,13 @@ void drawPanelRemote(App::BrowseInstance& I) {
     const float rbTableH = ImGui::GetContentRegionAvail().y - rbFootH;
     if (ImGui::BeginTable("rblist", 4, ImGuiTableFlags_Sortable | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_ScrollY |
-                                       ImGuiTableFlags_SortTristate,
+                                       ImGuiTableFlags_SortTristate |
+                                       ImGuiTableFlags_Resizable |
+                                       // Resizable forces BordersInnerV (TableFixFlags);
+                                       // this keeps the rows as they were - the
+                                       // separator shows in the header, and down the
+                                       // body only while a border is held or hovered
+                                       ImGuiTableFlags_NoBordersInBodyUntilResize,
                                        ImVec2(0, -rbFootH))) {
         // ---- the levels above the reader, held at the top ---------------------
         // A tree that scrolls loses the folder you are in: it is above
@@ -2082,19 +2103,88 @@ void drawPanelRemote(App::BrowseInstance& I) {
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch |
                                         ImGuiTableColumnFlags_DefaultSort, 0.0f, RB_COL_NAME);
         ImGui::TableSetupColumn("shape / dtype", ImGuiTableColumnFlags_WidthFixed |
-                                                 ImGuiTableColumnFlags_NoResize |
                                                  ImGuiTableColumnFlags_NoSort |
                                                  tHide(colShape), wShape, RB_COL_SHAPE);
         ImGui::TableSetupColumn("size", ImGuiTableColumnFlags_WidthFixed |
-                                        ImGuiTableColumnFlags_NoResize |
                                         ImGuiTableColumnFlags_PreferSortDescending |
                                         tHide(colSize), wSize, RB_COL_SIZE);
         ImGui::TableSetupColumn("modified", ImGuiTableColumnFlags_WidthFixed |
-                                            ImGuiTableColumnFlags_NoResize |
                                             ImGuiTableColumnFlags_PreferSortDescending |
                                             tHide(colDate), dateFull ? wDate : wDateS,
                                             RB_COL_MTIME);
+        // ---- the widths: computed until the user says otherwise ---------------
+        // ImGui takes a fixed, resizable column's initial width ONCE, on the
+        // table's first frame (imgui_tables.cpp, TableSetupColumn: WidthRequest
+        // is set from init_width_or_weight only while IsInitializing - and not
+        // even then when the layout file had a width for the column, because
+        // TableLoadSettings ran first); after that only a drag, an auto-fit or
+        // the settings file moves it. The widths above change with the font and
+        // with the panel's width, so while the columns are untouched they are
+        // written into WidthRequest here, before the layout - the same
+        // assignment TableUpdateLayout makes for a NoResize column
+        // ("column->WidthRequest = width_auto"), made from here because the flag
+        // that had ImGui make it is the flag that forbids the drag. Not through
+        // TableSetColumnWidth: that clamps to WidthMax, which for the right-most
+        // column is the room it already has (the stretch column takes every
+        // spare pixel), so "modified" could never grow back from its short
+        // form; and for a fixed column behind a stretch one it trades width
+        // with its neighbour instead of setting it.
+        //
+        // Whether the user has spoken is read off the table's own state here,
+        // before the layout, so the answer governs this very frame:
+        //   - LastResizedColumn != -1: a column border was held last frame and
+        //     its new width has just been committed (TableBeginApplyRequests,
+        //     the first thing BeginTable does with a resize) - a drag;
+        //   - AutoFitQueue != 0 on a column: an auto-fit was asked for - a
+        //     double-click on a border (TableUpdateBorders ->
+        //     TableSetColumnWidthAutoSingle) or "Size column to fit" in the
+        //     header's context menu, which Resizable brings with it. Nothing
+        //     else queues one here: every column has an explicit width (which
+        //     clears the queue) and TableLoadSettings clears it too;
+        //   - ...on EVERY enabled metadata column at once: the menu's "Size all
+        //     columns to default" (TableSetColumnWidthAutoAll queues them all;
+        //     the single-column paths queue one). Default, for this table, is
+        //     the computed widths, so this is the way BACK: the mark is
+        //     cleared, and the queues with it - or the layout would fit the
+        //     columns to their content for two frames first. (With a single
+        //     enabled metadata column the two requests are the same request.)
+        // Only the METADATA columns are read. The name column is a weightless
+        // stretch column, and ImGui gives such a column a three-frame auto-fit
+        // of its own when the table is born (TableUpdateLayout, start_auto_fit:
+        // StretchWeight < 0) - ImGui's doing, not the user's, and a fit of the
+        // one stretch column changes nothing, since it takes what is left
+        // whatever its weight.
+        // RB_COL_* index the columns: the TableSetupColumn calls above are in
+        // that order (the selftest's width checks are by these indices).
+        ImGuiTable* tbl = ImGui::GetCurrentTable();
+        {
+            bool anyFit = false, allFit = true;
+            for (int c = RB_COL_SHAPE; c <= RB_COL_MTIME; c++) {
+                const ImGuiTableColumn& tc = tbl->Columns[c];
+                if (!tc.IsEnabled) continue;
+                if (tc.AutoFitQueue != 0) anyFit = true; else allFit = false;
+            }
+            if (anyFit && allFit) {
+                for (int c = RB_COL_SHAPE; c <= RB_COL_MTIME; c++) tbl->Columns[c].AutoFitQueue = 0;
+                I.colTouched = false;
+            } else if (anyFit || tbl->LastResizedColumn != -1) {
+                I.colTouched = true;
+            }
+        }
+        if (!I.colTouched) {
+            tbl->Columns[RB_COL_SHAPE].WidthRequest = wShape;
+            tbl->Columns[RB_COL_SIZE].WidthRequest  = wSize;
+            tbl->Columns[RB_COL_MTIME].WidthRequest = dateFull ? wDate : wDateS;
+        }
         ImGui::TableHeadersRow();
+        // selftest probes: what the table laid out, and where its borders are
+        for (int c = RB_COL_NAME; c <= RB_COL_MTIME; c++) {
+            I.toolbar.colW[c] = tbl->Columns[c].WidthGiven;
+            I.toolbar.colEdgeX[c] = tbl->Columns[c].MaxX;
+        }
+        I.toolbar.colHdrY0 = tbl->OuterRect.Min.y;
+        I.toolbar.colHdrH = ImGui::TableGetHeaderRowHeight();
+        I.toolbar.colTableId = tbl->ID;
         // The spec is STASHED, not applied: `shown` was already sorted with it,
         // above, where the keyboard and the clipper can agree with the screen.
         // A sort change therefore lands on the next frame - invisible, and the
