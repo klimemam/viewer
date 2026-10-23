@@ -1995,19 +1995,22 @@ void drawPanelRemote(App::BrowseInstance& I) {
     // the one combination ImGui re-applies on every frame - and made the panel
     // the thing the user drags.
     //
-    // The column edges are draggable again (#288), with each half of that
-    // accident closed on its own:
-    //   - no auto-fit. An explicit initial width means ImGui never measures a
-    //     column, empty or not (TableSetupColumn clears AutoFitQueue when a
-    //     width is given), so there is nothing to latch;
-    //   - no persistence. ImGuiTableFlags_NoSavedSettings keeps the widths out
-    //     of layout.ini, so a dragged width lives for the session and a restart
-    //     starts from the computed ones. (Whether a width should be kept, and
-    //     which, is a separate decision - not taken here.)
-    // Until the user touches a column, the computed widths are written into the
-    // table every frame - they follow the font and the panel's width, which is
-    // how "modified" drops to its short form on a narrow panel and grows back.
-    // After a drag or an auto-fit the widths are the user's and that stops:
+    // The column edges are draggable again (#288). ONE thing keeps the accident
+    // from coming back: until the user touches a column in this session, the
+    // computed widths are written into the table every frame - the first frame
+    // included, over whatever the layout file handed it. So there is no
+    // auto-fit to latch (an explicit initial width also has ImGui skip the
+    // measurement: TableSetupColumn clears AutoFitQueue when a width is given),
+    // and a width the file carries is on screen for no frame at all - the
+    // widths the old accident latched are still in users' files, and a dragged
+    // width is written there now, as for any Resizable table. A restart
+    // therefore starts from the computed widths by construction, with no flag
+    // about saving involved; and the table's sort goes on living in the layout
+    // file as it always has (ImGuiTableFlags_NoSavedSettings would have taken
+    // that away with the widths). The computed widths follow the font and the
+    // panel's width, which is how "modified" drops to its short form on a
+    // narrow panel and grows back. After a drag or an auto-fit the widths are
+    // the user's for the rest of the session and the writing stops:
     // I.colTouched, set below from the table's own state.
     const ImGuiStyle& tSt = ImGui::GetStyle();
     const float tCell  = tSt.CellPadding.x * 2 + 1;              // + inner border
@@ -2040,8 +2043,7 @@ void drawPanelRemote(App::BrowseInstance& I) {
                                        // this keeps the rows as they were - the
                                        // separator shows in the header, and down the
                                        // body only while a border is held or hovered
-                                       ImGuiTableFlags_NoBordersInBodyUntilResize |
-                                       ImGuiTableFlags_NoSavedSettings,
+                                       ImGuiTableFlags_NoBordersInBodyUntilResize,
                                        ImVec2(0, -rbFootH))) {
         // ---- the levels above the reader, held at the top ---------------------
         // A tree that scrolls loses the folder you are in: it is above
@@ -2113,45 +2115,68 @@ void drawPanelRemote(App::BrowseInstance& I) {
         // ---- the widths: computed until the user says otherwise ---------------
         // ImGui takes a fixed, resizable column's initial width ONCE, on the
         // table's first frame (imgui_tables.cpp, TableSetupColumn: WidthRequest
-        // is set from init_width_or_weight only while IsInitializing); after that
-        // only a drag, an auto-fit or the settings file moves it. The widths
-        // above change with the font and with the panel's width, so while the
-        // columns are untouched they are written into WidthRequest here, before
-        // the layout - the same assignment TableUpdateLayout makes for a
-        // NoResize column ("column->WidthRequest = width_auto"), made from here
-        // because the flag that had ImGui make it is the flag that forbids the
-        // drag. Not through TableSetColumnWidth: that clamps to WidthMax, which
-        // for the right-most column is the room it already has (the stretch
-        // column takes every spare pixel), so "modified" could never grow back
-        // from its short form; and for a fixed column behind a stretch one it
-        // trades width with its neighbour instead of setting it.
+        // is set from init_width_or_weight only while IsInitializing - and not
+        // even then when the layout file had a width for the column, because
+        // TableLoadSettings ran first); after that only a drag, an auto-fit or
+        // the settings file moves it. The widths above change with the font and
+        // with the panel's width, so while the columns are untouched they are
+        // written into WidthRequest here, before the layout - the same
+        // assignment TableUpdateLayout makes for a NoResize column
+        // ("column->WidthRequest = width_auto"), made from here because the flag
+        // that had ImGui make it is the flag that forbids the drag. Not through
+        // TableSetColumnWidth: that clamps to WidthMax, which for the right-most
+        // column is the room it already has (the stretch column takes every
+        // spare pixel), so "modified" could never grow back from its short
+        // form; and for a fixed column behind a stretch one it trades width
+        // with its neighbour instead of setting it.
+        //
+        // Whether the user has spoken is read off the table's own state here,
+        // before the layout, so the answer governs this very frame:
+        //   - LastResizedColumn != -1: a column border was held last frame and
+        //     its new width has just been committed (TableBeginApplyRequests,
+        //     the first thing BeginTable does with a resize) - a drag;
+        //   - AutoFitQueue != 0 on a column: an auto-fit was asked for - a
+        //     double-click on a border (TableUpdateBorders ->
+        //     TableSetColumnWidthAutoSingle) or "Size column to fit" in the
+        //     header's context menu, which Resizable brings with it. Nothing
+        //     else queues one here: every column has an explicit width (which
+        //     clears the queue) and TableLoadSettings clears it too;
+        //   - ...on EVERY enabled metadata column at once: the menu's "Size all
+        //     columns to default" (TableSetColumnWidthAutoAll queues them all;
+        //     the single-column paths queue one). Default, for this table, is
+        //     the computed widths, so this is the way BACK: the mark is
+        //     cleared, and the queues with it - or the layout would fit the
+        //     columns to their content for two frames first. (With a single
+        //     enabled metadata column the two requests are the same request.)
+        // Only the METADATA columns are read. The name column is a weightless
+        // stretch column, and ImGui gives such a column a three-frame auto-fit
+        // of its own when the table is born (TableUpdateLayout, start_auto_fit:
+        // StretchWeight < 0) - ImGui's doing, not the user's, and a fit of the
+        // one stretch column changes nothing, since it takes what is left
+        // whatever its weight.
         // RB_COL_* index the columns: the TableSetupColumn calls above are in
         // that order (the selftest's width checks are by these indices).
         ImGuiTable* tbl = ImGui::GetCurrentTable();
+        {
+            bool anyFit = false, allFit = true;
+            for (int c = RB_COL_SHAPE; c <= RB_COL_MTIME; c++) {
+                const ImGuiTableColumn& tc = tbl->Columns[c];
+                if (!tc.IsEnabled) continue;
+                if (tc.AutoFitQueue != 0) anyFit = true; else allFit = false;
+            }
+            if (anyFit && allFit) {
+                for (int c = RB_COL_SHAPE; c <= RB_COL_MTIME; c++) tbl->Columns[c].AutoFitQueue = 0;
+                I.colTouched = false;
+            } else if (anyFit || tbl->LastResizedColumn != -1) {
+                I.colTouched = true;
+            }
+        }
         if (!I.colTouched) {
             tbl->Columns[RB_COL_SHAPE].WidthRequest = wShape;
             tbl->Columns[RB_COL_SIZE].WidthRequest  = wSize;
             tbl->Columns[RB_COL_MTIME].WidthRequest = dateFull ? wDate : wDateS;
         }
         ImGui::TableHeadersRow();
-        // ---- did the user take hold of a column this frame? -------------------
-        // TableHeadersRow ran the layout, and with it TableUpdateBorders, which
-        // records a held column border in ResizedColumn (imgui_tables.cpp, the
-        // `held` branch of TableUpdateBorders); the width itself lands next
-        // frame, in TableBeginApplyRequests, by which time the mark is set and
-        // the block above has stood down. A double-click on a border, or "Size
-        // column to fit" / "Size all columns to default" from the header's
-        // context menu (which Resizable brings with it), queues an auto-fit
-        // instead - TableSetColumnWidthAutoSingle / -All set AutoFitQueue - and
-        // nothing else can: every column here has an explicit width, which
-        // clears the queue, and no settings are loaded. Either is the user's
-        // word on the widths, for the rest of the session.
-        if (!I.colTouched) {
-            bool touched = tbl->ResizedColumn != -1;
-            for (int c = RB_COL_SHAPE; c <= RB_COL_MTIME; c++)
-                if (tbl->Columns[c].AutoFitQueue != 0) touched = true;
-            I.colTouched = touched;
-        }
         // selftest probes: what the table laid out, and where its borders are
         for (int c = RB_COL_NAME; c <= RB_COL_MTIME; c++) {
             I.toolbar.colW[c] = tbl->Columns[c].WidthGiven;

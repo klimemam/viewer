@@ -2458,14 +2458,15 @@
                     same ? 1 : 0, portOk ? "ok" : "FAIL");
             if (!portOk) ok = false;
         }
-        {   // ---- COLUMN WIDTHS: computed until dragged, never written down ----
+        {   // ---- COLUMN WIDTHS: computed until dragged, whatever the file says --
             // #288. The listing's column edges are draggable again. The accident
-            // that took the drag away had two causes - an auto-fit width latched
-            // on a column before any row had arrived, and the layout file keeping
-            // that number across restarts - and each is pinned here on its own,
-            // plus the two contracts that replace them: a dragged width survives
-            // a listing change, and until there is a drag the computed widths
-            // follow the panel (the short "modified" form grows back).
+            // that took the drag away had two halves - an auto-fit width latched
+            // on a column before any row had arrived, and the layout file handing
+            // that number back at every start - and each is pinned here on its
+            // own, plus the contracts that go with them: a dragged width survives
+            // a listing change, until there is a drag the computed widths follow
+            // the panel (the short "modified" form grows back), and the sort the
+            // layout file carries still comes back at start.
             //
             // Headless frames of the REAL panel (the seriespanel recipe), drawn
             // last so nothing above sees them; the table reports what it laid out
@@ -2492,9 +2493,10 @@
                 ImGui::SetNextWindowSize(ImVec2(panelW, 700), ImGuiCond_Always);
                 // NOT ImGuiWindowFlags_NoSavedSettings, unlike the other probe
                 // windows: a table inherits that flag from its root window
-                // (imgui_tables.cpp, TableFixFlags), which would make check (c)
-                // below pass with or without the table's own flag. The run has
-                // no ini file (scriptedRun), so nothing reaches disk either way.
+                // (imgui_tables.cpp, TableFixFlags) and then neither saves nor
+                // LOADS settings, and (c) / (e) below are about what a loaded
+                // layout file does to the table. The run has no ini file
+                // (scriptedRun), so nothing reaches disk either way.
                 ImGui::Begin("BrowseColsProbe", nullptr,
                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoDocking);
                 drawPanelRemote(I);
@@ -2593,30 +2595,49 @@
                         shapeDragged, wShape, I.colTouched ? 1 : 0, from.c_str(), want.c_str(),
                         g.colW[RB_COL_SHAPE], (dragOk && keptOk) ? "ok" : "FAIL");
             }
-            // (c) NOTHING REACHES THE LAYOUT FILE. What SaveIniSettingsToDisk
-            // would write has no [Table] entry under this table's id - the drag
-            // above made the table "dirty", which is exactly when ImGui writes
-            // one. Then a restart: the table forgotten (a new process starts
-            // from no table), the session mark gone with it, and the widths are
-            // the computed ones again.
-            bool notWritten = false, restartOk = false;
+            // (c) THE OTHER HALF OF THE ACCIDENT: a width the layout file hands
+            // the table. ImGui saves a Resizable table's widths and its sort (the
+            // drag above has just had it write this table's entry - logged, not
+            // asserted), and users' files still carry the widths the old accident
+            // latched. A new process - the table forgotten, the session mark
+            // clear - that loads such a file must show the COMPUTED widths on its
+            // very first frame; and (e) the sort the file carries, which is what
+            // the listing has always come back with, must come back too. The
+            // stale numbers are the ones in the real file.
+            bool staleOk = false, stillOk = false, sortOk = false;
             {
-                size_t n = 0;
-                const char* ini = ImGui::SaveIniSettingsToMemory(&n);
                 char key[64];
                 snprintf(key, sizeof key, "[Table][0x%08X,4]", g.colTableId);
-                notWritten = std::string(ini, n).find(key) == std::string::npos;
+                size_t n = 0;
+                const char* saved = ImGui::SaveIniSettingsToMemory(&n);
+                const bool written = std::string(saved, n).find(key) != std::string::npos;
+                char ini[512];
+                snprintf(ini, sizeof ini,
+                         "%s\nColumn 0  Weight=1.0000\nColumn 1  Width=113\n"
+                         "Column 2  Width=57\nColumn 3  Width=152 Sort=0^\n", key);
                 if (ImGuiTable* t = ImGui::TableFindByID((ImGuiID)g.colTableId)) ImGui::TableRemove(t);
+                ImGui::LoadIniSettingsFromMemory(ini);
                 I.colTouched = false;
-                frame(900); frame(900);
-                restartOk = about(g.colW[RB_COL_SHAPE], wShape) && about(g.colW[RB_COL_MTIME], wDate);
-                fprintf(stderr, "browseselftest: layout file after the drag: entry %s %s; after "
-                                "a restart: shape %.0f (computed %.0f): %s\n",
-                        key, notWritten ? "absent" : "PRESENT", g.colW[RB_COL_SHAPE], wShape,
-                        (notWritten && restartOk) ? "ok" : "FAIL");
+                frame(900);
+                const float f1Shape = g.colW[RB_COL_SHAPE], f1Size = g.colW[RB_COL_SIZE],
+                            f1Date = g.colW[RB_COL_MTIME];
+                staleOk = about(f1Shape, wShape) && about(f1Size, wSize) && about(f1Date, wDate);
+                sortOk = I.sortCol == RB_COL_MTIME && I.sortDesc;
+                frame(900);
+                stillOk = about(g.colW[RB_COL_SHAPE], wShape) && about(g.colW[RB_COL_MTIME], wDate) &&
+                          I.sortCol == RB_COL_MTIME && I.sortDesc;
+                fprintf(stderr, "browseselftest: layout file (entry %s written by the drag=%d) "
+                                "reloaded with stale widths 113/57/152 and Sort=0^ on modified, into "
+                                "a new table: first frame shape %.0f size %.0f modified %.0f "
+                                "(computed %.0f / %.0f / %.0f)=%d, sort col %d desc %d (want %d 1)=%d, "
+                                "second frame same=%d: %s\n",
+                        key, written ? 1 : 0, f1Shape, f1Size, f1Date, wShape, wSize, wDate,
+                        staleOk ? 1 : 0, I.sortCol, I.sortDesc ? 1 : 0, (int)RB_COL_MTIME,
+                        sortOk ? 1 : 0, stillOk ? 1 : 0,
+                        (staleOk && sortOk && stillOk) ? "ok" : "FAIL");
             }
             if (!(emptyOk && fullOk && shortOk && regrowOk && dragOk && keptOk &&
-                  notWritten && restartOk)) ok = false;
+                  staleOk && sortOk && stillOk)) ok = false;
         }
         {   // ---- THE FIXTURE THIS TEST WAS HANDED IS NOT THIS TEST'S TO EDIT --
             // tools/testdata/rb is shared: --browse-keys-selftest navigates it by

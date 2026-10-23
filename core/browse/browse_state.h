@@ -38,7 +38,7 @@ struct RbToolbarGeom {
     // (RB_COL_* order; 0 = the column is dropped for want of room), the right
     // edge of each - the border a drag takes hold of - the header row's top and
     // height, which is where that border is hit-tested, and the table's own id,
-    // the key a [Table] entry in layout.ini would carry if one were written.
+    // the key its [Table] entry in layout.ini carries.
     float colW[4] = { 0, 0, 0, 0 };
     float colEdgeX[4] = { 0, 0, 0, 0 };
     float colHdrY0 = 0, colHdrH = 0;
@@ -306,9 +306,10 @@ struct Instance {
     // and written into the table every frame - until the user drags a column
     // edge or asks for an auto-fit, after which the widths are theirs for the
     // rest of the session. This is the mark that tells the two apart (#288).
-    // Session-only on purpose, like the widths it protects: the table carries
-    // ImGuiTableFlags_NoSavedSettings, so nothing reaches layout.ini and a
-    // restart starts from the computed widths again.
+    // Session-only by construction: a new process starts with it false, so
+    // whatever width the layout file hands the table on its first frame (ImGui
+    // saves a Resizable table's widths, and the stale ones of the old accident
+    // are still in users' files) is overwritten before it is ever laid out.
     bool colTouched = false;
     // multi-select, by row index; sig says which listing it was built for
     std::vector<char> sel;
