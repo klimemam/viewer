@@ -1530,7 +1530,8 @@ static std::string histHlBadgeSaid() {
 //                 -0.0312 or 1.2041 says HOW FAR outside the display range the
 //                 sample is, which is the whole value of the column. xOf().
 //   画面値 screen  the 8-bit byte rebuildTexture writes: clamp, gamma, round.
-//                 A non-finite sample is 0 (black). byteOf().
+//                 A NaN sample is 0 (black); +-inf are the clamp ends,
+//                 255 / 0. byteOf().
 //
 // byteOf is the ONLY spelling of pixel -> byte. The texture loop below, the
 // Inspector's Pixel table and the status bar all call it; the PNG and video
@@ -1559,7 +1560,7 @@ struct DisplayMap {
     float xOf(float v) const { return (v - black) * inv; }
     uint8_t byteOf(float v) const {
         float x = std::clamp(xOf(v), 0.0f, 1.0f);
-        // A non-finite sample is BLACK (issue #296). std::clamp passes NaN
+        // A NaN sample is BLACK (issue #296). std::clamp passes NaN
         // through (every comparison with it is false), and both casts below
         // are then undefined: (int)NaN is INT_MIN on x86-64, so gammaLut[i]
         // read 8 GB before the table and the viewer died on the first NaN pixel
