@@ -1192,12 +1192,11 @@ home,dbl,waitdir:stopset,chkdir:stopset")
 # gets and the one NOTHING in this suite ran until now.
 #
 # #236 moved the local folder scan onto a thread and kept a synchronous branch
-# for scripted runs, because 103 call sites across 26 selftest files read
-# app.folderPick on the line after openFolder(). That branch is a convenience
-# and a HOLE: g_scriptedRun is true for every selftest, so all 57 of them walk
-# the folder on the UI thread and the worker handoff - scan finishes, "Scanning
-# folder" modal closes, picker opens, Load queues the stacks - had no test at
-# all. Issue #244 ("remote stacks stopped loading") could not be confirmed or
+# for scripted runs, because selftests read app.folderPick on the line after
+# openFolder(). That branch is a convenience and a HOLE: g_scriptedRun is true
+# for every selftest, so every selftest walks the folder on the UI thread and
+# the worker handoff - scan finishes, "Scanning folder" modal closes, picker
+# opens, Load queues the stacks - had no test at all. Issue #244 ("remote stacks stopped loading") could not be confirmed or
 # refuted against this suite for exactly that reason.
 #
 # --async-scan takes the branch back for this one run; `waitpick` is the wait a

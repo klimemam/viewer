@@ -85,7 +85,7 @@ static int cjkFontSelftest() {
         { 0x201C, Must, "U+201C left double quote (General Punctuation)" },
         { 0x201D, Must, "U+201D right double quote (General Punctuation)" },
         { 0x2018, Must, "U+2018 left single quote (General Punctuation)" },
-        // The four this build already asked for, one at a time. They are in the
+        // The ones this build asked for one at a time. They are in the
         // table so that widening the ranges cannot silently drop one of them -
         // U+2025 in particular is now covered BY the punctuation block rather
         // than by its own AddChar, which is exactly the kind of change that
@@ -94,6 +94,7 @@ static int cjkFontSelftest() {
         { 0x29C9, Soft, "U+29C9 two joined squares (the Files panel's share mark)" },
         { 0x03C3, Must, "U+03C3 sigma (the noise tables)" },
         { 0x03BC, Must, "U+03BC mu (the noise tables)" },
+        { 0x2192, Must, "U+2192 rightwards arrow (the status bar's screen-value mark)" },
         // ...and the Japanese the report led with, which must not regress.
         { 0x3042, Must, "U+3042 hiragana A" },
         { 0x30AB, Must, "U+30AB katakana KA" },

@@ -837,8 +837,8 @@ static void cjkFontRanges(ImFontAtlas* atlas, ImVector<ImWchar>& out) {
     b.AddChar((ImWchar)0x03C3);        // sigma
     b.AddChar((ImWchar)0x03BC);        // mu
     // U+2192 RIGHTWARDS ARROW: the status bar's marker for the hovered sample's
-    // screen value (HOVER_SCREEN_MARK, main.cpp). The Arrows block is in
-    // neither CJK table.
+    // screen value (hoverScreenMarkFor, main.cpp, which falls back to "->"
+    // when no CJK face loaded). The Arrows block is in neither CJK table.
     b.AddChar((ImWchar)0x2192);
     b.BuildRanges(&out);
     g_cjkRangesAsked = out;      // see g_cjkRangesAsked for why this is kept

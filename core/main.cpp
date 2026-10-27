@@ -254,15 +254,22 @@ static HoverReadout hoverReadoutOf(const ImageDoc& im, const DisplayMap& M, floa
     r.screen = b;
     return r;
 }
-// U+2192 RIGHTWARDS ARROW, the status bar's marker for the screen value, as UTF-8
-// bytes - a macro for SIGMA's reason (the letter after a \x escape has to be a
-// separate string). cjkFontRanges() asks the font for it.
-#define HOVER_SCREEN_MARK "\xe2\x86\x92"
+// The status bar's marker for the screen value. U+2192 RIGHTWARDS ARROW comes
+// only from the CJK face (cjkFontRanges() asks it for the glyph; ProggyClean,
+// the face used when no CJK font loaded, has no arrows), so without that face
+// the arrow would draw as '?' and the marker is the ASCII "->" instead
+// (issue #297 item 3). Chosen once, where the fonts are loaded.
+static const char* hoverScreenMarkFor(bool cjkFaceLoaded) {
+    return cjkFaceLoaded ? "\xe2\x86\x92" : "->";
+}
+static const char* g_hoverScreenMark = hoverScreenMarkFor(true);
 // The status bar's hover part: "  |  A (12, 34) [Gr] = 1023  x 0.0156  →4" -
 // raw / 表示値 / 画面値, one group per number and every channel in each group,
 // every number from hoverReadoutOf. `budget` is how many bytes the status bar
 // still has room for: when the three do not fit, the screen value is dropped
-// first, then x, and the raw value is never dropped (--hover-selftest T5).
+// first, then x; when not even the raw value fits WHOLE, the result is empty -
+// a number cut off mid-digit (355.75 shown as 355) is a value that does not
+// exist, and no number is better than that one (--hover-selftest T5, T10).
 static std::string hoverStatusText(const ImageDoc& hv, bool compare, bool inB,
                                    int x, int y, size_t budget) {
     std::string head = "  |  ";
@@ -280,10 +287,46 @@ static std::string hoverStatusText(const ImageDoc& hv, bool compare, bool inB,
     }
     const std::string rawOnly = head + raws;
     const std::string withX = rawOnly + "  x " + xs;
-    const std::string withAll = withX + "  " HOVER_SCREEN_MARK + screens;
+    const std::string withAll = withX + "  " + g_hoverScreenMark + screens;
     if (withAll.size() <= budget) return withAll;
     if (withX.size() <= budget) return withX;
-    return rawOnly;
+    if (rawOnly.size() <= budget) return rawOnly;
+    return std::string();
+}
+// The status bar's text left of the remote indicators: name, frame, size,
+// dtype, then the hover part in what is left of 511 bytes. Split out of the
+// frame loop so --hover-selftest reads the surface itself, not only
+// hoverStatusText's return value.
+static std::string statusBarText() {
+    ImageDoc* im = cur();
+    if (!im) return "no image";
+    char st[512];
+    // the readout follows the pane: in a split compare, values under
+    // the cursor in pane B are B's, and must say so
+    ImageDoc* hv = app.hoverInB && cmpB() ? cmpB() : im;
+    char seqInfoStr[64] = "";
+    if (im->seqId != 0) {
+        std::vector<int> fr = framesOfSeq(im->seqId);
+        int pos = 0;
+        for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
+        snprintf(seqInfoStr, sizeof seqInfoStr, "  frame %d/%d", pos + 1, (int)fr.size());
+    }
+    // zoom moved into the Image View footer (C3): magnification is
+    // a property of the pixels being looked at, so it sits beside
+    // them, not at the far edge of the screen
+    snprintf(st, 512, "%s%s   %dx%d %dch %s",
+             im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
+             im->dtype.c_str());
+    if (app.hoverX >= 0 && app.hoverX < hv->w && app.hoverY < hv->h) {
+        // The hover part gets what is left of the 512 after the name and
+        // the size, and is either whole or absent: hoverStatusText returns
+        // nothing rather than a part that would be cut here mid-number.
+        const size_t used = strlen(st);
+        const std::string hover = hoverStatusText(*hv, cmpB() != nullptr, app.hoverInB,
+                                                  app.hoverX, app.hoverY, 511 - used);
+        snprintf(st + used, 512 - used, "%s", hover.c_str());
+    }
+    return st;
 }
 
 // ---------------------------------------------------------------- UI
@@ -1369,6 +1412,7 @@ int main(int argc, char** argv) {
             mergePath.clear();          // unreadable: one face, and say nothing
     }
     g_fontMergePath = mergePath;
+    g_hoverScreenMark = hoverScreenMarkFor(jp != nullptr);
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);
@@ -2141,36 +2185,7 @@ static bool g_watchSuppressed = false;
 
         // status bar
         {
-            ImageDoc* im = cur();
-            char st[512];
-            snprintf(st, 512, "no image");
-            if (im) {
-                // the readout follows the pane: in a split compare, values under
-                // the cursor in pane B are B's, and must say so
-                ImageDoc* hv = app.hoverInB && cmpB() ? cmpB() : im;
-                char seqInfoStr[64] = "";
-                if (im->seqId != 0) {
-                    std::vector<int> fr = framesOfSeq(im->seqId);
-                    int pos = 0;
-                    for (int i = 0; i < (int)fr.size(); i++) if (fr[i] == app.current) pos = i;
-                    snprintf(seqInfoStr, sizeof seqInfoStr, "  frame %d/%d", pos + 1, (int)fr.size());
-                }
-                // zoom moved into the Image View footer (C3): magnification is
-                // a property of the pixels being looked at, so it sits beside
-                // them, not at the far edge of the screen
-                snprintf(st, 512, "%s%s   %dx%d %dch %s",
-                         im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
-                         im->dtype.c_str());
-                if (app.hoverX >= 0 && app.hoverX < hv->w && app.hoverY < hv->h) {
-                    // The hover readout gets what is left of the 512 after the
-                    // name and the size, and decides for itself what to drop
-                    // when that is short (raw stays, hoverStatusText).
-                    const size_t used = strlen(st);
-                    const std::string hover = hoverStatusText(*hv, cmpB() != nullptr, app.hoverInB,
-                                                              app.hoverX, app.hoverY, 511 - used);
-                    snprintf(st + used, 512 - used, "%s", hover.c_str());
-                }
-            }
+            const std::string st = statusBarText();
             // Remote link indicator, VSCode-style: the leftmost thing on the
             // status bar, always present while a server is involved. A toast
             // expires; "am I connected?" must be answerable at any moment.
@@ -2273,7 +2288,7 @@ static bool g_watchSuppressed = false;
                 }
                 ImGui::PopID();
             }
-            ImGui::TextUnformatted(st);
+            ImGui::TextUnformatted(st.c_str());
             // compare is a persistent state: a toast that expires is not enough
             if (app.compareMode != App::CmpOff) {
                 ImageDoc* b = cmpB();
