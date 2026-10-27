@@ -372,6 +372,14 @@ static const char* const* channelLabels(int ch) {
     return ch == 1 ? LB1 : ch == 2 ? LB2 : LB3;
 }
 
+// What the Pixel table PRINTED this frame, for --hover-selftest: the header's
+// three value columns ("hdr=raw [DN]|norm x|screen;") and one "row=ch|raw|x|
+// screen;" per channel - the same strings that went to ImGui, recorded as they
+// are passed, on the g_paneBadgeProbe rule. A probe that re-formatted the
+// numbers would be a second spelling of exactly the thing the test exists to
+// catch.
+static std::string g_pixelProbe;
+
 static void drawInspector() {
     ImageDoc* im = cur();
     ImGui::SeparatorText("Pixel");
@@ -389,7 +397,13 @@ static void drawInspector() {
             ImGui::TextDisabled("(-, -)  hover the image");
         int nch = im ? im->ch : 1;
         const char* const* lb = channelLabels(nch);
-        float inv = im ? 1.0f / std::max(effWhite(*im) - effBlack(*im), 1e-20f) : 1.0f;
+        // The mapping the texture was built with (compare.inc): the x and screen
+        // columns are DisplayMap::xOf / byteOf of the sample through
+        // hoverReadoutOf, which is also what the status bar prints. Three
+        // numbers per channel - 生値 raw, 表示値 x, 画面値 screen - and what each
+        // one is, and what the screen column means under CFA colorize or a
+        // colormap, is written once, at DisplayMap.
+        const DisplayMap M = im ? displayMapOf(*im) : DisplayMap{};
         // With compare on, the same pixel in B (and A-B) is the number the eye
         // cannot read off a wipe: two extra columns, present whenever compare is.
         ImageDoc* b = cmpB();
@@ -407,11 +421,18 @@ static void drawInspector() {
         std::string hRaw = std::string(b ? "A" : "raw") + unitOf(tA);
         std::string hB = std::string("B") + (b ? unitOf(b->dtype) : "");
         std::string hDiff = std::string("A-B") + unitOf(tDiff);
+        // The screen column is the byte the texture holds for this sample; with
+        // a colormap that byte picks the colour, so it is the LUT's index and
+        // the header says so.
+        const char* hScreen = M.colormap ? "screen idx" : "screen";
+        g_pixelProbe = std::string("hdr=") + hRaw + "|norm x|" + hScreen + ";";
         // fixed widths: the numbers must not shift as the cursor moves
-        if (ImGui::BeginTable("px", b ? 5 : 3, ImGuiTableFlags_SizingFixedFit)) {
+        if (ImGui::BeginTable("px", b ? 6 : 4, ImGuiTableFlags_SizingFixedFit)) {
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
             ImGui::TableSetupColumn(hRaw.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
-            ImGui::TableSetupColumn("norm [-]", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn("norm x", ImGuiTableColumnFlags_WidthFixed, numColW());
+            ImGui::TableSetupColumn(hScreen, ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::CalcTextSize("screen idx").x);
             if (b) {
                 ImGui::TableSetupColumn(hB.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
                 ImGui::TableSetupColumn(hDiff.c_str(), ImGuiTableColumnFlags_WidthFixed, numColW());
@@ -419,13 +440,19 @@ static void drawInspector() {
             ImGui::TableHeadersRow();
             for (int c = 0; c < nch; c++) {
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(c < 4 ? lb[std::min(c, 3)] : "?");
+                const char* chLabel = c < 4 ? lb[std::min(c, 3)] : "?";
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(chLabel);
                 float v = 0;
                 if (live) {
                     v = im->sample(app.hoverX, app.hoverY, c);
-                    ImGui::TableNextColumn(); textNumStr(fmtVal(v, im->dtype));
-                    ImGui::TableNextColumn(); textNum("%.4f", (v - effBlack(*im)) * inv);
+                    const HoverReadout r = hoverReadoutOf(*im, M, v);
+                    ImGui::TableNextColumn(); textNumStr(r.raw);
+                    ImGui::TableNextColumn(); textNumStr(r.x);
+                    ImGui::TableNextColumn(); textNumStr(r.screen);
+                    g_pixelProbe += std::string("row=") + chLabel + "|" + r.raw + "|" + r.x +
+                                    "|" + r.screen + ";";
                 } else {
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                     ImGui::TableNextColumn(); ImGui::TextDisabled("-");
                 }

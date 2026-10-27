@@ -1511,6 +1511,85 @@ static std::string histHlBadgeSaid() {
     return head + who + ": " + histHlCountPhrase(*Cp, nullptr);
 }
 
+// ---- the display mapping: ONE pixel value -> the numbers the user sees -------
+// Three numbers belong to one sample under the cursor (issue #292, and
+// docs/guides/manual.md's Pixel section names them):
+//
+//   生値  raw     the sample itself, formatted by fmtVal
+//   表示値 x      (v - black) * inv, NOT clamped. Out of range stays out of range:
+//                 -0.0312 or 1.2041 says HOW FAR outside the display range the
+//                 sample is, which is the whole value of the column. xOf().
+//   画面値 screen  the 8-bit byte rebuildTexture writes: clamp, gamma, round.
+//                 byteOf().
+//
+// byteOf is the ONLY spelling of pixel -> byte. The texture loop below, the
+// Inspector's Pixel table and the status bar all call it; the PNG and video
+// exports reach it through renderDocRGBA. Two spellings is how two surfaces
+// come to disagree about one pixel - one frame late or one rounding apart - so
+// a second (x * 255.0f + 0.5f) for a PIXEL'S display value anywhere else is the
+// defect, not a shortcut. What is not a second spelling: the A-B difference
+// image (ensureDiffTexture) quantizes a DIFFERENCE through its own gain and
+// colour ramp, the histogram bins the RAW value on its own DN grid, and the
+// value highlight tests the RAW value - different quantities, not this one
+// re-derived.
+//
+// Where the line is drawn for the branches that do not paint gray: CFA colorize
+// and the 2-channel layout put the SAME byte into some output channels and
+// black into the others (r = c == 0 ? src : black), and a display LUT turns the
+// byte into an RGB triple by table. The Pixel table's rows are INPUT channel
+// samples, so the screen value of a row is byteOf(sample) - the gray mapping of
+// that sample - and never the colorized RGB, because the row means "this
+// sample's value", not "this pixel's colour". With a LUT the byte is the LUT's
+// INDEX, and the column header says so ("screen idx", see `colormap` below).
+struct DisplayMap {
+    float black = 0, inv = 1;
+    bool doGamma = false;
+    const float* gammaLut = nullptr;   // sqrt-domain table, 1025 entries; set when doGamma
+    const uint8_t* colormap = nullptr; // display plugin LUT (RGB triples), or null = gray
+    float xOf(float v) const { return (v - black) * inv; }
+    uint8_t byteOf(float v) const {
+        float x = std::clamp(xOf(v), 0.0f, 1.0f);
+        if (doGamma) {
+            float f = sqrtf(x) * 1024.0f;
+            int i = std::min((int)f, 1023);
+            x = gammaLut[i] + (gammaLut[i + 1] - gammaLut[i]) * (f - i);
+        }
+        return (uint8_t)(x * 255.0f + 0.5f);
+    }
+};
+// Gamma through a table instead of 36 million powf() calls at 12 Mpx (235 ms
+// -> 76 ms measured), which is what makes dragging the range slider usable at
+// gamma 2.2. The table is in the SQRT domain: x^(1/g) is vertical at x=0, so
+// interpolating it there is worth 3 output codes of error, while the same
+// table over sqrt(x) is nearly straight and lands within 0.001 of exact.
+// Rebuilt only when the gamma changes; one table for the whole app.
+static const float* displayGammaTable(float gamma) {
+    static float lut[1025];
+    static float lutFor = -1;
+    if (lutFor != gamma) {
+        const float invGamma = 1.0f / gamma;
+        for (int i = 0; i <= 1024; i++) lut[i] = powf(i / 1024.0f, 2.0f * invGamma);
+        lutFor = gamma;
+    }
+    return lut;
+}
+static DisplayMap displayMapOf(const ImageDoc& im) {
+    DisplayMap M;
+    M.black = effBlack(im);
+    M.inv = 1.0f / std::max(effWhite(im) - M.black, 1e-20f);
+    // Custom values remain Custom even when close to 1.0. Only the exact
+    // linear preset bypasses gamma; otherwise a value such as 1.0005 must
+    // affect the view as entered.
+    M.doGamma = displayGammaNeedsTransform(app.dispGamma);
+    if (M.doGamma) M.gammaLut = displayGammaTable(app.dispGamma);
+    // display plugin colormap: 1ch only, and CFA colorize wins over it
+    const bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
+    if (im.ch == 1 && !cfaColor && im.displayLut >= 0 &&
+        im.displayLut < (int)plugin_host::displays().size())
+        M.colormap = plugin_host::displays()[im.displayLut].lut.data();
+    return M;
+}
+
 // upload/normalize into RGBA8 texture
 // float pixels -> display RGBA, exactly as the screen shows them (range, gamma,
 // colormap, CFA colorize). Split out of rebuildTexture so that EXPORTING a view
@@ -1518,43 +1597,17 @@ static std::string histHlBadgeSaid() {
 // screen is worse than no picture.
 static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
     rgba.resize((size_t)im.w * im.h * 4);
-    const float ib = effBlack(im), iw = effWhite(im);
-    float inv = 1.0f / std::max(iw - ib, 1e-20f);
-    float invGamma = 1.0f / app.dispGamma;
-    // Custom values remain Custom even when close to 1.0. Only the exact
-    // linear preset bypasses gamma; otherwise a value such as 1.0005 must
-    // affect the view as entered.
-    bool doGamma = displayGammaNeedsTransform(app.dispGamma);
-    // Gamma through a table instead of 36 million powf() calls at 12 Mpx (235 ms
-    // -> 76 ms measured), which is what makes dragging the range slider usable at
-    // gamma 2.2. The table is in the SQRT domain: x^(1/g) is vertical at x=0, so
-    // interpolating it there is worth 3 output codes of error, while the same
-    // table over sqrt(x) is nearly straight and lands within 0.001 of exact.
-    static float gammaLut[1025];
-    static float gammaLutFor = -1;
-    if (doGamma && gammaLutFor != app.dispGamma) {
-        for (int i = 0; i <= 1024; i++) gammaLut[i] = powf(i / 1024.0f, 2.0f * invGamma);
-        gammaLutFor = app.dispGamma;
-    }
-    auto applyGamma = [&](float x) {
-        float f = sqrtf(x) * 1024.0f;
-        int i = std::min((int)f, 1023);
-        return gammaLut[i] + (gammaLut[i + 1] - gammaLut[i]) * (f - i);
-    };
-    bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
-    const uint8_t* lut = nullptr;   // display plugin colormap (1ch only; CFA colorize wins)
-    if (im.ch == 1 && !cfaColor && im.displayLut >= 0 &&
-        im.displayLut < (int)plugin_host::displays().size())
-        lut = plugin_host::displays()[im.displayLut].lut.data();
+    const DisplayMap M = displayMapOf(im);
+    const float ib = M.black;
+    const bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
+    const uint8_t* lut = M.colormap;
     int px = 0, py = 0;
     for (size_t p = 0; p < (size_t)im.w * im.h; p++, px++) {
         if (px == im.w) { px = 0; py++; }
         const float* src = &im.px()[p * im.ch];
         float r, g, b;
         if (lut) {
-            float x = std::clamp((src[0] - ib) * inv, 0.0f, 1.0f);
-            if (doGamma) x = applyGamma(x);
-            int idx = (int)(x * 255.0f + 0.5f);
+            const int idx = M.byteOf(src[0]);
             rgba[p * 4 + 0] = lut[idx * 3];
             rgba[p * 4 + 1] = lut[idx * 3 + 1];
             rgba[p * 4 + 2] = lut[idx * 3 + 2];
@@ -1572,12 +1625,9 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
         else if (im.ch == 1) { r = g = b = src[0]; }
         else if (im.ch == 2) { r = src[0]; g = src[1]; b = ib; }
         else                 { r = src[0]; g = src[1]; b = src[2]; }
-        float v[3] = { (r - ib) * inv, (g - ib) * inv, (b - ib) * inv };
-        for (int c = 0; c < 3; c++) {
-            float x = std::clamp(v[c], 0.0f, 1.0f);
-            if (doGamma) x = applyGamma(x);
-            rgba[p * 4 + c] = (uint8_t)(x * 255.0f + 0.5f);
-        }
+        rgba[p * 4 + 0] = M.byteOf(r);
+        rgba[p * 4 + 1] = M.byteOf(g);
+        rgba[p * 4 + 2] = M.byteOf(b);
         rgba[p * 4 + 3] = 255;
     }
     // The value highlight goes HERE and nowhere else. This is the one place a

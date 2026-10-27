@@ -231,6 +231,61 @@ static std::string fmtVal(float v, const std::string& dtype) {
     return b;
 }
 
+// ---- the hover readout: three numbers for one sample ------------------------
+// What the Inspector's Pixel table and the status bar print for the sample under
+// the cursor (issue #292). ONE function for both surfaces, so they cannot
+// disagree about one pixel: the rounding of x and the byte are decided here and
+// nowhere else, and the byte is DisplayMap::byteOf - the texture's own mapping
+// (compare.inc), which is what makes the screen column the screen's value and
+// not a second formula for it. --hover-selftest asserts the three surfaces
+// against each other.
+struct HoverReadout {
+    std::string raw;     // 生値:   fmtVal's text
+    std::string x;       // 表示値 x: %.4f, NOT clamped - out of range stays out of range
+    std::string screen;  // 画面値:  the byte, decimal (with a colormap: the LUT index)
+};
+static HoverReadout hoverReadoutOf(const ImageDoc& im, const DisplayMap& M, float v) {
+    HoverReadout r;
+    r.raw = fmtVal(v, im.dtype);
+    char b[32];
+    snprintf(b, sizeof b, "%.4f", (double)M.xOf(v));
+    r.x = b;
+    snprintf(b, sizeof b, "%d", (int)M.byteOf(v));
+    r.screen = b;
+    return r;
+}
+// U+2192 RIGHTWARDS ARROW, the status bar's marker for the screen value, as UTF-8
+// bytes - a macro for SIGMA's reason (the letter after a \x escape has to be a
+// separate string). cjkFontRanges() asks the font for it.
+#define HOVER_SCREEN_MARK "\xe2\x86\x92"
+// The status bar's hover part: "  |  A (12, 34) [Gr] = 1023  x 0.0156  →4" -
+// raw / 表示値 / 画面値, one group per number and every channel in each group,
+// every number from hoverReadoutOf. `budget` is how many bytes the status bar
+// still has room for: when the three do not fit, the screen value is dropped
+// first, then x, and the raw value is never dropped (--hover-selftest T5).
+static std::string hoverStatusText(const ImageDoc& hv, bool compare, bool inB,
+                                   int x, int y, size_t budget) {
+    std::string head = "  |  ";
+    if (compare) head += inB ? "B " : "A ";
+    head += "(" + std::to_string(x) + ", " + std::to_string(y) + ")";
+    if (hv.cfa) head += std::string(" [") + CFA_CH_NAMES[cfaChannelAt(hv, x, y)] + "]";
+    head += " =";
+    const DisplayMap M = displayMapOf(hv);
+    std::string raws, xs, screens;
+    for (int c = 0; c < hv.ch; c++) {
+        const HoverReadout r = hoverReadoutOf(hv, M, hv.sample(x, y, c));
+        raws += " " + r.raw;
+        xs += (c ? " " : "") + r.x;
+        screens += (c ? " " : "") + r.screen;
+    }
+    const std::string rawOnly = head + raws;
+    const std::string withX = rawOnly + "  x " + xs;
+    const std::string withAll = withX + "  " HOVER_SCREEN_MARK + screens;
+    if (withAll.size() <= budget) return withAll;
+    if (withX.size() <= budget) return withX;
+    return rawOnly;
+}
+
 // ---------------------------------------------------------------- UI
 #include "ui/canvas.inc"
 #include "ui/panel_preferences.inc"
@@ -787,6 +842,12 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // abEqSelftest's reason: it is a function, and it drives the real Statistics
 // panel through real frames.
 #include "selftest/histhl.inc"
+
+// The three numbers of one hovered sample (#292): raw, 表示値 x, 画面値, on the
+// Inspector's Pixel table, the status bar and the texture. Here beside histhl
+// because it is the same kind of test - it drives the real Inspector through
+// real frames and reads the texture's bytes from renderDocRGBA.
+#include "selftest/hover.inc"
 
 // Frame stepping keeps the picture's size (#250). Here beside histhl because it
 // is a function like histHlSelftest() and needs nothing more than selectImage
@@ -1505,6 +1566,12 @@ int main(int argc, char** argv) {
     // every assertion is a byte, a count or a string.
     if (g_histHlSelftest) return histHlSelftest();
 
+    // The hover readout (#292): the Inspector's Pixel table, the status bar and
+    // the texture say the same three numbers about one sample. Windowless for
+    // the histhl reasons - fixtures in memory, every assertion a string or a
+    // byte.
+    if (g_hoverSelftest) return hoverSelftest();
+
     // Frame stepping never changes the picture's size on screen (#250): the
     // shared view against frames sitting at two resolution levels. Windowless
     // for the histhl reasons - the fixtures are sizes and every assertion is a
@@ -2078,20 +2145,9 @@ static bool g_watchSuppressed = false;
             char st[512];
             snprintf(st, 512, "no image");
             if (im) {
-                std::string hover;
                 // the readout follows the pane: in a split compare, values under
                 // the cursor in pane B are B's, and must say so
                 ImageDoc* hv = app.hoverInB && cmpB() ? cmpB() : im;
-                if (app.hoverX >= 0 && app.hoverX < hv->w && app.hoverY < hv->h) {
-                    hover = "  |  ";
-                    if (cmpB()) hover += app.hoverInB ? "B " : "A ";
-                    hover += "(" + std::to_string(app.hoverX) + ", " + std::to_string(app.hoverY) + ")";
-                    if (hv->cfa)
-                        hover += std::string(" [") + CFA_CH_NAMES[cfaChannelAt(*hv, app.hoverX, app.hoverY)] + "]";
-                    hover += " =";
-                    for (int c = 0; c < hv->ch; c++)
-                        hover += " " + fmtVal(hv->sample(app.hoverX, app.hoverY, c), hv->dtype);
-                }
                 char seqInfoStr[64] = "";
                 if (im->seqId != 0) {
                     std::vector<int> fr = framesOfSeq(im->seqId);
@@ -2102,9 +2158,18 @@ static bool g_watchSuppressed = false;
                 // zoom moved into the Image View footer (C3): magnification is
                 // a property of the pixels being looked at, so it sits beside
                 // them, not at the far edge of the screen
-                snprintf(st, 512, "%s%s   %dx%d %dch %s%s",
+                snprintf(st, 512, "%s%s   %dx%d %dch %s",
                          im->name.c_str(), seqInfoStr, im->w, im->h, im->ch,
-                         im->dtype.c_str(), hover.c_str());
+                         im->dtype.c_str());
+                if (app.hoverX >= 0 && app.hoverX < hv->w && app.hoverY < hv->h) {
+                    // The hover readout gets what is left of the 512 after the
+                    // name and the size, and decides for itself what to drop
+                    // when that is short (raw stays, hoverStatusText).
+                    const size_t used = strlen(st);
+                    const std::string hover = hoverStatusText(*hv, cmpB() != nullptr, app.hoverInB,
+                                                              app.hoverX, app.hoverY, 511 - used);
+                    snprintf(st + used, 512 - used, "%s", hover.c_str());
+                }
             }
             // Remote link indicator, VSCode-style: the leftmost thing on the
             // status bar, always present while a server is involved. A toast

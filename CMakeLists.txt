@@ -878,7 +878,7 @@ else()
 endif()
 
 # ---- selftests as ctest tests ---------------------------------------------
-# The binary carries 26 --*-selftest flags. THIS BLOCK IS THE LIST: CI runs
+# The binary's --*-selftest flags, as ctest runs them. THIS BLOCK IS THE LIST: CI runs
 # tools/run_selftests.sh, that script runs ctest, and a developer runs the same
 # script to get exactly what CI got. There is no second copy of the argument
 # lists anywhere - adding a test here adds it to CI.
@@ -1289,6 +1289,13 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # count == sum of the selected bins, inside the grid and at the folded end bin)
 # are the reason it is a test at all rather than a demo.
 viewer_selftest(histhl      NOGL --histhl-selftest)
+# The hovered sample's three numbers (#292): raw, 表示値 x and the screen byte,
+# on the Inspector's Pixel table, the status bar and the texture. The test is
+# the equality of the three surfaces, pixel by pixel, at two gammas - which is
+# what "one function" means once it is a claim rather than a comment. NOGL and
+# fixture-free for histhl's reasons: documents built in memory, the Inspector
+# driven through real frames, and every assertion a string or a byte.
+viewer_selftest(hover       NOGL --hover-selftest)
 # Frame stepping keeps the picture's size (#250): app.view is ONE view shared by
 # a stack whose frames can sit at two resolution levels at once (a remote frame
 # arrives decimated and is replaced by its full-resolution bytes later), so a
