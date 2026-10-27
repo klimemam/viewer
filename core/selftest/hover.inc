@@ -363,6 +363,71 @@ static int hoverSelftest() {
               "T7 3ch: status bar groups == Inspector columns, channel by channel");
     }
 
+    // ======================================================================
+    // Fixture D: f32, 3 x 1, (NaN, +inf, -inf), range 100 .. 1123 - the
+    // non-finite samples (issue #296). The contract is byteOf's: a NaN sample
+    // is screen 0 at EVERY gamma, and +-inf are the clamp ends, 255 / 0. The
+    // other two columns hide none of it: fmtVal prints nan / inf / -inf, and
+    // x = (NaN - 100) * inv is NaN, printed "nan" - the column is unclamped on
+    // purpose, and a NaN shown as 0.0000 would be a lie about the sample.
+    // Spelling: the fixture's NaN is quiet_NaN() with the sign bit clear, and
+    // the subtraction and the multiply keep the sign, so every C library prints
+    // it "nan" (a sign-bit NaN prints "-nan" or "-nan(ind)" depending on the
+    // library; no fixture here has one).
+    // Gamma 2.2 is the half that used to kill the process: byteOf's (int) of
+    // NaN indexed the gamma table at INT_MIN, so the renderDocRGBA below
+    // segfaulted before any assert ran. Surviving IS the first assert; the
+    // second is that all three surfaces then say 0.
+    // ======================================================================
+    {
+        ImageDoc* d = install(mk("hover_d", 3, 1, 1, "f32"));
+        d->px()[0] = std::numeric_limits<float>::quiet_NaN();
+        d->px()[1] = std::numeric_limits<float>::infinity();
+        d->px()[2] = -std::numeric_limits<float>::infinity();
+        setRange(*d, 100, 1123);
+        const char* RAWD[3] = { "nan", "inf", "-inf" };
+        const char* XD[3] = { "nan", "inf", "-inf" };
+        const int BYTED[3] = { 0, 255, 0 };
+        std::vector<Row> rows;
+        std::string status;
+        for (int pass = 0; pass < 2; pass++) {
+            const float gamma = pass ? 2.2f : 1.0f;
+            app.dispGamma = gamma;
+            d->texDirty = true;
+            std::vector<uint8_t> px;
+            renderDocRGBA(*d, px);
+            for (int x = 0; x < 3; x++) {
+                hoverAt(*d, x, 0, rows, status);
+                char what[128];
+                if (rows.size() != 1) {
+                    snprintf(what, sizeof what, "T8 g%.1f x=%d: one row for a 1ch document", gamma, x);
+                    check(false, what);
+                    continue;
+                }
+                const Row& r = rows[0];
+                const std::array<int, 4> b = rgbaAt(px, *d, x, 0);
+                const Status st = parseStatus(status);
+                snprintf(what, sizeof what, "T8 g%.1f x=%d (%s): Inspector raw is '%s'", gamma, x, RAWD[x], RAWD[x]);
+                checkEq(r.raw, RAWD[x], what);
+                snprintf(what, sizeof what, "T8 g%.1f x=%d (%s): Inspector norm x is '%s' (not clamped, not hidden)",
+                         gamma, x, RAWD[x], XD[x]);
+                checkEq(r.x, XD[x], what);
+                snprintf(what, sizeof what, "T8 g%.1f x=%d (%s): texture byte is %d", gamma, x, RAWD[x], BYTED[x]);
+                check(b[0] == BYTED[x] && b[1] == BYTED[x] && b[2] == BYTED[x] && b[3] == 255, what);
+                snprintf(what, sizeof what, "T8 g%.1f x=%d (%s): Inspector screen == texture byte", gamma, x, RAWD[x]);
+                checkEq(r.screen, std::to_string(b[0]), what);
+                snprintf(what, sizeof what, "T8 g%.1f x=%d (%s): status bar raw / x / screen == Inspector", gamma, x, RAWD[x]);
+                check(st.hasX && st.hasScreen && st.raws == r.raw && st.xs == r.x && st.screens == r.screen, what);
+            }
+        }
+        // the exact status bar text for the NaN sample, at the gamma that crashed
+        hoverAt(*d, 0, 0, rows, status);
+        checkEq(status, "  |  (0, 0) = nan  x nan  " HOVER_SCREEN_MARK "0",
+                "T8 g2.2 status bar text for NaN: '  |  (0, 0) = nan  x nan  ->0'");
+        app.dispGamma = 1.0f;
+        d->texDirty = true;
+    }
+
     // ---- leave the shared home as it was found -------------------------------
     app.hoverX = app.hoverY = -1;
     app.dispGamma = gamma0;

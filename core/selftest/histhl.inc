@@ -296,6 +296,20 @@ static int histHlSelftest() {
         check(histHlSideSaid(d.get(), "A") ==
               "A: 1 px (33.33% of finite R, whole frame)",
               "T4 a NaN pixel neither matches nor counts in the denominator");
+        // ...and once more at gamma 2.2, where this NaN pixel used to kill the
+        // process (issue #296: byteOf's (int) of NaN indexed the gamma table
+        // at INT_MIN). Getting past canvasDrew is the assert; the NaN pixel is
+        // then black by byteOf's contract, and the sentence is the same one.
+        app.dispGamma = 2.2f;
+        d->texDirty = true;
+        canvasDrew(*d, px);
+        check((rgbaAt(px, *d, 2, 0) == std::array<int, 4>{ 0, 0, 0, 255 }),
+              "T4 g2.2 the render survived and the NaN pixel is black");
+        check(histHlSideSaid(d.get(), "A") ==
+              "A: 1 px (33.33% of finite R, whole frame)",
+              "T4 g2.2 ...and the count sentence does not follow the gamma");
+        app.dispGamma = 1.0f;
+        d->texDirty = true;
         histHlClear();
     }
 
