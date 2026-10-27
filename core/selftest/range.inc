@@ -979,7 +979,9 @@
         // u16 through a real file. i16 and i8 had none anywhere, so i16
         // could have moved to -32768.. or to vmin.. and the suite would have
         // stayed green. i32 has no branch at all and falls to the float
-        // rules; the manual says so, and one row here pins that sentence.
+        // rules; one row here pins that i32 data outside [0,1] opens at its
+        // own min..max (a type-fullscale branch would turn it red). The
+        // 0..1-magnet half of that rule is not tested for i32.
         // In-memory fixtures; defaultRange reads nothing but the doc, so no
         // mode is borrowed.
         // ==================================================================
@@ -993,8 +995,10 @@
             // cannot answer either); the last sits inside the magnet on
             // purpose, so a float reading would answer 0..1, which is still
             // not 0..32767. The i32 row is the one exception: it has no
-            // branch, is EXPECTED to fall to vmin..vmax, and goes red if a
-            // branch is ever added. dtype is a mirror of src, hence the sync.
+            // branch and pins that i32 data outside [0,1] opens at its own
+            // min..max; a type-fullscale branch would turn it red (a branch
+            // that also answered vmin..vmax would not, and need not).
+            // dtype is a mirror of src, hence the sync.
             auto mkTyped = [&](const char* nm, const char* dt, float lo, float hi) {
                 auto d = mkRamp(nm, lo, hi, 0, 0.0f);
                 d->src->dtype = dt;
