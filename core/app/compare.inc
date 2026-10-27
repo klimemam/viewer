@@ -757,20 +757,25 @@ static void computeMinMax(ImageDoc& im) {
 static float effBlack(const ImageDoc& im);
 static float effWhite(const ImageDoc& im);
 
-// The LOAD-TIME default, and only that. Its two magnets - integer types to
-// their type fullscale, near-[0,1] floats to 0..1 - are conventions about what
-// a file that was just opened probably means, not a fit to what it contains.
-// Nothing that re-fits an image ALREADY on screen may go through here: see
-// autoRange below, and issue #245.
+// The LOAD-TIME default, and only that. Its two magnets - the 8- and 16-bit
+// integer types to their type fullscale, near-[0,1] floats to 0..1 - are
+// conventions about what a file that was just opened probably means, not a
+// fit to what it contains. Nothing that re-fits an image ALREADY on screen
+// may go through here: see autoRange below, and issue #245.
 //
-// "Fullscale" for a SIGNED integer type is 0 to the type's positive maximum,
-// not its whole range (ruled in issue #293, option A): negative pixels start
-// out black, and Auto (min-max or %) or a hand-typed black is what shows them.
-// The white is the type's own ceiling - i8 is -128..127, so its white is 127
-// and not u8's 255 - which keeps the default inside the values the type can
-// hold at all. A float holding the same negative pixels takes the last branch
-// and is visible from the start; that asymmetry is the ruling, not an
-// accident, and --range-selftest P16 pins every one of these numbers.
+// "Fullscale" for i8 and i16 - the signed types that have a branch here - is
+// 0 to the type's positive maximum, not its whole range (ruled in issue #293,
+// option A): negative pixels start out black, and Auto (min-max or %) or a
+// hand-typed black is what shows them. The white is the type's own ceiling -
+// i8 is -128..127, so its white is 127 and not u8's 255 - which keeps the
+// default inside the values the type can hold at all. i32 and u32 have no
+// branch of their own and fall to the float rules below (0..1 magnet, else
+// vmin..vmax), so a negative i32 is visible from the start: the ruling was
+// about i8 / i16, and a 0..2^31-1 default would mean nothing on screen, so
+// none is added. A float holding the same negative pixels as an i16 takes the
+// last branch and is visible from the start; that asymmetry is the ruling,
+// not an accident, and --range-selftest P16 pins every one of these numbers,
+// the i32 fall-through included.
 static void defaultRange(ImageDoc& im) {
     if (im.dtype == "u8")                           { im.black = 0; im.white = 255; }
     else if (im.dtype == "i8")                      { im.black = 0; im.white = 127; }
