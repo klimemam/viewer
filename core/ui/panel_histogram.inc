@@ -38,6 +38,9 @@ static const char* abRangeSaid(bool haveB) {
     if (app.compareRangeMode == 2)
         return slots ? "combined range, all compared images"
                      : "A and B combined range";
+    // Each side is DRAWN at its own fit (#301), but the curves still share one
+    // bin grid - A's range in force, which in this mode is A's own fit.
+    if (app.compareRangeMode == 3) return "A's own fit, each side fitted to itself";
     return "A's black-white range";
 }
 

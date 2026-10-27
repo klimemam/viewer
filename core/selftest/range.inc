@@ -33,7 +33,7 @@
         app.compareMode = App::CmpSplit;
         app.compareFollowFrame = true;
         static const char* MODE[3] = { "auto-per-frame", "per-stack", "linked" };
-        static const char* SHARE[3] = { "each-own", "B-uses-A", "union-auto" };
+        static const char* SHARE[4] = { "each-own", "B-uses-A", "union-auto", "each-fits" };
         int bad = 0;
         {   // The two stacks of a capture series hold identically NAMED frames
             // (00/frame_000.npy and 01/frame_000.npy are both frame_000.npy),
@@ -51,7 +51,7 @@
             // Union bins both sides identically and clips neither.
             fprintf(stderr, "rangeselftest: default compareRangeMode at startup = %d (%s)%s\n",
                     g_abRangeDefault,
-                    g_abRangeDefault >= 0 && g_abRangeDefault < 3 ? SHARE[g_abRangeDefault] : "?",
+                    g_abRangeDefault >= 0 && g_abRangeDefault < 4 ? SHARE[g_abRangeDefault] : "?",
                     g_abRangeDefault == 2 ? "" : "  <- EXPECTED 2 (union-auto)");
             if (g_abRangeDefault != 2) bad++;
         }
@@ -71,15 +71,17 @@
                     app.linkBlack = app.images[fa[0]]->vmin;
                     app.linkWhite = app.images[fa[0]]->vmax;
                 }
-                for (int sh = 0; sh < 3; sh++) {
+                for (int sh = 0; sh < 4; sh++) {
                     app.compareRangeMode = sh;
                     recomputeHistogramIfNeeded(cur(), app.hist[0]);
                     std::string lab = abHistXLabel(cur(), cmpB(), app.hist[0]);
                     bool named = app.linkRange
                                      ? lab.find("linked range") != std::string::npos
-                                     : (sh == 2
-                                            ? lab.find("A and B combined") != std::string::npos
-                                            : lab.find("A\'s black-white") != std::string::npos);
+                                     : sh == 2
+                                         ? lab.find("A and B combined") != std::string::npos
+                                     : sh == 3
+                                         ? lab.find("each side fitted to itself") != std::string::npos
+                                         : lab.find("A\'s black-white") != std::string::npos;
                     // and the label has to match the NUMBERS, not just read well
                     bool spans = !app.linkRange || (effBlack(*cur()) == app.linkBlack &&
                                                     effWhite(*cur()) == app.linkWhite);
@@ -97,7 +99,7 @@
             app.linkRange = m == 2;
             if (app.linkRange) { app.linkBlack = app.images[fa[0]]->vmin;
                                  app.linkWhite = app.images[fa[0]]->vmax; }
-            for (int sh = 0; sh < 3; sh++) {
+            for (int sh = 0; sh < 4; sh++) {
                 app.compareRangeMode = sh;
                 for (int step = 0; step < 2; step++) {
                     selectImage(fa[step]);
@@ -111,8 +113,10 @@
                             MODE[m], SHARE[sh], step, effBlack(*A), effWhite(*A),
                             effBlack(*B), effWhite(*B), B->seqIndex,
                             same ? "MATCHED" : "differs");
-                    // the contract: anything but "each-own" must produce one range
-                    if (sh != 0 && !same) bad++;
+                    // the contract: the shared modes must produce one range
+                    // ("each-own" and "each-fits" are per side by definition;
+                    // under Link range every mode is one range)
+                    if ((app.linkRange || (sh != 0 && sh != 3)) && !same) bad++;
                     // follow-frame must keep the sides on the same frame number
                     if (B->seqIndex != A->seqIndex) {
                         fprintf(stderr, "rangeselftest: FOLLOW BROKEN A#%d vs B#%d\n",
@@ -141,6 +145,136 @@
                     refit ? "ok" : "WRONG");
             if (!refit) bad++;
             app.rangeScope = 1;
+        }
+
+        // ---- P17: "A/B: each side fits itself" (#301) ----------------------
+        // Three stacks at three levels (multi/00, 01, 02): A, B and slot C on
+        // three different exposures. Every compared side must be DRAWN at
+        // exactly the fit that side would get on its own - in each of the three
+        // flavours - while its own black/white stay untouched; mode 2 must go
+        // back to the union; and stepping with follow-frame must re-fit every
+        // side to its NEW frame.
+        {
+            double t1 = nowSec();
+            while (nowSec() - t1 < 120.0) {
+                pumpSequenceAndQueue();
+                if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                    app.seqs.size() >= 3) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (app.seqs.size() < 3) {
+                fprintf(stderr, "rangeselftest: P17 needs 3 stacks, have %d  WRONG\n",
+                        (int)app.seqs.size());
+                bad++;
+            } else {
+                auto ok = [&](bool c, const char* what) {
+                    fprintf(stderr, "rangeselftest: P17 %s %s\n", what, c ? "ok" : "WRONG");
+                    if (!c) bad++;
+                };
+                const int saveCmpR = app.compareRangeMode, saveFlavor = app.autoFlavor;
+                const auto saveCmpMode = app.compareMode;
+                const bool saveFollow = app.compareFollowFrame;
+                std::vector<int> g0 = framesOfSeq(app.seqs[0].id), g1 = framesOfSeq(app.seqs[1].id),
+                                 g2 = framesOfSeq(app.seqs[2].id);
+                app.linkRange = false;
+                app.rangeScope = 1;                    // per stack: the default
+                app.compareFollowFrame = true;
+                selectImage(g0[0]);
+                app.cmpExtra.clear();
+                setCompareB(app.images[g1[0]].get());
+                addCompareSlot(app.images[g2[0]].get());
+                app.compareMode = App::CmpSplit;
+                std::vector<ImageDoc*> ex = compareExtras();
+                ImageDoc* A = cur();
+                ImageDoc* B = cmpB();
+                ImageDoc* C = ex.size() == 1 ? ex[0] : nullptr;
+                ok(A && B && C && A != B && B != C && A != C, "fixture: A, B and slot C on three stacks");
+                // A stored range no fit can land on, on every frame of all three
+                // stacks: a side showing its doc's own range is caught at once.
+                // (Saved and put back after: the blocks below read these stacks.)
+                std::vector<std::pair<ImageDoc*, std::pair<float, float>>> stored;
+                for (const auto* g : { &g0, &g1, &g2 })
+                    for (int i : *g) {
+                        ImageDoc* d = app.images[i].get();
+                        stored.push_back({ d, { d->black, d->white } });
+                        d->black = d->vmin - 1000.0f; d->white = d->vmax + 1000.0f;
+                    }
+                // "that doc alone's fit": what Auto per frame would write on it
+                auto aloneFit = [](ImageDoc* d, float& lo, float& hi) {
+                    const float sb = d->black, sw = d->white;
+                    refitByFlavor(*d);
+                    lo = d->black; hi = d->white;
+                    d->black = sb; d->white = sw;
+                };
+                auto untouched = [](const ImageDoc* d) {
+                    return d->black == d->vmin - 1000.0f && d->white == d->vmax + 1000.0f;
+                };
+                static const char* FL[3] = { "min-max", "0.1-99.9%", "median->target" };
+                static const int FL_BTN[3] = { RB_Auto, RB_AutoPct, RB_Median };
+                static const char SIDE[3] = { 'A', 'B', 'C' };
+                if (A && B && C) {
+                    for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
+                        app.autoFlavor = fl;
+                        app.compareRangeMode = 3;
+                        bool each = true, lamps = true;
+                        float w[3] = {};
+                        int k = 0;
+                        for (ImageDoc* d : { A, B, C }) {
+                            float lo = 0, hi = 0;
+                            aloneFit(d, lo, hi);
+                            const float eb = effBlack(*d), ew = effWhite(*d);
+                            fprintf(stderr, "rangeselftest: P17 %-14s side %c  shown %.6g..%.6g  "
+                                            "alone %.6g..%.6g\n", FL[fl], SIDE[k], eb, ew, lo, hi);
+                            each = each && eb == lo && ew == hi && untouched(d);
+                            lamps = lamps && rangeButtonMatches(*d, FL_BTN[fl], eb, ew);
+                            w[k++] = ew;
+                        }
+                        char what[112];
+                        snprintf(what, sizeof what, "%s: every side shown at its own fit, docs untouched", FL[fl]);
+                        ok(each, what);
+                        snprintf(what, sizeof what, "%s: the three fits really differ", FL[fl]);
+                        ok(w[0] != w[1] && w[1] != w[2] && w[0] != w[2], what);
+                        snprintf(what, sizeof what, "%s: the Range row lights its button on every side", FL[fl]);
+                        ok(lamps, what);
+                    }
+                    app.compareRangeMode = 2;              // back to the union
+                    const float ulo = std::min({ A->vmin, B->vmin, C->vmin });
+                    const float uhi = std::max({ A->vmax, B->vmax, C->vmax });
+                    bool uni = true;
+                    for (ImageDoc* d : { A, B, C })
+                        uni = uni && effBlack(*d) == ulo && effWhite(*d) == uhi && untouched(d);
+                    ok(uni, "mode 2 again: every side back on the union");
+                    // step: follow-frame moves B and C onto A's new frame number
+                    app.compareRangeMode = 3;
+                    app.autoFlavor = AF_Pct;
+                    const float wasB = effWhite(*B), wasC = effWhite(*C);
+                    selectImage(g0[1]);
+                    std::vector<ImageDoc*> ex2 = compareExtras();
+                    ImageDoc* B2 = cmpB();
+                    ImageDoc* C2 = ex2.size() == 1 ? ex2[0] : nullptr;
+                    ok(B2 && C2 && B2 != B && C2 != C && B2->seqIndex == cur()->seqIndex &&
+                       C2->seqIndex == cur()->seqIndex, "step: B and C followed A to its new frame");
+                    if (B2 && C2) {
+                        bool refit = true;
+                        for (ImageDoc* d : { cur(), B2, C2 }) {
+                            float lo = 0, hi = 0;
+                            aloneFit(d, lo, hi);
+                            refit = refit && effBlack(*d) == lo && effWhite(*d) == hi;
+                        }
+                        refit = refit && untouched(B2) && untouched(C2);
+                        fprintf(stderr, "rangeselftest: P17 step  B white %.6g -> %.6g  C white %.6g -> %.6g\n",
+                                wasB, effWhite(*B2), wasC, effWhite(*C2));
+                        ok(refit && effWhite(*B2) != wasB && effWhite(*C2) != wasC,
+                           "step: every side re-fitted to its own new frame");
+                    }
+                }
+                for (auto& s : stored) { s.first->black = s.second.first; s.first->white = s.second.second; }
+                app.cmpExtra.clear();           // A stays on g0[1], where the block above left it
+                app.compareMode = saveCmpMode;
+                app.compareFollowFrame = saveFollow;
+                app.compareRangeMode = saveCmpR;
+                app.autoFlavor = saveFlavor;
+            }
         }
 
         // ==================================================================

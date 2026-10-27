@@ -391,11 +391,12 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
                 app.compareFollowFrame = !app.compareFollowFrame;
             {   // the display range relationship, where the compare modes live
-                static const char* RN[3] = { "  each side keeps its own range",
+                static const char* RN[4] = { "  each side keeps its own range",
                                              "  every side uses A's range",
-                                             "  auto over every side (union)" };
+                                             "  auto over every side (union)",
+                                             "  each side fits itself (Auto)" };
                 ImGui::TextDisabled("Display range");
-                for (int r = 0; r < 3; r++)
+                for (int r = 0; r < 4; r++)
                     if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
                         app.compareRangeMode = r;
                         if (ImageDoc* bb = cmpB()) bb->texDirty = true;

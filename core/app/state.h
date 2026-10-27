@@ -767,6 +767,18 @@ struct ImageDoc {
     // the median and a black point that costs nothing to recompute.
     float medVal = 0;
     bool medValid = false;
+    // ...and the whole fit "A/B: each side fits itself" displays this doc at
+    // (issue #301): app.autoFlavor's answer for these pixels, asked by
+    // effBlack/effWhite on every UI frame for every compared side. The
+    // caches above already hold the expensive parts; this one also remembers
+    // an answer the pixels could NOT give (no finite median), which they do not
+    // - without it that case would re-run a 65536-bin pass every frame. Keyed
+    // on the flavour and the Med parameters it was fitted under, and dropped
+    // wherever pctValid is.
+    float fitLo = 0, fitHi = 0;
+    bool fitValid = false;
+    int fitFlavor = -1, fitMedBlackMode = -1;
+    float fitMedTarget = 0, fitMedBlackValue = 0;
     GLuint tex = 0;
     bool texDirty = true;
     float texBlack = 0, texWhite = 0;   // the range this texture was built with
@@ -850,6 +862,7 @@ struct ImageDoc {
         dtype = src->dtype; vmin = src->vmin; vmax = src->vmax;
         pctValid = false;             // different pixels, different quantiles
         medValid = false;             // ...and a different median
+        fitValid = false;             // ...and a different own fit (#301)
     }
     std::vector<float>&       px()       { return src->data; }
     const std::vector<float>& px() const { return src->data; }
@@ -1399,6 +1412,11 @@ struct App {
     //   2 union auto - both sides re-fit to min/max ACROSS A and B at the
     //                  current frame pair, so neither clips and neither is
     //                  favoured. This is "auto, but the same auto for both".
+    //   3 each fits  - every compared side is shown at ITS OWN fit, in the
+    //                  flavour app.autoFlavor names (min-max / 0.1-99.9% /
+    //                  median->target), re-fitted as each side's frame moves.
+    //                  Mode 0 with the Auto button pressed on every side, kept
+    //                  pressed while stepping (#301).
     // The DEFAULT is 2. It used to be 1, and on two stacks captured at
     // different levels that renders B at >white 99.69%: B's whole histogram
     // collapses into one dashed line against the right edge of the plot, and

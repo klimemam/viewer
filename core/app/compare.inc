@@ -751,6 +751,7 @@ static void computeMinMax(ImageDoc& im) {
     // through syncMirrors, which is how it learns the new vmin/vmax at all.
     im.pctValid = false;
     im.medValid = false;                    // ...and so does the cached median (#252)
+    im.fitValid = false;                    // ...and the own fit built on both (#301)
 }
 // Effective display range: the shared value when linking is on, the image's own
 // otherwise. Linking never overwrites an image's range (defined below with App).
@@ -1032,11 +1033,45 @@ static void medianFit(ImageDoc& im, float& lo, float& hi) {
 // Only ever reached with linkRange OFF (both callers guard on it), so the
 // pooled linked branches inside the fits below never run per frame - which
 // matters: linked Auto % / Med read every open pixel.
-static void refitByFlavor(ImageDoc& im) {
-    float lo = im.vmin, hi = im.vmax;            // AF_MinMax, i.e. autoRange
+//
+// The answer itself is fitByFlavor, which writes nothing: "A/B: each side fits
+// itself" (#301) DISPLAYS each compared side at exactly this fit without
+// touching the side's own black/white, and one function answering for both
+// is what keeps the per-frame re-fit and that display from disagreeing.
+static void fitByFlavor(ImageDoc& im, float& lo, float& hi) {
+    lo = im.vmin; hi = im.vmax;                  // AF_MinMax, i.e. autoRange
     if (app.autoFlavor == AF_Pct)         percentileRangeCached(im, lo, hi);
     else if (app.autoFlavor == AF_Median) medianFit(im, lo, hi);
+}
+static void refitByFlavor(ImageDoc& im) {
+    float lo = 0, hi = 0;
+    fitByFlavor(im, lo, hi);
     im.black = lo; im.white = hi;
+}
+// fitByFlavor's answer for one compared side, kept on the doc (see fitValid in
+// ImageDoc for why the caches under it are not enough on their own). Read by
+// abRange for every compared side on every UI frame. Same precondition as
+// refitByFlavor: linkRange OFF - effBlack/effWhite answer the linked pair
+// before abRange is consulted - so the pooled linked fits never run here.
+// Min-max is not cached: it is two cached numbers already, and reading them
+// live keeps a vmin/vmax written by hand honest without an invalidation.
+static void ownFitCached(ImageDoc& im, float& lo, float& hi) {
+    if (app.autoFlavor != AF_Pct && app.autoFlavor != AF_Median) {
+        lo = im.vmin; hi = im.vmax;
+        return;
+    }
+    const bool medKeyMoved = app.autoFlavor == AF_Median &&
+        (im.fitMedTarget != app.medTarget || im.fitMedBlackMode != app.medBlackMode ||
+         im.fitMedBlackValue != app.medBlackValue);
+    if (!im.fitValid || im.fitFlavor != app.autoFlavor || medKeyMoved) {
+        fitByFlavor(im, im.fitLo, im.fitHi);
+        im.fitFlavor = app.autoFlavor;
+        im.fitMedTarget = app.medTarget;
+        im.fitMedBlackMode = app.medBlackMode;
+        im.fitMedBlackValue = app.medBlackValue;
+        im.fitValid = true;
+    }
+    lo = im.fitLo; hi = im.fitHi;
 }
 
 // Keep only the most recent textures resident: a 200-frame sequence would

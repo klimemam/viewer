@@ -467,34 +467,57 @@ static ImageDoc* cmpB();          // fwd: the B side, or null when compare is of
 // 「Auto FitするのがA,BまででCが変わらない」). Mode 2 fits every compared
 // side to the union of what the current frames actually contain, recomputed
 // as you step. Mode 1 means "the reference side dictates": A's black-white
-// for every other letter. The slots join only while compare is ON - the
-// letters survive compare-off as seats, but a seat is not a comparison.
+// for every other letter. Mode 3 shows each compared side at its OWN fit
+// (#301) - the sides still have to be compared sides, so it shares the one
+// definition of who they are (comparedSides) with the other two. The slots
+// join only while compare is ON - the letters survive compare-off as seats,
+// but a seat is not a comparison.
 // A, B and the slots may now name the SAME document (resolveB no longer goes
 // quiet there), which this handles by construction: a union of min/max does
 // not care how many times a side appears, and the `rs.doc != b` below is kept
 // only so a duplicate cannot eat one of the fixed 16 places. It changes no
 // number - unlike the panels, where dropping a duplicate side dropped a curve.
-static bool abRange(const ImageDoc& im, float& lo, float& hi) {
-    if (app.compareRangeMode == 0) return false;
+// Who is being compared: A, B if it resolves, every resolved slot - A first.
+// A tiled canvas can hold A + C + D with no B at all, so B is optional - what
+// is required is that there be someone besides A to compare WITH, and a count
+// under 2 is the caller's "no comparison".
+enum { CMP_SIDES_MAX = 2 + 14 };    // A + B + every slot letter (SLOT_LETTERS)
+static int comparedSides(ImageDoc* (&parts)[CMP_SIDES_MAX]) {
     ImageDoc* a = cur();
-    if (!a) return false;
+    if (!a) return 0;
     ImageDoc* b = cmpB();
-    // who is being compared: A, B if it resolves, every resolved slot. A tiled
-    // canvas can hold A + C + D with no B at all, so B is optional - what is
-    // required is that there be someone besides A to compare WITH.
-    ImageDoc* parts[2 + 14];    // A + B + every slot letter (SLOT_LETTERS)
     int np = 0;
     parts[np++] = a;
     if (b) parts[np++] = b;
     if (app.compareMode != App::CmpOff && !app.cmpExtra.empty())
         for (const ResolvedSlot& rs : resolveSlots())
-            if (rs.doc != b && np < (int)(sizeof parts / sizeof *parts))
+            if (rs.doc != b && np < CMP_SIDES_MAX)
                 parts[np++] = rs.doc;
+    return np;
+}
+// The compared side that IS `im`, as the writable document the comparison
+// holds; null when nothing is compared or `im` is not one of the sides.
+static ImageDoc* comparedSideOf(const ImageDoc& im) {
+    ImageDoc* parts[CMP_SIDES_MAX];
+    const int np = comparedSides(parts);
+    if (np < 2) return nullptr;
+    for (int i = 0; i < np; i++) if (parts[i] == &im) return parts[i];
+    return nullptr;
+}
+static bool abRange(const ImageDoc& im, float& lo, float& hi) {
+    if (app.compareRangeMode == 0) return false;
+    ImageDoc* parts[CMP_SIDES_MAX];
+    const int np = comparedSides(parts);
     if (np < 2) return false;
-    bool member = false;
-    for (int i = 0; i < np; i++) if (parts[i] == &im) member = true;
-    if (!member) return false;
-    if (app.compareRangeMode == 1) { lo = a->black; hi = a->white; return true; }
+    ImageDoc* self = nullptr;
+    for (int i = 0; i < np; i++) if (parts[i] == &im) self = parts[i];
+    if (!self) return false;
+    if (app.compareRangeMode == 1) { lo = parts[0]->black; hi = parts[0]->white; return true; }
+    // Each side at its own fit (#301): display only, like the two modes around
+    // it - the side's black/white stay as they are, and come back when the mode
+    // changes or compare ends. Its own NEW frame is a different doc with its
+    // own cache, so stepping (follow-frame included) re-fits each side.
+    if (app.compareRangeMode == 3) { ownFitCached(*self, lo, hi); return hi > lo; }
     lo = parts[0]->vmin;                      // union of the CONTENT, not of the
     hi = parts[0]->vmax;                      // stretches
     for (int i = 1; i < np; i++) {
@@ -557,8 +580,12 @@ enum RangeButton { RB_Auto = 0, RB_AutoPct, RB_Median, RB_0_1, RB_0_255, RB_0_65
 // compare against (nothing ever spread this stack's range, or the frame that
 // did has been closed), and the row then says nothing at all.
 // Not consulted by the fixed presets: 0-255 is 0-255 whoever is looking.
+// ...except where the range in force is not the stack's at all: "each side
+// fits itself" (#301) shows every compared side at ITS OWN fit, so that side's
+// own pixels are what the row has to compare against.
 static ImageDoc* rangeRefDoc(ImageDoc& im) {
     if (app.linkRange || app.rangeScope != 1 || im.seqId <= 0) return &im;
+    if (app.compareRangeMode == 3 && comparedSideOf(im)) return &im;
     App::SeqInfo* si = seqInfo(im.seqId);
     if (!si || si->rangeRefUid == 0) return nullptr;
     if (si->rangeRefUid == im.uid) return &im;
