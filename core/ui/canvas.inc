@@ -850,11 +850,13 @@ static void drawCanvas(ImVec2 avail) {
                 if (ImGui::MenuItem("Save image as PNG...", nullptr, false, ci != nullptr)) {
                     if (!pfd::settings::available())
                         toast("no file-dialog backend found (install zenity or kdialog)", true);
-                    else
+                    else {
                         app.pngDlgUid = ci->uid;   // the name below is ci's: the pixels must be too
+                        app.pngDlgViewAUid = cur() ? cur()->uid : 0;   // ...and the view's (#304)
                         app.pngDlg = std::make_unique<pfd::save_file>("Save image as PNG",
                             baseName(ci->name) + ".png",
                             std::vector<std::string>{ "PNG (*.png)", "*.png" });
+                    }
                 }
                 {   // ...and the whole STACK, in one file, at the same levels
                     // (#253). Beside the PNG on purpose: it is the same verb

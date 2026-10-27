@@ -61,7 +61,7 @@
             int save = app.compareRangeMode;
             bool saveLink = app.linkRange;
             // ...and "in force" includes the Value range scope. linkRange
-            // short-circuits effBlack/effWhite before abRange is even consulted,
+            // short-circuits displayRangeFor before the A/B mode is consulted,
             // so with the scope set to everything the axis spans the linked pair
             // - widened by stacks that have nothing to do with the comparison -
             // whatever the A/B combo happens to say.

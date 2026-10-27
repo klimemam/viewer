@@ -559,8 +559,24 @@ File > **Export stack as video (displayed levels)...**(キャンバスの右ク�
   つまり *「フレーム n を選んで PNG 保存」と「動画の n フレーム目」は同じ絵*で、
   それは selftest が**バイト単位で**確かめています
 - **解像度はフレームの実寸**です(キャンバスのズームではありません)
-- レンジは各フレームの実効値。**Per stack / Linked なら全フレーム同じ**、
-  **Auto per frame ならフレーム送りと同じ再フィット**を1枚ずつ掛けてから描きます
+- **各フレームは、それが画面に出るときと同じレンジ**で描きます。A の stack なら
+  「A をフレーム n に送ったときの画面」—— B とスロットも follow-frame でそれぞれの
+  フレーム n に追従した上でのレンジです。`auto over every side (union)` なら A・B・C… の
+  フレーム n の和集合、`each side fits itself` なら A のフレーム n 自身のフィット、
+  `every side uses A's range` なら A のフレーム n の黒点/白点(表は [§3b](#3b-ab-比較ワイプ--並べて--差分))。
+  B やスロットに**フレーム n が無い**(stack が短い)ときは、画面と同じく固定されたフレーム
+  (`[stale]` の絵)を使います。**Per stack / Linked なら全フレーム同じ**、**Auto per frame
+  ならフレーム送りと同じ再フィット**を1枚ずつ掛けてから描きます
+- **B やスロットが持っている stack を書き出すと、各フレームはその役割のまま**描かれます ——
+  follow-frame が A をそのフレームの番号に合わせたときの画面の B / C の絵です
+  (follow-frame がオフなら A はそのままで、そのフレームを B / C に置いたときの絵)。
+  比較に入っていない stack は自分のレンジです
+- 使ったレンジは**ファイルに焼かず、文で言います**: 書き終えた toast・Messages・stderr に
+  `range: A/B: auto over every side (union), per frame` /
+  `range: A/B: every side uses A's range - A's is Auto per frame (min-max), per frame` /
+  `range: Per stack (default)` のような、Range と A/B のコンボと同じ言葉の1句が付きます。
+  B / C として描いたなら `- drawn as B`、固定フレームを使ったなら `; B held at frame 1`
+  も付きます。PNG / dot by dot ではこれに ` = 下端..上端` の数値が続きます
 - 形式は**拡張子で決まります**。`.mkv` = **FFV1**(可逆圧縮。`ffmpeg` が PATH に
   必要)、`.avi` = **無圧縮 RGB24**(依存ゼロ、このビルド自身が書きます)。
   保存ダイアログの手前に **fps(既定 30、セッションに保存)と形式**を訊く小さな
@@ -570,7 +586,9 @@ File > **Export stack as video (displayed levels)...**(キャンバスの右ク�
   **Stop は書きかけのファイルを消します**(2枚だけ再生できる動画は、何も無いより
   たちが悪いので)
 - **preview(まだ間引きの絵)が混じった stack は断ります** —— PNG 書き出しと
-  同じ文面で、「full が着いてから」と言います
+  同じ文面で、「full が着いてから」と言います。union のレンジが読む**他の側のフレームが
+  preview** のとき(A の stack なら B / スロットのフレーム n、B の stack なら A の対のフレーム)も、`B's frame 3`(1枚ものの B なら `B (a single image)`)
+  のように側とフレームを名指しして断ります
 - 無圧縮 AVI が **4 GB** を超える見込みなら**書き始める前に**断り、FFV1/MKV への
   道を示します(AVI 1.0 のオフセットが 32bit なので、その先はどの再生器からも
   届きません)
@@ -596,7 +614,8 @@ codec に削らせる理由はありません**。この build が libavcodec �
 | preview(間引き)中 | **断ります**(1:1 を名乗れないので) | **コピーして、preview だと言います** |
 
 - **dot by dot / PNG 保存 / 動画書き出しは同じ写像**(`renderDocRGBA`)を通ります。
-  表示レンジ・ガンマ・カラーマップ・CFA colorize・値域ハイライトは焼き込み、
+  表示レンジ(A/B 比較中の `A/B:` の設定を含め、画面と同じ。使ったレンジは toast の
+  `range: ...` が言います)・ガンマ・カラーマップ・CFA colorize・値域ハイライトは焼き込み、
   **補間だけは決してしません**。画質のレポートで**ノイズそのものが主題**のとき、
   拡大されたスクリーンショットはそのノイズを作りもし消しもするからです
 - **表示どおりは、その写像を通れません。** 2ペイン・仕切り線・4種のオーバーレイが
@@ -914,7 +933,10 @@ B は **Files で対象行を右クリック > Set as compare B**(実体を指�
   既定が union なのは、`every side uses A's range` だと露出違いの B が飽和して(実測 `>white 99.69%`)
   ヒストグラムが右端の1本になってしまうためです(union では同じデータで `0.02%`)。
   いずれも**表示だけ**で、各画像の黒点/白点そのものは書き換えません。
-  `View > Link range` を入れている間はそちらが優先です
+  `View > Link range` を入れている間はそちらが優先です。
+  **書き出しにも効きます**: PNG・dot by dot は画面と同じレンジ(PNG は保存ダイアログを
+  開いたときの画面)、stack の動画はフレームごとに、そのフレームが画面に出るときのレンジです
+  ([§2.3d](#23d-stack-を-lossless-動画に書き出す表示レベルのまま))
 - CLI: `viewer --compare wipe|split|diff|blink a.npy b.npy`（先頭2枚が A と B。
   `flip` も `blink` の互換 alias として受理します）
 - 並べて表示では**カーソルのあるペインが基準**です。ステータスバーの座標・画素値も

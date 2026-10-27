@@ -117,12 +117,26 @@ static std::string exportHighlightNote(const ImageDoc* im) {
            histHlRangeSaid(im ? im->dtype : std::string());
 }
 
+// The display range an export was drawn at is baked in and, like the
+// highlight, explained nowhere in the file - so it is named where the export
+// is announced (#304). Defined with displayRangeFor below.
+static std::string exportRangeNote(const ImageDoc& im, const ViewSides& v, bool video);
+static std::string viewRefusalFor(const ViewSides& v, const ImageDoc* self);
+static ImageDoc* sideOfView(const ImageDoc& im, const ViewSides& v);
+
 // The ONE place an export is produced, so the file and the clipboard can never
-// disagree about what the picture is.
-static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int& h) {
+// disagree about what the picture is. A single picture is drawn in the
+// SCREEN's view: the image on screen is drawn as it is drawn there, a B or a
+// slot keeps its role (and so A's range, or the union), and an image nobody
+// compares is at its own range - which is also how it is drawn once it is on
+// screen. (A stack video draws each frame in ITS view: export_video.inc.)
+// `v` names another view - the one a save dialog was opened in, saveViewPng.
+static bool exportDocRGBA(ImageDoc* im, std::vector<uint8_t>& rgba, int& w, int& h,
+                          const ViewSides* v = nullptr) {
     if (!exportRefusalFor(im).empty()) return false;
     w = im->w; h = im->h;
-    renderDocRGBA(*im, rgba);
+    const ViewSides screen = v ? ViewSides() : comparedSides();
+    renderDocRGBA(*im, rgba, v ? v : &screen);
     return true;
 }
 
@@ -133,11 +147,13 @@ static void copyViewDotByDot() {
     std::vector<uint8_t> png = encodePng(rgba, w, h);
     const std::string hlNote = exportHighlightNote(im);
     if (!hlNote.empty()) fprintf(stderr, "export: %s\n", hlNote.c_str());
+    const std::string rNote = exportRangeNote(*im, comparedSides(), false);
+    fprintf(stderr, "export: %s\n", rNote.c_str());
 #ifdef _WIN32
     std::string err;
     if (clipboardPutImage(rgba, w, h, png, err))
-        toast("copied " + std::to_string(w) + "x" + std::to_string(h) + " (dot by dot)" +
-              (hlNote.empty() ? "" : "  -  " + hlNote));
+        toast("copied " + std::to_string(w) + "x" + std::to_string(h) + " (dot by dot)  -  " +
+              rNote + (hlNote.empty() ? "" : "  -  " + hlNote));
     else
         toast("copy failed: " + err, true);
 #else
@@ -149,7 +165,7 @@ static void copyViewDotByDot() {
     f.write((const char*)png.data(), (std::streamsize)png.size());
     f.close();
     ImGui::SetClipboardText(path.c_str());
-    toast("wrote " + path + " (path on the clipboard)" +
+    toast("wrote " + path + " (path on the clipboard)  -  " + rNote +
           (hlNote.empty() ? "" : "  -  " + hlNote));
 #endif
 }
@@ -359,8 +375,13 @@ static void pumpCopyViewRequest() {
 
 // `uid` is the document the SAVE DIALOG was opened for, not whatever is current
 // when it closes. 0 means "the current one" (the CLI and the selftests, which
-// have no dialog between the choice and the write).
-static void saveViewPng(const std::string& path, uint64_t uid = 0) {
+// have no dialog between the choice and the write). `viewAUid` is the A the
+// dialog was opened under, by the same rule one level up (#304): the range a
+// picture is drawn at belongs to the VIEW, and a step taken while the OS
+// dialog is up moves the view - B follows A to another frame, the union moves
+// with it - so the pixels come from viewSidesFor(that A). 0, or an A that has
+// closed since, means the view on screen now.
+static void saveViewPng(const std::string& path, uint64_t uid = 0, uint64_t viewAUid = 0) {
     ImageDoc* im = nullptr;
     if (uid) {
         for (const auto& d : app.images) if (d->uid == uid) { im = d.get(); break; }
@@ -369,8 +390,11 @@ static void saveViewPng(const std::string& path, uint64_t uid = 0) {
             return;
         }
     } else im = cur();
+    ImageDoc* viewA = nullptr;
+    if (viewAUid) for (const auto& d : app.images) if (d->uid == viewAUid) { viewA = d.get(); break; }
+    const ViewSides view = viewA ? viewSidesFor(viewA) : comparedSides();
     std::vector<uint8_t> rgba; int w = 0, h = 0;
-    if (!exportDocRGBA(im, rgba, w, h)) { toast(exportRefusalFor(im), true); return; }
+    if (!exportDocRGBA(im, rgba, w, h, &view)) { toast(exportRefusalFor(im), true); return; }
     std::vector<uint8_t> png = encodePng(rgba, w, h);
     if (png.empty()) { toast("PNG encode failed", true); return; }
     std::ofstream f(pathFromUtf8(path), std::ios::binary);
@@ -378,8 +402,10 @@ static void saveViewPng(const std::string& path, uint64_t uid = 0) {
     f.write((const char*)png.data(), (std::streamsize)png.size());
     const std::string hlNote = exportHighlightNote(im);
     if (!hlNote.empty()) fprintf(stderr, "export: %s\n", hlNote.c_str());
+    const std::string rNote = exportRangeNote(*im, view, false);
+    fprintf(stderr, "export: %s\n", rNote.c_str());
     toast("saved " + baseName(path) + "  " + std::to_string(w) + "x" + std::to_string(h) +
-          (hlNote.empty() ? "" : "  -  " + hlNote));
+          "  -  " + rNote + (hlNote.empty() ? "" : "  -  " + hlNote));
 }
 
 // ここから forgetImage までは表示レンジ/テクスチャ/キャッシュ掃除の補助で export ではない(§2 の ~240 はこの並び込みの勘定)。住所のまま移動(§1) → P 段階で分けるなら compare 側へ
@@ -460,7 +486,6 @@ static void applyRangeMode(int mode, ImageDoc* on, int flavor = -1) {
 }
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
-static ImageDoc* cmpB();          // fwd: the B side, or null when compare is off
 // The compare display range - and "compare" means EVERY pane, not just the
 // A/B pair: two images stretched differently cannot be compared, and with
 // tiles that holds for slot C exactly as it holds for B (report 2026-07-30,
@@ -469,74 +494,195 @@ static ImageDoc* cmpB();          // fwd: the B side, or null when compare is of
 // as you step. Mode 1 means "the reference side dictates": A's black-white
 // for every other letter. Mode 3 shows each compared side at its OWN fit
 // (#301) - the sides still have to be compared sides, so it shares the one
-// definition of who they are (comparedSides) with the other two. The slots
-// join only while compare is ON - the letters survive compare-off as seats,
-// but a seat is not a comparison.
-// A, B and the slots may now name the SAME document (resolveB no longer goes
-// quiet there), which this handles by construction: a union of min/max does
-// not care how many times a side appears, and the `rs.doc != b` below is kept
-// only so a duplicate cannot eat one of the fixed 16 places. It changes no
-// number - unlike the panels, where dropping a duplicate side dropped a curve.
-// Who is being compared: A, B if it resolves, every resolved slot - A first.
-// A tiled canvas can hold A + C + D with no B at all, so B is optional - what
-// is required is that there be someone besides A to compare WITH, and a count
-// under 2 is the caller's "no comparison".
-enum { CMP_SIDES_MAX = 2 + 14 };    // A + B + every slot letter (SLOT_LETTERS)
-static int comparedSides(ImageDoc* (&parts)[CMP_SIDES_MAX]) {
-    ImageDoc* a = cur();
-    if (!a) return 0;
-    ImageDoc* b = cmpB();
-    int np = 0;
-    parts[np++] = a;
-    if (b) parts[np++] = b;
-    if (app.compareMode != App::CmpOff && !app.cmpExtra.empty())
-        for (const ResolvedSlot& rs : resolveSlots())
-            if (rs.doc != b && np < CMP_SIDES_MAX)
-                parts[np++] = rs.doc;
-    return np;
-}
+// definition of who they are (viewSidesFor, compare.inc) with the other two.
+//
+// WHOSE comparison is a parameter (#304): the range is a property of a VIEW,
+// not of a document. comparedSides() is the screen's view and is nothing but
+// viewSidesFor(cur()); an export hands displayRangeFor the view its pixels
+// would be on screen in, so frame k of a stack video comes out at the range
+// the screen gives frame k once A is stepped onto it - not at the range of a
+// document that merely is not the one on screen right now.
+static ViewSides comparedSides() { return viewSidesFor(cur()); }
 // The compared side that IS `im`, as the writable document the comparison
 // holds; null when nothing is compared or `im` is not one of the sides.
-static ImageDoc* comparedSideOf(const ImageDoc& im) {
-    ImageDoc* parts[CMP_SIDES_MAX];
-    const int np = comparedSides(parts);
-    if (np < 2) return nullptr;
-    for (int i = 0; i < np; i++) if (parts[i] == &im) return parts[i];
+static ImageDoc* sideOfView(const ImageDoc& im, const ViewSides& v) {
+    if (v.n < 2) return nullptr;
+    for (int i = 0; i < v.n; i++) if (v.side[i] == &im) return v.side[i];
     return nullptr;
 }
-static bool abRange(const ImageDoc& im, float& lo, float& hi) {
-    if (app.compareRangeMode == 0) return false;
-    ImageDoc* parts[CMP_SIDES_MAX];
-    const int np = comparedSides(parts);
-    if (np < 2) return false;
-    ImageDoc* self = nullptr;
-    for (int i = 0; i < np; i++) if (parts[i] == &im) self = parts[i];
-    if (!self) return false;
-    if (app.compareRangeMode == 1) { lo = parts[0]->black; hi = parts[0]->white; return true; }
-    // Each side at its own fit (#301): display only, like the two modes around
-    // it - the side's black/white stay as they are, and come back when the mode
-    // changes or compare ends. Its own NEW frame is a different doc with its
-    // own cache, so stepping (follow-frame included) re-fits each side.
-    if (app.compareRangeMode == 3) { ownFitCached(*self, lo, hi); return hi > lo; }
-    lo = parts[0]->vmin;                      // union of the CONTENT, not of the
-    hi = parts[0]->vmax;                      // stretches
-    for (int i = 1; i < np; i++) {
-        lo = std::min(lo, parts[i]->vmin);
-        hi = std::max(hi, parts[i]->vmax);
+static ImageDoc* comparedSideOf(const ImageDoc& im) {
+    return sideOfView(im, comparedSides());
+}
+// Does the range in force read the VIEW at all? Link range and "each keeps its
+// own" answer from the document alone, so the screen's hot path (effBlack /
+// effWhite / displayMapOf, several calls per document per UI frame) skips
+// building one - it hands displayRangeFor an empty view, which then takes the
+// same Link / own branch it would have taken anyway.
+static bool rangeReadsView() { return !app.linkRange && app.compareRangeMode != 0; }
+// The black-white `im` is drawn at in view `v`: Link range, then the compare
+// range mode 0..3, then the document's own numbers - one decision, which the
+// screen (effBlack/effWhite, displayMapOf) and every export reach.
+static void displayRangeFor(const ImageDoc& im, const ViewSides& v, float& lo, float& hi) {
+    if (app.linkRange) { lo = app.linkBlack; hi = app.linkWhite; return; }
+    lo = im.black; hi = im.white;
+    if (app.compareRangeMode == 0) return;
+    ImageDoc* self = sideOfView(im, v);
+    if (!self) return;
+    if (app.compareRangeMode == 1) { lo = v.side[0]->black; hi = v.side[0]->white; return; }
+    float l = 0, h = 0;
+    if (app.compareRangeMode == 3) {
+        // Each side at its own fit (#301): display only, like the two modes
+        // around it - the side's black/white stay as they are, and come back
+        // when the mode changes or compare ends. Its own NEW frame is a
+        // different doc with its own cache, so stepping (follow-frame
+        // included) re-fits each side.
+        ownFitCached(*self, l, h);
+    } else {
+        l = v.side[0]->vmin;                  // union of the CONTENT, not of the
+        h = v.side[0]->vmax;                  // stretches
+        for (int i = 1; i < v.n; i++) {
+            l = std::min(l, v.side[i]->vmin);
+            h = std::max(h, v.side[i]->vmax);
+        }
     }
-    return hi > lo;
+    if (h > l) { lo = l; hi = h; }
 }
 static float effBlack(const ImageDoc& im) {
-    if (app.linkRange) return app.linkBlack;
     float lo, hi;
-    if (abRange(im, lo, hi)) return lo;
-    return im.black;
+    displayRangeFor(im, rangeReadsView() ? comparedSides() : ViewSides(), lo, hi);
+    return lo;
 }
 static float effWhite(const ImageDoc& im) {
-    if (app.linkRange) return app.linkWhite;
     float lo, hi;
-    if (abRange(im, lo, hi)) return hi;
-    return im.white;
+    displayRangeFor(im, rangeReadsView() ? comparedSides() : ViewSides(), lo, hi);
+    return hi;
+}
+// The letter of side i of a view: "A", "B", or the slot's.
+static std::string viewSideLetter(const ViewSides& v, int i) {
+    return v.role[i] == 0 ? std::string("A") : v.role[i] == 1 ? std::string("B")
+                                             : slotName((size_t)(v.role[i] - 2));
+}
+// "B held at frame 1" for every side of `v` whose follow found no frame at A's
+// number and which the range is taken over (the union only): the screen draws
+// such a side on its PINNED frame - the one chosen as B or as the slot - and
+// marks it [stale]; the union includes it,
+// and so does the export - which then has to SAY it, because the file cannot
+// carry the mark. Empty when no such side.
+static std::vector<std::string> viewHeldSides(const ViewSides& v) {
+    std::vector<std::string> out;
+    if (app.linkRange || app.compareRangeMode != 2 || v.n < 2) return out;
+    for (int i = 1; i < v.n; i++)
+        if (v.diverged[i])
+            out.push_back(viewSideLetter(v, i) + " held at frame " +
+                          std::to_string(v.side[i]->seqIndex + 1));
+    return out;
+}
+// The words for the range `im` is exported at in view `v`, in the words of the
+// controls that set it: the Range combo ("Auto per frame (min-max)", "Per stack
+// (default)", "Linked across all images") and the A/B combo ("A/B: auto over
+// every side (union)" ...). Read off the same conditions displayRangeFor
+// decides by, never off the numbers: a union that happens to equal one side's
+// own range is still a union. `video` adds "per frame" wherever the range is
+// worked out again for every frame, and drops the numbers, which then differ
+// frame by frame; a single picture carries its numbers. A side drawn in a role
+// other than A says which ("drawn as B").
+static std::string exportRangeNote(const ImageDoc& im, const ViewSides& v, bool video) {
+    static const char* SCOPE_FLAVOR[3] = { "min-max", "0.1-99.9%", "median->target" };
+    static const char* AB_FIT[3] = { "min-max", "0.1-99.9%", "median" };
+    const int fl = std::clamp(app.autoFlavor, (int)AF_MinMax, (int)AF_Median);
+    const bool perFrameScope = !app.linkRange && app.rangeScope == 0;
+    const std::string scope = app.linkRange ? std::string("Linked across all images")
+                            : perFrameScope ? std::string("Auto per frame (") + SCOPE_FLAVOR[fl] + ")"
+                                            : std::string("Per stack (default)");
+    int self = -1;
+    if (v.n >= 2) for (int i = 0; i < v.n && self < 0; i++) if (v.side[i] == &im) self = i;
+    std::string rule;
+    if (app.linkRange) rule = scope;
+    else if (self >= 0 && app.compareRangeMode == 1)
+        rule = "A/B: every side uses A's range - A's is " + scope +
+               (video && perFrameScope ? ", per frame" : "");
+    else if (self >= 0 && app.compareRangeMode == 2)
+        rule = std::string("A/B: auto over every side (union)") + (video ? ", per frame" : "");
+    else if (self >= 0 && app.compareRangeMode == 3)
+        rule = std::string("A/B: each side fits itself (") + AB_FIT[fl] + ")" +
+               (video ? ", per frame" : "");
+    else if (self >= 0)
+        rule = "A/B: each keeps its own - " + scope;
+    else rule = scope;
+    if (self > 0) rule += " - drawn as " + viewSideLetter(v, self);
+    std::string out = "range: " + rule;
+    if (!video) {
+        float lo = 0, hi = 0;
+        displayRangeFor(im, v, lo, hi);
+        char num[64];
+        snprintf(num, sizeof num, " = %.6g..%.6g", lo, hi);
+        out += num;
+        for (const std::string& h : viewHeldSides(v)) out += "; " + h;
+    }
+    return out;
+}
+// Does the range in force read the OTHER sides' pixels? Only "auto over every
+// side (union)" does (A's range and each-fits-itself draw a side from A or
+// from itself), so only it can be misled by a side that is not a real frame.
+static bool rangeReadsOtherSides() {
+    return !app.linkRange && app.compareRangeMode == 2;
+}
+// "" when every side the view's range is TAKEN OVER is a real frame; the
+// refusal otherwise. A decimated preview's min/max is not the frame's, and a
+// file cannot say so afterwards - the same "not yet" as exportRefusalFor,
+// naming the side and (for a stack) its frame. A side whose stack simply has
+// no frame at A's number is NOT refused: the screen draws it on its pinned
+// frame and unions over that, the export does the same, and exportRangeNote
+// says so. `self` is the picture being exported, which exportRefusalFor has
+// already asked about; EVERY other side is checked - A included, because a
+// B or slot stack is exported in a view whose side 0 is A's paired frame (or
+// the A on screen), and the union starts from A's min/max.
+static std::string viewRefusalFor(const ViewSides& v, const ImageDoc* self) {
+    if (!rangeReadsOtherSides() || v.n < 2) return {};
+    for (int i = 0; i < v.n; i++) {
+        const ImageDoc* s = v.side[i];
+        if (s == self || exportRefusalFor(s).empty()) continue;
+        const std::string who = viewSideLetter(v, i);
+        return "the A/B range is the union over every side, and " +
+               (s->seqId > 0 ? who + "'s frame " + std::to_string(s->seqIndex + 1)
+                             : who + " (a single image)") +
+               " is still the decimated preview - wait for the full frame to land, "
+               "then export";
+    }
+    return {};
+}
+// The view a FRAME OF A STACK is on screen in, for an export of that stack
+// (#304). `stepTo` is the frame A would have to be stepped onto to show it -
+// what "Auto per frame" re-fits on the way - or null when A stays put.
+//   - A's own stack (or no comparison): A on that frame, viewSidesFor(d).
+//   - a stack held by B or a slot: the view in which follow-frame pairs A
+//     with d - A on the frame of its own stack carrying d's number - so d is
+//     drawn in its role there. With follow-frame off (or A a single image, or
+//     no such frame of A's) the screen's view with d in that side's place: d
+//     shown as that letter, A where it is.
+//   - a stack nobody compares: its own range, an empty view.
+static ViewSides exportFrameViewFor(ImageDoc* d, ImageDoc*& stepTo) {
+    ImageDoc* a = cur();
+    stepTo = d;
+    if (!a || app.compareMode == App::CmpOff || d->seqId <= 0 || d->seqId == a->seqId)
+        return viewSidesFor(d);
+    ViewSides s = comparedSides();
+    int r = -1;
+    for (int i = 1; i < s.n && r < 0; i++) if (s.side[i]->seqId == d->seqId) r = i;
+    if (r < 0) return ViewSides();
+    if (app.compareFollowFrame && a->seqId > 0) {
+        ImageDoc* pair = nullptr;
+        for (const auto& q : app.images)
+            if (q->seqId == a->seqId && q->seqIndex == d->seqIndex) { pair = q.get(); break; }
+        if (pair) {
+            ViewSides v = viewSidesFor(pair);
+            if (sideOfView(*d, v)) { stepTo = pair; return v; }
+        }
+    }
+    stepTo = nullptr;
+    s.side[r] = d;
+    s.diverged[r] = false;
+    return s;
 }
 // WHICH fit "each side fits itself" draws with (#301), set from the radio row
 // under the A/B combo and from the View > Compare A/B menu. It is the SAME
@@ -551,9 +697,8 @@ static void setEachSideFlavor(int fl) {
     if (fl < AF_MinMax || fl > AF_Median) return;
     if (!app.linkRange && app.rangeScope == 0 && cur()) applyRangeMode(0, cur(), fl);
     else app.autoFlavor = fl;
-    ImageDoc* parts[CMP_SIDES_MAX];
-    const int np = comparedSides(parts);
-    for (int i = 0; i < np; i++) parts[i]->texDirty = true;
+    const ViewSides v = comparedSides();
+    for (int i = 0; i < v.n; i++) v.side[i]->texDirty = true;
 }
 
 static void setRange(ImageDoc& im, float black, float white) {

@@ -19,9 +19,11 @@ static bool g_abFollowDiverged = false;
 // frame is compared against another of the same capture. A stack with no frame
 // at A's number hands back the pinned frame with `diverged` set: the caller
 // must SAY it (the [stale] vocabulary), never show it as a matched pair.
-static ImageDoc* followFrame(ImageDoc* d, bool& diverged) {
+// `a` is the A side the follow is FOR. The screen passes cur(); an export
+// passes the frame it is about to write (viewSidesFor, #304), because "B's
+// frame k" is a question about frame k, not about whatever is on screen.
+static ImageDoc* followFrame(ImageDoc* d, const ImageDoc* a, bool& diverged) {
     diverged = false;
-    ImageDoc* a = cur();
     if (!d || !a || !app.compareFollowFrame) return d;
     if (d->seqId == 0 || a->seqId == 0 || d->seqId == a->seqId ||
         d->seqIndex == a->seqIndex)
@@ -49,14 +51,19 @@ static ImageDoc* followFrame(ImageDoc* d, bool& diverged) {
 // the confirmation impossible - "B is identical to A" and "B is not being
 // drawn" look the same. So B is B, and two coinciding sides are DRAWN
 // coinciding: two curves in their own slotInk, two rows, two labels.
-static ImageDoc* resolveB() {
-    g_abFollowDiverged = false;
+//
+// resolveBAt answers for an A side that need not be on screen (#304) and
+// records nothing; resolveB is the screen's answer, i.e. resolveBAt(cur()),
+// and is the one that writes g_abFollowDiverged - the [stale] marks describe
+// the screen, so a video export resolving frame 7 must not repaint them.
+static ImageDoc* resolveBAt(const ImageDoc* a, bool& diverged) {
+    diverged = false;
     if (app.compareBUid) {
         ImageDoc* b = nullptr;
         for (const auto& d : app.images)
             if (d->uid == app.compareBUid) { b = d.get(); break; }
         if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
-        return followFrame(b, g_abFollowDiverged);
+        return followFrame(b, a, diverged);
     }
     if (app.compareB.empty()) return nullptr;
     // session fallback: match the saved name (and frame, for a stack), then latch
@@ -68,6 +75,12 @@ static ImageDoc* resolveB() {
         return d.get();
     }
     return nullptr;
+}
+static ImageDoc* resolveB() {
+    bool div = false;
+    ImageDoc* b = resolveBAt(cur(), div);
+    g_abFollowDiverged = div;
+    return b;
 }
 static ImageDoc* cmpB() { return app.compareMode == App::CmpOff ? nullptr : resolveB(); }
 
@@ -357,24 +370,81 @@ static std::vector<uint8_t> g_slotDiverged;   // by cmpExtra index, last resolve
 // rule resolveB now follows, for the same reason. Dropping it here made a
 // letter's row, curve and pane vanish the moment A walked onto it, which is
 // indistinguishable from the slot having been lost.
-static std::vector<ResolvedSlot> resolveSlots() {
+// resolveSlotsAt follows for an A side that need not be on screen (#304) and
+// records nothing but the pruning of closed slots, which is true whoever asks;
+// resolveSlots is the screen's answer and writes g_slotDiverged, as resolveB
+// writes g_abFollowDiverged.
+static std::vector<ResolvedSlot> resolveSlotsAt(const ImageDoc* a) {
     std::vector<ResolvedSlot> out;
-    g_slotDiverged.assign(app.cmpExtra.size(), 0);
     for (size_t i = 0; i < app.cmpExtra.size();) {
         ImageDoc* d = nullptr;
         for (const auto& q : app.images) if (q->uid == app.cmpExtra[i]) { d = q.get(); break; }
         if (!d) {   // closed
             app.cmpExtra.erase(app.cmpExtra.begin() + i);
-            g_slotDiverged.erase(g_slotDiverged.begin() + i);
             continue;
         }
         bool div = false;
-        ImageDoc* r = followFrame(d, div);
-        g_slotDiverged[i] = div ? 1 : 0;
+        ImageDoc* r = followFrame(d, a, div);
         out.push_back({ r, i, div });
         i++;
     }
     return out;
+}
+static std::vector<ResolvedSlot> resolveSlots() {
+    std::vector<ResolvedSlot> out = resolveSlotsAt(cur());
+    g_slotDiverged.assign(app.cmpExtra.size(), 0);
+    for (const ResolvedSlot& rs : out) g_slotDiverged[rs.idx] = rs.diverged ? 1 : 0;
+    return out;
+}
+
+// ---- the sides of a VIEW (#304) ---------------------------------------------
+// Who is being compared when A stands on `aAt`: A, B if it resolves, every
+// resolved slot - A first, each with its role (0 = A, 1 = B, 2 + i = the slot
+// letter SLOT_LETTERS[i]) and whether its follow diverged. The display range
+// is a property of THIS, not of a document: one frame is drawn at one range
+// as the A of one view and at another as an image nobody compares. The
+// screen's view is viewSidesFor(cur()) - comparedSides() in export.inc is that
+// and nothing else - and an export asks for the view its pixels would be on
+// screen in: frame k of a stack video is drawn in viewSidesFor(frame k), i.e.
+// what the screen shows once A is stepped onto frame k, B and the slots
+// following it.
+//
+// A tiled canvas can hold A + C + D with no B at all, so B is optional - what
+// is required is that there be someone besides A to compare WITH, and a count
+// under 2 is the caller's "no comparison". The slots join only while compare
+// is ON - the letters survive compare-off as seats, but a seat is not a
+// comparison. A, B and the slots may name the SAME document (resolveB does not
+// go quiet there): a union of min/max does not care how many times a side
+// appears, and the `rs.doc != b` below is kept only so a duplicate cannot eat
+// one of the fixed places.
+enum { CMP_SIDES_MAX = 2 + 14 };    // A + B + every slot letter (SLOT_LETTERS)
+struct ViewSides {
+    ImageDoc* side[CMP_SIDES_MAX] = {};
+    int role[CMP_SIDES_MAX] = {};       // 0 = A, 1 = B, 2 + i = slot letter i
+    bool diverged[CMP_SIDES_MAX] = {};  // the follow found no frame at A's number
+    int n = 0;
+};
+static ViewSides viewSidesFor(ImageDoc* aAt) {
+    ViewSides v;
+    if (!aAt) return v;
+    // When aAt IS the screen's A the screen's own resolves run: they are what
+    // record the [stale] marks, so the screen keeps every side effect it had.
+    const bool onScreen = aAt == cur();
+    bool bDiv = false;
+    ImageDoc* b = nullptr;
+    if (app.compareMode != App::CmpOff) {
+        if (onScreen) { b = resolveB(); bDiv = g_abFollowDiverged; }
+        else b = resolveBAt(aAt, bDiv);
+    }
+    v.side[v.n] = aAt; v.role[v.n] = 0; v.n++;
+    if (b) { v.side[v.n] = b; v.role[v.n] = 1; v.diverged[v.n] = bDiv; v.n++; }
+    if (app.compareMode != App::CmpOff && !app.cmpExtra.empty())
+        for (const ResolvedSlot& rs : onScreen ? resolveSlots() : resolveSlotsAt(aAt))
+            if (rs.doc != b && v.n < CMP_SIDES_MAX) {
+                v.side[v.n] = rs.doc; v.role[v.n] = 2 + (int)rs.idx;
+                v.diverged[v.n] = rs.diverged; v.n++;
+            }
+    return v;
 }
 static std::vector<ImageDoc*> compareExtras() {
     std::vector<ImageDoc*> out;
@@ -757,6 +827,11 @@ static void computeMinMax(ImageDoc& im) {
 // otherwise. Linking never overwrites an image's range (defined below with App).
 static float effBlack(const ImageDoc& im);
 static float effWhite(const ImageDoc& im);
+// ...both of which are displayRangeFor(im, comparedSides()): the range `im` is
+// drawn at in a VIEW (#304), defined with them in export.inc.
+static ViewSides comparedSides();
+static void displayRangeFor(const ImageDoc& im, const ViewSides& v, float& lo, float& hi);
+static bool rangeReadsView();
 
 // The LOAD-TIME default, and only that. Its two magnets - the 8- and 16-bit
 // integer types to their type fullscale, near-[0,1] floats to 0..1 - are
@@ -1055,9 +1130,10 @@ static void refitByFlavor(ImageDoc& im) {
 }
 // fitByFlavor's answer for one compared side, kept on the doc (see fitValid in
 // ImageDoc for why the caches under it are not enough on their own). Read by
-// abRange for every compared side on every UI frame. Same precondition as
-// refitByFlavor: linkRange OFF - effBlack/effWhite answer the linked pair
-// before abRange is consulted - so the pooled linked fits never run here.
+// displayRangeFor for every compared side on every UI frame. Same precondition
+// as refitByFlavor: linkRange OFF - displayRangeFor answers the linked pair
+// before the compare mode is consulted - so the pooled linked fits never run
+// here.
 // Min-max is not cached: it is two cached numbers already, and reading them
 // live keeps a vmin/vmax written by hand honest without an invalidation.
 static void ownFitCached(ImageDoc& im, float& lo, float& hi) {
@@ -1677,9 +1753,12 @@ static const float* displayGammaTable(float gamma) {
     }
     return lut;
 }
-static DisplayMap displayMapOf(const ImageDoc& im) {
+// `v` = the view `im` is drawn in (#304); null = the screen's, comparedSides().
+static DisplayMap displayMapOf(const ImageDoc& im, const ViewSides* v = nullptr) {
     DisplayMap M;
-    M.black = effBlack(im);
+    float rangeHi = 0;
+    displayRangeFor(im, v ? *v : rangeReadsView() ? comparedSides() : ViewSides(),
+                    M.black, rangeHi);
     // A range too wide for a float (issue #297 item 10): black -3e38 / white
     // 3e38 is legal, its float width is +inf, and inv = 1/inf = 0 turned
     // xOf(+inf) into inf * 0 = NaN, i.e. screen 0 instead of 255. ONLY that
@@ -1691,11 +1770,11 @@ static DisplayMap displayMapOf(const ImageDoc& im) {
     // taken in double, where two finite ends always give a finite width; an
     // end that is itself non-finite is held at 2 * FLT_MAX, the widest finite
     // range two floats can span, so inv is never 0.
-    const float wf = effWhite(im) - M.black;
+    const float wf = rangeHi - M.black;
     if (std::isfinite(wf)) {
         M.inv = 1.0f / std::max(wf, 1e-20f);
     } else {
-        double width = (double)effWhite(im) - (double)M.black;
+        double width = (double)rangeHi - (double)M.black;
         if (!std::isfinite(width)) width = 2.0 * (double)FLT_MAX;
         M.inv = (float)(1.0 / width);
     }
@@ -1717,9 +1796,13 @@ static DisplayMap displayMapOf(const ImageDoc& im) {
 // colormap, CFA colorize). Split out of rebuildTexture so that EXPORTING a view
 // runs the same code: a picture pasted into a report that does not match the
 // screen is worse than no picture.
-static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
+// `v` is the VIEW the pixels are drawn in, which decides their display range
+// (#304): null is the screen's view, and an export passes the view the picture
+// would be on screen in - frame k of a stack video passes viewSidesFor(frame k).
+static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba,
+                          const ViewSides* v = nullptr) {
     rgba.resize((size_t)im.w * im.h * 4);
-    const DisplayMap M = displayMapOf(im);
+    const DisplayMap M = displayMapOf(im, v);
     const float ib = M.black;
     const uint8_t* lut = M.colormap;
     int px = 0, py = 0;

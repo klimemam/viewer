@@ -9,12 +9,20 @@
 // the same picture, and that is asserted rather than asserted-to (see
 // --video-selftest, V6).
 //
-// WHICH RANGE: each frame's EFFECTIVE range, which is what effBlack/effWhite
-// answer. Per stack and Linked hand every frame the same numbers and need
-// nothing here. "Auto per frame" is the one mode that has to ACT: stepping
-// onto a frame re-fits it to its own min..max (selectImage, sequence.inc), and
-// an export that skipped that would write frames the user has never seen. The
-// same call, in the same condition, is made here per frame.
+// WHICH RANGE: each frame is drawn at the range the SCREEN gives it in the
+// view it is on screen in (#304, exportFrameViewFor). For A's own stack that
+// is A stepped onto frame k, B and the slots following to THEIR frame k:
+// under the A/B union the union of A_k, B_k, C_k... (a side with no frame k is
+// its pinned frame, as on screen, and the announcement says "B held at frame
+// 1"); under each side fits itself A_k's own fit; under A's range A_k's own
+// black-white. A stack held by B or a slot is drawn in that role, in the view
+// follow-frame pairs it in. An export that drew every frame in the screen's
+// view instead would draw only the frame on screen as a compared side and
+// every other at its own range - two ranges in one video. "Auto per frame"
+// additionally has to ACT: stepping A onto a frame re-fits it (selectImage,
+// sequence.inc), and the same call, in the same condition, is made here on
+// the frame A would be stepped onto. The range is named where the export is
+// announced (exportRangeNote), never baked into the file.
 //
 // WHY IT IS SLICED: renderDocRGBA is CPU-only but not thread-safe - it holds a
 // static gamma LUT - so it cannot go to a worker. It runs on the UI thread,
@@ -93,6 +101,17 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
         if (!why.empty())
             return "frame " + std::to_string(d->seqIndex + 1) + " of " +
                    std::to_string(fr.size()) + ": " + why;
+        // ...and every side the frame's range is taken OVER (the A/B union
+        // reads B's and the slots' frame k): the same "not yet" for them.
+        // Only the union reads them, so only the union builds the view.
+        if (rangeReadsOtherSides()) {
+            ImageDoc* stepTo = nullptr;
+            ImageDoc* fi = app.images[fr[i]].get();
+            why = viewRefusalFor(exportFrameViewFor(fi, stepTo), fi);
+            if (!why.empty())
+                return "frame " + std::to_string(d->seqIndex + 1) + " of " +
+                       std::to_string(fr.size()) + ": " + why;
+        }
         if (d->w != w || d->h != h)
             return "this stack's frames are not all one size (" +
                    std::to_string(w) + "x" + std::to_string(h) + " and " +
@@ -133,6 +152,11 @@ static std::string startStackVideoExport(int seqId, const std::string& path, dou
     J.w = app.images[fr.front()]->w;
     J.h = app.images[fr.front()]->h;
     for (int i : fr) J.uids.push_back(app.images[i]->uid);
+    {
+        ImageDoc* first = app.images[fr.front()].get();
+        ImageDoc* stepTo = nullptr;
+        J.rangeNote = exportRangeNote(*first, exportFrameViewFor(first, stepTo), true);
+    }
     std::string err;
     if (videoExtOf(path) == ".mkv") {
         J.sink = videowrite::openFfv1(path, J.w, J.h, fps, err);
@@ -177,6 +201,8 @@ static bool pumpVideoExport() {
         const std::string name = baseName(J.path), kind = J.sinkName;
         const int w = J.w, h = J.h;
         const double fps = J.fps;
+        std::string rNote = J.rangeNote;
+        for (const std::string& h : J.held) rNote += "; " + h;
         // A finish that failed leaves a file with no index and a header still
         // claiming 0 frames - unplayable, and saying nothing about why. It goes
         // the same way a Stop goes, for the same reason: nothing left behind.
@@ -188,8 +214,9 @@ static bool pumpVideoExport() {
         // does for a PNG: the magenta is IN the file (renderDocRGBA is the one
         // mapping) and the badge that explains it is not.
         const std::string hl = exportHighlightNote(cur());
-        toast("wrote " + name + tail + " (" + kind + ")" +
+        toast("wrote " + name + tail + " (" + kind + ")  -  " + rNote +
               (hl.empty() ? "" : "  -  " + hl));
+        fprintf(stderr, "export: video %s\n", rNote.c_str());
         if (!hl.empty()) fprintf(stderr, "export: video %s\n", hl.c_str());
         return false;
     }
@@ -210,21 +237,35 @@ static bool pumpVideoExport() {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
         return false;
     }
+    // The view this frame is on screen in (#304): for A's stack, A on it and B
+    // and the slots followed to theirs. Its sides can turn into previews
+    // mid-write too, and a side held at its pinned frame is said at the end.
+    ImageDoc* stepTo = nullptr;
+    const ViewSides view = exportFrameViewFor(d, stepTo);
+    why = viewRefusalFor(view, d);
+    if (!why.empty()) {
+        abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
+        return false;
+    }
+    for (const std::string& h : viewHeldSides(view))
+        if (std::find(J.held.begin(), J.held.end(), h) == J.held.end()) J.held.push_back(h);
     if (d->w != J.w || d->h != J.h) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
         return false;
     }
-    // "Auto per frame" re-fits the frame to its OWN numbers on the way in -
-    // the same call selectImage makes on a step, in the same condition, so the
-    // video shows what stepping through the stack would have shown. WHICH fit
+    // "Auto per frame" re-fits the frame A steps onto - the same call
+    // selectImage makes on a step, in the same condition, so the video shows
+    // what stepping through the stack would have shown. For A's own stack that
+    // is the frame itself; for a stack drawn as B it is A's paired frame (B is
+    // never re-fitted by a step), and with A staying put it is nothing. WHICH fit
     // (min..max, the 0.1-99.9% cut, median->target) is app.autoFlavor's
     // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
     // be a second answer to the one question. Linked and per-stack need
-    // nothing: effBlack/effWhite already answer for the stack.
-    if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
+    // nothing: displayRangeFor already answers for the stack.
+    if (app.rangeScope == 0 && !app.linkRange && stepTo) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
-    renderDocRGBA(*d, rgba);
+    renderDocRGBA(*d, rgba, &view);
     const size_t px = (size_t)J.w * J.h;
     rgb.resize(px * 3);
     for (size_t p = 0; p < px; p++) {
