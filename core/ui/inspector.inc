@@ -484,8 +484,8 @@ static void drawInspector() {
                 // is the case where a reading can mislead.
                 ImGui::SetNextItemWidth(-1);
                 // "both" and "B uses" were true when the comparison was a
-                // pair. The RULE was always N-wide (abRange spans every
-                // compared pane), so at three slots the labels lied about
+                // pair. The RULE was always N-wide (displayRangeFor spans
+                // every compared pane), so at three slots the labels lied about
                 // arity - issue #60 named this one by name. "every side" is
                 // the noun the panels already use, and it is true at two.
                 // The fourth (#301) is the third's sibling: still Auto, but

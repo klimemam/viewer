@@ -5820,10 +5820,11 @@ static void pollFileDialog() {           // called once per frame from the main 
         std::string p = app.pngDlg->result();
         if (!p.empty()) {
             if (p.size() < 4 || p.substr(p.size() - 4) != ".png") p += ".png";
-            saveViewPng(p, app.pngDlgUid);
+            saveViewPng(p, app.pngDlgUid, app.pngDlgViewAUid);
         }
         app.pngDlg.reset();
         app.pngDlgUid = 0;
+        app.pngDlgViewAUid = 0;
     }
     // ...and the same rule one layer up (#253): the dialog was opened on a
     // STACK, so the frames written are that stack's, named by seqId - not

@@ -23,14 +23,14 @@ static std::string abValueUnit(const std::string&) {
 // range there stays true.
 static const char* abRangeSaid(bool haveB) {
     // linkRange wins over all of it, and does so BEFORE any of this is consulted:
-    // effBlack/effWhite return the linked pair and never reach abRange, so the
+    // effBlack/effWhite return the linked pair and never reach the A/B mode, so the
     // axis spans the range shared by every open image - widened by stacks that
     // have nothing to do with the comparison. The Inspector already knows this
     // (it HIDES the A/B combo while the scope is "everything"), but the View >
     // Compare menu still sets the mode and the default is 2 regardless, so all
     // three combinations came out labelled with a range that was not in force.
     if (app.linkRange) return "linked range, all open images";
-    // Slots past B widen the union (abRange spans every compared pane), so
+    // Slots past B widen the union (displayRangeFor spans every compared pane), so
     // "A and B combined" undersells what the axis covers the moment C joins.
     // The letters count only while compare is on - a seat is not a comparison.
     const bool slots = app.compareMode != App::CmpOff && !compareExtras().empty();

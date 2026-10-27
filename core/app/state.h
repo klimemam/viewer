@@ -1307,6 +1307,9 @@ struct App {
     // dialog is open"); this is the same rule for pixels, kept by identity
     // rather than by copying a frame.
     uint64_t pngDlgUid = 0;
+    // ...and the A it was opened UNDER (#304): the range is the view's, and the
+    // view moves if A is stepped while the OS dialog is up. 0 = none.
+    uint64_t pngDlgViewAUid = 0;
     // ---- a STACK on its way out as a lossless video (issue #253) -----------
     // The neighbour of pngDlg above and its rule is pngDlgUid's, one layer up:
     // the dialog is opened ON A STACK, and the frames written when it closes
@@ -1337,6 +1340,8 @@ struct App {
         double fps = 30;
         std::string path;
         std::string sinkName;         // "uncompressed AVI" / "FFV1/MKV"
+        std::string rangeNote;        // exportRangeNote at start, announced at the end
+        std::vector<std::string> held; // "B held at frame 3", each once, as frames used them
         std::unique_ptr<videowrite::VideoSink> sink;
         bool stop = false;            // Stop: close the file and DELETE it
     } videoExport;
