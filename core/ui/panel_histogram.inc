@@ -783,6 +783,154 @@ static void drawPanelHistogram() {
 
 }
 
+// ---- the frame statistics: EVERY pixel of the region (issue #283) -----------
+// fStat used to be gathered inside the H pass below, which visits every column
+// of every step-th ROW. Below the sample cap that is every pixel; above it - a
+// 4096x3000 frame, step 6 - it was one row in six, while the panel said "the
+// whole region". The p-p of a subset can only be smaller than the region's,
+// and a row-periodic pattern aliases with the stride, so sigma (frame) and
+// p-p frame were biased exactly where FPN work looks. They are a pass of their
+// own now, over every row and every column, in the same order the H pass used
+// to visit them - so wherever the H pass did cover every pixel, the sums are
+// the same additions in the same order and the numbers do not move by a bit.
+//
+// Pure: it reads the buffer and the layout it is given and nothing in App, so
+// it runs unchanged on the UI thread or on a worker. Returns false when
+// `cancel` stopped it (checked once a row), leaving `out` unspecified.
+static bool projFrameMoments(const float* px, int imgW, int ch, int cfaType, int cfaPattern,
+                             int nSeries, bool allRow, int rx, int ry, int rw, int rh,
+                             App::ProjState::Stats out[5],
+                             const std::atomic<bool>* cancel) {
+    const bool cfa = cfaType != 0;
+    double fSum[5] = {}, fSum2[5] = {};
+    size_t fN[5] = {};
+    double fMn[5] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
+    double fMx[5] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
+    auto put = [&](int slot, float val) {
+        fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
+        fMn[slot] = std::min(fMn[slot], (double)val);
+        fMx[slot] = std::max(fMx[slot], (double)val);
+    };
+    for (int y = 0; y < rh; y++) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+        const float* row = &px[((size_t)(ry + y) * imgW + rx) * ch];
+        for (int x = 0; x < rw; x++) {
+            const float* src = row + (size_t)x * ch;
+            int lo = 0, hi = nSeries;
+            if (cfa) { lo = cfaChannelAtRaw(cfaType, cfaPattern, rx + x, ry + y); hi = lo + 1; }
+            for (int s = lo; s < hi; s++) {
+                float val = cfa ? src[0] : src[std::min(s, ch - 1)];
+                if (!std::isfinite(val)) continue;
+                put(s, val);
+                if (allRow) put(4, val);
+            }
+        }
+    }
+    for (int s = 0; s < 5; s++) {
+        App::ProjState::Stats& f = out[s];
+        f = {};
+        if (!fN[s]) continue;
+        f.n = fN[s];                   // the pooling weight, published
+        f.mean = fSum[s] / fN[s];
+        double var = fSum2[s] / fN[s] - f.mean * f.mean;
+        f.sd = sqrt(var > 0 ? var : 0);
+        f.mn = fMn[s]; f.mx = fMx[s]; f.pp = f.mx - f.mn;
+        f.pct = f.mean != 0 ? f.sd / fabs(f.mean) * 100.0 : 0.0;
+        f.valid = true;
+    }
+    return true;
+}
+
+// What fStat must answer for THIS document and region right now. nSeries and
+// allRow are the recompute's own rule (one plane per CFA phase, otherwise up
+// to three channels; "all" only with more than one plane), restated here
+// because the key has to be known BEFORE the recompute decides whether to run.
+static App::ProjState::FrameKey projFrameKeyOf(const ImageDoc* im, int rx, int ry,
+                                              int rw, int rh) {
+    App::ProjState::FrameKey k;
+    const bool cfa = im->ch == 1 && im->cfa != 0;
+    const int nSeries = cfa ? 4 : std::min(im->ch, 3);
+    k.uid = im->uid; k.dataRev = im->dataRev;
+    k.cfa = im->cfa; k.cfaPattern = im->cfaPattern;
+    k.rx = rx; k.ry = ry; k.rw = rw; k.rh = rh;
+    k.allRow = app.projAllRow && nSeries > 1;
+    k.pixels = im->px().data();
+    k.count = im->px().size();
+    return k;
+}
+
+// WHICH slots get frame statistics: every plane, and the pooled row when it is
+// on - and none at all on a refused side (the recompute's momSlot list, as a
+// mask, from the state it has already written).
+static void projFrameMask(const App::ProjState& P, bool mask[5]) {
+    for (int s = 0; s < 5; s++)
+        mask[s] = P.unavail.empty() && ((s < 4 && s < P.nSeries) || (s == 4 && P.allRow));
+}
+
+// Start the pass for P.fKey on a worker. fStat is cleared and stays cleared
+// until projFramePump installs the answer for the SAME key.
+static void projFrameStart(ImageDoc* im, App::ProjState& P) {
+    auto j = std::make_shared<App::ProjState::FrameJob>();
+    j->key = P.fKey;
+    j->src = im->src;
+    j->px = P.fKey.pixels;
+    j->imgW = im->w; j->ch = im->ch;
+    j->cfa = (im->ch == 1) ? im->cfa : 0;
+    j->cfaPattern = im->cfaPattern;
+    j->nSeries = P.nSeries;
+    j->allRow = P.fKey.allRow;
+    projFrameMask(P, j->mom);
+    for (int s = 0; s < 5; s++) P.fStat[s] = {};
+    P.fPending = true;
+    App::ProjState::FrameJob* raw = j.get();
+    j->th = std::thread([raw]() {
+        const App::ProjState::FrameKey& k = raw->key;
+        projFrameMoments(raw->px, raw->imgW, raw->ch, raw->cfa, raw->cfaPattern,
+                         raw->nSeries, raw->allRow, k.rx, k.ry, k.rw, k.rh,
+                         raw->out, &raw->cancel);
+        raw->done.store(true);
+    });
+    P.fJob = j;
+    // the registry is pruned by whoever walks it; a run with no frame loop
+    // (projFrameBusy) still starts jobs, so starting one prunes too
+    for (size_t i = 0; i < g_projFrameJobs.size();)
+        if (g_projFrameJobs[i].expired()) g_projFrameJobs.erase(g_projFrameJobs.begin() + (long)i);
+        else i++;
+    g_projFrameJobs.push_back(j);
+    g_projFrameJobStarts++;
+}
+
+// The landing, on the UI thread. A finished job is installed only if it was
+// not stopped AND its key is still the one `want` names; anything else is
+// dropped unread. A pending state left without a job (a fence stopped it) is
+// restarted over the CURRENT pixels - never the stopped job's, whose buffer
+// the writer behind the fence has just replaced.
+static void projFramePump(ImageDoc* im, App::ProjState& P,
+                          const App::ProjState::FrameKey& want) {
+    if (P.fJob && P.fJob->done.load()) {
+        std::shared_ptr<App::ProjState::FrameJob> j = std::move(P.fJob);
+        if (j->th.joinable()) j->th.join();
+        if (!j->cancel.load() && P.fPending && j->key == P.fKey && j->key == want) {
+            for (int s = 0; s < 5; s++)
+                P.fStat[s] = j->mom[s] ? j->out[s] : App::ProjState::Stats{};
+            P.fPending = false;
+        }
+    }
+    if (P.fPending && !P.fJob && P.fKey == want) projFrameStart(im, P);
+}
+
+// Drive P's pending frame statistics to the end on THIS thread: join the
+// worker, then land it through the same pump the frame loop uses. For a run
+// with no frame loop (a selftest) and for a file export, which must write
+// numbers rather than "computing...". waitForOpenJob's twin.
+static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P);
+static void projFrameWait(ImageDoc* im, App::ProjState& P) {
+    for (int guard = 0; P.fPending && guard < 8; guard++) {
+        if (P.fJob && P.fJob->th.joinable()) P.fJob->th.join();
+        recomputeProjectionIfNeeded(im, P);
+    }
+}
+
 // H/V projections: column means (horizontal profile) and row means (vertical
 // profile) over the selected ROI. Column FPN, banding and shading show up here
 // far more clearly than in the image itself.
@@ -797,6 +945,10 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             if (cw > 0 && chh > 0) { rx = cx; ry = cy; rw = cw; rh = chh; roiUsed = true; }
         }
     }
+    // the frame statistics land (or restart) BEFORE the cache answers: a
+    // region that has not moved still has a pass to collect
+    const App::ProjState::FrameKey fWant = projFrameKeyOf(im, rx, ry, rw, rh);
+    projFramePump(im, P, fWant);
     if (P.uid == im->uid && P.dataRev == im->dataRev && P.mode == app.projMode &&
         P.cfa == im->cfa && P.cfaPattern == im->cfaPattern &&
         P.allReq == app.projAllRow &&
@@ -913,24 +1065,16 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
             if (!moments[s]) P.fStat[s] = {};
         }
     }
-    // Region moments, gathered from the SAME samples the H pass visits (every
-    // column, every step-th row). So the region statistics and the H profile
-    // describe one and the same set of pixels, and - every column of a
-    // rectangle carrying the same sample count - the region mean and the mean
-    // of the column means are ONE NUMBER, computed twice. The panel prints
-    // both: fStat[].mean in the wide table, hStat[].mean in the per-axis one.
-    // They are asserted equal to within one float ulp (--precision-selftest
-    // P7c); they were 0.015 DN apart while the sum above was a float.
-    //
-    // NOT the V profile. That pass visits every row of every step-th COLUMN,
-    // which is a different set of pixels, and its mean differs from the region
-    // mean by ~0.04 DN on a 4000x3000 frame for that reason alone. The comment
-    // that used to stand here said "the profile sigmas", plural, and was
-    // therefore false for half of what it named.
-    double fSum[5] = {}, fSum2[5] = {};
-    size_t fN[5] = {};
-    double fMn[5] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
-    double fMx[5] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
+    // The region moments (fStat) are NOT gathered here any more: they are
+    // projFrameMoments' pass over every pixel (issue #283), started below
+    // once the stride is known. Where the H pass below covers every pixel -
+    // step == cell - the H profile and the region share one sample set and
+    // the region mean and the mean of the column means are ONE NUMBER,
+    // computed twice; they are asserted equal to within one float ulp
+    // (--precision-selftest P7c), and were 0.015 DN apart while the column
+    // sum was a float. Above the cap the H profile is over every step-th row
+    // and the region is over all of them, so the two means are different
+    // measurements - which is what the per-axis table's "mean (axis)" says.
     bool useMax = app.projMode == 1, useMin = app.projMode == 2;
     if (useMax || useMin)
         for (int i = 0; i < nAcc; i++) {
@@ -969,17 +1113,12 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         // second pass keeps the two rows over EXACTLY the same samples.
         auto put = [&](int slot, float val) {
             if (hasProfile[slot]) {         // a slot with no profile - the pooled
-                                            // row on a mosaic - still has moments
+                                            // row on a mosaic - has moments only
                 double& acc = toH ? hAcc[slot][x] : vAcc[slot][y];
                 if (useMax) acc = std::max(acc, (double)val);
                 else if (useMin) acc = std::min(acc, (double)val);
                 else acc += val;
                 (toH ? hN[slot][x] : vN[slot][y])++;
-            }
-            if (toH) {           // one pass only, or every pixel counts twice
-                fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
-                fMn[slot] = std::min(fMn[slot], (double)val);
-                fMx[slot] = std::max(fMx[slot], (double)val);
             }
         };
         // THE LATTICE IS WHERE THE PASS LOOKED, NOT WHERE IT FOUND SOMETHING.
@@ -1042,18 +1181,37 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     if (P.hMin > P.hMax) { P.hMin = 0; P.hMax = 1; }
     if (P.vMin > P.vMax) { P.vMin = 0; P.vMax = 1; }
 
-    for (int i = 0; i < nMom; i++) {       // ...including the pooled row on a
-        const int s = momSlot[i];          // mosaic, which has ONLY these
-        App::ProjState::Stats& f = P.fStat[s];
-        f = {};
-        if (!fN[s]) continue;
-        f.n = fN[s];                   // the pooling weight, published
-        f.mean = fSum[s] / fN[s];
-        double var = fSum2[s] / fN[s] - f.mean * f.mean;
-        f.sd = sqrt(var > 0 ? var : 0);
-        f.mn = fMn[s]; f.mx = fMx[s]; f.pp = f.mx - f.mn;
-        f.pct = f.mean != 0 ? f.sd / fabs(f.mean) * 100.0 : 0.0;
-        f.valid = true;
+    // ---- the frame statistics (issue #283), keyed ------------------------
+    // ...including the pooled row on a mosaic, which has ONLY these. Over a
+    // region the H pass covers whole (step == cell) the pass is no bigger than
+    // the one just made, so it runs here and nothing is ever pending; above
+    // the cap it goes to a worker and fStat reads "computing..." until
+    // projFramePump lands the answer for this same key. A job still running
+    // for the PREVIOUS key is simply dropped: its result could only be
+    // installed under a key that is no longer wanted.
+    //   ...and a recompute that did not move the KEY - the reduce mode
+    // changed, or forgetImage dropped the cache pointer - keeps the answer it
+    // has or the pass it is waiting for: the pixels and the region are the
+    // same, so "computing..." again would be a flash with nothing behind it.
+    const bool keepFrame = fWant.uid != 0 && P.fKey == fWant && (P.fJob || !P.fPending);
+    if (!keepFrame) {
+        P.fJob.reset();
+        P.fKey = fWant;
+        P.fPending = false;
+    }
+    if (nMom && !keepFrame) {
+        const bool async = step > cell && (!g_scriptedRun || g_forceAsyncProjFrame);
+        if (async) {
+            projFrameStart(im, P);
+        } else {
+            App::ProjState::Stats out[5];
+            projFrameMoments(im->px().data(), im->w, im->ch, cfa ? im->cfa : 0,
+                             im->cfaPattern, P.nSeries, P.allRow, rx, ry, rw, rh,
+                             out, nullptr);
+            bool mom[5];
+            projFrameMask(P, mom);
+            for (int s = 0; s < 5; s++) P.fStat[s] = mom[s] ? out[s] : App::ProjState::Stats{};
+        }
     }
     // statistics OF THE PROFILE itself: the spread of column means is column FPN,
     // the spread of row means is row FPN / banding - that is the number people

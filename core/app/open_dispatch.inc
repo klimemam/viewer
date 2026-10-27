@@ -1368,6 +1368,10 @@ static bool reloadLand(const std::shared_ptr<FrameSource>& src, const ReloadSpec
         idNew.mtime = N.mtime; idNew.fsize = N.fsize;
         newKey = srcIdentityKey(idNew);
     }
+    // the swap below replaces src->data in place: a Projection frame-statistics
+    // pass reading it stops first (projFrameFence, issue #283), outside the
+    // leaf lock
+    projFrameFence(src.get());
     {   // the swap, in ONE hold of g_srcRegMtx: the worker reads a shared
         // source only inside that lock (find + syncMirrors in one section), so
         // no thread can see a half-swapped source. nd is PRIVATE here - the

@@ -276,19 +276,20 @@ if (!g_precisionSelftest.empty()) {
     //                panel_histogram.inc accumulates in `double fSum[5]`;
     //   per-axis     "mean" = P.hStat[].mean, the mean of the COLUMN means,
     //   table        and every column sum was accumulated in a float.
-    // The H pass visits every column of every step-th row, and the region
-    // moments are gathered from EXACTLY those visits, so over a rectangle
-    // every column carries the same sample count and the two are the same
-    // number in arithmetic. Whatever separates them is the accumulator - and
-    // which of the two you are shown is decided by how wide the panel is.
+    // Below the sample cap the H pass visits every pixel and the region
+    // moments are over every pixel (issue #283), so over a rectangle every
+    // column carries the same sample count and the two are the same number in
+    // arithmetic. Whatever separates them is the accumulator - and which of
+    // the two you are shown is decided by how wide the panel is. (Above the
+    // cap they are different sample sets on purpose: P7e.)
     //
     // The fixture is arithmetic rather than a measurement, on the P1 rule:
     // every pixel is 3000.4f (= 3000.39990234375, exactly), so every column
     // mean is 3000.4f, the mean of the column means is 3000.4f, and the region
-    // mean is 3000.4f. 512 rows per column is what a 4000x3000 frame leaves
-    // after PROJ_MAX_SAMPLES strides it (step 6 -> 500 rows), so this small
-    // fixture drifts by what a real frame drifts by: measured -0.0149 DN here
-    // against -0.0146 DN on the 4000x3000 original.
+    // mean is 3000.4f. 512 rows per column is what a 4000x3000 frame's H
+    // profile keeps after PROJ_MAX_SAMPLES strides it (step 6 -> 500 rows), so
+    // this small fixture drifts by what a real frame's column sums drifted by:
+    // measured -0.0149 DN here against -0.0146 DN on the 4000x3000 original.
     //
     // Why a UNIFORM region and not a noisy one: the rounding error of a column
     // sum depends on the values, so on a noisy frame the 4000 columns make
@@ -366,11 +367,12 @@ if (!g_precisionSelftest.empty()) {
     check(PN.fStat[0].valid && PN.hStat[0].valid &&
           fabs(PN.hStat[0].mean - PN.fStat[0].mean) <= ulpBound(PN.fStat[0].mean),
           "P7d and the same bound holds over a noisy frame");
-    // The V profile is NOT part of this: it visits all rows of every step-th
-    // COLUMN, which is a different set of pixels from the one the region
-    // moments were gathered over, so its mean legitimately differs (0.037 DN
-    // on a 4000x3000 frame, in double). Asserting it here would be asserting
-    // something untrue - the comment in panel_histogram.inc used to.
+    // Above the cap neither profile is part of this: the H pass visits every
+    // step-th ROW and the V pass every step-th COLUMN, and the region moments
+    // are over every pixel (issue #283), so each axis mean legitimately
+    // differs from the region's (the V one by 0.037 DN on a 4000x3000 frame,
+    // in double). Asserting equality there would be asserting something
+    // untrue - the comment in panel_histogram.inc used to.
     //
     // ...and THAT is what issue #145 was about: two honest numbers shared one
     // column called "mean", so which one you read depended on the layout the
@@ -401,13 +403,16 @@ if (!g_precisionSelftest.empty()) {
         // of every step-th column, so it always does.
         //
         // Derivation, by hand: W=H=2048 (4.19 Mpx, step 2), base B, row 1 is B+D.
-        // The region moments are gathered in the H pass ("if (toH)"), so the
-        // region and the H profile share one sample set by construction:
-        //   H set = all x, even y            -> mean = B                (row 1 absent)
-        //   V set = even x, all y            -> mean = B + D/H
-        // With B = 3000 and D = 2048 the V mean is B + 1 exactly, which is
-        // 333 ppm - three orders above the one-ulp bound, so the assertion is
-        // about the sample sets and not about rounding.
+        // The region moments are over every pixel (issue #283; before it they
+        // were gathered in the H pass and shared its sample set):
+        //   H set      = all x, even y       -> mean = B                (row 1 absent)
+        //   V set      = even x, all y       -> mean = B + D/H
+        //   region set = all x, all y        -> mean = B + D/H
+        // With B = 3000 and D = 2048 the region mean is B + 1 exactly and the
+        // H mean is B, which is 333 ppm - three orders above the one-ulp bound,
+        // so the assertion is about the sample sets and not about rounding.
+        // Before #283 the pair that differed was V against the region; the
+        // claim - "mean (axis)" is not the region's mean - is the same one.
         const int BW = 2048, BH = 2048;
         auto big = std::make_unique<ImageDoc>();
         big->name = "p7struct";
@@ -418,17 +423,18 @@ if (!g_precisionSelftest.empty()) {
         big->syncMirrors();
         App::ProjState PB;
         probe(big.get(), PB);
-        const double dv = fabs(PB.vStat[0].mean - PB.fStat[0].mean);
+        const double dh = fabs(PB.hStat[0].mean - PB.fStat[0].mean);
         const double bound = ulpBound(PB.fStat[0].mean);
         const App::ProjState& PN = PB;
-        fprintf(stderr, "precisionselftest: P7e V profile %s vs region %s | "
+        fprintf(stderr, "precisionselftest: P7e H profile %s vs region %s | "
                         "off by %s DN (%.3g ppm), one-ulp bound %.3g ppm\n",
-                rp::exactNum(PN.vStat[0].mean).c_str(),
+                rp::exactNum(PN.hStat[0].mean).c_str(),
                 rp::exactNum(PN.fStat[0].mean).c_str(),
-                rp::exactNum(PN.vStat[0].mean - PN.fStat[0].mean).c_str(),
-                dv / fabs(PN.fStat[0].mean) * 1e6, bound / fabs(PN.fStat[0].mean) * 1e6);
-        check(PN.vStat[0].valid && dv > bound,
-              "P7e the V profile mean is a DIFFERENT number - the axis label is not decoration");
+                rp::exactNum(PN.hStat[0].mean - PN.fStat[0].mean).c_str(),
+                dh / fabs(PN.fStat[0].mean) * 1e6, bound / fabs(PN.fStat[0].mean) * 1e6);
+        check(PN.hStat[0].valid && PN.fStat[0].valid && dh > bound &&
+              PN.fStat[0].mean == 3001.0 && PN.hStat[0].mean == 3000.0,
+              "P7e the H profile mean is a DIFFERENT number - the axis label is not decoration");
     }
     app.projMode = savedMode; app.projAllRow = savedAll;
     app.annBusy = savedBusy; app.selectedAnn = savedSel;

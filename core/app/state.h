@@ -268,7 +268,10 @@ inline constexpr ImGuiKeyChord CHORD_COPY_DOT = MODK | ImGuiMod_Shift | ImGuiKey
 
 inline std::atomic<uint64_t> g_nextSrcId{ 1 };
 struct FrameSource {
-    std::vector<float> data;          // raw values, size w*h*ch
+    // raw values, size w*h*ch. A writer that REPLACES this vector on a source
+    // a document already shows calls projFrameFence(this) first: a Projection
+    // frame-statistics worker may be reading the old buffer (issue #283).
+    std::vector<float> data;
     int w = 0, h = 0, ch = 1;
     std::string dtype;
     float vmin = 0, vmax = 1;         // data min/max
@@ -899,11 +902,17 @@ inline constexpr int CFA_MAP[4][4] = {
     { 1, 0, 3, 2 },   // GRBG
     { 2, 3, 0, 1 },   // GBRG
 };
+// The phase arithmetic itself, on the two numbers it depends on. A worker that
+// must not touch an ImageDoc (the Projection frame statistics, issue #283) asks
+// THIS, and cfaChannelAt below is it with the document unpacked - one spelling.
+inline int cfaChannelAtRaw(int cfa, int cfaPattern, int x, int y) {
+    if (cfa == 0) return -1;
+    int cx = cfa == 2 ? (x >> 1) & 1 : x & 1;      // Quad Bayer: 2x2 blocks share a color
+    int cy = cfa == 2 ? (y >> 1) & 1 : y & 1;
+    return CFA_MAP[cfaPattern & 3][cy * 2 + cx];
+}
 inline int cfaChannelAt(const ImageDoc& im, int x, int y) {
-    if (im.cfa == 0) return -1;
-    int cx = im.cfa == 2 ? (x >> 1) & 1 : x & 1;   // Quad Bayer: 2x2 blocks share a color
-    int cy = im.cfa == 2 ? (y >> 1) & 1 : y & 1;
-    return CFA_MAP[im.cfaPattern & 3][cy * 2 + cx];
+    return cfaChannelAtRaw(im.cfa, im.cfaPattern, x, y);
 }
 
 struct ViewState {
@@ -3369,6 +3378,65 @@ struct App {
         // profile sigmas without it is reading a ratio with no denominator -
         // and it is the third quantity the row/column noise split needs.
         Stats fStat[5];
+        // ---- WHEN fStat IS READY (issue #283) ----------------------------
+        // fStat is over EVERY pixel of the region, and over a region big
+        // enough that the profile decimates (the H pass skips rows) that pass
+        // runs on a worker: a full sensor frame is tens of millions of
+        // samples, and #232 is what doing that on the UI thread looks like.
+        // So fStat has a third state beside valid / invalid: PENDING - the
+        // region is known, its numbers are not yet. While fPending is true
+        // every fStat[] is cleared ({}), so no reader can print the previous
+        // region's number as this one's; the panel and the TSV say
+        // "computing..." in those cells instead.
+        //
+        // The result is KEYED. fKey is what fStat answers (or is waiting
+        // for); a job carries the key it was started for, and its result is
+        // installed only while that key is still the one wanted - a region
+        // dragged, a frame stepped, a CFA toggled or the pixels swapped under
+        // it all change the key, and the late answer is dropped unread.
+        struct FrameKey {
+            uint64_t uid = 0;
+            int dataRev = -1, cfa = -1, cfaPattern = -1;
+            int rx = 0, ry = 0, rw = 0, rh = 0;
+            bool allRow = false;
+            // the buffer itself: an in-place swap that forgot to bump dataRev
+            // still moves the address
+            const float* pixels = nullptr;
+            size_t count = 0;
+            bool operator==(const FrameKey& o) const {
+                return uid == o.uid && dataRev == o.dataRev && cfa == o.cfa &&
+                       cfaPattern == o.cfaPattern && rx == o.rx && ry == o.ry &&
+                       rw == o.rw && rh == o.rh && allRow == o.allRow &&
+                       pixels == o.pixels && count == o.count;
+            }
+            bool operator!=(const FrameKey& o) const { return !(*this == o); }
+        };
+        // One pass, on its own thread, over pixels it does not own. `src`
+        // keeps the FrameSource (and so the vector) alive if the document is
+        // closed mid-pass; an IN-PLACE rewrite of src->data is the one thing
+        // that holding it cannot survive, and every such writer calls
+        // projFrameFence first (below App), which stops and joins the job.
+        struct FrameJob {
+            FrameKey key;
+            std::shared_ptr<FrameSource> src;
+            const float* px = nullptr;        // == key.pixels
+            int imgW = 0, ch = 1, cfa = 0, cfaPattern = 0, nSeries = 0;
+            bool allRow = false;
+            bool mom[5] = {};                 // the slots it was asked for
+            Stats out[5];                     // written by the worker only
+            std::atomic<bool> cancel{ false }, done{ false };
+            std::thread th;
+            uint64_t doneSeen = 0;            // UI thread: the frame that saw `done`
+            // a joinable thread reaching its destructor is std::terminate, and
+            // this object is reached from the global App
+            ~FrameJob() {
+                cancel.store(true);
+                if (th.joinable()) th.join();
+            }
+        };
+        std::shared_ptr<FrameJob> fJob;       // the pass in flight, if any
+        FrameKey fKey;
+        bool fPending = false;
         // Full, coherent per-plane ROI samples: the plotted H/V profiles may
         // stride DIFFERENT pixels, so their statistics cannot feed this split.
         std::array<profile_noise::Result, 4> noise;
@@ -3545,6 +3613,56 @@ struct App {
 // object; DEFINED in core/main.cpp — §6 keeps the definition in the spine.
 extern App app;
 
+// ---- the Projection frame-statistics worker (issue #283) ---------------------
+// Every FrameJob alive, weakly - the fence below has to find a job by the pixels
+// it reads, whichever ProjState owns it. UI thread only.
+inline std::vector<std::weak_ptr<App::ProjState::FrameJob>> g_projFrameJobs;
+// Stop and join every frame-statistics pass reading `s`'s pixels. Called by a
+// writer that is about to REPLACE src->data in place (crop, reload, a remote
+// full-resolution swap, a frame-average recompute): the job holds the source
+// alive, not the vector's old buffer. The pass checks its cancel flag once a
+// row, so this waits for at most one row. The ProjState that owned the job
+// notices on its next recompute (the job is done and cancelled) and starts a
+// fresh one over whatever pixels are there by then.
+inline void projFrameFence(const FrameSource* s) {
+    for (size_t i = 0; i < g_projFrameJobs.size();) {
+        std::shared_ptr<App::ProjState::FrameJob> j = g_projFrameJobs[i].lock();
+        if (!j) { g_projFrameJobs.erase(g_projFrameJobs.begin() + (long)i); continue; }
+        if (j->src.get() == s) {
+            j->cancel.store(true);
+            if (j->th.joinable()) j->th.join();
+            // ...and let go of the source: a crop asks use_count whether to
+            // copy, and a stopped pass is not another owner of these pixels
+            j->src.reset();
+        }
+        i++;
+    }
+}
+
+// Does the frame loop have to keep drawing for a frame-statistics pass? While one
+// runs, yes - this program idles at 0 fps, and the answer is landed by the
+// panel's own recompute, so with no frame after the pass ends the panel would
+// say "computing..." until the mouse moved. And for a few frames after it ends,
+// so the landing frame happens. Not for longer: a pass whose panel is hidden is
+// landed whenever the panel is next drawn, and must not keep the window busy.
+inline bool projFrameBusy(uint64_t frame) {
+    bool busy = false;
+    for (size_t i = 0; i < g_projFrameJobs.size();) {
+        std::shared_ptr<App::ProjState::FrameJob> j = g_projFrameJobs[i].lock();
+        if (!j) { g_projFrameJobs.erase(g_projFrameJobs.begin() + (long)i); continue; }
+        i++;
+        if (!j->done.load()) { busy = true; continue; }
+        // A finished pass reads nothing more, so it lets go of the source
+        // here rather than when its owner next recomputes - which, for a
+        // side that was just closed, may be never: a closed document's
+        // pixels must not live on inside a result nobody will collect.
+        j->src.reset();
+        if (!j->doneSeen) j->doneSeen = frame;
+        if (frame < j->doneSeen + 3) busy = true;
+    }
+    return busy;
+}
+
 // ---- "is anybody going to press anything?" -----------------------------------
 // True for --no-window, for every *-selftest and for --bench: a run with no
 // hand on it. Set once in main() before parseCli, so the folder argument's own
@@ -3580,6 +3698,14 @@ inline bool g_forceAsyncScan = false;
 // changes. (Session restore stays synchronous whatever this says: V25m / R18 /
 // V25p-r1 depend on the lines completing in order - stage 1's decision.)
 inline bool g_forceAsyncOpen = false;
+// ...and the same lid for the Projection frame-statistics worker (issue #283).
+// A scripted run computes the full-pixel frame statistics on this thread, so
+// the many selftests that read fStat on the line after recomputeProjection-
+// IfNeeded keep reading a number; --projframe-selftest sets this and then waits
+// (projFrameWait), which is the path a windowed run takes. Counted, for the
+// same reason g_openStarts is: a headless test can see which door was taken.
+inline bool g_forceAsyncProjFrame = false;
+inline int g_projFrameJobStarts = 0;
 // How many opens took that asynchronous door, and how often the frame loop came
 // round while one was still working. Both exist because of what a headless test
 // CANNOT do: it cannot watch a window fail to freeze. It can watch which door
