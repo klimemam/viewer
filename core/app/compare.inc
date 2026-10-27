@@ -1105,6 +1105,66 @@ static float niceCeil(float v) {
     return (m <= 1.0f ? 1.0f : m <= 2.0f ? 2.0f : m <= 5.0f ? 5.0f : 10.0f) * e;
 }
 
+// The difference view's colour ramp, ONE spelling for the image and for the
+// colour bar under it (issue #297 item 9): t is the difference over the full
+// scale, so -1..1 (0..1 in abs mode). Warm where A is brighter, cool where B
+// is, gray magnitude in abs mode, yellow past the scale. The bar promises
+// "this colour means this difference", which is only true while both ends of
+// the promise are one function.
+struct DiffRGB { uint8_t r, g, b; };
+static DiffRGB diffRamp(float t, bool absMode) {
+    float r, g, bl;
+    if (fabsf(t) > 1.0f) {                  // out of scale: unmistakable
+        r = 1.0f; g = 1.0f; bl = 0.2f;      // yellow
+    } else if (absMode) {
+        r = g = bl = fabsf(t);
+    } else if (t >= 0) {                    // A brighter: warm
+        r = t; g = 0.35f * t; bl = 0.10f * t;
+    } else {                                // B brighter: cool
+        const float m = -t;
+        r = 0.10f * m; g = 0.45f * m; bl = m;
+    }
+    auto q = [](float v) { return (uint8_t)(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    return DiffRGB{ q(r), q(g), q(bl) };
+}
+// The colour bar's column i of barW: the t it stands for, then diffRamp. The
+// mode is app.diffAbs, read here and in renderDiffRGBA - the same flag, not a
+// parameter each caller could pass differently.
+static DiffRGB diffBarColor(int i, float barW) {
+    const bool absMode = app.diffAbs;
+    const float t = absMode ? (float)i / barW : (float)i / barW * 2.0f - 1.0f;
+    return diffRamp(t, absMode);
+}
+// A-B -> RGBA over w x h (the overlap), the CPU half of ensureDiffTexture, so a
+// windowless test can read the bytes the texture gets. Returns how many pixels
+// fell off the scale.
+static size_t renderDiffRGBA(const ImageDoc& a, const ImageDoc& b, int w, int h, int ch,
+                             float gain, std::vector<uint8_t>& rgba) {
+    const bool absMode = app.diffAbs;
+    rgba.resize((size_t)w * h * 4);
+    const float inv = 1.0f / std::max(gain, 1e-20f);
+    size_t clipped = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float d = 0;
+            for (int c = 0; c < ch; c++) {          // the channel that differs most
+                float v = a.sample(x, y, c) - b.sample(x, y, c);
+                if (fabsf(v) > fabsf(d)) d = v;
+            }
+            if (!std::isfinite(d)) d = 0;
+            const float t = d * inv;
+            if (fabsf(t) > 1.0f) clipped++;
+            const DiffRGB c = diffRamp(t, absMode);
+            const size_t o = ((size_t)y * w + x) * 4;
+            rgba[o + 0] = c.r;
+            rgba[o + 1] = c.g;
+            rgba[o + 2] = c.b;
+            rgba[o + 3] = 255;
+        }
+    }
+    return clipped;
+}
+
 // A-B as a signed image. Rebuilt only when an input, the scale or the mode
 // changes: at 12 Mpx this is a ~60 ms pass, not something to do per frame.
 static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
@@ -1157,38 +1217,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
 
     double t0 = nowSec();
     static std::vector<uint8_t> rgba;
-    rgba.resize((size_t)w * h * 4);
-    const float inv = 1.0f / std::max(gain, 1e-20f);
-    size_t clipped = 0;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            float d = 0;
-            for (int c = 0; c < ch; c++) {          // the channel that differs most
-                float v = a.sample(x, y, c) - b.sample(x, y, c);
-                if (fabsf(v) > fabsf(d)) d = v;
-            }
-            if (!std::isfinite(d)) d = 0;
-            float t = d * inv;
-            size_t o = ((size_t)y * w + x) * 4;
-            float r, g2, bl;
-            if (fabsf(t) > 1.0f) {                  // out of scale: unmistakable
-                clipped++;
-                r = 1.0f; g2 = 1.0f; bl = 0.2f;     // yellow
-            } else if (app.diffAbs) {
-                float m = fabsf(t);
-                r = m; g2 = m; bl = m;
-            } else if (t >= 0) {                    // A brighter: warm
-                r = t; g2 = 0.35f * t; bl = 0.10f * t;
-            } else {                                // B brighter: cool
-                float m = -t;
-                r = 0.10f * m; g2 = 0.45f * m; bl = m;
-            }
-            rgba[o + 0] = (uint8_t)(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
-            rgba[o + 1] = (uint8_t)(std::clamp(g2, 0.0f, 1.0f) * 255.0f + 0.5f);
-            rgba[o + 2] = (uint8_t)(std::clamp(bl, 0.0f, 1.0f) * 255.0f + 0.5f);
-            rgba[o + 3] = 255;
-        }
-    }
+    const size_t clipped = renderDiffRGBA(a, b, w, h, ch, gain, rgba);
     if (!D.tex) glGenTextures(1, &D.tex);
     glBindTexture(GL_TEXTURE_2D, D.tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -1569,9 +1598,17 @@ static std::string histHlBadgeSaid() {
 //   表示値 x      (v - black) * inv, NOT clamped. Out of range stays out of range:
 //                 -0.0312 or 1.2041 says HOW FAR outside the display range the
 //                 sample is, which is the whole value of the column. xOf().
-//   画面値 screen  the 8-bit byte rebuildTexture writes: clamp, gamma, round.
-//                 A NaN sample is 0 (black); +-inf are the clamp ends,
-//                 255 / 0. byteOf().
+//   画面値 screen  the 8-bit byte rebuildTexture writes INTO THIS DOCUMENT'S
+//                 texture: clamp, gamma, round. byteOf(). A NaN sample is 0 -
+//                 black in gray, the colormap's first colour with a LUT (the
+//                 byte is then the LUT index); +-inf are the clamp ends, 255 / 0.
+//                 It is the hovered sample put through the mapping, not the
+//                 colour of the screen pixel: the Pixel table reads A, so where
+//                 a wipe / flip / difference view has B or A-B on screen it is
+//                 still A's byte, and a pixel the value highlight painted shows
+//                 the overlay colour, not this byte (issue #297 ruling 1; the
+//                 status bar reads B only when the cursor is in B's pane of a
+//                 split / tiled compare).
 //
 // byteOf is the ONLY spelling of pixel -> byte. The texture loop below, the
 // Inspector's Pixel table and the status bar all call it; the PNG and video
@@ -1579,10 +1616,10 @@ static std::string histHlBadgeSaid() {
 // come to disagree about one pixel - one frame late or one rounding apart - so
 // a second (x * 255.0f + 0.5f) for a PIXEL'S display value anywhere else is the
 // defect, not a shortcut. What is not a second spelling: the A-B difference
-// image (ensureDiffTexture) quantizes a DIFFERENCE through its own gain and
-// colour ramp, the histogram bins the RAW value on its own DN grid, and the
-// value highlight tests the RAW value - different quantities, not this one
-// re-derived.
+// image quantizes a DIFFERENCE through its own gain and its own colour ramp
+// (diffRamp, which the colour bar shares), the histogram bins the RAW value
+// on its own DN grid, and the value highlight tests the RAW value - different
+// quantities, not this one re-derived.
 //
 // Where the line is drawn for the branches that do not paint gray: CFA colorize
 // and the 2-channel layout put the SAME byte into some output channels and
@@ -1597,17 +1634,24 @@ struct DisplayMap {
     bool doGamma = false;
     const float* gammaLut = nullptr;   // sqrt-domain table, 1025 entries; set when doGamma
     const uint8_t* colormap = nullptr; // display plugin LUT (RGB triples), or null = gray
+    // CFA colorize (1ch, CFA, colorize on): each pixel goes to its colour
+    // channel. Decided here once; renderDocRGBA reads it and the colormap
+    // condition below is "not this".
+    bool cfaColor = false;
     float xOf(float v) const { return (v - black) * inv; }
     uint8_t byteOf(float v) const {
         float x = std::clamp(xOf(v), 0.0f, 1.0f);
-        // A NaN sample is BLACK (issue #296). std::clamp passes NaN
+        // A NaN sample is screen value 0 (issue #296): black in gray, the
+        // colormap's first colour with a LUT. std::clamp passes NaN
         // through (every comparison with it is false), and both casts below
         // are then undefined: (int)NaN is INT_MIN on x86-64, so gammaLut[i]
         // read 8 GB before the table and the viewer died on the first NaN pixel
         // at any gamma other than 1; at gamma 1 the byte happened to be 0. The
         // gate makes 0 the contract rather than the accident. +-inf need no
-        // gate: the clamp already lands them on 1 / 0, i.e. 255 / 0, and
-        // --hover-selftest asserts all three at gamma 1.0 and 2.2.
+        // gate: with a finite, non-zero inv (displayMapOf guarantees one) the
+        // clamp lands them on 1 / 0, i.e. 255 / 0, and --hover-selftest
+        // asserts all three at gamma 1.0 and 2.2 and at a range too wide for
+        // a float.
         if (std::isnan(x)) x = 0.0f;
         if (doGamma) {
             float f = sqrtf(x) * 1024.0f;
@@ -1636,15 +1680,33 @@ static const float* displayGammaTable(float gamma) {
 static DisplayMap displayMapOf(const ImageDoc& im) {
     DisplayMap M;
     M.black = effBlack(im);
-    M.inv = 1.0f / std::max(effWhite(im) - M.black, 1e-20f);
+    // A range too wide for a float (issue #297 item 10): black -3e38 / white
+    // 3e38 is legal, its float width is +inf, and inv = 1/inf = 0 turned
+    // xOf(+inf) into inf * 0 = NaN, i.e. screen 0 instead of 255. ONLY that
+    // case leaves the float expression: for a finite float width inv is
+    // exactly what it always was, because the double 1/width differs from it
+    // by an ulp whenever the float subtraction is inexact, and an ulp of inv
+    // moves bytes at rounding edges (black 0.1 / white 0.9, v 0.107843138:
+    // 3 -> 2; --hover-selftest T12 pins both). A non-finite float width is
+    // taken in double, where two finite ends always give a finite width; an
+    // end that is itself non-finite is held at 2 * FLT_MAX, the widest finite
+    // range two floats can span, so inv is never 0.
+    const float wf = effWhite(im) - M.black;
+    if (std::isfinite(wf)) {
+        M.inv = 1.0f / std::max(wf, 1e-20f);
+    } else {
+        double width = (double)effWhite(im) - (double)M.black;
+        if (!std::isfinite(width)) width = 2.0 * (double)FLT_MAX;
+        M.inv = (float)(1.0 / width);
+    }
     // Custom values remain Custom even when close to 1.0. Only the exact
     // linear preset bypasses gamma; otherwise a value such as 1.0005 must
     // affect the view as entered.
     M.doGamma = displayGammaNeedsTransform(app.dispGamma);
     if (M.doGamma) M.gammaLut = displayGammaTable(app.dispGamma);
     // display plugin colormap: 1ch only, and CFA colorize wins over it
-    const bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
-    if (im.ch == 1 && !cfaColor && im.displayLut >= 0 &&
+    M.cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
+    if (im.ch == 1 && !M.cfaColor && im.displayLut >= 0 &&
         im.displayLut < (int)plugin_host::displays().size())
         M.colormap = plugin_host::displays()[im.displayLut].lut.data();
     return M;
@@ -1659,7 +1721,6 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
     rgba.resize((size_t)im.w * im.h * 4);
     const DisplayMap M = displayMapOf(im);
     const float ib = M.black;
-    const bool cfaColor = im.ch == 1 && im.cfa != 0 && im.cfaColorize;
     const uint8_t* lut = M.colormap;
     int px = 0, py = 0;
     for (size_t p = 0; p < (size_t)im.w * im.h; p++, px++) {
@@ -1674,7 +1735,7 @@ static void renderDocRGBA(ImageDoc& im, std::vector<uint8_t>& rgba) {
             rgba[p * 4 + 3] = 255;
             continue;
         }
-        if (cfaColor) {
+        if (M.cfaColor) {
             // running x/y instead of p%w and p/w: a 64-bit div+mod per pixel is
             // ~40% of this loop at 12 Mpx
             int c = cfaChannelAt(im, px, py);

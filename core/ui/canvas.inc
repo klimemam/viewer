@@ -1215,16 +1215,10 @@ static void drawCanvas(ImVec2 avail) {
                     dl->AddRectFilled(ImVec2(bx - 6 * s, by - 6 * s),
                                       ImVec2(bx + barW + 6 * s, by + barH + ImGui::GetFontSize() + 8 * s),
                                       IM_COL32(0, 0, 0, 180), 3.0f * s);
-                    for (int i = 0; i < (int)barW; i++) {   // same ramp as the pixels
-                        float t = app.diffAbs ? (float)i / barW : (float)i / barW * 2.0f - 1.0f;
-                        float r, g2, bl;
-                        if (app.diffAbs)   { float m = t; r = g2 = bl = m; }
-                        else if (t >= 0)   { r = t; g2 = 0.35f * t; bl = 0.10f * t; }
-                        else               { float m = -t; r = 0.10f * m; g2 = 0.45f * m; bl = m; }
-                        ImU32 c = IM_COL32((int)(std::clamp(r, 0.f, 1.f) * 255),
-                                           (int)(std::clamp(g2, 0.f, 1.f) * 255),
-                                           (int)(std::clamp(bl, 0.f, 1.f) * 255), 255);
-                        dl->AddLine(ImVec2(bx + i, by), ImVec2(bx + i, by + barH), c);
+                    for (int i = 0; i < (int)barW; i++) {   // diffRamp, as the pixels
+                        const DiffRGB c = diffBarColor(i, barW);
+                        dl->AddLine(ImVec2(bx + i, by), ImVec2(bx + i, by + barH),
+                                    IM_COL32(c.r, c.g, c.b, 255));
                     }
                     dl->AddRect(ImVec2(bx, by), ImVec2(bx + barW, by + barH), IM_COL32(90, 100, 110, 255));
                     ImU32 tc = IM_COL32(210, 216, 226, 255);
