@@ -1328,6 +1328,7 @@ struct App {
         double fps = 30;
         std::string path;
         std::string sinkName;         // "uncompressed AVI" / "FFV1/MKV"
+        std::string rangeNote;        // exportRangeNote at start, announced at the end
         std::unique_ptr<videowrite::VideoSink> sink;
         bool stop = false;            // Stop: close the file and DELETE it
     } videoExport;

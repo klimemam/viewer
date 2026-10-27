@@ -9,12 +9,17 @@
 // the same picture, and that is asserted rather than asserted-to (see
 // --video-selftest, V6).
 //
-// WHICH RANGE: each frame's EFFECTIVE range, which is what effBlack/effWhite
-// answer. Per stack and Linked hand every frame the same numbers and need
-// nothing here. "Auto per frame" is the one mode that has to ACT: stepping
-// onto a frame re-fits it to its own min..max (selectImage, sequence.inc), and
-// an export that skipped that would write frames the user has never seen. The
-// same call, in the same condition, is made here per frame.
+// WHICH RANGE: frame k is drawn at the range the SCREEN gives it once A is
+// stepped onto frame k (#304) - renderDocRGBA in viewSidesFor(frame k), so B
+// and the slots follow to THEIR frame k exactly as they do on screen. Under
+// the A/B union that is the union of A_k, B_k, C_k...; under each side fits
+// itself it is A_k's own fit; under A's range, A_k's own black-white. An
+// export that drew every frame in the screen's view instead would draw only
+// the frame on screen as a compared side and every other at its own range -
+// two ranges in one video. "Auto per frame" additionally has to ACT: stepping
+// onto a frame re-fits it (selectImage, sequence.inc), and the same call, in
+// the same condition, is made here per frame. The range is named where the
+// export is announced (exportRangeNote), never baked into the file.
 //
 // WHY IT IS SLICED: renderDocRGBA is CPU-only but not thread-safe - it holds a
 // static gamma LUT - so it cannot go to a worker. It runs on the UI thread,
@@ -93,6 +98,12 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
         if (!why.empty())
             return "frame " + std::to_string(d->seqIndex + 1) + " of " +
                    std::to_string(fr.size()) + ": " + why;
+        // ...and every side the frame's range is taken OVER (the A/B union
+        // reads B's and the slots' frame k): the same "not yet" for them.
+        why = viewRefusalFor(viewSidesFor(app.images[fr[i]].get()));
+        if (!why.empty())
+            return "frame " + std::to_string(d->seqIndex + 1) + " of " +
+                   std::to_string(fr.size()) + ": " + why;
         if (d->w != w || d->h != h)
             return "this stack's frames are not all one size (" +
                    std::to_string(w) + "x" + std::to_string(h) + " and " +
@@ -133,6 +144,10 @@ static std::string startStackVideoExport(int seqId, const std::string& path, dou
     J.w = app.images[fr.front()]->w;
     J.h = app.images[fr.front()]->h;
     for (int i : fr) J.uids.push_back(app.images[i]->uid);
+    {
+        ImageDoc* first = app.images[fr.front()].get();
+        J.rangeNote = exportRangeNote(*first, viewSidesFor(first), true);
+    }
     std::string err;
     if (videoExtOf(path) == ".mkv") {
         J.sink = videowrite::openFfv1(path, J.w, J.h, fps, err);
@@ -177,6 +192,7 @@ static bool pumpVideoExport() {
         const std::string name = baseName(J.path), kind = J.sinkName;
         const int w = J.w, h = J.h;
         const double fps = J.fps;
+        const std::string rNote = J.rangeNote;
         // A finish that failed leaves a file with no index and a header still
         // claiming 0 frames - unplayable, and saying nothing about why. It goes
         // the same way a Stop goes, for the same reason: nothing left behind.
@@ -188,8 +204,9 @@ static bool pumpVideoExport() {
         // does for a PNG: the magenta is IN the file (renderDocRGBA is the one
         // mapping) and the badge that explains it is not.
         const std::string hl = exportHighlightNote(cur());
-        toast("wrote " + name + tail + " (" + kind + ")" +
+        toast("wrote " + name + tail + " (" + kind + ")  -  " + rNote +
               (hl.empty() ? "" : "  -  " + hl));
+        fprintf(stderr, "export: video %s\n", rNote.c_str());
         if (!hl.empty()) fprintf(stderr, "export: video %s\n", hl.c_str());
         return false;
     }
@@ -210,6 +227,14 @@ static bool pumpVideoExport() {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
         return false;
     }
+    // The view frame k is on screen in: A on frame k, B and the slots followed
+    // to theirs (#304). Its sides can turn into previews mid-write too.
+    const ViewSides view = viewSidesFor(d);
+    why = viewRefusalFor(view);
+    if (!why.empty()) {
+        abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
+        return false;
+    }
     if (d->w != J.w || d->h != J.h) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
         return false;
@@ -220,11 +245,11 @@ static bool pumpVideoExport() {
     // (min..max, the 0.1-99.9% cut, median->target) is app.autoFlavor's
     // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
     // be a second answer to the one question. Linked and per-stack need
-    // nothing: effBlack/effWhite already answer for the stack.
+    // nothing: displayRangeFor already answers for the stack.
     if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
-    renderDocRGBA(*d, rgba);
+    renderDocRGBA(*d, rgba, &view);
     const size_t px = (size_t)J.w * J.h;
     rgb.resize(px * 3);
     for (size_t p = 0; p < px; p++) {

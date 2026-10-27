@@ -23,6 +23,13 @@
 //                                      recovered from the container, encoded as
 //                                      a PNG, is byte-identical to what "select
 //                                      frame n, Save image as PNG" writes.
+//   ...in the view frame n is on   V7  A / B / slot C as three stacks, every
+//   screen in (#304)                   A/B range mode x fit x scope: frame k of
+//                                      the video == renderDocRGBA(cur()) after
+//                                      selectImage(frame k), the screen itself
+//                                      == main's rule derived by hand, the
+//                                      range named in the toast, and a union
+//                                      over a preview / missing side refused.
 //
 // Windowless and fixture-free on the histhl/framesize pattern and for the same
 // reasons: every document is analytic and built in memory, and every expected
@@ -589,6 +596,244 @@ static int videoSelftest() {
         app.autoFlavor = saveFlav;
         app.medBlackMode = saveBM;
         app.medTarget = saveTgt;
+    }
+
+    {   // ---- V7: frame k of the video IS the screen with A on frame k (#304) --
+        // The display range is a property of the VIEW, not of the document:
+        // frame k is drawn in viewSidesFor(frame k), the view the screen is in
+        // once A is stepped onto frame k - B and slot C followed to THEIR
+        // frame k. Asserted at the strongest point: the bytes the export
+        // wrote, read back out of the container, against renderDocRGBA(cur())
+        // after selectImage(frame k), for every A/B range mode, every fit
+        // flavour, both range scopes, every frame.
+        //
+        // Three stacks of three frames, as A / B / slot C, whose content ranges
+        // move frame by frame and differ side by side, so the union of frame 1
+        // is not the union of frame 0 and neither is any side's own range:
+        //   A_k: x + 10k          0+10k .. 47+10k
+        //   B_k: 2x - 20 + 5k   -20+5k .. 74+5k
+        //   C_k: x/2 + 30k       30k .. 23.5+30k
+        // Before #304 the export drew only the frame on screen as a compared
+        // side; frames 2 and 3 came out at their own range.
+        const int saveFlav = app.autoFlavor;
+        const auto saveCmpMode = app.compareMode;
+        const bool saveFollow = app.compareFollowFrame;
+        const std::vector<uint64_t> saveExtra = app.cmpExtra;
+        const uint64_t saveBUid = app.compareBUid, saveLastB = app.lastCompareBUid;
+        const std::string saveBName = app.compareB;
+        const int saveBSeq = app.compareBSeq;
+        app.linkRange = false;
+        app.compareFollowFrame = true;
+        const int sa = mkSeq("v304_A"), sb = mkSeq("v304_B"), sc = mkSeq("v304_C");
+        for (int k = 0; k < 3; k++) {
+            char n[32];
+            snprintf(n, sizeof n, "v7a_%d.npy", k); mk(n, sa, k, 1.0f, 10.0f * k);
+            snprintf(n, sizeof n, "v7b_%d.npy", k); mk(n, sb, k, 2.0f, -20.0f + 5.0f * k);
+            snprintf(n, sizeof n, "v7c_%d.npy", k); mk(n, sc, k, 0.5f, 30.0f * k);
+        }
+        const std::vector<int> fa = framesOfSeq(sa), fb = framesOfSeq(sb), fc = framesOfSeq(sc);
+        selectImage(fa[0]);
+        app.cmpExtra.clear();
+        setCompareB(app.images[fb[0]].get());
+        app.cmpExtra.push_back(app.images[fc[0]]->uid);
+        app.compareMode = App::CmpSplit;
+        {
+            ViewSides v0 = viewSidesFor(cur());
+            check(v0.n == 3 && v0.side[1] == app.images[fb[0]].get() &&
+                  v0.side[2] == app.images[fc[0]].get() && v0.role[1] == 1 && v0.role[2] == 2,
+                  "V7 fixture: A, B and slot C are the screen's three sides");
+            ViewSides v2 = viewSidesFor(app.images[fa[2]].get());
+            check(v2.n == 3 && v2.side[1] == app.images[fb[2]].get() &&
+                  v2.side[2] == app.images[fc[2]].get(),
+                  "V7 viewSidesFor(A's frame 3) follows B and C to THEIR frame 3");
+            ViewSides vs = comparedSides();
+            bool alias = vs.n == v0.n;
+            for (int i = 0; i < vs.n && alias; i++)
+                alias = vs.side[i] == v0.side[i] && vs.role[i] == v0.role[i];
+            check(alias, "V7 comparedSides() is viewSidesFor(cur())");
+        }
+        // Each combination starts from the same stored ranges: none a fit can
+        // land on, so a side drawn at its doc's own numbers is visible.
+        auto resetRanges = [&]() {
+            for (const auto* g : { &fa, &fb, &fc })
+                for (int i : *g) {
+                    ImageDoc* d = app.images[i].get();
+                    d->black = d->vmin - 3.0f; d->white = d->vmax + 7.0f;
+                    d->fitValid = false;
+                }
+        };
+        // The screen's bytes for one side, and the bytes main's rule gives
+        // that side, derived by hand from the mode: drawn with compare OFF at
+        // exactly that range, so nothing of the new view code decides it.
+        auto handRange = [&](ImageDoc* S, int k, float& lo, float& hi) {
+            ImageDoc* A = app.images[fa[k]].get();
+            ImageDoc* B = app.images[fb[k]].get();
+            ImageDoc* C = app.images[fc[k]].get();
+            switch (app.compareRangeMode) {
+                case 1: lo = A->black; hi = A->white; break;
+                case 2: lo = std::min({ A->vmin, B->vmin, C->vmin });
+                        hi = std::max({ A->vmax, B->vmax, C->vmax }); break;
+                case 3: fitByFlavor(*S, lo, hi); break;
+                default: lo = S->black; hi = S->white; break;
+            }
+        };
+        auto handBytes = [&](ImageDoc* S, int k) {
+            float lo = 0, hi = 0;
+            handRange(S, k, lo, hi);
+            const float sb = S->black, sw = S->white;
+            const auto cm = app.compareMode;
+            app.compareMode = App::CmpOff;
+            S->black = lo; S->white = hi;
+            std::vector<uint8_t> px;
+            renderDocRGBA(*S, px);
+            S->black = sb; S->white = sw;
+            app.compareMode = cm;
+            return px;
+        };
+        auto fnv = [](uint64_t h, const std::vector<uint8_t>& b) {
+            for (uint8_t c : b) { h ^= c; h *= 1099511628211ull; }
+            return h;
+        };
+        static const char* MODE[4] = { "own", "A's", "union", "each-fits" };
+        static const char* FLV[3] = { "min-max", "pct", "median" };
+        bool allMatch = true, allScreen = true, anyDiffers = false, notes = true;
+        int combos = 0;
+        std::vector<uint8_t> frame1Union;          // for the anti-vacuity below
+        for (int scope = 0; scope <= 1; scope++)
+        for (int mode = 0; mode <= 3; mode++)
+        for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
+            app.rangeScope = scope;
+            app.compareRangeMode = mode;
+            app.autoFlavor = fl;
+            resetRanges();
+            selectImage(fa[0]);
+            const std::string path = tmpFile("viewer_video_v7.avi");
+            std::string why = startStackVideoExport(sa, path, 30.0);
+            if (!why.empty()) fprintf(stderr, "videoselftest: V7 refused: %s\n", why.c_str());
+            const bool ran = why.empty() && runToEnd();
+            const std::string said = app.toast;
+            std::vector<uint8_t> bytes;
+            readFileBytes(path, bytes);
+            Avi Av = parseAvi(bytes);
+            // every frame is visited even after a mismatch, so the screen hash
+            // covers the same bytes whatever the export did
+            const bool readable = ran && Av.ok && Av.frames.size() == 3;
+            bool match = readable;
+            bool screen = true;
+            uint64_t h = 1469598103934665603ull;
+            for (int k = 0; k < 3 && readable; k++) {
+                selectImage(fa[k]);
+                std::vector<uint8_t> scr;
+                renderDocRGBA(*cur(), scr);
+                std::vector<uint8_t> got = aviFrameToRGB(bytes, Av.frames[k].first, W, H);
+                for (size_t p = 0; p < (size_t)W * H && match; p++)
+                    for (int c = 0; c < 3; c++)
+                        if (got[p * 3 + c] != scr[p * 4 + c]) { match = false; break; }
+                // the screen itself, every side, against main's rule by hand
+                for (ImageDoc* S : { app.images[fa[k]].get(), app.images[fb[k]].get(),
+                                     app.images[fc[k]].get() }) {
+                    std::vector<uint8_t> s; renderDocRGBA(*S, s);
+                    if (s != handBytes(S, k)) screen = false;
+                    h = fnv(h, s);
+                }
+                // the export's frame against frame 0's view: the bug drew
+                // frames 2 and 3 in a view they are not on screen in
+                if (k > 0) {
+                    std::vector<uint8_t> wrong;
+                    const ViewSides v0 = viewSidesFor(app.images[fa[0]].get());
+                    renderDocRGBA(*cur(), wrong, &v0);
+                    if (wrong != scr) anyDiffers = true;
+                }
+                if (scope == 0 && mode == 2 && fl == AF_MinMax && k == 1) frame1Union = got;
+            }
+            fprintf(stderr, "videoselftest: V7 scope=%s mode=%-9s fit=%-7s video==screen %d, "
+                            "screen==main's rule %d, screen hash %016llx | %s\n",
+                    scope ? "stack" : "frame", MODE[mode], FLV[fl], match ? 1 : 0,
+                    screen ? 1 : 0, (unsigned long long)h, said.c_str());
+            if (!match) allMatch = false;
+            if (!screen) allScreen = false;
+            // the range is NAMED where the export is announced
+            const char* want = mode == 2 ? "range: auto over every side (union, per frame)"
+                             : mode == 1 ? "range: every side uses A's range"
+                             : mode == 3 ? (fl == AF_MinMax ? "range: each side fits itself (min-max)"
+                                          : fl == AF_Pct ? "range: each side fits itself (0.1-99.9%)"
+                                                         : "range: each side fits itself (median)")
+                             : scope == 0 ? (fl == AF_MinMax ? "range: auto per frame (min-max)"
+                                           : fl == AF_Pct ? "range: auto per frame (0.1-99.9%)"
+                                                          : "range: auto per frame (median)")
+                                          : "range: the stack's black-white";
+            if (!has(said, want)) notes = false;
+            combos++;
+            std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+        }
+        check(combos == 24 && allMatch,
+              "V7 video frame k == the screen after selectImage(frame k), 24 combinations");
+        check(allScreen, "V7 the screen's bytes, every side, are main's rule (hand range)");
+        check(anyDiffers, "V7 ...and frame 0's view would have drawn some frame differently (anti-vacuity)");
+        check(notes, "V7 the toast names the range in force, in the control's words");
+
+        {   // ---- union: B's frame 2 changes -> the video's frame 2 changes ----
+            app.rangeScope = 0; app.compareRangeMode = 2; app.autoFlavor = AF_MinMax;
+            ImageDoc* B1 = app.images[fb[1]].get();
+            const std::vector<float> keep = B1->src->data;
+            for (float& x : B1->src->data) x *= 3.0f;          // -60 .. 237
+            B1->syncMirrors(); computeMinMax(*B1);
+            resetRanges();
+            selectImage(fa[0]);
+            const std::string path = tmpFile("viewer_video_v7b.avi");
+            const bool ran = startStackVideoExport(sa, path, 30.0).empty() && runToEnd();
+            std::vector<uint8_t> bytes;
+            readFileBytes(path, bytes);
+            Avi Av = parseAvi(bytes);
+            const bool okv = ran && Av.ok && Av.frames.size() == 3 && !frame1Union.empty();
+            check(okv && aviFrameToRGB(bytes, Av.frames[1].first, W, H) != frame1Union,
+                  "V7 union: B's frame 2 widened -> the video's frame 2 changed");
+            B1->src->data = keep; B1->syncMirrors(); computeMinMax(*B1);
+            std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+        }
+        {   // ---- a side the union is taken over is a preview: refused, named --
+            app.rangeScope = 1;
+            const std::string path = tmpFile("viewer_video_v7c.avi");
+            ImageDoc* B2 = app.images[fb[2]].get();
+            ImageDoc* C1 = app.images[fc[1]].get();
+            const int wasB = B2->src->remoteStep, wasC = C1->src->remoteStep;
+            selectImage(fa[0]);
+            app.compareRangeMode = 2;
+            B2->src->remoteStep = 4;
+            const std::string bPrev = stackVideoRefusal(sa, path, 30.0);
+            app.compareRangeMode = 1;
+            const std::string bPrevAs = stackVideoRefusal(sa, path, 30.0);
+            B2->src->remoteStep = wasB;
+            app.compareRangeMode = 2;
+            C1->src->remoteStep = 4;
+            const std::string cPrev = stackVideoRefusal(sa, path, 30.0);
+            C1->src->remoteStep = wasC;
+            const std::string none = stackVideoRefusal(sa, path, 30.0);
+            fprintf(stderr, "videoselftest: V7 B preview -> \"%s\"\n", bPrev.c_str());
+            fprintf(stderr, "videoselftest: V7 C preview -> \"%s\"\n", cPrev.c_str());
+            check(has(bPrev, "frame 3 of 3") && has(bPrev, "B's frame 3") && has(bPrev, "preview"),
+                  "V7 union over a preview B frame refuses, naming the side and the frame");
+            check(has(cPrev, "frame 2 of 3") && has(cPrev, "C's frame 2"),
+                  "V7 ...and a preview slot C frame, by its letter");
+            check(bPrevAs.empty(), "V7 ...while A's range, which never reads B, does not refuse");
+            check(none.empty(), "V7 ...and with every frame full the union exports (anti-vacuity)");
+            // A one frame longer than B and C: B has no frame 4
+            mk("v7a_3.npy", sa, 3, 1.0f, 30.0f);
+            const std::string shorter = stackVideoRefusal(sa, path, 30.0);
+            fprintf(stderr, "videoselftest: V7 B shorter -> \"%s\"\n", shorter.c_str());
+            check(has(shorter, "frame 4 of 4") && has(shorter, "B has no frame 4"),
+                  "V7 union where B's stack has no frame k refuses, naming it");
+            check(!std::filesystem::exists(pathFromUtf8(path)), "V7 ...and creates no file");
+        }
+        closeAll();
+        app.cmpExtra = saveExtra;
+        app.compareBUid = saveBUid;
+        app.lastCompareBUid = saveLastB;
+        app.compareB = saveBName;
+        app.compareBSeq = saveBSeq;
+        app.compareMode = saveCmpMode;
+        app.compareFollowFrame = saveFollow;
+        app.autoFlavor = saveFlav;
     }
 
     // The home is shared: give back every mode this test borrowed.
