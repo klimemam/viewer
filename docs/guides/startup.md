@@ -433,7 +433,7 @@ Files パネルでは batch 見出しの下に series が先に並び、メン�
   (ダーク、ゴールデンサンプル)なら切ってください
 - **表示レンジの関係**(Inspector か Compare メニュー):
   `each keeps its own` / `every side uses A's range` / **`auto over every side (union)`(既定)** /
-  `each side fits itself (Auto)`(各側が自分の Auto / Auto % / Med で描かれる)。
+  `each side fits itself`(各側が自分の min-max / 0.1-99.9% / median で描かれる。方式はすぐ下の `fit:` 行で選ぶ)。
   露出が違うもの同士は union にすると**どちらも飽和せず**に比べられます。
   既定が union なのは、`every side uses A's range` だと露出違いの B が飽和して
   (実測 `>white 99.69%`)ヒストグラムが右端の 1 本になってしまうためです

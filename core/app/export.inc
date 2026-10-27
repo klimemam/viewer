@@ -538,6 +538,23 @@ static float effWhite(const ImageDoc& im) {
     if (abRange(im, lo, hi)) return hi;
     return im.white;
 }
+// WHICH fit "each side fits itself" draws with (#301), set from the radio row
+// under the A/B combo and from the View > Compare A/B menu. It is the SAME
+// variable "Auto per frame" re-fits by - one answer to "which fit", not one per
+// feature - so under Auto per frame the frame on screen re-fits exactly as it
+// does when the flavour is picked in the Range combo (applyRangeMode). Under
+// Per stack that variable has no other control at all, and without this the
+// mode could only ever show min-max. The per-side cache is keyed on the
+// flavour, so every compared side re-fits on its next draw; the dirty marks
+// only make the textures follow on this frame.
+static void setEachSideFlavor(int fl) {
+    if (fl < AF_MinMax || fl > AF_Median) return;
+    if (!app.linkRange && app.rangeScope == 0 && cur()) applyRangeMode(0, cur(), fl);
+    else app.autoFlavor = fl;
+    ImageDoc* parts[CMP_SIDES_MAX];
+    const int np = comparedSides(parts);
+    for (int i = 0; i < np; i++) parts[i]->texDirty = true;
+}
 
 static void setRange(ImageDoc& im, float black, float white) {
     if (!(white > black)) return;

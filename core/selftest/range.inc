@@ -212,11 +212,22 @@
                 static const char* FL[3] = { "min-max", "0.1-99.9%", "median->target" };
                 static const int FL_BTN[3] = { RB_Auto, RB_AutoPct, RB_Median };
                 static const char SIDE[3] = { 'A', 'B', 'C' };
+                const float saveTarget = app.medTarget, saveBlackValue = app.medBlackValue;
+                const int saveBlackMode = app.medBlackMode;
                 if (A && B && C) {
+                    // The flavour is picked through the mode's own selector
+                    // (setEachSideFlavor - what the radio row under the A/B combo
+                    // and the View menu items call), and every side must move
+                    // with it: the selector exists so "each side at Auto %" can
+                    // be chosen at all under Per stack.
+                    app.compareRangeMode = 3;
+                    setEachSideFlavor(AF_Median);           // start away from min-max
+                    float prevLo[3] = {}, prevHi[3] = {};
+                    {   int k = 0;
+                        for (ImageDoc* d : { A, B, C }) { prevLo[k] = effBlack(*d); prevHi[k] = effWhite(*d); k++; } }
                     for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
-                        app.autoFlavor = fl;
-                        app.compareRangeMode = 3;
-                        bool each = true, lamps = true;
+                        setEachSideFlavor(fl);
+                        bool each = true, lamps = true, moved = true;
                         float w[3] = {};
                         int k = 0;
                         for (ImageDoc* d : { A, B, C }) {
@@ -225,8 +236,10 @@
                             const float eb = effBlack(*d), ew = effWhite(*d);
                             fprintf(stderr, "rangeselftest: P17 %-14s side %c  shown %.6g..%.6g  "
                                             "alone %.6g..%.6g\n", FL[fl], SIDE[k], eb, ew, lo, hi);
-                            each = each && eb == lo && ew == hi && untouched(d);
+                            each = each && app.autoFlavor == fl && eb == lo && ew == hi && untouched(d);
                             lamps = lamps && rangeButtonMatches(*d, FL_BTN[fl], eb, ew);
+                            moved = moved && (eb != prevLo[k] || ew != prevHi[k]);
+                            prevLo[k] = eb; prevHi[k] = ew;
                             w[k++] = ew;
                         }
                         char what[112];
@@ -236,6 +249,54 @@
                         ok(w[0] != w[1] && w[1] != w[2] && w[0] != w[2], what);
                         snprintf(what, sizeof what, "%s: the Range row lights its button on every side", FL[fl]);
                         ok(lamps, what);
+                        snprintf(what, sizeof what, "selector -> %s: every side's fit moved", FL[fl]);
+                        ok(moved, what);
+                    }
+                    // Same flavour, different Med parameters: the per-side cache
+                    // is keyed on them, so every side must re-fit.
+                    {
+                        bool tgt = true, blk = true;
+                        float was[3];
+                        int k = 0;
+                        for (ImageDoc* d : { A, B, C }) was[k++] = effWhite(*d);
+                        app.medTarget = 0.4f;
+                        k = 0;
+                        for (ImageDoc* d : { A, B, C }) {
+                            float lo = 0, hi = 0;
+                            aloneFit(d, lo, hi);
+                            tgt = tgt && effBlack(*d) == lo && effWhite(*d) == hi && effWhite(*d) != was[k++];
+                        }
+                        ok(tgt, "median->target: a new target re-fits every side");
+                        k = 0;
+                        for (ImageDoc* d : { A, B, C }) was[k++] = effBlack(*d);
+                        app.medBlackMode = MB_Min;          // black: the value 0 -> each side's min
+                        k = 0;
+                        for (ImageDoc* d : { A, B, C }) {
+                            float lo = 0, hi = 0;
+                            aloneFit(d, lo, hi);
+                            blk = blk && effBlack(*d) == lo && effWhite(*d) == hi && effBlack(*d) != was[k++];
+                        }
+                        ok(blk, "median->target: a new black-point mode re-fits every side");
+                        app.medTarget = saveTarget;
+                        app.medBlackMode = saveBlackMode;
+                        app.medBlackValue = saveBlackValue;
+                    }
+                    // New pixels on one side (computeMinMax is where reload, crop
+                    // and detrend arrive): that side re-fits, from the new pixels.
+                    {
+                        setEachSideFlavor(AF_Pct);
+                        const float wasLo = effBlack(*B);
+                        const std::vector<float> keep = B->px();
+                        for (float& v : B->px()) v += 100.0f;
+                        B->dataRev++;
+                        computeMinMax(*B);
+                        float lo = 0, hi = 0;
+                        aloneFit(B, lo, hi);
+                        const bool fresh = effBlack(*B) == lo && effWhite(*B) == hi && effBlack(*B) != wasLo;
+                        B->px() = keep;
+                        B->dataRev++;
+                        computeMinMax(*B);
+                        ok(fresh, "new pixels + computeMinMax: that side re-fits from them");
                     }
                     app.compareRangeMode = 2;              // back to the union
                     const float ulo = std::min({ A->vmin, B->vmin, C->vmin });
@@ -246,7 +307,7 @@
                     ok(uni, "mode 2 again: every side back on the union");
                     // step: follow-frame moves B and C onto A's new frame number
                     app.compareRangeMode = 3;
-                    app.autoFlavor = AF_Pct;
+                    setEachSideFlavor(AF_Pct);
                     const float wasB = effWhite(*B), wasC = effWhite(*C);
                     selectImage(g0[1]);
                     std::vector<ImageDoc*> ex2 = compareExtras();
@@ -266,10 +327,17 @@
                                 wasB, effWhite(*B2), wasC, effWhite(*C2));
                         ok(refit && effWhite(*B2) != wasB && effWhite(*C2) != wasC,
                            "step: every side re-fitted to its own new frame");
+                        // Per stack, on frames that are NOT the frame whose range
+                        // the stack shares: the lamp must still compare each side
+                        // against its own pixels, because that is the range in force.
+                        bool lamps = app.rangeScope == 1;
+                        for (ImageDoc* d : { B2, C2 })
+                            lamps = lamps && rangeButtonMatches(*d, RB_AutoPct, effBlack(*d), effWhite(*d));
+                        ok(lamps, "step, Per stack: Auto % lit on B and C at their own new fit");
                     }
                 }
                 for (auto& s : stored) { s.first->black = s.second.first; s.first->white = s.second.second; }
-                app.cmpExtra.clear();           // A stays on g0[1], where the block above left it
+                app.cmpExtra.clear();           // A ends on g0[1], the frame it arrived on
                 app.compareMode = saveCmpMode;
                 app.compareFollowFrame = saveFollow;
                 app.compareRangeMode = saveCmpR;

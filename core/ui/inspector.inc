@@ -489,13 +489,12 @@ static void drawInspector() {
                 // arity - issue #60 named this one by name. "every side" is
                 // the noun the panels already use, and it is true at two.
                 // The fourth (#301) is the third's sibling: still Auto, but
-                // each side's own instead of one shared across them. Its fit
-                // is the Range mode's flavour - the same min-max / 0.1-99.9% /
-                // median->target the per-frame re-fit uses.
+                // each side's own instead of one shared across them. WHICH
+                // fit is chosen right under it (the radio row below).
                 static const char* AB_RANGE_ITEMS[4] = {
                     "A/B: each keeps its own", "A/B: every side uses A's range",
                     "A/B: auto over every side (union)",
-                    "A/B: each side fits itself (Auto)" };
+                    "A/B: each side fits itself" };
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::Combo("##abrange", &app.compareRangeMode,
                                  AB_RANGE_ITEMS, 4)) {
@@ -514,14 +513,32 @@ static void drawInspector() {
                         "  every side uses A's range: one range, A's, for every other\n"
                         "    letter, and it does not move while you step A. Right when\n"
                         "    the others really are measured against A.\n"
-                        "  each side fits itself (Auto): every side at ITS OWN fit -\n"
-                        "    min-max, 0.1-99.9%% or median->target, whichever the Range\n"
-                        "    mode below names - re-fitted as each side steps. For\n"
-                        "    looking at each picture well; the sides are not on one\n"
-                        "    scale, and it says so.\n"
+                        "  each side fits itself: every side at ITS OWN fit - min-max,\n"
+                        "    0.1-99.9%% or median, picked on the 'fit' row under this\n"
+                        "    (the same choice as Auto per frame's) - re-fitted as each\n"
+                        "    side steps. For looking at each picture well; the sides\n"
+                        "    are not on one scale, and it says so.\n"
                         "  each keeps its own: comparing SHAPES at wildly different\n"
                         "    exposures - the one case where the sides are not directly\n"
                         "    comparable, and it says so.");
+                if (app.compareRangeMode == 3) {
+                    // The mode's own question, asked where the mode is chosen.
+                    // Under Per stack (the default) this is the ONLY control of
+                    // the flavour, so it cannot live in the Range section.
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("fit:");
+                    static const char* FIT_ITEMS[3] = { "min-max##abfit", "0.1-99.9%##abfit",
+                                                        "median##abfit" };
+                    for (int f = AF_MinMax; f <= AF_Median; f++) {
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton(FIT_ITEMS[f], app.autoFlavor == f))
+                            setEachSideFlavor(f);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("The fit every side is drawn at. The same choice as\n"
+                                              "Auto per frame's: median uses the target and black\n"
+                                              "point under the Range buttons.");
+                    }
+                }
                 // The numbers IN FORCE (effBlack/effWhite): in mode 0 they are
                 // each doc's own, in mode 3 each side's fit - the two modes in
                 // which the sides can be on different scales.
