@@ -9,17 +9,20 @@
 // the same picture, and that is asserted rather than asserted-to (see
 // --video-selftest, V6).
 //
-// WHICH RANGE: frame k is drawn at the range the SCREEN gives it once A is
-// stepped onto frame k (#304) - renderDocRGBA in viewSidesFor(frame k), so B
-// and the slots follow to THEIR frame k exactly as they do on screen. Under
-// the A/B union that is the union of A_k, B_k, C_k...; under each side fits
-// itself it is A_k's own fit; under A's range, A_k's own black-white. An
-// export that drew every frame in the screen's view instead would draw only
-// the frame on screen as a compared side and every other at its own range -
-// two ranges in one video. "Auto per frame" additionally has to ACT: stepping
-// onto a frame re-fits it (selectImage, sequence.inc), and the same call, in
-// the same condition, is made here per frame. The range is named where the
-// export is announced (exportRangeNote), never baked into the file.
+// WHICH RANGE: each frame is drawn at the range the SCREEN gives it in the
+// view it is on screen in (#304, exportFrameViewFor). For A's own stack that
+// is A stepped onto frame k, B and the slots following to THEIR frame k:
+// under the A/B union the union of A_k, B_k, C_k... (a side with no frame k is
+// its held frame, as on screen, and the announcement says "B held at frame
+// 3"); under each side fits itself A_k's own fit; under A's range A_k's own
+// black-white. A stack held by B or a slot is drawn in that role, in the view
+// follow-frame pairs it in. An export that drew every frame in the screen's
+// view instead would draw only the frame on screen as a compared side and
+// every other at its own range - two ranges in one video. "Auto per frame"
+// additionally has to ACT: stepping A onto a frame re-fits it (selectImage,
+// sequence.inc), and the same call, in the same condition, is made here on
+// the frame A would be stepped onto. The range is named where the export is
+// announced (exportRangeNote), never baked into the file.
 //
 // WHY IT IS SLICED: renderDocRGBA is CPU-only but not thread-safe - it holds a
 // static gamma LUT - so it cannot go to a worker. It runs on the UI thread,
@@ -100,10 +103,14 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
                    std::to_string(fr.size()) + ": " + why;
         // ...and every side the frame's range is taken OVER (the A/B union
         // reads B's and the slots' frame k): the same "not yet" for them.
-        why = viewRefusalFor(viewSidesFor(app.images[fr[i]].get()));
-        if (!why.empty())
-            return "frame " + std::to_string(d->seqIndex + 1) + " of " +
-                   std::to_string(fr.size()) + ": " + why;
+        // Only the union reads them, so only the union builds the view.
+        if (rangeReadsOtherSides()) {
+            ImageDoc* stepTo = nullptr;
+            why = viewRefusalFor(exportFrameViewFor(app.images[fr[i]].get(), stepTo));
+            if (!why.empty())
+                return "frame " + std::to_string(d->seqIndex + 1) + " of " +
+                       std::to_string(fr.size()) + ": " + why;
+        }
         if (d->w != w || d->h != h)
             return "this stack's frames are not all one size (" +
                    std::to_string(w) + "x" + std::to_string(h) + " and " +
@@ -146,7 +153,8 @@ static std::string startStackVideoExport(int seqId, const std::string& path, dou
     for (int i : fr) J.uids.push_back(app.images[i]->uid);
     {
         ImageDoc* first = app.images[fr.front()].get();
-        J.rangeNote = exportRangeNote(*first, viewSidesFor(first), true);
+        ImageDoc* stepTo = nullptr;
+        J.rangeNote = exportRangeNote(*first, exportFrameViewFor(first, stepTo), true);
     }
     std::string err;
     if (videoExtOf(path) == ".mkv") {
@@ -192,7 +200,8 @@ static bool pumpVideoExport() {
         const std::string name = baseName(J.path), kind = J.sinkName;
         const int w = J.w, h = J.h;
         const double fps = J.fps;
-        const std::string rNote = J.rangeNote;
+        std::string rNote = J.rangeNote;
+        for (const std::string& h : J.held) rNote += "; " + h;
         // A finish that failed leaves a file with no index and a header still
         // claiming 0 frames - unplayable, and saying nothing about why. It goes
         // the same way a Stop goes, for the same reason: nothing left behind.
@@ -227,26 +236,32 @@ static bool pumpVideoExport() {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
         return false;
     }
-    // The view frame k is on screen in: A on frame k, B and the slots followed
-    // to theirs (#304). Its sides can turn into previews mid-write too.
-    const ViewSides view = viewSidesFor(d);
+    // The view this frame is on screen in (#304): for A's stack, A on it and B
+    // and the slots followed to theirs. Its sides can turn into previews
+    // mid-write too, and a side held at its last frame is said at the end.
+    ImageDoc* stepTo = nullptr;
+    const ViewSides view = exportFrameViewFor(d, stepTo);
     why = viewRefusalFor(view);
     if (!why.empty()) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
         return false;
     }
+    for (const std::string& h : viewHeldSides(view))
+        if (std::find(J.held.begin(), J.held.end(), h) == J.held.end()) J.held.push_back(h);
     if (d->w != J.w || d->h != J.h) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
         return false;
     }
-    // "Auto per frame" re-fits the frame to its OWN numbers on the way in -
-    // the same call selectImage makes on a step, in the same condition, so the
-    // video shows what stepping through the stack would have shown. WHICH fit
+    // "Auto per frame" re-fits the frame A steps onto - the same call
+    // selectImage makes on a step, in the same condition, so the video shows
+    // what stepping through the stack would have shown. For A's own stack that
+    // is the frame itself; for a stack drawn as B it is A's paired frame (B is
+    // never re-fitted by a step), and with A staying put it is nothing. WHICH fit
     // (min..max, the 0.1-99.9% cut, median->target) is app.autoFlavor's
     // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
     // be a second answer to the one question. Linked and per-stack need
     // nothing: displayRangeFor already answers for the stack.
-    if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
+    if (app.rangeScope == 0 && !app.linkRange && stepTo) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
     renderDocRGBA(*d, rgba, &view);

@@ -831,6 +831,7 @@ static float effWhite(const ImageDoc& im);
 // drawn at in a VIEW (#304), defined with them in export.inc.
 static ViewSides comparedSides();
 static void displayRangeFor(const ImageDoc& im, const ViewSides& v, float& lo, float& hi);
+static bool rangeReadsView();
 
 // The LOAD-TIME default, and only that. Its two magnets - the 8- and 16-bit
 // integer types to their type fullscale, near-[0,1] floats to 0..1 - are
@@ -1756,7 +1757,8 @@ static const float* displayGammaTable(float gamma) {
 static DisplayMap displayMapOf(const ImageDoc& im, const ViewSides* v = nullptr) {
     DisplayMap M;
     float rangeHi = 0;
-    displayRangeFor(im, v ? *v : comparedSides(), M.black, rangeHi);
+    displayRangeFor(im, v ? *v : rangeReadsView() ? comparedSides() : ViewSides(),
+                    M.black, rangeHi);
     // A range too wide for a float (issue #297 item 10): black -3e38 / white
     // 3e38 is legal, its float width is +inf, and inv = 1/inf = 0 turned
     // xOf(+inf) into inf * 0 = NaN, i.e. screen 0 instead of 255. ONLY that
