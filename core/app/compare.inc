@@ -762,8 +762,18 @@ static float effWhite(const ImageDoc& im);
 // a file that was just opened probably means, not a fit to what it contains.
 // Nothing that re-fits an image ALREADY on screen may go through here: see
 // autoRange below, and issue #245.
+//
+// "Fullscale" for a SIGNED integer type is 0 to the type's positive maximum,
+// not its whole range (ruled in issue #293, option A): negative pixels start
+// out black, and Auto (min-max or %) or a hand-typed black is what shows them.
+// The white is the type's own ceiling - i8 is -128..127, so its white is 127
+// and not u8's 255 - which keeps the default inside the values the type can
+// hold at all. A float holding the same negative pixels takes the last branch
+// and is visible from the start; that asymmetry is the ruling, not an
+// accident, and --range-selftest P16 pins every one of these numbers.
 static void defaultRange(ImageDoc& im) {
-    if (im.dtype == "u8" || im.dtype == "i8")       { im.black = 0; im.white = 255; }
+    if (im.dtype == "u8")                           { im.black = 0; im.white = 255; }
+    else if (im.dtype == "i8")                      { im.black = 0; im.white = 127; }
     else if (im.dtype == "u16")                     { im.black = 0; im.white = 65535; }
     else if (im.dtype == "i16")                     { im.black = 0; im.white = 32767; }
     else if (im.vmin >= -0.001f && im.vmax <= 1.2f && im.vmax > 0.005f) { im.black = 0; im.white = 1; }

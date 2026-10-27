@@ -970,6 +970,67 @@
             app.rangeScope = saveScope;
         }
 
+        // ==================================================================
+        // #293 - the LOAD-TIME default for integer types, held as numbers.
+        // The user ruled (2026-10-27, option A) that a signed type defaults
+        // to 0..its positive maximum: negative pixels are black until Auto
+        // (min-max or %) or a hand-typed black. Until here only the 0..1
+        // magnet had a test (P5), so i16 could have moved to -32768.. or to
+        // vmin.. and the suite would have stayed green. In-memory fixtures;
+        // defaultRange reads nothing but the doc, so no mode is borrowed.
+        // ==================================================================
+        {   // ---- P16: u8 / i8 / u16 / i16 defaults, and the float asymmetry
+            // One ramp per dtype. The data is chosen so that a default that
+            // fell through to either FLOAT branch would print a different
+            // pair: the ramps hold negatives or exceed 1.2 (so the 0..1 magnet
+            // cannot answer) and never end on the type's ceiling (so vmin..vmax
+            // cannot answer either). dtype is a mirror of src, hence the sync.
+            auto mkTyped = [&](const char* nm, const char* dt, float lo, float hi) {
+                auto d = mkRamp(nm, lo, hi, 0, 0.0f);
+                d->src->dtype = dt;
+                d->syncMirrors();
+                return d;
+            };
+            struct Case { const char* dt; float lo, hi, eb, ew; const char* why; };
+            const Case cases[] = {
+                { "u8",      0.0f,  200.0f, 0.0f,   255.0f, "type fullscale" },
+                { "i8",   -100.0f,  100.0f, 0.0f,   127.0f, "0..positive max: 255 is outside int8" },
+                { "u16",     0.0f, 4000.0f, 0.0f, 65535.0f, "type fullscale" },
+                { "i16",     0.0f, 1000.0f, 0.0f, 32767.0f, "0..positive max" },
+                { "i16",  -1000.0f, 1000.0f, 0.0f, 32767.0f, "negatives present: black STAYS 0 (the ruling)" },
+                { "i16",     0.3f,    0.6f, 0.0f, 32767.0f, "dtype decides, not the data (a float here reads 0..1)" },
+            };
+            for (const Case& c : cases) {
+                auto d = mkTyped("def_int", c.dt, c.lo, c.hi);
+                defaultRange(*d);
+                bool ok = d->black == c.eb && d->white == c.ew;
+                fprintf(stderr, "rangeselftest: P16 %-3s data %.6g..%.6g -> default %.6g..%.6g "
+                                "(expect %.6g..%.6g; %s) %s\n",
+                        c.dt, d->vmin, d->vmax, d->black, d->white, c.eb, c.ew, c.why,
+                        ok ? "ok" : "WRONG");
+                if (!ok) bad++;
+            }
+            // The float side of the asymmetry, with the SAME negative data as
+            // the fifth row: it lands in vmin..vmax and is visible at once.
+            // Pinned so the int16-vs-float difference reads as intended.
+            auto f = mkTyped("def_f32neg", "f32", -1000.0f, 1000.0f);
+            defaultRange(*f);
+            bool fneg = f->black == f->vmin && f->white == f->vmax && f->black < 0.0f;
+            fprintf(stderr, "rangeselftest: P16 f32 data %.6g..%.6g -> default %.6g..%.6g "
+                            "(expect vmin..vmax, negatives visible) %s\n",
+                    f->vmin, f->vmax, f->black, f->white, fneg ? "ok" : "WRONG");
+            if (!fneg) bad++;
+            // ...and the 0..1 magnet is still the float rule near [0,1]: the
+            // same data the sixth row gave i16, answered as a float.
+            auto g = mkTyped("def_f32unit", "f32", 0.3f, 0.6f);
+            defaultRange(*g);
+            bool magnet = g->black == 0.0f && g->white == 1.0f;
+            fprintf(stderr, "rangeselftest: P16 f32 data %.6g..%.6g -> default %.6g..%.6g "
+                            "(expect 0..1, the magnet) %s\n",
+                    g->vmin, g->vmax, g->black, g->white, magnet ? "ok" : "WRONG");
+            if (!magnet) bad++;
+        }
+
         // the shared home gets the modes it was lent, back
         app.rangeScope = 1;
         app.linkRange = false;
