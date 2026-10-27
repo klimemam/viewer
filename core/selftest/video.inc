@@ -1008,6 +1008,27 @@ static int videoSelftest() {
             const std::string lPrev = stackVideoRefusal(sa, path, 30.0);
             L->src->remoteStep = wasL;
             setCompareB(B_(0));
+            // B's stack exported while A's paired frame is a preview: the
+            // union starts from A's min/max, so A is checked too - and with
+            // follow-frame off, the A on screen is
+            ImageDoc* A1 = A_(1);
+            const int wasA = A1->src->remoteStep;
+            A1->src->remoteStep = 4;
+            const std::string aPrev = stackVideoRefusal(sb, path, 30.0);
+            A1->src->remoteStep = wasA;
+            app.compareFollowFrame = false;
+            selectImage(fa[1]);
+            A1->src->remoteStep = 4;
+            const std::string aPrevOff = stackVideoRefusal(sb, path, 30.0);
+            A1->src->remoteStep = wasA;
+            app.compareFollowFrame = true;
+            selectImage(fa[0]);
+            fprintf(stderr, "videoselftest: V7 B's stack, A_2 preview -> \"%s\"\n", aPrev.c_str());
+            fprintf(stderr, "videoselftest: V7 ...follow off, A on screen preview -> \"%s\"\n", aPrevOff.c_str());
+            check(has(aPrev, "frame 2 of 3") && has(aPrev, "A's frame 2") && has(aPrev, "preview"),
+                  "V7 B's stack exported over a preview A frame refuses, naming A and the frame");
+            check(has(aPrevOff, "frame 1 of 3") && has(aPrevOff, "A's frame 2"),
+                  "V7 ...and with follow-frame off, the preview A on screen is named too");
             const std::string none = stackVideoRefusal(sa, path, 30.0);
             fprintf(stderr, "videoselftest: V7 B preview -> \"%s\"\n", bPrev.c_str());
             fprintf(stderr, "videoselftest: V7 C preview -> \"%s\"\n", cPrev.c_str());
@@ -1020,7 +1041,8 @@ static int videoSelftest() {
                   !has(lPrev, "B's frame"),
                   "V7 ...and a single-image B by name, with no frame number");
             check(bPrevAs.empty(), "V7 ...while A's range, which never reads B, does not refuse");
-            check(none.empty(), "V7 ...and with every frame full the union exports (anti-vacuity)");
+            check(none.empty() && stackVideoRefusal(sb, path, 30.0).empty(),
+                  "V7 ...and with every frame full the union exports (anti-vacuity)");
         }
 
         {   // ---- A longer than B and C: they are HELD, as on screen ----------

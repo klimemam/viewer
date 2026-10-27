@@ -586,8 +586,8 @@ File > **Export stack as video (displayed levels)...**(キャンバスの右ク�
   **Stop は書きかけのファイルを消します**(2枚だけ再生できる動画は、何も無いより
   たちが悪いので)
 - **preview(まだ間引きの絵)が混じった stack は断ります** —— PNG 書き出しと
-  同じ文面で、「full が着いてから」と言います。union のレンジが読む **B / スロットの
-  フレーム n が preview** のときも、`B's frame 3`(1枚ものの B なら `B (a single image)`)
+  同じ文面で、「full が着いてから」と言います。union のレンジが読む**他の側のフレームが
+  preview** のとき(A の stack なら B / スロットのフレーム n、B の stack なら A の対のフレーム)も、`B's frame 3`(1枚ものの B なら `B (a single image)`)
   のように側とフレームを名指しして断ります
 - 無圧縮 AVI が **4 GB** を超える見込みなら**書き始める前に**断り、FFV1/MKV への
   道を示します(AVI 1.0 のオフセットが 32bit なので、その先はどの再生器からも

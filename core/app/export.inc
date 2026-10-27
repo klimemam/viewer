@@ -121,7 +121,7 @@ static std::string exportHighlightNote(const ImageDoc* im) {
 // highlight, explained nowhere in the file - so it is named where the export
 // is announced (#304). Defined with displayRangeFor below.
 static std::string exportRangeNote(const ImageDoc& im, const ViewSides& v, bool video);
-static std::string viewRefusalFor(const ViewSides& v);
+static std::string viewRefusalFor(const ViewSides& v, const ImageDoc* self);
 static ImageDoc* sideOfView(const ImageDoc& im, const ViewSides& v);
 
 // The ONE place an export is produced, so the file and the clipboard can never
@@ -562,9 +562,10 @@ static std::string viewSideLetter(const ViewSides& v, int i) {
     return v.role[i] == 0 ? std::string("A") : v.role[i] == 1 ? std::string("B")
                                              : slotName((size_t)(v.role[i] - 2));
 }
-// "B held at frame 3" for every side of `v` whose follow found no frame at A's
+// "B held at frame 1" for every side of `v` whose follow found no frame at A's
 // number and which the range is taken over (the union only): the screen draws
-// such a side as its last frame and marks it [stale], the union includes it,
+// such a side on its PINNED frame - the one chosen as B or as the slot - and
+// marks it [stale]; the union includes it,
 // and so does the export - which then has to SAY it, because the file cannot
 // carry the mark. Empty when no such side.
 static std::vector<std::string> viewHeldSides(const ViewSides& v) {
@@ -630,13 +631,17 @@ static bool rangeReadsOtherSides() {
 // refusal otherwise. A decimated preview's min/max is not the frame's, and a
 // file cannot say so afterwards - the same "not yet" as exportRefusalFor,
 // naming the side and (for a stack) its frame. A side whose stack simply has
-// no frame at A's number is NOT refused: the screen draws its held frame and
-// unions over it, the export does the same, and exportRangeNote says so.
-static std::string viewRefusalFor(const ViewSides& v) {
+// no frame at A's number is NOT refused: the screen draws it on its pinned
+// frame and unions over that, the export does the same, and exportRangeNote
+// says so. `self` is the picture being exported, which exportRefusalFor has
+// already asked about; EVERY other side is checked - A included, because a
+// B or slot stack is exported in a view whose side 0 is A's paired frame (or
+// the A on screen), and the union starts from A's min/max.
+static std::string viewRefusalFor(const ViewSides& v, const ImageDoc* self) {
     if (!rangeReadsOtherSides() || v.n < 2) return {};
-    for (int i = 1; i < v.n; i++) {
+    for (int i = 0; i < v.n; i++) {
         const ImageDoc* s = v.side[i];
-        if (exportRefusalFor(s).empty()) continue;
+        if (s == self || exportRefusalFor(s).empty()) continue;
         const std::string who = viewSideLetter(v, i);
         return "the A/B range is the union over every side, and " +
                (s->seqId > 0 ? who + "'s frame " + std::to_string(s->seqIndex + 1)

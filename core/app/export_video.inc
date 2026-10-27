@@ -13,8 +13,8 @@
 // view it is on screen in (#304, exportFrameViewFor). For A's own stack that
 // is A stepped onto frame k, B and the slots following to THEIR frame k:
 // under the A/B union the union of A_k, B_k, C_k... (a side with no frame k is
-// its held frame, as on screen, and the announcement says "B held at frame
-// 3"); under each side fits itself A_k's own fit; under A's range A_k's own
+// its pinned frame, as on screen, and the announcement says "B held at frame
+// 1"); under each side fits itself A_k's own fit; under A's range A_k's own
 // black-white. A stack held by B or a slot is drawn in that role, in the view
 // follow-frame pairs it in. An export that drew every frame in the screen's
 // view instead would draw only the frame on screen as a compared side and
@@ -106,7 +106,8 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
         // Only the union reads them, so only the union builds the view.
         if (rangeReadsOtherSides()) {
             ImageDoc* stepTo = nullptr;
-            why = viewRefusalFor(exportFrameViewFor(app.images[fr[i]].get(), stepTo));
+            ImageDoc* fi = app.images[fr[i]].get();
+            why = viewRefusalFor(exportFrameViewFor(fi, stepTo), fi);
             if (!why.empty())
                 return "frame " + std::to_string(d->seqIndex + 1) + " of " +
                        std::to_string(fr.size()) + ": " + why;
@@ -238,10 +239,10 @@ static bool pumpVideoExport() {
     }
     // The view this frame is on screen in (#304): for A's stack, A on it and B
     // and the slots followed to theirs. Its sides can turn into previews
-    // mid-write too, and a side held at its last frame is said at the end.
+    // mid-write too, and a side held at its pinned frame is said at the end.
     ImageDoc* stepTo = nullptr;
     const ViewSides view = exportFrameViewFor(d, stepTo);
-    why = viewRefusalFor(view);
+    why = viewRefusalFor(view, d);
     if (!why.empty()) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
         return false;
