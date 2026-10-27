@@ -1689,6 +1689,11 @@ int main(int argc, char** argv) {
     // the expected value a rational derived by hand.
     #include "selftest/rowcolsigma.inc"
 
+    // The Projection frame statistics over every pixel, on a worker, keyed
+    // (issue #283). Beside rowcolsigma.inc: the same panel's numbers, held
+    // against a scan written out in the test.
+    #include "selftest/projframe.inc"
+
     // The three shipped analyzers that had no value assertion at all (板 304).
     // Beside rowcolsigma.inc because it is the same discipline on the other side
     // of the ABI: analytic fixtures whose answer can be written down.
@@ -2537,6 +2542,7 @@ static bool g_watchSuppressed = false;
                     !app.openQueue.empty() ||
                     app.reloadJob != nullptr ||      // ...or RE-read (2026-09-28)
                     !app.reloadQueue.empty() ||
+                    projFrameBusy(app.uiFrame) ||    // Projection frame stats (#283)
                     app.anyFileDialog() ||
                     (!app.toast.empty() && ImGui::GetTime() < app.toastUntil) ||
                     // the A/B step throttle is a DEADLINE, not an event: without

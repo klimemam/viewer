@@ -101,7 +101,7 @@ Temporal / ROIs のエクスポートは、パネルが表示している値を*
 |---|---|---|---|---|---|
 | 1 | `core/ui/panel_rois.inc:8` `roiBasicStatsUncached` | **200k** (モザイクセル単位ストライド) | CFA→4 / ch別 / pooled | 黙って skip (**数えない**) | ROIs パネル `mean/sd/std-mean[%]/min/max/n`、ROIs `Copy (TSV)` / `Save (CSV)` |
 | 2 | `core/ui/canvas.inc:1596` `recomputeHistogramIfNeeded` | **1M** | CFA→4 / ch≤3 | skip (clip 分母からも除外) | Histogram パネル `mean/std/var` |
-| 3 | `core/ui/panel_histogram.inc:773` `recomputeProjectionIfNeeded` の `fStat` | **2M** (H パスのみが供給) | CFA→4 + pooled slot | skip | Projection `mean` / `σ (frame)` / `pp` / `%`、Projection `Copy table (TSV)`、Temporal export §2 |
+| 3 | `core/ui/panel_histogram.inc:773` `recomputeProjectionIfNeeded` の `fStat` | **full** (#283 以降。それ以前は **2M**、H パスのみが供給。大きい領域は worker で計算) | CFA→4 + pooled slot | skip | Projection `mean` / `σ (frame)` / `pp` / `%`、Projection `Copy table (TSV)`、Temporal export §2 |
 | 4 | `core/ui/panel_temporal.inc:454` `exportPerFrameBlock` | **full** | CFA→4 / **ch 別** | skip | Temporal `Copy (TSV)` / `Save (CSV)` §3、`--framestats-selftest` |
 | 5 | `core/app/temporal_model.inc:102-115` (`T.frameStd`) | **40k 格子** | **pooled** | 数える (`T.nonFinite`、ただし 40k 分のみ) | Temporal パネルの frame std グラフ |
 | 6 | `core/serve.cpp:2252-2264` (`frame std` 系列) | full | **pooled** | 数えて申告 | peer 応答 → Temporal パネル server 行 |
@@ -257,7 +257,7 @@ clamp 位置 (`max(0, …)` を ddof スケールの**前**) は全 site で一�
 | P2 | σ_fpn / fpn_corr / clamp / σ_tot: local ↔ peer | **はい** | **あり** `--rtemporal-selftest` の P2/P3/P4/P5 | ビット単位。**補正量とクランプ旗まで**比べる (両側がクランプして 0 同士で一致するのを防ぐため) |
 | P3 | set fold: local (K4#4) ↔ peer (`foldOneRole`) | **はい** | **あり** `--rset-selftest` RS3/RS5c/RS7/RS9/RS10/RS11/RS24 | ビット単位、全欄 (値・補正量・非補正上界・μ・σ_d・クランプ・標本数・遮蔽 p-p / % / 可否) + タイトル/form/cutoff/拒否文の文字列。fixture に**非2進小数の項を意図的に混ぜて**「厳密一致が入力のせいで成立する」のを防いでいる |
 | P4 | plugin 結果: local 実行 ↔ peer 実行 | **はい** | **あり** `--rplugin-selftest` RP24 (出荷 `stats/moments`)、RP3/RP21、`--remote-selftest` MEASURE (pooled と Bayer 宣言の2回) | **`%.9g` の文字列一致**。同じ dll を両側で走らせるので算術は同一。**`mean/var/std/min/max/p1/p50/p99/entropy/finite ratio` がこの1本でだけ2回計算されて比べられている** |
-| P5 | 領域 mean: `fStat.mean` (K1#3) ↔ 列平均の平均 `hStat.mean` (K2#1) | **はい** (同じ標本の同じ平均を2回計算している) | **あり** `--precision-selftest` P7c/P7d | **float 1 ulp** (`\|m\|·2⁻²³ + 1e-12`)。P7e は**V profile の平均は別の数**であることを逆に固定する (#145) |
+| P5 | 領域 mean: `fStat.mean` (K1#3) ↔ 列平均の平均 `hStat.mean` (K2#1) | **step ≤ cell のときだけはい** (mono 4M 未満 / Bayer 3M 未満 / quad Bayer 2.5M 未満。同じ標本の同じ平均を2回計算している。#283 以降 `fStat` は全画素なので、H パスが間引く大きさでは別の標本) | **あり** `--precision-selftest` P7c/P7d | **float 1 ulp** (`\|m\|·2⁻²³ + 1e-12`)。P7e は間引く大きさで**H profile の平均は別の数**であることを逆に固定する (#145、#283 以前は V profile で固定していた) |
 | P6 | Temporal export §3 の per-frame σ ↔ ddof=0 の閉形式 | はい | **あり** `--export-tsv-selftest` E11 | `%.9g` で最終桁まで一致し、**ddof=1 とは一致しないこと**も検査 |
 | P7 | パネル表示 ↔ エクスポート (ROIs / Projection / Analysis / Set / Series / Temporal §1-2) | **はい** | **あり (構造的)** `--export-tsv-selftest` E2/E9/E13、`--roi-export-selftest` X4 | **再計算しないので定義上一致**。E2 は σ_t / σ_fpn / `fStat.mean` / `fStat.sd` / `vStat.sd` / `hStat.sd` / HFPN-RN / VFPN-RN / status を `%.9g` で突き合わせる。E9 は「B 列は A を貼り替えたものではない」 |
 | P8 | σ_fpn: Temporal パネル (K5 local) ↔ Set Analysis の DSNU (K4#4→`setPlaneFpn`) | **はい** (DSNU は同じ推定量を dark に当てたもの) | **あり** `--setanalysis-selftest` S2 (+ F2 / F10) | **ビット単位**。値・補正量・クランプ旗。許容を使わない理由をコメントが述べている |

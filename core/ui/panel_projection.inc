@@ -219,6 +219,52 @@ static std::string projRegionSaid(const std::vector<ProjSide>& sides) {
     return out;
 }
 
+// The word a frame-statistics cell carries while its full-pixel pass is still
+// running (issue #283, ProjState::fPending). ASCII on purpose: it is drawn with
+// the panel font and pasted into TSV readers, and both take "..." as it is.
+static const char* const PROJ_FRAME_PENDING = "computing...";
+
+// ONE row of the "Copy table (TSV)" text, for one side and one series. A
+// function rather than inline in the button so --projframe-selftest can read
+// the exact bytes the clipboard gets: the claim under test is that a pending
+// side's frame cells say "computing..." and never the previous region's number.
+// Column order is the header's in drawPanelProjection.
+static std::string projTsvRow(const App::ProjState& S, const char* side, bool stale, int i) {
+    const App::ProjState::Stats& f = S.fStat[i];
+    const App::ProjState::Stats& vv = S.vStat[i];
+    const App::ProjState::Stats& hh = S.hStat[i];
+    // Retain an all-invalid plane: the noise cells explain why
+    // the measurement is unavailable instead of hiding its row.
+    auto n6 = [](const App::ProjState::Stats& st, double v, char* out, size_t cap) {
+        if (st.valid) snprintf(out, cap, "%.9g", v);
+        else          snprintf(out, cap, "-");
+    };
+    // the frame cells: a number, "-", or - while the pass runs - the word
+    auto nf = [&](double v, char* out, size_t cap) {
+        if (S.fPending) snprintf(out, cap, "%s", PROJ_FRAME_PENDING);
+        else            n6(f, v, out, cap);
+    };
+    char b[640];
+    char m[40], sf[40], sv[40], sh[40], pf[40], pv2[40], ph[40], qf[40], qv[40], qh[40],
+         nfr[40];
+    nf(f.mean, m, sizeof m);
+    nf(f.sd, sf, sizeof sf);  n6(vv, vv.sd, sv, sizeof sv);  n6(hh, hh.sd, sh, sizeof sh);
+    nf(f.pct, qf, sizeof qf); n6(vv, vv.pct, qv, sizeof qv); n6(hh, hh.pct, qh, sizeof qh);
+    nf(f.pp, pf, sizeof pf);  n6(vv, vv.pp, pv2, sizeof pv2); n6(hh, hh.pp, ph, sizeof ph);
+    // n_frame: how many samples the frame columns are over - every finite
+    // pixel of this plane in the region, which is the evidence that they are
+    if (S.fPending)   snprintf(nfr, sizeof nfr, "%s", PROJ_FRAME_PENDING);
+    else if (f.valid) snprintf(nfr, sizeof nfr, "%zu", f.n);
+    else              snprintf(nfr, sizeof nfr, "-");
+    // a stale side's numbers carry the caveat INTO the paste - a
+    // dimmed pixel does not survive the clipboard, the word does
+    snprintf(b, sizeof b, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
+             side, stale ? " (stale)" : "",
+             S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph, nfr);
+    return std::string(b) + "\t" + projNoiseValue(S, i, true) + "\t" +
+           projNoiseValue(S, i, false) + "\t" + projNoiseStatus(S, i) + "\n";
+}
+
 static void drawPanelProjection() {
     g_projSideProbe.clear();
     g_projCurveProbe.clear();
@@ -1695,47 +1741,32 @@ static void drawPanelProjection() {
             // comment='#', which would drop exactly this line.
             tsv += "side\tch\tmean\tsigma_frame(ddof=0)\tsigma_row(ddof=1)\tsigma_col(ddof=1)\t"
                    "sigma_frame_pct(ddof=0)\tsigma_row_pct(ddof=1)\tsigma_col_pct(ddof=1)\t"
-                   "pp_frame\tpp_row\tpp_col\tHFPN/RN(one-frame)\tVFPN/RN(one-frame)\tnoise_status\n";
+                   "pp_frame\tpp_row\tpp_col\tn_frame\tHFPN/RN(one-frame)\tVFPN/RN(one-frame)\t"
+                   "noise_status\n";
             tsv += "# HFPN/RN=row/pixel; VFPN/RN=column/pixel. Full ROI mean-based spatial "
                    "estimates for a flat field, not separated fixed/temporal noise. "
                    "H/V vendor names vary; ratios are dimensionless.\n";
-            int nRows = 0;
+            int nRows = 0, nPending = 0;
             projForEachRow([&](const App::ProjState& S, const char* side, int i,
                                const char* plane) {
                 if (i < 0) {   // a plane the other side has and this one does not
                     tsv += std::string(side) + (sideIsStale(side) ? " (stale)" : "") +
                            "\t" + (plane ? plane : "?");
-                    for (int k = 0; k < 12; k++) tsv += "\t-";   // 10 values + the 2 ratios
+                    for (int k = 0; k < 13; k++) tsv += "\t-";   // 10 values, n, 2 ratios
                     tsv += "\tunavailable: no such plane on this side\n";
                     nRows++;
                     return;
                 }
-                const App::ProjState::Stats& f = S.fStat[i];
-                const App::ProjState::Stats& vv = S.vStat[i];
-                const App::ProjState::Stats& hh = S.hStat[i];
-                // Retain an all-invalid plane: the noise cells explain why
-                // the measurement is unavailable instead of hiding its row.
-                char b[512];
-                auto n6 = [](const App::ProjState::Stats& st, double v, char* out, size_t cap) {
-                    if (st.valid) snprintf(out, cap, "%.9g", v);
-                    else          snprintf(out, cap, "-");
-                };
-                char m[40], sf[40], sv[40], sh[40], pf[40], pv2[40], ph[40], qf[40], qv[40], qh[40];
-                n6(f, f.mean, m, sizeof m);
-                n6(f, f.sd, sf, sizeof sf);  n6(vv, vv.sd, sv, sizeof sv);  n6(hh, hh.sd, sh, sizeof sh);
-                n6(f, f.pct, qf, sizeof qf); n6(vv, vv.pct, qv, sizeof qv); n6(hh, hh.pct, qh, sizeof qh);
-                n6(f, f.pp, pf, sizeof pf);  n6(vv, vv.pp, pv2, sizeof pv2); n6(hh, hh.pp, ph, sizeof ph);
-                // a stale side's numbers carry the caveat INTO the paste - a
-                // dimmed pixel does not survive the clipboard, the word does
-                snprintf(b, sizeof b, "%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s",
-                         side, sideIsStale(side) ? " (stale)" : "",
-                         S.seriesNames[i], m, sf, sv, sh, qf, qv, qh, pf, pv2, ph);
-                tsv += std::string(b) + "\t" + projNoiseValue(S, i, true) + "\t" +
-                       projNoiseValue(S, i, false) + "\t" + projNoiseStatus(S, i) + "\n";
+                tsv += projTsvRow(S, side, sideIsStale(side), i);
+                if (S.fPending) nPending++;
                 nRows++;
             });
             ImGui::SetClipboardText(tsv.c_str());
-            toast("copied " + std::to_string(nRows) + " row(s) (TSV)");
+            // ...and the toast says so when a frame column went out as words:
+            // a paste is read later, away from the panel that was computing
+            toast("copied " + std::to_string(nRows) + " row(s) (TSV)" +
+                  (nPending ? std::string(" - frame statistics still computing on ") +
+                              std::to_string(nPending) + " row(s)" : std::string()));
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("the table as tab-separated text, one row per side/plane,\n"
@@ -1762,8 +1793,11 @@ static void drawPanelProjection() {
         // slot 4 means every plane's region statistics are invalid too - and the
         // per-plane no-curve notice above is already saying "no finite sample at
         // any of its N position(s)" for each of them.
+        // (A PENDING slot 4 counts: its numbers are on their way, and a
+        // sentence that vanished for the length of the pass and came back
+        // would move every line under it twice - issue #283.)
         if (sd.S->cell > 1 && sd.S->allRow && sd.S->unavail.empty() &&
-            sd.S->fStat[4].valid) {
+            (sd.S->fStat[4].valid || sd.S->fPending)) {
             if (!pooledMosaic.empty()) pooledMosaic += ", ";
             pooledMosaic += sd.name;
         }
@@ -1818,17 +1852,16 @@ static void drawPanelProjection() {
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-            // ONE mean, not three - and the one printed is the REGION's.
-            // Over a rectangle the region mean and the mean of the column means
-            // are the same number twice: the H pass visits every column of
-            // every step-th row and the region moments are gathered from
-            // exactly those visits, so the sample sets are identical and the
-            // column counts equal. --precision-selftest P7c holds them to it.
-            // The mean of the ROW means is NOT that number: the V pass visits
-            // every row of every step-th COLUMN, a different set of pixels, and
-            // differs by ~0.04 DN on a 4000x3000 frame for that reason alone.
-            // Which is why this table prints fStat and not an axis: it says
-            // "the region", and every row of it means the same thing.
+            // ONE mean, not three - and the one printed is the REGION's,
+            // over every pixel of it (issue #283). Where the H pass also
+            // covers every pixel (step == cell) the mean of the column
+            // means is the same number twice, and --precision-selftest P7c
+            // holds them to it; once it strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx)
+            // the column and row means are
+            // each over a stride of the region and differ from it - the V pass
+            // by ~0.04 DN on a 4000x3000 frame. Which is why this table prints
+            // fStat and not an axis: it says "the region", and every row of it
+            // means the same thing.
             // the literal is split after each escape: "\xcf\x83f" would be read
             // as \xcf followed by the 3-digit escape \x83f, which is not a byte
             // Spelled out rather than initialled. "sigma-f" needs the footnote
@@ -1848,9 +1881,11 @@ static void drawPanelProjection() {
             // the one people will read numbers off into a report
             if (ImGui::TableGetHoveredColumn() >= (anySide ? 2 : 1) &&
                 ImGui::TableGetHoveredColumn() < (anySide ? 12 : 11))
-                ImGui::SetTooltip("f = the whole region     v = the row means (horizontal banding)\n"
+                ImGui::SetTooltip("f = the whole region, every pixel     v = the row means (horizontal banding)\n"
                                   "h = the column means (vertical striping)\n"
-                                  "%% is sigma / mean.  p-p is max - min.  All values in DN.");
+                                  "%% is sigma / mean.  p-p is max - min.  All values in DN.\n"
+                                  "\"%s\": a large region's every-pixel pass is still running.",
+                                  PROJ_FRAME_PENDING);
             auto wrow1 = [&](const App::ProjState& S, const char* sideName, int i) {
                 {
                     const App::ProjState::Stats& f = S.fStat[i];
@@ -1860,22 +1895,25 @@ static void drawPanelProjection() {
                     if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
                     ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
                     ImGui::TableNextColumn();
-                    if (f.valid)       textStat(f.mean);
-                    else if (hh.valid) textStat(hh.mean);
-                    else               ImGui::TextDisabled("-");
+                    // PENDING before the fallback: the column mean is a
+                    // different number (every step-th row), and printing it in
+                    // the region's column while the region's is computing is
+                    // the stale-number failure by another route (issue #283)
+                    if (f.valid)          textStat(f.mean);
+                    else if (S.fPending)  ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
+                    else if (hh.valid)    textStat(hh.mean);
+                    else                  ImGui::TextDisabled("-");
                     const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
-                    for (int k = 0; k < 3; k++) {
+                    // k == 0 is the frame column of each triple
+                    auto cell3 = [&](int k, double v) {
                         ImGui::TableNextColumn();
-                        if (trio[k]->valid) textStat(trio[k]->sd); else ImGui::TextDisabled("-");
-                    }
-                    for (int k = 0; k < 3; k++) {
-                        ImGui::TableNextColumn();
-                        if (trio[k]->valid) textStat(trio[k]->pct); else ImGui::TextDisabled("-");
-                    }
-                    for (int k = 0; k < 3; k++) {
-                        ImGui::TableNextColumn();
-                        if (trio[k]->valid) textStat(trio[k]->pp); else ImGui::TextDisabled("-");
-                    }
+                        if (k == 0 && S.fPending) ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
+                        else if (trio[k]->valid)  textStat(v);
+                        else                      ImGui::TextDisabled("-");
+                    };
+                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->sd);
+                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->pct);
+                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->pp);
                     ImGui::TableNextColumn(); drawProjNoiseCell(S, i, true);
                     ImGui::TableNextColumn(); drawProjNoiseCell(S, i, false);
                 }
@@ -1902,7 +1940,7 @@ static void drawPanelProjection() {
             });
             ImGui::EndTable();
         }
-        ImGui::TextDisabled("frame = the whole region; row = the row means (banding); "
+        ImGui::TextDisabled("frame = the whole region, every pixel; row = the row means (banding); "
                             "col = the column means (striping). DN");
         projSayPlaneMismatch();
     } else
@@ -1928,12 +1966,14 @@ static void drawPanelProjection() {
         // mean OF THE PROFILE named in the axis column - not the region's.
         //
         // The two are different measurements over different sample sets, and
-        // saying so is the whole fix (issue #145). The H pass visits every
-        // column of every step-th ROW, and the region moments are gathered from
-        // exactly those visits, so the H row's mean equals the region mean by
-        // construction (--precision-selftest P7c asserts it). The V pass visits
-        // every row of every step-th COLUMN - different pixels - and measured
-        // on a 4000x3000 frame at ~3000 DN the two differ by 12 ppm. That is
+        // saying so is the whole fix (issue #145). The region moments are
+        // over every pixel (issue #283). The H pass visits every column of
+        // every step-th ROW, so while step == cell its mean IS the region
+        // mean (--precision-selftest P7c asserts it) and once it strides
+        // (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) it is
+        // a stride of it (P7e). The V pass visits every row of every step-th
+        // COLUMN - different pixels again - and measured on a 4000x3000 frame
+        // at ~3000 DN the two axis means differ by 12 ppm. That is
         // larger than the float-accumulator defect PR #144 removed (4.9 ppm)
         // and it survives at %.6g on screen and %.9g in the TSV.
         //
@@ -1964,8 +2004,9 @@ static void drawPanelProjection() {
                 ImGui::TableNextColumn();
                 if (st.valid) textStat(st.mean); else ImGui::TextDisabled("-");
                 ImGui::TableNextColumn();
-                if (S.fStat[s].valid) textStat(S.fStat[s].sd);
-                else                  ImGui::TextDisabled("-");
+                if (S.fStat[s].valid)  textStat(S.fStat[s].sd);
+                else if (S.fPending)   ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
+                else                   ImGui::TextDisabled("-");
                 ImGui::TableNextColumn();
                 if (st.valid) textStat(st.sd); else ImGui::TextDisabled("-");
                 ImGui::TableNextColumn();
@@ -2008,7 +2049,7 @@ static void drawPanelProjection() {
             });
         ImGui::EndTable();
     }
-    ImGui::TextDisabled(SIGMA " (frame) = the whole region.  " SIGMA " (axis) = of the means "
+    ImGui::TextDisabled(SIGMA " (frame) = the whole region, every pixel.  " SIGMA " (axis) = of the means "
                         "in the axis column:\n"
                         "column means = column FPN, row means = row FPN. DN");
     projSayPlaneMismatch();
@@ -2432,6 +2473,7 @@ static bool stackReduceFrame(int seqId, int fold, std::string& err,
         // by construction (path empty, outside the §6.2 registry), so writing
         // it in place cannot reach any other doc.
         FrameSource& S = *into->src;
+        projFrameFence(&S);              // replaced in place (#283)
         S.w = W; S.h = H; S.ch = C;
         S.dtype = "f32";
         S.data = std::move(folded);

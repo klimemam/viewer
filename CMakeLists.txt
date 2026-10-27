@@ -1488,6 +1488,11 @@ viewer_selftest(profile-noise NOGL --profile-noise-selftest)
 # value is a rational derived by hand - and it needs the shipped
 # uniformity/prnu-fpn dll, which startup loads before parseCli either way.
 viewer_selftest(rowcol-sigma NOGL --rowcol-sigma-selftest)
+# The Projection frame statistics (issue #283): over every pixel of the region,
+# computed on a worker when the region is big enough that the profile strides,
+# "computing..." until the answer for the SAME region lands. NOGL and
+# fixture-free for rowcol-sigma's reasons.
+viewer_selftest(projframe   NOGL --projframe-selftest)
 # The VALUES of the three shipped analyzers that had none (板 304 / inventory
 # §4.2). Same NOGL reasoning and the same dlls as selftest.bundled - which fixes
 # their keys and version - on fixtures whose answer is closed form instead.

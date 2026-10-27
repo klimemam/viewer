@@ -683,6 +683,11 @@ static std::vector<TExpSide> temporalExportSides() {
     if (!im) return out;
     recomputeTemporalIfNeeded(im, app.temporal[0]);
     recomputeProjectionIfNeeded(im, app.proj[0]);
+    // a FILE carries numbers, never "computing...": a large region's
+    // full-pixel frame statistics (issue #283) are finished here, on this
+    // thread, for the length of one pass - the export is the one reader that
+    // cannot come back for them a frame later
+    projFrameWait(im, app.proj[0]);
     {
         TExpSide A;
         A.letter = "A";
@@ -697,6 +702,7 @@ static std::vector<TExpSide> temporalExportSides() {
     if (Bim) {
         recomputeTemporalIfNeeded(Bim, app.temporal[1]);
         recomputeProjectionIfNeeded(Bim, app.proj[1]);
+        projFrameWait(Bim, app.proj[1]);
         TExpSide B;
         B.letter = "B";
         B.doc = Bim;
@@ -714,6 +720,7 @@ static std::vector<TExpSide> temporalExportSides() {
         if (rs.idx >= app.temporalExtra.size()) continue;
         recomputeTemporalIfNeeded(rs.doc, app.temporalExtra[rs.idx]);
         recomputeProjectionIfNeeded(rs.doc, app.projExtra[rs.idx]);
+        projFrameWait(rs.doc, app.projExtra[rs.idx]);
         TExpSide X;
         X.letter = slotName(rs.idx);
         X.doc = rs.doc;
@@ -930,7 +937,7 @@ static std::string buildTemporalExport(char delim) {
               "sigma_row [DN](ddof=1)", "sigma_col [DN](ddof=1)",
               "sigma_frame [%](ddof=0)", "sigma_row [%](ddof=1)",
               "sigma_col [%](ddof=1)",
-              "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]",
+              "pp_frame [DN]", "pp_row [DN]", "pp_col [DN]", "n_frame",
               "HFPN/RN [1](one-frame)", "VFPN/RN [1](one-frame)", "noise_status" });
     bool anyAllRow = false;
     for (const TExpSide& s : sides) {
@@ -951,15 +958,17 @@ static std::string buildTemporalExport(char delim) {
                       n9(f, f.mean), n9(f, f.sd), n9(vv, vv.sd), n9(hh, hh.sd),
                       n9(f, f.pct), n9(vv, vv.pct), n9(hh, hh.pct),
                       n9(f, f.pp), n9(vv, vv.pp), n9(hh, hh.pp),
+                      f.valid ? std::to_string(f.n) : std::string("-"),
                       projNoiseValue(P, i, true), projNoiseValue(P, i, false),
                       projNoiseStatus(P, i) });
         };
         for (int i = 0; i < P.nSeries; i++) prow(i);
         if (P.allRow) { prow(4); anyAllRow = true; }
     }
-    doc.comment("sigma_frame = the whole region's own sigma; sigma_row = sigma of "
-                "the row means (horizontal banding); sigma_col = sigma of the "
-                "column means (vertical striping); % is sigma / mean; pp is max - min");
+    doc.comment("sigma_frame = the whole region's own sigma, over every pixel; "
+                "sigma_row = sigma of the row means (horizontal banding); sigma_col = "
+                "sigma of the column means (vertical striping); % is sigma / mean; "
+                "pp is max - min; n_frame = the samples the frame columns are over");
     doc.comment("HFPN/RN=row/pixel; VFPN/RN=column/pixel. Full ROI mean-based spatial "
                 "estimates for a flat field, independent of plot reduce; not separated "
                 "fixed/temporal noise. H/V vendor names vary. noise_status reports refusals/clamps.");

@@ -584,6 +584,7 @@ static void pumpRemoteFetch() {
         }
         int stepBefore = im->src->remoteStep;
         FrameSource& S = *im->src;
+        projFrameFence(&S);          // the preview's buffer is replaced in place (#283)
         S.data = std::move(d.data);
         S.w = d.w; S.h = d.h; S.ch = d.ch;
         S.dtype = d.dtype;

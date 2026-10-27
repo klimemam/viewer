@@ -59,6 +59,9 @@ static std::string g_stackAvgSelftest;  // --stackavg-selftest <dir>: stack mean
 static std::string g_precisionSelftest; // --precision-selftest <dir>: the u32/i32/f64 values a
                                         // float32 cannot hold, and what is shown for them, exit
 static bool g_profileNoiseSelftest = false; // single-frame banding/pixel ratios
+static bool g_projFrameSelftest = false;   // --projframe-selftest: the Projection
+                                           // frame statistics are over every pixel,
+                                           // on a worker, keyed (issue #283)
 static bool g_rowColSigmaSelftest = false;  // --rowcol-sigma-selftest: the four
                                             // implementations of "sigma of the row /
                                             // column means", against each other
@@ -749,6 +752,9 @@ static void printUsage() {
         "                              AVI container, the refusals, and that a video\n"
         "                              frame IS the PNG export of that frame\n"
         "  --profile-noise-selftest    single-frame horizontal/vertical banding ratios\n"
+        "  --projframe-selftest        the Projection frame statistics: every pixel\n"
+        "                              of the region, on a worker above the sample\n"
+        "                              cap, never the previous region's number (#283)\n"
         "  --rowcol-sigma-selftest     the four implementations of 'sigma of the\n"
         "                              row / column means' on one analytic fixture:\n"
         "                              each against its own definition, and the\n"
@@ -1014,6 +1020,8 @@ static void parseCli(int argc, char** argv) {
             g_precisionSelftest = next();          // handled in main()
         } else if (a == "--profile-noise-selftest") {
             g_profileNoiseSelftest = true;
+        } else if (a == "--projframe-selftest") {
+            g_projFrameSelftest = true;            // handled in main()
         } else if (a == "--rowcol-sigma-selftest") {
             g_rowColSigmaSelftest = true;
         } else if (a == "--anavalue-selftest") {

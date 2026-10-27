@@ -108,11 +108,15 @@ plane の後ろに置き `all` と表記する — pooled は別測定であり5
 ない)。列は Projection の Copy table (TSV) と同語彙:
 
 ```text
-side  ch  mean [DN]  sigma_frame [DN](ddof=0)  sigma_row [DN](ddof=1)  sigma_col [DN](ddof=1)  sigma_frame [%](ddof=0)  sigma_row [%](ddof=1)  sigma_col [%](ddof=1)  pp_frame [DN]  pp_row [DN]  pp_col [DN]  HFPN/RN [1](one-frame)  VFPN/RN [1](one-frame)  noise_status
+side  ch  mean [DN]  sigma_frame [DN](ddof=0)  sigma_row [DN](ddof=1)  sigma_col [DN](ddof=1)  sigma_frame [%](ddof=0)  sigma_row [%](ddof=1)  sigma_col [%](ddof=1)  pp_frame [DN]  pp_row [DN]  pp_col [DN]  n_frame  HFPN/RN [1](one-frame)  VFPN/RN [1](one-frame)  noise_status
 ```
 
 - 値は `App::ProjState`(A/B/slot 毎)の `fStat/vStat/hStat` を**そのまま**読む。
   reduce モード(mean/max/min)はセクション見出しに明記。
+- `*_frame` の列は領域の**全画素**(plane 別)から取り、`n_frame` はその標本数
+  (有限画素数)。パネルではこの計算が大きい領域で裏に回り終わるまで `computing...`
+  を出すが、書き出しはその場で計算を終えてから書くので、ファイルに `computing...`
+  は入らない(#283)。
 - 末尾の2比は同じ状態の `noise` キャッシュを読む。`HFPN/RN=σ_row/σ_p`、
   `VFPN/RN=σ_col/σ_p` の無次元・1枚推定値
   ([flat-field-stats.md (a)](../analysis/flat-field-stats.md))。

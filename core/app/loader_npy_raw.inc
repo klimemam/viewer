@@ -775,6 +775,10 @@ static bool cropInPlace(ImageDoc& im, int x, int y, int w, int h,
     // thread under that lock, so a probe either adopts BEFORE this (then
     // use_count > 1 forces the clone) or looks up after and is refused
     // (srcShareable sees the crop) - it can never adopt pixels mid-crop.
+    // A Projection frame-statistics pass reading these pixels stops first
+    // (projFrameFence, issue #283): the in-place branch below replaces the
+    // buffer it reads.
+    projFrameFence(im.src.get());
     std::lock_guard<std::mutex> regLk(g_srcRegMtx);
     if (im.src.use_count() > 1) {
         im.src = cloneSource(*im.src);
