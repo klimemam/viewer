@@ -254,15 +254,8 @@ static HoverReadout hoverReadoutOf(const ImageDoc& im, const DisplayMap& M, floa
     r.screen = b;
     return r;
 }
-// The status bar's marker for the screen value. U+2192 RIGHTWARDS ARROW comes
-// only from the CJK face (cjkFontRanges() asks it for the glyph; ProggyClean,
-// the face used when no CJK font loaded, has no arrows), so without that face
-// the arrow would draw as '?' and the marker is the ASCII "->" instead
-// (issue #297 item 3). Chosen once, where the fonts are loaded.
-static const char* hoverScreenMarkFor(bool cjkFaceLoaded) {
-    return cjkFaceLoaded ? "\xe2\x86\x92" : "->";
-}
-static const char* g_hoverScreenMark = hoverScreenMarkFor(true);
+// The status bar's marker for the screen value: hoverScreenMarkFor and
+// g_hoverScreenMark, util.inc, set by fontAtlasBake from the baked atlas.
 // The status bar's hover part: "  |  A (12, 34) [Gr] = 1023  x 0.0156  →4" -
 // raw / 表示値 / 画面値, one group per number and every channel in each group,
 // every number from hoverReadoutOf. `budget` is how many bytes the status bar
@@ -1412,7 +1405,6 @@ int main(int argc, char** argv) {
             mergePath.clear();          // unreadable: one face, and say nothing
     }
     g_fontMergePath = mergePath;
-    g_hoverScreenMark = hoverScreenMarkFor(jp != nullptr);
     if (!jp) {
         ImFontConfig cfg; cfg.SizePixels = 13.0f * fontScale;
         io.Fonts->AddFontDefault(&cfg);

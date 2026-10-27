@@ -837,8 +837,8 @@ static void cjkFontRanges(ImFontAtlas* atlas, ImVector<ImWchar>& out) {
     b.AddChar((ImWchar)0x03C3);        // sigma
     b.AddChar((ImWchar)0x03BC);        // mu
     // U+2192 RIGHTWARDS ARROW: the status bar's marker for the hovered sample's
-    // screen value (hoverScreenMarkFor, main.cpp, which falls back to "->"
-    // when no CJK face loaded). The Arrows block is in neither CJK table.
+    // screen value (hoverScreenMarkFor, which falls back to "->" when the
+    // baked atlas lacks it). The Arrows block is in neither CJK table.
     b.AddChar((ImWchar)0x2192);
     b.BuildRanges(&out);
     g_cjkRangesAsked = out;      // see g_cjkRangesAsked for why this is kept
@@ -917,6 +917,25 @@ static std::string fontAtlasFromText(const FontAtlasCost& c, const FontChoice& c
     std::string s = ch.path + " [" + ch.how + "]";
     if (!mergePath.empty()) s += " + " + mergePath;
     return s;
+}
+
+// The status bar's marker for the hovered sample's screen value (issue #297
+// item 3). U+2192 RIGHTWARDS ARROW comes only from a CJK face - cjkFontRanges()
+// asks for it, and ProggyClean, the built-in font, has no arrows - so an atlas
+// without the glyph would draw it as '?' and the marker is the ASCII "->".
+// Decided from the BAKED atlas at the end of fontAtlasBake, every bake: a CJK
+// face that loaded but failed to build leaves the built-in font, and the
+// question is what is in the atlas, not what was asked for. "->" until the
+// first bake, since nothing is known to hold the arrow before it.
+static const char* hoverScreenMarkFor(bool atlasHasArrow) {
+    return atlasHasArrow ? "\xe2\x86\x92" : "->";
+}
+static const char* g_hoverScreenMark = hoverScreenMarkFor(false);
+// Does the default face of the built atlas hold U+2192? (The status bar draws
+// with the default face, which is where a merged second face lives too.)
+static bool fontAtlasHasArrow() {
+    ImFontAtlas* a = ImGui::GetIO().Fonts;
+    return a->Fonts.Size > 0 && a->Fonts[0]->FindGlyphNoFallback((ImWchar)0x2192) != nullptr;
 }
 
 // `fontLoadFailed` = the chosen file did not even LOAD (AddFontFromFileTTF
@@ -1000,6 +1019,7 @@ static void fontAtlasBake(const ImVector<ImWchar>& ranges, float fontScale,
     c.texW = a->TexWidth; c.texH = a->TexHeight;
     c.faces = a->ConfigData.Size;
     g_fontAtlasCost = c;
+    g_hoverScreenMark = hoverScreenMarkFor(fontAtlasHasArrow());
     // ...and WHICH FONT, on the same line (review P3-7). The merge has exactly
     // one silent failure mode - the wrong face first - and this is the only
     // place a log from a user's machine could ever show which files were in it.

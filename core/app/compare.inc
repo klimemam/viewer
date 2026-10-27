@@ -1087,8 +1087,11 @@ static DiffRGB diffRamp(float t, bool absMode) {
     auto q = [](float v) { return (uint8_t)(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
     return DiffRGB{ q(r), q(g), q(bl) };
 }
-// The colour bar's column i of barW: the t it stands for, then diffRamp.
-static DiffRGB diffBarColor(int i, float barW, bool absMode) {
+// The colour bar's column i of barW: the t it stands for, then diffRamp. The
+// mode is app.diffAbs, read here and in renderDiffRGBA - the same flag, not a
+// parameter each caller could pass differently.
+static DiffRGB diffBarColor(int i, float barW) {
+    const bool absMode = app.diffAbs;
     const float t = absMode ? (float)i / barW : (float)i / barW * 2.0f - 1.0f;
     return diffRamp(t, absMode);
 }
@@ -1096,7 +1099,8 @@ static DiffRGB diffBarColor(int i, float barW, bool absMode) {
 // windowless test can read the bytes the texture gets. Returns how many pixels
 // fell off the scale.
 static size_t renderDiffRGBA(const ImageDoc& a, const ImageDoc& b, int w, int h, int ch,
-                             float gain, bool absMode, std::vector<uint8_t>& rgba) {
+                             float gain, std::vector<uint8_t>& rgba) {
+    const bool absMode = app.diffAbs;
     rgba.resize((size_t)w * h * 4);
     const float inv = 1.0f / std::max(gain, 1e-20f);
     size_t clipped = 0;
@@ -1173,7 +1177,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
 
     double t0 = nowSec();
     static std::vector<uint8_t> rgba;
-    const size_t clipped = renderDiffRGBA(a, b, w, h, ch, gain, app.diffAbs, rgba);
+    const size_t clipped = renderDiffRGBA(a, b, w, h, ch, gain, rgba);
     if (!D.tex) glGenTextures(1, &D.tex);
     glBindTexture(GL_TEXTURE_2D, D.tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -1636,16 +1640,25 @@ static const float* displayGammaTable(float gamma) {
 static DisplayMap displayMapOf(const ImageDoc& im) {
     DisplayMap M;
     M.black = effBlack(im);
-    // The width in DOUBLE (issue #297 item 10): black -3e38 / white 3e38 is a
-    // legal range whose float width is +inf, and inv = 1/inf = 0 turned
-    // xOf(+inf) into inf * 0 = NaN, i.e. screen 0 instead of 255. In double the
-    // width is finite and 1/width is a small but non-zero float. An end that
-    // is itself non-finite gives a non-finite width even in double; that is
-    // held at the widest finite range two floats can span, 2 * FLT_MAX, so
-    // inv stays non-zero there too.
-    double width = (double)effWhite(im) - (double)M.black;
-    if (!std::isfinite(width)) width = 2.0 * (double)FLT_MAX;
-    M.inv = (float)(1.0 / std::max(width, 1e-20));
+    // A range too wide for a float (issue #297 item 10): black -3e38 / white
+    // 3e38 is legal, its float width is +inf, and inv = 1/inf = 0 turned
+    // xOf(+inf) into inf * 0 = NaN, i.e. screen 0 instead of 255. ONLY that
+    // case leaves the float expression: for a finite float width inv is
+    // exactly what it always was, because the double 1/width differs from it
+    // by an ulp whenever the float subtraction is inexact, and an ulp of inv
+    // moves bytes at rounding edges (black 0.1 / white 0.9, v 0.107843138:
+    // 3 -> 2; --hover-selftest T12 pins both). A non-finite float width is
+    // taken in double, where two finite ends always give a finite width; an
+    // end that is itself non-finite is held at 2 * FLT_MAX, the widest finite
+    // range two floats can span, so inv is never 0.
+    const float wf = effWhite(im) - M.black;
+    if (std::isfinite(wf)) {
+        M.inv = 1.0f / std::max(wf, 1e-20f);
+    } else {
+        double width = (double)effWhite(im) - (double)M.black;
+        if (!std::isfinite(width)) width = 2.0 * (double)FLT_MAX;
+        M.inv = (float)(1.0 / width);
+    }
     // Custom values remain Custom even when close to 1.0. Only the exact
     // linear preset bypasses gamma; otherwise a value such as 1.0005 must
     // affect the view as entered.

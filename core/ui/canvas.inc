@@ -1216,7 +1216,7 @@ static void drawCanvas(ImVec2 avail) {
                                       ImVec2(bx + barW + 6 * s, by + barH + ImGui::GetFontSize() + 8 * s),
                                       IM_COL32(0, 0, 0, 180), 3.0f * s);
                     for (int i = 0; i < (int)barW; i++) {   // diffRamp, as the pixels
-                        const DiffRGB c = diffBarColor(i, barW, app.diffAbs);
+                        const DiffRGB c = diffBarColor(i, barW);
                         dl->AddLine(ImVec2(bx + i, by), ImVec2(bx + i, by + barH),
                                     IM_COL32(c.r, c.g, c.b, 255));
                     }

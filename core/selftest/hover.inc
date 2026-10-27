@@ -167,8 +167,24 @@ static int hoverSelftest() {
 
     // ---- T9: the screen-value mark without a CJK face (issue #297 item 3) ----
     // ProggyClean has no U+2192, so the status bar would show "?64".
-    checkEq(hoverScreenMarkFor(false), "->", "T9 no CJK face loaded: the screen mark is ASCII '->'");
-    checkEq(hoverScreenMarkFor(true), "\xe2\x86\x92", "T9 CJK face loaded: the screen mark is U+2192");
+    checkEq(hoverScreenMarkFor(false), "->", "T9 atlas without U+2192: the screen mark is ASCII '->'");
+    checkEq(hoverScreenMarkFor(true), "\xe2\x86\x92", "T9 atlas with U+2192: the screen mark is U+2192");
+    // ...and the WIRING: start-up baked this run's atlas (headless too - the
+    // font load does not depend on the window), and the mark in use has to be
+    // the one that atlas calls for. The glyph is looked up here directly, not
+    // through fontAtlasHasArrow, so a bake that forgot to set the mark, or set
+    // it from anything but the atlas, disagrees with it. On a machine whose
+    // atlas has the arrow this also tells "set" from "left at the '->'
+    // default"; on one without, both read "->" and only the inverted wiring
+    // goes red.
+    {
+        ImFontAtlas* fa = ImGui::GetIO().Fonts;
+        const bool has = fa->Fonts.Size > 0 &&
+                         fa->Fonts[0]->FindGlyphNoFallback((ImWchar)0x2192) != nullptr;
+        fprintf(stderr, "hoverselftest: (this run's atlas %s U+2192)\n", has ? "has" : "lacks");
+        checkEq(g_hoverScreenMark, has ? "\xe2\x86\x92" : "->",
+                "T9 the mark in use is the one the baked atlas calls for");
+    }
 
     closeAll();
     app.compareMode = App::CmpOff;
@@ -507,35 +523,78 @@ static int hoverSelftest() {
         app.dispGamma = 1.0f;
         d->texDirty = true;
 
-        // ---- T12: a range too wide for a float (issue #297 item 10) -------
+        // ---- T12: ranges too wide for a float (issue #297 item 10) -------
         // black -3e38 / white 3e38: the float width is +inf, and inv = 1/inf
         // = 0 made x of +inf inf * 0 = NaN, i.e. screen 0. displayMapOf takes
-        // the width in double, so inv is a small non-zero float and +inf is
+        // that width in double, so inv is a small non-zero float and +inf is
         // the clamp end 255 again; NaN stays 0 and -inf 0.
-        setRange(*d, -3e38f, 3e38f);
-        check(std::isfinite(displayMapOf(*d).inv) && displayMapOf(*d).inv > 0,
-              "T12 wide range: inv is finite and non-zero");
-        std::vector<uint8_t> pxw;
-        renderDocRGBA(*d, pxw);
-        const char* NAMEW[3] = { "NaN", "+inf", "-inf" };
-        const int BYTEW[3] = { 0, 255, 0 };
-        for (int x = 0; x < 3; x++) {
-            hoverAt(*d, x, 0, rows, status);
+        // black -3e38 / white +inf: the width is non-finite in double too, and
+        // is held at 2 * FLT_MAX - without that, inv is 0 again and +inf reads
+        // 0. Both ranges, the same three samples, the same three answers.
+        struct Wide { float black, white; const char* name; };
+        const Wide WIDE[2] = { { -3e38f, 3e38f, "-3e38..3e38" },
+                               { -3e38f, std::numeric_limits<float>::infinity(), "-3e38..+inf" } };
+        for (const Wide& wr : WIDE) {
+            setRange(*d, wr.black, wr.white);
             char what[128];
-            const std::array<int, 4> b = rgbaAt(pxw, *d, x, 0);
-            snprintf(what, sizeof what, "T12 wide range x=%d (%s): texture byte is %d", x, NAMEW[x], BYTEW[x]);
-            check(b[0] == BYTEW[x] && b[1] == BYTEW[x] && b[2] == BYTEW[x], what);
-            snprintf(what, sizeof what, "T12 wide range x=%d (%s): Inspector and status bar say %d", x, NAMEW[x], BYTEW[x]);
-            check(rows.size() == 1 && rows[0].screen == std::to_string(BYTEW[x]) &&
-                  parseStatus(status).screens == rows[0].screen, what);
+            snprintf(what, sizeof what, "T12 range %s: inv is finite and non-zero", wr.name);
+            check(std::isfinite(displayMapOf(*d).inv) && displayMapOf(*d).inv > 0, what);
+            std::vector<uint8_t> pxw;
+            renderDocRGBA(*d, pxw);
+            const char* NAMEW[3] = { "NaN", "+inf", "-inf" };
+            const int BYTEW[3] = { 0, 255, 0 };
+            for (int x = 0; x < 3; x++) {
+                hoverAt(*d, x, 0, rows, status);
+                const std::array<int, 4> b = rgbaAt(pxw, *d, x, 0);
+                snprintf(what, sizeof what, "T12 range %s x=%d (%s): texture byte is %d",
+                         wr.name, x, NAMEW[x], BYTEW[x]);
+                check(b[0] == BYTEW[x] && b[1] == BYTEW[x] && b[2] == BYTEW[x], what);
+                snprintf(what, sizeof what, "T12 range %s x=%d (%s): Inspector and status bar say %d",
+                         wr.name, x, NAMEW[x], BYTEW[x]);
+                check(rows.size() == 1 && rows[0].screen == std::to_string(BYTEW[x]) &&
+                      parseStatus(status).screens == rows[0].screen, what);
+            }
+        }
+    }
+
+    // ======================================================================
+    // T15: ORDINARY float ranges keep main's bytes bit for bit (PR #303
+    // review P2). The wide-range fix must not touch a finite float width: a
+    // double 1/width differs from the float 1.0f/width by an ulp whenever the
+    // float subtraction is inexact, and that ulp moves bytes at rounding
+    // edges. Two such edges, checked against a float32 emulation of both
+    // expressions (float inv / double inv):
+    //   black 0.1, white 0.9, v 0.107843138      ->  3  (double inv: 2)
+    //   black 4/255, white 14/255, v 5/255        -> 26  (double inv: 25)
+    // ======================================================================
+    {
+        ImageDoc* d = install(mk("hover_ord", 1, 1, 1, "f32"));
+        struct Ord { float black, white, v; int byte; const char* name; };
+        const Ord ORD[2] = { { 0.1f, 0.9f, 0.107843138f, 3, "0.1..0.9 v=0.107843138" },
+                             { 4.0f / 255.0f, 14.0f / 255.0f, 5.0f / 255.0f, 26, "4/255..14/255 v=5/255" } };
+        std::vector<Row> rows;
+        std::string status;
+        for (const Ord& o : ORD) {
+            d->px()[0] = o.v;
+            setRange(*d, o.black, o.white);
+            std::vector<uint8_t> px;
+            renderDocRGBA(*d, px);
+            hoverAt(*d, 0, 0, rows, status);
+            char what[128];
+            snprintf(what, sizeof what, "T15 ordinary range %s: texture byte is %d", o.name, o.byte);
+            check(rgbaAt(px, *d, 0, 0)[0] == o.byte, what);
+            snprintf(what, sizeof what, "T15 ordinary range %s: Inspector screen is %d", o.name, o.byte);
+            check(rows.size() == 1 && rows[0].screen == std::to_string(o.byte), what);
         }
     }
 
     // ======================================================================
     // Fixture E: the difference view's ramp (issue #297 item 9). A and B are
     // f32 3 x 1 with A-B = +5, -5, +5 at gain 10, so t = +0.5, -0.5 and (abs
-    // mode) 0.5. The texture's bytes come from renderDiffRGBA - ensureDiffTexture
-    // is that plus glTexImage2D - and the colour bar's from diffBarColor at
+    // mode) 0.5. Both sides read the mode from app.diffAbs, which the test sets
+    // (and puts back). The texture's bytes come from renderDiffRGBA -
+    // ensureDiffTexture is that plus glTexImage2D - and the colour bar's from
+    // diffBarColor at
     // the column that stands for the same t: barW 180, so column 135 is
     // 135/180*2-1 = +0.5, column 45 is -0.5 and, in abs mode, column 90 is
     // 0.5 - all exact in float. Hand-derived: +0.5 -> (128, 45, 13),
@@ -547,9 +606,12 @@ static int hoverSelftest() {
         A->px()[0] = 15; B->px()[0] = 10;
         A->px()[1] = 10; B->px()[1] = 15;
         A->px()[2] = 15; B->px()[2] = 10;
+        const bool abs0 = app.diffAbs;
         std::vector<uint8_t> sgn, ab;
-        renderDiffRGBA(*A, *B, 3, 1, 1, 10.0f, false, sgn);
-        renderDiffRGBA(*A, *B, 3, 1, 1, 10.0f, true, ab);
+        app.diffAbs = false;
+        renderDiffRGBA(*A, *B, 3, 1, 1, 10.0f, sgn);
+        app.diffAbs = true;
+        renderDiffRGBA(*A, *B, 3, 1, 1, 10.0f, ab);
         struct Case { const char* what; const std::vector<uint8_t>* px; int x, col; bool absMode; int r, g, b; };
         const Case cases[3] = {
             { "t=+0.5", &sgn, 0, 135, false, 128, 45, 13 },
@@ -559,7 +621,8 @@ static int hoverSelftest() {
         for (const Case& k : cases) {
             const size_t o = (size_t)k.x * 4;
             const int tr = (*k.px)[o], tg = (*k.px)[o + 1], tb = (*k.px)[o + 2];
-            const DiffRGB bar = diffBarColor(k.col, 180.0f, k.absMode);
+            app.diffAbs = k.absMode;
+            const DiffRGB bar = diffBarColor(k.col, 180.0f);
             char what[128];
             snprintf(what, sizeof what, "T13 diff %s: texture is (%d, %d, %d)", k.what, k.r, k.g, k.b);
             check(tr == k.r && tg == k.g && tb == k.b, what);
@@ -567,6 +630,7 @@ static int hoverSelftest() {
                      k.what, bar.r, bar.g, bar.b, tr, tg, tb);
             check(bar.r == tr && bar.g == tg && bar.b == tb, what);
         }
+        app.diffAbs = abs0;
     }
 
     // ======================================================================
@@ -596,6 +660,19 @@ static int hoverSelftest() {
                      x, CFA_CH_NAMES[c], wr, wg, wb);
             check(b[0] == wr && b[1] == wg && b[2] == wb, what);
         }
+        // ...and colorize is a 1-channel thing: a 3-channel document with the
+        // same CFA flags is plain RGB, each channel its own byte (0 / 128 /
+        // 255 for 100 / 611.5 / 1500), not the first sample tinted.
+        ImageDoc* d3 = install(mk("hover_cfa3", 1, 1, 3, "f32"));
+        d3->px()[0] = 100; d3->px()[1] = 611.5f; d3->px()[2] = 1500;
+        d3->cfa = 1; d3->cfaPattern = 0; d3->cfaColorize = true;
+        setRange(*d3, 100, 1123);
+        check(!displayMapOf(*d3).cfaColor, "T14 CFA flags on a 3ch document: cfaColor is false");
+        std::vector<uint8_t> px3;
+        renderDocRGBA(*d3, px3);
+        const std::array<int, 4> b3 = rgbaAt(px3, *d3, 0, 0);
+        check(b3[0] == 0 && b3[1] == 128 && b3[2] == 255,
+              "T14 CFA flags on a 3ch document: texture is plain RGB (0, 128, 255)");
     }
 
     // ---- leave the shared home as it was found -------------------------------

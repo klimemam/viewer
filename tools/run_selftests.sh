@@ -546,7 +546,8 @@ echo "== OpenGL probe =="
 # window and an OpenGL context, so on a machine that has none they die inside
 # glfwCreateWindow - and nothing in the output said so. They read as that many
 # broken asserts, which is how the matrix stayed red with no way to see why
-# (back when startup made a window for all 22 of them, not just these five).
+# (back when startup made a window for every selftest, not just the ones that
+# draw).
 # The question is asked once, up front, and answered in GLFW's own words.
 #
 # It is a question about the MACHINE, not about its OS name. Where a context
@@ -564,8 +565,9 @@ have_gl=1
 # was written and was never implemented, so the switch a developer would use to
 # check what Windows and macOS actually run did nothing at all - which is a
 # small version of the very thing it exists to catch. Three lines, here, so that
-# "29 ran, 5 skipped on the runners with no context" is something a developer
-# can MEASURE on a box that has one, instead of waiting for CI to say it.
+# what runs and what is skipped on the runners with no context is something a
+# developer can MEASURE on a box that has one, instead of waiting for CI to say
+# it.
 if [ -n "${VIEWER_FORCE_NO_GL:-}" ] && [ "${VIEWER_FORCE_NO_GL}" != "0" ]; then
     have_gl=0
     gl_reason="VIEWER_FORCE_NO_GL is set (the machine may well have one)"

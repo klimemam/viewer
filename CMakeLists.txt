@@ -1196,8 +1196,9 @@ home,dbl,waitdir:stopset,chkdir:stopset")
 # openFolder(). That branch is a convenience and a HOLE: g_scriptedRun is true
 # for every selftest, so every selftest walks the folder on the UI thread and
 # the worker handoff - scan finishes, "Scanning folder" modal closes, picker
-# opens, Load queues the stacks - had no test at all. Issue #244 ("remote stacks stopped loading") could not be confirmed or
-# refuted against this suite for exactly that reason.
+# opens, Load queues the stacks - had no test at all. Issue #244 ("remote
+# stacks stopped loading") could not be confirmed or refuted against this
+# suite for exactly that reason.
 #
 # --async-scan takes the branch back for this one run; `waitpick` is the wait a
 # person performs and its timeout is a FAILURE, so "the picker never appeared"
