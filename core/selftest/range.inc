@@ -972,19 +972,33 @@
 
         // ==================================================================
         // #293 - the LOAD-TIME default for integer types, held as numbers.
-        // The user ruled (2026-10-27, option A) that a signed type defaults
-        // to 0..its positive maximum: negative pixels are black until Auto
-        // (min-max or %) or a hand-typed black. Until here only the 0..1
-        // magnet had a test (P5), so i16 could have moved to -32768.. or to
-        // vmin.. and the suite would have stayed green. In-memory fixtures;
-        // defaultRange reads nothing but the doc, so no mode is borrowed.
+        // The user ruled (2026-10-27, option A) that i8 and i16 default to
+        // 0..the type's positive maximum: negative pixels are black until
+        // Auto (min-max or %) or a hand-typed black. Until here, in THIS
+        // file, only the 0..1 magnet had a test (P5); media.inc M2 / M11 pin
+        // u16 through a real file. i16 and i8 had none anywhere, so i16
+        // could have moved to -32768.. or to vmin.. and the suite would have
+        // stayed green. i32 has no branch at all and falls to the float
+        // rules; one row here pins that i32 data outside [0,1] opens at its
+        // own min..max (a type-fullscale branch would turn it red). The
+        // 0..1-magnet half of that rule is not tested for i32.
+        // In-memory fixtures; defaultRange reads nothing but the doc, so no
+        // mode is borrowed.
         // ==================================================================
-        {   // ---- P16: u8 / i8 / u16 / i16 defaults, and the float asymmetry
-            // One ramp per dtype. The data is chosen so that a default that
-            // fell through to either FLOAT branch would print a different
-            // pair: the ramps hold negatives or exceed 1.2 (so the 0..1 magnet
-            // cannot answer) and never end on the type's ceiling (so vmin..vmax
-            // cannot answer either). dtype is a mirror of src, hence the sync.
+        {   // ---- P16: u8 / i8 / u16 / i16 defaults, the i32 fall-through,
+            //      and the float asymmetry
+            // One ramp per dtype. For the types that HAVE a branch the data is
+            // chosen so that a default that fell through to either FLOAT
+            // branch would print a different pair: every ramp but the last
+            // holds negatives or exceeds 1.2 (so the 0..1 magnet cannot
+            // answer) and never ends on the type's ceiling (so vmin..vmax
+            // cannot answer either); the last sits inside the magnet on
+            // purpose, so a float reading would answer 0..1, which is still
+            // not 0..32767. The i32 row is the one exception: it has no
+            // branch and pins that i32 data outside [0,1] opens at its own
+            // min..max; a type-fullscale branch would turn it red (a branch
+            // that also answered vmin..vmax would not, and need not).
+            // dtype is a mirror of src, hence the sync.
             auto mkTyped = [&](const char* nm, const char* dt, float lo, float hi) {
                 auto d = mkRamp(nm, lo, hi, 0, 0.0f);
                 d->src->dtype = dt;
@@ -998,6 +1012,7 @@
                 { "u16",     0.0f, 4000.0f, 0.0f, 65535.0f, "type fullscale" },
                 { "i16",     0.0f, 1000.0f, 0.0f, 32767.0f, "0..positive max" },
                 { "i16",  -1000.0f, 1000.0f, 0.0f, 32767.0f, "negatives present: black STAYS 0 (the ruling)" },
+                { "i32",  -1000.0f, 1000.0f, -1000.0f, 1000.0f, "no i32 branch: the float rules, so vmin..vmax and the negatives show (not 0..2^31-1)" },
                 { "i16",     0.3f,    0.6f, 0.0f, 32767.0f, "dtype decides, not the data (a float here reads 0..1)" },
             };
             for (const Case& c : cases) {
@@ -1011,8 +1026,10 @@
                 if (!ok) bad++;
             }
             // The float side of the asymmetry, with the SAME negative data as
-            // the fifth row: it lands in vmin..vmax and is visible at once.
-            // Pinned so the int16-vs-float difference reads as intended.
+            // the i16 row that holds negatives: it lands in vmin..vmax and is
+            // visible at once. Pinned so the int16-vs-float difference reads
+            // as intended (the i32 row answers the same way, by having no
+            // branch).
             auto f = mkTyped("def_f32neg", "f32", -1000.0f, 1000.0f);
             defaultRange(*f);
             bool fneg = f->black == f->vmin && f->white == f->vmax && f->black < 0.0f;
@@ -1021,7 +1038,7 @@
                     f->vmin, f->vmax, f->black, f->white, fneg ? "ok" : "WRONG");
             if (!fneg) bad++;
             // ...and the 0..1 magnet is still the float rule near [0,1]: the
-            // same data the sixth row gave i16, answered as a float.
+            // same data the last row of the table gave i16, answered as a float.
             auto g = mkTyped("def_f32unit", "f32", 0.3f, 0.6f);
             defaultRange(*g);
             bool magnet = g->black == 0.0f && g->white == 1.0f;
