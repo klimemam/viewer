@@ -152,6 +152,11 @@ static bool g_abEqSelftest = false;
 // histHlSelftest().
 static bool g_histHlSelftest = false;
 
+// --hover-selftest: the hovered sample's three numbers (#292) - raw, 表示値 x,
+// 画面値 - on the Inspector's Pixel table, the status bar and the texture, from
+// ONE function. No window for the --histhl-selftest reasons. See hoverSelftest().
+static bool g_hoverSelftest = false;
+
 // --framesize-selftest: stepping frames inside one stack never changes the
 // picture's size on screen (#250) - app.view is shared by the whole stack while
 // its frames can sit at two resolution levels at once. Takes no directory and
@@ -729,6 +734,9 @@ static void printUsage() {
         "                              coinciding, through the real panel\n"
         "  --histhl-selftest           the value highlight (#68): the drag -> interval\n"
         "                              mapping, the paint, the count, the sentences\n"
+        "  --hover-selftest            the hovered sample's three numbers (#292): raw,\n"
+        "                              x and screen byte agree across Inspector, status\n"
+        "                              bar and texture\n"
         "  --framesize-selftest        frame stepping inside a stack keeps the picture\n"
         "                              the size it had on screen (#250)\n"
         "  --uiscale-selftest          how big to draw the UI (#257): logical vs\n"
@@ -939,6 +947,8 @@ static void parseCli(int argc, char** argv) {
             g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--histhl-selftest") {
             g_histHlSelftest = true;               // handled in main()
+        } else if (a == "--hover-selftest") {
+            g_hoverSelftest = true;                // handled in main()
         } else if (a == "--framesize-selftest") {
             g_frameSizeSelftest = true;            // handled in main()
         } else if (a == "--uiscale-selftest") {
