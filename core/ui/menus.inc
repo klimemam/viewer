@@ -391,16 +391,27 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
                 app.compareFollowFrame = !app.compareFollowFrame;
             {   // the display range relationship, where the compare modes live
-                static const char* RN[3] = { "  each side keeps its own range",
+                static const char* RN[4] = { "  each side keeps its own range",
                                              "  every side uses A's range",
-                                             "  auto over every side (union)" };
+                                             "  auto over every side (union)",
+                                             "  each side fits itself" };
                 ImGui::TextDisabled("Display range");
-                for (int r = 0; r < 3; r++)
+                for (int r = 0; r < 4; r++)
                     if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
                         app.compareRangeMode = r;
                         if (ImageDoc* bb = cmpB()) bb->texDirty = true;
                         if (cur()) cur()->texDirty = true;
                     }
+                // ...and, under the mode that asks it, WHICH fit (#301): the
+                // same three the Inspector's radio row offers, through the same
+                // setter.
+                if (app.compareRangeMode == 3) {
+                    static const char* FIT[3] = { "      fit: min-max", "      fit: 0.1-99.9%",
+                                                  "      fit: median" };
+                    for (int f = AF_MinMax; f <= AF_Median; f++)
+                        if (ImGui::MenuItem(FIT[f], nullptr, app.autoFlavor == f))
+                            setEachSideFlavor(f);
+                }
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Two images stretched differently cannot be compared -\n"

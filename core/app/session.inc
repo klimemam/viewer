@@ -3468,7 +3468,10 @@ static std::string loadSession(const std::string& path,
             if (std::isfinite(bv))                   app.medBlackValue = bv;
         }
         else if (key == "cmpfollow") { int on = 1; ls >> on; app.compareFollowFrame = on != 0; }
-        else if (key == "cmprange") { ls >> app.compareRangeMode; }
+        // 0..3 (3 = each side fits itself, #301). A value this build does not
+        // know keeps the current mode rather than landing on an unnamed one.
+        else if (key == "cmprange") { int m = -1; ls >> m;
+                                      if (m >= 0 && m <= 3) app.compareRangeMode = m; }
         else if (key == "cmpslot")  { int fi = -1; ls >> fi;
                                       std::string pth; std::getline(ls, pth);
                                       if (!pth.empty() && pth[0] == ' ') pth.erase(0, 1);

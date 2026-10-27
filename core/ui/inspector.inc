@@ -488,12 +488,16 @@ static void drawInspector() {
                 // compared pane), so at three slots the labels lied about
                 // arity - issue #60 named this one by name. "every side" is
                 // the noun the panels already use, and it is true at two.
-                static const char* AB_RANGE_ITEMS[3] = {
+                // The fourth (#301) is the third's sibling: still Auto, but
+                // each side's own instead of one shared across them. WHICH
+                // fit is chosen right under it (the radio row below).
+                static const char* AB_RANGE_ITEMS[4] = {
                     "A/B: each keeps its own", "A/B: every side uses A's range",
-                    "A/B: auto over every side (union)" };
+                    "A/B: auto over every side (union)",
+                    "A/B: each side fits itself" };
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::Combo("##abrange", &app.compareRangeMode,
-                                 AB_RANGE_ITEMS, 3)) {
+                                 AB_RANGE_ITEMS, 4)) {
                     b->texDirty = true; im->texDirty = true;
                 }
                 if (ImGui::IsItemHovered())
@@ -509,16 +513,47 @@ static void drawInspector() {
                         "  every side uses A's range: one range, A's, for every other\n"
                         "    letter, and it does not move while you step A. Right when\n"
                         "    the others really are measured against A.\n"
+                        "  each side fits itself: every side at ITS OWN fit - min-max,\n"
+                        "    0.1-99.9%% or median, picked on the 'fit' row under this\n"
+                        "    (the same choice as Auto per frame's) - re-fitted as each\n"
+                        "    side steps. For looking at each picture well; the sides\n"
+                        "    are not on one scale, and it says so.\n"
                         "  each keeps its own: comparing SHAPES at wildly different\n"
                         "    exposures - the one case where the sides are not directly\n"
                         "    comparable, and it says so.");
-                if (app.compareRangeMode == 0 &&
-                    (b->black != im->black || b->white != im->white)) {
-                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "display range differs");
-                    ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(im->black, im->dtype).c_str(),
-                                        fmtVal(im->white, im->dtype).c_str(),
-                                        fmtVal(b->black, b->dtype).c_str(),
-                                        fmtVal(b->white, b->dtype).c_str());
+                if (app.compareRangeMode == 3) {
+                    // The mode's own question, asked where the mode is chosen.
+                    // Under Per stack (the default) this is the ONLY control of
+                    // the flavour, so it cannot live in the Range section.
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("fit:");
+                    static const char* FIT_ITEMS[3] = { "min-max##abfit", "0.1-99.9%##abfit",
+                                                        "median##abfit" };
+                    for (int f = AF_MinMax; f <= AF_Median; f++) {
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton(FIT_ITEMS[f], app.autoFlavor == f))
+                            setEachSideFlavor(f);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("The fit every side is drawn at. The same choice as\n"
+                                              "Auto per frame's: median uses the target and black\n"
+                                              "point under the Range buttons.");
+                    }
+                }
+                // The numbers IN FORCE (effBlack/effWhite): in mode 0 they are
+                // each doc's own, in mode 3 each side's fit - the two modes in
+                // which the sides can be on different scales.
+                const float ab0 = effBlack(*im), aw0 = effWhite(*im);
+                const float bb0 = effBlack(*b),  bw0 = effWhite(*b);
+                if ((app.compareRangeMode == 0 || app.compareRangeMode == 3) &&
+                    (bb0 != ab0 || bw0 != aw0)) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
+                                       app.compareRangeMode == 3
+                                           ? "display range differs - each side is fitted to itself"
+                                           : "display range differs");
+                    ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(ab0, im->dtype).c_str(),
+                                        fmtVal(aw0, im->dtype).c_str(),
+                                        fmtVal(bb0, b->dtype).c_str(),
+                                        fmtVal(bw0, b->dtype).c_str());
                 }
             }
             if (b->dtype != im->dtype)
