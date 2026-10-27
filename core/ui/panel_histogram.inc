@@ -785,8 +785,9 @@ static void drawPanelHistogram() {
 
 // ---- the frame statistics: EVERY pixel of the region (issue #283) -----------
 // fStat used to be gathered inside the H pass below, which visits every column
-// of every step-th ROW. Below the sample cap that is every pixel; above it - a
-// 4096x3000 frame, step 6 - it was one row in six, while the panel said "the
+// of every step-th ROW. While step == cell that is every pixel; once the H
+// pass strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) - a 4096x3000
+// frame is step 6 - it was one row in six, while the panel said "the
 // whole region". The p-p of a subset can only be smaller than the region's,
 // and a row-periodic pattern aliases with the stride, so sigma (frame) and
 // p-p frame were biased exactly where FPN work looks. They are a pass of their
@@ -954,7 +955,19 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
         P.allReq == app.projAllRow &&
         P.rx == rx && P.ry == ry && P.rw == rw && P.rh == rh)
         return;
-    if (app.annBusy && P.uid == im->uid) return;   // mid-drag: keep the last profile
+    if (app.annBusy && P.uid == im->uid) {         // mid-drag: keep the last profile
+        // ...but NOT the last frame statistics. The curves lag the rectangle
+        // visibly; a number in a table does not, and the frame cells would be
+        // the previous region's numbers under the region being drawn - the
+        // one thing #283's ruling says they never are. Comparing the key costs
+        // nothing; the pass itself waits for the drag to end, like the profile.
+        if (fWant != P.fKey && !P.fPending) {
+            P.fJob.reset();
+            for (int s = 0; s < 5; s++) P.fStat[s] = {};
+            P.fPending = true;
+        }
+        return;
+    }
     P.img = im; P.uid = im->uid; P.dataRev = im->dataRev;
     P.mode = app.projMode; P.cfa = im->cfa; P.cfaPattern = im->cfaPattern;
     P.allReq = app.projAllRow;     // the ASK, keyed on above; allRow is the answer
@@ -1072,7 +1085,8 @@ static void recomputeProjectionIfNeeded(ImageDoc* im, App::ProjState& P) {
     // the region mean and the mean of the column means are ONE NUMBER,
     // computed twice; they are asserted equal to within one float ulp
     // (--precision-selftest P7c), and were 0.015 DN apart while the column
-    // sum was a float. Above the cap the H profile is over every step-th row
+    // sum was a float. Once the H pass strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx)
+    // the H profile is over every step-th row
     // and the region is over all of them, so the two means are different
     // measurements - which is what the per-axis table's "mean (axis)" says.
     bool useMax = app.projMode == 1, useMin = app.projMode == 2;

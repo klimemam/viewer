@@ -1854,9 +1854,10 @@ static void drawPanelProjection() {
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
             // ONE mean, not three - and the one printed is the REGION's,
             // over every pixel of it (issue #283). Where the H pass also
-            // covers every pixel (below the sample cap) the mean of the column
+            // covers every pixel (step == cell) the mean of the column
             // means is the same number twice, and --precision-selftest P7c
-            // holds them to it; above the cap the column and row means are
+            // holds them to it; once it strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx)
+            // the column and row means are
             // each over a stride of the region and differ from it - the V pass
             // by ~0.04 DN on a 4000x3000 frame. Which is why this table prints
             // fStat and not an axis: it says "the region", and every row of it
@@ -1967,8 +1968,9 @@ static void drawPanelProjection() {
         // The two are different measurements over different sample sets, and
         // saying so is the whole fix (issue #145). The region moments are
         // over every pixel (issue #283). The H pass visits every column of
-        // every step-th ROW, so below the sample cap its mean IS the region
-        // mean (--precision-selftest P7c asserts it) and above the cap it is
+        // every step-th ROW, so while step == cell its mean IS the region
+        // mean (--precision-selftest P7c asserts it) and once it strides
+        // (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) it is
         // a stride of it (P7e). The V pass visits every row of every step-th
         // COLUMN - different pixels again - and measured on a 4000x3000 frame
         // at ~3000 DN the two axis means differ by 12 ppm. That is

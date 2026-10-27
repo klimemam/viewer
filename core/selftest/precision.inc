@@ -276,12 +276,13 @@ if (!g_precisionSelftest.empty()) {
     //                panel_histogram.inc accumulates in `double fSum[5]`;
     //   per-axis     "mean" = P.hStat[].mean, the mean of the COLUMN means,
     //   table        and every column sum was accumulated in a float.
-    // Below the sample cap the H pass visits every pixel and the region
+    // While step == cell the H pass visits every pixel and the region
     // moments are over every pixel (issue #283), so over a rectangle every
     // column carries the same sample count and the two are the same number in
     // arithmetic. Whatever separates them is the accumulator - and which of
     // the two you are shown is decided by how wide the panel is. (Above the
-    // cap they are different sample sets on purpose: P7e.)
+    // cap - step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx - they are
+    // different sample sets on purpose: P7e.)
     //
     // The fixture is arithmetic rather than a measurement, on the P1 rule:
     // every pixel is 3000.4f (= 3000.39990234375, exactly), so every column
@@ -367,7 +368,8 @@ if (!g_precisionSelftest.empty()) {
     check(PN.fStat[0].valid && PN.hStat[0].valid &&
           fabs(PN.hStat[0].mean - PN.fStat[0].mean) <= ulpBound(PN.fStat[0].mean),
           "P7d and the same bound holds over a noisy frame");
-    // Above the cap neither profile is part of this: the H pass visits every
+    // Once the H pass strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) neither
+    // profile is part of this: the H pass visits every
     // step-th ROW and the V pass every step-th COLUMN, and the region moments
     // are over every pixel (issue #283), so each axis mean legitimately
     // differs from the region's (the V one by 0.037 DN on a 4000x3000 frame,

@@ -21,6 +21,19 @@
 //       place (no copy forced by the stopped job), the answer is the crop's
 //   F7  a recompute that does not move the key (reduce mode) keeps the pass
 //   F8  the worker door on the mosaic: every plane == direct
+//   F9  an ROI being DRAGGED (app.annBusy): the profile waits for the drag, the
+//       frame cells go pending at once - never the previous region's numbers
+//   F10 the same ProjState switched to another document of the same size:
+//       the first document's late answer is not installed as the second's
+//   F11 the pixels change in place under the same buffer (dataRev only): the
+//       finished-but-unlanded answer for the old values is not installed
+//   F12 a reload swap, F13 a remote full-resolution swap, F14 a frame-average
+//       recompute, each WHILE a pass runs: the fence stopped and released the
+//       job before the buffer was replaced, and what lands is the new pixels
+//   F15 a region the H pass covers whole (step == cell): fStat is BIT-identical
+//       to the pre-#283 accumulation, copied verbatim below
+//   F16 RGB (each channel and the pooled row), F17 quad Bayer, F18 a region
+//       with NaN / +inf / -inf: every value == a direct scan of the finite pixels
 //
 // The fixture has a row-periodic pattern with period == the stride, the case
 // the issue names: the H pass at step 6 sees rows y%6 == 0 only and the hot row
@@ -48,25 +61,34 @@ if (g_projFrameSelftest) {
     app.anns.clear();
     app.selectedAnn = 0;
 
-    const int W = 4096, H = 3000;
+    constexpr int W = 4096, H = 3000;
     // the row pattern, period 6: row y%6 == 3 is the hot one
     static const float FPN[6] = { 0.0f, 2.0f, -3.0f, 12.0f, 1.0f, -2.0f };
-    auto mk = [&](const char* nm, int cfa) {
+    // `off` shifts every value, so two documents of one shape have different
+    // answers; `ch` > 1 gives each channel its own level, as cfa gives each plane
+    auto fill = [&](std::vector<float>& px, int w, int h, int ch, int cfa, float off) {
+        px.resize((size_t)w * h * ch);
+        uint32_t st = 0x2468ace1u;                 // fixed: the numbers repeat
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                for (int c = 0; c < ch; c++) {
+                    st = st * 1664525u + 1013904223u;
+                    float n = 16.0f * ((float)(st >> 8) * 0x1p-24f - 0.5f);   // +-8 DN
+                    // a mosaic gets a level per plane (and a multi-channel frame
+                    // per channel), so a phase or channel error is a WRONG LEVEL
+                    // and cannot pass by reading a neighbour
+                    float lvl = cfa ? 200.0f * (float)cfaChannelAtRaw(cfa, 0, x, y)
+                                    : 300.0f * (float)c;
+                    px[((size_t)y * w + x) * ch + c] = 1000.0f + off + lvl + FPN[y % 6] + n;
+                }
+    };
+    auto mk = [&](const char* nm, int cfa, int w = 4096, int h = 3000, int ch = 1,
+                  float off = 0.0f) {
         auto d = std::make_unique<ImageDoc>();
         d->name = nm;
-        d->src->w = W; d->src->h = H; d->src->ch = 1;
+        d->src->w = w; d->src->h = h; d->src->ch = ch;
         d->src->dtype = "f32";
-        d->src->data.resize((size_t)W * H);
-        uint32_t st = 0x2468ace1u;                 // fixed: the numbers repeat
-        for (int y = 0; y < H; y++)
-            for (int x = 0; x < W; x++) {
-                st = st * 1664525u + 1013904223u;
-                float n = 16.0f * ((float)(st >> 8) * 0x1p-24f - 0.5f);   // +-8 DN
-                // a mosaic gets a level per plane, so a phase error is a WRONG
-                // LEVEL and cannot pass by reading a neighbour
-                float lvl = cfa ? 200.0f * (float)(((y & 1) << 1) | (x & 1)) : 0.0f;
-                d->src->data[(size_t)y * W + x] = 1000.0f + lvl + FPN[y % 6] + n;
-            }
+        fill(d->src->data, w, h, ch, cfa, off);
         d->cfa = cfa;
         d->cfaPattern = 0;                          // RGGB
         d->syncMirrors();
@@ -80,36 +102,37 @@ if (g_projFrameSelftest) {
     // `rowOk` picks the rows: every row (the truth), or the H pass's rows (what
     // the code used to report - printed as "before", and the anti-vacuity).
     struct Ref { double mean = 0, sd = 0, mn = 0, mx = 0, pp = 0; size_t n = 0; };
+    // Slot s of a multi-channel frame is channel s; the pooled slot 4 is every
+    // channel the panel shows (the first three). Non-finite samples are not
+    // samples: skipped, and not counted.
     auto scan = [&](const ImageDoc& d, int rx, int ry, int rw, int rh, int slot,
                     const std::function<bool(int)>& rowOk) {
-        const bool cfa = d.cfa != 0;
-        auto in = [&](int x, int y) {
-            if (slot == 4 || !cfa) return true;
-            return cfaChannelAt(d, x, y) == slot;
+        const bool cfa = d.cfa != 0 && d.ch == 1;
+        const int nCh = cfa ? 1 : std::min(d.ch, 3);
+        auto each = [&](const std::function<void(double)>& f) {
+            for (int y = ry; y < ry + rh; y++) {
+                if (!rowOk(y - ry)) continue;
+                for (int x = rx; x < rx + rw; x++) {
+                    if (cfa && slot != 4 && cfaChannelAt(d, x, y) != slot) continue;
+                    for (int c = 0; c < nCh; c++) {
+                        if (!cfa && slot != 4 && c != slot) continue;
+                        const double v = d.px()[((size_t)y * d.w + x) * d.ch + c];
+                        if (std::isfinite(v)) f(v);
+                    }
+                }
+            }
         };
         Ref r;
         double sum = 0;
         r.mn = DBL_MAX; r.mx = -DBL_MAX;
-        for (int y = ry; y < ry + rh; y++) {
-            if (!rowOk(y - ry)) continue;
-            for (int x = rx; x < rx + rw; x++) {
-                if (!in(x, y)) continue;
-                const double v = d.px()[(size_t)y * d.w + x];
-                sum += v; r.n++;
-                r.mn = std::min(r.mn, v); r.mx = std::max(r.mx, v);
-            }
-        }
+        each([&](double v) {
+            sum += v; r.n++;
+            r.mn = std::min(r.mn, v); r.mx = std::max(r.mx, v);
+        });
         if (!r.n) return r;
         r.mean = sum / r.n;
         double ss = 0;
-        for (int y = ry; y < ry + rh; y++) {
-            if (!rowOk(y - ry)) continue;
-            for (int x = rx; x < rx + rw; x++) {
-                if (!in(x, y)) continue;
-                const double e = d.px()[(size_t)y * d.w + x] - r.mean;
-                ss += e * e;
-            }
-        }
+        each([&](double v) { ss += (v - r.mean) * (v - r.mean); });
         r.sd = std::sqrt(ss / r.n);                 // ddof=0, as sigma (frame)
         r.pp = r.mx - r.mn;
         return r;
@@ -313,6 +336,291 @@ if (g_projFrameSelftest) {
         check(all, "F8 ...every plane lands == a scan of every pixel");
     }
 
+    // ---- F9: an ROI being dragged ------------------------------------------------
+    {
+        App::ProjState P;
+        setRoi(0, 0, 3000, 2000);
+        recomputeProjectionIfNeeded(M, P);
+        projFrameWait(M, P);
+        check(!P.fPending && same(P.fStat[0], scan(*M, 0, 0, 3000, 2000, 0, allRows)),
+              "F9 before the drag: the ROI's every-pixel answer");
+        app.annBusy = true;
+        setRoi(100, 100, 2800, 1900);
+        recomputeProjectionIfNeeded(M, P);
+        check(P.rx == 0 && P.rw == 3000,
+              "F9 mid-drag: the profile keeps the last region (unchanged rule)");
+        check(P.fPending && noneValid(P) && pendingSaid(P, 0),
+              "F9 ...but the frame cells say computing..., not the last region's numbers");
+        // ...and a small target region (the synchronous size) is no different
+        setRoi(10, 10, 600, 400);
+        recomputeProjectionIfNeeded(M, P);
+        check(P.fPending && noneValid(P), "F9 mid-drag to a small region: pending too");
+        app.annBusy = false;
+        recomputeProjectionIfNeeded(M, P);
+        check(!P.fPending && same(P.fStat[0], scan(*M, 10, 10, 600, 400, 0, allRows)),
+              "F9 the drag ends on a small region: its answer at once (synchronous size)");
+        app.annBusy = true;
+        setRoi(100, 100, 2800, 1900);
+        recomputeProjectionIfNeeded(M, P);
+        app.annBusy = false;
+        recomputeProjectionIfNeeded(M, P);
+        projFrameWait(M, P);
+        check(!P.fPending && same(P.fStat[0], scan(*M, 100, 100, 2800, 1900, 0, allRows)),
+              "F9 the drag ends on a large region: the pass runs and lands ITS answer");
+        clearRoi();
+    }
+
+    ImageDoc* M2 = mk("pf_mono2", 0, W, H, 1, 50.0f);
+
+    // ---- F10: another document of the same size, same slot ------------------------
+    {
+        App::ProjState P;
+        recomputeProjectionIfNeeded(M, P);                 // M's pass starts...
+        check(P.fPending && P.fJob != nullptr, "F10 M's pass running");
+        recomputeProjectionIfNeeded(M2, P);                // ...and the slot moves on
+        projFrameWait(M2, P);
+        const Ref r2 = scan(*M2, 0, 0, W, H, 0, allRows);
+        check(!P.fPending && same(P.fStat[0], r2) && P.fStat[0].mean > wholeF.mean + 40.0,
+              "F10 same rect, other document: M2's own answer, not M's late one");
+    }
+
+    // ---- F11: the same buffer, new values (dataRev only) ---------------------------
+    {
+        App::ProjState P;
+        recomputeProjectionIfNeeded(M2, P);
+        check(P.fPending && P.fJob != nullptr, "F11 pass running");
+        P.fJob->th.join();                                  // finished, NOT landed
+        const float* buf = M2->px().data();
+        for (float& v : M2->src->data) v += 7.0f;           // in place: no realloc
+        M2->dataRev++;
+        check(M2->px().data() == buf, "F11 the buffer is the same one");
+        recomputeProjectionIfNeeded(M2, P);
+        projFrameWait(M2, P);
+        check(!P.fPending && same(P.fStat[0], scan(*M2, 0, 0, W, H, 0, allRows)),
+              "F11 the answer for the OLD values is dropped: the new values' lands");
+    }
+
+    // the fence fired: the job the writer found was stopped and let go of the
+    // source BEFORE the buffer was replaced. Asked of the job the slot still
+    // holds, right after the writer returns and before anything pumps it.
+    auto fenced = [](const App::ProjState& P) {
+        return P.fJob != nullptr && P.fJob->cancel.load() && P.fJob->src == nullptr;
+    };
+    const int W2 = 2048, H2 = 2048;                         // 4.2 Mpx: step 2
+
+    // ---- F12: a reload swap while the pass runs -------------------------------------
+    {
+        const std::string path = (std::filesystem::temp_directory_path() /
+                                  "viewer_projframe_reload.npy").u8string();
+        std::vector<float> a, b;
+        fill(a, W2, H2, 1, 0, 0.0f);
+        fill(b, W2, H2, 1, 0, 100.0f);
+        npyWriteFile(path, "<f4", { H2, W2 }, a.data(), a.size() * sizeof(float));
+        const size_t before = app.images.size();
+        const std::string lerr = loadNpy(path);
+        ImageDoc* R = app.images.size() > before ? app.images.back().get() : nullptr;
+        check(lerr.empty() && R && R->w == W2, "F12 the .npy opened");
+        if (R) {
+            App::ProjState P;
+            recomputeProjectionIfNeeded(R, P);
+            check(P.fPending && P.fJob != nullptr, "F12 pass running");
+            npyWriteFile(path, "<f4", { H2, W2 }, b.data(), b.size() * sizeof(float));
+            std::string rerr;
+            const bool rok = reloadSource(R->src, rerr);
+            check(rok && fenced(P), "F12 the reload swap stopped and released the pass first");
+            recomputeProjectionIfNeeded(R, P);
+            projFrameWait(R, P);
+            const Ref r = scan(*R, 0, 0, W2, H2, 0, allRows);
+            check(!P.fPending && same(P.fStat[0], r) && r.mean > 1090.0,
+                  "F12 ...and what lands is the RELOADED pixels' every-pixel answer");
+        }
+        std::error_code ec;
+        std::filesystem::remove(pathFromUtf8(path), ec);
+    }
+
+    // ---- F13: a remote full-resolution swap while the pass runs ------------------------
+    {
+        ImageDoc* Q = mk("pf_remote", 0, W2, H2);
+        Q->src->remoteStep = 2;                             // "a preview"
+        App::ProjState P;
+        recomputeProjectionIfNeeded(Q, P);
+        check(P.fPending && P.fJob != nullptr, "F13 pass running");
+        App::RFetchDone d;
+        d.uid = Q->uid;
+        d.w = W2; d.h = H2; d.ch = 1;
+        d.dtype = "f32";
+        fill(d.data, W2, H2, 1, 0, 200.0f);
+        d.vmin = 0; d.vmax = 4000;
+        d.gen = app.rfGen.load();
+        app.rfPending++;
+        {
+            std::lock_guard<std::mutex> lk(app.rfMtx);
+            app.rfDone.push_back(std::move(d));
+        }
+        pumpRemoteFetch();
+        check(Q->src->remoteStep == 1 && fenced(P),
+              "F13 the remote swap stopped and released the pass first");
+        recomputeProjectionIfNeeded(Q, P);
+        projFrameWait(Q, P);
+        const Ref r = scan(*Q, 0, 0, W2, H2, 0, allRows);
+        check(!P.fPending && same(P.fStat[0], r) && r.mean > 1190.0,
+              "F13 ...and what lands is the FULL-RESOLUTION pixels' answer");
+    }
+
+    // ---- F14: a frame-average recompute while the pass runs ----------------------------
+    {
+        ImageDoc* f0 = mk("pf_avg0", 0, W2, H2, 1, 0.0f);
+        ImageDoc* f1 = mk("pf_avg1", 0, W2, H2, 1, 40.0f);
+        App::SeqInfo si;
+        si.id = app.nextSeqId++;
+        si.name = "pf_avg";
+        app.seqs.push_back(si);
+        f0->seqId = si.id; f0->seqIndex = 0;
+        f1->seqId = si.id; f1->seqIndex = 1;
+        ImageDoc* X = mk("pf_avg_into", 0, W2, H2, 1, 500.0f);
+        App::ProjState P;
+        recomputeProjectionIfNeeded(X, P);
+        check(P.fPending && P.fJob != nullptr, "F14 pass running");
+        std::string aerr;
+        const bool aok = stackReduceFrame(si.id, FOLD_MEAN, aerr, nullptr, X);
+        check(aok && fenced(P), "F14 the frame-average recompute stopped and released the pass first");
+        recomputeProjectionIfNeeded(X, P);
+        projFrameWait(X, P);
+        const Ref r = scan(*X, 0, 0, W2, H2, 0, allRows);
+        check(!P.fPending && same(P.fStat[0], r) && r.mean > 1010.0 && r.mean < 1030.0,
+              "F14 ...and what lands is the AVERAGE's every-pixel answer");
+    }
+
+    // ---- F15: where the H pass covers every pixel, not one bit moves -------------------
+    // THE PRE-#283 ACCUMULATION, copied verbatim from panel_histogram.inc as it
+    // stood on main (the H pass with step == cell, the region moments gathered
+    // in its `toH` branch, the same formulas after). Copying it is the point:
+    // the claim is "the same additions in the same order", and only the old
+    // code itself can say what that order was.
+    {
+        auto oldMoments = [](const ImageDoc& im, int rx, int ry, int rw, int rh, bool allRow,
+                             int nSeries, App::ProjState::Stats out[5]) {
+            const bool cfa = im.ch == 1 && im.cfa != 0;
+            double fSum[5] = {}, fSum2[5] = {};
+            size_t fN[5] = {};
+            double fMn[5] = { DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX };
+            double fMx[5] = { -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX, -DBL_MAX };
+            const int cell = im.cfa == 2 ? 4 : im.cfa ? 2 : 1;
+            int step = (int)std::max<size_t>(1, ((size_t)rw * rh * cell) / 2000000);
+            if (cell > 1) step = ((step + cell - 1) / cell) * cell;
+            auto accumulate = [&](int x, int y) {
+                const float* src = &im.px()[((size_t)(ry + y) * im.w + (rx + x)) * im.ch];
+                int lo = 0, hi = nSeries;
+                if (cfa) { lo = cfaChannelAt(im, rx + x, ry + y); hi = lo + 1; }
+                auto put = [&](int slot, float val) {
+                    fSum[slot] += val; fSum2[slot] += (double)val * val; fN[slot]++;
+                    fMn[slot] = std::min(fMn[slot], (double)val);
+                    fMx[slot] = std::max(fMx[slot], (double)val);
+                };
+                for (int s = lo; s < hi; s++) {
+                    float val = cfa ? src[0] : src[std::min(s, im.ch - 1)];
+                    if (!std::isfinite(val)) continue;
+                    put(s, val);
+                    if (allRow) put(4, val);
+                }
+            };
+            for (int y = 0; y < rh; y += step)
+                for (int dy = 0; dy < cell && y + dy < rh; dy++)
+                    for (int x = 0; x < rw; x++) accumulate(x, y + dy);
+            for (int s = 0; s < 5; s++) {
+                App::ProjState::Stats& f = out[s];
+                f = {};
+                if (!fN[s]) continue;
+                f.n = fN[s];
+                f.mean = fSum[s] / fN[s];
+                double var = fSum2[s] / fN[s] - f.mean * f.mean;
+                f.sd = sqrt(var > 0 ? var : 0);
+                f.mn = fMn[s]; f.mx = fMx[s]; f.pp = f.mx - f.mn;
+                f.pct = f.mean != 0 ? f.sd / fabs(f.mean) * 100.0 : 0.0;
+                f.valid = true;
+            }
+            return step;
+        };
+        auto bits = [](const App::ProjState::Stats& a, const App::ProjState::Stats& b) {
+            return a.valid == b.valid && a.n == b.n &&
+                   memcmp(&a.mean, &b.mean, sizeof(double)) == 0 &&
+                   memcmp(&a.sd, &b.sd, sizeof(double)) == 0 &&
+                   memcmp(&a.mn, &b.mn, sizeof(double)) == 0 &&
+                   memcmp(&a.mx, &b.mx, sizeof(double)) == 0 &&
+                   memcmp(&a.pp, &b.pp, sizeof(double)) == 0 &&
+                   memcmp(&a.pct, &b.pct, sizeof(double)) == 0;
+        };
+        ImageDoc* S1 = mk("pf_small_mono", 0, 1536, 1100, 1, 0.37f);
+        ImageDoc* S2 = mk("pf_small_bayer", 1, 1536, 1100, 1, 0.37f);
+        ImageDoc* S3 = mk("pf_small_rgb", 0, 900, 700, 3, 0.37f);
+        struct Case { ImageDoc* d; int rx, ry, rw, rh; bool all; const char* what; };
+        const Case cases[] = {
+            { S1, 0, 0, 1536, 1100, false, "F15 mono 1536x1100: bit-identical to the old accumulation" },
+            { S2, 3, 1, 1501, 1077, true,  "F15 Bayer, odd ROI origin, with all: bit-identical" },
+            { S3, 0, 0, 900, 700, true,    "F15 RGB with all: bit-identical" },
+        };
+        for (const Case& c : cases) {
+            app.projAllRow = c.all;
+            if (c.rx || c.ry) setRoi(c.rx, c.ry, c.rw, c.rh); else clearRoi();
+            App::ProjState P;
+            recomputeProjectionIfNeeded(c.d, P);
+            App::ProjState::Stats old[5];
+            const int step = oldMoments(*c.d, c.rx, c.ry, c.rw, c.rh, P.allRow, P.nSeries, old);
+            bool eq = !P.fPending && step == P.cell;
+            for (int s = 0; s < 5; s++) eq = eq && bits(P.fStat[s], old[s]);
+            check(eq, c.what);
+        }
+        app.projAllRow = false;
+        clearRoi();
+    }
+
+    // ---- F16: RGB, each channel and the pooled row ------------------------------------
+    {
+        ImageDoc* C3 = mk("pf_rgb", 0, 2560, 2000, 3);
+        app.projAllRow = true;
+        App::ProjState P;
+        recomputeProjectionIfNeeded(C3, P);
+        projFrameWait(C3, P);
+        bool all = !P.fPending && P.nSeries == 3;
+        for (int s : { 0, 1, 2, 4 }) {
+            const Ref r = scan(*C3, 0, 0, 2560, 2000, s, allRows);
+            all = all && same(P.fStat[s], r);
+        }
+        check(all && P.fStat[2].mean > P.fStat[0].mean + 500.0,
+              "F16 RGB 2560x2000: ch0/ch1/ch2 and \"all\" == a scan of every pixel");
+        app.projAllRow = false;
+    }
+
+    // ---- F17: quad Bayer --------------------------------------------------------------
+    {
+        ImageDoc* QB = mk("pf_quad", 2, W2, H2);
+        App::ProjState P;
+        recomputeProjectionIfNeeded(QB, P);
+        projFrameWait(QB, P);
+        bool all = !P.fPending && P.cell == 4;
+        for (int s = 0; s < 4; s++) all = all && same(P.fStat[s], scan(*QB, 0, 0, W2, H2, s, allRows));
+        check(all && P.fStat[3].mean > P.fStat[0].mean + 500.0,
+              "F17 quad Bayer 2048x2048: every plane == a scan of every pixel");
+    }
+
+    // ---- F18: NaN and infinities are not samples ---------------------------------------
+    {
+        ImageDoc* NF = mk("pf_nonfinite", 0, W2, H2);
+        const float inf = std::numeric_limits<float>::infinity();
+        NF->src->data[(size_t)7 * W2 + 5] = std::numeric_limits<float>::quiet_NaN();
+        NF->src->data[(size_t)3 * W2 + 100] = inf;            // an odd row: not an H row
+        NF->src->data[(size_t)2046 * W2 + 2000] = -inf;       // an even row: an H row
+        NF->src->data[(size_t)1001 * W2 + 9] = std::numeric_limits<float>::quiet_NaN();
+        NF->dataRev++;
+        App::ProjState P;
+        recomputeProjectionIfNeeded(NF, P);
+        projFrameWait(NF, P);
+        const Ref r = scan(*NF, 0, 0, W2, H2, 0, allRows);
+        check(!P.fPending && same(P.fStat[0], r) && P.fStat[0].n == (size_t)W2 * H2 - 4 &&
+              std::isfinite(P.fStat[0].mean) && std::isfinite(P.fStat[0].pp),
+              "F18 NaN/+inf/-inf excluded: n = every pixel - 4, values == the finite scan");
+    }
+
     // ---- F6: a crop while the pass runs (last: it changes M) --------------------
     {
         clearRoi();
@@ -336,6 +644,7 @@ if (g_projFrameSelftest) {
     // The home is shared: put back everything borrowed.
     Q = App::ProjState{};
     closeAll();
+    app.seqs.clear();
     app.projMode = saveMode;
     app.projAllRow = saveAllRow;
     app.annBusy = saveBusy;

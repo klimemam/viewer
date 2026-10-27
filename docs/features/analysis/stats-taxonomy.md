@@ -198,7 +198,7 @@ canvas を、`detrend.inc:124` / `rtemporal.inc:69` / `setanalysis.inc:371` /
 |---|---|---|---|
 | 1 | `core/ui/panel_rois.inc:50` | **0** | ROIs パネル `sd` 列、および `std / mean [%]` (:73) |
 | 2 | `core/ui/canvas.inc:1424` | **0** | Histogram パネルの `sd` / `var` 列 |
-| 3 | `core/ui/panel_histogram.inc:654` | **0** | Projection パネル `σ (frame)`、TSV `sigma_frame` |
+| 3 | `core/ui/panel_histogram.inc` `projFrameMoments` | **0** | Projection パネル `σ (frame)`、TSV `sigma_frame` |
 | 4 | `core/ui/panel_temporal.inc:472` | **1** | Temporal エクスポート第3節 `sigma[_ch] [DN]` |
 | 5 | `core/app/temporal_model.inc:96` | **0** | Temporal パネルの frame std グラフ (`T.frameStd`) |
 | 6 | `core/serve.cpp:1229` | **0** | peer `frame std` 系列 (`MOP_TEMPORAL_STATS`) |
@@ -463,6 +463,8 @@ stack では第3節の列名にプレーン接尾辞が付かないため、**�
 **保護が必要なのは ddof=1 側であり、現時点では異常を確実に検出する回帰テストを書けない。** 二節の
 σを突き合わせる assert は書けない —— 第2節は間引き標本、第3節は全画素走査で、
 **同じ標本を測っていない**ので比が `sqrt(n/(n−1))` にならず、閾値は勘になる。
+(#283 以降、第2節の `sigma_frame` は領域の全画素から取るので、この理由は `sigma_frame` に
+ついては当たらなくなった。`sigma_row` / `sigma_col` は今も間引いたプロファイルの σ。)
 残る手はテスト内に推定量を書き直すことだが、**自分が守る対象を再実装した
 テストは、両方を一緒に編集された日に黙って通る** —— PR #130 のスキャナが
 存在する理由がまさにその失敗である。
