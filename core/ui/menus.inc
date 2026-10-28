@@ -452,7 +452,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("One plot per side, all of equal width and always in\n"
                                   "slot order: shapes can only be compared on plots of\n"
                                   "equal width. More slots make each plot narrower;\n"
-                                  "below 320 px they fall back to the overlay and say so.");
+                                  "below 320 px (logical width) a panel draws the overlay\n"
+                                  "instead, without a note on the panel.");
             ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a

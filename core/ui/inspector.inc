@@ -165,31 +165,15 @@ static void drawABBand(const char* side, const std::string& name, bool stale = f
     ImGui::Dummy(ImVec2(w, h + 2 * s));
 }
 
-// Why the side-by-side layout fell back to an overlay. Two things it has to get
-// right and did not: it must WRAP (Text does not, and at exactly the width that
-// triggers it the line was cut mid-word - "panel narrower than 480 px: overlaid
-// ins..."), and it must quote the LOGICAL threshold. It used to print the
-// DPI-scaled minSide, so a 150% display was told to widen past 480 px while the
-// code compares against 320 logical ones - a number the user cannot act on.
-static const char* AB_NARROW_MSG =
-    "panel narrower than 320 px (logical width, before display scaling): "
-    "overlaid instead of side by side";
+// Why the side-by-side layout fell back to an overlay used to be said in a
+// line of its own above the plot. It came and went with the panel width and
+// cluttered the panel (user 2026-10-28:「panel narrower than 320 pixって表示は
+// 乱雑になるからなくても良い」), so the fallback is silent on the panel and the
+// threshold lives in the manual and the layout control's tooltip. The layout
+// arithmetic still asks for the note's height, which is now none.
 static const float AB_MIN_SIDE = 320.0f;
-// The height it will take at the current width, so the plot layout can reserve
-// exactly what the wrapped text uses. A note that appears and pushes the plot
-// down is the same defect as the browser's scrub bar and the preview row.
-static float abNarrowNoteH() {
-    return ImGui::CalcTextSize(AB_NARROW_MSG, nullptr, false,
-                               ImGui::GetContentRegionAvail().x).y +
-           ImGui::GetStyle().ItemSpacing.y;
-}
-static void abNarrowNote() {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1));
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextUnformatted(AB_NARROW_MSG);
-    ImGui::PopTextWrapPos();
-    ImGui::PopStyleColor();
-}
+static float abNarrowNoteH() { return 0.0f; }
+static void abNarrowNote() {}
 
 // A and B series correspond BY NAME (R <-> R), never by index: the canon says
 // CFA planes are never mixed, and ch0 is not R. -1 = this series exists on one
