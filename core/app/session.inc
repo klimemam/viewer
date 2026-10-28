@@ -1554,6 +1554,11 @@ static void writePrefsTo(std::ostream& f) {
     // preference: 0 is the default and writing it changes nothing today, but the
     // line is what lets a later default move without silently moving this user.
     f << "folderclick " << P.folderClick << "\n";
+    // #309: the histogram's drag switch and its linked-range option. Written
+    // from App directly, like `window`: settings.jsonc has no key for either,
+    // so there is no lower layer for a live value to leak over.
+    f << "histdrag " << app.histDragMode << "\n";
+    f << "histzoomrange " << (app.histZoomSetsRange ? 1 : 0) << "\n";
     // The window: logical size, raw position, then the maximized flag (see
     // fitSavedWindow). Written only once a real window has reported a geometry,
     // so a run that never samples one - every scripted run - hands back exactly
@@ -1993,6 +1998,10 @@ static void loadPrefs() {
         // two values are 0 and 1, and a hand-edited 7 is not a gesture - the
         // honest answer to it is the default, which is also today's behaviour.
         else if (key == "folderclick") { ls >> v; if (v == 0 || v == 1) app.folderClick = v; }
+        // #309, validated for folderclick's reason: two values, and anything
+        // else gets the default rather than a guess.
+        else if (key == "histdrag")    { ls >> v; if (v == 0 || v == 1) app.histDragMode = v; }
+        else if (key == "histzoomrange") { ls >> v; app.histZoomSetsRange = v != 0; }
         // THE KEYS WHOSE VALUE IS THE REST OF THE LINE, because a path may
         // contain spaces. This list is the gate: a key missing from it never
         // reaches the chain below, however carefully that chain handles it.

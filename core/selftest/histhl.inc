@@ -2,7 +2,9 @@
 // ---- --histhl-selftest: the value highlight (#68) ---------------------------
 // Drag a value interval on the histogram's x axis; the pixels in it are painted
 // on the image and the count is declared. docs/features/histogram/histogram-select-design.md is
-// the specification and §9 is this file's running order.
+// the specification and §9 is this file's running order. (Its §6 gesture -
+// plain drag, double-click clears - is #309's Shift+drag now; see the note
+// appended there and T15 below.)
 //
 // Windowless, on the abEqSelftest pattern and for the same reason: every claim
 // here is a pixel value, a count or a string, and all of it is CPU on both
@@ -771,9 +773,14 @@ static int histHlSelftest() {
         // ---- T15: a real drag RELEASE that is refused ----------------------
         // T11 pins histHlRefusalFor and what a DRAWN pane answers. What it does
         // not reach is the gesture: the release has to decline out loud and arm
-        // nothing. Driven through histHlGesture itself with injected mouse
+        // nothing. Driven through histDragGesture itself with injected mouse
         // events, so it is the shipped branch and not a re-statement of it.
+        // Since #309 a plain drag ZOOMS by default and the highlight is
+        // Shift+drag, so the drags below hold Shift with the switch pinned to
+        // its default (and handed back after - the selftest home is shared).
         {
+            const int dragModeWas = app.histDragMode;
+            app.histDragMode = 0;
             histHlClear();
             app.compareMode = App::CmpOff;
             setCompareB(nullptr);
@@ -784,7 +791,7 @@ static int histHlSelftest() {
             auto mono2 = mk("hl4_mono", 8, 8, 1, "u8");
             for (size_t i = 0; i < mono2->px().size(); i++) mono2->px()[i] = 150.0f;
             setRange(*mono2, 0, 255);
-            // ONE pass per mouse state: histHlGesture keeps the drag in statics,
+            // ONE pass per mouse state: histDragGesture keeps the drag in statics,
             // and two passes per call would press twice.
             auto gestureFrame = [&](ImVec2 at, bool down, ImageDoc* d) {
                 if (g_haveWindow) {
@@ -800,6 +807,7 @@ static int histHlSelftest() {
                 // MousePos from the OS cursor every frame (verify.inc V19)
                 io.AddMousePosEvent(at.x, at.y);
                 io.AddMouseButtonEvent(0, down);
+                io.AddKeyEvent(ImGuiMod_Shift, true);    // Shift+drag = highlight
                 ImGui::NewFrame();
                 ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
                 ImGui::SetNextWindowSize(ImVec2(900, 720), ImGuiCond_Always);
@@ -816,7 +824,7 @@ static int histHlSelftest() {
                 pr.xmax = (float)((double)app.hist[0].binOrigin +
                                   256.0 * (double)app.hist[0].binW);
                 pr.ymin = 0; pr.ymax = 1; pr.ok = true;
-                histHlGesture(pr, d, app.hist[0]);
+                histDragGesture(pr, d, app.hist[0]);
                 ImGui::End();
                 ImGui::EndFrame();
             };
@@ -855,8 +863,12 @@ static int histHlSelftest() {
                   "T15 ...while the same drag on a mono frame DOES arm (anti-vacuity)");
             check(app.toast.empty(),
                   "T15 ...with nothing to say about it");
+            check(!app.histZoom.on, "T15 ...and the Shift+drag zoomed nothing");
             histHlClear();
             app.toast.clear();
+            // Shift released, so no later frame of this file inherits it.
+            io.AddKeyEvent(ImGuiMod_Shift, false);
+            app.histDragMode = dragModeWas;
         }
 
         // ---- T16: the difference view, and the A fallback under it ---------

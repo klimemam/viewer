@@ -90,6 +90,8 @@ PR #122 で消え、`docs/guides/manual.md` は既に「ビルドを切り替え
 | `pythonexe` | 使う Python | 空 → PATH を探る | — |
 | `readerdir` | ユーザーのリーダを置く**1つ**のフォルダ | 空 | — (#51 が複数化を持つ) |
 | `readerfor` | パス → リーダの記憶 (上限 **64** = `READER_MEMO_MAX`) | 空 | **履歴** |
+| `histdrag` | Histogram の素のドラッグ (0 = zoom / 1 = highlight、Shift で他方。#309) | **0 = zoom** | 見出し行の `drag: [zoom] [highlight]` が名乗る |
+| `histzoomrange` | Histogram の拡大で表示レンジも動かす (`zoom sets display range`、#309) | false | 見出し行のチェックが名乗る |
 | ~~`rbadv`~~ | 撤去済み (Browse の drawer)。読んで捨てる | — | 退役キーの扱いの**前例** |
 
 > **訂正 (2026-08-11, stage 1 の実装で判明)。** この表は 25 行だが、実際の

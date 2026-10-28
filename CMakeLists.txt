@@ -1292,6 +1292,11 @@ viewer_selftest(abeq        NOGL --abeq-selftest)
 # count == sum of the selected bins, inside the grid and at the folded end bin)
 # are the reason it is a test at all rather than a demo.
 viewer_selftest(histhl      NOGL --histhl-selftest)
+# The histogram zoom (#309): a drag re-lays the 256 bins on the dragged values,
+# Shift (or the heading row's switch) makes the drag the highlight above, and an
+# option makes the zoom set the display range. NOGL and fixture-free for
+# histhl's reasons; the bins, counts and ranges it asserts are derived by hand.
+viewer_selftest(histzoom    NOGL --histzoom-selftest)
 # The hovered sample's three numbers (#292): raw, 表示値 x and the screen byte,
 # on the Inspector's Pixel table, the status bar and the texture. The test is
 # the equality of the three surfaces, pixel by pixel, at two gammas - which is

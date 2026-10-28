@@ -840,6 +840,11 @@ static void cjkFontRanges(ImFontAtlas* atlas, ImVector<ImWchar>& out) {
     // screen value (hoverScreenMarkFor, which falls back to "->" when the
     // baked atlas lacks it). The Arrows block is in neither CJK table.
     b.AddChar((ImWchar)0x2192);
+    // U+25C0 / U+25B6, the histogram's "highlight outside" marks on a zoomed
+    // axis (#309; histHlBand falls back to '<' / '>' when the baked atlas
+    // lacks them). Geometric Shapes is in neither CJK table either.
+    b.AddChar((ImWchar)0x25C0);
+    b.AddChar((ImWchar)0x25B6);
     b.BuildRanges(&out);
     g_cjkRangesAsked = out;      // see g_cjkRangesAsked for why this is kept
 }
