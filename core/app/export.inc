@@ -1433,6 +1433,128 @@ static bool rangeFitLit(ImageDoc& ref, float eb, float ew) {
     return rangeButtonMatches(ref, RB_Auto, eb, ew) || rangeButtonMatches(ref, RB_AutoPct, eb, ew) ||
            rangeButtonMatches(ref, RB_Median, eb, ew);
 }
+// ---- what the Inspector's Range rows say (#321 §3) ---------------------------
+// Pure answers, so --range-selftest reads exactly what the panel draws.
+
+// The `applies to` row: the segments offered for `im`, in reading order. A
+// single image has no `frame` (it IS its stack); `A+B` exists only while a
+// comparison is on, spelled with the letters compared ("A+B+C", "A+B+C+..."
+// past four).
+struct RangeSeg { int scope; std::string label; };
+static std::vector<RangeSeg> rangeScopeSegs(const ImageDoc* im) {
+    std::vector<RangeSeg> out;
+    if (im && im->seqId > 0) out.push_back({ RS_Frame, "frame" });
+    out.push_back({ RS_Stack, "stack" });
+    const ViewSides v = comparedSides();
+    if (v.n >= 2) {
+        std::string l;
+        for (int i = 0; i < v.n && i < 4; i++) l += (i ? "+" : "") + viewSideLetter(v, i);
+        if (v.n > 4) l += "+…";
+        out.push_back({ RS_Compared, l });
+    }
+    out.push_back({ RS_All, "all open" });
+    return out;
+}
+// The `rule` row for a scope: (id, label). Stack: RangeRule ids; A+B: the
+// compare rule 1..3; frame and all open: one range only (id -1, not a choice).
+static std::vector<std::pair<int, std::string>> rangeRuleSegs(int scope) {
+    if (scope == RS_Stack) return { { RR_OneRange, "one range" }, { RR_EachFrame, "each frame fits itself" } };
+    if (scope == RS_Compared) return { { 1, "A's range" }, { 2, "union" }, { 3, "each side fits itself" } };
+    return { { -1, "one range" } };
+}
+static int rangeRuleLit(int scope) {
+    return scope == RS_Stack ? app.rangeRule : scope == RS_Compared ? app.compareRangeMode : -1;
+}
+static std::vector<int> framesOfSeq(int seqId);   // fwd (sequence.inc)
+// The dim line under `applies to`: WHO that is, by name.
+static std::string rangeScopeName(const ImageDoc* im, int scope) {
+    if (!im) return {};
+    auto stackName = [](const ImageDoc* d) {
+        if (d->seqId > 0) if (const App::SeqInfo* si = seqInfo(d->seqId)) if (!si->name.empty()) return si->name;
+        return d->name;
+    };
+    if (scope == RS_All) {
+        const size_t n = app.images.size();
+        return std::to_string(n) + (n == 1 ? " open image" : " open images");
+    }
+    if (scope == RS_Compared) {
+        const ViewSides v = comparedSides();
+        std::string s;
+        for (int i = 0; i < v.n; i++) s += (i ? " · " : "") + viewSideLetter(v, i) + " " + stackName(v.side[i]);
+        return s;
+    }
+    if (scope == RS_Frame)
+        return "frame " + std::to_string(im->seqIndex + 1) + " of " + stackName(im) + " — its own range";
+    const size_t n = im->seqId > 0 ? framesOfSeq(im->seqId).size() : 1;
+    return stackName(im) + "  (" + std::to_string(n) + (n == 1 ? " frame)" : " frames)");
+}
+// Frames of `im`'s stack, other than `im`, that keep their own range.
+static int ownFramesElsewhere(const ImageDoc* im) {
+    if (!im || im->seqId <= 0) return 0;
+    int n = 0;
+    for (const auto& d : app.images) if (d.get() != im && d->seqId == im->seqId && d->rangeOwn) n++;
+    return n;
+}
+static std::string ownFramesLine(int n) {
+    return n == 1 ? std::string("1 frame of this stack keeps its own range")
+                  : std::to_string(n) + " frames of this stack keep their own range";
+}
+// [rejoin all]: every frame of `im`'s stack wears the stack's range again.
+static void rejoinAllOwn(const ImageDoc* im) {
+    if (!im || im->seqId <= 0) return;
+    const ImageDoc* h = stackRangeHolder(im->seqId, nullptr);
+    for (auto& d : app.images)
+        if (d->seqId == im->seqId && d->rangeOwn) {
+            d->rangeOwn = false;
+            if (h) { d->black = h->black; d->white = h->white; }
+            d->texDirty = true;
+        }
+}
+// The `in force` row: "<lo> .. <hi>   <words>", the amber part apart.
+struct InForce { std::string text, warn; bool amber = false; };
+static InForce inForceOf(const ImageDoc& im) {
+    InForce f;
+    const ViewSides v = comparedSides();
+    float lo = 0, hi = 0;
+    displayRangeFor(im, v, lo, hi);
+    const RangeWords w = rangeWords(im, v);
+    f.text = fmtVal(lo, im.dtype) + " .. " + fmtVal(hi, im.dtype) + "   " + w.said;
+    for (const std::string& h : w.held) f.text += "; " + h;
+    f.warn = w.warn;
+    return f;
+}
+// What a fit button reads under the rule in force (#321 §3.2): under "each
+// frame / each side fits itself" the three fits are the CHOICE of fit, and the
+// chosen one is lit; under the union Auto is lit as a fact (the union is
+// min-max over every side) and the other two are not offered; under the rest
+// they are lit by comparison, as before (#248). The fixed presets are dark
+// under a fitting rule - pressing one moves the rule to one range (I2).
+static bool rangeEachRule(const ImageDoc* im) {
+    const int s = rangeScopeOf(im);
+    return (s == RS_Stack && app.rangeRule == RR_EachFrame) || (s == RS_Compared && app.compareRangeMode == 3);
+}
+static bool rangeUnionRule(const ImageDoc* im) {
+    return rangeScopeOf(im) == RS_Compared && app.compareRangeMode == 2;
+}
+static bool rangeButtonEnabled(const ImageDoc& im, int btn) {
+    return !(rangeUnionRule(&im) && (btn == RB_AutoPct || btn == RB_Median));
+}
+static bool rangeButtonLit(ImageDoc& im, int btn, float eb, float ew) {
+    const bool fit = btn == RB_Auto || btn == RB_AutoPct || btn == RB_Median;
+    if (rangeEachRule(&im))
+        return fit && btn == (app.autoFlavor == AF_Pct ? RB_AutoPct : app.autoFlavor == AF_Median ? RB_Median : RB_Auto);
+    if (rangeUnionRule(&im)) return btn == RB_Auto;
+    return rangeButtonMatches(im, btn, eb, ew);
+}
+// The words a Range control's tooltip ends on: who a press reaches.
+static std::string rangeScopeTail(const ImageDoc* im) {
+    switch (rangeScopeOf(im)) {
+        case RS_Frame:    return "this frame only";
+        case RS_Compared: return "A's stack (A's range for every side)";
+        case RS_All:      return "all open images";
+        default:          return im && im->seqId > 0 ? "the stack" : "this image";
+    }
+}
 static void forgetTexture(ImageDoc* im) {
     app.texLru.erase(std::remove(app.texLru.begin(), app.texLru.end(), im), app.texLru.end());
 }

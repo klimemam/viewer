@@ -442,20 +442,28 @@ static void drawMenuBar(GLFWwindow* win) {
             ImGui::Separator();
             if (ImGui::MenuItem("B follows A's frame number", nullptr, app.compareFollowFrame))
                 app.compareFollowFrame = !app.compareFollowFrame;
-            {   // the display range relationship, where the compare modes live
-                static const char* RN[4] = { "  each side keeps its own range",
-                                             "  every side uses A's range",
-                                             "  auto over every side (union)",
+            {   // the display range relationship, where the compare modes live -
+                // in the Inspector's Range words (#321): "stack" is the scope
+                // that leaves each side its own; the other three are the A+B
+                // rules. Choosing one of those leaves Link range, exactly as
+                // the Inspector's A+B segment does.
+                static const char* RN[4] = { "  stack (each keeps its own)",
+                                             "  A's range",
+                                             "  union",
                                              "  each side fits itself" };
                 ImGui::TextDisabled("Display range");
                 for (int r = 0; r < 4; r++)
-                    if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) setCompareRule(r);
-                // ...and, under the mode that asks it, WHICH fit (#301): the
-                // same three the Inspector's radio row offers, through the same
-                // setter.
+                    if (ImGui::MenuItem(RN[r], nullptr, !app.linkRange && app.compareRangeMode == r)) {
+                        setCompareRule(r);
+                        if (r >= 1 && app.linkRange) setRangeScope(RS_Compared, cur());
+                        else if (r == 0 && app.linkRange) setRangeScope(RS_Stack, cur());
+                    }
+                // ...and, under the rule that asks it, WHICH fit (#301): the
+                // same three the Inspector's fit buttons choose there, through
+                // the same setter.
                 if (app.compareRangeMode == 3) {
                     static const char* FIT[3] = { "      fit: min-max", "      fit: 0.1-99.9%",
-                                                  "      fit: median" };
+                                                  "      fit: median->target" };
                     for (int f = AF_MinMax; f <= AF_Median; f++)
                         if (ImGui::MenuItem(FIT[f], nullptr, app.autoFlavor == f))
                             setFlavor(f);

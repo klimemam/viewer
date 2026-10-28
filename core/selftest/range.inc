@@ -1495,6 +1495,12 @@
             ok(f2->black == 5.0f && f2->white == 6.0f && f1->black == 0.0f && f1->white == 255.0f,
                "a write on the stack skips the frame that keeps its own");
             ok(rangeScopeOf(f0) == RS_Stack, "...and a sibling's scope is still the stack");
+            ok(ownFramesLine(ownFramesElsewhere(f0)) == "1 frame of this stack keeps its own range" &&
+               ownFramesElsewhere(f1) == 0,
+               "Inspector, on a sibling: \"1 frame of this stack keeps its own range\"");
+            ok(rangeScopeName(f1, RS_Frame) == "frame 2 of fx \u2014 its own range" &&
+               inForceOf(*f1).text.find("   this frame only") != std::string::npos,
+               "Inspector, on the frame: \"frame 2 of fx - its own range\", in force \"this frame only\"");
             setRangeScope(RS_Stack, f1);
             ok(!f1->rangeOwn && f1->black == 5.0f && f1->white == 6.0f && rangeScopeOf(f1) == RS_Stack,
                "stack: frame 1 rejoins, at the stack's range");
@@ -1628,14 +1634,16 @@
                         recomputeHistogramIfNeeded(cur(), app.hist[0]);
                         const std::string lab = abHistXLabel(cur(), cmpB(), app.hist[0]);
                         const std::string note = exportRangeNote(*g[0], v, false);
+                        const std::string inforce = inForceOf(*g[0]).text;
                         const bool c = !head.empty() && lab.find(head) != std::string::npos &&
-                                       note.rfind("range: " + rw.said, 0) == 0;
+                                       note.rfind("range: " + rw.said, 0) == 0 &&
+                                       inforce.find("   " + rw.said) != std::string::npos;
                         if (!c) fprintf(stderr, "rangeselftest: P22 link %d rule %d mode %d | head \"%s\" | "
-                                                "axis \"%s\" | note \"%s\"  WRONG\n",
-                                        link, rule, m, head.c_str(), lab.c_str(), note.c_str());
+                                                "axis \"%s\" | note \"%s\" | in force \"%s\"  WRONG\n",
+                                        link, rule, m, head.c_str(), lab.c_str(), note.c_str(), inforce.c_str());
                         same = same && c;
                     }
-            ok("P22", same, "the head of rangeWords is on the axis and in the export note, every scope x rule x mode");
+            ok("P22", same, "rangeWords: the in-force line, the axis (its head) and the export note, every scope x rule x mode");
             app.linkRange = false; app.rangeRule = RR_OneRange; app.compareRangeMode = 2;
             const float u0 = effBlack(*g[0]), u1 = effWhite(*g[0]);
             ok("P22", u0 == g[0]->vmin && u1 == g[0]->vmax &&
@@ -1653,6 +1661,138 @@
             }
             app.linkRange = saveLink; app.linkBlack = saveLB; app.linkWhite = saveLW;
             app.rangeRule = saveRule; app.compareRangeMode = saveCmpR; app.autoFlavor = saveFlav;
+            app.compareMode = saveCmpMode; app.compareFollowFrame = saveFollow;
+            app.compareBUid = saveBUid; app.lastCompareBUid = saveLastB;
+            app.compareB = saveBName; app.compareBSeq = saveBSeq;
+            app.cmpExtra = saveExtra; app.current = saveCurrent;
+        }
+
+        {   // ---- P21 / P23 / P24: the compared sides, writes, and the lamps --
+            const bool saveLink = app.linkRange;
+            const float saveLB = app.linkBlack, saveLW = app.linkWhite;
+            const int saveRule = app.rangeRule, saveCmpR = app.compareRangeMode, saveFlav = app.autoFlavor;
+            const int saveRuleLast = app.compareRuleLast;
+            const auto saveCmpMode = app.compareMode;
+            const bool saveFollow = app.compareFollowFrame;
+            const uint64_t saveBUid = app.compareBUid, saveLastB = app.lastCompareBUid;
+            const std::string saveBName = app.compareB;
+            const int saveBSeq = app.compareBSeq;
+            const std::vector<uint64_t> saveExtra = app.cmpExtra;
+            const int saveCurrent = app.current;
+            const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
+            auto A0 = mkRamp("cs_A0", 100.0f, 400.0f, 4, 2000.0f);
+            auto A1 = mkRamp("cs_A1", 150.0f, 900.0f, 4, 3000.0f);
+            auto B0 = mkRamp("cs_B0", 1000.0f, 1600.0f, 4, 5000.0f);
+            auto B1 = mkRamp("cs_B1", 1100.0f, 1700.0f, 0, 0.0f);
+            A0->seqId = 4280; A0->seqIndex = 0;
+            A1->seqId = 4280; A1->seqIndex = 1;
+            B0->seqId = 4281; B0->seqIndex = 0;
+            B1->seqId = 4281; B1->seqIndex = 1;
+            ImageDoc* a0 = A0.get(); ImageDoc* a1 = A1.get(); ImageDoc* b0 = B0.get(); ImageDoc* b1 = B1.get();
+            a0->black = a1->black = 50.0f;  a0->white = a1->white = 950.0f;
+            b0->black = b1->black = 900.0f; b0->white = b1->white = 1800.0f;
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(A0));
+            pool.push_back(std::move(A1));
+            pool.push_back(std::move(B0));
+            pool.push_back(std::move(B1));
+            std::swap(app.images, pool);
+            App::SeqInfo s0; s0.id = 4280; s0.name = "csA"; app.seqs.push_back(s0);
+            App::SeqInfo s1; s1.id = 4281; s1.name = "csB"; app.seqs.push_back(s1);
+            app.linkRange = false;
+            app.rangeRule = RR_OneRange;
+            app.autoFlavor = AF_MinMax;
+            app.compareRuleLast = 2;
+            app.compareFollowFrame = false;
+            app.cmpExtra.clear();
+            app.current = 0;
+            app.compareMode = App::CmpOff;
+            auto ok = [&](const char* tag, bool c, const char* what) {
+                fprintf(stderr, "rangeselftest: %s %s %s\n", tag, what, c ? "ok" : "WRONG");
+                if (!c) bad++;
+            };
+            auto segs = [&]() {
+                std::string s;
+                for (const RangeSeg& g : rangeScopeSegs(cur())) s += g.label + ",";
+                return s;
+            };
+            // ---- P23: the A+B segment exists only while comparing ----
+            ok("P23", segs() == "frame,stack,all open,", "compare off: frame, stack, all open - no A+B");
+            setCompareB(b0);
+            app.compareMode = App::CmpSplit;
+            app.compareRangeMode = 2;
+            ok("P23", segs() == "frame,stack,A+B,all open,", "compare on: the A+B segment appears");
+            ok("P23", rangeScopeOf(a0) == RS_Compared, "...and the union lights it");
+            setRangeScope(RS_Stack, a0);
+            ok("P23", app.compareRangeMode == 0 && app.compareRuleLast == 2 && rangeScopeOf(a0) == RS_Stack,
+               "stack: compare goes to each keeps its own, the union is remembered");
+            ok("P23", effBlack(*a0) == 50.0f && effWhite(*b0) == 1800.0f,
+               "...and every side shows its own stack's range");
+            setRangeScope(RS_Compared, a0);
+            ok("P23", app.compareRangeMode == 2, "A+B: back to the rule last chosen (union)");
+            {   // a single image offers no frame segment
+                const int sq = a0->seqId; a0->seqId = 0;
+                ok("P23", segs().rfind("stack,", 0) == 0, "a single image: no frame segment");
+                a0->seqId = sq;
+            }
+            // ---- P24: the lamp table ----
+            float eb = effBlack(*a0), ew = effWhite(*a0);
+            ok("P24", rangeButtonLit(*a0, RB_Auto, eb, ew) && !rangeButtonLit(*a0, RB_AutoPct, eb, ew) &&
+                      !rangeButtonEnabled(*a0, RB_AutoPct) && !rangeButtonEnabled(*a0, RB_Median) &&
+                      rangeButtonEnabled(*a0, RB_Auto) && !rangeButtonLit(*a0, RB_0_65535, eb, ew),
+               "union: Auto lit as a fact, Auto % / Med not offered, presets dark");
+            setCompareRule(3);
+            app.autoFlavor = AF_Pct;
+            eb = effBlack(*a0); ew = effWhite(*a0);
+            ok("P24", rangeButtonLit(*a0, RB_AutoPct, eb, ew) && !rangeButtonLit(*a0, RB_Auto, eb, ew) &&
+                      !rangeButtonLit(*a0, RB_Median, eb, ew) && rangeButtonEnabled(*a0, RB_Median),
+               "each side fits itself: the chosen fit is lit, the other two are choices");
+            setCompareRule(0);
+            app.rangeRule = RR_EachFrame;
+            app.autoFlavor = AF_Median;
+            eb = effBlack(*a0); ew = effWhite(*a0);
+            ok("P24", rangeButtonLit(*a0, RB_Median, eb, ew) && !rangeButtonLit(*a0, RB_Auto, eb, ew),
+               "each frame fits itself: Med lit as the chosen fit");
+            a0->black = 0.0f; a0->white = 255.0f;   // a stored preset is not what is drawn
+            ok("P24", !rangeButtonLit(*a0, RB_0_255, effBlack(*a0), effWhite(*a0)),
+               "...and the fixed presets dark");
+            app.rangeRule = RR_OneRange;
+            ok("P24", rangeButtonLit(*a0, RB_0_255, effBlack(*a0), effWhite(*a0)),
+               "one range: the presets by comparison again");
+            a0->rangeOwn = true;
+            a0->black = a0->vmin; a0->white = a0->vmax;
+            ok("P24", rangeButtonLit(*a0, RB_Auto, effBlack(*a0), effWhite(*a0)),
+               "frame exception: Auto compared against the frame itself");
+            a0->rangeOwn = false;
+            a0->black = 50.0f; a0->white = 950.0f;
+            // ---- P21: a written range is a declaration of one range ----
+            app.rangeRule = RR_EachFrame;
+            setRange(*a1, 10.0f, 20.0f);
+            ok("P21", app.rangeRule == RR_OneRange && a0->black == 10.0f && a0->white == 20.0f &&
+                      b0->black == 900.0f,
+               "each frame fits itself + a typed range: rule -> one range, the stack takes it, B does not");
+            setCompareRule(2);
+            setRange(*a0, 0.0f, 255.0f);
+            ok("P21", app.compareRangeMode == 1 && a0->black == 0.0f && a1->white == 255.0f &&
+                      b0->black == 900.0f && b0->white == 1800.0f,
+               "union + 0-255: rule -> A's range, A's stack written, B's numbers untouched");
+            ok("P21", effBlack(*b0) == 0.0f && effWhite(*b0) == 255.0f, "...and B is drawn at A's range");
+            setCompareRule(3);
+            setRange(*b0, 5.0f, 6.0f);
+            ok("P21", app.compareRangeMode == 1 && a0->black == 5.0f && b0->black == 900.0f,
+               "each side fits itself + a write on B: rule -> A's range, the write goes to A's stack");
+            for (int i = 0; i < 2; i++)
+                for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+                    if (it->id == 4280 || it->id == 4281) { app.seqs.erase(it); break; }
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas || app.seqs.size() != seqWas) {
+                fprintf(stderr, "rangeselftest: P23 app.images %zu -> %zu, seqs %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size(), seqWas, app.seqs.size());
+                bad++;
+            }
+            app.linkRange = saveLink; app.linkBlack = saveLB; app.linkWhite = saveLW;
+            app.rangeRule = saveRule; app.compareRangeMode = saveCmpR; app.autoFlavor = saveFlav;
+            app.compareRuleLast = saveRuleLast;
             app.compareMode = saveCmpMode; app.compareFollowFrame = saveFollow;
             app.compareBUid = saveBUid; app.lastCompareBUid = saveLastB;
             app.compareB = saveBName; app.compareBSeq = saveBSeq;

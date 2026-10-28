@@ -537,6 +537,18 @@
                       "T13 a part-loaded stack's counter says n of N, not n of n");
                 t13s->expectedFrames = saveExp;
             }
+            // (d) a frame that keeps its own range (#321) is marked in the
+            // footer, in amber after the name - and only that frame
+            if (cur() && cur()->seqId > 0) {
+                cur()->rangeOwn = true;
+                canvasFrame(1720.0f, 980.0f);
+                const bool marked = g_footerProbe.find("ownrange=1;") != std::string::npos;
+                cur()->rangeOwn = false;
+                canvasFrame(1720.0f, 980.0f);
+                const bool clear = g_footerProbe.find("ownrange=") == std::string::npos;
+                check(marked && clear, "T13 a frame with its own range says [own range] in the footer; "
+                                       "a frame without says nothing");
+            }
             app.compareMode = App::CmpSplit;
             app.compareFollowFrame = saveFollow;
         }

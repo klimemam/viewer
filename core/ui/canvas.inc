@@ -1429,6 +1429,14 @@ static void drawCanvas(ImVec2 avail) {
         dl->AddText(ImVec2(canvasP0.x, botY), IM_COL32(175, 183, 191, 200), name);
         dl->PopClipRect();
         g_footerProbe += std::string("name=") + name + ";";
+        // A frame that keeps its own range (#321) is the stack's exception,
+        // and an exception you cannot see is a trap: marked here, in the
+        // warning amber the [stale] token wears, as well as in the Inspector.
+        if (im->rangeOwn && im->seqId > 0) {
+            static const char* OWN_TOKEN = " [own range]";
+            dl->AddText(ImVec2(canvasP0.x + nameW, botY), IM_COL32(242, 184, 89, 255), OWN_TOKEN);
+            g_footerProbe += "ownrange=1;";
+        }
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
