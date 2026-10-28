@@ -1510,8 +1510,18 @@ struct App {
     // by five with no way to tell which panel is showing what.
     // Auto mirrors the image: CmpSplit puts the images left/right, so the plots
     // go left/right; wipe / blink / diff have ONE image area, so the plots overlay.
+    // Since #320 it governs Histogram and Projection only: Temporal has its own
+    // setting just below.
     enum { AbAuto = 0, AbOverlay = 1, AbSide = 2 };
     int abStatsLayout = AbAuto;
+    // Temporal's layout, its OWN setting (#320, ruled 2026-10-28: "少なくとも
+    // 既定は重ねて表示"). Overlay by default whatever abStatsLayout says - a
+    // time series is read by comparing curves on ONE axis - and Side by side is
+    // still there for the day it is wanted. No Auto: the image arrangement is
+    // not what decides how two time series are best read. A preference, not
+    // session state ("temporallayout", compare.temporalLayout).
+    enum { TlOverlay = 0, TlSide = 1 };
+    int temporalLayout = TlOverlay;
     // Slot 1 of every statistics cache is filled ONLY while compare is on. This
     // records whether it still holds anything, so compare-off invalidates it
     // exactly once and then costs nothing at all.
@@ -1800,6 +1810,16 @@ struct App {
     std::map<uint64_t, uint64_t> hlShown;
 
     // ---- sequences (連番): a stack of frames that supports temporal analysis ----
+    // One per-frame X axis of a stack: what frame i physically IS (elapsed
+    // time, exposure, temperature). NAME + UNIT + one value per frame - a bare
+    // list of numbers cannot label an axis, so all three travel together,
+    // exactly as a series carries name/unit/value for its stack-level parameter
+    // one layer up (docs/series-plan.md). The unit is never defaulted (unset is
+    // unset, never assumed). vals[i] belongs to seqIndex i.
+    struct NamedAxis {
+        std::string name, unit;
+        std::vector<double> vals;
+    };
     struct SeqInfo {
         int id = 0;
         std::string name;             // display name (pattern)
@@ -1944,16 +1964,55 @@ struct App {
         // so that seqAutoReloadMark does not have to parse it back out of one.
         // Set and cleared with autoReloadNote, always together.
         std::string autoReloadWhen;
-        // Per-frame X axis for the Temporal chart: what frame i physically IS
-        // (elapsed time, exposure, temperature). NAME + UNIT + one value per
-        // frame - a bare list of numbers cannot label an axis, so all three
-        // are required, exactly as a series carries name/unit/value for its
-        // stack-level parameter one layer up (docs/series-plan.md). This is
-        // legitimately per-STACK (unlike `level`): the axis maps THIS stack's
-        // frame numbers and nothing else. Empty axisVals = not set - and the
-        // unit is never defaulted (unset is unset, never assumed).
-        std::string axisName, axisUnit;
-        std::vector<double> axisVals;     // axisVals[i] belongs to seqIndex i
+        // The per-frame X axes the Temporal charts can plot against (#314),
+        // NAMED, so a stack can carry time AND exposure AND temperature at
+        // once and each chart picks one. Legitimately per-STACK (unlike
+        // `level`): an axis maps THIS stack's frame numbers and nothing else.
+        // The frame index is the implicit axis every stack has and is never
+        // stored here. Names are unique within a stack: putAxis replaces the
+        // one of the same name. axes[0] is the stack's DEFAULT axis - the one
+        // the first chart and the export use unless told otherwise. Every
+        // reader goes through this vector (and the helpers below); there
+        // is no second spelling of "the stack's axis".
+        //
+        // Where they come from (docs/guides/manual.md §5.2b): a .vnz stack's
+        // timestamps, its covariates, the x axis... dialog and the
+        // .npz picker (both through applyFrameAxisVals), and the session.
+        std::vector<NamedAxis> axes;
+        // "The same name" is the same name to a reader: surrounding blanks do
+        // not count and neither does letter case ("Time" and "time " are one
+        // axis). Names are stored trimmed, with the case they arrived in.
+        static std::string trimName(const std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+        }
+        static bool sameName(const std::string& x, const std::string& y) {
+            const std::string a = trimName(x), b = trimName(y);
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+                    return false;
+            return true;
+        }
+        const NamedAxis* axis(const std::string& n) const {
+            for (const NamedAxis& a : axes) if (sameName(a.name, n)) return &a;
+            return nullptr;
+        }
+        // add, or replace the axis of the same name IN PLACE (its position -
+        // and so which one is the default - does not move). true = replaced.
+        bool putAxis(NamedAxis a) {
+            a.name = trimName(a.name);
+            for (NamedAxis& b : axes)
+                if (sameName(b.name, a.name)) { b = std::move(a); return true; }
+            axes.push_back(std::move(a));
+            return false;
+        }
+        bool dropAxis(const std::string& n) {
+            for (size_t i = 0; i < axes.size(); i++)
+                if (sameName(axes[i].name, n)) { axes.erase(axes.begin() + (long)i); return true; }
+            return false;
+        }
         // Empty on every stack that was OPENED. Filled only on a stack this
         // program COMPUTED with the detrend stage (docs/features/analysis/flat-field-stats.md
         // 判断6): the method, the window, the shading it measured before and
@@ -2061,7 +2120,7 @@ struct App {
                 s.autoReloadWhen.clear();
                 s.refW = s.refH = s.refCh = 0;
                 s.remoteUrl.clear(); s.remoteHost.clear(); s.remoteFiles.clear();
-                s.axisName.clear(); s.axisUnit.clear(); s.axisVals.clear();
+                s.axes.clear();
             }
             v_.swap(fresh);
             rev_++;
@@ -2319,7 +2378,8 @@ struct App {
     // File > Recent Sessions (#307): the named .vsession files saved or opened,
     // most recent first, capped at SESSION_RECENT_MAX (core/app/session.inc).
     // History like rbRecents - prefs.txt carries it, the app writes it - and
-    // never the autosave, which File > Restore last session already opens.
+    // never the autosave, which a start opens by itself and the menu offers in
+    // a row of its own above these (#319).
     std::vector<std::string> sessionRecents;
     using RemoteSearch = browse::RemoteSearch;
     // ==== ONE Browse instance: a view onto ONE place - browse::Instance =====
@@ -2665,11 +2725,24 @@ struct App {
         double fpnCorr[4] = {};
         bool fpnClamped[4] = {};
         std::vector<float> idx, frameMean, frameStd;
+        // The STATE this request was made for, recorded by requestServerTemporal
+        // (#320). B is fired automatically once per (stack, state), and "has
+        // this state been asked already?" is a comparison against these: the
+        // stack's data revision, its mosaic (the interpretation the peer is
+        // told), and the selected region as the local Temporal resolves it -
+        // the ROI is one of the ruling's triggers even though the wire carries
+        // no rect today (rx..rh above record what was actually measured).
+        int keyRev = -1, keyCfa = -1, keyCfaPattern = -1;
+        int keyRx = 0, keyRy = 0, keyRw = 0, keyRh = 0;
+        bool keyPoi = false;
     } srvTemporal;
-    // The same, for the compare B side. NEVER fired automatically: a server
-    // aggregate is a real job on a real machine, and B following A around
-    // would double them silently. The Temporal panel's "Measure B" button is
-    // the only thing that fills this.
+    // The same, for the compare B side. Fired AUTOMATICALLY since #320 (ruled
+    // 2026-10-28, reversing ab-stats-plan §4's "never on its own"): on the
+    // triggers A has - B chosen, B's stack changed, the ROI or the mosaic
+    // changed - and ONCE per (stack, state): never while a request is pending
+    // and never when the slot already holds an answer, or a failure, for that
+    // state. A failure is retried by hand from the line that reports it.
+    // ensureServerTemporalB (core/ui/panel_temporal.inc) is the trigger.
     ServerTemporal srvTemporalB;
     // background loader
     std::thread seqThread;
@@ -2816,10 +2889,9 @@ struct App {
     // is actually created.
     struct SeqRestore { uint64_t uid; std::vector<std::string> files; std::string pattern;
                         std::string name;
-                        // the session's per-frame x axis, applied with the name
+                        // the session's per-frame x axes, applied with the name
                         // once the stack exists (same window, same fix)
-                        std::string axisName, axisUnit;
-                        std::vector<double> axisVals;
+                        std::vector<NamedAxis> axes;
                         // docs/reference-design.md §5.2: `files` came from the
                         // session's own `stackmember` lines, not from a sibling
                         // scan - i.e. this stack's membership was an EXPLICIT
@@ -3503,6 +3575,29 @@ struct App {
     // cache, same key: a slot only pays for a recompute when its STACK or the
     // ROI changes, so N slots cost N cached lookups per frame, not N passes.
     std::vector<TemporalState> temporalExtra;
+    // The Temporal panel's charts, stacked top to bottom (#314). The table,
+    // the legend and the side colours belong to the PANEL; what a chart owns
+    // is its x axis and its zoom. Never empty: the last chart cannot be
+    // removed. Saved in the SESSION, not prefs - an axis choice names an axis
+    // of the data, and another set of stacks need not have one by that name.
+    struct TemporalChart {
+        enum XKind { XDefault = 0, XFrame = 1, XNamed = 2 };
+        // a panel splits its height between its charts; past this many each
+        // one is at its height floor and another adds nothing readable
+        static constexpr int kMax = 6;
+        // XDefault = each side's default axis (axes[0]) under the one-axis
+        // rule - what the single chart always did; XFrame = the frame index;
+        // XNamed = the axis called `xName` on every side that has it.
+        int xKind = XDefault;
+        std::string xName;
+        // Box zoom. Keyed (zoomSig) to what is on the axes - A's document and
+        // the x label - so a zoom in seconds does not survive a switch to
+        // another stack or axis, where the same numbers mean something else.
+        bool zoomOn = false;
+        float zx0 = 0, zx1 = 1, zy0 = 0, zy1 = 1;
+        std::string zoomSig;
+    };
+    std::vector<TemporalChart> tcharts = std::vector<TemporalChart>(1);
     // H/V projections (line profiles) of the selected ROI / whole image
     struct ProjState {
         const ImageDoc* img = nullptr;

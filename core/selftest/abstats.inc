@@ -510,6 +510,29 @@
             app.abStatsLayout = keep;
             app.compareMode = App::CmpSplit;
         }
+        {   // #320: Temporal has its OWN layout, and a fresh start puts it on
+            // overlay - the ruling's default - while the shared one stays Auto.
+            // Read off a freshly constructed App, so it is the in-class default
+            // and not whatever an earlier group or prefs.txt left in `app`.
+            std::unique_ptr<App> fresh(new App());
+            const int keepTL = app.temporalLayout, keepAB = app.abStatsLayout;
+            app.temporalLayout = fresh->temporalLayout;
+            app.abStatsLayout = App::AbSide;
+            const bool tOver = !temporalSideBySide();
+            app.temporalLayout = App::TlSide;
+            const bool tSide = temporalSideBySide();
+            app.abStatsLayout = App::AbAuto;
+            fprintf(stderr, "abstatsselftest: P1t fresh temporalLayout=%d abStatsLayout=%d; "
+                            "temporal side under abStats=Side with the default: %d, "
+                            "chosen side: %d\n", fresh->temporalLayout,
+                    fresh->abStatsLayout, tOver ? 0 : 1, tSide ? 1 : 0);
+            check(fresh->temporalLayout == App::TlOverlay && fresh->abStatsLayout == App::AbAuto,
+                  "P1t a fresh start: Temporal on overlay, Histogram / Projection on Auto");
+            check(tOver && tSide,
+                  "P1t Temporal answers its own setting, not abStatsLayout = Side by side");
+            app.temporalLayout = keepTL;
+            app.abStatsLayout = keepAB;
+        }
 
         // ---- P2: a B that does not share A's axis must never be overlaid ----
         {
@@ -697,10 +720,94 @@
                       "P3b with no ROI both sides say whole image");
             }
             check(abDeltaMeaningful(cur(), b7), "P3 equal channel counts allow a delta");
-            // B's server aggregate must never have been fired on its own
+            // a LOCAL B stack is measured here: nothing goes to a server for it
+            ensureServerTemporalB(cmpB());     // what the main loop calls
             check(app.srvTemporalB.token == 0 && !app.srvTemporalB.pending &&
                   app.srvTemporalB.seqId == -1,
-                  "P3 B's server temporal is never fired automatically");
+                  "P3 a local B stack fires no server temporal");
+        }
+        // ---- P3c: B's server aggregate runs ON ITS OWN, once per state (#320) ----
+        // B used to be a "Measure B" button. The ruling: automatic, on A's
+        // triggers (B chosen, B's stack changed, ROI / interpretation changed),
+        // and never twice for one (stack, state). B is made server-computed by
+        // giving its stack a peer url, and the request function is FAKED so the
+        // test counts requests without a peer: the fake does exactly the slot
+        // half of the real one (serverTemporalArm) and puts nothing on a wire.
+        {
+            static int s_bReqs = 0;
+            s_bReqs = 0;
+            auto* keepFn = g_serverTemporalBRequest;
+            g_serverTemporalBRequest = [](int sid, App::ServerTemporal& S) {
+                s_bReqs++;
+                serverTemporalArm(sid, S);
+            };
+            App::SeqInfo* sbi = seqInfo(sidB);
+            const std::string keepUrl = sbi ? sbi->remoteUrl : std::string();
+            const int keepPolicy = app.procPolicy;
+            const int keepSel = app.selectedAnn;
+            app.procPolicy = App::PolAuto;
+            app.selectedAnn = 0;
+            if (sbi) sbi->remoteUrl = "rp://selftest.invalid:1/b";
+            app.srvTemporalB = App::ServerTemporal{};
+            selectImage(frA.front());
+            setCompareB(app.images[framesOfSeq(sidB).front()].get());
+            app.compareMode = App::CmpSplit;
+            auto frames = [&](int n) {          // n main-loop frames
+                for (int i = 0; i < n; i++) { abStatsFrame(); ensureServerTemporalB(cmpB()); }
+            };
+            frames(5);
+            const int afterStart = s_bReqs;
+            const bool pendingForB = app.srvTemporalB.pending && app.srvTemporalB.seqId == sidB;
+            // no ROI is keyed as 0x0 and not as the frame's size: a remote B
+            // with no frame here yet, whose first frame then lands, is the SAME
+            // state and must not be asked for twice
+            const bool wholeIs0 = app.srvTemporalB.keyRx == 0 && app.srvTemporalB.keyRy == 0 &&
+                                  app.srvTemporalB.keyRw == 0 && app.srvTemporalB.keyRh == 0;
+            // the answer lands (as pumpMeasure files it), and frames go on
+            app.srvTemporalB.pending = false;
+            app.srvTemporalB.valid = true;
+            frames(5);
+            const int afterAnswer = s_bReqs;
+            // ...and a refusal is not re-sent on its own either (retry is a click)
+            app.srvTemporalB.valid = false;
+            app.srvTemporalB.err = "refused";
+            frames(5);
+            const int afterFail = s_bReqs;
+            // the ROI moves: a new state, so ONE new request - and only one
+            app.srvTemporalB.err.clear();
+            app.srvTemporalB.valid = true;
+            addAnn(0, 1, 1, 8, 8);
+            frames(5);
+            const int afterRoi = s_bReqs;
+            const bool roiKeyed = app.srvTemporalB.keyRw == 8 && app.srvTemporalB.keyRh == 8;
+            // B's stack data changes (a reload bumps stackRev): one more
+            app.srvTemporalB.pending = false;
+            app.srvTemporalB.valid = true;
+            if (sbi) sbi->stackRev++;
+            frames(5);
+            const int afterRev = s_bReqs;
+            fprintf(stderr, "abstatsselftest: P3c B server requests: start %d (pending for B "
+                            "%d), after answer %d, after failure %d, after ROI %d (keyed "
+                            "%dx%d), after stackRev %d\n",
+                    afterStart, pendingForB ? 1 : 0, afterAnswer, afterFail, afterRoi,
+                    app.srvTemporalB.keyRw, app.srvTemporalB.keyRh, afterRev);
+            check(afterStart == 1 && pendingForB,
+                  "P3c starting compare with a server-computed B asks for B once, by itself");
+            check(wholeIs0,
+                  "P3c ...keyed as the whole frame (0x0), with or without a frame here");
+            check(afterAnswer == 1,
+                  "P3c ...and never again while that state's answer is held");
+            check(afterFail == 1,
+                  "P3c ...nor after a failure for the same state (retry is by hand)");
+            check(afterRoi == 2 && roiKeyed,
+                  "P3c changing the ROI asks again, exactly once");
+            check(afterRev == 3, "P3c a change to B's stack data asks again, exactly once");
+            deleteAnn(app.selectedAnn);
+            if (sbi) { sbi->stackRev--; sbi->remoteUrl = keepUrl; }
+            app.selectedAnn = keepSel;
+            app.procPolicy = keepPolicy;
+            app.srvTemporalB = App::ServerTemporal{};
+            g_serverTemporalBRequest = keepFn;
         }
         {   // a B that is not a stack, and a B with a different channel count
             std::string root = g_abstatsSelftest;
@@ -785,6 +892,8 @@
                 return false;
             };
             const int saveLayout = app.abStatsLayout, saveMode = app.compareMode;
+            const int saveTLayout = app.temporalLayout;
+            app.temporalLayout = App::TlOverlay;   // the default, stated
 
             // T1: two stacks, overlaid. Both curves on one axis, and the plot
             // INSIDE the panel - the check the reported symptom needed.
@@ -813,16 +922,49 @@
             // typed in: below that threshold the layout is SUPPOSED to fall
             // back to an overlay, and a hard-coded width would make this check
             // a test of the machine's DPI setting.
-            app.abStatsLayout = App::AbSide;
+            // Since #320 that is Temporal's OWN setting, not abStatsLayout.
             const float sideW = AB_MIN_SIDE * app.uiScale * 2 + 120.0f;
+            // T1c first: the default is overlay WHATEVER abStatsLayout says -
+            // Auto over split (which lays Histogram / Projection side by side)
+            // and an explicit Side by side alike. A panel this wide would
+            // really lay out side by side, so an overlay here is the setting's
+            // answer and not the narrow fallback.
+            {
+                bool overAuto = false, overSide = false;
+                int nAuto = 0, nSide = 0;
+                app.abStatsLayout = App::AbAuto;          // split -> H/P side by side
+                temporalFrame(sideW, 440.0f);
+                overAuto = !g_tchart.sideBySide;
+                nAuto = (ptsOf('A') >= 2) + (ptsOf('B') >= 2);
+                app.abStatsLayout = App::AbSide;
+                temporalFrame(sideW, 440.0f);
+                overSide = !g_tchart.sideBySide;
+                nSide = (ptsOf('A') >= 2) + (ptsOf('B') >= 2);
+                fprintf(stderr, "abstatsselftest: T1c temporal default %.0fx440: "
+                                "abStats=Auto(split) overlay=%d curves=%d, abStats=Side "
+                                "overlay=%d curves=%d (H/P side=%d)\n",
+                        sideW, overAuto ? 1 : 0, nAuto, overSide ? 1 : 0, nSide,
+                        abSideBySide() ? 1 : 0);
+                check(overAuto && nAuto == 2,
+                      "T1c Temporal overlays by default under abStatsLayout = Auto (split)");
+                check(overSide && nSide == 2 && abSideBySide(),
+                      "T1c ...and under abStatsLayout = Side by side, which still lays "
+                      "Histogram / Projection side by side");
+            }
+            app.abStatsLayout = App::AbOverlay;       // ...and the reverse: it is
+            app.temporalLayout = App::TlSide;         // Temporal's own switch
             temporalFrame(sideW, 440.0f);
             fprintf(stderr, "abstatsselftest: T1b side-by-side %.0fx440 (uiScale %.2f): "
                             "side=%d A=%d B=%d plot bottom=%.1f window bottom=%.1f\n",
                     sideW, app.uiScale, g_tchart.sideBySide ? 1 : 0, ptsOf('A'),
                     ptsOf('B'), g_tchart.plotBot, g_tchart.winBot);
             check(g_tchart.sideBySide && ptsOf('A') >= 2 && ptsOf('B') >= 2,
-                  "T1b side by side: each side gets its own curve");
+                  "T1b Temporal side by side (its own setting): one plot per side, "
+                  "each with its curve");
+            check(!abSideBySide(),
+                  "T1b ...while Histogram / Projection stay overlaid as abStatsLayout says");
             check(temporalChartVisible(), "T1b ...and both plots fit in the panel");
+            app.temporalLayout = App::TlOverlay;
             app.abStatsLayout = App::AbOverlay;
 
             // T2: B is a lone frame. A's chart must survive, and the panel must
@@ -959,7 +1101,226 @@
             check(g_tchart.plotted && ptsOf('A') >= 2 && temporalChartVisible(),
                   "T4 compare off: the one-sided chart is drawn and fits");
 
+            // T7 (#314): several charts in the one panel, each on its own x
+            // with its own zoom. A carries two named axes - exposure FIRST, so
+            // a chart that ignored its own choice and fell to the default
+            // would plot exposure where time was asked for.
+            {
+                const std::vector<App::TemporalChart> chartsBefore = app.tcharts;
+                App::SeqInfo* sa = seqInfo(sidA);
+                App::SeqInfo* sb = seqInfo(sidB);
+                const std::vector<App::NamedAxis> axA = sa ? sa->axes : std::vector<App::NamedAxis>{};
+                const std::vector<App::NamedAxis> axB = sb ? sb->axes : std::vector<App::NamedAxis>{};
+                const int expA = sa ? sa->expectedFrames : 0;
+                const int nA = (int)framesOfSeq(sidA).size();
+                std::vector<double> tVals, eVals;
+                for (int k = 0; k < nA; k++) { tVals.push_back(10.0 * k); eVals.push_back(1.0 + k); }
+                if (sa) {
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", eVals });
+                    sa->putAxis({ "time", "s", tVals });
+                }
+                if (sb) sb->axes.clear();
+                auto xsAre = [&](int ci, const std::vector<double>& want) {
+                    const TemporalChartProbe::Chart& p = g_tchart.ch[ci];
+                    if (p.nX != (int)want.size()) return false;
+                    for (int k = 0; k < p.nX; k++)
+                        if (fabs(p.xs[k] - want[(size_t)k]) > 1e-4) return false;
+                    return true;
+                };
+                std::vector<double> idxVals;
+                for (int k = 0; k < nA; k++) idxVals.push_back(k);
+                auto chartLine = [&](const char* tag) {
+                    for (int ci = 0; ci < g_tchart.nCharts; ci++) {
+                        const TemporalChartProbe::Chart& p = g_tchart.ch[ci];
+                        fprintf(stderr, "abstatsselftest: %s chart %d: plotted=%d custom=%d "
+                                        "x '%s' [%.4g..%.4g] zoomed=%d fellBack=%d lent=%d "
+                                        "canRemove=%d nX=%d x1=%.4g y %.1f..%.1f\n", tag, ci,
+                                p.plotted ? 1 : 0, p.custom ? 1 : 0, p.xlabel, p.xmin, p.xmax,
+                                p.zoomed ? 1 : 0, p.fellBack ? 1 : 0, p.lent ? 1 : 0,
+                                p.canRemove ? 1 : 0, p.nX, p.nX > 1 ? p.xs[1] : -1.0f,
+                                p.top, p.bot);
+                    }
+                };
+
+                // T7a: one stack, two charts - frame index above, time below
+                app.compareMode = App::CmpOff;
+                abStatsFrame();
+                selectImage(frA.front());
+                app.tcharts.assign(2, App::TemporalChart{});
+                app.tcharts[0].xKind = App::TemporalChart::XFrame;
+                app.tcharts[1].xKind = App::TemporalChart::XNamed;
+                app.tcharts[1].xName = "time";
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7a");
+                check(g_tchart.nCharts == 2 && g_tchart.ch[0].plotted && g_tchart.ch[1].plotted,
+                      "T7a two charts in the one panel, both drawn");
+                check(!g_tchart.ch[0].custom && xsAre(0, idxVals) &&
+                      std::string(g_tchart.ch[0].xlabel) == "frame number (index in stack)",
+                      "T7a ...the first on the frame index: its x are the frame numbers");
+                check(g_tchart.ch[1].custom && xsAre(1, tVals) &&
+                      std::string(g_tchart.ch[1].xlabel) == "time (s)",
+                      "T7a ...the second on the axis IT chose (time, not the default exposure)");
+                check(g_tchart.ch[0].bot <= g_tchart.ch[1].top && temporalChartVisible(),
+                      "T7a ...stacked top to bottom, and both inside the panel");
+                check(g_tchart.ch[0].canRemove && g_tchart.ch[1].canRemove,
+                      "T7a ...each with a live remove button");
+
+                // T7b: zoom one chart - the other keeps its whole range
+                app.tcharts[1].zoomOn = true;
+                app.tcharts[1].zx0 = 10.0f; app.tcharts[1].zx1 = 20.0f;
+                app.tcharts[1].zy0 = -1e6f; app.tcharts[1].zy1 = 1e6f;
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7b");
+                check(g_tchart.ch[1].zoomed && fabsf(g_tchart.ch[1].xmin - 10.0f) < 1e-3f &&
+                      fabsf(g_tchart.ch[1].xmax - 20.0f) < 1e-3f,
+                      "T7b a zoomed chart draws its own zoom range");
+                check(!g_tchart.ch[0].zoomed && fabsf(g_tchart.ch[0].xmin) < 1e-3f &&
+                      fabsf(g_tchart.ch[0].xmax - (float)(nA - 1)) < 1e-3f,
+                      "T7b ...and the other chart is NOT zoomed: zoom is per chart");
+
+                // T7c: remove the first; the last one cannot go
+                bool rm1 = tchartRemove(0);
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7c");
+                check(rm1 && app.tcharts.size() == 1 && g_tchart.nCharts == 1 &&
+                      g_tchart.ch[0].custom && xsAre(0, tVals),
+                      "T7c remove takes that chart away; the other stays as it was");
+                bool rm2 = tchartRemove(0);
+                check(!rm2 && app.tcharts.size() == 1 && !g_tchart.ch[0].canRemove,
+                      "T7c the last chart cannot be removed (its button is dead)");
+                // "+ chart" picks an axis no chart shows yet
+                tchartAdd({ "exposure", "time" }, "exposure");
+                check(app.tcharts.size() == 2 &&
+                      app.tcharts[1].xKind == App::TemporalChart::XNamed &&
+                      app.tcharts[1].xName == "exposure",
+                      "T7c + chart opens on an axis no chart is showing");
+
+                // T7d: compare - A has time, B has none, same length: lent on
+                // the time chart. The OTHER chart is on a named axis both sides
+                // carry (exposure, B's values its own), so "one chart falls
+                // back or lends -> every chart does" would show on it: a
+                // frame-index chart looks the same either way.
+                const int nB = (int)framesOfSeq(sidB).size();
+                const int nBx = std::max(sb ? sb->expectedFrames : 0, nB);
+                if ((sb = seqInfo(sidB))) {
+                    std::vector<double> eB;
+                    for (int k = 0; k < nBx; k++) eB.push_back(2.0 + k);
+                    sb->putAxis({ "exposure", "ms", eB });
+                }
+                app.tcharts.assign(2, App::TemporalChart{});
+                app.tcharts[0].xKind = App::TemporalChart::XNamed;
+                app.tcharts[0].xName = "exposure";
+                app.tcharts[1].xKind = App::TemporalChart::XNamed;
+                app.tcharts[1].xName = "time";
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                app.compareMode = App::CmpSplit;
+                app.abStatsLayout = App::AbOverlay;
+                abStatsFrame();
+                const bool sameLen = framesOfSeq(sidB).size() == (size_t)nA;
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7d");
+                check(sameLen && g_tchart.ch[1].custom && g_tchart.ch[1].lent &&
+                      !g_tchart.ch[1].fellBack && xsAre(1, tVals),
+                      "T7d B without time, same length: the time chart lends A's and says so");
+                check(std::string(g_tchart.ch[1].lendNote).find("B: no time of its own") !=
+                          std::string::npos,
+                      "T7d ...in the words for a side that LACKS the axis");
+                check(g_tchart.ch[0].custom && !g_tchart.ch[0].lent &&
+                      !g_tchart.ch[0].fellBack && xsAre(0, eVals),
+                      "T7d ...and the exposure chart is not touched by it: on its own axis, "
+                      "nothing lent");
+                check(temporalChartVisible(), "T7d ...both compare charts inside the panel");
+
+                // T7d': the spread line under a zoomed time chart names the
+                // TIME window and counts the frames whose time is inside it
+                // (t = 10, 20: frames 1 and 2), not frame numbers 10..20
+                app.tcharts[1].zoomOn = true;
+                app.tcharts[1].zx0 = 10.0f; app.tcharts[1].zx1 = 20.0f;
+                app.tcharts[1].zy0 = -1e6f; app.tcharts[1].zy1 = 1e6f;
+                temporalFrame(560.0f, 800.0f);
+                fprintf(stderr, "abstatsselftest: T7d' spread A: n=%d window [%.4g..%.4g]\n",
+                        g_tchart.ch[1].spreadN, g_tchart.ch[1].spreadX0,
+                        g_tchart.ch[1].spreadX1);
+                check(g_tchart.ch[1].zoomed && g_tchart.ch[1].spreadN == 2 &&
+                      fabsf(g_tchart.ch[1].spreadX0 - 10.0f) < 1e-3f &&
+                      fabsf(g_tchart.ch[1].spreadX1 - 20.0f) < 1e-3f,
+                      "T7d' spread line on a zoomed time chart: cut by the chart's own x");
+                app.tcharts[1].zoomOn = false;
+
+                // T7e: A's time now covers a frame count B does not have: that
+                // chart alone falls back to frame index and says why
+                if (sa) {
+                    sa = seqInfo(sidA);
+                    sa->expectedFrames = nA + 1;
+                    std::vector<double> t2 = tVals, e2 = eVals;
+                    t2.push_back(10.0 * nA); e2.push_back(1.0 + nA);
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", e2 });
+                    sa->putAxis({ "time", "s", t2 });
+                }
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7e");
+                check(!g_tchart.ch[1].custom && g_tchart.ch[1].fellBack && xsAre(1, idxVals),
+                      "T7e different length: only that chart falls to frame index, with a notice");
+                check(std::string(g_tchart.ch[1].notice).find("B has no such axis") !=
+                          std::string::npos,
+                      "T7e ...the notice says B LACKS the axis");
+                check(g_tchart.ch[0].plotted && g_tchart.ch[0].custom &&
+                      !g_tchart.ch[0].fellBack && xsAre(0, eVals),
+                      "T7e ...and the other chart is unaffected: still on exposure");
+
+                // T7f: B HAS time, at the wrong length - a different fact from
+                // lacking it, and the lend says which
+                if ((sa = seqInfo(sidA))) {
+                    sa->expectedFrames = expA;
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", eVals });
+                    sa->putAxis({ "time", "s", tVals });
+                }
+                std::vector<double> tB;
+                for (int k = 0; k + 1 < nBx; k++) tB.push_back(5.0 * k);
+                if ((sb = seqInfo(sidB))) sb->putAxis({ "time", "s", tB });
+                char odd[96];
+                snprintf(odd, sizeof odd, "%d value(s) for %d frame(s)", nBx - 1, nBx);
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7f");
+                fprintf(stderr, "abstatsselftest: T7f lend: '%s'\n", g_tchart.ch[1].lendNote);
+                const std::string lend7f = g_tchart.ch[1].lendNote;
+                check(g_tchart.ch[1].lent && xsAre(1, tVals) &&
+                      lend7f.find(std::string("B: its time has ") + odd) != std::string::npos &&
+                      lend7f.find("no time of its own") == std::string::npos,
+                      "T7f B's time has the wrong count: lent, and the note names the counts "
+                      "(not 'no time of its own')");
+
+                // T7g: ...and when A's cannot be lent either, the notice keeps
+                // the same distinction
+                if ((sa = seqInfo(sidA))) {
+                    sa->expectedFrames = nA + 1;
+                    std::vector<double> t2 = tVals, e2 = eVals;
+                    t2.push_back(10.0 * nA); e2.push_back(1.0 + nA);
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", e2 });
+                    sa->putAxis({ "time", "s", t2 });
+                }
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7g");
+                fprintf(stderr, "abstatsselftest: T7g notice: '%s'\n", g_tchart.ch[1].notice);
+                const std::string note7g = g_tchart.ch[1].notice;
+                check(g_tchart.ch[1].fellBack &&
+                      note7g.find(std::string("B has it but ") + odd) != std::string::npos &&
+                      note7g.find("no such axis") == std::string::npos,
+                      "T7g cannot lend: the notice says B HAS time at the wrong count "
+                      "(not 'no such axis')");
+
+                if ((sa = seqInfo(sidA))) { sa->axes = axA; sa->expectedFrames = expA; }
+                if ((sb = seqInfo(sidB))) sb->axes = axB;
+                app.tcharts = chartsBefore;
+            }
+
             app.abStatsLayout = saveLayout;
+            app.temporalLayout = saveTLayout;
             app.compareMode = saveMode;
             selectImage(frA.front());
             setCompareB(app.images[framesOfSeq(sidB).front()].get());
@@ -1554,11 +1915,19 @@
             // fails against every build before this change: the table stopped
             // at B because hist[] did.
             app.abStatsLayout = App::AbOverlay;
+            // Temporal's own layout (#320) set the OTHER way on purpose, through
+            // N3 below: Histogram / Projection answer abStatsLayout and nothing
+            // else, so this must not lay them side by side
+            const int keepTL = app.temporalLayout;
+            app.temporalLayout = App::TlSide;
             histFrame();
             std::string pOver = g_histSideProbe;
             fprintf(stderr, "abstatsselftest: N1 overlay probe '%s'\n", pOver.c_str());
             check(rowsOf(pOver) == "ABCD",
                   "N1 the statistics table gives A, B, C and D a row each");
+            check(field(pOver, "layout=") == "overlay",
+                  "N1 ...overlaid as abStatsLayout says, with Temporal's own set to "
+                  "side by side (#320: it does not reach the histogram)");
             check(field(pOver, "curves=") == "ABCD",
                   "N1 ...and one plane on the axis puts all four on the plot");
             std::string unsaid;
@@ -1596,6 +1965,7 @@
             //
             // Width is part of the fixture: four panes need 4 * AB_MIN_SIDE.
             app.abStatsLayout = App::AbSide;
+            app.temporalLayout = App::TlOverlay;   // the other way again (#320)
             // AB_MIN_SIDE is LOGICAL px and the floor is compared against the
             // DPI-scaled one, so the fixture has to scale too - on a 150%
             // display four 320 px panes need 1920, not 1280.
@@ -1615,8 +1985,9 @@
             check(accountedFor(pSide, unsaid),
                   "N3 every slot with numbers is drawn or named");
             // ...and the Projection panel answers the same question the same
-            // way, off the same abSideBySide(): one setting, every panel, so a
-            // comparison laid out on the image is laid out in both of them.
+            // way, off the same abSideBySide(): one setting for both distribution
+            // panels (Temporal has its own since #320), so a comparison laid out
+            // on the image is laid out in both of them.
             projFrameW(wide4);
             std::string pSideP = g_projSideProbe;
             fprintf(stderr, "abstatsselftest: N3 projection side-by-side probe '%s'\n",
@@ -1639,6 +2010,7 @@
             check(rowsOf(pNarrow) == "ABCD" && accountedFor(pNarrow, unsaid),
                   "N3b ...and loses nobody on the way");
             app.abStatsLayout = App::AbOverlay;
+            app.temporalLayout = keepTL;
 
             // N4: past the palette. slotInk tells slotInkCount() slots apart
             // and then its modulo hands slot H back A's green - two slots in
@@ -4243,6 +4615,101 @@
                     check(hA.size() == 4 && hA[0].rfind("R in view", 0) == 0,
                           "C31 one side alone names the plane and nothing else");
                 }
+                app.proj[1] = App::ProjState{};
+            }
+
+            // ======================================================================
+            // C32 - THE TABLE'S NUMBERS LINE UP ON THE POINT (issue #313). B is A
+            // at a hundredth of the level, so every value column holds numbers two
+            // orders of magnitude apart - "510.2" over "5.1". Drawn for real, both
+            // layouts: each column's "." is at ONE screen x for every row of it,
+            // every number carries the column's decimals, and stepping B to a
+            // frame whose numbers differ in the fourth digit moves no point.
+            // numalign.inc holds the rule itself; this holds the PANEL to it.
+            // ======================================================================
+            {
+                auto mkNum = [&](const char* nm, float scale) {
+                    auto d = mkFrame(nm, 16, 16, 0, 1);
+                    // a checkerboard on top, so the residual (RN) is not zero and
+                    // the HFPN/RN and VFPN/RN columns have numbers to align too
+                    for (int y = 0; y < 16; y++)
+                        for (int x = 0; x < 16; x++)
+                            d->px()[(size_t)y * 16 + x] =
+                                scale * (500.0f + (float)(x % 89) + (float)(y % 7) +
+                                         (((x ^ y) & 1) ? 3.0f : -3.0f));
+                    computeMinMax(*d);
+                    return d;
+                };
+                app.images.clear();
+                app.images.push_back(mkNum("na_A", 1.0f));
+                app.images.push_back(mkNum("na_B", 0.01f));
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                // per column: is every "." at one x, with one count of decimals?
+                std::map<std::string, float> pointAt;
+                auto columnsAligned = [&](const char* tag, size_t wantCols, bool keepPoints) {
+                    std::map<std::string, std::vector<const NumAlignProbe*>> by;
+                    for (const NumAlignProbe& p : g_numAlignProbe) by[p.col].push_back(&p);
+                    bool all = by.size() == wantCols;
+                    for (const auto& kv : by) {
+                        const NumAlignProbe& p0 = *kv.second[0];
+                        bool same = kv.second.size() >= 2;
+                        std::string line;
+                        for (const NumAlignProbe* p : kv.second) {
+                            same &= fabsf(p->pointX - p0.pointX) < 0.01f &&
+                                    p->fracDigits == p0.fracDigits;
+                            line += " " + p->text;
+                        }
+                        fprintf(stderr, "abstatsselftest: C32 %s %-14s x=%.2f dec=%d:%s\n", tag,
+                                kv.first.c_str(), p0.pointX, p0.fracDigits, line.c_str());
+                        all &= same;
+                        if (keepPoints) pointAt[kv.first] = p0.pointX;
+                    }
+                    return all;
+                };
+                auto lengthsDiffer = [&](const char* col) {
+                    std::set<size_t> lens;
+                    for (const NumAlignProbe& p : g_numAlignProbe)
+                        if (p.col == col) lens.insert(p.text.size());
+                    return lens.size() >= 2;
+                };
+                draw();
+                {
+                    const std::string pr = field(g_projSideProbe, "planerows=");
+                    fprintf(stderr, "abstatsselftest: C32 rows '%s'\n", pr.c_str());
+                    check(std::count(pr.begin(), pr.end(), '@') == 2 &&
+                          pr.find("@A") != std::string::npos && pr.find("@B") != std::string::npos,
+                          "C32 fixture: one plane on each of two sides, wide table");
+                }
+                check(columnsAligned("wide", 12, true),
+                      "C32 wide: every column's '.' at one x, one count of decimals");
+                check(lengthsDiffer("mean"),
+                      "C32 ...over numbers of different lengths (510.2 over 5.1) - not vacuous");
+                // a step: B's next frame differs in the fourth digit, the shape holds
+                {
+                    ImageDoc* b = app.images[1].get();
+                    for (float& v : b->px()) v *= 1.0007f;
+                    b->dataRev++;
+                    computeMinMax(*b);
+                }
+                app.abStepBusyUntil = 0;
+                const std::map<std::string, float> before = pointAt;
+                draw();
+                bool still = columnsAligned("stepped", 12, true);
+                for (const auto& kv : before)
+                    still &= pointAt.count(kv.first) && fabsf(pointAt[kv.first] - kv.second) < 0.01f;
+                check(still, "C32 a frame step that moves the fourth digit moves no '.'");
+                app.projStatLayout = 2;                      // per axis
+                draw();
+                check(columnsAligned("per-axis", 7, false),
+                      "C32 per axis: every column's '.' at one x, one count of decimals");
+                app.projStatLayout = 1;
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
                 app.proj[1] = App::ProjState{};
             }
 

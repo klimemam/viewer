@@ -158,29 +158,25 @@ static std::string projNoiseStatus(const App::ProjState& P, int plane) {
     return s;
 }
 
-static std::string projNoiseValue(const App::ProjState& P, int plane,
-                                  bool row, bool display = false) {
+// The clipboard spelling. The table spells the same value through
+// projNoiseCell and its column (issue #313), so there is no display mode here.
+static std::string projNoiseValue(const App::ProjState& P, int plane, bool row) {
     if (plane < 0 || plane >= P.nSeries || plane >= 4) return "-";
     const auto& n = P.noise[(size_t)plane];
     if (!n.ratioValid()) return "-";
     char buf[80];
-    const double value = row ? n.rowRatio() : n.colRatio();
-    if (display && app.projDecimals >= 0)
-        snprintf(buf, sizeof buf, "%.*f", std::clamp(app.projDecimals, 0, 6), value);
-    else snprintf(buf, sizeof buf, display ? "%.6g" : "%.9g", value);
-    return std::string(buf) + (display && n.clamped() ? "*" : "");
+    snprintf(buf, sizeof buf, "%.9g", row ? n.rowRatio() : n.colRatio());
+    return buf;
 }
 
-static void drawProjNoiseCell(const App::ProjState& P, int plane, bool row) {
-    textNumStr(projNoiseValue(P, plane, row, true));
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s = %s / pixel residual sigma. Dimensionless.\n"
-                          "One-frame spatial estimate for a flat field, NOT a separation\n"
-                          "of fixed pattern and temporal/read noise. H/V vendor names vary.\n"
-                          "Computed from full ROI means, even when plot reduce is max/min.\n%s",
-                          row ? "HFPN/RN" : "VFPN/RN",
-                          row ? "row (horizontal banding) sigma" : "column (vertical banding) sigma",
-                          projNoiseStatus(P, plane).c_str());
+static void projNoiseTooltip(const App::ProjState& P, int plane, bool row) {
+    ImGui::SetTooltip("%s = %s / pixel residual sigma. Dimensionless.\n"
+                      "One-frame spatial estimate for a flat field, NOT a separation\n"
+                      "of fixed pattern and temporal/read noise. H/V vendor names vary.\n"
+                      "Computed from full ROI means, even when plot reduce is max/min.\n%s",
+                      row ? "HFPN/RN" : "VFPN/RN",
+                      row ? "row (horizontal banding) sigma" : "column (vertical banding) sigma",
+                      projNoiseStatus(P, plane).c_str());
 }
 
 // One side of the Projection panel: A, B, or a lettered slot. Built ONCE, above
@@ -265,8 +261,63 @@ static std::string projTsvRow(const App::ProjState& S, const char* side, bool st
            projNoiseValue(S, i, false) + "\t" + projNoiseStatus(S, i) + "\n";
 }
 
+// One value cell of the statistics tables: a number, "-", or the pending word.
+// Decided for every row before the table is drawn, so a column can take its
+// decimals and its point x from all of them (issue #313).
+struct ProjCell {
+    enum Kind : unsigned char { Dash, Pending, Num };
+    Kind kind = Dash;
+    double v = 0;
+    bool clamped = false;      // the HFPN/RN "*": a negative variance was clamped
+    signed char noise = -1;    // 1: an HFPN/RN cell, 0: VFPN/RN - it has their tooltip
+};
+static ProjCell projCellNum(double v) {
+    ProjCell c;
+    c.kind = ProjCell::Num;
+    c.v = v;
+    return c;
+}
+static ProjCell projCellPending() {
+    ProjCell c;
+    c.kind = ProjCell::Pending;
+    return c;
+}
+static const char* projCellWord(const ProjCell& c) {
+    return c.kind == ProjCell::Pending ? PROJ_FRAME_PENDING : "-";
+}
+// projNoiseValue's cases, as a cell: "-" exactly where it says "-", and the
+// unrounded ratio otherwise - the column decides how it is spelled
+static ProjCell projNoiseCell(const App::ProjState& P, int plane, bool row) {
+    ProjCell c;
+    c.noise = row ? 1 : 0;
+    if (plane < 0 || plane >= P.nSeries || plane >= 4) return c;
+    const auto& n = P.noise[(size_t)plane];
+    if (!n.ratioValid()) return c;
+    c.kind = ProjCell::Num;
+    c.v = row ? n.rowRatio() : n.colRatio();
+    c.clamped = n.clamped();
+    return c;
+}
+struct ProjTableRow {
+    const App::ProjState* S = nullptr;
+    std::string side, plane;
+    int i = -1;                // the series, or < 0 for a plane this side has not got
+    bool horizontal = false;   // the per-axis table's axis
+    bool stale = false;
+    std::vector<ProjCell> c;
+};
+// The two tables' columns between frames, by table and header ("w/HFPN/RN",
+// "a/mean (axis)"); NumColState's own key says which comparison it is for.
+static std::map<std::string, NumColState> g_projNumCols;
+static void drawProjCell(const ProjCell& c, const NumCol& col, const App::ProjState* S, int plane) {
+    if (c.kind == ProjCell::Num) textNumAligned(col, c.v, c.clamped ? "*" : "");
+    else                         ImGui::TextDisabled("%s", projCellWord(c));
+    if (S && c.noise >= 0 && ImGui::IsItemHovered()) projNoiseTooltip(*S, plane, c.noise == 1);
+}
+
 static void drawPanelProjection() {
     g_projSideProbe.clear();
+    g_numAlignProbe.clear();
     g_projCurveProbe.clear();
     g_projHoverProbe.clear();
     g_projUnavailProbe.clear();
@@ -1667,7 +1718,7 @@ static void drawPanelProjection() {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", wide ? "wide" : "per axis");
         ImGui::SameLine();
-        static const char* DP[8] = { "sig. digits", "0", "1", "2", "3", "4", "5", "6" };
+        static const char* DP[8] = { "auto", "0", "1", "2", "3", "4", "5", "6" };
         int dpIdx = app.projDecimals < 0 ? 0 : app.projDecimals + 1;
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f);
         if (ImGui::BeginCombo("decimals##projstat", DP[std::clamp(dpIdx, 0, 7)])) {
@@ -1679,10 +1730,14 @@ static void drawPanelProjection() {
             ImGui::EndCombo();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("fixed decimals make a COLUMN scannable, and pasteable\n"
-                              "into a report as a column. \"sig. digits\" is the old\n"
-                              "behaviour: every cell picks its own length, so no two\n"
-                              "rows line up.");
+            ImGui::SetTooltip("every column prints ONE number of decimals and lines up\n"
+                              "on the point, every side and plane in it included.\n"
+                              "auto: the decimals that give the column's largest value\n"
+                              "four significant digits and every other nonzero value\n"
+                              "two (at most 6), kept when a frame step would make it\n"
+                              "one fewer. 0-6: every column uses that many. A nonzero\n"
+                              "value too small for them is written like 3.0e-07.\n"
+                              "Copy table (TSV) is full precision either way.");
         ImGui::SameLine();
         if (ImGui::Checkbox("all", &app.projAllRow)) app.prefsDirty = true;
         if (ImGui::IsItemHovered())
@@ -1837,11 +1892,133 @@ static void drawPanelProjection() {
     // Give the table its content height; the containing panel scrolls vertically.
     const float tableH = (ImGui::GetTextLineHeight() + 2 * ImGui::GetStyle().CellPadding.y) *
                          (tableRows + 1) + ImGui::GetStyle().ScrollbarSize + 2;
+    // ---- the cells, decided before the table is drawn (issue #313) ----------
+    // A column's decimals and its point x come from EVERY row of it - every
+    // side, every plane - so the rows are gathered first and the table is drawn
+    // from what was gathered. The TSV above reads the same ProjState through
+    // projTsvRow and is untouched by any of this: this is how the screen
+    // spells a number, not which number it is.
+    //
+    // The key a column's shape is remembered under: which sides, looking at
+    // which stack, split into how many planes. A different comparison starts
+    // its columns again; the next frame of the same one is held to them.
+    std::string numKey;
+    for (const ProjSide& sd : sides)
+        numKey += sd.name + "=" + sd.label + "#" + std::to_string(sd.S->nSeries) + "/" +
+                  std::to_string(sd.S->cell) + ";";
+    numKey += "plane=" + std::to_string(app.histPlane);
+    auto shapeCols = [&](const char* table, const std::vector<ProjTableRow>& rows,
+                         const char* const* heads, int nNum) {
+        const NumMetrics m = numMetricsNow();
+        std::vector<NumCol> out;
+        for (int k = 0; k < nNum; k++) {
+            std::vector<double> vals;
+            float markW = 0, wordW = 0;
+            bool pending = false;   // a side's every-pixel pass has not landed yet
+            for (const ProjTableRow& r : rows) {
+                const ProjCell& c = r.c[(size_t)k];
+                if (c.kind == ProjCell::Num) {
+                    vals.push_back(c.v);
+                    if (c.clamped) markW = std::max(markW, m.textW("*"));
+                } else {
+                    wordW = std::max(wordW, m.textW(projCellWord(c)));
+                    pending |= c.kind == ProjCell::Pending;
+                }
+            }
+            NumColState& st = g_projNumCols[std::string(table) + "/" + heads[k]];
+            NumCol col = numColDecide(st, numKey, vals, app.projDecimals, markW, wordW,
+                                      m.textW(heads[k]), m, pending);
+            col.probe = heads[k];
+            out.push_back(col);
+        }
+        return out;
+    };
+    // the row's own columns (side, axis, ch), then its numbers
+    auto drawRows = [&](const std::vector<ProjTableRow>& rows, const std::vector<NumCol>& cols,
+                        bool axisCol) {
+        for (const ProjTableRow& r : rows) {
+            if (r.stale) ImGui::PushStyleColor(ImGuiCol_Text,
+                                               ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TableNextRow();
+            if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", r.side.c_str()); }
+            if (axisCol) {
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled(r.horizontal ? "H (col)" : "V (row)");
+            }
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", r.plane.c_str());
+            for (size_t k = 0; k < r.c.size(); k++) {
+                ImGui::TableNextColumn();
+                drawProjCell(r.c[k], cols[k], r.S, r.i);
+            }
+            if (r.stale) ImGui::PopStyleColor();
+        }
+    };
     if (wide) {
         // sigma_f = the REGION's own sigma (how much the pixels differ)
         // sigma_v = sigma of the row means    (horizontal banding / row FPN)
         // sigma_h = sigma of the column means (vertical striping / column FPN)
-        // side? + ch + the twelve value columns below - keep this equal to the
+        // ONE mean, not three - and the one printed is the REGION's,
+        // over every pixel of it (issue #283). Where the H pass also
+        // covers every pixel (step == cell) the mean of the column
+        // means is the same number twice, and --precision-selftest P7c
+        // holds them to it; once it strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx)
+        // the column and row means are
+        // each over a stride of the region and differ from it - the V pass
+        // by ~0.04 DN on a 4000x3000 frame. Which is why this table prints
+        // fStat and not an axis: it says "the region", and every row of it
+        // means the same thing.
+        // the literal is split after each escape: "\xcf\x83f" would be read
+        // as \xcf followed by the 3-digit escape \x83f, which is not a byte
+        // Spelled out rather than initialled. "sigma-f" needs the footnote
+        // to be read at all; "sigma (frame)" is read on sight, and these
+        // are numbers people copy into a report where the header travels
+        // with them.
+        static const char* WH[12] = { "mean",
+                                      SIGMA " (frame)", SIGMA " (row)", SIGMA " (col)",
+                                      SIGMA " (frame) %", SIGMA " (row) %", SIGMA " (col) %",
+                                      "p-p frame", "p-p row", "p-p col",
+                                      "HFPN/RN", "VFPN/RN" };
+        std::vector<ProjTableRow> rows;
+        projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                           const char* plane) {
+            ProjTableRow r;
+            r.S = &S; r.side = side; r.i = i; r.stale = sideIsStale(side);
+            if (i < 0) {
+                // ...a plane this side does not have: the name, then nothing.
+                // The row is KEPT so that the line under R:A is still about R.
+                r.plane = plane ? plane : "?";
+                r.c.assign(12, ProjCell{});
+                rows.push_back(std::move(r));
+                return;
+            }
+            r.plane = S.seriesNames[i] ? S.seriesNames[i] : "?";
+            const App::ProjState::Stats& f = S.fStat[i];
+            const App::ProjState::Stats& hh = S.hStat[i];
+            const App::ProjState::Stats& vv = S.vStat[i];
+            // PENDING before the fallback: the column mean is a
+            // different number (every step-th row), and printing it in
+            // the region's column while the region's is computing is
+            // the stale-number failure by another route (issue #283)
+            if (f.valid)          r.c.push_back(projCellNum(f.mean));
+            else if (S.fPending)  r.c.push_back(projCellPending());
+            else if (hh.valid)    r.c.push_back(projCellNum(hh.mean));
+            else                  r.c.push_back(ProjCell{});
+            const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
+            // k == 0 is the frame column of each triple
+            auto cell3 = [&](int k, double v) {
+                if (k == 0 && S.fPending) r.c.push_back(projCellPending());
+                else if (trio[k]->valid)  r.c.push_back(projCellNum(v));
+                else                      r.c.push_back(ProjCell{});
+            };
+            for (int k = 0; k < 3; k++) cell3(k, trio[k]->sd);
+            for (int k = 0; k < 3; k++) cell3(k, trio[k]->pct);
+            for (int k = 0; k < 3; k++) cell3(k, trio[k]->pp);
+            r.c.push_back(projNoiseCell(S, i, true));
+            r.c.push_back(projNoiseCell(S, i, false));
+            rows.push_back(std::move(r));
+        });
+        const std::vector<NumCol> cols = shapeCols("w", rows, WH, 12);
+        // side? + ch + the twelve value columns - keep this equal to the
         // number of TableSetupColumn calls or ImGui asserts and the table is
         // drawn wrong. It went out of step when "mean" was added back.
         int wCols = (anySide ? 1 : 0) + 1 + 12;
@@ -1852,30 +2029,10 @@ static void drawPanelProjection() {
                 ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                         ImGui::GetFontSize() * 1.6f);
             ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-            // ONE mean, not three - and the one printed is the REGION's,
-            // over every pixel of it (issue #283). Where the H pass also
-            // covers every pixel (step == cell) the mean of the column
-            // means is the same number twice, and --precision-selftest P7c
-            // holds them to it; once it strides (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx)
-            // the column and row means are
-            // each over a stride of the region and differ from it - the V pass
-            // by ~0.04 DN on a 4000x3000 frame. Which is why this table prints
-            // fStat and not an axis: it says "the region", and every row of it
-            // means the same thing.
-            // the literal is split after each escape: "\xcf\x83f" would be read
-            // as \xcf followed by the 3-digit escape \x83f, which is not a byte
-            // Spelled out rather than initialled. "sigma-f" needs the footnote
-            // to be read at all; "sigma (frame)" is read on sight, and these
-            // are numbers people copy into a report where the header travels
-            // with them.
-            static const char* WH[10] = { "mean",
-                                          SIGMA " (frame)", SIGMA " (row)", SIGMA " (col)",
-                                          SIGMA " (frame) %", SIGMA " (row) %", SIGMA " (col) %",
-                                          "p-p frame", "p-p row", "p-p col" };
-            for (int c = 0; c < 10; c++)
-                ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, numColW());
-            ImGui::TableSetupColumn("HFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
-            ImGui::TableSetupColumn("VFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
+            // the width each column's numbers decided, not one for all: the
+            // table is not resizable, so ImGui takes it as the column's width
+            for (int c = 0; c < 12; c++)
+                ImGui::TableSetupColumn(WH[c], ImGuiTableColumnFlags_WidthFixed, cols[(size_t)c].width);
             ImGui::TableHeadersRow();
             // the header abbreviations are not self-evident, and this table is
             // the one people will read numbers off into a report
@@ -1886,58 +2043,7 @@ static void drawPanelProjection() {
                                   "%% is sigma / mean.  p-p is max - min.  All values in DN.\n"
                                   "\"%s\": a large region's every-pixel pass is still running.",
                                   PROJ_FRAME_PENDING);
-            auto wrow1 = [&](const App::ProjState& S, const char* sideName, int i) {
-                {
-                    const App::ProjState::Stats& f = S.fStat[i];
-                    const App::ProjState::Stats& hh = S.hStat[i];
-                    const App::ProjState::Stats& vv = S.vStat[i];
-                    ImGui::TableNextRow();
-                    if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
-                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[i]);
-                    ImGui::TableNextColumn();
-                    // PENDING before the fallback: the column mean is a
-                    // different number (every step-th row), and printing it in
-                    // the region's column while the region's is computing is
-                    // the stale-number failure by another route (issue #283)
-                    if (f.valid)          textStat(f.mean);
-                    else if (S.fPending)  ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
-                    else if (hh.valid)    textStat(hh.mean);
-                    else                  ImGui::TextDisabled("-");
-                    const App::ProjState::Stats* trio[3] = { &f, &vv, &hh };
-                    // k == 0 is the frame column of each triple
-                    auto cell3 = [&](int k, double v) {
-                        ImGui::TableNextColumn();
-                        if (k == 0 && S.fPending) ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
-                        else if (trio[k]->valid)  textStat(v);
-                        else                      ImGui::TextDisabled("-");
-                    };
-                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->sd);
-                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->pct);
-                    for (int k = 0; k < 3; k++) cell3(k, trio[k]->pp);
-                    ImGui::TableNextColumn(); drawProjNoiseCell(S, i, true);
-                    ImGui::TableNextColumn(); drawProjNoiseCell(S, i, false);
-                }
-            };
-            // ...and a plane this side does not have: the name, then nothing.
-            // The row is KEPT so that the line under R:A is still about R.
-            auto wmissing = [&](const char* sideName, const char* plane) {
-                ImGui::TableNextRow();
-                if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", plane ? plane : "?");
-                for (int k = 0; k < 12; k++) {
-                    ImGui::TableNextColumn();
-                    ImGui::TextDisabled("-");
-                }
-            };
-            projForEachRow([&](const App::ProjState& S, const char* side, int i,
-                               const char* plane) {
-                const bool st = sideIsStale(side);
-                if (st) ImGui::PushStyleColor(ImGuiCol_Text,
-                                              ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-                if (i < 0) wmissing(side, plane);
-                else       wrow1(S, side, i);
-                if (st) ImGui::PopStyleColor();
-            });
+            drawRows(rows, cols, false);
             ImGui::EndTable();
         }
         ImGui::TextDisabled("frame = the whole region, every pixel; row = the row means (banding); "
@@ -1945,108 +2051,87 @@ static void drawPanelProjection() {
         projSayPlaneMismatch();
     } else
     {
+    // one row per (side, axis, plane). The table's axis is the QUANTITY, so
+    // A and B cannot be a column pair here - they are rows, and the side
+    // column says which is which (docs/features/compare/ab-stats-plan.md 4).
+    //
+    // sigma-f rides next to the mean on every row: the profile sigma beside
+    // it is a spread of MEANS, and without the region's own sigma there is
+    // nothing to judge it against. The axis column already says which
+    // profile the bare sigma belongs to, so it needs no letter of its own -
+    // naming it "sigma h,v" would say both when each row is only one.
+    // "(axis)", like the three columns below it, because this mean is the
+    // mean OF THE PROFILE named in the axis column - not the region's.
+    //
+    // The two are different measurements over different sample sets, and
+    // saying so is the whole fix (issue #145). The region moments are
+    // over every pixel (issue #283). The H pass visits every column of
+    // every step-th ROW, so while step == cell its mean IS the region
+    // mean (--precision-selftest P7c asserts it) and once it strides
+    // (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) it is
+    // a stride of it (P7e). The V pass visits every row of every step-th
+    // COLUMN - different pixels again - and measured on a 4000x3000 frame
+    // at ~3000 DN the two axis means differ by 12 ppm. That is
+    // larger than the float-accumulator defect PR #144 removed (4.9 ppm)
+    // and it survives at %.6g on screen and %.9g in the TSV.
+    //
+    // Nothing was computed wrongly. Two honest numbers were sharing one
+    // header, and which one you read depended on the layout the panel
+    // happened to be in - the failure the WIDE table's own comment names
+    // ("a number that differs by where it is shown"). The wide table keeps
+    // its one region mean; this one now says whose mean it prints.
+    //
+    // A bare sigma here means "of the means named in the axis column", and
+    // nothing on the header said so. Each row IS one axis, so the header
+    // cannot name a single one - it points at the axis column instead, and
+    // matches the two columns after it rather than reading "this axis".
+    static const char* AH[7] = { "mean (axis)", SIGMA " (frame)", SIGMA " (axis)",
+                                 SIGMA " (axis) %", "p-p (axis)", "HFPN/RN", "VFPN/RN" };
+    std::vector<ProjTableRow> rows;
+    auto rows1 = [&](const App::ProjState& S, const char* side, int s, const char* plane,
+                     bool horizontal) {
+        ProjTableRow r;
+        r.S = &S; r.side = side; r.i = s; r.horizontal = horizontal;
+        r.stale = sideIsStale(side);
+        if (s < 0) {   // the same "-" row as the wide table's, one per axis here
+            r.plane = plane ? plane : "?";
+            r.c.assign(7, ProjCell{});
+            rows.push_back(std::move(r));
+            return;
+        }
+        r.plane = S.seriesNames[s] ? S.seriesNames[s] : "?";
+        const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
+        r.c.push_back(st.valid ? projCellNum(st.mean) : ProjCell{});
+        if (S.fStat[s].valid)  r.c.push_back(projCellNum(S.fStat[s].sd));
+        else if (S.fPending)   r.c.push_back(projCellPending());
+        else                   r.c.push_back(ProjCell{});
+        r.c.push_back(st.valid ? projCellNum(st.sd) : ProjCell{});
+        r.c.push_back(st.valid ? projCellNum(st.pct) : ProjCell{});
+        r.c.push_back(st.valid ? projCellNum(st.pp) : ProjCell{});
+        r.c.push_back(projNoiseCell(S, s, true));
+        r.c.push_back(projNoiseCell(S, s, false));
+        rows.push_back(std::move(r));
+    };
+    if (app.showProjH)
+        projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                           const char* plane) { rows1(S, side, i, plane, true); });
+    if (app.showProjV)
+        projForEachRow([&](const App::ProjState& S, const char* side, int i,
+                           const char* plane) { rows1(S, side, i, plane, false); });
+    const std::vector<NumCol> cols = shapeCols("a", rows, AH, 7);
     int nCols = (anySide ? 3 : 2) + 7;
     if (ImGui::BeginTable("projstats", nCols, ImGuiTableFlags_SizingFixedFit |
                                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX,
                           ImVec2(0, tableH))) {
-        // one row per (side, axis, plane). The table's axis is the QUANTITY, so
-        // A and B cannot be a column pair here - they are rows, and the side
-        // column says which is which (docs/features/compare/ab-stats-plan.md 4).
         if (anySide)
             ImGui::TableSetupColumn("side", ImGuiTableColumnFlags_WidthFixed,
                                     ImGui::GetFontSize() * 1.6f);
         ImGui::TableSetupColumn("axis", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3);
         ImGui::TableSetupColumn("ch", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.4f);
-        // sigma-f rides next to the mean on every row: the profile sigma beside
-        // it is a spread of MEANS, and without the region's own sigma there is
-        // nothing to judge it against. The axis column already says which
-        // profile the bare sigma belongs to, so it needs no letter of its own -
-        // naming it "sigma h,v" would say both when each row is only one.
-        // "(axis)", like the three columns below it, because this mean is the
-        // mean OF THE PROFILE named in the axis column - not the region's.
-        //
-        // The two are different measurements over different sample sets, and
-        // saying so is the whole fix (issue #145). The region moments are
-        // over every pixel (issue #283). The H pass visits every column of
-        // every step-th ROW, so while step == cell its mean IS the region
-        // mean (--precision-selftest P7c asserts it) and once it strides
-        // (step > cell: mono from 4 Mpx, Bayer from 3 Mpx, quad Bayer from 2.5 Mpx) it is
-        // a stride of it (P7e). The V pass visits every row of every step-th
-        // COLUMN - different pixels again - and measured on a 4000x3000 frame
-        // at ~3000 DN the two axis means differ by 12 ppm. That is
-        // larger than the float-accumulator defect PR #144 removed (4.9 ppm)
-        // and it survives at %.6g on screen and %.9g in the TSV.
-        //
-        // Nothing was computed wrongly. Two honest numbers were sharing one
-        // header, and which one you read depended on the layout the panel
-        // happened to be in - the failure the WIDE table's own comment names
-        // ("a number that differs by where it is shown"). The wide table keeps
-        // its one region mean; this one now says whose mean it prints.
-        ImGui::TableSetupColumn("mean (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn(SIGMA " (frame)", ImGuiTableColumnFlags_WidthFixed, numColW());
-        // A bare sigma here means "of the means named in the axis column", and
-        // nothing on the header said so. Each row IS one axis, so the header
-        // cannot name a single one - it points at the axis column instead, and
-        // matches the two columns after it rather than reading "this axis".
-        ImGui::TableSetupColumn(SIGMA " (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn(SIGMA " (axis) %", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("p-p (axis)", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("HFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
-        ImGui::TableSetupColumn("VFPN/RN", ImGuiTableColumnFlags_WidthFixed, numColW());
+        for (int c = 0; c < 7; c++)
+            ImGui::TableSetupColumn(AH[c], ImGuiTableColumnFlags_WidthFixed, cols[(size_t)c].width);
         ImGui::TableHeadersRow();
-        auto rows1 = [&](const App::ProjState& S, const char* sideName, int s, bool horizontal) {
-            {
-                const App::ProjState::Stats& st = horizontal ? S.hStat[s] : S.vStat[s];
-                ImGui::TableNextRow();
-                if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
-                ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", S.seriesNames[s]);
-                ImGui::TableNextColumn();
-                if (st.valid) textStat(st.mean); else ImGui::TextDisabled("-");
-                ImGui::TableNextColumn();
-                if (S.fStat[s].valid)  textStat(S.fStat[s].sd);
-                else if (S.fPending)   ImGui::TextDisabled("%s", PROJ_FRAME_PENDING);
-                else                   ImGui::TextDisabled("-");
-                ImGui::TableNextColumn();
-                if (st.valid) textStat(st.sd); else ImGui::TextDisabled("-");
-                ImGui::TableNextColumn();
-                if (st.valid) textStat(st.pct); else ImGui::TextDisabled("-");
-                ImGui::TableNextColumn();
-                if (st.valid) textStat(st.pp); else ImGui::TextDisabled("-");
-                ImGui::TableNextColumn(); drawProjNoiseCell(S, s, true);
-                ImGui::TableNextColumn(); drawProjNoiseCell(S, s, false);
-            }
-        };
-        // the same "-" row as the wide table's, one per axis here
-        auto missing1 = [&](const char* sideName, const char* plane, bool horizontal) {
-            ImGui::TableNextRow();
-            if (anySide) { ImGui::TableNextColumn(); ImGui::TextDisabled("%s", sideName); }
-            ImGui::TableNextColumn(); ImGui::TextDisabled(horizontal ? "H (col)" : "V (row)");
-            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", plane ? plane : "?");
-            for (int k = 0; k < 7; k++) {
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("-");
-            }
-        };
-        auto dimmed = [&](const App::ProjState& S, const char* side, int i,
-                          const char* plane, bool horiz) {
-            const bool st = sideIsStale(side);
-            if (st) ImGui::PushStyleColor(ImGuiCol_Text,
-                                          ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            if (i < 0) missing1(side, plane, horiz);
-            else       rows1(S, side, i, horiz);
-            if (st) ImGui::PopStyleColor();
-        };
-        if (app.showProjH)
-            projForEachRow([&](const App::ProjState& S, const char* side, int i,
-                               const char* plane) {
-                dimmed(S, side, i, plane, true);
-            });
-        if (app.showProjV)
-            projForEachRow([&](const App::ProjState& S, const char* side, int i,
-                               const char* plane) {
-                dimmed(S, side, i, plane, false);
-            });
+        drawRows(rows, cols, true);
         ImGui::EndTable();
     }
     ImGui::TextDisabled(SIGMA " (frame) = the whole region, every pixel.  " SIGMA " (axis) = of the means "

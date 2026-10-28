@@ -1526,6 +1526,33 @@ int main(int argc, char** argv) {
 
     parseCli(argc, argv);
 
+    {   // #319: a start that names nothing comes back where the last one left
+        // off. After parseCli, because what the command line named is the
+        // decision's main input; before any selftest, because S0 of
+        // --startup-selftest asserts on what this very run decided. A scripted
+        // run does not even scan: the user's autosave is not its business.
+        StartupRestoreIn in;
+        in.scripted = scriptedRun;
+        in.noSession = g_cliNoSession;
+        in.cliOpens = g_cliNamesOpen;
+        if (!scriptedRun) {
+            in.offer = recoveryOfferIn(viewerConfigDir(), currentPid(), nullptr);
+            std::error_code ec;
+            if (!in.offer.empty())
+                in.offerBytes = std::filesystem::file_size(pathFromUtf8(in.offer), ec);
+        }
+        g_startupRestore = startupRestoreDecide(in);
+        startupRestoreApply(g_startupRestore);
+        // The decision puts scripted first; this is the line that keeps it
+        // there for every selftest, not only the one that asks.
+        if (scriptedRun && g_startupRestore.why != SR_Scripted) {
+            fprintf(stderr, "startup: a scripted run decided \"%s\" - refusing to "
+                            "go on with the user's session\n",
+                    startupRestoreWhyName(g_startupRestore.why));
+            return 1;
+        }
+    }
+
     #include "selftest/picker.inc"
 
     #include "selftest/localbrowse.inc"
@@ -1539,6 +1566,8 @@ int main(int argc, char** argv) {
     #include "selftest/batch.inc"
 
     #include "selftest/sessiondoor.inc"
+
+    #include "selftest/startup.inc"
 
     #include "selftest/export.inc"
 
@@ -1702,6 +1731,10 @@ int main(int argc, char** argv) {
     // (issue #283). Beside rowcolsigma.inc: the same panel's numbers, held
     // against a scan written out in the test.
     #include "selftest/projframe.inc"
+
+    // The Projection table's numbers, lined up on the point (issue #313). Beside
+    // projframe.inc: the same table, and the same claim that the TSV is untouched.
+    #include "selftest/numalign.inc"
 
     // The three shipped analyzers that had no value assertion at all (板 304).
     // Beside rowcolsigma.inc because it is the same discipline on the other side
@@ -1983,6 +2016,11 @@ static bool g_watchSuppressed = false;
         drawMenuBar(win);
         // before any panel draws: the B cache slots exist only while compare does
         abStatsFrame();
+        // B's server aggregate, once per (stack, state), whether or not the
+        // Temporal panel is open - A's is fired at the open the same way (#320).
+        // cmpB and not abStatsB: a remote B with no frame here yet is exactly
+        // the stack the server answers for.
+        ensureServerTemporalB(cmpB());
         // ...and before any panel draws, because it closes documents (§3.3)
         pumpReRead();
 
@@ -2329,9 +2367,11 @@ static bool g_watchSuppressed = false;
                         ImGui::EndCombo();
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Histogram / Projection / Temporal layout for this\n"
-                                          "comparison. Auto follows the image: split -> side by\n"
-                                          "side, wipe / blink / difference -> overlay.");
+                        ImGui::SetTooltip("Histogram / Projection layout for this comparison.\n"
+                                          "Auto follows the image: split -> side by side,\n"
+                                          "wipe / blink / difference -> overlay.\n"
+                                          "Temporal has its own (overlay by default): on the\n"
+                                          "Temporal panel's heading, or View > Compare A/B.");
                 }
             }
             if (app.showFps) {

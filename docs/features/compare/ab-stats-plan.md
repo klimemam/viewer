@@ -76,6 +76,7 @@
 - **Projection**: B は破線、min-max バーは **A だけ**、y レンジは A∪B で共有。
 
 ## 3. 横並び (Side by Side) — 画像の並びを写す
+- (2026-10-28 以降、Temporal はこの設定に従わない —— §4 の #320 の注)
 - 設定は**グローバルに 1 つ**: `app.abStatsLayout` = `Auto / Overlay / Side by side`。置き場所は
   `View > Compare A/B` + ステータスバーの `A/B split 50%` 隣の小コンボ。**パネル毎にしない**
   理由: 「画像と同じ並び」は比較全体の性質でパネルの性質ではない。パネル毎だと状態が 5 倍に
@@ -92,8 +93,24 @@
   ヘッダには必ず単位(`sigma_t [DN]` 等)。Δ[%] = `(A−B)/|A|×100`、A=0 または量が既に % なら
   絶対差のみ(単位 `pt`)。**絶対と相対の両方**(σ の 0.3 DN が大きいかは相対でしか判らない)。
   常駐フレーム数の差は頻出なので列見出しに `A (n=12/12)` `B (n=8/300)` を併記。B が stack で
-  なければ B 列は `—(stack ではない)`、Δ は空。`app.srvTemporal` は **B 側を自動発火しない**
-  (remote job が倍になる)。`Measure B` ボタンで明示実行し同じ 4 列表に流す。
+  なければ B 列は `—(stack ではない)`、Δ は空。~~`app.srvTemporal` は **B 側を自動発火しない**
+  (remote job が倍になる)。`Measure B` ボタンで明示実行し同じ 4 列表に流す。~~
+  - **裁定の変更(2026-10-28、[#320](https://github.com/klimemam/viewer/issues/320))**: B 側の
+    サーバ集計 (`app.srvTemporalB`) も **A と同じ契機で自動実行**する —— B が決まった・B の
+    stack が変わった(stackRev)・ROI / 解釈(モザイク)が変わった、のとき。「remote job が倍に
+    なる」心配はボタンではなく規則で答える: **同じ (stack, 状態) には 1 回だけ**。要求中なら
+    投げない、その状態の結果(**失敗も含む**)を持っていれば投げない、ROI をドラッグ中なら着地を
+    待つ。`Measure B` ボタンは外し、失敗したときだけ表の下の失敗の行に `retry` を出す(断った
+    peer は毎フレーム断るので、失敗の自動再送はしない)。実装は `ensureServerTemporalB`
+    (`core/app/open_dispatch.inc`)、状態の鍵は `ServerTemporal::key*`。
+    注: サーバ集計は今も全画面で、ROI は wire に載らない。ROI の変更で再要求するのは裁定どおり
+    だが、返る数は同じ全画面の数である(ROI を wire に載せるかは別の問い)。
+  - **Temporal のグラフの並べ方(同日、#320)**: Temporal は §3 の `app.abStatsLayout` に
+    従わず、**専用の設定 `app.temporalLayout`(既定 Overlay、Side by side も選べる)** を持つ。
+    時系列は 1 本の軸の上で曲線を比べて読むものなので、画像の並びには追従しない(Auto は無い)。
+    切り替えは Temporal パネルの見出しと `View > Compare A/B > Statistics layout: Temporal`、
+    prefs に保存(`temporallayout`、settings.jsonc `compare.temporalLayout`)。
+    `abStatsLayout` は Histogram / Projection だけに効く。
 - **ROI stats 表**: 行 = ROI、列 = 量なので A/B を列対にできない。**1 ROI = 2 行**(A 行 / B 行、
   B 行はインデント+行頭 `B`)。Δ 行は既定オフのトグル(行数 3 倍)。annotation は全画像共有なので
   B のサイズが違えば矩形を clamp し `(clipped)` を付す。

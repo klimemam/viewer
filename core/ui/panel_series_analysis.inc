@@ -553,41 +553,55 @@ static void drawPanelSeriesAnalysis() {
 }
 
 // The x axis one stack's per-frame data is plotted (and exported) against:
-// the custom axis when it is set AND still covers every frame, else the frame
-// index. ONE resolver for the chart, the export and the selftest, so they can
-// never disagree about which axis is in force. `why` names the reason a SET
-// axis is not usable (frame count changed since it was applied).
+// the asked-for axis when the stack has it AND it still covers every frame,
+// else the frame index. ONE resolver for the charts, the export and the
+// selftest, so they can never disagree about which axis is in force. `why`
+// names the reason a SET axis is not usable (frame count changed since it was
+// applied). `name` null = the stack's default axis (axes[0]); a name the
+// stack does not carry is `missing` - frame index, and nothing to explain,
+// because "this side has no such axis" is the caller's sentence to say.
 struct FrameAxis {
     bool custom = false;
+    bool missing = false;
     std::string name, unit;
     const std::vector<double>* vals = nullptr;   // by seqIndex
     std::string label;                           // ready for beginPlot's x label
     std::string why;
+    // when `why`: the stack HAS the axis (name, unit) but nVals values for
+    // nFrames frames - a different sentence from "no such axis"
+    int nVals = 0, nFrames = 0;
     double at(double seqIndex) const {           // mapping: value i <- seqIndex i
         int i = (int)(seqIndex + 0.5);
         return custom && i >= 0 && i < (int)vals->size() ? (*vals)[i] : seqIndex;
     }
 };
-static FrameAxis frameAxisOf(int seqId) {
+static FrameAxis frameAxisOf(int seqId, const char* name = nullptr) {
     FrameAxis a;
     a.label = "frame number (index in stack)";
     App::SeqInfo* si = seqInfo(seqId);
-    if (!si || si->axisVals.empty()) return a;
+    const App::NamedAxis* ax = !si ? nullptr
+                             : name ? si->axis(name)
+                             : si->axes.empty() ? nullptr : &si->axes.front();
+    if (!ax || ax->vals.empty()) { a.missing = name != nullptr; return a; }
     int n = (int)framesOfSeq(seqId).size();
     int N = std::max(si->expectedFrames, n);
-    if ((int)si->axisVals.size() != N) {
-        char b[128];
-        snprintf(b, sizeof b, "custom x axis ignored: %d value(s) for %d frame(s) - "
+    if ((int)ax->vals.size() != N) {
+        char b[160];
+        snprintf(b, sizeof b, "custom x axis %s ignored: %d value(s) for %d frame(s) - "
                               "plotted on frame index",
-                 (int)si->axisVals.size(), N);
+                 ax->name.c_str(), (int)ax->vals.size(), N);
         a.why = b;
+        a.name = ax->name;
+        a.unit = ax->unit;
+        a.nVals = (int)ax->vals.size();
+        a.nFrames = N;
         return a;
     }
     a.custom = true;
-    a.name = si->axisName;
-    a.unit = si->axisUnit;
-    a.vals = &si->axisVals;
-    a.label = si->axisName + " (" + si->axisUnit + ")";
+    a.name = ax->name;
+    a.unit = ax->unit;
+    a.vals = &ax->vals;
+    a.label = ax->name + " (" + ax->unit + ")";
     return a;
 }
 

@@ -116,6 +116,7 @@ bool → チェックボックス、列挙 → コンボ、数値 → 入力、�
 | loading.watchFiles (段2e) | bool | true | watchfiles | plumbing |
 | loading.watchAutoReload (段2e) | bool | false | watchauto | plumbing (毎回1行名乗る — File メニューの約束のまま) |
 | loading.folderScanDepth (#204) | 数値 1..16 | **6** | scandepth | plumbing (「all stacks below」がローカル・peer とも読む唯一の深さ) |
+| compare.temporalLayout (#320) | 列挙 overlay/side-by-side | **overlay** | temporallayout | presentation (Histogram / Projection の `abstats` とは別。行の注でそう言う) |
 
 ### 3.3 43 個のパネル内トグルからの昇格は 0
 

@@ -245,7 +245,7 @@ peer の導入元を変えるためにビルドし直す理由が無い (判断1
 |---|---|---|---|---|---|
 | F1 | **フォルダのクリック挙動** (List で1クリック / Tree で名前展開・ダブルで移動) | 固定 | `core/browse/panel.cpp` `rbActivateRow` | 板 row 136、ユーザー発言「preference で指定できるようにしてもいいね、preference が実装されたときに」 | 操作のみ |
 | F2 | **一覧の並び順の既定** (自然順 / 辞書順) | 自然順 (**決着済み**) | `rbNameCmp` / `rbSortShown` | 板 row 157 | **動かす** — 一覧の順が stack の順と食い違うと σ_t の意味が嘘になる。だから**既定を変えた** |
-| F3 | **数値の有効数字** | 書式リテラル 14 種が散在、書式関数 3 つ | `textNum` / `fmtVal` / `textStat` ほか 11 ファイル | 板 row 98 / `todo-open.md` 項目23。4択の3番が literally「アプリ全体の設定」 | 表示と**コピー** (TSV は表示桁を無視する、が読み手が写す数字は表示側) |
+| F3 | **数値の有効数字** | 書式リテラル 14 種が散在、書式関数 3 つ | `textNum` / `fmtVal` / `numColDecide`(Projection の表、#313)ほか 11 ファイル | 板 row 98 / `todo-open.md` 項目23。4択の3番が literally「アプリ全体の設定」 | 表示と**コピー** (TSV は表示桁を無視する、が読み手が写す数字は表示側) |
 | F4 | **ヒストグラムのビン数** | **256、[black,white] の等分** | `core/ui/canvas.inc` `recomputeHistogramIfNeeded` | `todo-open.md` 項目9「基本的には整数もしくは2のべき乗」 | **動かす** — clip 数と櫛状アーティファクトが変わる |
 | F5 | **detrend の既定とカットオフ** | 既定「なし (raw)」、ON 時は多項式2次・減算・プレーン別 | `core/app/detrend.inc` | flat-field-stats.md 判断6/7 | **動かす** — PRNU も σ_fpn もカットオフの関数 |
 | F6 | **表示レンジの既定 0..65535** | 16bit 固定 | 表示レンジの初期化 | `manual.md:243`「12/14bit の RAW は暗く見えます」、板 row 190 の未了 | 表示のみ (ただし毎回手作業を強いる) |
@@ -861,16 +861,17 @@ prefs.txt に残ったまま settings.jsonc に**無い**もの: 履歴5種
 - **`browse.folderActivate` / `sortColumn` / `sortDescending` / `panels`** ——
   機構そのものが無い。設定にしても効かないので、v1 は「まだ」と名指しする。
 
-## 11. 現行の実装帳簿 (2026-09-28、板 297 で更新)
+## 11. 現行の実装帳簿 (2026-10-28、#320 で更新)
 
 §10.7 は stage 1 当時の「まだ」であり、現在形ではない。現在は JSONC reader、
 `File > Preferences...`、出所バッジ、Copy as JSONC / Copy template / Reset to
 default、`loading.rawRecipes`、`measuring.memoryBudgetGB`、watch 2キー、
 `loading.folderScanDepth`、`appearance.uiScale`、`browse.folderClick`、
-`watch.intervalSec`、`appearance.fontPath` まで実装されている。
-`SETTING_KEYS` の現行照合は **31 Read / 4 Later / 2 NotHere = 37行**。`prefs.txt` は
-`writePrefsTo` が34キーを書き、`loadPrefs` が互換入力を含む36キーを読む
-(板 306 が `fontpath` を足した。板 297 が `watchinterval` を足して
+`watch.intervalSec`、`appearance.fontPath`、`compare.temporalLayout` まで実装されている。
+`SETTING_KEYS` の現行照合は **32 Read / 4 Later / 2 NotHere = 38行**。`prefs.txt` は
+`writePrefsTo` が35キーを書き、`loadPrefs` が互換入力を含む37キーを読む
+(#320 が `temporallayout` を足した。板 306 が `fontpath` を足して
+31 Read / 34書き/36読み。板 297 が `watchinterval` を足して
 30 Read / 33書き/35読み。phase④ が `folderclick` / `repourl` /
 `editor` を足して 29 Read / 32書き/34読み。28 Read / 5 Later と
 29書き/31読みは phase④ 直前の値で、当時の記録として書き換えない)。
@@ -891,6 +892,17 @@ loading 級と裁定され、`loading.watchFiles` / `loading.watchAutoReload` �
 この値から比で出る (`watchRemoteEvery`) ので、local を遅くすれば peer も遅くなり、
 **local より速くなることはない**。設計は
 `docs/features/watch/watch-design.md §17.3`。
+
+`compare.temporalLayout` (#320) も**節を1つ開いた**ので1段落置く。compare 中の
+Temporal のグラフの並べ方で、`"overlay"`(既定)/ `"side-by-side"` の列挙。
+裁定 (2026-10-28、「少なくとも既定は重ねて表示」) は Temporal を、セッションに残る
+`abstats`(§3.2、Histogram / Projection の `Auto / Overlay / Side by side`)から
+**切り離した**: 時系列は1本の軸の上で曲線を比べて読むもので、画像の並びには
+追従しない —— だから Auto は無い。`abstats` がセッション状態のままなのに
+こちらが設定なのは、「比較をどう並べたか」はその比較の記録だが、「時系列を
+どう読みたいか」は人の好みだからである。presentation 級。節名 `compare` は
+「比較をどう見せるか」の調整の置き場で、以後の compare の表示の好みはここに置く。
+設計は `docs/features/compare/ab-stats-plan.md §4` の #320 の注。
 
 `appearance.uiScale` (#257) は他のキーと**判定の形が違う**ので、ここに1段落置く。
 値は「UI を何倍で描くか」で、**0 = ディスプレイに訊いて決める**が既定。自動側が
@@ -965,7 +977,7 @@ memory / watch は M1–M3、folder scan depth は D1–D6 が固定する。
   → 同じ観測が受け持つ。
 
 固定するのは `--settings-selftest` の O1–O7 / W1–W12 / M1–M4 / D1–D6 / F1–F5 /
-G1–G7 で、G 群が観測と焼付き、W6–W12 が行の契約、F 群が `browse.folderClick`、
+TL1–TL4 / G1–G7 で、TL 群が `compare.temporalLayout`、G 群が観測と焼付き、W6–W12 が行の契約、F 群が `browse.folderClick`、
 O7/M4 が CLI 出所と予算の窓を持つ。
 
 未実装の設定そのものは、stage 1 から継続する `state.json`、`loading.raw`、

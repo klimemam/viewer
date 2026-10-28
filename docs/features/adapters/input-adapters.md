@@ -855,7 +855,7 @@ Series(sts, conditions=Values(exposures, "exposure", "ms"))    # 名前は必須
 |---|---|---|---|---|
 | `timestamps` | `Stack` | **フレーム数** | **省略可** (既定 `"time"`)。`"elapsed"` 等で上書き可 | **必須** |
 | `conditions` | `Series` | **メンバ数** | **必須** — 何を振ったかは viewer には分からない | **必須** |
-| `covariates` (将来) | `Stack` | フレーム数 | **キーが名前** | **必須** |
+| `covariates` | `Stack` | フレーム数 | **キーが名前** (または名前付き `Values` の列) | **必須** |
 
 - **型は `Values(values, name="", unit="")` の1つだけ。** 専用型 (`Times` / `Sweep`) は
   作らない — `covariates` を足すときも同じ型で足りる
@@ -870,12 +870,21 @@ Series(sts, conditions=Values(exposures, "exposure", "ms"))    # 名前は必須
   測定値を捨てるとユーザは数値を打ち直す羽目になる
 - **複数形は「メンバ1つにつき1つ」を語形が言う。** 長さの規則が名前から読める
 
-将来 `covariates` を足すときの形 (v1 では受けない、名前だけ予約):
+`covariates` の形 (2026-10-28 から受ける, #314 — それまでは名前だけ予約していた):
 
 ```python
 Stack(arr, timestamps=Values(t, unit="s"),
-           covariates={"temperature": Values(temp, unit="C")})
+           covariates={"temperature": Values(temp, unit="C"),
+                       "illuminance": Values(lx, unit="lx")})
 ```
+
+- **何か**: 設定を変えずに撮った stack の各フレームで**観測された量** (温度、照度の
+  揺れ)。viewer では stack の**名前付きの x 軸**になり、Temporal のチャートがそれに
+  対して描ける (manual §5.2b)
+- **何でないか**: **設定を変えた**なら `conditions` で、層は `Series` (下の表)。
+  covariate は σ_t にも stack の同一性にも**何も効かない** —— 「露光の掃引を時間ノイズと
+  して報告する」失敗を covariate が持ち込むことはない。stack ノードに `conditions` を
+  置いても軸にはならない
 
 **なぜ `timestamps` を汎用化しないか**: 温度ドリフトを時刻欄に入れさせると、
 「いつ」と「何が観測されたか」が同じ場所に混ざる。狭く始めて、必要になったら
@@ -956,7 +965,8 @@ viewer は σ_t を計算できてしまい、**露光の掃引を「時間ノ�
 判断に迷う例:
 
 - **温度が勝手に上がった連続撮影** → `timestamps` (時刻)。設定は変えていない。
-  温度そのものは観測された共変量で、v1 では受けない (将来 `covariates`)
+  温度そのものは観測された共変量で、`covariates` に入れる (x 軸になるだけで、
+  σ_t には効かない)
 - **温度を段階的に設定した測定** → `conditions`。各点が別の条件
 - **撮影時刻を記録した露光掃引** → `Series` + `conditions`(露光)。時刻も残したければ
   各 `Stack` の `timestamps` に入れる (両方持てる)
@@ -1103,7 +1113,16 @@ ValueError: Series: conditions has 8 value(s) but there are 16 stack(s)
   - 画素と付随物: `__pixels_<i>` / `__cfa_<i>` / `__name_<i>` / `__note_<i>` /
     `__range_<i>` / `__layout_<i>`
   - 軸: `__conditions_values_<i>` / `__conditions_name_<i>` / `__conditions_unit_<i>` /
-    `__timestamps_values_<i>` / `__timestamps_name_<i>` / `__timestamps_unit_<i>`
+    `__timestamps_values_<i>` / `__timestamps_name_<i>` / `__timestamps_unit_<i>` /
+    `__covariates_values_<i>` / `__covariates_name_<i>` / `__covariates_unit_<i>`
+  - covariates の形 (2026-10-28 裁定, #314): **ノードあたりキーは 1 組**、stack ノードだけ。
+    1 つなら values `(F,)`・name/unit は 0-D 文字列、**K 個なら values `(F, K)`・name/unit は
+    長さ K の 1-D 文字列配列** (列 k の名前と単位)。F はフレーム数。K が values と
+    name/unit で食い違う・行数がフレーム数と違うときは viewer は**どの列も適用せず**理由を
+    note に書く。既にある軸と同じ名前 (前後の空白・大小文字は区別しない — `time` と
+    `Time ` は同じ) の列も note に書いて適用しない。stream では `covariates_cols <i> K` +
+    列ごとの `covariates_name_at <i> <k> …` / `covariates_unit_at <i> <k> …` + 行優先
+    F×K 個の `covariates <i> …`
   - metadata: 根は `__meta_<k>`、ノード i>0 は `__meta_<i>_<k>`。値は JSON で
     書く (`{"value":6.0,"unit":"dB"}` は配列ではない)
 - 1行の要約を stderr に出す (viewer がそのまま中継する)
@@ -1545,6 +1564,7 @@ PR #114 以来アトミック)。**順序が設定の一部**なので行の順�
    `Series` に **`conditions`** (複数形 = メンバ1つにつき1つ = 長さの規則)。
    値の型は **`Values(values, name, unit)` の1つ**で、`timestamps` の名前は
    `"time"` が既定。共変量は v1 では受けず、将来 `covariates` を別に足す。
+   (2026-10-28, #314: `Stack.covariates` を受けるようになった — §4.3.2 / §4.5)
    `layout` は廃止 (軸の順序を合わせるのは書いた人の仕事)。
 
    **後続改訂 (2026-08-19〜20, #230):** `layout` は transposed tensor の明示宣言

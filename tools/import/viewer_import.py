@@ -371,6 +371,13 @@ class Stack:
     meta: Optional[Dict[str, Any]] = None
     range: Any = None
     layout: str = ""
+    # Quantities OBSERVED per frame while the setting stayed put (temperature,
+    # illuminance drift): {"temperature": Values(t, unit="C"), ...} -- the key is
+    # the name -- or one named Values / a sequence of them; one value per frame
+    # (4.5).  Never a setting that was changed -- that is a
+    # Series with conditions.  Each one is an x axis the viewer can plot
+    # against; no statistic reads them.
+    covariates: Any = None
 
     LAYER: ClassVar[str] = "stack"
 
@@ -390,6 +397,22 @@ class Stack:
             _check_length("Stack", "timestamps", self.timestamps, shape[0], "frame")
             if not self.timestamps.name:            # 4.3.2: the default name
                 object.__setattr__(self, "timestamps", self.timestamps.renamed("time"))
+        if self.covariates is not None:
+            covs = self.covariates
+            if isinstance(covs, dict):              # 4.3.2: the key is the name
+                covs = tuple(v.renamed(str(k)) if isinstance(v, Values) else v
+                             for k, v in covs.items())
+            covs = tuple(covs) if isinstance(covs, (list, tuple)) else (covs,)
+            if not covs:
+                raise ValueError("Stack: covariates is an empty sequence")
+            for c in covs:
+                _check_values("Stack", "covariates", c, need_name=True)
+                _check_length("Stack", "covariates", c, shape[0], "frame")
+            names = [c.name.strip().lower() for c in covs]
+            if len(set(names)) != len(names):
+                raise ValueError("Stack: two covariates share a name (%s)"
+                                 % ", ".join(c.name for c in covs))
+            object.__setattr__(self, "covariates", covs)
 
     @property
     def shape(self):
@@ -697,7 +720,8 @@ def _self_check():
     """Cheap sanity check that the fields did not drift from the spec table (4.3)."""
     want = {
         Frame: ["pixels", "cfa", "name", "note", "meta", "range", "layout"],
-        Stack: ["pixels", "timestamps", "cfa", "name", "note", "meta", "range", "layout"],
+        Stack: ["pixels", "timestamps", "cfa", "name", "note", "meta", "range", "layout",
+                "covariates"],
         Series: ["members", "conditions", "name", "note", "meta", "range", "layout"],
         Batch: ["members", "name"],
         AnalysisSet: ["roles", "name", "note", "meta"],   # no range: a set has no pixels

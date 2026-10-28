@@ -131,6 +131,19 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
     f << "seriespanel " << app.lin.tablePlane << " " << (app.lin.snrDb ? 1 : 0) << " "
       << app.lin.fitMethod << " " << app.lin.winMode << " "
       << app.lin.winLo << " " << app.lin.winHi << "\n";
+    // The Temporal panel's charts (#314), one line each, top to bottom: what
+    // its x is - "default", "frame", or "axis <name>" (the name last: spaces).
+    // Zoom is not saved: it is keyed to a document of this run.
+    // Nothing is written for the one default chart every session without
+    // these lines already means - so a session that never touched the charts
+    // is the file an older viewer wrote, line for line.
+    const bool oneDefault = app.tcharts.size() == 1 &&
+                            app.tcharts[0].xKind == App::TemporalChart::XDefault;
+    for (const App::TemporalChart& c : app.tcharts) {
+        if (oneDefault) break;
+        if (c.xKind == App::TemporalChart::XNamed) f << "tchart axis " << c.xName << "\n";
+        else f << "tchart " << (c.xKind == App::TemporalChart::XFrame ? "frame" : "default") << "\n";
+    }
     // "npyaxis" used to sit here: one global reading for a whole session
     // (§3.4). Its successor is the per-image "npyread" line below, so nothing
     // global is written any more. An OLD session's npyaxis is skipped like any
@@ -345,15 +358,20 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
             // name may be user-given ("25C dark") - it must survive the session.
             if (const App::SeqInfo* sqi = seqInfo(d->seqId)) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
-                // the per-frame x axis, additive keys an older viewer skips.
+                // the per-frame x axes, additive keys an older viewer skips.
                 // Values first and EXACTLY (fmtExact): this is an axis data is
                 // plotted against. Name and unit last on their lines: spaces.
-                if (!sqi->axisVals.empty()) {
+                // One vals/unit/name triple PER AXIS, in the stack's order
+                // (#314): the name line closes the triple, so a file with one
+                // axis is byte-for-byte what a one-axis viewer wrote, and that
+                // viewer reading a many-axis file keeps the last triple.
+                for (const App::NamedAxis& ax : sqi->axes) {
+                    if (ax.vals.empty()) continue;
                     f << "seqaxisvals";
-                    for (double v : sqi->axisVals) f << " " << fmtExact(v);
+                    for (double v : ax.vals) f << " " << fmtExact(v);
                     f << "\n";
-                    f << "seqaxisunit " << sqi->axisUnit << "\n";
-                    f << "seqaxisname " << sqi->axisName << "\n";
+                    f << "seqaxisunit " << ax.unit << "\n";
+                    f << "seqaxisname " << ax.name << "\n";
                 }
             }
         } else {
@@ -1300,11 +1318,14 @@ static std::string autosavePath() {
 }
 
 // The recovery offer: the NEWEST autosave under dir that no LIVE instance owns.
-// A lock held by selfPid is ours - offering our own previous session is the
-// historic "Restore last session"; a lock held by another live PID means that
+// A lock held by selfPid is ours - offering our own previous session is what a
+// start does with it (#319); a lock held by another live PID means that
 // window is running and rewriting its file right now, and restoring it would
 // fork a session that is still open. nameOut says WHICH file is being offered,
 // because with several candidates "last session" alone no longer names one.
+// A 0-byte file is passed over: it is a crash file (openCrashFile) created by a
+// start that never had anything open, newer than every real one and holding
+// nothing - offering it would hide the session the user actually left.
 static std::string recoveryOfferIn(const std::string& dir, unsigned long selfPid,
                                    std::string* nameOut) {
     if (nameOut) nameOut->clear();
@@ -1318,6 +1339,8 @@ static std::string recoveryOfferIn(const std::string& dir, unsigned long selfPid
         if (!std::filesystem::exists(p, ec)) continue;
         unsigned long owner = lockPid(slotLockPath(dir, n));
         if (owner && owner != selfPid && pidAlive(owner)) continue;  // live, not us
+        const uintmax_t bytes = std::filesystem::file_size(p, ec);
+        if (ec || bytes == 0) continue;                               // nothing in it
         std::filesystem::file_time_type t = std::filesystem::last_write_time(p, ec);
         if (ec) continue;
         if (best.empty() || t > bestT) { best = (dir + "/" + name); bestName = name; bestT = t; }
@@ -1474,6 +1497,7 @@ struct PrefsBase {
     int frameMode = 1;
     bool rbFlat = false, rbTree = false, rbNatural = true;
     int folderClick = 0;                 // board row 136
+    int temporalLayout = 0;              // #320 (App::TlOverlay)
     std::string remoteExe, pythonExe;
     std::vector<std::string> readerPlaces;
     // The two keys that had no prefs.txt line at all until phase④ closed
@@ -1532,6 +1556,7 @@ static void capturePrefsBase() {
     g_prefsBase.rbTree = app.rbTree;
     g_prefsBase.rbNatural = app.rbNatural;
     g_prefsBase.folderClick = app.folderClick;
+    g_prefsBase.temporalLayout = app.temporalLayout;
     g_prefsBase.remoteExe = app.remoteExe;
     g_prefsBase.pythonExe = app.pythonExe;
     g_prefsBase.readerPlaces = app.readerPlaces;
@@ -1578,6 +1603,8 @@ static void writePrefsTo(std::ostream& f) {
     // so there is no lower layer for a live value to leak over.
     f << "histdrag " << app.histDragMode << "\n";
     f << "histzoomrange " << (app.histZoomSetsRange ? 1 : 0) << "\n";
+    // #320, written unconditionally for folderclick's reason above.
+    f << "temporallayout " << P.temporalLayout << "\n";
     // The window: logical size, raw position, then the maximized flag (see
     // fitSavedWindow). Written only once a real window has reported a geometry,
     // so a run that never samples one - every scripted run - hands back exactly
@@ -1664,12 +1691,12 @@ static void savePrefs() {
 // The named sessions this user saved or opened, most recent first. A session
 // could always be loaded - File > Open, drag & drop, Browse, --session all reach
 // openPath's .vsession branch - but nothing on the File menu said so, and the
-// one session item that did open something (Restore last session) only ever
-// opens the AUTOSAVE. These are the rows that remember the other kind.
+// one session item that did open something only ever opened the AUTOSAVE.
+// These are the rows that remember the other kind.
 //
 // The autosave is kept OUT on purpose: it is rewritten every 60 s, so letting it
-// in would push every session the user named off the end of an 8-row list, and
-// it already has its own door.
+// in would push every session the user named off the end of an 8-row list. It
+// has a row of its own above them instead (lastAutosaveRow, #319).
 static const size_t SESSION_RECENT_MAX = 8;
 
 // The comparison form: one file reached through two spellings (a dialog's
@@ -2021,6 +2048,10 @@ static void loadPrefs() {
         // else gets the default rather than a guess.
         else if (key == "histdrag")    { ls >> v; if (v == 0 || v == 1) app.histDragMode = v; }
         else if (key == "histzoomrange") { ls >> v; app.histZoomSetsRange = v != 0; }
+        // #320, validated like folderclick: 0 overlay, 1 side by side, and
+        // anything else is the default. A prefs file from before the key has no
+        // line, so an upgrading user gets overlay - the ruling's default.
+        else if (key == "temporallayout") { ls >> v; if (v == 0 || v == 1) app.temporalLayout = v; }
         // THE KEYS WHOSE VALUE IS THE REST OF THE LINE, because a path may
         // contain spaces. This list is the gate: a key missing from it never
         // reaches the chain below, however carefully that chain handles it.
@@ -3291,14 +3322,23 @@ static void refreshCrashSnapshot() {
     g_crashText = os.str();
 }
 
+// NOT INHERITED (#319, measured). A windowed start spawns a child that lives as
+// long as it does - `viewer --serve --serve-readers`, the local reader peer -
+// and a child started with inherited handles holds its own copy of this one.
+// releaseCrashFileFor then closes OUR copy and the rename still meets an open
+// file: every autosave of a windowed run on Windows failed "Permission denied"
+// and left the 0-byte file this open had created, so the next start had no
+// session to come back to. _O_NOINHERIT / O_CLOEXEC keep the fd this process's
+// alone; --startup-selftest S6 asserts the flag.
 static void openCrashFile() {
     std::string p = autosavePath();
     if (p.empty()) return;
 #if defined(_WIN32)
     g_crashFd = _wopen(pathFromUtf8(p).wstring().c_str(),
-                       _O_CREAT | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+                       _O_CREAT | _O_RDWR | _O_BINARY | _O_NOINHERIT,
+                       _S_IREAD | _S_IWRITE);
 #else
-    g_crashFd = open(pathFromUtf8(p).c_str(), O_CREAT | O_RDWR, 0644);
+    g_crashFd = open(pathFromUtf8(p).c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 #endif
 }
 
@@ -3579,6 +3619,22 @@ static std::string loadSession(const std::string& path,
     app.anns.clear();
     app.selectedAnn = 0;
     app.annRev++;
+    // a session without tchart lines (every file before #314) is ONE chart on
+    // the default axis - what such a session always showed
+    app.tcharts.assign(1, App::TemporalChart{});
+    bool tchartsFromFile = false;
+    // the seqaxis triple being read (#314): vals and unit wait here until the
+    // name line closes the axis, which then lands on the stack (or its queued
+    // restore) by NAME - replacing one of that name, adding otherwise
+    App::NamedAxis pendAxis;
+    bool pendAxisOk = false;
+    // A stack whose image line carries seqaxis lines gets the SESSION's axes,
+    // in the session's order, INSTEAD of what its file declared: the file was
+    // re-read before these lines (a .vnz's timestamps / covariates land on
+    // open), and merging would bring back an axis the user removed and move
+    // the default (axes[0]) to the file's. A stack with no seqaxis lines keeps
+    // the file's axes. These are the stacks already cleared for it.
+    std::vector<int> axesFromSession;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
     // The member list a `stackmember` block is accumulating for the NEXT
     // `seqload` line (docs/reference-design.md §5.2, board row 267). Read
@@ -3834,6 +3890,21 @@ static std::string loadSession(const std::string& path,
             if (std::isfinite(lo)) app.lin.winLo = lo;
             if (std::isfinite(hi)) app.lin.winHi = hi;
         }
+        else if (key == "tchart") {        // one Temporal chart (#314)
+            std::string kind;
+            ls >> kind;
+            App::TemporalChart c;
+            if (kind == "frame") c.xKind = App::TemporalChart::XFrame;
+            else if (kind == "axis") {
+                c.xKind = App::TemporalChart::XNamed;
+                c.xName = restOfLine(ls);
+            } else if (kind != "default") {
+                rep.note(LK_LineRejected, "tchart");
+                continue;
+            }
+            if (!tchartsFromFile) { app.tcharts.clear(); tchartsFromFile = true; }
+            if ((int)app.tcharts.size() < App::TemporalChart::kMax) app.tcharts.push_back(c);
+        }
         // "npyaxis" is deliberately NOT parsed any more (§3.4): the flag it
         // restored no longer exists, and an old session's value falls through
         // the chain like any unknown key rather than being half-honoured.
@@ -3975,18 +4046,35 @@ static std::string loadSession(const std::string& path,
                     if (!end || *end != '\0' || !std::isfinite(v)) { bad = true; break; }
                     vals.push_back(v);
                 }
-                if (bad || vals.empty()) {
+                pendAxis = App::NamedAxis{};
+                pendAxisOk = !bad && !vals.empty();
+                if (!pendAxisOk) {
                     fprintf(stderr, "session: seqaxisvals unreadable - x axis dropped\n");
                     rep.note(LK_LineRejected, "seqaxisvals");
-                    if (si2) si2->axisVals.clear(); else sr->axisVals.clear();
-                } else if (si2) si2->axisVals = std::move(vals);
-                else sr->axisVals = std::move(vals);
+                } else pendAxis.vals = std::move(vals);
             } else if (key == "seqaxisunit") {
-                std::string u = restOfLine(ls);
-                if (si2) si2->axisUnit = u; else sr->axisUnit = u;
+                pendAxis.unit = restOfLine(ls);
             } else {
-                std::string n = restOfLine(ls);
-                if (si2) si2->axisName = n; else sr->axisName = n;
+                pendAxis.name = restOfLine(ls);
+                if (pendAxisOk) {
+                    if (si2) {
+                        if (std::find(axesFromSession.begin(), axesFromSession.end(),
+                                      si2->id) == axesFromSession.end()) {
+                            si2->axes.clear();
+                            axesFromSession.push_back(si2->id);
+                        }
+                        si2->putAxis(std::move(pendAxis));
+                    } else {
+                        bool put = false;
+                        for (App::NamedAxis& a : sr->axes)
+                            if (App::SeqInfo::sameName(a.name, pendAxis.name)) {
+                                a = pendAxis; put = true;
+                            }
+                        if (!put) sr->axes.push_back(pendAxis);
+                    }
+                }
+                pendAxis = App::NamedAxis{};
+                pendAxisOk = false;
             }
         }
         // MIGRATION of the old per-stack level. saveSession has never written
@@ -4273,7 +4361,7 @@ static std::string loadSession(const std::string& path,
                     // stack) carries the display name onto the queued entry the
                     // way it already does for a rescan.
                     app.seqRestore.push_back({ cur()->uid, std::move(explicitFiles),
-                                               std::string(), {}, {}, {}, {}, true });
+                                               std::string(), {}, {}, true });
                 } else if (isRemote) {
                     // A folder stack whose frames live on a peer. Its siblings
                     // are a LISTING, and findSequenceSiblings below walks THIS
@@ -4304,7 +4392,7 @@ static std::string loadSession(const std::string& path,
                     // queued, not started: see App::seqRestore
                     if (files.size() >= 2)
                         app.seqRestore.push_back({ cur()->uid, std::move(files), pat,
-                                                   {}, {}, {}, {} });
+                                                   {}, {} });
                     else
                         // the same silence, on this disk: the folder is gone or
                         // has lost its numbering, and the stack the file asked
@@ -4833,4 +4921,118 @@ static std::string loadSession(const std::string& path,
     settingsResyncGuiSnapshot();
     markAllTexDirty();                 // gamma may have changed
     return {};
+}
+
+// When an autosave was written, in the words the toast and the menu row use:
+// local time to the minute. C++17 has no file_clock -> system_clock conversion,
+// so the difference is anchored against "now" on both clocks (serve.cpp's
+// unixMtime does the same), exact to well under the minute shown.
+static std::string autosaveWhen(const std::string& path) {
+    std::error_code ec;
+    const auto ft = std::filesystem::last_write_time(pathFromUtf8(path), ec);
+    if (ec) return "?";
+    const auto sys = std::chrono::system_clock::now() +
+                     std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                         ft - std::filesystem::file_time_type::clock::now());
+    const time_t tt = std::chrono::system_clock::to_time_t(sys);
+    struct tm tmv {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+    char b[32];
+    strftime(b, sizeof b, "%Y-%m-%d %H:%M", &tmv);
+    return b;
+}
+
+// ---- a start opens the last session (#319) ---------------------------------
+// A start with nothing named on its command line comes back where the last one
+// left off: the autosave recoveryOfferIn picks - the newest one no LIVE window
+// owns, so a second window never takes the first one's. Decided by a pure
+// function of what main() knows right after parseCli, so every case is asserted
+// (--startup-selftest) without a window; startupRestoreApply is the half that
+// reads the file.
+enum StartupRestoreWhy {
+    SR_Open = 0,        // open `path`
+    SR_Scripted,        // a selftest / --*-selftest / --bench / --no-window
+    SR_NoSession,       // --no-session: start empty, the autosave is kept
+    SR_CommandLine,     // the command line named something to open
+    SR_NoAutosave,      // none, or every one is held by a live window
+    SR_EmptyAutosave,   // 0 bytes
+    SR_Broken,          // loadSession refused it - the APPLY's verdict, not the decision's
+};
+static const char* startupRestoreWhyName(StartupRestoreWhy w) {
+    switch (w) {
+    case SR_Open:          return "open";
+    case SR_Scripted:      return "scripted run";
+    case SR_NoSession:     return "--no-session";
+    case SR_CommandLine:   return "command line names something to open";
+    case SR_NoAutosave:    return "no autosave";
+    case SR_EmptyAutosave: return "empty autosave";
+    case SR_Broken:        return "broken autosave";
+    }
+    return "?";
+}
+struct StartupRestoreIn {
+    bool scripted = false;     // main()'s scriptedRun
+    bool noSession = false;    // --no-session (parseCli: g_cliNoSession)
+    bool cliOpens = false;     // parseCli: g_cliNamesOpen
+    std::string offer;         // recoveryOfferIn's answer ("" = none)
+    uintmax_t offerBytes = 0;
+};
+struct StartupRestore {
+    StartupRestoreWhy why = SR_NoAutosave;
+    std::string path;          // set only when why == SR_Open
+};
+// In this order because the first true reason is the one a reader is owed: a
+// scripted run never looks at the user's state at all, and an explicit flag
+// outranks the inference "a file was named, so that is what this start is for".
+static StartupRestore startupRestoreDecide(const StartupRestoreIn& in) {
+    StartupRestore d;
+    if (in.scripted)            d.why = SR_Scripted;
+    else if (in.noSession)      d.why = SR_NoSession;
+    else if (in.cliOpens)       d.why = SR_CommandLine;
+    else if (in.offer.empty())  d.why = SR_NoAutosave;
+    else if (in.offerBytes == 0) d.why = SR_EmptyAutosave;
+    else { d.why = SR_Open; d.path = in.offer; }
+    return d;
+}
+// What this start decided, kept for the selftest (which asserts on its own run)
+// and for nobody else.
+static StartupRestore g_startupRestore;
+// Open what the decision named. A file that is not a session, or cannot be
+// read, closes nothing (nothing is open yet) and is ONE line in Messages - the
+// start is not the moment for an error toast over an empty window, and the file
+// is left where it is for the user to look at. A lossy load has already put its
+// own sentence on screen (what did not come back, by name); that one outranks
+// this one, so this goes to Messages beside it, as openPath's session door does.
+static void startupRestoreApply(StartupRestore& d) {
+    if (d.why != SR_Open) return;
+    const std::string when = autosaveWhen(d.path);
+    SessionReport rep;
+    const std::string err = loadSession(d.path, &rep);
+    if (!err.empty()) {
+        d.why = SR_Broken;
+        logMsg("last session not restored: " + baseName(d.path) + ": " + err +
+               " - started empty", true);
+        return;
+    }
+    const std::string msg = "restored last session (autosave, " + when +
+                            ") - start with --no-session to skip";
+    if (rep.lost() > 0) logMsg(msg);
+    else toast(msg);
+}
+
+// File > Recent Sessions' head row (#319): the autosave the start would open,
+// for the times it did not - started with --no-session, or replaced since by
+// something else. A row of its own, above a separator, and never one of
+// sessionRecents (that list stays the sessions the user NAMED). label is empty
+// when there is nothing to offer.
+struct LastAutosaveRow { std::string label, path; };
+static LastAutosaveRow lastAutosaveRow(const std::string& dir, unsigned long selfPid) {
+    LastAutosaveRow r;
+    r.path = recoveryOfferIn(dir, selfPid, nullptr);
+    if (!r.path.empty()) r.label = "Last autosave (" + autosaveWhen(r.path) + ")";
+    return r;
 }

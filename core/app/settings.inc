@@ -436,6 +436,9 @@ enum SKey {
     // the reason above; its ROW sits with the appearance keys, because that is
     // what a font is from the reader's side.
     SK_fontPath,
+    // #320: Temporal's own A/B layout. Appended at the end for the reason
+    // above; its ROW opens the compare section.
+    SK_temporalLayout,
     // The end marker, and it is not bookkeeping. The origin ledger and the
     // sticky-warning ledger are ARRAYS INDEXED BY THIS ENUM, and their bound
     // used to be SK_defaultUnit - the last id on the day they were written. Any
@@ -632,6 +635,16 @@ static const SKeyDef SETTING_KEYS[] = {
       "Levels UNDER the folder that is opened, 1..16. The same depth is used by "
       "the local walk and by the ask sent to a peer - it is the only depth "
       "\"all stacks below\" has.", "3" },
+    // #320 (ruled 2026-10-28: "少なくとも既定は重ねて表示"). Temporal's A/B
+    // layout, which stopped following the Histogram / Projection one: a time
+    // series is read by comparing curves on one axis, so overlay is the default
+    // whatever the image arrangement is. Presentation-class. The sample is the
+    // non-default word, so the schema walk feeds this row a value that lands.
+    { SK_temporalLayout, "compare.temporalLayout", SS_Read,
+      "Temporal with a compare partner: \"overlay\" (the default) puts every "
+      "side's curve on one time axis, \"side-by-side\" gives each side its own "
+      "plot. The Histogram / Projection layout does not change it.",
+      "\"side-by-side\"" },
 };
 static const size_t SETTING_KEY_COUNT = sizeof SETTING_KEYS / sizeof SETTING_KEYS[0];
 
@@ -646,7 +659,9 @@ static const char* SETTING_SECTIONS[] = {
     // name already says. The split is stated here so nobody has to wonder which
     // of the two sections the next watch key belongs in: a SWITCH over loading
     // behaviour is loading's, the watcher's own tuning is watch's.
-    "watch"
+    "watch",
+    // #320: how a comparison is laid out in the statistics panels.
+    "compare"
 };
 static const size_t SETTING_SECTION_COUNT =
     sizeof SETTING_SECTIONS / sizeof SETTING_SECTIONS[0];
@@ -1153,6 +1168,14 @@ static void sjApplyKey(SjApply& A, const SKeyDef& d, const SjVal& v) {
                 A.setI(app.folderClick, idx, path);
             break;
         }
+        // #320. The words are the layouts' own names; index 0 is overlay, the
+        // default, which is also App::TlOverlay.
+        case SK_temporalLayout: {
+            int idx = 0;
+            if (A.wantEnum(v, path, { "overlay", "side-by-side" }, idx))
+                A.setI(app.temporalLayout, idx, path);
+            break;
+        }
         case SK_stackPrompt: {
             int idx = 0;
             if (A.wantEnum(v, path, { "ask", "always", "never" }, idx))
@@ -1590,7 +1613,7 @@ static SWidget settingsWidgetFor(SKey id) {
         // the field is rbFlat, so a checkbox would be inverted against its own
         // name. Two words beat a negated tick.
         case SK_theme: case SK_titleBar: case SK_stackPrompt: case SK_policy:
-        case SK_grouped: case SK_folderClick:
+        case SK_grouped: case SK_folderClick: case SK_temporalLayout:
             return SW_Enum;
         case SK_gamma:
             return SW_Gamma;
@@ -1762,6 +1785,10 @@ static void prefEnumChoices(SKey id, std::vector<const char*>& out, int& cur) {
             out = { "single", "double" };
             cur = std::clamp(app.folderClick, 0, 1);
             break;
+        case SK_temporalLayout:
+            out = { "overlay", "side-by-side" };
+            cur = app.temporalLayout == App::TlSide ? 1 : 0;
+            break;
         default: break;
     }
 }
@@ -1774,6 +1801,7 @@ static void prefEnumSet(SKey id, int idx) {
         case SK_policy: app.procPolicy = idx ? App::PolLocalFetch : App::PolAuto; break;
         case SK_grouped: app.rbFlat = idx != 0; break;
         case SK_folderClick: app.folderClick = std::clamp(idx, 0, 1); break;
+        case SK_temporalLayout: app.temporalLayout = idx ? App::TlSide : App::TlOverlay; break;
         default: break;
     }
 }
@@ -1807,6 +1835,7 @@ static void prefsRecordFrom(PrefsBase& B, SKey id) {
         case SK_tree:        B.rbTree = app.rbTree; break;
         case SK_naturalSort: B.rbNatural = app.rbNatural; break;
         case SK_folderClick: B.folderClick = app.folderClick; break;
+        case SK_temporalLayout: B.temporalLayout = app.temporalLayout; break;
         case SK_stackPrompt: B.seqLoadMode = app.seqLoadMode; break;
         case SK_peerExe:     B.remoteExe = app.remoteExe; break;
         case SK_policy:      B.procPolicy = app.procPolicy; break;
@@ -1983,6 +2012,7 @@ static void prefResetToDefault(SKey id) {
         case SK_tree:        app.rbTree = false; break;
         case SK_naturalSort: app.rbNatural = true; break;
         case SK_folderClick: app.folderClick = 0; break;
+        case SK_temporalLayout: app.temporalLayout = App::TlOverlay; break;
         case SK_stackPrompt: app.seqLoadMode = 0; break;
         case SK_rawRecipes:  g_rawLibrary.clear(); break;
         case SK_peerExe:     app.remoteExe.clear(); break;
@@ -2179,6 +2209,9 @@ static std::string settingsCurrentValue(SKey id) {
         // 判断9 keeps "chose single" and "never chose" apart for the day the
         // default moves - which is the whole reason this is a key and not a bool.
         case SK_folderClick: return app.folderClick == 1 ? "\"double\"" : "";
+        // #320. Overlay is the default and writes nothing, for 判断9's reason.
+        case SK_temporalLayout:
+            return app.temporalLayout == App::TlSide ? "\"side-by-side\"" : "";
         // 0 is the default AND a meaningful value ("automatic"), so the empty
         // string here means "not set" exactly as it does everywhere else - the
         // two coincide, which is why the panel prints the RESOLVED figure

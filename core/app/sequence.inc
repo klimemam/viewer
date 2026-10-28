@@ -1318,10 +1318,11 @@ static void pumpSequenceAndQueue() {
                 if (app.images[i]->seqId != 0)
                     if (App::SeqInfo* si2 = seqInfo(app.images[i]->seqId)) {
                         if (!r.name.empty()) si2->name = r.name;
-                        if (!r.axisVals.empty()) {
-                            si2->axisName = r.axisName;
-                            si2->axisUnit = r.axisUnit;
-                            si2->axisVals = std::move(r.axisVals);
+                        // the session's axes REPLACE whatever the rescan found
+                        // (loadSession: axesFromSession says why)
+                        if (!r.axes.empty()) {
+                            si2->axes.clear();
+                            for (App::NamedAxis& a : r.axes) si2->putAxis(std::move(a));
                         }
                     }
                 break;
@@ -2481,7 +2482,8 @@ static void pickerAccept() {
 // different shapes coexist inside it as separate stacks - that is the whole
 // point of a container.
 static bool applyFrameAxisVals(int seqId, const std::string& name, const std::string& unit,
-                               std::vector<double> vals, std::string& err);   // fwd
+                               std::vector<double> vals, std::string& err,
+                               bool* replaced = nullptr);                     // fwd
 static std::string trimAxisLabel(const std::string& s);                       // fwd
 static void openLocalFile(const std::string& path, int kind);   // fwd (open_dispatch.inc)
 // The next .npz that was dropped while this picker was up. Draining here and on

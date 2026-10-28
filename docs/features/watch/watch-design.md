@@ -241,7 +241,7 @@ membership** を一歩で更新する。元 stack を Reload すれば、そこ�
 | Histogram / Projection / ROI 表 / 差分テクスチャ / A/B auto range | (uid, dataRev) の鍵が外れる (9835 / 11026 / 15303 / 1842 / 1817) | walk が dataRev++ するだけで既存機構が働く |
 | Temporal (σ_t) | 鍵に `SeqInfo::stackRev` を足す (reference-design §3.2 — 今日の鍵 7027 は dataRev を含まない) | ステージ5 の修正に含む |
 | temporalExtra (スロットの σ_t) | forgetImage が今日触っていない (2183 の k<2) — walk で無効化する | 同上 |
-| server temporal (σ_t サーバ集計) | その stack を指していれば再発火 (seqMosaicChanged 7519-7520 と同型)。**自動再発火は A 側 (`srvTemporal`) のみ** — B の「Measure B は押した人のもの」(835 の struct 注記) はそのまま、B 側は結果を破棄して「measure again」を出す | 新規1行ずつ |
+| server temporal (σ_t サーバ集計) | その stack を指していれば再発火 (seqMosaicChanged 7519-7520 と同型)。**自動再発火は A 側 (`srvTemporal`) のみ** — B の「Measure B は押した人のもの」(835 の struct 注記) はそのまま、B 側は結果を破棄して「measure again」を出す (**#320 で変更**: B も自動、同じ (stack, 状態) に1回 —— ab-stats-plan §4) | 新規1行ずつ |
 | series の fit / linearity 行 | `linFitStale()` + 係る series の fit 破棄 (5092c4b と同じ規律) | walk に含む |
 | テクスチャ | texDirty + texLru はそのまま | 既存 |
 | compare のピン / follow | uid を保持するので影響なし。divergence は次の resolve で再計算 | 既存 |
