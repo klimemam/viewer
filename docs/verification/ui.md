@@ -171,7 +171,7 @@ rc=0
 | B6 | reload / stale / failure を区別して表示する | `reload` / `stackavg` | `(stale)` と `(reload failed)` を、対象と解消方法が異なる状態として表示する。成功条件を満たす操作が行われるまで、黙って消さない |
 | B7 | 設定 UI と保存値を一致させる | `settings` | default < prefs < settings.jsonc < CLI の優先順を保つ。不正な file / key は理由付きで拒否し、画面上の値と保存値を取り違えない |
 | B8 | Browse の行モデルと picker | `browse` / `localbrowse` / `picker` | grouped / flat、local / peer、file / group / folder という各分類の行 identity と選択対象を混同せず、picker の操作を実際の行に結び付ける |
-| B9 | 表示範囲と false color | `range` / `test_display_falsecolor` | 表示範囲の状態遷移と false-color plugin の出力が、定義済みの値と境界を保つ |
+| B9 | 表示範囲と false color | `range` / `test_display_falsecolor` | 表示範囲の状態遷移と false-color plugin の出力が、定義済みの値と境界を保つ。Range の scope と rule (#321): `frame` の例外は書き込みをそのフレームだけに受け、stack の書き込みは外したフレームを飛ばし、`[own range]` をフッタに出し、`framerange` で往復する。`each frame fits itself` は保存値を書かない。固定値は rule を `one range` / `A's range` に移す。ランプ表(fit 系の下では選んだ fit、union では Auto が事実として点灯し Auto % / Med は押せない、frame は自分と比較)。in force 行・x 軸・書き出し注記が同じ言葉。旧セッションの全設定で画面 byte が main と一致(S1) |
 | B10 | benchmark 中の描画対象を確認する | `benchcov` | 開いた対象パネルが計測フレーム中に実際に描画される。隠れたタブを測定したことにしない |
 | B11 | histogram を拡大する (#309) | `histzoom` | ドラッグした値域に bin を `histZoomGrid` で張り直す(整数型で 256 DN 未満は 1 DN/bin を DN の数だけ、それ以外は 256 bin で、グリッドはドラッグ範囲を覆う)。比較の全側が A の同じグリッドで数え、bin 合計 + 範囲外 == 有限画素。Shift / 見出しの切り替えで拡大とハイライトが入れ替わる。連動オフでは表示レンジを書かず、オンでは解除で直前に戻す(間に別の操作があれば戻さない)。frame 送りで保ち、別 stack / plane で解除 |
 

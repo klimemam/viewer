@@ -732,6 +732,11 @@
             check((int)framesOfSeq(rs).size() == 4 && !memberDoc(rs, 4),
                   "W28 (setup) the stack is down to four members, none of them r_003");
             rebWrite(3, 903.0f);                  // r_003 is back, with new pixels
+            // #321: the stack's reference frame keeps its own range - the frame
+            // that joins must take the STACK's, not the exception's
+            ImageDoc* ex28 = app.images[framesOfSeq(rs).front()].get();
+            for (int i : framesOfSeq(rs)) { app.images[i]->black = 1.0f; app.images[i]->white = 2.0f; }
+            ex28->rangeOwn = true; ex28->black = 5.0f; ex28->white = 6.0f;
             int failed = -1;
             const std::string msg = reloadStackFromDisk(rs, &failed);
             fprintf(stderr, "watchselftest: W28 summary: %s\n", msg.c_str());
@@ -745,6 +750,10 @@
             ImageDoc* n3 = memberDoc(rs, 3);
             check(n3 && n3->px()[0] == 903.0f && n3->w == 4 && n3->h == 4,
                   "W28b ...and it was really decoded: the file's new pixels");
+            check(n3 && !n3->rangeOwn && n3->black == 1.0f && n3->white == 2.0f &&
+                  ex28->rangeOwn && ex28->black == 5.0f,
+                  "W28d the joining frame takes the stack's range, not the excepted head frame's (#321)");
+            ex28->rangeOwn = false; ex28->black = 1.0f; ex28->white = 2.0f;
             check(failed == 0 && seqInfo(rs) && seqInfo(rs)->expectedFrames == 5 &&
                   msg.find("1 file(s) appeared in the folder (r_003.npy)") !=
                       std::string::npos &&
@@ -1443,7 +1452,16 @@
                 check((int)framesOfSeq(cs).size() == 4 && failed0 == 0 &&
                       plain.find("membership rebuilt") == std::string::npos,
                       "W47c2 (contrast) the NAME rule alone rebuilds nothing: still 4 of 6");
+                ImageDoc* ex47 = app.images[framesOfSeq(cs).front()].get();
+                for (int i : framesOfSeq(cs)) { app.images[i]->black = 1.0f; app.images[i]->white = 2.0f; }
+                ex47->rangeOwn = true; ex47->black = 5.0f; ex47->white = 6.0f;
                 watchReloadNow(cs, false);
+                {
+                    ImageDoc* j4 = memberDoc(cs, 4);
+                    check(j4 && !j4->rangeOwn && j4->black == 1.0f && j4->white == 2.0f && ex47->rangeOwn,
+                          "W47h a frame the grown axis adds takes the stack's range, not the excepted head's (#321)");
+                    ex47->rangeOwn = false; ex47->black = 1.0f; ex47->white = 2.0f;
+                }
                 check((int)framesOfSeq(cs).size() == 6 &&
                       seqInfo(cs) && seqInfo(cs)->expectedFrames == 6,
                       "W47d F grew 4 -> 6: the stack holds SIX frames now");

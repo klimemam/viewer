@@ -371,9 +371,11 @@ static bool montageROI(bool horizontal, std::string& err, bool perFrameAuto = fa
         S.dtype = "f32";                 // whatever the source was, this is not it
         out->black = 0.0f; out->white = 1.0f;
         S.vmin = 0.0f;  S.vmax = 1.0f;
+        S.measured = true;               // normalised to 0..1 by construction
     } else {
         out->black = im->black; out->white = im->white;
         S.vmin = im->vmin; S.vmax = im->vmax;
+        S.measured = im->src->measured;
     }
     out->syncMirrors();
     out->batchId = im->batchId;

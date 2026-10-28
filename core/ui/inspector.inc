@@ -661,87 +661,6 @@ static void drawInspector() {
             if (b->w != im->w || b->h != im->h)
                 ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "size differs: B is %dx%d",
                                    b->w, b->h);
-            // Two images auto-ranged to their own min/max look different even when
-            // the pixels are identical - the fastest way to a wrong conclusion.
-            if (!app.linkRange) {
-                // Sharing is the default because two images stretched
-                // differently cannot be compared: the difference you see would
-                // be the stretch. When it is off, SAY the numbers differ - that
-                // is the case where a reading can mislead.
-                ImGui::SetNextItemWidth(-1);
-                // "both" and "B uses" were true when the comparison was a
-                // pair. The RULE was always N-wide (displayRangeFor spans
-                // every compared pane), so at three slots the labels lied about
-                // arity - issue #60 named this one by name. "every side" is
-                // the noun the panels already use, and it is true at two.
-                // The fourth (#301) is the third's sibling: still Auto, but
-                // each side's own instead of one shared across them. WHICH
-                // fit is chosen right under it (the radio row below).
-                static const char* AB_RANGE_ITEMS[4] = {
-                    "A/B: each keeps its own", "A/B: every side uses A's range",
-                    "A/B: auto over every side (union)",
-                    "A/B: each side fits itself" };
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::Combo("##abrange", &app.compareRangeMode,
-                                 AB_RANGE_ITEMS, 4)) {
-                    b->texDirty = true; im->texDirty = true;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(
-                        "How the compared sides are STRETCHED - every pane, slots\n"
-                        "included, not just A and B. Display only - each keeps its own\n"
-                        "numbers and gets them back when compare ends.\n"
-                        "  auto over every side (union), the default: every compared\n"
-                        "    side re-fits to min/max across A, B and the slots, so no\n"
-                        "    side clips and none is favoured. Two stacks at different\n"
-                        "    exposures need this - B against A's range alone saturates\n"
-                        "    into a single bin.\n"
-                        "  every side uses A's range: one range, A's, for every other\n"
-                        "    letter, and it does not move while you step A. Right when\n"
-                        "    the others really are measured against A.\n"
-                        "  each side fits itself: every side at ITS OWN fit - min-max,\n"
-                        "    0.1-99.9%% or median, picked on the 'fit' row under this\n"
-                        "    (the same choice as Auto per frame's) - re-fitted as each\n"
-                        "    side steps. For looking at each picture well; the sides\n"
-                        "    are not on one scale, and it says so.\n"
-                        "  each keeps its own: comparing SHAPES at wildly different\n"
-                        "    exposures - the one case where the sides are not directly\n"
-                        "    comparable, and it says so.");
-                if (app.compareRangeMode == 3) {
-                    // The mode's own question, asked where the mode is chosen.
-                    // Under Per stack (the default) this is the ONLY control of
-                    // the flavour, so it cannot live in the Range section.
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted("fit:");
-                    static const char* FIT_ITEMS[3] = { "min-max##abfit", "0.1-99.9%##abfit",
-                                                        "median##abfit" };
-                    for (int f = AF_MinMax; f <= AF_Median; f++) {
-                        ImGui::SameLine();
-                        if (ImGui::RadioButton(FIT_ITEMS[f], app.autoFlavor == f))
-                            setEachSideFlavor(f);
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("The fit every side is drawn at. The same choice as\n"
-                                              "Auto per frame's: median uses the target and black\n"
-                                              "point under the Range buttons.");
-                    }
-                }
-                // The numbers IN FORCE (effBlack/effWhite): in mode 0 they are
-                // each doc's own, in mode 3 each side's fit - the two modes in
-                // which the sides can be on different scales.
-                const float ab0 = effBlack(*im), aw0 = effWhite(*im);
-                const float bb0 = effBlack(*b),  bw0 = effWhite(*b);
-                if ((app.compareRangeMode == 0 || app.compareRangeMode == 3) &&
-                    (bb0 != ab0 || bw0 != aw0)) {
-                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                                       app.compareRangeMode == 3
-                                           ? "display range differs - each side is fitted to itself"
-                                           : "display range differs");
-                    ImGui::TextDisabled("A %s-%s / B %s-%s", fmtVal(ab0, im->dtype).c_str(),
-                                        fmtVal(aw0, im->dtype).c_str(),
-                                        fmtVal(bb0, b->dtype).c_str(),
-                                        fmtVal(bw0, b->dtype).c_str());
-                }
-            }
             if (b->dtype != im->dtype)
                 ImGui::TextDisabled("dtype differs: A %s / B %s", im->dtype.c_str(), b->dtype.c_str());
             if (app.compareMode == App::CmpFlip) {
@@ -1073,41 +992,131 @@ static void drawInspector() {
         }
 
         ImGui::SeparatorText("Range (black / white)");
-        {   // ONE mode control. It used to be a "link across all images"
-            // checkbox PLUS an on-switch combo whose third entry re-implemented
-            // linking destructively (copying the range into each image instead
-            // of overlaying one) - two mechanisms for the same intent, spotted
-            // as such immediately. Modes:
-            //   0..2 auto per frame - every frame re-fits, in one of the three
-            //                         flavours the Range row offers (#252)
-            //   3    per stack      - frames of a stack share the reference range
-            //   4    linked         - one display range overlays every open image
-            // The per-frame mode is spelled out three times rather than paired
-            // with a second "flavour" control: "Auto per frame" without saying
-            // auto WHAT is the question the user has to answer anyway, and a
-            // combo that names the answer needs no second widget to explain it.
-            int mode = app.linkRange ? 4
-                     : app.rangeScope == 0 ? std::min(std::max(app.autoFlavor, 0), 2)
-                                           : 3;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::Combo("##rangemode", &mode,
-                             "Auto per frame (min-max)\0"
-                             "Auto per frame (0.1-99.9%)\0"
-                             "Auto per frame (median->target)\0"
-                             "Per stack (default)\0"
-                             "Linked across all images\0")) {
-                if (mode <= 2) applyRangeMode(0, im, mode);
-                else           applyRangeMode(mode - 2, im);   // 3 -> 1, 4 -> 2
+        // #321: the section reads in the order the questions are asked - WHO
+        // shares one range (`applies to`), HOW it is decided (`rule`), what is
+        // IN FORCE, then the numbers and the buttons that write it. The A/B
+        // rule used to sit in the Pixel section above, so the eye met "union"
+        // before "Per stack" and had to put the two together itself.
+        // Each row is a set of segments: radio choices, one click commits -
+        // they are modes, not a list. Every choice goes through the setters in
+        // export.inc (setRangeScope / setRangeRule / setCompareRule), and every
+        // row's words come from the functions the selftest reads.
+        {
+            const ImGuiStyle& st = ImGui::GetStyle();
+            const float rowX = ImGui::GetCursorPosX();
+            const float labelW = ImGui::CalcTextSize("applies to").x + 2 * st.ItemSpacing.x;
+            const int scope = rangeScopeOf(im);
+            auto rowLabel = [&](const char* t) {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(t);
+                ImGui::SameLine(rowX + labelW);
+            };
+            // one segment; wraps under the row's first segment when the panel
+            // is too narrow for the next one
+            bool firstSeg = true;
+            auto seg = [&](const std::string& label, bool lit, bool amber, bool enabled,
+                           const char* tip) {
+                const float w = ImGui::CalcTextSize(label.c_str(), nullptr, true).x + 2 * st.FramePadding.x;
+                if (!firstSeg) {
+                    ImGui::SameLine();
+                    if (ImGui::GetCursorPosX() + w > ImGui::GetWindowContentRegionMax().x) {
+                        ImGui::NewLine();
+                        ImGui::SetCursorPosX(rowX + labelW);
+                    }
+                }
+                firstSeg = false;
+                int pushed = 0;
+                if (lit) {
+                    const ImVec4 a = amber ? ImVec4(0.62f, 0.43f, 0.13f, 1.0f)
+                                           : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive);
+                    ImGui::PushStyleColor(ImGuiCol_Button, a);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, a);
+                    pushed = 2;
+                }
+                ImGui::BeginDisabled(!enabled);
+                const bool hit = ImGui::Button(label.c_str());
+                ImGui::EndDisabled();
+                if (pushed) ImGui::PopStyleColor(pushed);
+                if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", tip);
+                return hit && enabled && !lit;
+            };
+
+            // ---- applies to: who shares one range -----------------------------
+            static const char* SCOPE_TIP[4] = {
+                "This frame only. Its range leaves the stack and stays with this frame until "
+                "you choose stack again. Marked in amber here and in the footer.",
+                "Every frame of this stack shares one range - a single image is its own "
+                "stack. The default.",
+                "Every compared side - A, B and the slots - while Compare A/B is on. Display "
+                "only: each stack keeps its own numbers and gets them back when compare ends.",
+                "One display range over every open image. Display only: each stack keeps its "
+                "own numbers and gets them back when you leave." };
+            rowLabel("applies to");
+            for (const RangeSeg& s : rangeScopeSegs(im))
+                if (seg(s.label + "##rscope", s.scope == scope, s.scope == RS_Frame, true, SCOPE_TIP[s.scope]))
+                    setRangeScope(s.scope, im);
+            ImGui::SetCursorPosX(rowX + labelW);
+            if (scope == RS_Frame) ImGui::TextColored(AB_AMBER, "%s", rangeScopeName(im, scope).c_str());
+            else                   ImGui::TextDisabled("%s", rangeScopeName(im, scope).c_str());
+            if (scope == RS_Stack) {
+                const int nOwn = ownFramesElsewhere(im);
+                if (nOwn > 0) {
+                    ImGui::SetCursorPosX(rowX + labelW);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextDisabled("%s", ownFramesLine(nOwn).c_str());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("rejoin all")) rejoinAllOwn(im);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Every frame of this stack wears the stack's range again.");
+                }
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Auto per frame: every frame re-fits as you step -\n"
-                                  "  to its own min..max, its own 0.1-99.9%% cut, or the\n"
-                                  "  range that puts its own median at 'target' below\n"
-                                  "Per stack: frames of one stack share the reference\n"
-                                  "  frame's range, so they compare directly\n"
-                                  "Linked: one display range for every open image - display\n"
-                                  "  only, each image keeps its own and gets it back on unlink");
+
+            // ---- rule: how that range is decided ------------------------------
+            static const char* RULE_TIP_STACK[2] = {
+                "Every frame is drawn at its own fit - min-max, 0.1-99.9% or median->target, "
+                "chosen with the three fit buttons below. Display only: the stack's stored "
+                "numbers stay. A fixed preset or a typed number switches back to one range.",
+                "One black/white for the whole stack - the numbers below. A fit button reads "
+                "the frame on screen and spreads its answer; a fixed preset or a typed number "
+                "spreads that." };
+            static const char* RULE_TIP_AB[4] = {
+                nullptr,
+                "Every side at A's numbers - A's stack's range, or A's own when A keeps one. It does "
+                "not move while you step A.",
+                "Every side re-fits to min/max across every compared side, every step. No side "
+                "clips, none is favoured.",
+                "Every side at its own fit (the fit buttons choose which). The sides are not on "
+                "one scale and the line below says so." };
+            firstSeg = true;
+            rowLabel("rule");
+            const int ruleLit = rangeRuleLit(scope);
+            for (const auto& r : rangeRuleSegs(scope)) {
+                const char* tip = scope == RS_Stack ? RULE_TIP_STACK[r.first == RR_OneRange ? 1 : 0]
+                                : scope == RS_Compared ? RULE_TIP_AB[std::clamp(r.first, 1, 3)]
+                                : nullptr;
+                if (seg(r.second + "##rrule", r.first < 0 || r.first == ruleLit, false, r.first >= 0, tip)) {
+                    if (scope == RS_Stack) setRangeRule(r.first, im);
+                    else                   setCompareRule(r.first);
+                }
+            }
+
+            // ---- in force: the range on screen, and why -----------------------
+            rowLabel("in force");
+            const InForce f = inForceOf(*im);
+            ImGui::PushTextWrapPos(0.0f);
+            if (f.amber) ImGui::TextColored(AB_AMBER, "%s", f.text.c_str());
+            else         ImGui::TextUnformatted(f.text.c_str());
+            ImGui::PopTextWrapPos();
+            if (!f.warn.empty()) {
+                ImGui::SetCursorPosX(rowX + labelW);
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(AB_AMBER, "%s", f.warn.c_str() + (f.warn.rfind(" · ", 0) == 0 ? 4 : 0));
+                ImGui::PopTextWrapPos();
+            }
         }
+        const std::string tail = rangeScopeTail(im);
+        const bool eachRule = rangeEachRule(im), unionRule = rangeUnionRule(im);
         // EnterReturnsTrue is not allowed on InputScalar-family widgets (asserts in
         // debug builds); edit a shadow buffer and commit on deactivate-after-edit.
         static float bwEdit[2];
@@ -1118,6 +1127,9 @@ static void drawInspector() {
         bwEditing = ImGui::IsItemActive();
         if (ImGui::IsItemDeactivatedAfterEdit() && bwEdit[1] > bwEdit[0])
             setRange(*im, bwEdit[0], bwEdit[1]);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("black / white -> %s%s", tail.c_str(),
+                              eachRule || unionRule ? "\n(a typed range is one range: the rule moves to it)" : "");
         {   // SIX buttons in TWO rows of three, measured from the panel and
             // never wider than it. The split is by what the button ANSWERS,
             // which is what the eye is looking for: the top row are the three
@@ -1126,16 +1138,15 @@ static void drawInspector() {
             // "Auto %" and "0-1" and read as a list of unrelated presets.
             float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
             bw = std::max(bw, ImGui::GetFontSize() * 2.0f);
-            // ...each lit while its own answer IS the range in force, so the
-            // row says where the numbers above came from (「Auto が選択されて
-            // いるかを UI 上で示した方が良い」, #248). The rule lives in
-            // rangeButtonMatches; see there for why this is not a radio group.
-            // ButtonHovered is pushed to the same colour as Button: without it
-            // a lit button reverts to the ordinary hover tint under the cursor
-            // and reads as having just gone OFF.
+            // ...each lit by the lamp table (rangeButtonLit, #321 §3.2): under
+            // one range its own answer IS the range in force (#248, compared,
+            // never remembered); under a fitting rule the fit chosen; under the
+            // union Auto, as a fact. ButtonHovered is pushed to the same colour
+            // as Button: without it a lit button reverts to the ordinary hover
+            // tint under the cursor and reads as having just gone OFF.
             const float eb = effBlack(*im), ew = effWhite(*im);
             auto lit = [&](int btn) {
-                bool on = rangeButtonMatches(*im, btn, eb, ew);
+                bool on = rangeButtonLit(*im, btn, eb, ew);
                 if (on) {
                     const ImVec4 a = ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive);
                     ImGui::PushStyleColor(ImGuiCol_Button, a);
@@ -1143,57 +1154,61 @@ static void drawInspector() {
                 }
                 return on;
             };
-            bool on = lit(RB_Auto);
-            if (ImGui::Button("Auto", ImVec2(bw, 0))) {
-                float lo = im->vmin, hi = im->vmax;
+            static const char* UNION_FIT_TIP =
+                "the union is min-max over every side; for a percentile or median fit per side "
+                "choose \"each side fits itself\"";
+            // A fit button: under a fitting rule it CHOOSES the fit; otherwise
+            // it reads `im` (or, linked, every open image) and writes the answer.
+            auto fitButton = [&](const char* label, int btn, int flavor, auto&& fit, const char* what) {
+                bool on = lit(btn);
+                ImGui::BeginDisabled(!rangeButtonEnabled(*im, btn));
+                if (ImGui::Button(label, ImVec2(bw, 0))) {
+                    if (eachRule) setFlavor(flavor);
+                    else if (!unionRule) { float lo = im->vmin, hi = im->vmax; fit(lo, hi); setRange(*im, lo, hi); }
+                }
+                ImGui::EndDisabled();
+                if (on) ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (unionRule && btn != RB_Auto) ImGui::SetTooltip("%s", UNION_FIT_TIP);
+                    else if (unionRule) ImGui::SetTooltip("the union: min-max over every compared side");
+                    else if (eachRule) ImGui::SetTooltip("draw every %s at its own %s",
+                                                         rangeScopeOf(im) == RS_Compared ? "side" : "frame", what);
+                    else if (app.linkRange) ImGui::SetTooltip("%s over all open images -> %s", what, tail.c_str());
+                    else ImGui::SetTooltip("%s of this frame -> %s", what, tail.c_str());
+                }
+            };
+            fitButton("Auto", RB_Auto, AF_MinMax, [&](float& lo, float& hi) {
                 if (app.linkRange)                       // fit every image, not just this one
                     for (const auto& d : app.images) { lo = std::min(lo, d->vmin); hi = std::max(hi, d->vmax); }
-                setRange(*im, lo, hi);
-            }
-            if (on) ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(app.linkRange ? "min/max over all open images" : "min/max of this image");
+            }, "min/max");
             ImGui::SameLine();
             // ...and the same fit with the tails cut off. One hot pixel is
             // enough to make "Auto" useless, and cutting it is a DIFFERENT
             // answer rather than a better one - min/max is the only fit that
             // shows every pixel you have - so both stay on the row (#245).
-            on = lit(RB_AutoPct);
-            if (ImGui::Button("Auto %", ImVec2(bw, 0))) {
-                float lo = im->vmin, hi = im->vmax;
+            fitButton("Auto %", RB_AutoPct, AF_Pct, [&](float& lo, float& hi) {
                 autoPercentileFit(*im, lo, hi);
-                setRange(*im, lo, hi);
-            }
-            if (on) ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(app.linkRange ? "0.1-99.9%% over all open images"
-                                                : "0.1-99.9%% of this image");
+            }, "0.1-99.9%");
             ImGui::SameLine();
             // ...and the third question neither of them asks: not "what is in
             // the picture" but "where do I want the bulk of it to sit" (#252).
-            on = lit(RB_Median);
-            if (ImGui::Button("Med", ImVec2(bw, 0))) {
-                float lo = im->vmin, hi = im->vmax;
+            fitButton("Med", RB_Median, AF_Median, [&](float& lo, float& hi) {
                 medianFit(*im, lo, hi);
-                setRange(*im, lo, hi);
-            }
-            if (on) ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(app.linkRange
-                    ? "median of ALL open images -> target (one pooled histogram)"
-                    : "this image's median -> target, from the black point below");
+            }, "median -> target");
 
-            on = lit(RB_0_1);
-            if (ImGui::Button("0-1", ImVec2(bw, 0))) setRange(*im, 0, 1);
-            if (on) ImGui::PopStyleColor(2);
+            auto fixedButton = [&](const char* label, int btn, float b, float w) {
+                bool on = lit(btn);
+                if (ImGui::Button(label, ImVec2(bw, 0))) setRange(*im, b, w);
+                if (on) ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s -> %s%s", label, tail.c_str(),
+                                      eachRule || unionRule ? "\n(a fixed range is one range: the rule moves to it)" : "");
+            };
+            fixedButton("0-1", RB_0_1, 0, 1);
             ImGui::SameLine();
-            on = lit(RB_0_255);
-            if (ImGui::Button("0-255", ImVec2(bw, 0))) setRange(*im, 0, 255);
-            if (on) ImGui::PopStyleColor(2);
+            fixedButton("0-255", RB_0_255, 0, 255);
             ImGui::SameLine();
-            on = lit(RB_0_65535);
-            if (ImGui::Button("0-65535", ImVec2(bw, 0))) setRange(*im, 0, 65535);
-            if (on) ImGui::PopStyleColor(2);
+            fixedButton("0-65535", RB_0_65535, 0, 65535);
         }
         {   // The Med fit's parameters, directly UNDER the button that uses
             // them and in the order the sentence is read: "put the median at

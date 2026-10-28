@@ -113,7 +113,7 @@ Yes なら series、No なら batch。
 |---|---|---|---|---|---|
 | **Close** | 単発 frame のみ閉じる。stack の一員なら**stack ごと閉じる**（1枚ずつ消えるのは誤り）。逃げ道: Ctrl+Alt+W はその1枚だけ | 全 frame + SeqInfo を破棄 | Close=中身ごと破棄 / **ungroup(解散)=くくりだけ外す**。空になれば消える | 束縛の記録を破棄。メンバは無傷（束縛は所有ではない。[reader-analysisset.md](features/adapters/reader-analysisset.md) §6） | 管理する frame / stack / series / AnalysisSet を破棄。別 batch に管理された role-ref 参照先は無傷 |
 | **rename** | — (ファイル名) | 右クリック / F2。セッション保存 | 右クリック。セッション保存 | 右クリック。セッション保存 | ヘッダ右クリック。セッション保存 |
-| **表示レンジ** | `View > Value range scope` = per frame | 同 = per stack（既定：基準フレームを共有） | — |  | 同 = everything（全体で共有） |
+| **表示レンジ** | **例外**: Inspector > Range の `applies to` = `frame` —— その1枚だけのレンジ（琥珀の印、`stack` で戻る。セッションに `framerange`） | **既定**: `applies to` = `stack` —— 1つのレンジ（`rule` = `one range`）、または各フレームが自分で fit（`each frame fits itself`、表示だけ） | — |  | — （batch は構造を主張しないので表示レンジを持たない。全体で共有するのは **all open images**（`applies to` = `all open`）で、batch ではない） |
 | **Temporal (σ_t/FPN)** | — （1枚に時間軸はない） | ここが本体。ローカル集計 or サーバー集計。**未オープンの stack（ブラウザ上のグループ）もサーバ集計可**、結果は `not opened` タグ付き | — （series は条件が違う集まり） |  | — （条件混在は平均に意味がない） |
 | **frame 平均** | — （1枚に時間軸はない） | ここが本体。全 frame の画素ごと平均を **1枚の frame** として開く（stack を開く各所の右クリックと Files の stack 行）。結果は stack ではなく frame なので、Histogram / Projection / ROI がそのまま効く。元の stack は開いたまま残す | — （条件が違うものを平均しても量にならない） |  | — （条件混在は平均に意味がない） |
 | **per-frame 表 (TSV)** | 1行 | 全 frame の表。**σ_t 列は持たない**（stack の属性を frame 行に置くのは誤り） | 将来: series 横断の表（パラメータ列つき） |  | 将来: batch 横断の表 |

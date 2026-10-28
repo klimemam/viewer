@@ -1429,6 +1429,17 @@ static void drawCanvas(ImVec2 avail) {
         dl->AddText(ImVec2(canvasP0.x, botY), IM_COL32(175, 183, 191, 200), name);
         dl->PopClipRect();
         g_footerProbe += std::string("name=") + name + ";";
+        // A frame that keeps its own range (#321) is the stack's exception,
+        // and an exception you cannot see is a trap: marked here, in the
+        // warning amber the [stale] token wears, as well as in the Inspector.
+        // The token takes its own width: the scrub bar below starts after it.
+        float ownW = 0;
+        if (im->rangeOwn && im->seqId > 0) {
+            static const char* OWN_TOKEN = " [own range]";
+            dl->AddText(ImVec2(canvasP0.x + nameW, botY), IM_COL32(242, 184, 89, 255), OWN_TOKEN);
+            ownW = ImGui::CalcTextSize(OWN_TOKEN).x;
+            g_footerProbe += "ownrange=1;";
+        }
         if (si && fr.size() > 1) {
             int pos = 0;
             for (int k = 0; k < (int)fr.size(); k++) if (fr[k] == app.current) pos = k;
@@ -1447,7 +1458,7 @@ static void drawCanvas(ImVec2 avail) {
             dl->AddText(ImVec2(canvasP1.x - cs.x, botY), IM_COL32(175, 183, 191, 200), cnt);
             g_footerProbe += std::string("count=") + cnt + ";";
             float barH = 5.0f * s;
-            ImVec2 b0(canvasP0.x + nameW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
+            ImVec2 b0(canvasP0.x + nameW + ownW + 12 * s, botY + lh * 0.5f - barH * 0.5f);
             ImVec2 b1(canvasP1.x - cs.x - 12 * s, botY + lh * 0.5f + barH * 0.5f);
             if (b1.x > b0.x + 40 * s) {
                 ImGui::SetCursorScreenPos(ImVec2(b0.x, botY));

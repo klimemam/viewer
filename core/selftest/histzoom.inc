@@ -37,7 +37,7 @@ static int histZoomSelftest() {
     const bool zoomSets0 = app.histZoomSetsRange;
     const bool link0 = app.linkRange;
     const float linkB0 = app.linkBlack, linkW0 = app.linkWhite;
-    const int scope0 = app.rangeScope;
+    const int scope0 = app.rangeRule;
     const bool follow0 = app.compareFollowFrame;
     const uint64_t drawPass0 = app.drawPass;
     const int plane0 = app.histPlane;
@@ -142,7 +142,7 @@ static int histZoomSelftest() {
     app.compareFollowFrame = false;
     app.abStepBusyUntil = 0;
     app.linkRange = false;
-    app.rangeScope = 0;              // per frame: setRange touches only the frame
+    app.rangeRule = RR_OneRange;    // the fixtures are single images: each is its own stack
     app.histPlane = -1;
     app.histDragMode = 0;
     app.histZoomSetsRange = false;
@@ -619,9 +619,12 @@ static int histZoomSelftest() {
     }
 
     // ======================================================================
-    // Z10 - "Auto per frame" + the linked option + a frame step. The step back
-    // belongs to the DOCUMENT whose range the zoom wrote: reset restores that
-    // frame, and never touches the frame now on screen, whose range is its own.
+    // Z10 - "each frame fits itself" + the linked option + a frame step. A
+    // linked zoom WRITES a range, and a written range is a declaration of one
+    // range (#321 I2): the rule moves to "one range" and the whole stack takes
+    // the zoom - the rule row moving is what says so. The step back is then
+    // the stack's: reset, with the other frame on screen, gives both frames the
+    // range from before the zoom - and gives the RULE back with it.
     // ======================================================================
     {
         auto f0 = ramp("hz_apf_000"); f0->seqId = 93092; f0->seqIndex = 0;
@@ -631,22 +634,27 @@ static int histZoomSelftest() {
         app.images.push_back(std::move(f1));
         ImageDoc* d0 = app.images[app.images.size() - 2].get();
         ImageDoc* d1 = app.images.back().get();
-        app.rangeScope = 0;
+        app.rangeRule = RR_EachFrame;
         app.histZoomSetsRange = true;
         app.current = (int)app.images.size() - 2;
         app.histZoom = App::HistZoom{};
         histFrame();
         histZoomApply(d0, 1024.0f, 2048.0f, app.hist[0].binW, app.hist[0].nBins);
-        check(d0->black == 1024.0f && d0->white == 2048.0f && d1->black == 10.0f,
-              "Z10 fixture: the linked zoom wrote frame 0's range only");
+        check(app.rangeRule == RR_OneRange && d0->black == 1024.0f && d0->white == 2048.0f &&
+              d1->black == 1024.0f && d1->white == 2048.0f,
+              "Z10 the linked zoom is a written range: rule -> one range, the whole stack takes it");
         app.current = (int)app.images.size() - 1;     // the frame step
         histFrame();
         check(app.histZoom.on, "Z10 ...and the step kept the zoom");
         histZoomReset(d1);                            // reset with frame 1 on screen
-        check(d0->black == 0.0f && d0->white == 4095.0f,
-              "Z10 reset gives the ZOOMED frame its range back");
-        check(d1->black == 10.0f && d1->white == 4000.0f,
-              "Z10 ...and leaves the frame on screen alone");
+        check(d0->black == 0.0f && d0->white == 4095.0f && d1->black == 0.0f && d1->white == 4095.0f,
+              "Z10 reset gives the stack the range from before the zoom");
+        // ...and the RULE: the picture before the zoom was each frame at its
+        // fit, and that is what comes back (#321 review P2-2)
+        check(app.rangeRule == RR_EachFrame &&
+              effBlack(*d1) == d1->vmin && effWhite(*d1) == d1->vmax,
+              "Z10 ...and the rule: each frame fits itself again, frame 1 drawn at its own fit");
+        app.rangeRule = RR_OneRange;
         app.histZoomSetsRange = false;
         app.histZoom = App::HistZoom{};
     }
@@ -664,7 +672,7 @@ static int histZoomSelftest() {
         app.images.push_back(std::move(g1));
         ImageDoc* d0 = app.images[app.images.size() - 2].get();
         ImageDoc* d1 = app.images.back().get();
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         app.histZoomSetsRange = true;
         app.current = (int)app.images.size() - 2;
         app.histZoom = App::HistZoom{};
@@ -685,7 +693,7 @@ static int histZoomSelftest() {
               d1->white == 4095.0f,
               "Z11 reset gives the whole stack the range from before the FIRST zoom");
         app.histZoomSetsRange = false;
-        app.rangeScope = 0;
+        app.rangeRule = RR_OneRange;
         app.histZoom = App::HistZoom{};
     }
 
@@ -753,7 +761,7 @@ static int histZoomSelftest() {
     app.histDragMode = dragMode0;
     app.histZoomSetsRange = zoomSets0;
     app.linkRange = link0; app.linkBlack = linkB0; app.linkWhite = linkW0;
-    app.rangeScope = scope0;
+    app.rangeRule = scope0;
     app.compareFollowFrame = follow0;
     app.compareMode = App::CmpOff;
     setCompareB(nullptr);

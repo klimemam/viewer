@@ -341,7 +341,7 @@
         // slot to one union; "B uses A's" must hand A's range to the slots
         // too (the reference side dictates); per-own stays per-own.
         {
-            app.rangeScope = 1;
+            app.rangeRule = 1;
             app.linkRange = false;
             bool saveFollow = app.compareFollowFrame;
             app.compareFollowFrame = false;   // pin = resolved doc, so the
@@ -400,12 +400,12 @@
                 app.compareRangeMode = 2;
                 std::string said = abRangeSaid(true);
                 fprintf(stderr, "tileselftest: T11 label with slot C: '%s'\n", said.c_str());
-                check(said.find("compared images") != std::string::npos,
+                check(said == std::string("union over A, B, C (min-max)"),
                       "T11 the union label names the slots, not just A and B");
                 app.cmpExtra.clear();
                 said = abRangeSaid(true);
-                check(said == std::string("A and B combined range"),
-                      "T11 ...and stays 'A and B' when only A and B compare");
+                check(said == std::string("union over A, B (min-max)"),
+                      "T11 ...and says 'A, B' when only A and B compare");
             }
             app.compareFollowFrame = saveFollow;
         }
@@ -536,6 +536,18 @@
                       != std::string::npos,
                       "T13 a part-loaded stack's counter says n of N, not n of n");
                 t13s->expectedFrames = saveExp;
+            }
+            // (d) a frame that keeps its own range (#321) is marked in the
+            // footer, in amber after the name - and only that frame
+            if (cur() && cur()->seqId > 0) {
+                cur()->rangeOwn = true;
+                canvasFrame(1720.0f, 980.0f);
+                const bool marked = g_footerProbe.find("ownrange=1;") != std::string::npos;
+                cur()->rangeOwn = false;
+                canvasFrame(1720.0f, 980.0f);
+                const bool clear = g_footerProbe.find("ownrange=") == std::string::npos;
+                check(marked && clear, "T13 a frame with its own range says [own range] in the footer; "
+                                       "a frame without says nothing");
             }
             app.compareMode = App::CmpSplit;
             app.compareFollowFrame = saveFollow;

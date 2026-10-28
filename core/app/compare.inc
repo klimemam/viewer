@@ -62,7 +62,16 @@ static ImageDoc* resolveBAt(const ImageDoc* a, bool& diverged) {
         ImageDoc* b = nullptr;
         for (const auto& d : app.images)
             if (d->uid == app.compareBUid) { b = d.get(); break; }
-        if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
+        if (!b) {
+            // B was closed (or replaced without handing its seat on). The name
+            // goes too: the fallback below exists for a session's B, which has
+            // no uid yet, and left armed here it re-latched B onto the FIRST
+            // doc of that name - in a capture series that is a frame of another
+            // stack, A's own included, and the union then spanned A with itself
+            // until the files were reopened (#321 §6 suspect 4).
+            app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+            return nullptr;
+        }
         return followFrame(b, a, diverged);
     }
     if (app.compareB.empty()) return nullptr;
@@ -75,6 +84,15 @@ static ImageDoc* resolveBAt(const ImageDoc* a, bool& diverged) {
         return d.get();
     }
     return nullptr;
+}
+// A doc replaced IN PLACE (a new uid in the same slot: restore full frame, a
+// raw reinterpret) keeps the compare seats it held - B, the remembered B, a
+// slot - instead of losing them to the uid change.
+static void carryCompareSeats(uint64_t oldUid, uint64_t newUid) {
+    if (!oldUid || oldUid == newUid) return;
+    if (app.compareBUid == oldUid) app.compareBUid = newUid;
+    if (app.lastCompareBUid == oldUid) app.lastCompareBUid = newUid;
+    for (uint64_t& u : app.cmpExtra) if (u == oldUid) u = newUid;
 }
 static ImageDoc* resolveB() {
     bool div = false;
@@ -232,6 +250,14 @@ static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) 
 static bool g_abNoThrottle = false;
 // True while frames are being stepped continuously. The B slots skip their
 // recompute then; whoever draws B must say "stale" (docs/features/compare/ab-stats-plan.md 1).
+// Is a frame still owed for the A/B step throttle at time t? Up to the deadline
+// the throttle holds B's statistics; a frame AFTER it is the one that refreshes
+// them. A frame drawn just before the deadline still finds the throttle on, so
+// without the tail the refresh waited for the next mouse move - the Histogram's
+// B side stayed on the frame before the union, and "union did nothing" was what
+// the panel said (#321 §6 suspect 5).
+static constexpr double AB_STEP_TAIL = 0.05;
+static bool abStepRefreshOwed(double t) { return t < app.abStepBusyUntil + AB_STEP_TAIL; }
 static bool abStepBusy() {
     return !g_abNoThrottle && app.abStepBusyUntil > nowSec();
 }
@@ -855,6 +881,7 @@ static void computeMinMax(ImageDoc& im) {
     float mn = 0, mx = 1;
     minMaxOf(im.px(), mn, mx);
     im.src->vmin = mn; im.src->vmax = mx;   // the source's truth...
+    im.src->measured = true;
     im.vmin = mn; im.vmax = mx;             // ...and the doc's mirror of it
     // The cached "Auto %" answer was measured from the pixels this just
     // re-measured, so it no longer describes them (#248). Only THIS doc is
@@ -1145,36 +1172,26 @@ static void medianFit(ImageDoc& im, float& lo, float& hi) {
     lo = black; hi = white;
 }
 
-// ONE answer to "what does re-fitting this frame mean right now" (#252), for
-// the two places that re-fit in "Auto per frame": selectImage, when a frame
-// arrives on screen, and applyRangeMode, when the mode itself is chosen. They
-// used to both call autoRange, so the mode had exactly one meaning; now it has
-// three and they must not be able to disagree about which.
+// ONE answer to "what is this frame's fit right now" (#252): min..max, the
+// 0.1-99.9% cut or median->target, as app.autoFlavor names. It writes nothing.
+// "Each frame fits itself" and "each side fits itself" (#301) both DRAW a frame
+// at exactly this fit without touching its black/white (#321 I3: the per-frame
+// rule used to write it into every frame it stepped onto), and one function
+// answering for both is what keeps the two from disagreeing.
 //
-// Only ever reached with linkRange OFF (both callers guard on it), so the
-// pooled linked branches inside the fits below never run per frame - which
-// matters: linked Auto % / Med read every open pixel.
-//
-// The answer itself is fitByFlavor, which writes nothing: "A/B: each side fits
-// itself" (#301) DISPLAYS each compared side at exactly this fit without
-// touching the side's own black/white, and one function answering for both
-// is what keeps the per-frame re-fit and that display from disagreeing.
+// Only ever reached with linkRange OFF (displayRangeFor answers the linked
+// pair first), so the pooled linked branches inside the fits below never run
+// per frame - which matters: linked Auto % / Med read every open pixel.
 static void fitByFlavor(ImageDoc& im, float& lo, float& hi) {
     lo = im.vmin; hi = im.vmax;                  // AF_MinMax, i.e. autoRange
     if (app.autoFlavor == AF_Pct)         percentileRangeCached(im, lo, hi);
     else if (app.autoFlavor == AF_Median) medianFit(im, lo, hi);
 }
-static void refitByFlavor(ImageDoc& im) {
-    float lo = 0, hi = 0;
-    fitByFlavor(im, lo, hi);
-    im.black = lo; im.white = hi;
-}
-// fitByFlavor's answer for one compared side, kept on the doc (see fitValid in
-// ImageDoc for why the caches under it are not enough on their own). Read by
-// displayRangeFor for every compared side on every UI frame. Same precondition
-// as refitByFlavor: linkRange OFF - displayRangeFor answers the linked pair
-// before the compare mode is consulted - so the pooled linked fits never run
-// here.
+// fitByFlavor's answer for one doc, kept on the doc (see fitValid in ImageDoc
+// for why the caches under it are not enough on their own). Read by
+// displayRangeFor for every frame drawn at its fit, on every UI frame. Same
+// precondition as fitByFlavor: linkRange OFF, so the pooled linked fits never
+// run here.
 // Min-max is not cached: it is two cached numbers already, and reading them
 // live keeps a vmin/vmax written by hand honest without an invalidation.
 static void ownFitCached(ImageDoc& im, float& lo, float& hi) {

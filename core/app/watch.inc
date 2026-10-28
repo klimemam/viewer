@@ -802,7 +802,10 @@ static bool watchFrameAxisJoin(int seqId, WatchAxisPlan& p, int f,
     nd->seqId = seqId;
     nd->seqIndex = f;
     nd->batchId = ref->batchId;
-    nd->black = ref->black; nd->white = ref->white;
+    {   // the STACK's range, not an excepted head frame's (#321)
+        const ImageDoc* rr = stackRangeSource(seqId, ref);
+        nd->black = rr->black; nd->white = rr->white;
+    }
     nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
     nd->cfaColorize = ref->cfaColorize;
     nd->displayLut = ref->displayLut;

@@ -18,10 +18,9 @@
 // black-white. A stack held by B or a slot is drawn in that role, in the view
 // follow-frame pairs it in. An export that drew every frame in the screen's
 // view instead would draw only the frame on screen as a compared side and
-// every other at its own range - two ranges in one video. "Auto per frame"
-// additionally has to ACT: stepping A onto a frame re-fits it (selectImage,
-// sequence.inc), and the same call, in the same condition, is made here on
-// the frame A would be stepped onto. The range is named where the export is
+// every other at its own range - two ranges in one video. "Each frame fits
+// itself" needs nothing more: it is a display rule (#321), so the frame's view
+// answers it like every other rule. The range is named where the export is
 // announced (exportRangeNote), never baked into the file.
 //
 // WHY IT IS SLICED: renderDocRGBA is CPU-only but not thread-safe - it holds a
@@ -365,7 +364,6 @@ static bool pumpVideoExport() {
     ImageDoc* stepTo = nullptr;
     // a compare video's frame is A_k's own view (A is the spec's, not cur())
     const ViewSides view = J.compare ? viewSidesFor(d) : exportFrameViewFor(d, stepTo);
-    if (J.compare) stepTo = d;
     why = viewRefusalFor(view, d);
     if (!why.empty()) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
@@ -389,16 +387,10 @@ static bool pumpVideoExport() {
                            "follow-frame or the difference's |A-B| changed mid-write");
         return false;
     }
-    // "Auto per frame" re-fits the frame A steps onto - the same call
-    // selectImage makes on a step, in the same condition, so the video shows
-    // what stepping through the stack would have shown. For A's own stack that
-    // is the frame itself; for a stack drawn as B it is A's paired frame (B is
-    // never re-fitted by a step), and with A staying put it is nothing. WHICH fit
-    // (min..max, the 0.1-99.9% cut, median->target) is app.autoFlavor's
-    // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
-    // be a second answer to the one question. Linked and per-stack need
-    // nothing: displayRangeFor already answers for the stack.
-    if (app.rangeScope == 0 && !app.linkRange && stepTo) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
+    // Nothing is re-fitted here: every rule, "each frame fits itself"
+    // included, is answered by displayRangeFor in the frame's view (#321 I3),
+    // so the video shows what stepping through the stack would have shown
+    // without writing a range on the way.
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
     if (J.compare) {

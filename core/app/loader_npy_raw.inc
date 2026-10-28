@@ -574,6 +574,7 @@ static std::string loadRaw(const RawDialog& d) {
         im->texDirty = true;
         forgetImage(old);
         im->uid = app.nextUid++;
+        carryCompareSeats(old->uid, im->uid);
         app.images[d.replaceIdx] = std::move(im);
         app.current = d.replaceIdx;
     } else {
@@ -892,6 +893,7 @@ static void restoreFull() {
         if (old->tex) glDeleteTextures(1, &old->tex);
         forgetImage(old);
         doc->uid = app.nextUid++;
+        carryCompareSeats(old->uid, doc->uid);
         app.images[idx] = std::move(doc);
         app.current = idx;
     } else {
