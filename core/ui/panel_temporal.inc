@@ -147,13 +147,18 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
         // the custom per-frame x axis applies to the server's series too: the
         // mapping is by frame number, and the server's x IS the frame number.
         // ONE chart here, on the panel's first chart's x (#314: the extra
-        // charts are the local panel's).
+        // charts are the local panel's). An axis that chart chose and this
+        // stack lacks is said in the local path's words, not left as a quiet
+        // frame-index plot.
         const App::TemporalChart& c0 = app.tcharts.front();
         FrameAxis ax = c0.xKind == App::TemporalChart::XFrame ? FrameAxis{}
                      : frameAxisOf(si->id, c0.xKind == App::TemporalChart::XNamed
                                                ? c0.xName.c_str() : nullptr);
-        if (!ax.why.empty())
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", ax.why.c_str());
+        std::string why = ax.why;
+        if (ax.missing)
+            why = "x " + c0.xName + ": this stack has no such axis - plotted on frame index";
+        if (!why.empty())
+            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", why.c_str());
         float mn = FLT_MAX, mx = -FLT_MAX;
         for (float v : S.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
         float fx0 = FLT_MAX, fx1 = -FLT_MAX;
@@ -1193,6 +1198,10 @@ struct TemporalChartProbe {
         char xlabel[64] = {};
         int nX = 0;              // the first curve's x positions, as plotted
         float xs[32] = {};
+        char notice[256] = {};   // the fall-back sentence it printed
+        char lendNote[256] = {}; // the lend sentence it printed
+        int spreadN = 0;         // A's spread line: points inside the window...
+        float spreadX0 = 0, spreadX1 = 0;   // ...and the window it named
     } ch[App::TemporalChart::kMax];
 };
 static TemporalChartProbe g_tchart;
@@ -1400,8 +1409,18 @@ struct TChartAx {
     std::string label = "frame number (index in stack)";
     std::string shown = "frame index";   // what the chart's x: selector reads
     std::string borrowed, lender;        // who plotted on whose axis
+    std::string lendNote;                // ...and the sentence that says so
     std::string notice;                  // why it fell back ("" = it did not)
 };
+// Why one side is not on the chart's axis, in its own words: lacking the axis
+// and carrying it at the wrong length are different facts, and the second is
+// the one the user can fix (x axis... on that stack).
+static std::string tchartLacks(const FrameAxis& a, const std::string& letter) {
+    if (a.why.empty()) return letter + " has no such axis";
+    char b[96];
+    snprintf(b, sizeof b, " has it but %d value(s) for %d frame(s)", a.nVals, a.nFrames);
+    return letter + b;
+}
 static TChartAx tchartResolve(const App::TemporalChart& c,
                               const std::vector<const ImageDoc*>& docs,
                               const std::vector<bool>& has,
@@ -1434,9 +1453,19 @@ static TChartAx tchartResolve(const App::TemporalChart& c,
                  r.axs[i].unit != r.axs[(size_t)ref].unit) conflict = true;
     }
     if (!any) {
-        if (c.xKind == App::TemporalChart::XNamed)
-            r.notice = "x " + c.xName + ": no side on this chart carries it - plotted on "
-                       "frame index";
+        if (c.xKind == App::TemporalChart::XNamed) {
+            bool someOdd = false;
+            std::string each;
+            for (size_t i = 0; i < docs.size(); i++) {
+                if (!has[i]) continue;
+                someOdd = someOdd || !r.axs[i].why.empty();
+                if (!each.empty()) each += "; ";
+                each += tchartLacks(r.axs[i], letters[i]);
+            }
+            r.notice = "x " + c.xName + ": " +
+                       (someOdd ? each : std::string("no side on this chart carries it")) +
+                       " - plotted on frame index";
+        }
         return r;
     }
     const FrameAxis refAx = r.axs[(size_t)ref];
@@ -1454,7 +1483,7 @@ static TChartAx tchartResolve(const App::TemporalChart& c,
     }
     std::string cannot;
     std::vector<FrameAxis> lent = r.axs;
-    std::string borrowed;
+    std::string borrowed, lendNone, lendOdd;
     for (size_t i = 0; i < docs.size(); i++) {
         if (!has[i] || r.axs[i].custom) continue;
         // same length = value k exists for every frame k the side has;
@@ -1464,16 +1493,32 @@ static TChartAx tchartResolve(const App::TemporalChart& c,
             lent[i] = refAx;
             if (!borrowed.empty()) borrowed += ", ";
             borrowed += letters[i];
+            if (r.axs[i].why.empty()) {
+                if (!lendNone.empty()) lendNone += ", ";
+                lendNone += letters[i];
+            } else {
+                char b[96];
+                snprintf(b, sizeof b, " has %d value(s) for %d frame(s)",
+                         r.axs[i].nVals, r.axs[i].nFrames);
+                if (!lendOdd.empty()) lendOdd += "; ";
+                lendOdd += letters[i] + ": its " + r.axs[i].name + b;
+            }
         } else {
-            if (!cannot.empty()) cannot += ", ";
-            cannot += letters[i];
+            if (!cannot.empty()) cannot += "; ";
+            cannot += tchartLacks(r.axs[i], letters[i]);
         }
     }
     if (!cannot.empty()) {
-        r.notice = "x " + refAx.name + ": " + cannot + " has no such axis and a different "
-                   "frame count, so " + letters[(size_t)ref] + "'s cannot be lent - this "
-                   "chart is plotted on frame index";
+        r.notice = "x " + refAx.name + ": " + cannot + ", and a different frame count, so " +
+                   letters[(size_t)ref] + "'s cannot be lent - this chart is plotted on "
+                   "frame index";
         return r;
+    }
+    if (!borrowed.empty()) {
+        std::string who = lendNone.empty() ? "" : lendNone + ": no " + refAx.name + " of its own";
+        if (!lendOdd.empty()) who += (who.empty() ? "" : "; ") + lendOdd;
+        r.lendNote = who + " - plotted on " + letters[(size_t)ref] + "'s (paired by frame "
+                     "number, as follow-frame already assumes)";
     }
     r.axs = std::move(lent);
     r.use = true;
@@ -1972,13 +2017,17 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         if (tchartHeader(ci, axChoices, X.shown)) removeAt = ci;
         if (!X.notice.empty()) {
             ImGui::TextColored(AB_AMBER, "%s", X.notice.c_str());
-            if (pc) pc->fellBack = true;
+            if (pc) {
+                pc->fellBack = true;
+                snprintf(pc->notice, sizeof pc->notice, "%s", X.notice.c_str());
+            }
         }
         if (!X.borrowed.empty()) {
-            ImGui::TextColored(AB_AMBER, "%s: no %s of its own - plotted on %s's (paired "
-                               "by frame number, as follow-frame already assumes)",
-                               X.borrowed.c_str(), X.shown.c_str(), X.lender.c_str());
-            if (pc) pc->lent = true;
+            ImGui::TextColored(AB_AMBER, "%s", X.lendNote.c_str());
+            if (pc) {
+                pc->lent = true;
+                snprintf(pc->lendNote, sizeof pc->lendNote, "%s", X.lendNote.c_str());
+            }
         }
         float fx0 = FLT_MAX, fx1 = -FLT_MAX;
         for (size_t i = 0; i < slots.size(); i++) {
@@ -2025,6 +2074,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                     for (float ix : *sl.t->idx) xsl.push_back(xOf(X, i, ix));
                     const PlotSpread sp = plotSpreadIn(xsl, *sl.t->mean, tp.xmin, tp.xmax);
                     plotSpreadLine(sp, sl.letter.c_str());
+                    if (pc && i == 0) {
+                        pc->spreadN = sp.n;
+                        pc->spreadX0 = sp.x0;
+                        pc->spreadX1 = sp.x1;
+                    }
                 }
             }
         } else {

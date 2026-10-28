@@ -1055,9 +1055,20 @@
                       "T7c + chart opens on an axis no chart is showing");
 
                 // T7d: compare - A has time, B has none, same length: lent on
-                // the time chart, and the frame-index chart is untouched
+                // the time chart. The OTHER chart is on a named axis both sides
+                // carry (exposure, B's values its own), so "one chart falls
+                // back or lends -> every chart does" would show on it: a
+                // frame-index chart looks the same either way.
+                const int nB = (int)framesOfSeq(sidB).size();
+                const int nBx = std::max(sb ? sb->expectedFrames : 0, nB);
+                if ((sb = seqInfo(sidB))) {
+                    std::vector<double> eB;
+                    for (int k = 0; k < nBx; k++) eB.push_back(2.0 + k);
+                    sb->putAxis({ "exposure", "ms", eB });
+                }
                 app.tcharts.assign(2, App::TemporalChart{});
-                app.tcharts[0].xKind = App::TemporalChart::XFrame;
+                app.tcharts[0].xKind = App::TemporalChart::XNamed;
+                app.tcharts[0].xName = "exposure";
                 app.tcharts[1].xKind = App::TemporalChart::XNamed;
                 app.tcharts[1].xName = "time";
                 selectImage(frA.front());
@@ -1071,10 +1082,30 @@
                 check(sameLen && g_tchart.ch[1].custom && g_tchart.ch[1].lent &&
                       !g_tchart.ch[1].fellBack && xsAre(1, tVals),
                       "T7d B without time, same length: the time chart lends A's and says so");
-                check(!g_tchart.ch[0].custom && !g_tchart.ch[0].lent &&
-                      !g_tchart.ch[0].fellBack && xsAre(0, idxVals),
-                      "T7d ...and the frame-index chart is not touched by it");
+                check(std::string(g_tchart.ch[1].lendNote).find("B: no time of its own") !=
+                          std::string::npos,
+                      "T7d ...in the words for a side that LACKS the axis");
+                check(g_tchart.ch[0].custom && !g_tchart.ch[0].lent &&
+                      !g_tchart.ch[0].fellBack && xsAre(0, eVals),
+                      "T7d ...and the exposure chart is not touched by it: on its own axis, "
+                      "nothing lent");
                 check(temporalChartVisible(), "T7d ...both compare charts inside the panel");
+
+                // T7d': the spread line under a zoomed time chart names the
+                // TIME window and counts the frames whose time is inside it
+                // (t = 10, 20: frames 1 and 2), not frame numbers 10..20
+                app.tcharts[1].zoomOn = true;
+                app.tcharts[1].zx0 = 10.0f; app.tcharts[1].zx1 = 20.0f;
+                app.tcharts[1].zy0 = -1e6f; app.tcharts[1].zy1 = 1e6f;
+                temporalFrame(560.0f, 800.0f);
+                fprintf(stderr, "abstatsselftest: T7d' spread A: n=%d window [%.4g..%.4g]\n",
+                        g_tchart.ch[1].spreadN, g_tchart.ch[1].spreadX0,
+                        g_tchart.ch[1].spreadX1);
+                check(g_tchart.ch[1].zoomed && g_tchart.ch[1].spreadN == 2 &&
+                      fabsf(g_tchart.ch[1].spreadX0 - 10.0f) < 1e-3f &&
+                      fabsf(g_tchart.ch[1].spreadX1 - 20.0f) < 1e-3f,
+                      "T7d' spread line on a zoomed time chart: cut by the chart's own x");
+                app.tcharts[1].zoomOn = false;
 
                 // T7e: A's time now covers a frame count B does not have: that
                 // chart alone falls back to frame index and says why
@@ -1091,8 +1122,55 @@
                 chartLine("T7e");
                 check(!g_tchart.ch[1].custom && g_tchart.ch[1].fellBack && xsAre(1, idxVals),
                       "T7e different length: only that chart falls to frame index, with a notice");
-                check(g_tchart.ch[0].plotted && !g_tchart.ch[0].fellBack && xsAre(0, idxVals),
-                      "T7e ...and the other chart is unaffected");
+                check(std::string(g_tchart.ch[1].notice).find("B has no such axis") !=
+                          std::string::npos,
+                      "T7e ...the notice says B LACKS the axis");
+                check(g_tchart.ch[0].plotted && g_tchart.ch[0].custom &&
+                      !g_tchart.ch[0].fellBack && xsAre(0, eVals),
+                      "T7e ...and the other chart is unaffected: still on exposure");
+
+                // T7f: B HAS time, at the wrong length - a different fact from
+                // lacking it, and the lend says which
+                if ((sa = seqInfo(sidA))) {
+                    sa->expectedFrames = expA;
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", eVals });
+                    sa->putAxis({ "time", "s", tVals });
+                }
+                std::vector<double> tB;
+                for (int k = 0; k + 1 < nBx; k++) tB.push_back(5.0 * k);
+                if ((sb = seqInfo(sidB))) sb->putAxis({ "time", "s", tB });
+                char odd[96];
+                snprintf(odd, sizeof odd, "%d value(s) for %d frame(s)", nBx - 1, nBx);
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7f");
+                fprintf(stderr, "abstatsselftest: T7f lend: '%s'\n", g_tchart.ch[1].lendNote);
+                const std::string lend7f = g_tchart.ch[1].lendNote;
+                check(g_tchart.ch[1].lent && xsAre(1, tVals) &&
+                      lend7f.find(std::string("B: its time has ") + odd) != std::string::npos &&
+                      lend7f.find("no time of its own") == std::string::npos,
+                      "T7f B's time has the wrong count: lent, and the note names the counts "
+                      "(not 'no time of its own')");
+
+                // T7g: ...and when A's cannot be lent either, the notice keeps
+                // the same distinction
+                if ((sa = seqInfo(sidA))) {
+                    sa->expectedFrames = nA + 1;
+                    std::vector<double> t2 = tVals, e2 = eVals;
+                    t2.push_back(10.0 * nA); e2.push_back(1.0 + nA);
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", e2 });
+                    sa->putAxis({ "time", "s", t2 });
+                }
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7g");
+                fprintf(stderr, "abstatsselftest: T7g notice: '%s'\n", g_tchart.ch[1].notice);
+                const std::string note7g = g_tchart.ch[1].notice;
+                check(g_tchart.ch[1].fellBack &&
+                      note7g.find(std::string("B has it but ") + odd) != std::string::npos &&
+                      note7g.find("no such axis") == std::string::npos,
+                      "T7g cannot lend: the notice says B HAS time at the wrong count "
+                      "(not 'no such axis')");
 
                 if ((sa = seqInfo(sidA))) { sa->axes = axA; sa->expectedFrames = expA; }
                 if ((sb = seqInfo(sidB))) sb->axes = axB;

@@ -1219,9 +1219,17 @@ NaN で枚数が減った画素は**その画素自身の n_i** で補正され�
   そのチャートが選んだ軸を曲線のある全側が同じ量(名前と単位)で持っていればその軸、
   持たない側には**同じフレーム数なら基準側の軸を貸して**そう書き、貸せない(フレーム数が
   違う)・量が食い違うときは**そのチャートだけ** frame index に落ちて理由を出します。
-  ほかのチャートは影響を受けません。`x:` の候補は比較中の全側が持つ軸の名前の和です
+  ほかのチャートは影響を受けません。`x:` の候補は比較中の全側が持つ軸の名前の和です。
+  貸す・貸せないの文言は、その側が**軸を持たない**(`no time of its own` /
+  `B has no such axis`)のか、**持っているが個数が合わない**(`its time has 3 value(s) for
+  5 frame(s)` / `B has it but 3 value(s) for 5 frame(s)`)のかを言い分けます。後者は
+  その stack の `x axis...` で直せます
 - リモートの stack は**サーバ側で集計**され、`[server <ホスト>, N frames]` と出ます
   (`File > Stack loading > Remote processing` で切替)。
+  サーバ集計の表示では**チャートは 1 つだけ**で、横軸はパネルの**最初のチャート**の `x:` です
+  (`+ chart` で足したチャートはローカル集計のパネルのものです)。その軸がこの stack に
+  無ければ、ローカルと同じく `x <名前>: this stack has no such axis - plotted on frame index`
+  と出して frame index で描きます。
   開いてすらいない連番も Browse パネルの**連番(group)行**を右クリックして
   「Temporal stats (server) for stack "…"」から測れて、そのときは
   `not opened:` 付きで出ます。**1 回 = 1 stack です** —— 複数行を選んでから
