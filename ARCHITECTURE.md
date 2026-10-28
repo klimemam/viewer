@@ -412,6 +412,7 @@ autosave」を選びます。
 | `--picker-selftest <dir>` | picker の5ユースケース (merge、フィルタ、トップフォルダ毎の batch、単一フレーム) |
 | `--close-selftest <dir>` | Ctrl+W の層ごとの意味。取得中に閉じた stack が先読みキューから蘇らないこと |
 | `--batch-selftest <dir>` | batch 移動が stack を丸ごと動かし、Files の並びを乱さず、空 batch を刈り、名前が往復すること |
+| `--startup-selftest <dir>` | 起動時に前回の autosave を開く判断(`startupRestoreDecide`)の全ケース —— scripted / `--no-session` / 開くものの指定 / autosave 無し・空 —— と、parseCli がそれを正しく報せること、0 byte の autosave を候補にしないこと、壊れた autosave は Messages に 1 行で空起動、`--no-session` は autosave を消さないこと、File > Recent Sessions 先頭の `Last autosave (<時刻>)` 行と `Restore last session` が無いこと、そして**この selftest 自身の起動が何も開かなかったこと**(#319) |
 | `--sessiondoor-selftest <dir>` | File > Recent Sessions(追加・重複除去・上限 8・`(missing)`・Clear・prefs の往復)、Open... / Open Session... のダイアログのフィルタ順と開始フォルダ、`.vsession` を `openPath` に渡すと読み込んで開いていた画像を置き換え Recent に入ること(autosave は入らない)(#307) |
 | `--scan-selftest <dir>` | リモート Open Folder を実経路 (local peer → rb worker → LIST → グループ化 → picker) で |
 | `--browse-selftest <dir>` | Browse パネルの挙動: grouped↔flat が1つの返信上の純粋なビューであること、ツリーの遅延展開、キャンセル世代、壊れた `.npy` も一覧に出ること |

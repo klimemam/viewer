@@ -208,7 +208,8 @@
             check(app.images.size() == 1 && app.sessionRecents.size() == 1,
                   "D6 a session that cannot be read closes nothing, adds nothing");
 
-            // The autosave goes through the SAME door (Restore last session) and
+            // The autosave goes through the SAME door (File > Recent Sessions'
+            // Last autosave row, #319) and
             // is refused at Recent's.
             const std::string ap = viewerConfigDir() + "/autosave-63.vsession";
             check(saveSession(ap, true), "D6 an autosave-slot file is written");

@@ -172,7 +172,15 @@ cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release   # 初回のみ
 cmake --build build-mingw
 ./build-mingw/viewer                       # Windows: .\build-mingw\viewer.exe
 ./build-mingw/viewer path/to/image.npy     # ファイル指定で開く
+./build-mingw/viewer --no-session          # 空で起動(前回のセッションを開かない)
+./build-mingw/viewer --session run3.vsession   # 保存したセッションで起動
 ```
+
+**何も指定せずに起動すると、前回のセッション(終了時・クラッシュ時・60 秒ごとの自動保存)を
+開きます。** ファイルやフォルダ、`--session` などを指定したとき、`--no-session` を付けたときは
+開きません。`--no-session` は自動保存を消さないので、次に普通に起動すればまた戻ります。
+起動後に戻すのは `File > Recent Sessions` の先頭の `Last autosave (<時刻>)`
+([manual §8](manual.md#起動時に前回のセッションを開く))。
 
 ソースからビルドした場合もショートカットは同じスクリプトで作れます
 (`tools\install_shortcut.cmd` / `tools/install_shortcut.sh`)。ビルド時に

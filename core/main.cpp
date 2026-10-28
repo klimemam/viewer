@@ -1524,6 +1524,33 @@ int main(int argc, char** argv) {
 
     parseCli(argc, argv);
 
+    {   // #319: a start that names nothing comes back where the last one left
+        // off. After parseCli, because what the command line named is the
+        // decision's main input; before any selftest, because S0 of
+        // --startup-selftest asserts on what this very run decided. A scripted
+        // run does not even scan: the user's autosave is not its business.
+        StartupRestoreIn in;
+        in.scripted = scriptedRun;
+        in.noSession = g_cliNoSession;
+        in.cliOpens = g_cliNamesOpen;
+        if (!scriptedRun) {
+            in.offer = recoveryOfferIn(viewerConfigDir(), currentPid(), nullptr);
+            std::error_code ec;
+            if (!in.offer.empty())
+                in.offerBytes = std::filesystem::file_size(pathFromUtf8(in.offer), ec);
+        }
+        g_startupRestore = startupRestoreDecide(in);
+        startupRestoreApply(g_startupRestore);
+        // The decision puts scripted first; this is the line that keeps it
+        // there for every selftest, not only the one that asks.
+        if (scriptedRun && g_startupRestore.why != SR_Scripted) {
+            fprintf(stderr, "startup: a scripted run decided \"%s\" - refusing to "
+                            "go on with the user's session\n",
+                    startupRestoreWhyName(g_startupRestore.why));
+            return 1;
+        }
+    }
+
     #include "selftest/picker.inc"
 
     #include "selftest/localbrowse.inc"
@@ -1537,6 +1564,8 @@ int main(int argc, char** argv) {
     #include "selftest/batch.inc"
 
     #include "selftest/sessiondoor.inc"
+
+    #include "selftest/startup.inc"
 
     #include "selftest/export.inc"
 

@@ -49,6 +49,14 @@ static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut +
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
 static std::string g_sessionDoorSelftest; // --sessiondoor-selftest <dir>: Open Session / Recent (#307)
+static std::string g_startupSelftest;     // --startup-selftest <dir>: a start reopens the autosave (#319)
+// What parseCli learned that main() needs for the start's one decision (#319,
+// startupRestoreDecide): --no-session, and whether the command line named
+// ANYTHING to open - a file, a folder, a url, --session, --compare. Set at the
+// branches that open (or ask for an open), so "named" means what parseCli did,
+// not a second reading of argv that could disagree with it.
+static bool g_cliNoSession = false;
+static bool g_cliNamesOpen = false;
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
 static std::string g_fmtgateSelftest;   // --fmtgate-selftest <dir>: which listing asks
@@ -626,8 +634,12 @@ static void printUsage() {
         "          or raw binaries (.bin/.raw/...)\n", imagefile::dialogPattern().c_str());
     printf(
         "  folder: loads the numbered files below it, one stack per group\n"
+        "  none:   reopens the last session (the newest autosave no open window\n"
+        "          owns); naming anything to open, or --no-session, skips that\n"
         "options:\n"
-        "  --session <file.vsession>   restore a saved session\n"
+        "  --session <file.vsession>   start with this saved session, not the autosave\n"
+        "  --no-session                start empty: do not reopen the last session\n"
+        "                              (its autosave is kept for the next start)\n"
         "  --raw-dtype <t>             storage of one sample: u8|u16|f32|f64\n"
         "  --raw-interp <i>            meaning of samples: gray|rgb|bgr|rgba|bgra|bayer|quad-bayer\n"
         "  --raw-format <fmt>          legacy combined names (gray8|...|rgbf32|bayer8|bayer16)\n"
@@ -729,6 +741,8 @@ static void printUsage() {
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
         "  --sessiondoor-selftest <dir> Open Session..., Recent Sessions, Open...'s filters\n"
+        "  --startup-selftest <dir>    a start reopens the last autosave: every case\n"
+        "                              of the decision, --no-session, the menu row\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
         "  --aset-selftest <dir>       AnalysisSet: transport, Ref binding, session\n"
         "  --roistats-selftest         the ROI table's numbers and its std/mean column,\n"
@@ -838,7 +852,9 @@ static void parseCli(int argc, char** argv) {
         auto next = [&]() -> std::string { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
         if (a == "--session") {
             std::string p = next();
-            if (!p.empty()) openPath(p);
+            if (!p.empty()) { g_cliNamesOpen = true; openPath(p); }
+        } else if (a == "--no-session") {
+            g_cliNoSession = true;                 // main(): startupRestoreDecide
         } else if (a == "--raw-format") {          // legacy combined names
             std::string v = next();
             bool found = false;
@@ -994,6 +1010,8 @@ static void parseCli(int argc, char** argv) {
             g_batchSelftest = next();              // handled in main()
         } else if (a == "--sessiondoor-selftest") {
             g_sessionDoorSelftest = next();        // handled in main()
+        } else if (a == "--startup-selftest") {
+            g_startupSelftest = next();            // handled in main()
         } else if (a == "--rtemporal-selftest") {
             g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--localbrowse-selftest") {
@@ -1105,6 +1123,9 @@ static void parseCli(int argc, char** argv) {
         } else if (a == "--compare") {
             std::string v = next();
             int m = compareModeFromName(v);
+            // Named, even when the mode is not: the start was asked to compare
+            // what it opens, which is not "carry on where you left off".
+            g_cliNamesOpen = true;
             if (m >= 0) cliCompare = m;
             else fprintf(stderr, "--compare expects %s\n", compareModeNameList().c_str());
         } else if (a == "--zoom") {
@@ -1120,8 +1141,10 @@ static void parseCli(int argc, char** argv) {
         } else if (!a.empty() && a[0] == '-') {
             fprintf(stderr, "unknown option: %s (see --help)\n", a.c_str());
         } else if (std::filesystem::is_directory(pathFromUtf8(a))) {
+            g_cliNamesOpen = true;
             openFolder(a);                     // a folder = every stack below it
         } else {
+            g_cliNamesOpen = true;             // a file or url, opened or refused
             std::string low = a;
             std::transform(low.begin(), low.end(), low.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
