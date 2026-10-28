@@ -439,10 +439,59 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
                    uint32_t repW, uint32_t repH, uint32_t repCh,
                    uint32_t dtype, uint32_t rawBytes);
 
+// What the command DID, beyond the bytes on its stdout (#324). "stdout came
+// back" was the whole of the old answer, so an ssh that never got past
+// authentication - exit 255, "Permission denied (publickey)." on stderr, an
+// empty stdout - read as a command that ran and printed nothing, and the
+// caller then named a cause from that nothing ("no prebuilt peer for this
+// machine"). These are the facts that tell "it ran" from "it never ran".
+struct SshRun {
+    // The child's exit status; -1 when there is none to report: it could not be
+    // started, it was abandoned (timeout, cancel, the output cap), or it was
+    // still running after its output closed. A signal death is 128 + signo.
+    int exitCode = -1;
+    // Its stderr, drained alongside stdout (a chatty stderr must not fill its
+    // pipe and stall the child) and kept up to kSshStderrCap bytes.
+    std::string stderrText;
+    // ssh ITSELF failed - a host was given and ssh exited 255, the status ssh
+    // reserves for its own errors (auth, DNS, refused, host key). The remote
+    // command never ran, so an empty stdout says nothing about the far side.
+    bool sshFailed = false;
+};
+constexpr size_t kSshStderrCap = 64 * 1024;
+
+// The sentence for "the commands never ran over there", in one place so every
+// ssh caller words it alike: `could not run commands on <host> over ssh (exit
+// N): <the gist of ssh's stderr>`, or `whenSilent` when stderr said nothing.
+// A "Permission denied" (or a 255 with no words to go on) adds the one remedy
+// that matters here: the viewer runs ssh with BatchMode=yes, so there is no
+// password or passphrase prompt and only key authentication works.
+std::string sshCouldNotRun(const std::string& host, int port, int exitCode,
+                           const std::string& stderrText, const std::string& whenSilent);
+// The lines of an ssh stderr worth showing: CRs and blank lines dropped, ssh's
+// "Warning: Permanently added" notice and its "** " banners dropped, and the
+// last few lines kept (the cause is what ssh says LAST).
+std::string sshStderrGist(const std::string& stderrText);
+
+// TEST HOOK. The argv that stands for `ssh` (default {"ssh"}, found on PATH).
+// --sshfail-selftest points it at `<this binary> --fake-ssh` so the failure
+// paths can be driven without a server. Not synchronised: set it before any
+// worker runs and put it back after.
+void setSshProgramForTest(const std::vector<std::string>& argvPrefix);
+// `<this binary> --fake-ssh <ssh-style args>`: an ssh whose outcome is chosen
+// by the HOST argument (the table is in remote.cpp). main() runs it before
+// anything else and returns its status.
+int runFakeSsh(int argc, char** argv);
+
 // Run one shell command on the host (or locally when host is empty) and collect
-// its combined output. `stdinData` is fed to it verbatim - a script for `sh`, or
-// the bytes of a file for `cat > path`. Returns false on spawn failure or when
-// timeoutSec elapses (a hung git clone must not wedge the caller forever).
+// its stdout. `stdinData` is fed to it verbatim - a script for `sh`, or the
+// bytes of a file for `cat > path`. Returns false on spawn failure, when
+// timeoutSec elapses (a hung git clone must not wedge the caller forever), and
+// when the command EXITS NONZERO - ssh's own 255 included, worded by
+// sshCouldNotRun. `output` keeps what stdout said even then (a script that
+// explains itself on stdout and exits 1 has still explained itself), `err`
+// says what failed with the gist of stderr, and `run`, when given, holds the
+// facts for a caller that words its own sentence.
 //
 // `abort` is the caller's stop flag, checked on the same 50 ms slice the read
 // loop already runs on, for Session::setAbort's reason one layer out: without
@@ -452,11 +501,12 @@ bool tileReplySane(uint32_t reqW, uint32_t reqH, uint32_t step,
 // question nobody is waiting for is worse than no answer.
 bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
                    const std::string& stdinData, std::string& output, std::string& err,
-                   double timeoutSec = 60.0, const std::atomic<bool>* abort = nullptr);
+                   double timeoutSec = 60.0, const std::atomic<bool>* abort = nullptr,
+                   SshRun* run = nullptr);
 // convenience: feed a script to `sh`
 bool runSshScript(const std::string& host, int port, const std::string& script,
                   std::string& output, std::string& err, double timeoutSec = 60.0,
-                  const std::atomic<bool>* abort = nullptr);
+                  const std::atomic<bool>* abort = nullptr, SshRun* run = nullptr);
 
 // Accepted forms, in order of standards-conformance:
 //   ssh://user@host[:port]/abs/path   RFC 3986: after the colon comes a PORT,

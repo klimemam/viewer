@@ -62,6 +62,8 @@ static std::string g_precisionSelftest; // --precision-selftest <dir>: the u32/i
 static bool g_profileNoiseSelftest = false; // single-frame banding/pixel ratios
 static bool g_numAlignSelftest = false;    // --numalign-selftest: a column of numbers
                                            // lines up on its decimal point (#313)
+static bool g_sshFailSelftest = false;     // --sshfail-selftest: an ssh that failed
+                                           // says so, and why (#324)
 static bool g_projFrameSelftest = false;   // --projframe-selftest: the Projection
                                            // frame statistics are over every pixel,
                                            // on a worker, keyed (issue #283)
@@ -766,6 +768,9 @@ static void printUsage() {
         "  --numalign-selftest         a column of numbers lines up on its decimal\n"
         "                              point: shared decimals with hysteresis, a\n"
         "                              fixed digit advance, the TSV unchanged (#313)\n"
+        "  --sshfail-selftest          an ssh that failed says so (#324): exit status\n"
+        "                              and stderr against a fake ssh, never \"no\n"
+        "                              prebuilt peer\" over an empty answer\n"
         "  --projframe-selftest        the Projection frame statistics: every pixel\n"
         "                              of the region, on a worker above the sample\n"
         "                              cap, never the previous region's number (#283)\n"
@@ -1040,6 +1045,8 @@ static void parseCli(int argc, char** argv) {
             g_profileNoiseSelftest = true;
         } else if (a == "--numalign-selftest") {
             g_numAlignSelftest = true;             // handled in main()
+        } else if (a == "--sshfail-selftest") {
+            g_sshFailSelftest = true;              // handled in main()
         } else if (a == "--projframe-selftest") {
             g_projFrameSelftest = true;            // handled in main()
         } else if (a == "--rowcol-sigma-selftest") {

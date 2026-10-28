@@ -30,9 +30,11 @@ namespace remote {
 struct Pipe {
 #if defined(_WIN32)
     HANDLE inW = nullptr, outR = nullptr, proc = nullptr;
+    HANDLE errR = nullptr;            // the child's stderr, when spawn was asked to keep it
 #else
     int inW = -1, outR = -1;
     pid_t pid = -1;
+    int errR = -1;
 #endif
     // Set by the owning worker so a blocked read can be given up on. See
     // Session::setAbort for why this is a flag and not a deadline.
@@ -46,6 +48,11 @@ struct Pipe {
     // is NOT reset by stop() - a reconnect on a Session that had received
     // something would read as "it answered".
     uint64_t bytesRead = 0;
+    // Did a read or a write find the far end CLOSED (as opposed to giving up on
+    // a clock or a stop flag)? Only then is the child known to be on its way
+    // out, and only then is it worth waiting a moment for its exit status
+    // (startOn, #324).
+    bool farClosed = false;
 };
 
 // What the OS said, as one UTF-8 clause that ENDS WITH THE NUMBER: the text is
@@ -84,8 +91,14 @@ static std::string osErrorText(int e) {
 // WHICH FILE the first token was and words the failure around it (startOn's
 // local peer). The OS clause is captured before any handle is closed: CloseHandle
 // and close() overwrite GetLastError / errno.
+//
+// `keepStderr`: the child's stderr goes to a pipe of its own (p.errR) instead
+// of this process's stderr. Only for a caller that DRAINS it for the child's
+// whole life - runSshCommand does, alongside stdout - or a child with something
+// to say fills the pipe and stops. The protocol Session does not ask: nothing
+// reads a second pipe during a healthy session.
 static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& err,
-                  std::string* why = nullptr) {
+                  std::string* why = nullptr, bool keepStderr = false) {
     std::string cmd;
     for (const auto& a : argv) {          // quote: paths have spaces
         if (!cmd.empty()) cmd += ' ';
@@ -106,8 +119,17 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
         CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
         return fail("cannot create pipes", os);
     }
+    HANDLE childErr = nullptr;
+    if (keepStderr && !CreatePipe(&p.errR, &childErr, &sa, 0)) {
+        std::string os = osErrorText(GetLastError());
+        CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
+        CloseHandle(childOut); CloseHandle(p.outR); p.outR = nullptr;
+        p.errR = nullptr;
+        return fail("cannot create pipes", os);
+    }
     SetHandleInformation(p.inW, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(p.outR, HANDLE_FLAG_INHERIT, 0);
+    if (p.errR) SetHandleInformation(p.errR, HANDLE_FLAG_INHERIT, 0);
     // CreateProcessW, not A: this user's profile directory is Japanese, and the
     // ANSI entry point garbles any non-ASCII path to the binary or the data
     int wn = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
@@ -119,7 +141,7 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     si.wShowWindow = SW_HIDE;
     si.hStdInput = childIn;
     si.hStdOutput = childOut;
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdError = childErr ? childErr : GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
     // lpApplicationName stays null ON PURPOSE: the ssh callers hand this a
     // command line whose first token is resolved by Windows (`ssh` on PATH), and
@@ -130,9 +152,11 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     const DWORD startErr = ok ? 0 : GetLastError();
     CloseHandle(childIn);
     CloseHandle(childOut);
+    if (childErr) CloseHandle(childErr);  // ours open would hold the pipe open forever
     if (!ok) {
         CloseHandle(p.inW);  p.inW = nullptr;
         CloseHandle(p.outR); p.outR = nullptr;
+        if (p.errR) { CloseHandle(p.errR); p.errR = nullptr; }
         return fail("cannot start", osErrorText(startErr));
     }
     CloseHandle(pi.hThread);
@@ -161,17 +185,30 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     }
     fcntl(execErr[0], F_SETFD, FD_CLOEXEC);
     fcntl(execErr[1], F_SETFD, FD_CLOEXEC);
+    int errPipe[2] = { -1, -1 };
+    if (keepStderr && pipe(errPipe) != 0) {
+        int e = errno;
+        close(toChild[0]); close(toChild[1]);
+        close(fromChild[0]); close(fromChild[1]);
+        close(execErr[0]); close(execErr[1]);
+        return fail("cannot create pipes", osErrorText(e));
+    }
     pid_t pid = fork();
     if (pid < 0) {
         int e = errno;
         close(toChild[0]); close(toChild[1]);
         close(fromChild[0]); close(fromChild[1]);
         close(execErr[0]); close(execErr[1]);
+        if (errPipe[0] >= 0) { close(errPipe[0]); close(errPipe[1]); }
         return fail("cannot fork", osErrorText(e));
     }
     if (pid == 0) {
         dup2(toChild[0], STDIN_FILENO);
         dup2(fromChild[1], STDOUT_FILENO);
+        if (errPipe[1] >= 0) {
+            dup2(errPipe[1], STDERR_FILENO);
+            close(errPipe[0]); close(errPipe[1]);
+        }
         close(toChild[0]); close(toChild[1]);
         close(fromChild[0]); close(fromChild[1]);
         std::vector<char*> args;
@@ -190,15 +227,18 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     close(execErr[0]);
     close(toChild[0]);
     close(fromChild[1]);
+    if (errPipe[1] >= 0) close(errPipe[1]);   // ours open would hold the pipe open forever
     if (got == (ssize_t)sizeof childErrno) {
         int st = 0;
         waitpid(pid, &st, 0);             // it _exit(127)ed: reap it now, no zombie
         close(toChild[1]);
         close(fromChild[0]);
+        if (errPipe[0] >= 0) close(errPipe[0]);
         return fail("cannot start", osErrorText(childErrno));
     }
     p.inW = toChild[1];
     p.outR = fromChild[0];
+    p.errR = errPipe[0];
     p.pid = pid;
     return true;
 #endif
@@ -209,11 +249,13 @@ static bool pipeWrite(Pipe& p, const void* buf, size_t n) {
     while (n) {
 #if defined(_WIN32)
         DWORD wrote = 0;
-        if (!WriteFile(p.inW, q, (DWORD)std::min<size_t>(n, 1u << 20), &wrote, nullptr) || !wrote)
+        if (!WriteFile(p.inW, q, (DWORD)std::min<size_t>(n, 1u << 20), &wrote, nullptr) || !wrote) {
+            p.farClosed = true;
             return false;
+        }
 #else
         ssize_t wrote = write(p.inW, q, std::min<size_t>(n, 1u << 20));
-        if (wrote <= 0) return false;
+        if (wrote <= 0) { p.farClosed = true; return false; }
 #endif
         q += wrote; n -= (size_t)wrote;
     }
@@ -236,12 +278,17 @@ static bool pipeRead(Pipe& p, void* buf, size_t n) {
 #if defined(_WIN32)
         DWORD avail = 0;
         if (sliced) {                     // only pay for the poll when it can matter
-            if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) return false;
+            if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) {
+                p.farClosed = true;
+                return false;
+            }
             if (avail == 0) { Sleep(20); continue; }
         }
         DWORD got = 0;
-        if (!ReadFile(p.outR, q, (DWORD)std::min<size_t>(n, 1u << 20), &got, nullptr) || !got)
+        if (!ReadFile(p.outR, q, (DWORD)std::min<size_t>(n, 1u << 20), &got, nullptr) || !got) {
+            p.farClosed = true;
             return false;
+        }
 #else
         if (sliced) {
             struct pollfd pf { p.outR, POLLIN, 0 };
@@ -250,7 +297,7 @@ static bool pipeRead(Pipe& p, void* buf, size_t n) {
             if (pr < 0) return false;
         }
         ssize_t got = read(p.outR, q, std::min<size_t>(n, 1u << 20));
-        if (got <= 0) return false;
+        if (got <= 0) { p.farClosed = true; return false; }
 #endif
         q += got; n -= (size_t)got;
         p.bytesRead += (uint64_t)got;
@@ -264,6 +311,7 @@ static void pipeClose(Pipe& p) {
 #if defined(_WIN32)
     if (p.inW) { CloseHandle(p.inW); p.inW = nullptr; }
     if (p.outR) { CloseHandle(p.outR); p.outR = nullptr; }
+    if (p.errR) { CloseHandle(p.errR); p.errR = nullptr; }
     if (p.proc) {
         WaitForSingleObject(p.proc, 2000);
         TerminateProcess(p.proc, 0);
@@ -273,6 +321,7 @@ static void pipeClose(Pipe& p) {
 #else
     if (p.inW >= 0) { close(p.inW); p.inW = -1; }
     if (p.outR >= 0) { close(p.outR); p.outR = -1; }
+    if (p.errR >= 0) { close(p.errR); p.errR = -1; }
     if (p.pid > 0) {
         // terminate FIRST, then reap - the old order reaped a child that had not
         // exited yet, leaving a zombie for the life of the viewer
@@ -297,9 +346,6 @@ static void closeWriteEnd(Pipe& p) {
 #endif
 }
 
-// One shell command on the host, script over stdin (immune to every quoting
-// layer between here and the remote sh), combined output back. This is how the
-// peer gets bootstrapped into ~/.viewer without the user copying anything.
 // Wall clock, monotonic enough for a timeout.
 static double nowSeconds() {
 #if defined(_WIN32)
@@ -311,9 +357,98 @@ static double nowSeconds() {
 #endif
 }
 
+// The child's exit status, waited for until `deadline` (nowSeconds()) at most;
+// -1 when it is still running then, when the stop flag fires, or when the OS
+// will not say. A signal death is 128 + signo, the shell's convention. On POSIX
+// this reaps the child, so pipeClose has nobody left to signal.
+static int pipeWaitExit(Pipe& p, double deadline, const std::atomic<bool>* abort) {
+#if defined(_WIN32)
+    if (!p.proc) return -1;
+    for (;;) {
+        DWORD w = WaitForSingleObject(p.proc, 20);
+        if (w == WAIT_OBJECT_0) {
+            DWORD code = 0;
+            return GetExitCodeProcess(p.proc, &code) ? (int)code : -1;
+        }
+        if (w != WAIT_TIMEOUT) return -1;
+        if ((abort && abort->load()) || nowSeconds() > deadline) return -1;
+    }
+#else
+    if (p.pid <= 0) return -1;
+    for (;;) {
+        int st = 0;
+        pid_t r = waitpid(p.pid, &st, WNOHANG);
+        if (r == p.pid) {
+            p.pid = -1;
+            if (WIFEXITED(st)) return WEXITSTATUS(st);
+            if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+            return -1;
+        }
+        if (r < 0 && errno != EINTR) return -1;
+        if ((abort && abort->load()) || nowSeconds() > deadline) return -1;
+        usleep(10 * 1000);
+    }
+#endif
+}
+
+// What stands for `ssh` on every command line below. setSshProgramForTest's.
+static std::vector<std::string> g_sshProgram = { "ssh" };
+
+void setSshProgramForTest(const std::vector<std::string>& argvPrefix) {
+    g_sshProgram = argvPrefix.empty() ? std::vector<std::string>{ "ssh" } : argvPrefix;
+}
+
+std::string sshStderrGist(const std::string& text) {
+    std::vector<std::string> keep;
+    size_t b = 0;
+    while (b < text.size()) {
+        size_t nl = text.find('\n', b);
+        std::string line = text.substr(b, nl == std::string::npos ? std::string::npos : nl - b);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        size_t lead = line.find_first_not_of(" \t");
+        line = lead == std::string::npos ? std::string() : line.substr(lead);
+        // Noise ssh prints on a GOOD day: the first-contact host key notice and
+        // OpenSSH's "** WARNING: ... post-quantum" banner. Neither is a cause.
+        if (!line.empty() && line.compare(0, 3, "** ") != 0 &&
+            line.compare(0, 26, "Warning: Permanently added") != 0)
+            keep.push_back(line);
+        if (nl == std::string::npos) break;
+        b = nl + 1;
+    }
+    const size_t kLastLines = 4;
+    std::string out;
+    for (size_t i = keep.size() > kLastLines ? keep.size() - kLastLines : 0; i < keep.size(); i++) {
+        if (!out.empty()) out += '\n';
+        out += keep[i];
+    }
+    return out;
+}
+
+std::string sshCouldNotRun(const std::string& host, int port, int exitCode,
+                           const std::string& stderrText, const std::string& whenSilent) {
+    const std::string gist = sshStderrGist(stderrText);
+    std::string s = "could not run commands on " + host + " over ssh (" +
+                    (exitCode >= 0 ? "exit " + std::to_string(exitCode) : std::string("no exit status")) +
+                    "): " + (gist.empty() ? whenSilent : gist);
+    if (stderrText.find("Permission denied") != std::string::npos ||
+        (gist.empty() && exitCode == 255))
+        s += "\n(the viewer runs ssh with BatchMode=yes, so only key authentication works - "
+             "check that `ssh -o BatchMode=yes " +
+             (port > 0 ? "-p " + std::to_string(port) + " " : std::string()) + host +
+             " uname` succeeds in a terminal)";
+    return s;
+}
+
+// One shell command on the host, script over stdin (immune to every quoting
+// layer between here and the remote sh), stdout back - and stderr and the exit
+// status beside it, because those are what say whether anything RAN (#324).
+// This is how the peer gets bootstrapped into ~/.viewer without the user
+// copying anything.
 bool runSshCommand(const std::string& host, int port, const std::string& remoteCmd,
                    const std::string& stdinData, std::string& output, std::string& err,
-                   double timeoutSec, const std::atomic<bool>* abort) {
+                   double timeoutSec, const std::atomic<bool>* abort, SshRun* run) {
+    if (run) *run = SshRun{};
     Pipe p;
     std::vector<std::string> argv;
     if (host.empty()) {
@@ -324,19 +459,31 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
         argv = { "sh", "-c", remoteCmd };
 #endif
     } else {
-        argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10" };
+        argv = g_sshProgram;
+        for (const char* a : { "-o", "BatchMode=yes", "-o", "ConnectTimeout=10" }) argv.push_back(a);
         if (port > 0) { argv.push_back("-p"); argv.push_back(std::to_string(port)); }
         argv.push_back(host);
         argv.push_back(remoteCmd);
     }
-    if (!spawn(p, argv, err)) return false;
+    if (!spawn(p, argv, err, nullptr, /*keepStderr=*/true)) return false;
     bool wroteOk = stdinData.empty() || pipeWrite(p, stdinData.data(), stdinData.size());
     closeWriteEnd(p);                     // EOF: the remote command runs
     output.clear();
+    std::string errText;
     const double deadline = nowSeconds() + timeoutSec;
     char buf[4096];
-    bool timedOut = false, cancelled = false;
-    for (;;) {
+    bool timedOut = false, cancelled = false, capped = false;
+    // BOTH pipes, on one loop, until both have closed. Reading stdout to its end
+    // first and stderr after would hang on a child that fills its stderr pipe
+    // (4 KB on Windows) before closing stdout: it blocks writing, we block
+    // waiting, and only the timeout ends it.
+    bool outOpen = true, errOpen = true;
+    // stderr keeps its LAST kSshStderrCap bytes: the cause is what comes last.
+    auto keepErr = [&](const char* q, size_t n) {
+        errText.append(q, n);
+        if (errText.size() > 2 * kSshStderrCap) errText.erase(0, errText.size() - kSshStderrCap);
+    };
+    while (outOpen || errOpen) {
         // The caller's stop flag, on the slice this loop already turns on. A
         // worker that is being joined must not be held here for the rest of
         // timeoutSec: see the note on the declaration.
@@ -345,24 +492,57 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
 #if defined(_WIN32)
         // PeekNamedPipe first: ReadFile on a pipe blocks with no way out, and a
         // hung git clone on the far side would otherwise wedge this thread until
-        // the process exits.
-        DWORD avail = 0;
-        if (!PeekNamedPipe(p.outR, nullptr, 0, nullptr, &avail, nullptr)) break;
-        if (avail == 0) { Sleep(50); continue; }
-        DWORD got = 0;
-        if (!ReadFile(p.outR, buf, sizeof buf, &got, nullptr) || !got) break;
+        // the process exits. A failed peek is the writer gone and the pipe empty.
+        bool moved = false;
+        auto take = [&](HANDLE h, bool& open, bool isErr) {
+            if (!open) return;
+            DWORD avail = 0;
+            if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) { open = false; return; }
+            if (avail == 0) return;
+            DWORD got = 0;
+            if (!ReadFile(h, buf, (DWORD)std::min<size_t>(avail, sizeof buf), &got, nullptr) || !got) {
+                open = false;
+                return;
+            }
+            moved = true;
+            if (isErr) keepErr(buf, got); else output.append(buf, got);
+        };
+        take(p.outR, outOpen, false);
+        take(p.errR, errOpen, true);
+        if (!moved && (outOpen || errOpen)) Sleep(50);
 #else
-        struct pollfd pf { p.outR, POLLIN, 0 };
-        int pr = poll(&pf, 1, 50);
+        struct pollfd pf[2];
+        bool isErr[2];
+        int n = 0;
+        if (outOpen) { pf[n] = { p.outR, POLLIN, 0 }; isErr[n++] = false; }
+        if (errOpen) { pf[n] = { p.errR, POLLIN, 0 }; isErr[n++] = true; }
+        int pr = poll(pf, (nfds_t)n, 50);
         if (pr == 0) continue;
-        if (pr < 0) break;
-        ssize_t got = read(p.outR, buf, sizeof buf);
-        if (got <= 0) break;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            if (!pf[i].revents) continue;
+            ssize_t got = read(pf[i].fd, buf, sizeof buf);
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) { (isErr[i] ? errOpen : outOpen) = false; continue; }
+            if (isErr[i]) keepErr(buf, (size_t)got); else output.append(buf, (size_t)got);
+        }
 #endif
-        output.append(buf, (size_t)got);
-        if (output.size() > (1u << 20)) break;   // no script needs a MB of output
+        if (output.size() > (1u << 20)) { capped = true; break; }   // no script needs a MB
     }
+    if (errText.size() > kSshStderrCap) errText.erase(0, errText.size() - kSshStderrCap);
+    // Both pipes closed: the child is exiting, if it has not already. Bounded by
+    // the caller's deadline and by a few seconds past its output in any case - a
+    // child that has closed its stdio and lingers is not worth a timeout, and
+    // its status is then simply not known (-1), as it was before #324.
+    int code = -1;
+    if (!cancelled && !timedOut && !capped)
+        code = pipeWaitExit(p, std::min(deadline, nowSeconds() + 5.0), abort);
+    if (abort && abort->load()) cancelled = true;
     pipeClose(p);
+    if (run) run->stderrText = errText;
     if (cancelled) {
         output.clear();
         err = "cancelled";
@@ -372,15 +552,122 @@ bool runSshCommand(const std::string& host, int port, const std::string& remoteC
         err = "timed out after " + std::to_string((int)timeoutSec) + "s";
         return false;
     }
+    const bool sshFailed = !host.empty() && code == 255;
+    if (run) { run->exitCode = code; run->sshFailed = sshFailed; }
+    // The exit status before "could not write the script": an ssh that failed
+    // to authenticate may close its stdin before we wrote, and its own words
+    // are the reason, not the write that followed.
+    if (sshFailed) {
+        err = sshCouldNotRun(host, port, code, errText, "ssh said nothing on stderr");
+        return false;
+    }
+    if (code > 0) {
+        const std::string gist = sshStderrGist(errText);
+        err = (host.empty() ? std::string("the command") : "the command on " + host) +
+              " exited with status " + std::to_string(code) + (gist.empty() ? "" : ":\n" + gist);
+        return false;
+    }
     if (!wroteOk) { err = "could not reach the host"; return false; }
     return true;
 }
 
 bool runSshScript(const std::string& host, int port, const std::string& script,
                   std::string& output, std::string& err, double timeoutSec,
-                  const std::atomic<bool>* abort) {
-    return runSshCommand(host, port, "sh", script + "\n", output, err, timeoutSec, abort);
+                  const std::atomic<bool>* abort, SshRun* run) {
+    return runSshCommand(host, port, "sh", script + "\n", output, err, timeoutSec, abort, run);
 }
+
+// ---------------------------------------------------------------- the fake ssh
+// --sshfail-selftest's stand-in for ssh. The HOST picks the outcome, so a test
+// names a scenario the way a user names a server:
+//   auth     ssh's own failure: "Permission denied (publickey)." on stderr
+//            (CRLF, as MS OpenSSH writes it), exit 255, stdin never read
+//   empty    the command "ran" and said nothing at all, exit 0
+//   sunos    a machine there is no prebuilt peer for: uname answers SunOS sparc64
+//   chatty   256 KB of stderr BEFORE a line of stdout, exit 3 - hangs a reader
+//            that drains stdout first
+//   explains a script that says why on stdout and exits 1
+// Anything else is an ssh that cannot resolve the name (exit 255).
+#if defined(_WIN32)
+static void fakeWrite(DWORD which, const std::string& s) {
+    HANDLE h = GetStdHandle(which);
+    size_t off = 0;
+    while (off < s.size()) {
+        DWORD wrote = 0;
+        if (!WriteFile(h, s.data() + off, (DWORD)std::min<size_t>(s.size() - off, 1u << 16),
+                       &wrote, nullptr) || !wrote)
+            return;
+        off += wrote;
+    }
+}
+static void fakeDrainStdin() {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    char b[4096];
+    DWORD got = 0;
+    while (ReadFile(h, b, sizeof b, &got, nullptr) && got) {}
+}
+#define FAKE_OUT STD_OUTPUT_HANDLE
+#define FAKE_ERR STD_ERROR_HANDLE
+#else
+static void fakeWrite(int fd, const std::string& s) {
+    size_t off = 0;
+    while (off < s.size()) {
+        ssize_t wrote = write(fd, s.data() + off, s.size() - off);
+        if (wrote < 0 && errno == EINTR) continue;
+        if (wrote <= 0) return;
+        off += (size_t)wrote;
+    }
+}
+static void fakeDrainStdin() {
+    char b[4096];
+    for (;;) {
+        ssize_t got = read(STDIN_FILENO, b, sizeof b);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return;
+    }
+}
+#define FAKE_OUT STDOUT_FILENO
+#define FAKE_ERR STDERR_FILENO
+#endif
+
+int runFakeSsh(int argc, char** argv) {
+    std::string host;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--fake-ssh") continue;
+        if ((a == "-o" || a == "-p") && i + 1 < argc) { i++; continue; }
+        host = a;                         // the first word that is not an option
+        break;
+    }
+    if (host == "auth") {
+        fakeWrite(FAKE_ERR, "hish@auth: Permission denied (publickey).\r\n");
+        return 255;
+    }
+    if (host == "empty") { fakeDrainStdin(); return 0; }
+    if (host == "sunos") {
+        fakeDrainStdin();
+        fakeWrite(FAKE_OUT, "UNAME SunOS sparc64\nNO_PEER\n");
+        return 0;
+    }
+    if (host == "chatty") {
+        std::string noise;
+        while (noise.size() < 256 * 1024) noise += "remote chatter that nobody asked for\n";
+        fakeWrite(FAKE_ERR, noise);
+        fakeWrite(FAKE_ERR, "the last thing it said\n");
+        fakeDrainStdin();
+        fakeWrite(FAKE_OUT, "stdout after the noise\n");
+        return 3;
+    }
+    if (host == "explains") {
+        fakeDrainStdin();
+        fakeWrite(FAKE_OUT, "git clone failed (private repo or no network on this server?)\n");
+        return 1;
+    }
+    fakeWrite(FAKE_ERR, "ssh: Could not resolve hostname " + host + ": No such host is known.\r\n");
+    return 255;
+}
+#undef FAKE_OUT
+#undef FAKE_ERR
 
 // ---------------------------------------------------------------- payload codec
 struct W {
@@ -449,15 +736,20 @@ bool Session::start(const std::string& host, const std::string& exe, std::string
 // The exe goes to the remote shell exactly as startOn passes it (unquoted, so
 // "~" is the remote HOME), and stderr is folded into stdout because the loader
 // writes there. First non-empty line only: the rest is usage text.
+//
+// `run` is how the caller learns that the trip itself failed IN SSH (exit 255):
+// then nothing ran over there, the answer is empty, and ssh's own stderr is
+// the explanation - which the caller words with sshCouldNotRun (#324).
 static std::string peerStartError(const std::string& host, int port,
                                   const std::string& exe,
-                                  const std::atomic<bool>* abort) {
+                                  const std::atomic<bool>* abort, SshRun* run) {
     std::string out, e;
-    if (!runSshCommand(host, port, exe + " --version 2>&1 || true", "", out, e, 8.0, abort))
-        // Could not even ask. Say NOTHING: `e` holds OUR words for our own
+    if (!runSshCommand(host, port, exe + " --version 2>&1 || true", "", out, e, 8.0, abort, run))
+        // Could not even ask. Say NOTHING here: `e` holds OUR words for our own
         // failure ("timed out after 8s", "cancelled"), and appending them to
         // "no answer from the remote viewer" reads as the peer's answer -
         // a sentence the user is told to report, about a probe that never ran.
+        // (ssh's own failure reaches the caller through `run`.)
         return {};
     size_t b = 0;
     while (b < out.size()) {
@@ -497,8 +789,10 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         // BatchMode: fail fast instead of hanging on a password prompt with no
         // terminal. ConnectTimeout/ServerAlive: a black-holed route or a dead
         // sshd must become an error in seconds, not a UI frozen forever.
-        argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3" };
+        argv = g_sshProgram;
+        for (const char* a : { "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                               "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3" })
+            argv.push_back(a);
         if (port > 0) { argv.push_back("-p"); argv.push_back(std::to_string(port)); }
         argv.push_back(host);
         argv.push_back(exe);
@@ -530,13 +824,30 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         // nothing was ever connected, and the wording hides the one state the
         // round trip below can explain. The pipe knows: not a byte arrived.
         const bool noAnswer = (p->bytesRead == 0);
+        // ...and was it the PEER that did not answer, or SSH that never got as
+        // far as starting it? ssh exits 255 for its own failures (auth, DNS,
+        // refused, host key), and "is it installed there?" about a server we
+        // never logged into sends the user to the wrong machine (#324). Asked
+        // only when the pipe found the far end CLOSED - then ssh is exiting
+        // and its status is a moment away; a read that gave up on a clock
+        // leaves ssh running and the question unanswerable without a wait.
+        const bool aborted0 = abort_ && abort_->load();
+        const bool sshFailed = noAnswer && !host.empty() && p->farClosed && !aborted0 &&
+                               pipeWaitExit(*p, nowSeconds() + 2.0, abort_) == 255;
         if (noAnswer || err.empty())
             // ...and for a LOCAL peer the question "is it installed there?" is
             // the wrong one: the file started (spawn said so, by name), so what
             // is left is a binary that exited before HELLO - a missing DLL, a
             // Peer executable setting that names something other than a viewer.
+            //
+            // ssh's own words went to this process's stderr (see peerStartError
+            // for why this pipe does not keep them), so the sentence here has
+            // the status and the remedy; a caller that opted into the extra
+            // round trip below gets ssh's words too.
             err = host.empty()
                 ? "the local reader (" + exe + ") started but did not answer"
+                : sshFailed
+                ? sshCouldNotRun(host, port, 255, "", "ssh failed before the viewer was started there")
                 : "no answer from the remote viewer (is it installed there?)";
         // ...and what the peer ACTUALLY said - but only when all four hold:
         //   the caller opted in (setExplainFailure: a worker that shows it),
@@ -548,8 +859,13 @@ bool Session::startOn(const std::string& host, int port, const std::string& exe,
         //   wait out a second handshake).
         const bool aborted = abort_ && abort_->load();
         if (explainFailure_ && !host.empty() && noAnswer && !aborted) {
-            std::string why = peerStartError(host, port, exe, abort_);
-            if (!why.empty()) err += "\n" + why;
+            SshRun probe;
+            std::string why = peerStartError(host, port, exe, abort_, &probe);
+            if (probe.sshFailed)          // the same failure, with ssh's own words this time
+                err = sshCouldNotRun(host, port, 255, probe.stderrText,
+                                     "ssh failed before the viewer was started there");
+            else if (!why.empty())
+                err += "\n" + why;
         }
         stop();
         return false;

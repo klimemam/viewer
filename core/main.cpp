@@ -918,6 +918,11 @@ static void migrateLayoutIni(const std::string& iniPath) {
 #include "selftest/asyncopen.inc"
 
 int main(int argc, char** argv) {
+    // --sshfail-selftest's stand-in for ssh (remote::runFakeSsh): first, before
+    // anything else, because it is not this program - it is an ssh that prints
+    // what its host name says and exits with that status.
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--fake-ssh")) return remote::runFakeSsh(argc, argv);
 #if defined(_WIN32)
     {
         // --serve is the exception: its stdin/stdout are the protocol, and it is
@@ -1706,6 +1711,11 @@ int main(int argc, char** argv) {
     // The Projection table's numbers, lined up on the point (issue #313). Beside
     // projframe.inc: the same table, and the same claim that the TSV is untouched.
     #include "selftest/numalign.inc"
+
+    // An ssh that failed says so (issue #324): deployPeer, runSshCommand and the
+    // Session's handshake against `<this binary> --fake-ssh`. Here because it
+    // drives deployPeer, which open_dispatch.inc defines well above.
+    #include "selftest/sshfail.inc"
 
     // The three shipped analyzers that had no value assertion at all (板 304).
     // Beside rowcolsigma.inc because it is the same discipline on the other side
