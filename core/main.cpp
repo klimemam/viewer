@@ -1534,6 +1534,8 @@ int main(int argc, char** argv) {
 
     #include "selftest/batch.inc"
 
+    #include "selftest/sessiondoor.inc"
+
     #include "selftest/export.inc"
 
     #include "selftest/series.inc"

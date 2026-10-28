@@ -86,6 +86,7 @@ PR #122 で消え、`docs/guides/manual.md` は既に「ビルドを切り替え
 | `remoteurl` | 最後に繋いだ URL | 空 | **履歴** |
 | `rbookmark` | Browse のブックマーク (複数行) | 空 | **履歴** |
 | `rbrecent` | Browse の最近の場所 (複数行、上限 **10**) | 空 | **履歴** |
+| `sessionrecent` | File > Recent Sessions (複数行、新しい順、上限 **8** = `SESSION_RECENT_MAX`、autosave は入れない。#307 で追加、この節の数え上げより後) | 空 | **履歴** |
 | `pythonexe` | 使う Python | 空 → PATH を探る | — |
 | `readerdir` | ユーザーのリーダを置く**1つ**のフォルダ | 空 | — (#51 が複数化を持つ) |
 | `readerfor` | パス → リーダの記憶 (上限 **64** = `READER_MEMO_MAX`) | 空 | **履歴** |

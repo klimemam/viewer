@@ -5666,9 +5666,27 @@ static void openPath(const std::string& path) {
     } else if (ends(".npz")) {
         openLocalFile(path, OK_Npz);
     } else if (ends(".vsession")) {
-        std::string err = loadSession(path);
+        // A session REPLACES what is open; it does not add to it. loadSession
+        // closes everything (closeAll) once the file has proved to be a session
+        // and before its first line is applied, and it does not ask - a file
+        // that cannot be read or is not a session returns before that, with
+        // nothing closed. #307 keeps that behaviour and says it: what was
+        // replaced goes into the sentence that reports the load, in the layer
+        // canon's words (docs/terminology.md) - a 50-frame stack is one stack.
+        const std::string replaced = openContentsPhrase();
+        SessionReport rep;
+        std::string err = loadSession(path, &rep);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
-        else toast("session restored: " + baseName(path));
+        else {
+            noteRecentSession(path);   // Recent Sessions; the autosave is refused there
+            std::string msg = "session restored: " + baseName(path);
+            if (!replaced.empty()) msg += " - replaced " + replaced;
+            // A lossy load has already put its own sentence on screen (what did
+            // not come back, by name). That one outranks this one, so it stays,
+            // and this goes to the Messages log beside it.
+            if (rep.lost() > 0) logMsg(msg);
+            else toast(msg);
+        }
     } else if (imagefile::forPath(path)) {
         // PNG / JPEG / TIFF. The extension only chooses this door; what decodes
         // is decided by the bytes behind it. A file this build will not read -
@@ -5719,18 +5737,84 @@ static std::string openImagesFilter() {
     return ownDoorPattern() + " " + imagefile::dialogPattern();
 }
 
-static void openFileDialog() {
+// What an open dialog is asked for, apart from asking for it (#307): the
+// selftest reads the filters, their order and the starting folder from here,
+// headless, instead of from a pfd window nobody can inspect. `filters` is pfd's
+// flat list - label, pattern, label, pattern - and the FIRST pair is the one the
+// dialog shows when it opens.
+struct OpenDialogSpec {
+    std::string title;
+    std::string startDir;            // "" = wherever the OS starts it
+    std::vector<std::string> filters;
+    bool multiselect = false;
+};
+
+// File > Open... The first filter shows sessions alongside the pictures: a
+// .vsession is opened through this dialog as well (openPath's branch), and a
+// first filter that hid it made "where did my session go" the answer to
+// opening one. The pairs after it are the ones the dialog always had.
+static OpenDialogSpec openFileDialogSpec() {
+    const std::string pat = openImagesFilter();
+    OpenDialogSpec s;
+    s.title = "Open image / session";
+    s.filters = { "Images and sessions (" + pat + " *.vsession)", pat + " *.vsession",
+                  "Images (" + pat + ")", pat,
+                  "Session (*.vsession)", "*.vsession",
+                  "All files", "*" };
+    s.multiselect = true;
+    return s;
+}
+// File > Open Session... One session at a time - a second would replace the
+// first - starting in the folder of the session last saved or opened.
+static OpenDialogSpec openSessionDialogSpec() {
+    OpenDialogSpec s;
+    s.title = "Open session";
+    s.startDir = sessionDialogStartDir();
+    s.filters = { "viewer session (*.vsession)", "*.vsession", "All files", "*" };
+    s.multiselect = false;
+    return s;
+}
+static void launchOpenDialog(const OpenDialogSpec& s) {
     if (!pfd::settings::available()) {   // e.g. Linux without zenity/kdialog
         toast("no file-dialog backend found (install zenity or kdialog) - drag & drop files instead", true);
         return;
     }
     if (app.openDlg) return;             // one dialog at a time
-    const std::string pat = openImagesFilter();
-    app.openDlg = std::make_unique<pfd::open_file>("Open image / session", "",
-        std::vector<std::string>{ "Images (" + pat + ")", pat,
-          "Session (*.vsession)", "*.vsession",
-          "All files", "*" },
-        pfd::opt::multiselect);
+    // Both land in pollFileDialog, which hands every path to openPath - so a
+    // session picked from either dialog takes the one .vsession branch.
+    app.openDlg = std::make_unique<pfd::open_file>(s.title, s.startDir, s.filters,
+        s.multiselect ? pfd::opt::multiselect : pfd::opt::none);
+}
+static void openFileDialog() { launchOpenDialog(openFileDialogSpec()); }
+static void openSessionDialog() { launchOpenDialog(openSessionDialogSpec()); }
+
+// What an open dialog's selection does, in a fixed order whatever order the OS
+// returned the names in. With "Images and sessions" as Open...'s first filter
+// a selection can hold both, and a session REPLACES what is open - so handing
+// the names to openPath as they came would close images just opened when the
+// session happened to come later, and keep them when it came first.
+//
+// The rule: the session opens FIRST and everything else opens on top of it.
+// More than one session in one selection has no order that means anything
+// (each replaces the last), so none of them is opened, the toast says why, and
+// the rest of the selection still opens.
+static void openDialogSelection(const std::vector<std::string>& picked) {
+    std::vector<std::string> sessions, rest;
+    for (const std::string& p : picked)
+        (isSessionFileName(p) ? sessions : rest).push_back(p);
+    if (sessions.size() == 1) openPath(sessions[0]);
+    for (const std::string& p : rest) openPath(p);
+    if (sessions.size() > 1)
+        toast(std::to_string(sessions.size()) + " sessions selected - a session replaces "
+              "what is open, so open one at a time; none of them was opened", true);
+}
+// The Save Session dialog's answer: saveSession's extension rule applied HERE
+// first, so Recent Sessions names the file that was written ("run3" typed into
+// the dialog is run3.vsession on disk), and remembered only when it was.
+static void saveSessionDialogResult(std::string p) {
+    if (p.empty()) return;
+    if (p.find('.') == std::string::npos) p += ".vsession";
+    if (saveSession(p)) noteRecentSession(p);
 }
 static void openFolderDialog() {
     if (!pfd::settings::available()) {
@@ -5775,12 +5859,11 @@ static void openFolder(const std::string& path);   // defined with the sequence 
 
 static void pollFileDialog() {           // called once per frame from the main loop
     if (app.openDlg && app.openDlg->ready(0)) {
-        for (const std::string& p : app.openDlg->result()) openPath(p);
+        openDialogSelection(app.openDlg->result());
         app.openDlg.reset();
     }
     if (app.saveDlg && app.saveDlg->ready(0)) {
-        std::string p = app.saveDlg->result();
-        if (!p.empty()) saveSession(p);
+        saveSessionDialogResult(app.saveDlg->result());
         app.saveDlg.reset();
     }
     if (app.csvDlg && app.csvDlg->ready(0)) {

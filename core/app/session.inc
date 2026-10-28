@@ -805,8 +805,9 @@ static void retakeCrashFile();                              // fwd
 // counts and the first few names per LossKind. Callers that only want the file
 // written pass nothing and get the sentence in the toast / the Messages log,
 // which is where it belongs: ONE sentence per save, not four stderr lines and
-// two parenthesised clauses.
-static void saveSession(std::string path, bool quiet = false,
+// two parenthesised clauses. Returns whether the file was written - the File
+// menu's save remembers the session in Recent Sessions only when it was (#307).
+static bool saveSession(std::string path, bool quiet = false,
                         SessionReport* reportOut = nullptr) {
     // A saved session has no transients - but the way to honour that is to
     // leave the preview OUT of the file (isSavedLine), not to promote it into
@@ -834,7 +835,7 @@ static void saveSession(std::string path, bool quiet = false,
         std::string msg = "session NOT saved: " + why + " - the previous " +
                           baseName(path) + " is unchanged";
         if (quiet) logMsg(msg, true); else toast(msg, true);
-        return;
+        return false;
     }
     // stderr gets it whether or not anybody is watching a window: it is what a
     // scripted run, a CI log and a bug report have. It carries the NAMES.
@@ -851,9 +852,10 @@ static void saveSession(std::string path, bool quiet = false,
     // unchanged session says this once and not once per autosave.
     if (quiet) {
         if (!det.empty()) logMsg(msg, true);
-        return;
+        return true;
     }
     toast(msg, rep.lost() > 0);
+    return true;
 }
 
 static std::string loadNpy(const std::string& path, int npyRead,
@@ -1579,6 +1581,8 @@ static void writePrefsTo(std::ostream& f) {
     if (!app.lastRemoteUrl.empty()) f << "remoteurl " << app.lastRemoteUrl << "\n";
     for (const auto& b : app.rbBookmarks) f << "rbookmark " << b << "\n";
     for (const auto& r : app.rbRecents)   f << "rbrecent " << r << "\n";
+    // #307: File > Recent Sessions, most recent first. History, like rbrecent.
+    for (const auto& r : app.sessionRecents) f << "sessionrecent " << r << "\n";
     if (!P.pythonExe.empty()) f << "pythonexe " << P.pythonExe << "\n";
     // §4.13.2: the registered reader places, IN ORDER - the order is the setting
     // as much as the paths are, because first-match-wins is only answerable when
@@ -1630,6 +1634,204 @@ static void savePrefs() {
         // so a disk that stays full says it once.
         logMsg("preferences NOT saved: " + why +
                " - the previous prefs.txt is unchanged", true);
+}
+
+// ---- File > Recent Sessions (#307) ------------------------------------------
+// The named sessions this user saved or opened, most recent first. A session
+// could always be loaded - File > Open, drag & drop, Browse, --session all reach
+// openPath's .vsession branch - but nothing on the File menu said so, and the
+// one session item that did open something (Restore last session) only ever
+// opens the AUTOSAVE. These are the rows that remember the other kind.
+//
+// The autosave is kept OUT on purpose: it is rewritten every 60 s, so letting it
+// in would push every session the user named off the end of an 8-row list, and
+// it already has its own door.
+static const size_t SESSION_RECENT_MAX = 8;
+
+// The comparison form: one file reached through two spellings (a dialog's
+// backslashes, a drop's forward slashes, a different case) is ONE row, not two
+// - on Windows, where those ARE one file. On POSIX a backslash is an ordinary
+// character of a name and case is significant, so nothing is folded there.
+static std::string sessionRecentKey(const std::string& p) {
+    std::string s = p;
+#if defined(_WIN32)
+    std::replace(s.begin(), s.end(), '\\', '/');
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+#endif
+    return s;
+}
+// The stored form: absolute and normalised, so a --session given relative to
+// one working directory still names the same file from the next one.
+static std::string sessionRecentSpelling(const std::string& p) {
+    std::error_code ec;
+    std::filesystem::path a = std::filesystem::absolute(pathFromUtf8(p), ec);
+    if (ec) return p;
+    return a.lexically_normal().generic_u8string();
+}
+// Pure, so the selftest can drive it without a prefs.txt: the newest goes in
+// front, an earlier row for the same file goes away, the oldest falls off.
+static void sessionRecentPush(std::vector<std::string>& v, const std::string& p) {
+    const std::string k = sessionRecentKey(p);
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](const std::string& q) { return sessionRecentKey(q) == k; }),
+            v.end());
+    v.insert(v.begin(), p);
+    if (v.size() > SESSION_RECENT_MAX) v.resize(SESSION_RECENT_MAX);
+}
+// The loader's half: rows arrive oldest-LAST, so they go on the end - under the
+// same one-row-per-file rule and the same cap.
+static void sessionRecentAppend(std::vector<std::string>& v, const std::string& p) {
+    const std::string k = sessionRecentKey(p);
+    for (const auto& q : v) if (sessionRecentKey(q) == k) return;
+    if (v.size() < SESSION_RECENT_MAX) v.push_back(p);
+}
+// An autosave of ANY instance slot (slotAutosaveName) in the config directory.
+// A copy of autosave.vsession somewhere else is a file the user moved and named
+// by doing so, and is an ordinary session.
+static bool isAutosaveSessionPath(const std::string& p, const std::string& cfgDir) {
+    if (cfgDir.empty()) return false;
+    const std::string s = sessionRecentKey(sessionRecentSpelling(p));
+    std::string d = sessionRecentKey(sessionRecentSpelling(cfgDir));
+    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    const size_t slash = s.find_last_of('/');
+    if (slash == std::string::npos || s.compare(0, slash, d) != 0 || slash != d.size())
+        return false;
+    const std::string name = s.substr(slash + 1);
+    if (name == sessionRecentKey(slotAutosaveName(1))) return true;
+    const std::string pre = "autosave-", suf = ".vsession";
+    if (name.size() <= pre.size() + suf.size() || name.compare(0, pre.size(), pre) != 0 ||
+        name.compare(name.size() - suf.size(), suf.size(), suf) != 0)
+        return false;
+    for (size_t i = pre.size(); i < name.size() - suf.size(); i++)
+        if (!std::isdigit((unsigned char)name[i])) return false;
+    return true;
+}
+// A save or an open of p SUCCEEDED: remember it, and persist at once - prefs.txt
+// is written on every change, not only on the way out (a machine that is switched
+// off still had its sessions). Returns false when p is not remembered (the
+// autosave).
+static bool noteRecentSession(const std::string& p) {
+    if (p.empty() || isAutosaveSessionPath(p, viewerConfigDir())) return false;
+    sessionRecentPush(app.sessionRecents, sessionRecentSpelling(p));
+    savePrefs();
+    return true;
+}
+static void clearRecentSessions() {
+    app.sessionRecents.clear();
+    savePrefs();
+}
+// One row of the submenu. The NAME first - it is what the user gave the file
+// and what they are looking for - then the folder that tells two run3.vsession
+// apart, then "(missing)" for a file that has gone since it was remembered (the
+// row is drawn disabled, i.e. grey; Clear is how it goes away).
+static std::string recentSessionLabel(const std::string& p, bool exists) {
+    std::string s = baseName(p);
+#if defined(_WIN32)
+    const size_t slash = p.find_last_of("/\\");
+#else
+    const size_t slash = p.find_last_of('/');
+#endif
+    if (slash != std::string::npos && slash > 0) s += "  -  " + p.substr(0, slash);
+    if (!exists) s += "  (missing)";
+    return s;
+}
+static bool recentSessionExists(const std::string& p) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(pathFromUtf8(p), ec);
+}
+
+// "(missing)" without stalling the frame. A remembered session can live on an
+// SMB/NFS share that has gone away, and a stat() against one blocks for as long
+// as the OS takes to give up - seconds - so the submenu must not stat a row per
+// frame. Instead the rows are probed ONCE per opening of the submenu, on a
+// worker, and the menu draws from the result: a row the probe has not answered
+// yet is drawn as present (no "(missing)", clickable - a click on a file that
+// turns out to be gone gets openPath's own refusal, which names it).
+//
+// The worker owns nothing but its shared RecentProbe, so a probe still stuck on
+// a dead share when the menu closes, or when the next one starts, is simply
+// left to finish into a record nobody reads.
+struct RecentProbe {
+    std::vector<std::string> paths;  // the list as it was when the menu opened
+    std::vector<char> exists;        // filled by the worker, read after `done`
+    std::atomic<bool> done{false};
+};
+static std::shared_ptr<RecentProbe> g_recentProbe;
+static int g_recentProbeLastFrame = -2;   // the last frame the submenu was open in
+static int g_recentProbeLaunches = 0;     // how many probes were started (selftest)
+
+// Called by the submenu on every frame it is open, with ImGui's frame number.
+// A frame that does not directly follow the last open one is a new opening, and
+// only that starts a probe.
+static void recentSessionsMenuFrame(int frame) {
+    const bool opening = frame != g_recentProbeLastFrame + 1;
+    g_recentProbeLastFrame = frame;
+    if (!opening) return;
+    auto pr = std::make_shared<RecentProbe>();
+    pr->paths = app.sessionRecents;
+    pr->exists.assign(pr->paths.size(), 1);
+    g_recentProbe = pr;
+    g_recentProbeLaunches++;
+    std::thread([pr]() {
+        for (size_t i = 0; i < pr->paths.size(); i++)
+            pr->exists[i] = recentSessionExists(pr->paths[i]) ? 1 : 0;
+        pr->done.store(true, std::memory_order_release);
+    }).detach();
+}
+// 1 there, 0 missing, -1 not known yet (the probe is running, or the list has
+// changed under it since the menu opened).
+static int recentSessionState(size_t i) {
+    std::shared_ptr<RecentProbe> pr = g_recentProbe;
+    if (!pr || !pr->done.load(std::memory_order_acquire)) return -1;
+    if (i >= pr->paths.size() || i >= app.sessionRecents.size() ||
+        pr->paths[i] != app.sessionRecents[i])
+        return -1;
+    return pr->exists[i];
+}
+// openPath's own test for its .vsession branch, as a name: the open dialog's
+// selection is ordered by it (openDialogSelection), so the two cannot disagree.
+static bool isSessionFileName(const std::string& p) {
+    static const char suf[] = ".vsession";
+    const size_t n = sizeof suf - 1;
+    if (p.size() < n) return false;
+    for (size_t i = 0; i < n; i++)
+        if (std::tolower((unsigned char)p[p.size() - n + i]) != suf[i]) return false;
+    return true;
+}
+// What is open, in the layer canon's words (docs/terminology.md): stacks with
+// their frame count, and the frames that stand alone - "Close Image" calls
+// those images, so this does too. One 50-frame stack is "1 stack (50 frames)",
+// never "50 images". Previews are not opens and are not counted. "" when
+// nothing is open.
+static std::string openContentsPhrase() {
+    std::vector<int> seqs;
+    int stackFrames = 0, images = 0;
+    for (const auto& d : app.images) {
+        if (d->preview) continue;
+        if (d->seqId == 0) { images++; continue; }
+        stackFrames++;
+        if (std::find(seqs.begin(), seqs.end(), d->seqId) == seqs.end()) seqs.push_back(d->seqId);
+    }
+    auto n = [](int k, const char* one, const char* many) {
+        return std::to_string(k) + " " + (k == 1 ? one : many);
+    };
+    std::string s;
+    if (!seqs.empty())
+        s = n((int)seqs.size(), "stack", "stacks") + " (" + n(stackFrames, "frame", "frames") + ")";
+    if (images > 0) s += (s.empty() ? "" : " and ") + n(images, "image", "images");
+    return s;
+}
+// Where File > Open Session... starts: the folder of the last session saved or
+// opened. A folder that has gone since is passed over for the next one; with
+// none left the dialog starts where the OS would have started it ("").
+static std::string sessionDialogStartDir() {
+    std::error_code ec;
+    for (const auto& p : app.sessionRecents) {
+        std::filesystem::path d = pathFromUtf8(p).parent_path();
+        if (!d.empty() && std::filesystem::is_directory(d, ec)) return d.u8string();
+    }
+    return {};
 }
 
 // Keys the last loadPrefs() did not recognise, in file order. A key that
@@ -1785,7 +1987,7 @@ static void loadPrefs() {
         // way to set it. Measured: prefs-only `fontpath` was ignored and the
         // search fell through to meiryo.
         else if (key == "remoteexe" || key == "remoteurl" ||
-                 key == "rbookmark" || key == "rbrecent" ||
+                 key == "rbookmark" || key == "rbrecent" || key == "sessionrecent" ||
                  key == "pythonexe" || key == "readerfor" || key == "readerdir" ||
                  key == "readerplace" || key == "repourl" || key == "editor" ||
                  key == "fontpath") {
@@ -1803,6 +2005,11 @@ static void loadPrefs() {
             else if (key == "fontpath")  g_prefsBase.fontPath = s;
             else if (key == "remoteurl") app.lastRemoteUrl = s;
             else if (key == "rbookmark") app.rbBookmarks.push_back(s);
+            // Appended in file order (most recent first) through the same rule
+            // a new entry obeys - one row per file, SESSION_RECENT_MAX at most -
+            // so a hand-edited file cannot grow the menu and a second loadPrefs
+            // in one process (the selftests do that) cannot double it.
+            else if (key == "sessionrecent") sessionRecentAppend(app.sessionRecents, s);
             else if (key == "pythonexe") app.pythonExe = s;
             // The one folder that "readerplace" replaced (§4.13.2). Still read,
             // and read as the FIRST place, so an existing prefs.txt keeps

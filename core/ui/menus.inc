@@ -216,6 +216,31 @@ static void drawMenuBar(GLFWwindow* win) {
             rbEnqueue(I, std::move(j));
         }
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
+        // #307: the way back in, beside the way out. No shortcut: the obvious
+        // chord, Ctrl+Shift+O, is Open Folder's, and the menu must not show two
+        // items claiming one chord.
+        if (ImGui::MenuItem("Open Session...")) openSessionDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("load a saved .vsession. It REPLACES what is open:\n"
+                              "every open image is closed first, without asking.");
+        if (ImGui::BeginMenu("Recent Sessions", !app.sessionRecents.empty())) {
+            // Existence is probed once per opening, on a worker - never a stat
+            // per row per frame (a dead network share would freeze the UI).
+            recentSessionsMenuFrame(ImGui::GetFrameCount());
+            std::string pick;          // opened after the loop: opening rewrites the list
+            for (size_t i = 0; i < app.sessionRecents.size(); i++) {
+                const std::string& p = app.sessionRecents[i];
+                const bool there = recentSessionState(i) != 0;   // not known yet = present
+                const std::string label = recentSessionLabel(p, there) + "##rs" + std::to_string(i);
+                if (ImGui::MenuItem(label.c_str(), nullptr, false, there)) pick = p;
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", p.c_str());
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear")) clearRecentSessions();
+            ImGui::EndMenu();
+            if (!pick.empty()) openPath(pick);
+        }
         {   // recovery: the autosave is written on exit, on crash and every 60 s.
             // With instance slots there can be several: scan them ALL, offer
             // the newest one no LIVE window owns, and say which one it is -
@@ -741,8 +766,9 @@ bool viewerReadsName(const std::string& n) {
     // fourth copy of the list turned out to be missing an extension.
     //
     // `.vsession` is a door as well (a session is opened, not decoded) but it
-    // is NOT one of theirs: Open Folder must not bundle sessions into a stack,
-    // and File > Open gives it its own filter entry. So it is added here, at
+    // is NOT one of theirs: Open Folder must not bundle sessions into a stack.
+    // (File > Open lists it beside the pictures in its first filter, and in a
+    // "Session" filter of its own - openFileDialogSpec.) So it is added here, at
     // the one door that asks "can the viewer do something with this name",
     // and nowhere else - what Browse greys out has to match what happens if
     // you go around it.
@@ -794,8 +820,8 @@ std::string viewerRefusalFor(const std::string& n) {
     if (viewerReadsName(n)) return {};
     std::string vid = imagefile::videoRefusal(n);
     if (!vid.empty()) return vid;
-    // The list it prints is the File > Open filter itself, plus the session
-    // door that filter keeps separate. A refusal that names a set the operator
+    // The list it prints is File > Open's first filter: the pictures plus the
+    // session door (openFileDialogSpec). A refusal that names a set the operator
     // can then go and check has to name the SAME set, or the next thing they
     // try contradicts the sentence that sent them there.
     return "not a name this viewer reads (" + openImagesFilter() + " *.vsession)"

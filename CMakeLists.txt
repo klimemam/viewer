@@ -1227,6 +1227,9 @@ viewer_selftest(abstats-nogl NOGL --abstats-selftest tools/testdata/multi
 viewer_selftest(range       NOGL --range-selftest tools/testdata/multi)
 viewer_selftest(close       NOGL --close-selftest tools/testdata/multi)
 viewer_selftest(batch       NOGL --batch-selftest tools/testdata/multi)
+# #307: File > Open Session... / Recent Sessions / Open...'s first filter. It
+# writes prefs.txt (Recent persists at once) and puts the bytes back.
+viewer_selftest(sessiondoor NOGL --sessiondoor-selftest tools/testdata/multi)
 viewer_selftest(picker      NOGL --picker-selftest tools/testdata/abset)
 # The ROI row probe: real frames with an injected cursor, asserting on where the
 # rows the panel laid out actually are - the delete button's rect and the clicks
