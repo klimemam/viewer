@@ -8,6 +8,9 @@
   #define WIN32_LEAN_AND_MEAN
   #define NOMINMAX
   #include <windows.h>               // GL/gl.h needs APIENTRY/WINGDIAPI
+  #include <shellapi.h>              // CommandLineToArgvW - board 333 §1.
+                                     // Named here because WIN32_LEAN_AND_MEAN
+                                     // above leaves it out of windows.h.
   #include <GL/gl.h>
 #else
   #include <GL/gl.h>
@@ -810,6 +813,44 @@ static void migrateLayoutIni(const std::string& iniPath) {
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
+    // ---- THE ARGUMENTS, RE-READ AS UTF-16 (board 333 §1) -------------------
+    // FIRST, before anything at all looks at argv - including the --serve scan
+    // below, which is why this block is above it.
+    //
+    // The parameters themselves are reassigned, so the several dozen
+    // `strcmp(argv[i], ...)` calls in this function and the whole of parseCli
+    // are untouched: they go on comparing ASCII flag names, and the only thing
+    // that changed is that a PATH among those arguments is now UTF-8 instead of
+    // the active code page. One conversion, one place.
+    //
+    // The storage is a local of main(), which is exactly the lifetime the
+    // replacement needs: argv is used for as long as main runs and never after.
+    std::vector<std::string> wArgs;
+    std::vector<char*> wArgv;
+    {
+        if (winArgvFromCommandLine(GetCommandLineW(), wArgs) && !wArgs.empty()) {
+            // Built only after wArgs has stopped growing: these are pointers
+            // INTO its elements, and a reallocation would dangle every one.
+            wArgv.reserve(wArgs.size() + 1);
+            for (std::string& s : wArgs) wArgv.push_back(s.data());
+            wArgv.push_back(nullptr);          // argv is NULL-terminated
+            argc = (int)wArgs.size();
+            argv = wArgv.data();
+        } else {
+            // NOT fatal: the narrow argv still names the flags correctly, and
+            // an ASCII-only command line - which is most of them - is
+            // identical either way. But it is not silent, because the failure
+            // mode it leaves behind is the one this whole change is about.
+            //
+            // stderr, not a toast: this runs before there is a window, and on
+            // the --serve path there must never be a window. stderr is also
+            // where the "ui scale:" and "font atlas:" lines go, so a report
+            // from a user's machine carries all three together.
+            fprintf(stderr, "argv: could not re-read the command line as UTF-16 "
+                            "- non-ASCII paths on the command line may not "
+                            "resolve on a machine whose code page is not UTF-8\n");
+        }
+    }
     {
         // --serve is the exception: its stdin/stdout are the protocol, and it is
         // started by ssh, never by a person clicking something.
@@ -970,7 +1011,24 @@ int main(int argc, char** argv) {
     bool benchPanels = benchFrames > 0;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--bench-panels")) benchPanels = true;
+    // ---- WHERE THIS BINARY IS (board 333 §3) -------------------------------
+    // argv[0] is whatever the shell typed: ACP-encoded on Windows, and
+    // RELATIVE if that is how it was invoked - so it stops being a valid path
+    // the moment anything changes the working directory. selfExePath()'s own
+    // comment has admitted the second half for as long as it has existed
+    // ("argv[0]: right unless the cwd changed"), and what this value is used
+    // for is finding `viewer-serve` NEXT TO the binary (open_dispatch.inc), so
+    // a wrong answer here is the same family of failure as the user's
+    // "viewer-serve does not get replaced" report.
+    //
+    // Windows only, on purpose: on POSIX argv[0] is already in the filesystem's
+    // own encoding and there is no encoding bug to fix. The relative-path half
+    // is left alone there too, because that is a different change and this one
+    // is about the code page.
     app.exePath = argv[0];
+#if defined(_WIN32)
+    if (std::string mod = winModulePath(); !mod.empty()) app.exePath = mod;
+#endif
     // the out-of-the-box A/B range mode, read before anything can override it:
     // --range-selftest checks it, and prefs on the machine running the test
     // would otherwise decide what "the default" is
@@ -1139,10 +1197,15 @@ int main(int argc, char** argv) {
     {
         std::error_code ec;
         std::filesystem::path cfg;
+        // board 333 §2, and the same chain as viewerConfigDir() - see there for
+        // why the variable and its order do not move. This is the SECOND copy
+        // of that lookup (layout.ini is written from here, everything else from
+        // viewerConfigDir), so both had the same encoding bug and both are
+        // fixed the same way.
 #if defined(_WIN32)
-        if (const char* ad = getenv("APPDATA")) cfg = std::filesystem::u8path(ad);
+        if (std::string ad; winEnvUtf8(L"APPDATA", ad)) cfg = pathFromUtf8(ad);
 #else
-        if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
+        if (const char* hm = getenv("HOME")) cfg = pathFromUtf8(hm) / ".config";
 #endif
         // scripted runs (selftest, bench, --no-window) must neither read nor
         // write the user's layout - same rule the exit path applies to
@@ -2265,13 +2328,21 @@ static bool g_watchSuppressed = false;
         if (!I.b.connected && I.b.host.empty() && I.b.dir == "~") {
             std::string place = app.rbRecents.empty() ? std::string() : app.rbRecents.front();
             if (place.empty()) {
+                // board 333 §2 one more time, and this site has a second
+                // reason to care: the value becomes a `local://` URL that the
+                // Browse panel then lists. A profile directory with a Japanese
+                // name (C:\Users\表示) produced a URL with a stray separator in
+                // the middle of the name, so the panel opened on nothing at
+                // all. USERPROFILE is still the variable asked, on purpose.
+                std::string hp;
 #if defined(_WIN32)
-                const char* h = getenv("USERPROFILE");
+                const bool haveHome = winEnvUtf8(L"USERPROFILE", hp);
 #else
                 const char* h = getenv("HOME");
+                const bool haveHome = h && *h;
+                if (haveHome) hp = h;
 #endif
-                if (h && *h) {
-                    std::string hp = h;
+                if (haveHome && !hp.empty()) {
                     std::replace(hp.begin(), hp.end(), '\\', '/');
                     place = "local://" + hp;
                 }

@@ -881,10 +881,20 @@ static bool g_secondary = false;
 static std::string viewerConfigDir() {
     std::error_code ec;
     std::filesystem::path cfg;
+    // board 333 §2: the VALUE comes from the wide API because getenv() hands
+    // back the active code page, and this path then goes into every file the
+    // program owns - prefs.txt, settings.jsonc, layout.ini, the autosaves. A
+    // user profile called C:\Users\表示 made all of them land somewhere else,
+    // or nowhere, because 表's second byte in cp932 IS a backslash.
+    //
+    // WHICH VARIABLE is asked, and in what order, is deliberately unchanged:
+    // this is an encoding fix, and moving the directory would move every
+    // existing user's settings without telling them. pathFromUtf8 rather than
+    // u8path for the same reason it is used everywhere else.
 #if defined(_WIN32)
-    if (const char* ad = getenv("APPDATA")) cfg = std::filesystem::u8path(ad);
+    if (std::string ad; winEnvUtf8(L"APPDATA", ad)) cfg = pathFromUtf8(ad);
 #else
-    if (const char* hm = getenv("HOME")) cfg = std::filesystem::u8path(hm) / ".config";
+    if (const char* hm = getenv("HOME")) cfg = pathFromUtf8(hm) / ".config";
 #endif
     if (cfg.empty()) return {};
     cfg /= "viewer";
@@ -2551,15 +2561,20 @@ static std::string readerCommandLine(const std::string& src, const std::string& 
 // --newwin-selftest can assert the exact command line without starting one.
 static std::string selfExePath() {
 #if defined(_WIN32)
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) return std::filesystem::path(buf).u8string();
+    // board 333 §3: winModulePath() grows its buffer instead of giving up at
+    // MAX_PATH, which this used to do silently - a binary under a long profile
+    // path then fell through to argv[0] on a machine where argv[0] is exactly
+    // what cannot be trusted.
+    if (std::string mod = winModulePath(); !mod.empty()) return mod;
 #else
     char buf[4096];                    // Windows-primary; keep the Linux path built
     ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
     if (n > 0) { buf[n] = 0; return buf; }
 #endif
-    return app.exePath;                // argv[0]: right unless the cwd changed
+    // The last resort. On Windows app.exePath is GetModuleFileNameW's answer
+    // too (main() sets it), so reaching here means both calls failed; on POSIX
+    // it is argv[0], which is right unless the cwd changed.
+    return app.exePath;
 }
 
 // The command line that makes "the same image look the same" in the child:

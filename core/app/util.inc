@@ -2,6 +2,144 @@
 // ---------------------------------------------------------------- utilities
 // (pathFromUtf8 は P6 で app/state.h へ: state.h の自己完結が要求する。この断片は
 //  state.h の後に include されるので、以下の関数からは従来どおり見える。)
+
+// ---- WINDOWS: THE COMMAND LINE AND THE ENVIRONMENT ARE UTF-16 (board 333) --
+// A narrow `main(int, char**)` on Windows is handed its arguments in the
+// process's ACTIVE CODE PAGE, and so is getenv(). Everything downstream of
+// them in this program treats a std::string path as UTF-8 - pathFromUtf8 is
+// literally u8path - so on any machine whose ACP is not UTF-8 the bytes are
+// reinterpreted as a different encoding the moment they are used.
+//
+// THE CHARACTER THAT PROVES IT is 表 (U+8868). In cp932 - the ACP of a
+// Japanese Windows - it is the two bytes 0x95 0x5C, and 0x5C is the byte for a
+// backslash. So `C:\data\表\a.npy` does not merely come out looking wrong: the
+// second byte of 表 becomes A PATH SEPARATOR, the name splits in two, and what
+// the program then looks for is a directory that was never there. That is why
+// the report is "the file does not open" rather than "the name looks odd", and
+// it is why this is a correctness bug and not a cosmetic one.
+//
+// WHAT WAS DELIBERATELY NOT DONE (board 333's own ruling):
+//  - NOT `wmain`. MinGW needs -municode for it, so the link line changes and
+//    the entry point differs between the two Windows toolchains this repo
+//    actually uses. One entry point on three platforms is worth more.
+//  - NOT an `activeCodePage` manifest. It puts a floor at Windows 10 1903 and
+//    changes the meaning of every narrow API in the process at once.
+//  - CommandLineToArgvW sets no OS floor, changes neither the link line nor
+//    the entry point, and puts the conversion in ONE place.
+#if defined(_WIN32)
+// UTF-16 -> UTF-8. `wlen` is -1 for a NUL-terminated string, or an explicit
+// length in wchar_t. No WC_ERR_INVALID_CHARS: an unpaired surrogate becomes
+// U+FFFD rather than failing the whole conversion, because what is being
+// converted is a NAME and a name that cannot be fully represented is still
+// worth carrying (and reporting) rather than dropping.
+static std::string wideToUtf8(const wchar_t* w, int wlen = -1) {
+    if (!w) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, wlen, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    // With wlen == -1 the count includes the terminating NUL; with an explicit
+    // length it does not.
+    std::string out((size_t)(wlen < 0 ? n - 1 : n), '\0');
+    if (out.empty()) return out;
+    WideCharToMultiByte(CP_UTF8, 0, w, wlen, &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+// THE SEAM (board 333 §5): a UTF-16 command line in, UTF-8 arguments out.
+// Named, and pure apart from the OS call, because a machine with a Japanese
+// ACP cannot be put in CI - so what the selftest exercises is THE CONVERSION,
+// with a command line it wrote itself, rather than the operating system.
+static bool winArgvFromCommandLine(const wchar_t* cmdline,
+                                   std::vector<std::string>& out) {
+    out.clear();
+    if (!cmdline) return false;
+    int n = 0;
+    wchar_t** wargv = CommandLineToArgvW(cmdline, &n);
+    if (!wargv) return false;
+    out.reserve((size_t)n);
+    for (int i = 0; i < n; i++) out.push_back(wideToUtf8(wargv[i]));
+    LocalFree(wargv);
+    return true;
+}
+
+// ...and the environment, from the wide API for the same reason (§2).
+// false = not set. An empty value also answers false, which is exactly what
+// getenv()'s callers here already did with it: `if (const char* v = getenv(..))`
+// followed by a path that comes out empty and is then rejected as empty. The
+// point of this function is the ENCODING; which directory gets chosen must not
+// move, so the chain each call site walks is left alone, character for
+// character.
+static bool winEnvUtf8(const wchar_t* name, std::string& out) {
+    out.clear();
+    const DWORD need = GetEnvironmentVariableW(name, nullptr, 0);
+    if (need == 0) return false;                  // not set
+    std::vector<wchar_t> buf((size_t)need);
+    const DWORD got = GetEnvironmentVariableW(name, buf.data(), need);
+    if (got == 0 || got >= need) return false;    // vanished, or raced
+    out = wideToUtf8(buf.data(), (int)got);
+    return !out.empty();
+}
+
+// ...and this process's own image path (§3), which fixes an encoding bug and a
+// correctness bug in the same line. argv[0] is what the shell happened to type,
+// so it is ACP-encoded AND relative - and selfExePath()'s own comment already
+// admitted the second half ("argv[0]: right unless the cwd changed"). What sits
+// next to this path is `viewer-serve` (open_dispatch.inc), so a wrong answer
+// here is the same family as the "viewer-serve does not get replaced" report.
+//
+// The buffer GROWS. GetModuleFileNameW truncates and reports
+// ERROR_INSUFFICIENT_BUFFER rather than telling us the size, and MAX_PATH is
+// not the limit on a modern Windows - a long path under a deep profile
+// directory really does exceed it.
+static std::string winModulePath() {
+    std::vector<wchar_t> buf(MAX_PATH);
+    for (int tries = 0; tries < 8; tries++) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
+        if (n == 0) return {};                            // no answer at all
+        if (n < buf.size() && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+            return wideToUtf8(buf.data(), (int)n);
+        buf.resize(buf.size() * 2);
+    }
+    return {};
+}
+#endif  // _WIN32
+
+// Is this byte string well-formed UTF-8? (board 333 §4.) Needed because a
+// machine that ran an EARLIER build has already written ACP bytes into its
+// prefs.txt and its .vsession, and those files outlive this fix. Such a line
+// cannot be repaired - working out which code page it was is guesswork, and
+// guessing at a path is how you open the wrong file - so it is REFUSED and
+// named. This is the test for "is this one of those".
+//
+// Overlong forms, encoded surrogates and values above U+10FFFF are ill-formed
+// even though their byte patterns look correct, so the check is on the VALUE
+// and not only on the shape.
+static bool utf8IsValid(const std::string& s) {
+    const unsigned char* p = (const unsigned char*)s.data();
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = p[i];
+        if (c < 0x80) { i++; continue; }
+        int need = 0;
+        uint32_t cp = 0;
+        if (c >= 0xC2 && c <= 0xDF)      { need = 1; cp = c & 0x1Fu; }
+        else if (c >= 0xE0 && c <= 0xEF) { need = 2; cp = c & 0x0Fu; }
+        else if (c >= 0xF0 && c <= 0xF4) { need = 3; cp = c & 0x07u; }
+        else return false;               // 0x80..0xC1 and 0xF5..0xFF start nothing
+        if (i + (size_t)need >= n) return false;          // truncated
+        for (int k = 1; k <= need; k++) {
+            const unsigned char cc = p[i + k];
+            if (cc < 0x80 || cc > 0xBF) return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000) ||
+            (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+            return false;
+        i += (size_t)need + 1;
+    }
+    return true;
+}
 static std::string jpFontPath() {
     static const char* candidates[] = {
 #if defined(_WIN32)
