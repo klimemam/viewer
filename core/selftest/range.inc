@@ -1491,6 +1491,14 @@
             ok(f0->black == 1.0f && f0->white == 2.0f && f2->black == 1.0f && f2->white == 2.0f &&
                !f0->texDirty && !f2->texDirty,
                "...and on that frame only: the siblings are not written or redrawn");
+            // ...and it is a write on THAT frame, not a declaration about the
+            // stack: under "each frame fits itself" the stack's rule stays
+            app.rangeRule = RR_EachFrame;
+            setRange(*f1, 10.0f, 20.0f);
+            ok(app.rangeRule == RR_EachFrame && f1->black == 10.0f && f0->black == 1.0f,
+               "a write on the excepted frame leaves the stack's rule alone (each frame fits itself stays)");
+            app.rangeRule = RR_OneRange;
+            setRange(*f1, 0.0f, 255.0f);
             setRange(*f0, 5.0f, 6.0f);
             ok(f2->black == 5.0f && f2->white == 6.0f && f1->black == 0.0f && f1->white == 255.0f,
                "a write on the stack skips the frame that keeps its own");
