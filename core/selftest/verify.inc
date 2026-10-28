@@ -1597,16 +1597,17 @@
             }
             // (c) the matching 1-D member becomes the axis, EXACTLY
             App::SeqInfo* v21si = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
-            bool axOk = v21si && v21si->axisVals.size() == 4 &&
-                        v21si->axisVals[3] == 12345.678901234567 &&
-                        v21si->axisName == "exposure_ms" && v21si->axisUnit == "ms";
+            const App::NamedAxis* v21a = v21si && !v21si->axes.empty() ? &v21si->axes.front()
+                                                                        : nullptr;
+            bool axOk = v21a && v21a->vals.size() == 4 &&
+                        v21a->vals[3] == 12345.678901234567 &&
+                        v21a->name == "exposure_ms" && v21a->unit == "ms";
             fprintf(stderr, "verifyselftest: V21 axis: %d value(s) '%s' [%s], last=%s\n",
-                    v21si ? (int)v21si->axisVals.size() : -1,
-                    v21si ? v21si->axisName.c_str() : "-",
-                    v21si ? v21si->axisUnit.c_str() : "-",
-                    v21si && !v21si->axisVals.empty() ? fmtExact(v21si->axisVals.back()).c_str()
-                                                      : "-");
-            check(axOk, "V21 the matching 1-D member lands in axisVals exactly");
+                    v21a ? (int)v21a->vals.size() : -1,
+                    v21a ? v21a->name.c_str() : "-",
+                    v21a ? v21a->unit.c_str() : "-",
+                    v21a && !v21a->vals.empty() ? fmtExact(v21a->vals.back()).c_str() : "-");
+            check(axOk, "V21 the matching 1-D member lands in the stack's axes exactly");
             // (d) counts BOTH directions, by name, never silent
             std::string v21msg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
             bool said = v21msg.find("exposure_ms") != std::string::npos &&
@@ -1623,9 +1624,9 @@
             bool member = false;
             for (const auto& d : app.images) if (d->src->member == "data") member = true;
             App::SeqInfo* v21r = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
-            bool raxOk = v21r && v21r->axisVals.size() == 4 &&
-                         v21r->axisVals[3] == 12345.678901234567 &&
-                         v21r->axisName == "exposure_ms" && v21r->axisUnit == "ms";
+            const App::NamedAxis* v21ra = v21r ? v21r->axis("exposure_ms") : nullptr;
+            bool raxOk = v21ra && v21r->axes.size() == 1 && v21ra->vals.size() == 4 &&
+                         v21ra->vals[3] == 12345.678901234567 && v21ra->unit == "ms";
             fprintf(stderr, "verifyselftest: V21 after restore: %zu image(s), member=%d, "
                             "axis=%d%s\n", app.images.size(), (int)member, (int)raxOk,
                     v21lerr.empty() ? "" : (" load err: " + v21lerr).c_str());
@@ -1696,9 +1697,9 @@
             npzPickAccept();
             App::SeqInfo* spSi = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
             std::string spMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
-            fprintf(stderr, "verifyselftest: V21d blank unit: axisVals=%d \"%s\"\n",
-                    spSi ? (int)spSi->axisVals.size() : -1, spMsg.c_str());
-            check(spSi && spSi->axisVals.empty(),
+            fprintf(stderr, "verifyselftest: V21d blank unit: axes=%d \"%s\"\n",
+                    spSi ? (int)spSi->axes.size() : -1, spMsg.c_str());
+            check(spSi && spSi->axes.empty(),
                   "V21d a whitespace unit is refused from the npz path too");
             // ...and the pasted path still refuses it, so the two agree
             {
@@ -2243,7 +2244,7 @@
                         s.members.size() < 2 ? -1 : s.members[1].value);
             }
             for (const auto& sq : app.seqs)
-                if (sq.axisName == "exposure") condOffStacks = false;
+                if (sq.axis("exposure")) condOffStacks = false;
             check(condOk, "V25b the conditions land on the series, with name and unit");
             check(condOffStacks, "V25b the conditions are NOT copied onto the stacks");
 
@@ -2251,9 +2252,9 @@
             // the paste path and the .npz picker write, or the panels see nothing
             bool tsOk = false;
             for (const auto& sq : app.seqs)
-                if (sq.axisVals.size() == 3 && sq.axisName == "time" && sq.axisUnit == "s" &&
-                    sq.axisVals[1] == 0.5)
-                    tsOk = true;
+                if (const App::NamedAxis* t = sq.axis("time"))
+                    if (t->vals.size() == 3 && t->unit == "s" && t->vals[1] == 0.5)
+                        tsOk = true;
             check(tsOk, "V25c timestamps land on the stack as its frame axis");
 
             bool cfaOk = false, noteOk = false;
@@ -2319,6 +2320,203 @@
                 fprintf(stderr, "verifyselftest: V25g broken: err=\"%s\"\n", berr.c_str());
                 check(!berr.empty() && berr.find("__layer_2") != std::string::npos,
                       "V25g a malformed container names the member that is wrong");
+            }
+
+            // V25z (#314, input-adapters.md §4.5): a STACK's covariates -
+            // quantities observed per frame, the setting unchanged - are
+            // further named axes of that stack, after its timestamps. ONE key
+            // per node: __covariates_values_<i> is (F,) for one or (F, K) for
+            // K, and _name_ / _unit_ a 0-D string or a K-long string array. A
+            // mismatched K or a row count that is not the frame count is said
+            // on the frames and nothing of it applied. A CONDITION on a stack
+            // node is not a covariate and never becomes an axis.
+            {
+                auto strsNpy = [&](const std::vector<std::string>& l) {
+                    size_t item = 1;
+                    for (const auto& s : l) item = std::max(item, s.size());
+                    std::vector<uint32_t> cps(item * l.size(), 0);
+                    for (size_t k = 0; k < l.size(); k++)
+                        for (size_t c = 0; c < l[k].size(); c++)
+                            cps[k * item + c] = (uint32_t)(unsigned char)l[k][c];
+                    return npyBytes(("<U" + std::to_string(item)).c_str(),
+                                    { (int64_t)l.size() }, cps.data(), cps.size() * 4);
+                };
+                auto f64Npy2 = [&](const std::vector<double>& v, int64_t r, int64_t c) {
+                    return npyBytes("<f8", { r, c }, v.data(), v.size() * 8);
+                };
+                // node 1 (stack e1) has 3 frames and timestamps "time"
+                auto openWith = [&](const char* tag,
+                                    std::vector<std::pair<std::string, std::vector<uint8_t>>> extra) {
+                    std::vector<std::pair<std::string, std::vector<uint8_t>>> km = cm;
+                    for (auto& e : extra) km.push_back(std::move(e));
+                    std::string kpath = (adir / (std::string("cov_") + tag + ".npz")).u8string();
+                    writeNpz2(kpath, km);
+                    closeAll();
+                    return loadNpz(kpath);
+                };
+                auto e1Of = [&]() -> App::SeqInfo* {
+                    for (auto& sq : app.seqs) if (sq.axis("time") || sq.axis("elapsed"))
+                        return seqInfo(sq.id);
+                    return nullptr;
+                };
+                auto saidOnFrames = [&](const std::string& what) {
+                    for (const auto& d : app.images)
+                        if (d->note.find(what) != std::string::npos) return true;
+                    return false;
+                };
+                auto axesOf = [&](const App::SeqInfo* s) {
+                    std::string names;
+                    if (s) for (const auto& a : s->axes) names += a.name + "[" + a.unit + "] ";
+                    return names;
+                };
+                const std::vector<std::pair<std::string, std::vector<uint8_t>>> cov2 = {
+                    { "__covariates_values_1", f64Npy2({ 25.0, 100.0,  30.5, 101.0,
+                                                         41.25, 99.5 }, 3, 2) },
+                    { "__covariates_name_1",   strsNpy({ "temperature", "illuminance" }) },
+                    { "__covariates_unit_1",   strsNpy({ "C", "lx" }) } };
+
+                // (F, 2): timestamps + two covariates = three axes, in order
+                std::string kerr = openWith("f2", cov2);
+                App::SeqInfo* e1 = e1Of();
+                fprintf(stderr, "verifyselftest: V25z (F,2): err=\"%s\" %s\n", kerr.c_str(),
+                        axesOf(e1).c_str());
+                const App::NamedAxis* te = e1 ? e1->axis("temperature") : nullptr;
+                const App::NamedAxis* il = e1 ? e1->axis("illuminance") : nullptr;
+                check(kerr.empty() && e1 && e1->axes.size() == 3 &&
+                      e1->axes[0].name == "time" && e1->axes[1].name == "temperature" &&
+                      e1->axes[2].name == "illuminance",
+                      "V25z timestamps + an (F,2) covariate = three named axes, in order");
+                check(te && te->unit == "C" && te->vals.size() == 3 && te->vals[1] == 30.5 &&
+                      te->vals[2] == 41.25 && il && il->unit == "lx" && il->vals.size() == 3 &&
+                      il->vals[1] == 101.0 && il->vals[2] == 99.5,
+                      "V25z ...each column its own name, unit and values, exactly");
+                bool seriesOff = true;
+                for (const auto& sq : app.seqs) if (sq.axis("exposure")) seriesOff = false;
+                check(seriesOff, "V25z the series' condition stays off the stacks");
+
+                // P2-1: a session's axes REPLACE the file's for that stack -
+                // the default stays the session's and a removed axis stays gone
+                if (e1) {
+                    std::string sess = (adir / "cov_axes.vsession").u8string();
+                    e1->dropAxis("time");
+                    e1->putAxis({ "elapsed", "s", { 0.0, 0.5, 1.0 } });  // [temperature, illuminance, elapsed]
+                    e1->dropAxis("illuminance");
+                    e1->dropAxis("temperature");                          // [elapsed]: one axis
+                    saveSession(sess, true);
+                    std::string serr = loadSession(sess);
+                    loadAll();
+                    App::SeqInfo* r1 = e1Of();
+                    fprintf(stderr, "verifyselftest: V25z one-axis session: err=\"%s\" %s\n",
+                            serr.c_str(), axesOf(r1).c_str());
+                    check(serr.empty() && r1 && r1->axes.size() == 1 &&
+                          r1->axes[0].name == "elapsed",
+                          "V25z a one-axis session's axis is the stack's axis again - the "
+                          "file's time and covariates do not come back");
+                    if ((r1 = e1Of())) {
+                        r1->putAxis({ "temperature", "C", { 1.0, 2.0, 3.0 } });   // [elapsed, temperature]
+                        saveSession(sess, true);
+                        serr = loadSession(sess);
+                        loadAll();
+                        r1 = e1Of();
+                        fprintf(stderr, "verifyselftest: V25z two-axis session: err=\"%s\" %s\n",
+                                serr.c_str(), axesOf(r1).c_str());
+                        check(serr.empty() && r1 && r1->axes.size() == 2 &&
+                              r1->axes[0].name == "elapsed" &&
+                              r1->axes[1].name == "temperature" && !r1->axis("time") &&
+                              r1->axes[1].vals[2] == 3.0,
+                              "V25z a removed time stays removed; the session's order and "
+                              "values win over the file's");
+                    }
+                    std::error_code ec2;
+                    std::filesystem::remove(std::filesystem::u8path(sess), ec2);
+                }
+
+                // (F, 1): a 2-D array of one column is one covariate
+                kerr = openWith("f1", {
+                    { "__covariates_values_1", f64Npy2({ 25.0, 30.5, 41.25 }, 3, 1) },
+                    { "__covariates_name_1",   strsNpy({ "temperature" }) },
+                    { "__covariates_unit_1",   strsNpy({ "C" }) } });
+                e1 = e1Of();
+                te = e1 ? e1->axis("temperature") : nullptr;
+                check(kerr.empty() && e1 && e1->axes.size() == 2 && te && te->unit == "C" &&
+                      te->vals.size() == 3 && te->vals[2] == 41.25,
+                      "V25z an (F,1) array is one covariate");
+
+                // K mismatch: two value columns, one name - noted, none applied
+                kerr = openWith("kmis", {
+                    { "__covariates_values_1", f64Npy2({ 25.0, 0.0,  30.5, 6.0,  41.25, 12.0 },
+                                                       3, 2) },
+                    { "__covariates_name_1",   strsNpy({ "temperature" }) },
+                    { "__covariates_unit_1",   strsNpy({ "C", "dB" }) } });
+                e1 = e1Of();
+                fprintf(stderr, "verifyselftest: V25z K mismatch: err=\"%s\" %s\n",
+                        kerr.c_str(), axesOf(e1).c_str());
+                check(kerr.empty() && e1 && e1->axes.size() == 1 &&
+                      saidOnFrames("__covariates_name_1 names 1 covariate(s) for 2 value "
+                                   "column(s) - not applied"),
+                      "V25z a K mismatch between values and names is said, and nothing applied");
+
+                // rows != frames: (2, 2) on a 3-frame stack - noted, none applied
+                kerr = openWith("rmis", {
+                    { "__covariates_values_1", f64Npy2({ 25.0, 0.0,  30.5, 6.0 }, 2, 2) },
+                    { "__covariates_name_1",   strsNpy({ "temperature", "gain" }) },
+                    { "__covariates_unit_1",   strsNpy({ "C", "dB" }) } });
+                e1 = e1Of();
+                check(kerr.empty() && e1 && e1->axes.size() == 1 &&
+                      saidOnFrames("__covariates_values_1 has 2 row(s) but the stack has 3 "
+                                   "frame(s)"),
+                      "V25z a row count that is not the frame count is said, and nothing applied");
+
+                // a covariate named like the timestamps ("Time ") collides:
+                // said, not applied - two axes cannot answer to one name
+                kerr = openWith("clash", {
+                    { "__covariates_values_1", f64Npy2({ 9.0, 25.0,  8.0, 30.5,  7.0, 41.25 },
+                                                       3, 2) },
+                    { "__covariates_name_1",   strsNpy({ "Time ", "temperature" }) },
+                    { "__covariates_unit_1",   strsNpy({ "s", "C" }) } });
+                e1 = e1Of();
+                const App::NamedAxis* tm = e1 ? e1->axis("TIME") : nullptr;
+                check(kerr.empty() && e1 && e1->axes.size() == 2 && tm && tm->vals[0] == 0.0 &&
+                      e1->axis("temperature") &&
+                      saidOnFrames("covariate \"Time \" has the name of an axis this stack "
+                                   "already has - not applied"),
+                      "V25z a covariate named like an existing axis (blanks / case aside) is "
+                      "said, not applied");
+
+                // a CONDITION on the stack node is not a covariate: no axis
+                kerr = openWith("stackcond", {
+                    { "__conditions_values_1", f64Npy({ 25.0, 30.5, 41.25 }) },
+                    { "__conditions_name_1",   strNpy("temperature") },
+                    { "__conditions_unit_1",   strNpy("C") } });
+                e1 = e1Of();
+                check(kerr.empty() && e1 && e1->axes.size() == 1 && !e1->axis("temperature"),
+                      "V25z a condition on a stack node does not become an axis (§4.5)");
+
+                // ...and the stream carrier says (F, K) in its own words: K on a
+                // line, a name / unit line per column, the values row-major -
+                // exactly what run_adapter.py stream_out writes
+                {
+                    std::istringstream hs(
+                        "VIEWERSTREAM 3\nn 1\nlayer 0 stack\nparent 0 -1\n"
+                        "covariates_cols 0 2\ncovariates_name_at 0 0 temperature\n"
+                        "covariates_unit_at 0 0 C\ncovariates_name_at 0 1 illuminance\n"
+                        "covariates_unit_at 0 1 lx\ncovariates 0 4 25.0 100.0 30.5 101.0\nend\n");
+                    int sver = 0, sn = 0;
+                    std::vector<VnzNode> snodes;
+                    std::vector<VnzBlob> sblobs;
+                    std::vector<std::pair<std::string, std::string>> smeta;
+                    vnsParseHeader(hs, sver, snodes, sn, sblobs, smeta);
+                    std::vector<VnzCovariate> sc;
+                    std::string serr = snodes.size() == 1 ? vnzCovariates(snodes[0], 0, 2, sc)
+                                                          : std::string("no node");
+                    fprintf(stderr, "verifyselftest: V25z stream (F,K): err=\"%s\" cols=%zu\n",
+                            serr.c_str(), sc.size());
+                    check(serr.empty() && sc.size() == 2 && sc[0].name == "temperature" &&
+                          sc[0].unit == "C" && sc[1].name == "illuminance" && sc[1].unit == "lx" &&
+                          sc[0].vals == std::vector<double>({ 25.0, 30.5 }) &&
+                          sc[1].vals == std::vector<double>({ 100.0, 101.0 }),
+                          "V25z the stream's covariates_cols carries the same K columns");
+                }
             }
 
             // ---- V25h/V25i: the harness, and the cache around it -------------

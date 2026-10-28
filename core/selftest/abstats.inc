@@ -959,6 +959,146 @@
             check(g_tchart.plotted && ptsOf('A') >= 2 && temporalChartVisible(),
                   "T4 compare off: the one-sided chart is drawn and fits");
 
+            // T7 (#314): several charts in the one panel, each on its own x
+            // with its own zoom. A carries two named axes - exposure FIRST, so
+            // a chart that ignored its own choice and fell to the default
+            // would plot exposure where time was asked for.
+            {
+                const std::vector<App::TemporalChart> chartsBefore = app.tcharts;
+                App::SeqInfo* sa = seqInfo(sidA);
+                App::SeqInfo* sb = seqInfo(sidB);
+                const std::vector<App::NamedAxis> axA = sa ? sa->axes : std::vector<App::NamedAxis>{};
+                const std::vector<App::NamedAxis> axB = sb ? sb->axes : std::vector<App::NamedAxis>{};
+                const int expA = sa ? sa->expectedFrames : 0;
+                const int nA = (int)framesOfSeq(sidA).size();
+                std::vector<double> tVals, eVals;
+                for (int k = 0; k < nA; k++) { tVals.push_back(10.0 * k); eVals.push_back(1.0 + k); }
+                if (sa) {
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", eVals });
+                    sa->putAxis({ "time", "s", tVals });
+                }
+                if (sb) sb->axes.clear();
+                auto xsAre = [&](int ci, const std::vector<double>& want) {
+                    const TemporalChartProbe::Chart& p = g_tchart.ch[ci];
+                    if (p.nX != (int)want.size()) return false;
+                    for (int k = 0; k < p.nX; k++)
+                        if (fabs(p.xs[k] - want[(size_t)k]) > 1e-4) return false;
+                    return true;
+                };
+                std::vector<double> idxVals;
+                for (int k = 0; k < nA; k++) idxVals.push_back(k);
+                auto chartLine = [&](const char* tag) {
+                    for (int ci = 0; ci < g_tchart.nCharts; ci++) {
+                        const TemporalChartProbe::Chart& p = g_tchart.ch[ci];
+                        fprintf(stderr, "abstatsselftest: %s chart %d: plotted=%d custom=%d "
+                                        "x '%s' [%.4g..%.4g] zoomed=%d fellBack=%d lent=%d "
+                                        "canRemove=%d nX=%d x1=%.4g y %.1f..%.1f\n", tag, ci,
+                                p.plotted ? 1 : 0, p.custom ? 1 : 0, p.xlabel, p.xmin, p.xmax,
+                                p.zoomed ? 1 : 0, p.fellBack ? 1 : 0, p.lent ? 1 : 0,
+                                p.canRemove ? 1 : 0, p.nX, p.nX > 1 ? p.xs[1] : -1.0f,
+                                p.top, p.bot);
+                    }
+                };
+
+                // T7a: one stack, two charts - frame index above, time below
+                app.compareMode = App::CmpOff;
+                abStatsFrame();
+                selectImage(frA.front());
+                app.tcharts.assign(2, App::TemporalChart{});
+                app.tcharts[0].xKind = App::TemporalChart::XFrame;
+                app.tcharts[1].xKind = App::TemporalChart::XNamed;
+                app.tcharts[1].xName = "time";
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7a");
+                check(g_tchart.nCharts == 2 && g_tchart.ch[0].plotted && g_tchart.ch[1].plotted,
+                      "T7a two charts in the one panel, both drawn");
+                check(!g_tchart.ch[0].custom && xsAre(0, idxVals) &&
+                      std::string(g_tchart.ch[0].xlabel) == "frame number (index in stack)",
+                      "T7a ...the first on the frame index: its x are the frame numbers");
+                check(g_tchart.ch[1].custom && xsAre(1, tVals) &&
+                      std::string(g_tchart.ch[1].xlabel) == "time (s)",
+                      "T7a ...the second on the axis IT chose (time, not the default exposure)");
+                check(g_tchart.ch[0].bot <= g_tchart.ch[1].top && temporalChartVisible(),
+                      "T7a ...stacked top to bottom, and both inside the panel");
+                check(g_tchart.ch[0].canRemove && g_tchart.ch[1].canRemove,
+                      "T7a ...each with a live remove button");
+
+                // T7b: zoom one chart - the other keeps its whole range
+                app.tcharts[1].zoomOn = true;
+                app.tcharts[1].zx0 = 10.0f; app.tcharts[1].zx1 = 20.0f;
+                app.tcharts[1].zy0 = -1e6f; app.tcharts[1].zy1 = 1e6f;
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7b");
+                check(g_tchart.ch[1].zoomed && fabsf(g_tchart.ch[1].xmin - 10.0f) < 1e-3f &&
+                      fabsf(g_tchart.ch[1].xmax - 20.0f) < 1e-3f,
+                      "T7b a zoomed chart draws its own zoom range");
+                check(!g_tchart.ch[0].zoomed && fabsf(g_tchart.ch[0].xmin) < 1e-3f &&
+                      fabsf(g_tchart.ch[0].xmax - (float)(nA - 1)) < 1e-3f,
+                      "T7b ...and the other chart is NOT zoomed: zoom is per chart");
+
+                // T7c: remove the first; the last one cannot go
+                bool rm1 = tchartRemove(0);
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7c");
+                check(rm1 && app.tcharts.size() == 1 && g_tchart.nCharts == 1 &&
+                      g_tchart.ch[0].custom && xsAre(0, tVals),
+                      "T7c remove takes that chart away; the other stays as it was");
+                bool rm2 = tchartRemove(0);
+                check(!rm2 && app.tcharts.size() == 1 && !g_tchart.ch[0].canRemove,
+                      "T7c the last chart cannot be removed (its button is dead)");
+                // "+ chart" picks an axis no chart shows yet
+                tchartAdd({ "exposure", "time" }, "exposure");
+                check(app.tcharts.size() == 2 &&
+                      app.tcharts[1].xKind == App::TemporalChart::XNamed &&
+                      app.tcharts[1].xName == "exposure",
+                      "T7c + chart opens on an axis no chart is showing");
+
+                // T7d: compare - A has time, B has none, same length: lent on
+                // the time chart, and the frame-index chart is untouched
+                app.tcharts.assign(2, App::TemporalChart{});
+                app.tcharts[0].xKind = App::TemporalChart::XFrame;
+                app.tcharts[1].xKind = App::TemporalChart::XNamed;
+                app.tcharts[1].xName = "time";
+                selectImage(frA.front());
+                setCompareB(app.images[framesOfSeq(sidB).front()].get());
+                app.compareMode = App::CmpSplit;
+                app.abStatsLayout = App::AbOverlay;
+                abStatsFrame();
+                const bool sameLen = framesOfSeq(sidB).size() == (size_t)nA;
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7d");
+                check(sameLen && g_tchart.ch[1].custom && g_tchart.ch[1].lent &&
+                      !g_tchart.ch[1].fellBack && xsAre(1, tVals),
+                      "T7d B without time, same length: the time chart lends A's and says so");
+                check(!g_tchart.ch[0].custom && !g_tchart.ch[0].lent &&
+                      !g_tchart.ch[0].fellBack && xsAre(0, idxVals),
+                      "T7d ...and the frame-index chart is not touched by it");
+                check(temporalChartVisible(), "T7d ...both compare charts inside the panel");
+
+                // T7e: A's time now covers a frame count B does not have: that
+                // chart alone falls back to frame index and says why
+                if (sa) {
+                    sa = seqInfo(sidA);
+                    sa->expectedFrames = nA + 1;
+                    std::vector<double> t2 = tVals, e2 = eVals;
+                    t2.push_back(10.0 * nA); e2.push_back(1.0 + nA);
+                    sa->axes.clear();
+                    sa->putAxis({ "exposure", "ms", e2 });
+                    sa->putAxis({ "time", "s", t2 });
+                }
+                temporalFrame(560.0f, 800.0f);
+                chartLine("T7e");
+                check(!g_tchart.ch[1].custom && g_tchart.ch[1].fellBack && xsAre(1, idxVals),
+                      "T7e different length: only that chart falls to frame index, with a notice");
+                check(g_tchart.ch[0].plotted && !g_tchart.ch[0].fellBack && xsAre(0, idxVals),
+                      "T7e ...and the other chart is unaffected");
+
+                if ((sa = seqInfo(sidA))) { sa->axes = axA; sa->expectedFrames = expA; }
+                if ((sb = seqInfo(sidB))) sb->axes = axB;
+                app.tcharts = chartsBefore;
+            }
+
             app.abStatsLayout = saveLayout;
             app.compareMode = saveMode;
             selectImage(frA.front());

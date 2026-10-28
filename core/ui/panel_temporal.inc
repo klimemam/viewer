@@ -145,8 +145,13 @@ static bool drawServerTemporal(const App::SeqInfo* si) {
     temporalClampNote(S.nPl, S.fpnClamped);
     if (!S.frameMean.empty()) {
         // the custom per-frame x axis applies to the server's series too: the
-        // mapping is by frame number, and the server's x IS the frame number
-        FrameAxis ax = frameAxisOf(si->id);
+        // mapping is by frame number, and the server's x IS the frame number.
+        // ONE chart here, on the panel's first chart's x (#314: the extra
+        // charts are the local panel's).
+        const App::TemporalChart& c0 = app.tcharts.front();
+        FrameAxis ax = c0.xKind == App::TemporalChart::XFrame ? FrameAxis{}
+                     : frameAxisOf(si->id, c0.xKind == App::TemporalChart::XNamed
+                                               ? c0.xName.c_str() : nullptr);
         if (!ax.why.empty())
             ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", ax.why.c_str());
         float mn = FLT_MAX, mx = -FLT_MAX;
@@ -335,8 +340,11 @@ static std::string trimAxisLabel(const std::string& s) {
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
+// ADDS the axis to the stack's named axes, or replaces the one of the same
+// name (#314) - never the stack's other axes. `replaced` says which happened.
 static bool applyFrameAxisVals(int seqId, const std::string& nameIn, const std::string& unitIn,
-                               std::vector<double> vals, std::string& err) {
+                               std::vector<double> vals, std::string& err,
+                               bool* replaced) {
     App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "not a stack"; return false; }
     // The trim lives HERE, not in one caller: a unit of " " is not a unit, and
@@ -359,14 +367,14 @@ static bool applyFrameAxisVals(int seqId, const std::string& nameIn, const std::
         err = b;
         return false;
     }
-    si->axisName = name;
-    si->axisUnit = unit;
-    si->axisVals = std::move(vals);
+    const bool rep = si->putAxis({ name, unit, std::move(vals) });
+    if (replaced) *replaced = rep;
     return true;
 }
 
 static bool applyFrameAxis(int seqId, const char* name, const char* unit,
-                           const std::string& text, std::string& err) {
+                           const std::string& text, std::string& err,
+                           bool* replaced = nullptr) {
     App::SeqInfo* si = seqInfo(seqId);
     if (!si) { err = "not a stack"; return false; }
     std::string nm = trimAxisLabel(name ? name : ""), un = trimAxisLabel(unit ? unit : "");
@@ -382,7 +390,7 @@ static bool applyFrameAxis(int seqId, const char* name, const char* unit,
         if (err.empty()) err = "no values";
         return false;
     }
-    return applyFrameAxisVals(seqId, nm, un, std::move(vals), err);
+    return applyFrameAxisVals(seqId, nm, un, std::move(vals), err, replaced);
 }
 
 // ---- frame-wise linearity: MIGRATED (docs/analysis-layers.md §3.3) --------
@@ -1042,45 +1050,86 @@ static void temporalExportButtons() {
 }
 
 // The "x axis..." popup: paste a comma / space / tab separated list of numbers
-// and the Temporal chart plots the per-frame curve against THAT instead of the
-// frame index - frames of a stack usually correspond to a physical quantity
-// (elapsed time, exposure, temperature), and with a real axis the drift chart
-// becomes a measurement plot. Name + unit + values, applied per STACK
-// (each stack has its own axis or none), session-saved.
+// and the Temporal charts can plot the per-frame curve against THAT instead of
+// the frame index - frames of a stack usually correspond to a physical
+// quantity (elapsed time, exposure, temperature), and with a real axis the
+// drift chart becomes a measurement plot. Name + unit + values, per STACK,
+// session-saved. A stack holds several NAMED axes (#314): Apply ADDS one, or
+// replaces the one of the same name, and the list above the fields shows what
+// the stack already carries, each with its own edit and remove. Which axis a
+// chart plots against is chosen ON that chart (its "x:"), not here.
 static void frameAxisPopupButton(ImageDoc* im) {
     if (!im || im->seqId == 0) return;
     if (ImGui::SmallButton("x axis..."))
         ImGui::OpenPopup("temporal_xaxis");
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("plot the per-frame curve against a real quantity\n"
-                          "(elapsed time, exposure, temperature...): paste one\n"
-                          "value per frame, comma / space / tab separated.\n"
-                          "Applies to THIS stack; each stack has its own axis.");
+        ImGui::SetTooltip("give THIS stack a named per-frame axis (elapsed time,\n"
+                          "exposure, temperature...): paste one value per frame,\n"
+                          "comma / space / tab separated. A stack can carry\n"
+                          "several; each chart picks its own with its x: selector.");
     static int forSeq = -1;
     static char nm[64], un[32];
     static char vbuf[16384];
     static std::string err;
+    auto seedFrom = [&](const App::NamedAxis* a) {
+        snprintf(nm, sizeof nm, "%s", a ? a->name.c_str() : "");
+        snprintf(un, sizeof un, "%s", a ? a->unit.c_str() : "");
+        std::string s;
+        if (a)
+            for (size_t i = 0; i < a->vals.size(); i++) {
+                if (i) s += ", ";
+                s += fmtExact(a->vals[i]);
+            }
+        snprintf(vbuf, sizeof vbuf, "%s", s.c_str());
+    };
     if (ImGui::BeginPopup("temporal_xaxis")) {
         App::SeqInfo* si = seqInfo(im->seqId);
-        if (forSeq != im->seqId) {          // (re)seed from the stack on open
+        if (forSeq != im->seqId) {          // (re)seed on open
             forSeq = im->seqId;
             err.clear();
-            snprintf(nm, sizeof nm, "%s", si ? si->axisName.c_str() : "");
-            snprintf(un, sizeof un, "%s", si ? si->axisUnit.c_str() : "");
-            vbuf[0] = 0;
-            if (si) {
-                std::string s;
-                for (size_t i = 0; i < si->axisVals.size(); i++) {
-                    if (i) s += ", ";
-                    s += fmtExact(si->axisVals[i]);
-                }
-                snprintf(vbuf, sizeof vbuf, "%s", s.c_str());
-            }
+            // blank - adding is what this dialog is for - EXCEPT for an axis
+            // that arrived without its unit (a .vnz timestamps member may):
+            // the values are here, so typing the unit finishes the job instead
+            // of retyping the measurements
+            const App::NamedAxis* noUnit = nullptr;
+            if (si)
+                for (const App::NamedAxis& a : si->axes)
+                    if (a.unit.empty()) { noUnit = &a; break; }
+            seedFrom(noUnit);
         }
         int n = (int)framesOfSeq(im->seqId).size();
         int N = si ? std::max(si->expectedFrames, n) : n;
-        ImGui::TextDisabled("x axis for %s: one value per frame (%d expected)",
-                            abDocLabel(im).c_str(), N);
+        ImGui::TextDisabled("x axes of %s (frame index is always there):",
+                            abDocLabel(im).c_str());
+        std::string drop;
+        if (si) {
+            if (si->axes.empty()) ImGui::TextDisabled("  (none yet)");
+            for (size_t i = 0; i < si->axes.size(); i++) {
+                const App::NamedAxis& a = si->axes[i];
+                ImGui::PushID((int)i);
+                if (a.unit.empty())
+                    ImGui::TextColored(AB_AMBER, "  %s - no unit, %d value(s)",
+                                       a.name.c_str(), (int)a.vals.size());
+                else
+                    ImGui::Text("  %s (%s), %d value(s)", a.name.c_str(), a.unit.c_str(),
+                                (int)a.vals.size());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("edit")) { seedFrom(&a); err.clear(); }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("load this axis into the fields below; Apply\n"
+                                      "under the same name replaces it");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("remove")) drop = a.name;
+                ImGui::PopID();
+            }
+        }
+        if (si && !drop.empty()) {
+            si->dropAxis(drop);
+            err.clear();
+            toast("x axis removed: " + drop);
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("add an axis: one value per frame (%d expected)", N);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
         ImGui::InputText("name", nm, sizeof nm);
         ImGui::SameLine();
@@ -1090,23 +1139,18 @@ static void frameAxisPopupButton(ImageDoc* im) {
                                   ImVec2(ImGui::GetFontSize() * 22, ImGui::GetFontSize() * 6));
         if (ImGui::Button("Apply")) {
             std::string e;
-            if (applyFrameAxis(im->seqId, nm, un, vbuf, e)) {
+            bool replaced = false;
+            if (applyFrameAxis(im->seqId, nm, un, vbuf, e, &replaced)) {
                 err.clear();
                 forSeq = -1;
-                toast("x axis applied: " + std::string(nm) + " (" + un + ")");
+                toast(std::string(replaced ? "x axis replaced: " : "x axis added: ") +
+                      trimAxisLabel(nm) + " (" + trimAxisLabel(un) + ")");
                 ImGui::CloseCurrentPopup();
             } else err = e;
         }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!si || si->axisVals.empty());
-        if (ImGui::Button("Clear")) {
-            if (si) { si->axisName.clear(); si->axisUnit.clear(); si->axisVals.clear(); }
-            err.clear();
-            forSeq = -1;
-            toast("x axis cleared: frame index");
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("adds the axis to this stack - or replaces the one of\n"
+                              "the same name; the stack's other axes stay");
         if (!err.empty()) {
             ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26);
             ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", err.c_str());
@@ -1126,15 +1170,30 @@ static void frameAxisPopupButton(ImageDoc* im) {
 // report this probe exists to catch.
 struct TemporalChartProbe {
     bool ran = false;            // the chart block was reached at all
-    bool plotted = false;        // beginPlot returned a usable rect
+    bool plotted = false;        // beginPlot returned a usable rect (any chart)
     bool sideBySide = false;
     float availBefore = 0;       // content height left when the chart block began
-    float plotTop = 0, plotBot = 0, winBot = 0;
+    float plotTop = 0, plotBot = 0, winBot = 0;   // top of the first, bottom of the last
     int nSlots = 0;              // slots the panel considered (A, B, C, ...)
     char slot[16] = {};          // 'A', 'B', 'C', ...
     int pts[16] = {};            // points stroked for that slot (0 = no curve)
     int nNoAxis = 0;             // slots that have no time axis and SAID so
     char noAxisSlot[16] = {};
+    // ...and per CHART, top to bottom (#314): what each one put on its x.
+    int nCharts = 0;
+    struct Chart {
+        bool plotted = false;
+        bool custom = false;     // plotted on a named axis (false = frame index)
+        bool zoomed = false;
+        bool canRemove = false;  // its remove button was live
+        bool fellBack = false;   // was asked for an axis and SAID why it is on frame index
+        bool lent = false;       // a side is plotted on another side's axis, and it SAID so
+        float top = 0, bot = 0;
+        float xmin = 0, xmax = 0;   // the x range it was drawn over
+        char xlabel[64] = {};
+        int nX = 0;              // the first curve's x positions, as plotted
+        float xs[32] = {};
+    } ch[App::TemporalChart::kMax];
 };
 static TemporalChartProbe g_tchart;
 // The chart fits when its bottom edge is inside the panel. One text line of
@@ -1142,6 +1201,286 @@ static TemporalChartProbe g_tchart;
 // read as "off screen".
 static bool temporalChartVisible() {
     return g_tchart.plotted && g_tchart.plotBot <= g_tchart.winBot + 1.0f;
+}
+
+// ---- the panel's charts (#314) ------------------------------------------
+// One Temporal panel, several charts stacked top to bottom, each with its
+// own x axis and its own zoom; the table, the legend and the side colours stay
+// the panel's. Everything a chart OWNS is in App::TemporalChart, and these are
+// the pieces the chart blocks (one stack, compare) draw it with.
+
+// The axis chart `c` puts one stack on. XFrame never asks the stack.
+static FrameAxis tchartAxisOf(const App::TemporalChart& c, int seqId) {
+    if (c.xKind == App::TemporalChart::XFrame || seqId == 0) {
+        FrameAxis a;
+        a.label = "frame number (index in stack)";   // frameAxisOf's own fallback words
+        return a;
+    }
+    return frameAxisOf(seqId, c.xKind == App::TemporalChart::XNamed ? c.xName.c_str()
+                                                                     : nullptr);
+}
+
+// What a chart over these stacks can choose besides the frame index: every
+// axis name any of them carries, the first stack's order first. The union,
+// not the intersection - a side that lacks the chosen axis is lent one or
+// sends that chart to frame index, and either way the chart says so.
+static std::vector<std::string> tchartChoices(const std::vector<const ImageDoc*>& docs) {
+    std::vector<std::string> out;
+    for (const ImageDoc* d : docs) {
+        if (!d || d->seqId == 0) continue;
+        if (const App::SeqInfo* si = seqInfo(d->seqId))
+            for (const App::NamedAxis& a : si->axes)
+                if (!a.vals.empty() &&
+                    std::none_of(out.begin(), out.end(), [&](const std::string& o) {
+                        return App::SeqInfo::sameName(o, a.name); }))
+                    out.push_back(a.name);
+    }
+    return out;
+}
+
+// "+ chart": a new chart at the bottom, on the first axis no chart is showing
+// yet (`defName` = what the XDefault charts resolve to), else the frame index.
+static void tchartAdd(const std::vector<std::string>& choices, const std::string& defName) {
+    if ((int)app.tcharts.size() >= App::TemporalChart::kMax) return;
+    App::TemporalChart c;
+    c.xKind = App::TemporalChart::XFrame;
+    for (const std::string& n : choices) {
+        bool shown = false;
+        for (const App::TemporalChart& t : app.tcharts)
+            if ((t.xKind == App::TemporalChart::XNamed && App::SeqInfo::sameName(t.xName, n)) ||
+                (t.xKind == App::TemporalChart::XDefault && App::SeqInfo::sameName(defName, n)))
+                shown = true;
+        if (!shown) { c.xKind = App::TemporalChart::XNamed; c.xName = n; break; }
+    }
+    app.tcharts.push_back(c);
+}
+// ...and its x. The last chart cannot go: a panel with no chart is not a state
+// any button should reach.
+static bool tchartRemove(int i) {
+    if (app.tcharts.size() <= 1 || i < 0 || i >= (int)app.tcharts.size()) return false;
+    app.tcharts.erase(app.tcharts.begin() + i);
+    return true;
+}
+static void tchartAddButton(const std::vector<std::string>& choices, const std::string& defName) {
+    ImGui::BeginDisabled((int)app.tcharts.size() >= App::TemporalChart::kMax);
+    if (ImGui::SmallButton("+ chart")) tchartAdd(choices, defName);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("another chart under these, with its own x axis\n"
+                          "and its own zoom - the table and the legend stay\n"
+                          "the panel's (at most %d)", App::TemporalChart::kMax);
+}
+// The row ON a chart, above it: its "x:" selector and its remove button.
+// Absent while it would offer nothing - ONE chart over stacks that carry no
+// named axis has only the frame index to be on and nothing to remove, and a
+// short panel needs that line for the plot.
+static bool tchartRowShown(const std::vector<std::string>& choices) {
+    return app.tcharts.size() > 1 || !choices.empty();
+}
+// Compact (no vertical frame padding): one text line, like the rows around it.
+static float tchartHeaderH(const std::vector<std::string>& choices) {
+    return tchartRowShown(choices)
+         ? ImGui::GetFontSize() + ImGui::GetStyle().ItemSpacing.y : 0.0f;
+}
+// `shown` is the axis it is actually on, which is what the selector reads
+// (a default chart says which axis the default turned out to be). Returns
+// true when the remove button was pressed - the caller removes the chart once
+// it is done drawing them all.
+static bool tchartHeader(int ci, const std::vector<std::string>& choices,
+                         const std::string& shown) {
+    if (!tchartRowShown(choices)) return false;
+    App::TemporalChart& c = app.tcharts[(size_t)ci];
+    ImGui::PushID(ci);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ImGui::GetStyle().FramePadding.x, 0.0f));
+    ImGui::TextDisabled("x:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10);
+    if (ImGui::BeginCombo("##tchartx", shown.c_str())) {
+        if (ImGui::Selectable("frame index", c.xKind == App::TemporalChart::XFrame)) {
+            c.xKind = App::TemporalChart::XFrame;
+            c.xName.clear();
+        }
+        for (const std::string& n : choices)
+            if (ImGui::Selectable(n.c_str(), c.xKind == App::TemporalChart::XNamed &&
+                                             c.xName == n)) {
+                c.xKind = App::TemporalChart::XNamed;
+                c.xName = n;
+            }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("what THIS chart plots against: the frame index, or an\n"
+                          "axis the stacks carry (x axis... adds one)");
+    ImGui::SameLine();
+    const bool canRemove = app.tcharts.size() > 1;
+    if (ci < App::TemporalChart::kMax) g_tchart.ch[ci].canRemove = canRemove;
+    ImGui::BeginDisabled(!canRemove);
+    const bool rm = ImGui::SmallButton("x");
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(canRemove ? "remove this chart"
+                                    : "the last chart stays - + chart adds another");
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+    return rm;
+}
+
+// Box zoom, per chart. Drag a rectangle on the chart to narrow both ranges to
+// it; double-click resets. The key is what is on the axes (A's document and
+// the x label): a zoom in seconds must not survive a switch to a different
+// stack or axis, where the same numbers mean something else. While zoomed the
+// chart says so - a magnified chart that does not announce itself reads as
+// the whole signal.
+static int g_tzDragChart = -1;      // the chart the current drag began on
+static ImVec2 g_tzDragA;            // ...and where
+static void tchartZoomKey(App::TemporalChart& c, const std::string& sig) {
+    if (sig != c.zoomSig) { c.zoomSig = sig; c.zoomOn = false; }
+}
+static void tchartZoomUI(App::TemporalChart& c, int ci, const PlotRect& tp) {
+    if (!tp.ok) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const bool hov = ImGui::IsMouseHoveringRect(tp.p0, tp.p1) &&
+                     ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        c.zoomOn = false; g_tzDragChart = -1;
+    }
+    if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g_tzDragA = ImGui::GetMousePos(); g_tzDragChart = ci;
+    }
+    if (g_tzDragChart == ci && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        ImVec2 b2 = ImGui::GetMousePos();
+        dl->AddRectFilled(g_tzDragA, b2, IM_COL32(120, 190, 255, 30));
+        dl->AddRect(g_tzDragA, b2, IM_COL32(120, 190, 255, 160));
+    }
+    if (g_tzDragChart == ci && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        g_tzDragChart = -1;
+        float x0, x1, y0, y1;
+        if (zoomRangeFromDrag(tp, g_tzDragA, ImGui::GetMousePos(), x0, x1, y0, y1)) {
+            c.zx0 = x0; c.zx1 = x1; c.zy0 = y0; c.zy1 = y1; c.zoomOn = true;
+        }
+    }
+    if (c.zoomOn) {
+        const char* zt = "zoomed - double-click to reset";
+        ImVec2 ts = ImGui::CalcTextSize(zt);
+        dl->AddText(ImVec2(tp.p1.x - ts.x - 4 * app.uiScale, tp.p0.y + 2 * app.uiScale),
+                    AB_AMBER32, zt);
+    }
+}
+// What one chart records about itself for the probe.
+static void tchartProbe(int ci, const PlotRect& tp, bool custom, bool zoomed,
+                        const char* xlabel, const std::vector<float>* xs) {
+    if (ci < 0 || ci >= App::TemporalChart::kMax || !tp.ok) return;
+    TemporalChartProbe::Chart& p = g_tchart.ch[ci];
+    if (!g_tchart.plotted) { g_tchart.plotted = true; g_tchart.plotTop = tp.p0.y; }
+    g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
+    if (!p.plotted) p.top = tp.p0.y;
+    p.plotted = true;
+    p.bot = std::max(p.bot, tp.p1.y);
+    p.custom = custom;
+    p.zoomed = zoomed;
+    p.xmin = tp.xmin; p.xmax = tp.xmax;
+    snprintf(p.xlabel, sizeof p.xlabel, "%s", xlabel);
+    if (xs && !p.nX) {
+        p.nX = (int)std::min(xs->size(), sizeof p.xs / sizeof p.xs[0]);
+        for (int i = 0; i < p.nX; i++) p.xs[i] = (*xs)[(size_t)i];
+    }
+}
+
+// One compare chart's x, decided over every slot that has a curve. ONE plot
+// has ONE x axis: a named axis is used only when every slot carries the same
+// QUANTITY (same name and unit - the values may differ, that is the point of
+// plotting them together); otherwise the chart falls back to the frame index
+// and says why, rather than plotting incommensurables on one line. The rule
+// runs PER CHART, on the axis that chart chose, so one chart falling back
+// leaves the others where they are.
+struct TChartAx {
+    std::vector<FrameAxis> axs;  // per slot, lent axes already in place
+    bool use = false;            // plotted on axs[], else on the frame index
+    std::string label = "frame number (index in stack)";
+    std::string shown = "frame index";   // what the chart's x: selector reads
+    std::string borrowed, lender;        // who plotted on whose axis
+    std::string notice;                  // why it fell back ("" = it did not)
+};
+static TChartAx tchartResolve(const App::TemporalChart& c,
+                              const std::vector<const ImageDoc*>& docs,
+                              const std::vector<bool>& has,
+                              const std::vector<std::string>& letters) {
+    TChartAx r;
+    r.axs.resize(docs.size());
+    if (c.xKind == App::TemporalChart::XNamed) r.shown = c.xName;
+    if (c.xKind == App::TemporalChart::XFrame) return r;
+    for (size_t i = 0; i < docs.size(); i++)
+        if (docs[i] && docs[i]->seqId != 0) r.axs[i] = tchartAxisOf(c, docs[i]->seqId);
+    // Two different reasons a side can fail the one-axis rule, and they
+    // deserve different treatment:
+    //   conflict - two sides carry DIFFERENT axes. Incommensurable; the
+    //              fallback to frame index stands.
+    //   missing  - a side simply has no such axis. Starting an A/B compare
+    //              against an axis-less B used to throw the whole chart back
+    //              to frame index - the user read it as "A/B 比較を始めると
+    //              X Axisがクリアされちゃう". Follow-frame already pairs sides
+    //              BY FRAME NUMBER, so lending the reference axis to an
+    //              axis-less side of the same length asserts nothing
+    //              follow-frame has not already assumed. Lent, not silently:
+    //              the chart names who borrowed.
+    bool any = false, conflict = false;
+    int ref = -1;
+    for (size_t i = 0; i < docs.size(); i++) {
+        if (!has[i] || !r.axs[i].custom) continue;
+        any = true;
+        if (ref < 0) ref = (int)i;
+        else if (!App::SeqInfo::sameName(r.axs[i].name, r.axs[(size_t)ref].name) ||
+                 r.axs[i].unit != r.axs[(size_t)ref].unit) conflict = true;
+    }
+    if (!any) {
+        if (c.xKind == App::TemporalChart::XNamed)
+            r.notice = "x " + c.xName + ": no side on this chart carries it - plotted on "
+                       "frame index";
+        return r;
+    }
+    const FrameAxis refAx = r.axs[(size_t)ref];
+    if (c.xKind == App::TemporalChart::XDefault) r.shown = refAx.name;
+    std::string what;
+    for (size_t i = 0; i < docs.size(); i++) {
+        if (!has[i]) continue;
+        if (!what.empty()) what += "; ";
+        what += letters[i] + ": " + (r.axs[i].custom ? r.axs[i].label : "frame index");
+    }
+    if (conflict) {
+        r.notice = "custom x axes differ (" + what + ") - one plot has one axis: "
+                   "plotted on frame index";
+        return r;
+    }
+    std::string cannot;
+    std::vector<FrameAxis> lent = r.axs;
+    std::string borrowed;
+    for (size_t i = 0; i < docs.size(); i++) {
+        if (!has[i] || r.axs[i].custom) continue;
+        // same length = value k exists for every frame k the side has;
+        // anything else would invent positions
+        size_t nSide = docs[i] && docs[i]->seqId != 0 ? framesOfSeq(docs[i]->seqId).size() : 0;
+        if (refAx.vals && nSide == refAx.vals->size()) {
+            lent[i] = refAx;
+            if (!borrowed.empty()) borrowed += ", ";
+            borrowed += letters[i];
+        } else {
+            if (!cannot.empty()) cannot += ", ";
+            cannot += letters[i];
+        }
+    }
+    if (!cannot.empty()) {
+        r.notice = "x " + refAx.name + ": " + cannot + " has no such axis and a different "
+                   "frame count, so " + letters[(size_t)ref] + "'s cannot be lent - this "
+                   "chart is plotted on frame index";
+        return r;
+    }
+    r.axs = std::move(lent);
+    r.use = true;
+    r.label = refAx.label;
+    r.borrowed = borrowed;
+    r.lender = letters[(size_t)ref];
+    return r;
 }
 
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
@@ -1204,6 +1543,14 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     ImGui::SameLine();
     temporalExportButtons();   // covers every side on screen, not only A
     if (A.isStack) { ImGui::SameLine(); frameAxisPopupButton(im); }
+    {   // every chart lists the axes of every side on screen
+        std::vector<const ImageDoc*> hd = { im, Bim };
+        for (const TExtra& x : XS) hd.push_back(x.doc);
+        const App::SeqInfo* sa = im->seqId != 0 ? seqInfo(im->seqId) : nullptr;
+        ImGui::SameLine();
+        tchartAddButton(tchartChoices(hd),
+                        sa && !sa->axes.empty() ? sa->axes.front().name : std::string());
+    }
     // B's server aggregate is never fired automatically - one explicit press,
     // one remote job (docs/features/compare/ab-stats-plan.md 4).
     if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
@@ -1254,13 +1601,9 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     const float tblWant = rowH * (4 * nPlanes + 1)      // + the header row
                         + gst.ScrollbarSize             // ScrollX reserves one
                         + gst.CellPadding.y * 2;
-    // ---- custom per-frame x axes, one per slot's stack. ONE plot has ONE x
-    // axis: the custom axis is used only when every slot that has a curve
-    // carries the same QUANTITY (same name and unit - the values may differ,
-    // that is the point of plotting them together); otherwise everything falls
-    // back to the frame index and a notice says why, rather than plotting
-    // incommensurables on one line. Decided here because that notice is one of
-    // the lines the table must leave room for.
+    // ---- the x of every chart, decided before the table takes its height:
+    // each chart's notices are lines the chart block has to have room for
+    // (tchartResolve - the one-axis rule, per chart).
     auto axHasCurve = [](const AbTemporal& t) {
         return t.mean && t.idx && t.mean->size() >= 2 && t.idx->size() >= 2;
     };
@@ -1272,51 +1615,10 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         axHas.push_back(axHasCurve(x.t));
         axLetters.push_back(x.letter);
     }
-    std::vector<FrameAxis> axs(axDocs.size());
-    for (size_t i = 0; i < axDocs.size(); i++)
-        if (axDocs[i] && axDocs[i]->seqId != 0)
-            axs[i] = frameAxisOf(axDocs[i]->seqId);
-    bool axAny = false, axUse = false;
-    std::string axLabel, axBorrowed;
-    {
-        // Two different reasons a side can fail the one-axis rule, and they
-        // deserve different treatment:
-        //   conflict - two sides carry DIFFERENT custom axes. Incommensurable;
-        //              the fallback to frame index stands.
-        //   missing  - a side simply has no axis of its own. Starting an A/B
-        //              compare against an axis-less B used to throw the whole
-        //              chart back to frame index - the user read it as "A/B
-        //              比較を始めるとX Axisがクリアされちゃう". Follow-frame
-        //              already pairs sides BY FRAME NUMBER, so lending the
-        //              reference axis to an axis-less side of the same length
-        //              asserts nothing follow-frame has not already assumed.
-        //              Lent, not silently: the notice names who borrowed.
-        bool conflict = false;
-        int ref = -1;
-        for (size_t i = 0; i < axDocs.size(); i++) {
-            if (!axHas[i] || !axs[i].custom) continue;
-            axAny = true;
-            if (ref < 0) { ref = (int)i; axLabel = axs[i].label; }
-            else if (axs[i].name != axs[ref].name || axs[i].unit != axs[ref].unit)
-                conflict = true;
-        }
-        if (axAny && !conflict) {
-            bool lendOk = true;
-            for (size_t i = 0; i < axDocs.size(); i++) {
-                if (!axHas[i] || axs[i].custom) continue;
-                // same length = value k exists for every frame k the side has;
-                // anything else would invent positions
-                size_t nSide = axDocs[i] && axDocs[i]->seqId != 0
-                             ? framesOfSeq(axDocs[i]->seqId).size() : 0;
-                if (axs[ref].vals && nSide == axs[ref].vals->size()) {
-                    axs[i] = axs[ref];
-                    if (!axBorrowed.empty()) axBorrowed += ", ";
-                    axBorrowed += axLetters[i];
-                } else lendOk = false;
-            }
-            axUse = lendOk;
-        }
-    }
+    std::vector<TChartAx> chAx;
+    for (const App::TemporalChart& c : app.tcharts)
+        chAx.push_back(tchartResolve(c, axDocs, axHas, axLetters));
+    const std::vector<std::string> axChoices = tchartChoices(axDocs);
     // every notice line that will follow the table, counted before it is drawn
     // (none of them wrap, so each is exactly one line)
     std::string slotDiv;    // slots whose follow-frame found no partner frame
@@ -1332,8 +1634,6 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     int notices = 0;
     if (anyClamp(A)) notices++;
     if (anyClamp(B)) notices++;
-    if (axAny && !axUse) notices++;
-    if (!axBorrowed.empty()) notices++;
     if (g_abFollowDiverged) notices++;
     if (!slotDiv.empty()) notices++;
     if (A.valid && B.valid && A.nPl != B.nPl) notices++;
@@ -1342,9 +1642,19 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (!sameRegion) notices++;
     else if (!canDelta && im->ch != Bim->ch) notices++;
     if (A.fromServer || B.fromServer) notices++;
-    // the chart's floor: plot + its three rows of axis chrome + one legend row
-    const float chartMinH = 70.0f * app.uiScale + ImGui::GetFontSize() * 3
-                          + 12 * app.uiScale + ImGui::GetTextLineHeightWithSpacing();
+    // the charts' floor: per chart, its x: row + plot + its three rows of axis
+    // chrome + its notices; and one legend row for the panel
+    // (and, above the last, the spread lines each chart prints under itself)
+    const int nCurves = (int)std::count(axHas.begin(), axHas.end(), true);
+    float chartMinH = ImGui::GetTextLineHeightWithSpacing();
+    for (size_t ci = 0; ci < chAx.size(); ci++) {
+        const TChartAx& x = chAx[ci];
+        chartMinH += tchartHeaderH(axChoices) + 70.0f * app.uiScale + ImGui::GetFontSize() * 3
+                   + 12 * app.uiScale
+                   + ((x.notice.empty() ? 0 : 1) + (x.borrowed.empty() ? 0 : 1)
+                      + (ci + 1 < chAx.size() ? nCurves : 0))
+                     * ImGui::GetTextLineHeightWithSpacing();
+    }
     const float tblRoom = ImGui::GetContentRegionAvail().y
                         - notices * ImGui::GetTextLineHeightWithSpacing() - chartMinH;
     const float tblH = std::min(tblWant, std::max(tblRoom, rowH * 3));
@@ -1481,24 +1791,8 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (A.fromServer || B.fromServer)
         ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
                             B.fromServer ? "server" : "local");
-    if (axAny && !axUse) {
-        std::string what;
-        for (size_t i = 0; i < axDocs.size(); i++) {
-            if (!axHas[i]) continue;
-            if (!what.empty()) what += "; ";
-            what += axLetters[i] + ": " + (axs[i].custom ? axs[i].label : "frame index");
-        }
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "custom x axes differ (%s) - one plot has one axis: "
-                           "plotted on frame index", what.c_str());
-    }
-    if (!axBorrowed.empty()) {
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1),
-                           "%s: no x axis of its own - plotted on A's (paired by frame "
-                           "number, as follow-frame already assumes)", axBorrowed.c_str());
-    }
 
-    // ---- per-frame mean over time: one curve per compare slot, one axis ----
+    // ---- per-frame mean over time: one curve per compare slot, per chart ----
     // What each slot puts on the chart and, when it puts nothing there, WHY.
     // The chart used to give up entirely the moment A had no series
     // ("if (!A.mean || A.mean->empty()) return;") - so a B with a perfectly
@@ -1540,7 +1834,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     g_tchart.nSlots = (int)std::min(slots.size(), sizeof g_tchart.slot);
     for (int i = 0; i < g_tchart.nSlots; i++) g_tchart.slot[i] = slots[i].letter[0];
 
-    float mn = FLT_MAX, mx = -FLT_MAX, fx0 = FLT_MAX, fx1 = -FLT_MAX;
+    g_tchart.nCharts = (int)std::min(app.tcharts.size(), (size_t)App::TemporalChart::kMax);
+
+    // The y range, the legend and the inks are the PANEL's: every chart plots
+    // the same curves, against its own x.
+    float mn = FLT_MAX, mx = -FLT_MAX;
     int nHas = 0;
     bool anyMosaic = false;
     std::string noAxis;
@@ -1556,13 +1854,6 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         }
         nHas++;
         for (float v : *s.t->mean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-        // min/max over the MAPPED positions, never front/back: a custom axis
-        // (temperature up and down) is legitimately non-monotonic
-        for (float ix : *s.t->idx) {
-            float x = axUse ? (float)axs[i].at(ix) : ix;
-            fx0 = std::min(fx0, x);
-            fx1 = std::max(fx1, x);
-        }
     }
     if (!nHas) {
         // Nothing to plot on ANY side. Say which side and why, rather than
@@ -1573,7 +1864,6 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                             "stack, never of a frame).");
         return;
     }
-    if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
     char yl[160];
     const char* rlab = sameRegion && !A.roiUsed ? "frame" : "ROI";
     // The per-frame mean is a LEVEL, not a noise statistic, so it is
@@ -1585,19 +1875,26 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                  rlab, unit.c_str(), plab, im->dtype.c_str(), Bim->dtype.c_str());
     else snprintf(yl, sizeof yl, "%s mean value (%s%s)", rlab, unit.c_str(), plab);
 
+    // A slot's frame positions on one chart's x (min/max over the MAPPED
+    // positions where a range is wanted, never front/back: a custom axis -
+    // temperature up and down - is legitimately non-monotonic).
+    auto xOf = [&](const TChartAx& X, size_t si, float ix) {
+        return X.use && si < X.axs.size() ? (float)X.axs[si].at(ix) : ix;
+    };
     // Sharing one plot, every slot needs its own ink; alone in its own panel it
     // is stroked exactly like A, so the panels can be read against each other.
     // (Same rule as the projection profiles - a dash pattern reads as a broken
     // curve rather than as "this one is B".)
-    auto curve = [&](const PlotRect& tp, size_t si, ImU32 ink) {
+    auto curve = [&](const PlotRect& tp, size_t si, ImU32 ink, const TChartAx& X,
+                     std::vector<float>* xsOut) {
         const TSlot& s = slots[si];
         if (!tp.ok || !s.has) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         std::vector<ImVec2> pts;
         pts.reserve(s.t->mean->size());
         for (size_t i = 0; i < s.t->mean->size() && i < s.t->idx->size(); i++) {
-            float x = axUse && si < axs.size() ? (float)axs[si].at((*s.t->idx)[i])
-                                               : (*s.t->idx)[i];
+            float x = xOf(X, si, (*s.t->idx)[i]);
+            if (xsOut) xsOut->push_back(x);
             pts.push_back(tp.at(x, (*s.t->mean)[i]));
         }
         if (pts.size() < 2) return;
@@ -1609,14 +1906,13 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     // - drawn solid it read as a second curve ("frame 0 のところに黄色いやつ",
     // user report), which is exactly the confusion the dashed-is-reference
     // rule exists to prevent. It is also named in the legend now: an unlabelled
-    // vertical line cannot be told from a series by looking.
+    // vertical line cannot be told from a series by looking. On EVERY chart,
+    // at that chart's x of the frame.
     const ImU32 MARKER_INK = IM_COL32(255, 184, 77, 200);
-    auto marker = [&](const PlotRect& tp, const ImageDoc* d, size_t si) {
+    auto marker = [&](const PlotRect& tp, const ImageDoc* d, size_t si, const TChartAx& X) {
         if (!tp.ok || !d) return;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        float x = axUse && si < axs.size() ? (float)axs[si].at((float)d->seqIndex)
-                                           : (float)d->seqIndex;
-        float mxp = tp.at(x, tp.ymin).x;
+        float mxp = tp.at(xOf(X, si, (float)d->seqIndex), tp.ymin).x;
         ImVec2 seg[2] = { ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y) };
         float dash = 5 * app.uiScale;
         addDashedPolyline(dl, seg, 2, MARKER_INK, 1.0f, dash, dash);
@@ -1644,117 +1940,125 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
                    / (float)nHas;
     bool tooNarrow = side && perPanel < minSide;
     if (tooNarrow) side = false;
+    // Height: what the panel's own lines leave, split evenly between the
+    // charts after each one's x: row, notices, axis chrome and (overlaid) its
+    // spread lines - with the plot's floor per chart.
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    const float chrome = ImGui::GetFontSize() * 3 + 12 * app.uiScale;
+    const float nameBand = ImGui::GetTextLineHeight() + 6 * app.uiScale;
     float tAvail = ImGui::GetContentRegionAvail().y
-                 - (ImGui::GetFontSize() * 3 + 12 * app.uiScale)
                  - (tooNarrow ? abNarrowNoteH() : 0.0f)
                  - (side ? 0.0f : slotLegendRow(leg, false))
-                 - (noAxis.empty() ? 0.0f : ImGui::GetTextLineHeightWithSpacing());
-    if (side) tAvail -= ImGui::GetTextLineHeight() + 6 * app.uiScale;   // the name band
-    float plotH = std::max(tAvail, 70.0f * app.uiScale);
-    const char* xlab = axUse ? axLabel.c_str() : "frame number (index in stack)";
-    // Box-zoom. Drag a rectangle on the chart to narrow both ranges to it;
-    // double-click resets. The state is keyed to WHAT is on the axes (A's
-    // document and the x label): a zoom in seconds must not survive a switch
-    // to a different stack or axis, where the same numbers mean something
-    // else. While zoomed the chart says so - a magnified chart that does not
-    // announce itself reads as the whole signal.
-    static bool tzOn = false;
-    static float tzX0 = 0, tzX1 = 1, tzY0 = 0, tzY1 = 1;
-    static std::string tzSig;
-    {
-        std::string sig = std::string(xlab) + "|" +
-                          std::to_string(im ? (unsigned long long)im->uid : 0ULL);
-        if (sig != tzSig) { tzSig = sig; tzOn = false; }
+                 - (noAxis.empty() ? 0.0f : lineH);
+    const int nCh = (int)app.tcharts.size();
+    // (the LAST chart's spread lines are not reserved - they sit under the
+    // panel's last plot, where the single chart always had them)
+    for (size_t ci = 0; ci < chAx.size(); ci++) {
+        const TChartAx& X = chAx[ci];
+        tAvail -= tchartHeaderH(axChoices) + chrome
+                + (side ? nameBand : ci + 1 < chAx.size() ? nHas * lineH : 0.0f)
+                + ((X.notice.empty() ? 0 : 1) + (X.borrowed.empty() ? 0 : 1)) * lineH;
     }
-    if (tzOn) { fx0 = tzX0; fx1 = tzX1; mn = tzY0; mx = tzY1; }
-    static ImVec2 tzDragA;              // where the current drag began
-    static bool tzDragging = false;
-    auto zoomUI = [&](const PlotRect& tp) {
-        if (!tp.ok) return;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const bool hov = ImGui::IsMouseHoveringRect(tp.p0, tp.p1) &&
-                         ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
-        if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            tzOn = false; tzDragging = false;
+    float plotH = std::max(tAvail / (float)std::max(nCh, 1), 70.0f * app.uiScale);
+    const std::string uidKey = std::to_string(im ? (unsigned long long)im->uid : 0ULL);
+    int removeAt = -1;
+    for (int ci = 0; ci < nCh && ci < (int)chAx.size(); ci++) {
+        App::TemporalChart& c = app.tcharts[(size_t)ci];
+        const TChartAx& X = chAx[(size_t)ci];
+        TemporalChartProbe::Chart* pc = ci < App::TemporalChart::kMax ? &g_tchart.ch[ci]
+                                                                        : nullptr;
+        // the chart's own row, in reading order: what its x is, then why it
+        // is not what was asked for, then the chart
+        if (tchartHeader(ci, axChoices, X.shown)) removeAt = ci;
+        if (!X.notice.empty()) {
+            ImGui::TextColored(AB_AMBER, "%s", X.notice.c_str());
+            if (pc) pc->fellBack = true;
         }
-        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            tzDragA = ImGui::GetMousePos(); tzDragging = true;
+        if (!X.borrowed.empty()) {
+            ImGui::TextColored(AB_AMBER, "%s: no %s of its own - plotted on %s's (paired "
+                               "by frame number, as follow-frame already assumes)",
+                               X.borrowed.c_str(), X.shown.c_str(), X.lender.c_str());
+            if (pc) pc->lent = true;
         }
-        if (tzDragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            ImVec2 b2 = ImGui::GetMousePos();
-            dl->AddRectFilled(tzDragA, b2, IM_COL32(120, 190, 255, 30));
-            dl->AddRect(tzDragA, b2, IM_COL32(120, 190, 255, 160));
-        }
-        if (tzDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            tzDragging = false;
-            float x0, x1, y0, y1;
-            if (zoomRangeFromDrag(tp, tzDragA, ImGui::GetMousePos(), x0, x1, y0, y1)) {
-                tzX0 = x0; tzX1 = x1; tzY0 = y0; tzY1 = y1; tzOn = true;
-            }
-        }
-        if (tzOn) {
-            const char* zt = "zoomed - double-click to reset";
-            ImVec2 ts = ImGui::CalcTextSize(zt);
-            dl->AddText(ImVec2(tp.p1.x - ts.x - 4 * app.uiScale, tp.p0.y + 2 * app.uiScale),
-                        AB_AMBER32, zt);
-        }
-    };
-    if (!side) {
-        PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, !axUse, false, plotH);
-        if (tp.ok) {
-            g_tchart.plotted = true;
-            g_tchart.plotTop = tp.p0.y; g_tchart.plotBot = tp.p1.y;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->PushClipRect(tp.p0, tp.p1, true);
-            for (size_t i = 0; i < slots.size(); i++) curve(tp, i, slots[i].ink);
-            // the "you are here" marker is A's frame index, and a lone frame
-            // has none - a line at 0 would name a frame of somebody's stack
-            if (A.isStack) marker(tp, im, 0);
-            dl->PopClipRect();
-            zoomUI(tp);
-            // ...and how far each curve swings over the part of it that is on
-            // screen, as a fraction of its own level. Per SLOT, because A and B
-            // are two measurements and one pooled number would belong to
-            // neither. The window is named with the number: it is a statement
-            // about what is being LOOKED at, so panning or zooming changes it
-            // and the reader has to be able to see that it did.
-            for (const TSlot& sl : slots) {
-                if (!sl.has || !sl.t || !sl.t->mean || !sl.t->idx) continue;
-                const PlotSpread sp = plotSpreadIn(*sl.t->idx, *sl.t->mean,
-                                                   tp.xmin, tp.xmax);
-                plotSpreadLine(sp, sl.letter.c_str());
-            }
-        }
-        slotLegendRow(leg, true);
-    } else {
-        g_tchart.sideBySide = true;
-        float childH = plotH + ImGui::GetFontSize() * 3 + 12 * app.uiScale
-                     + ImGui::GetTextLineHeight() + 8 * app.uiScale;
-        bool first = true;
+        float fx0 = FLT_MAX, fx1 = -FLT_MAX;
         for (size_t i = 0; i < slots.size(); i++) {
             if (!slots[i].has) continue;
-            if (!first) ImGui::SameLine();
-            first = false;
-            ImGui::BeginChild(("##temp" + slots[i].letter).c_str(), ImVec2(perPanel, childH),
-                              false, ImGuiWindowFlags_NoScrollbar |
-                                     ImGuiWindowFlags_NoScrollWithMouse);
-            drawABBand(slots[i].letter.c_str(), slots[i].label, slots[i].stale);
-            {   // same limits in every panel, by construction
-                PlotRect tp = beginPlot(xlab, yl, fx0, fx1, mn, mx, !axUse, false, plotH);
-                if (tp.ok) {
-                    if (!g_tchart.plotted) { g_tchart.plotted = true; g_tchart.plotTop = tp.p0.y; }
-                    g_tchart.plotBot = std::max(g_tchart.plotBot, tp.p1.y);
-                    ImDrawList* dl = ImGui::GetWindowDrawList();
-                    dl->PushClipRect(tp.p0, tp.p1, true);
-                    curve(tp, i, slotInk(0));   // its own panel: A's stroke
-                    marker(tp, slots[i].doc, i);
-                    dl->PopClipRect();
-                    zoomUI(tp);         // shared limits: a zoom in one panel zooms all
+            for (float ix : *slots[i].t->idx) {
+                float x = xOf(X, i, ix);
+                fx0 = std::min(fx0, x);
+                fx1 = std::max(fx1, x);
+            }
+        }
+        if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
+        float y0 = mn, y1 = mx;
+        const char* xlab = X.use ? X.label.c_str() : "frame number (index in stack)";
+        tchartZoomKey(c, std::string(xlab) + "|" + uidKey);
+        const bool zoomed = c.zoomOn;
+        if (zoomed) { fx0 = c.zx0; fx1 = c.zx1; y0 = c.zy0; y1 = c.zy1; }
+        if (!side) {
+            PlotRect tp = beginPlot(xlab, yl, fx0, fx1, y0, y1, !X.use, false, plotH);
+            if (tp.ok) {
+                std::vector<float> xs0;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->PushClipRect(tp.p0, tp.p1, true);
+                for (size_t i = 0; i < slots.size(); i++)
+                    curve(tp, i, slots[i].ink, X, xs0.empty() ? &xs0 : nullptr);
+                // the "you are here" marker is A's frame index, and a lone frame
+                // has none - a line at 0 would name a frame of somebody's stack
+                if (A.isStack) marker(tp, im, 0, X);
+                dl->PopClipRect();
+                tchartZoomUI(c, ci, tp);
+                tchartProbe(ci, tp, X.use, zoomed, xlab, &xs0);
+                // ...and how far each curve swings over the part of it that is
+                // on screen, as a fraction of its own level. Per SLOT, because
+                // A and B are two measurements and one pooled number would
+                // belong to neither. The window is named with the number: it is
+                // a statement about what is being LOOKED at, so panning or
+                // zooming changes it and the reader has to be able to see that
+                // it did. Over the chart's OWN x (the slot's frame positions on
+                // it), so a chart on time reports the time window it shows.
+                for (size_t i = 0; i < slots.size(); i++) {
+                    const TSlot& sl = slots[i];
+                    if (!sl.has || !sl.t || !sl.t->mean || !sl.t->idx) continue;
+                    std::vector<float> xsl;
+                    xsl.reserve(sl.t->idx->size());
+                    for (float ix : *sl.t->idx) xsl.push_back(xOf(X, i, ix));
+                    const PlotSpread sp = plotSpreadIn(xsl, *sl.t->mean, tp.xmin, tp.xmax);
+                    plotSpreadLine(sp, sl.letter.c_str());
                 }
             }
-            ImGui::EndChild();
+        } else {
+            g_tchart.sideBySide = true;
+            float childH = plotH + chrome + ImGui::GetTextLineHeight() + 8 * app.uiScale;
+            bool first = true;
+            for (size_t i = 0; i < slots.size(); i++) {
+                if (!slots[i].has) continue;
+                if (!first) ImGui::SameLine();
+                first = false;
+                ImGui::BeginChild(("##temp" + slots[i].letter + std::to_string(ci)).c_str(),
+                                  ImVec2(perPanel, childH), false,
+                                  ImGuiWindowFlags_NoScrollbar |
+                                  ImGuiWindowFlags_NoScrollWithMouse);
+                drawABBand(slots[i].letter.c_str(), slots[i].label, slots[i].stale);
+                {   // same limits in every panel of the chart, by construction
+                    PlotRect tp = beginPlot(xlab, yl, fx0, fx1, y0, y1, !X.use, false, plotH);
+                    if (tp.ok) {
+                        std::vector<float> xs0;
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        dl->PushClipRect(tp.p0, tp.p1, true);
+                        curve(tp, i, slotInk(0), X, &xs0);   // its own panel: A's stroke
+                        marker(tp, slots[i].doc, i, X);
+                        dl->PopClipRect();
+                        tchartZoomUI(c, ci, tp);   // shared limits: one zoom, all panels
+                        tchartProbe(ci, tp, X.use, zoomed, xlab, &xs0);
+                    }
+                }
+                ImGui::EndChild();
+            }
         }
     }
+    if (removeAt >= 0) tchartRemove(removeAt);
+    if (!side) slotLegendRow(leg, true);
     // ...and the slots that contributed no curve, named, with the reason. A
     // chart that quietly holds fewer curves than there are compare slots is
     // indistinguishable from a broken one.
@@ -1824,6 +2128,9 @@ static void drawPanelTemporal() {
         temporalExportButtons();
         ImGui::SameLine();
         frameAxisPopupButton(im);
+        ImGui::SameLine();
+        tchartAddButton(tchartChoices({ im }),
+                        si && !si->axes.empty() ? si->axes.front().name : std::string());
         ImGui::Separator();
         if (!T.valid) {
             ImGui::TextDisabled("need >= 2 loaded frames of equal size");
@@ -1869,21 +2176,12 @@ static void drawPanelTemporal() {
             if (axPeek.custom)
                 ImGui::TextDisabled("linearity fit: Series Analysis panel (a swept capture "
                                     "is a series; the axis keeps the monitor curve below)");
-            // per-frame mean over time - against the custom x axis when this
-            // stack carries one (a real quantity per frame), else frame index.
+            // per-frame mean over time, once per chart - each against the axis
+            // ITS x: names (a real quantity per frame) or the frame index.
             // Non-monotonic values are fine: the polyline follows frame order,
             // which is why the range is min/max and never front/back.
-            FrameAxis ax = frameAxisOf(im->seqId);
-            if (!ax.why.empty())
-                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s", ax.why.c_str());
             float mn = FLT_MAX, mx = -FLT_MAX;
             for (float v : T.frameMean) { mn = std::min(mn, v); mx = std::max(mx, v); }
-            float fx0 = FLT_MAX, fx1 = -FLT_MAX;
-            for (float ix : T.idx) {
-                float x = (float)ax.at(ix);
-                fx0 = std::min(fx0, x); fx1 = std::max(fx1, x);
-            }
-            if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
             char yl[80];
             // the per-frame mean is a LEVEL, not a noise statistic, so it is
             // legitimately pooled - but it still has to say so next to a table
@@ -1891,32 +2189,78 @@ static void drawPanelTemporal() {
             snprintf(yl, sizeof yl, "%s value (%s%s)",
                      T.poi ? "pixel" : T.roiUsed ? "ROI mean" : "frame mean",
                      abValueUnit(im->dtype).c_str(), T.nPl > 1 ? ", plane=all" : "");
-            float tAvail = ImGui::GetContentRegionAvail().y
-                         - (ImGui::GetFontSize() * 3 + 12 * app.uiScale);
+            const std::vector<const ImageDoc*> oneDoc = { im };
+            const std::vector<std::string> choices = tchartChoices(oneDoc);
+            const int nCh = (int)app.tcharts.size();
+            std::vector<FrameAxis> axs;
+            std::vector<std::string> notes;     // why a chart is not on what it asked for
+            for (const App::TemporalChart& c : app.tcharts) {
+                FrameAxis a = tchartAxisOf(c, im->seqId);
+                std::string why = a.why;
+                if (a.missing)
+                    why = "x " + c.xName + ": this stack has no such axis - plotted on "
+                          "frame index";
+                axs.push_back(a);
+                notes.push_back(why);
+            }
+            const float lineH = ImGui::GetTextLineHeightWithSpacing();
+            const float chrome = ImGui::GetFontSize() * 3 + 12 * app.uiScale;
+            float tAvail = ImGui::GetContentRegionAvail().y;
+            for (int ci = 0; ci < nCh; ci++)
+                tAvail -= tchartHeaderH(choices) + chrome + (notes[(size_t)ci].empty() ? 0 : lineH);
+            const float plotH = std::max(tAvail / (float)std::max(nCh, 1), 70.0f * app.uiScale);
             g_tchart.ran = true;
             g_tchart.nSlots = 1;
             g_tchart.slot[0] = 'A';
             g_tchart.winBot = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
-            PlotRect tp = beginPlot(ax.label.c_str(), yl,
-                                    fx0, fx1, mn, mx, !ax.custom, false,
-                                    std::max(tAvail, 70.0f * app.uiScale));
-            if (tp.ok) {
-                g_tchart.plotted = true;
-                g_tchart.plotTop = tp.p0.y; g_tchart.plotBot = tp.p1.y;
-                g_tchart.pts[0] = (int)T.frameMean.size();
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                dl->PushClipRect(tp.p0, tp.p1, true);
-                for (size_t i = 1; i < T.frameMean.size(); i++)
-                    dl->AddLine(tp.at((float)ax.at(T.idx[i - 1]), T.frameMean[i - 1]),
-                                tp.at((float)ax.at(T.idx[i]), T.frameMean[i]),
-                                IM_COL32(105, 220, 130, 255), 1.5f);
-                if (ImageDoc* c2 = cur()) {   // marker for the frame on screen
-                    float mxp = tp.at((float)ax.at((float)c2->seqIndex), tp.ymin).x;
-                    dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y),
-                                IM_COL32(255, 184, 77, 200));
+            g_tchart.nCharts = std::min(nCh, (int)App::TemporalChart::kMax);
+            int removeAt = -1;
+            for (int ci = 0; ci < nCh; ci++) {
+                App::TemporalChart& c = app.tcharts[(size_t)ci];
+                const FrameAxis& ax = axs[(size_t)ci];
+                if (tchartHeader(ci, choices, ax.custom ? ax.name
+                                            : c.xKind == App::TemporalChart::XNamed
+                                                ? c.xName : std::string("frame index")))
+                    removeAt = ci;
+                if (!notes[(size_t)ci].empty()) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.35f, 1), "%s",
+                                       notes[(size_t)ci].c_str());
+                    if (ci < App::TemporalChart::kMax) g_tchart.ch[ci].fellBack = true;
                 }
-                dl->PopClipRect();
+                float fx0 = FLT_MAX, fx1 = -FLT_MAX;
+                std::vector<float> xs;
+                xs.reserve(T.idx.size());
+                for (float ix : T.idx) {
+                    float x = (float)ax.at(ix);
+                    xs.push_back(x);
+                    fx0 = std::min(fx0, x); fx1 = std::max(fx1, x);
+                }
+                if (fx0 > fx1) { fx0 = 0; fx1 = 1; }
+                float y0 = mn, y1 = mx;
+                tchartZoomKey(c, ax.label + "|" + std::to_string((unsigned long long)im->uid));
+                const bool zoomed = c.zoomOn;
+                if (zoomed) { fx0 = c.zx0; fx1 = c.zx1; y0 = c.zy0; y1 = c.zy1; }
+                PlotRect tp = beginPlot(ax.label.c_str(), yl, fx0, fx1, y0, y1, !ax.custom,
+                                        false, plotH);
+                if (tp.ok) {
+                    g_tchart.pts[0] = (int)T.frameMean.size();
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->PushClipRect(tp.p0, tp.p1, true);
+                    for (size_t i = 1; i < T.frameMean.size() && i < xs.size(); i++)
+                        dl->AddLine(tp.at(xs[i - 1], T.frameMean[i - 1]),
+                                    tp.at(xs[i], T.frameMean[i]),
+                                    IM_COL32(105, 220, 130, 255), 1.5f);
+                    if (ImageDoc* c2 = cur()) {   // marker for the frame on screen
+                        float mxp = tp.at((float)ax.at((float)c2->seqIndex), tp.ymin).x;
+                        dl->AddLine(ImVec2(mxp, tp.p0.y), ImVec2(mxp, tp.p1.y),
+                                    IM_COL32(255, 184, 77, 200));
+                    }
+                    dl->PopClipRect();
+                    tchartZoomUI(c, ci, tp);
+                    tchartProbe(ci, tp, ax.custom, zoomed, ax.label.c_str(), &xs);
+                }
             }
+            if (removeAt >= 0) tchartRemove(removeAt);
         }
         return;
     }

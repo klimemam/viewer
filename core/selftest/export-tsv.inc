@@ -400,11 +400,47 @@
             check(has(tsvX, "\n0\t10\t") && has(tsvX, "\n4\t50\t"),
                   "E7 export rows carry the axis value for their frame");
             // count honesty at USE time: the resolver refuses a stale axis
-            if (App::SeqInfo* si = seqInfo(sid)) si->axisVals = { 1.0, 2.0, 3.0 };
+            if (App::SeqInfo* si = seqInfo(sid)) si->axes.front().vals = { 1.0, 2.0, 3.0 };
             FrameAxis ax2 = frameAxisOf(sid);
             check(!ax2.custom && has(ax2.why, "3 value(s)") && has(ax2.why, "5 frame(s)"),
                   "E7 a stale axis falls back to frame index and says why");
-            if (App::SeqInfo* si = seqInfo(sid)) si->axisVals = { 10, 20, 30, 40, 50 };
+            if (App::SeqInfo* si = seqInfo(sid)) si->axes.front().vals = { 10, 20, 30, 40, 50 };
+
+            // ---- E7b (#314): a stack carries several NAMED axes. x axis...
+            // ADDS one, the same name replaces that one in place, remove drops
+            // exactly one - and the resolver serves the axis it is asked for.
+            bool rep1 = true, rep2 = false;
+            bool addOk = applyFrameAxis(sid, "exposure", "ms", "1 2 4 8 16", err, &rep1);
+            App::SeqInfo* si7 = seqInfo(sid);
+            fprintf(stderr, "texportselftest: E7b after add: ok=%d replaced=%d axes=%d "
+                            "[0]='%s' [1]='%s'\n", addOk ? 1 : 0, rep1 ? 1 : 0,
+                    si7 ? (int)si7->axes.size() : -1,
+                    si7 && si7->axes.size() > 0 ? si7->axes[0].name.c_str() : "-",
+                    si7 && si7->axes.size() > 1 ? si7->axes[1].name.c_str() : "-");
+            check(addOk && !rep1 && si7 && si7->axes.size() == 2 &&
+                  si7->axes[0].name == "temp" && si7->axes[1].name == "exposure",
+                  "E7b x axis... ADDS a second axis - the first stays, and stays first");
+            bool repOk = applyFrameAxis(sid, "exposure", "us", "1000 2000 4000 8000 16000",
+                                        err, &rep2);
+            si7 = seqInfo(sid);
+            const App::NamedAxis* ex7 = si7 ? si7->axis("exposure") : nullptr;
+            check(repOk && rep2 && si7 && si7->axes.size() == 2 &&
+                  si7->axes[1].name == "exposure" && ex7 && ex7->unit == "us" &&
+                  ex7->vals.size() == 5 && ex7->vals[4] == 16000,
+                  "E7b the same name REPLACES that axis, in place");
+            FrameAxis fe = frameAxisOf(sid, "exposure"), fd = frameAxisOf(sid),
+                      fm = frameAxisOf(sid, "no such axis");
+            check(fe.custom && fe.at(1) == 2000 && fe.label == "exposure (us)" &&
+                  fd.custom && fd.name == "temp" && !fm.custom && fm.missing && fm.why.empty(),
+                  "E7b the resolver: named = that axis, none = the first, unknown = missing");
+            check(applyFrameAxis(sid, "gone", "s", "0 1 2 3 4", err), "E7b a third axis adds");
+            si7 = seqInfo(sid);
+            bool dropped = si7 && si7->dropAxis("gone");
+            si7 = seqInfo(sid);
+            check(dropped && si7 && si7->axes.size() == 2 && !si7->axis("gone") &&
+                  si7->axis("temp") && si7->axis("exposure"),
+                  "E7b remove drops that axis and only that axis");
+            check(si7 && !si7->dropAxis("gone"), "E7b removing an absent axis says so");
         }
 
         {   // ---- E10: the box-zoom mapping is the exact inverse of the plot's
@@ -520,29 +556,105 @@
             }
         }
 
-        // ---- E8: the axis survives a session round-trip ----
+        // ---- E8: the axes - and the panel's charts - survive a session ----
         {
             std::error_code ec;
             std::string sess = (std::filesystem::temp_directory_path(ec) /
                                 "viewer_texport.vsession").u8string();
+            const std::vector<App::TemporalChart> chartsBefore = app.tcharts;
+            app.tcharts.assign(3, App::TemporalChart{});
+            app.tcharts[1].xKind = App::TemporalChart::XNamed;
+            app.tcharts[1].xName = "exposure";
+            app.tcharts[2].xKind = App::TemporalChart::XFrame;
             saveSession(sess, true);
-            std::string lerr = loadSession(sess);
-            loadAll();
-            double tn = nowSec();
-            while (nowSec() - tn < 60.0 &&
-                   (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
-                pumpSequenceAndQueue();
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-            loadAll();
-            bool found = false;
-            for (const auto& si : app.seqs)
-                if (si.axisName == "temp" && si.axisUnit == "C" &&
-                    si.axisVals.size() == 5 && si.axisVals[4] == 50)
+            app.tcharts.assign(1, App::TemporalChart{});
+            auto restore = [&](const std::string& path) {
+                std::string e = loadSession(path);
+                loadAll();
+                double tn = nowSec();
+                while (nowSec() - tn < 60.0 &&
+                       (!app.seqRestore.empty() || app.seqRunning || seqReadyPending())) {
+                    pumpSequenceAndQueue();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                loadAll();
+                return e;
+            };
+            std::string lerr = restore(sess);
+            bool found = false, both = false;
+            for (const auto& si : app.seqs) {
+                const App::NamedAxis* t = si.axis("temp");
+                const App::NamedAxis* e = si.axis("exposure");
+                if (t && t->unit == "C" && t->vals.size() == 5 && t->vals[4] == 50)
                     found = true;
-            fprintf(stderr, "texportselftest: E8 reloaded %zu stack(s), load err '%s'\n",
-                    app.seqs.size(), lerr.c_str());
+                if (si.axes.size() == 2 && si.axes[0].name == "temp" && e && e->unit == "us" &&
+                    e->vals.size() == 5 && e->vals[4] == 16000)
+                    both = true;
+            }
+            fprintf(stderr, "texportselftest: E8 reloaded %zu stack(s), load err '%s', "
+                            "charts=%zu\n", app.seqs.size(), lerr.c_str(), app.tcharts.size());
             check(lerr.empty() && found, "E8 x axis survives a session round-trip");
+            check(both, "E8 ...every named axis does, in its order (#314)");
+            check(app.tcharts.size() == 3 &&
+                  app.tcharts[0].xKind == App::TemporalChart::XDefault &&
+                  app.tcharts[1].xKind == App::TemporalChart::XNamed &&
+                  app.tcharts[1].xName == "exposure" &&
+                  app.tcharts[2].xKind == App::TemporalChart::XFrame,
+                  "E8 the charts and each one's x come back from the session");
+            // E8b: a session written before #314 - ONE vals/unit/name triple
+            // and no tchart lines - still reads: the one axis, one chart.
+            {
+                std::ifstream in(std::filesystem::u8path(sess), std::ios::binary);
+                std::string txt((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+                in.close();
+                std::string old, ln;
+                std::istringstream ls(txt);
+                bool skipTriple = false;
+                while (std::getline(ls, ln)) {
+                    if (ln.rfind("tchart", 0) == 0) continue;
+                    if (ln.rfind("seqaxisvals 1000 ", 0) == 0) { skipTriple = true; continue; }
+                    if (skipTriple && (ln.rfind("seqaxisunit", 0) == 0)) continue;
+                    if (skipTriple && ln.rfind("seqaxisname", 0) == 0) { skipTriple = false; continue; }
+                    old += ln + "\n";
+                }
+                std::string oldSess = (std::filesystem::temp_directory_path(ec) /
+                                       "viewer_texport_old.vsession").u8string();
+                {
+                    std::ofstream o(std::filesystem::u8path(oldSess), std::ios::binary);
+                    o << old;
+                }
+                app.tcharts.assign(2, App::TemporalChart{});
+                std::string oerr = restore(oldSess);
+                bool oneAxis = false;
+                for (const auto& si : app.seqs)
+                    if (si.axes.size() == 1 && si.axes[0].name == "temp" &&
+                        si.axes[0].unit == "C" && si.axes[0].vals.size() == 5)
+                        oneAxis = true;
+                fprintf(stderr, "texportselftest: E8b old-format session: err '%s', "
+                                "one axis=%d, charts=%zu\n", oerr.c_str(), oneAxis ? 1 : 0,
+                        app.tcharts.size());
+                check(oerr.empty() && oneAxis, "E8b a one-axis session reads back as that axis");
+                check(app.tcharts.size() == 1 &&
+                      app.tcharts[0].xKind == App::TemporalChart::XDefault,
+                      "E8b ...and a session without tchart lines is one default chart");
+                std::filesystem::remove(std::filesystem::u8path(oldSess), ec);
+                // back to the two axes the rest of this test was written against
+                lerr = restore(sess);
+            }
+            // ...and ONE default chart - what every older session means - writes
+            // no tchart line at all, so such a session is the file an older
+            // viewer wrote
+            {
+                app.tcharts.assign(1, App::TemporalChart{});
+                saveSession(sess, true);
+                std::ifstream in(std::filesystem::u8path(sess), std::ios::binary);
+                std::string txt((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+                check(!txt.empty() && txt.find("\ntchart") == std::string::npos,
+                      "E8 one default chart writes no tchart line");
+            }
+            app.tcharts = chartsBefore;
             std::filesystem::remove(std::filesystem::u8path(sess), ec);
         }
 

@@ -619,6 +619,62 @@ def load(path):
 
 
 @case
+def harness_stack_covariates():
+    """4.5 (#314): a stack's covariates -- observed per frame, the setting unchanged --
+    travel as ONE member per node: (F,) + 0-D name/unit for one, (F, K) + K-long
+    string arrays for K.  The stream says the same (F, K) in its own words."""
+    need_numpy(); need_runner()
+    d = tempdir()
+    path = os.path.join(d, "drift.npz")
+    np.savez(path, data=np.zeros((3, 4, 5), dtype="uint16"),
+             tc=np.array([25.0, 30.5, 41.25]), lx=np.array([100.0, 101.0, 99.5]))
+    two = """
+import numpy as np
+from viewer_import import Stack, Values
+def load(path):
+    z = np.load(path)
+    return Stack(z["data"], timestamps=Values([0.0, 0.5, 1.0], unit="s"),
+                 covariates=[Values(z["tc"], "temperature", "C"),
+                             Values(z["lx"], "illuminance", "lx")])
+"""
+    _, out = run_adapter(two, "load", path)
+    m = members(out)
+    v = m["__covariates_values_0"]
+    assert v.shape == (3, 2), v.shape
+    assert np.array_equal(v[:, 0], [25.0, 30.5, 41.25]) and np.array_equal(v[:, 1], [100.0, 101.0, 99.5])
+    assert list(m["__covariates_name_0"]) == ["temperature", "illuminance"]
+    assert list(m["__covariates_unit_0"]) == ["C", "lx"]
+    assert "__conditions_values_0" not in m, "a covariate is not a condition (4.5)"
+    one = two.replace(""",
+                             Values(z["lx"], "illuminance", "lx")]""", "]")
+    _, out1 = run_adapter(one, "load", path)
+    m1 = members(out1)
+    assert m1["__covariates_values_0"].shape == (3,)
+    assert scalar(m1, "__covariates_name_0") == "temperature"
+    assert scalar(m1, "__covariates_unit_0") == "C"
+    import io
+    import run_adapter as ra
+    nd = ra.Node("stack", -1)
+    nd.covariates = [(np.array([25.0, 30.5]), "temperature", "C"),
+                     (np.array([100.0, 101.0]), "illuminance", "lx")]
+    fh = io.BytesIO()
+    ra.stream_out(fh, [nd])
+    text = fh.getvalue().decode("utf-8")
+    assert "covariates_cols 0 2\n" in text, text
+    assert "covariates_name_at 0 1 illuminance\n" in text and "covariates_unit_at 0 0 C\n" in text
+    assert "covariates 0 4 25.0 100.0 30.5 101.0\n" in text, text
+    s = vi.Stack(np.zeros((3, 4, 4)), covariates={"temperature": vi.Values([1, 2, 3], unit="C")})
+    assert s.covariates[0].name == "temperature", "4.3.2: the key is the name"
+    fails(lambda: vi.Stack(np.zeros((3, 4, 4)), covariates=vi.Values([1, 2, 3], unit="C")),
+          "covariates has no name")
+    fails(lambda: vi.Stack(np.zeros((3, 4, 4)), covariates=vi.Values([1, 2], "t", "C")),
+          "covariates has 2 value(s) but there are 3 frame(s)")
+    fails(lambda: vi.Stack(np.zeros((3, 4, 4)),
+                           covariates=[vi.Values([1, 2, 3], "t", "C"), vi.Values([1, 2, 3], "T", "C")]),
+          "share a name")
+
+
+@case
 def harness_folder_adapter():
     """4.1: path may be a folder -- one condition per file is the natural series."""
     need_numpy(); need_runner()
