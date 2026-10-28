@@ -154,6 +154,11 @@ static bool g_abEqSelftest = false;
 // memory, and every assertion is a pixel value, a count or a string. See
 // histHlSelftest().
 static bool g_histHlSelftest = false;
+// --histzoom-selftest: the histogram zoom (#309) - a drag re-bins the 256 bins
+// on the dragged values, Shift / the heading switch swaps zoom and highlight,
+// and the option that makes a zoom set the display range (and its one step
+// back). No window for the --histhl-selftest reasons. See histZoomSelftest().
+static bool g_histZoomSelftest = false;
 
 // --hover-selftest: the hovered sample's three numbers (#292) - raw, 表示値 x,
 // 画面値 - on the Inspector's Pixel table, the status bar and the texture, from
@@ -737,6 +742,8 @@ static void printUsage() {
         "                              coinciding, through the real panel\n"
         "  --histhl-selftest           the value highlight (#68): the drag -> interval\n"
         "                              mapping, the paint, the count, the sentences\n"
+        "  --histzoom-selftest         the histogram zoom (#309): re-binning, the drag\n"
+        "                              switch, the zoom that sets the display range\n"
         "  --hover-selftest            the hovered sample's three numbers (#292): raw,\n"
         "                              x and screen byte agree across Inspector, status\n"
         "                              bar and texture\n"
@@ -953,6 +960,8 @@ static void parseCli(int argc, char** argv) {
             g_abEqSelftest = true;                 // handled in main()
         } else if (a == "--histhl-selftest") {
             g_histHlSelftest = true;               // handled in main()
+        } else if (a == "--histzoom-selftest") {
+            g_histZoomSelftest = true;             // handled in main()
         } else if (a == "--hover-selftest") {
             g_hoverSelftest = true;                // handled in main()
         } else if (a == "--framesize-selftest") {

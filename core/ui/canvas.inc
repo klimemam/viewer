@@ -1679,17 +1679,28 @@ static void histBinGrid(const std::string& dtype, float black, float white,
 // handed A's range instead: two histograms sharing one x axis have to be BINNED
 // alike or the overlay is a lie - and it keeps the axis A's, which is what the
 // user set. It is a cache key, so changing A's range re-bins B.
+//
+// zoomLo / zoomHi: the histogram zoom (#309), NaN when there is none. Zoomed,
+// the GRID is laid on the zoom instead of on binBlack..binWhite - by the same
+// histBinGrid, so a zoom makes the bins finer rather than stretching the old
+// ones - and the bins stop folding (state.h, HistState::zoomed). binBlack /
+// binWhite stay what they were, the range the clip rates are counted against:
+// "<black / >white" is about the DISPLAY range and a zoom is not one.
 static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                                        float binBlack = std::numeric_limits<float>::quiet_NaN(),
-                                       float binWhite = std::numeric_limits<float>::quiet_NaN()) {
+                                       float binWhite = std::numeric_limits<float>::quiet_NaN(),
+                                       float zoomLo = std::numeric_limits<float>::quiet_NaN(),
+                                       float zoomHi = std::numeric_limits<float>::quiet_NaN()) {
     const float wantBlack = std::isfinite(binBlack) ? binBlack : effBlack(*im);
     const float wantWhite = std::isfinite(binWhite) ? binWhite : effWhite(*im);
+    const bool zoomed = std::isfinite(zoomLo) && std::isfinite(zoomHi) && zoomHi > zoomLo;
     // The grid is decided HERE, above the cache comparison, so that the cache
     // key, the binning, the axis label and the shared A/B grid all see one
     // decision made in one place. Snapping below the comparison would miss the
     // cache every frame and re-scan a million pixels.
     float gOrigin = 0, gW = 0;
-    histBinGrid(im->dtype, wantBlack, wantWhite, gOrigin, gW);
+    if (zoomed) histBinGrid(im->dtype, zoomLo, zoomHi, gOrigin, gW);
+    else        histBinGrid(im->dtype, wantBlack, wantWhite, gOrigin, gW);
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
     int rx = 0, ry = 0, rw = im->w, rh = im->h;
@@ -1703,12 +1714,16 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     }
     if (H.uid == im->uid && H.dataRev == im->dataRev && H.black == wantBlack &&
         H.white == wantWhite && H.cfa == im->cfa && H.cfaPattern == im->cfaPattern &&
-        H.rx == rx && H.ry == ry && H.rw == rw && H.rh == rh)
+        H.rx == rx && H.ry == ry && H.rw == rw && H.rh == rh &&
+        H.zoomed == zoomed && (!zoomed || (H.zoomLo == zoomLo && H.zoomHi == zoomHi)))
         return;
     if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
     H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
     H.black = wantBlack; H.white = wantWhite;
     H.binOrigin = gOrigin; H.binW = gW;
+    H.zoomed = zoomed;
+    H.zoomLo = zoomed ? zoomLo : 0.0f; H.zoomHi = zoomed ? zoomHi : 0.0f;
+    H.outLoN = H.outHiN = H.finite = 0;
     H.cfa = im->cfa; H.cfaPattern = im->cfaPattern;
     H.rx = rx; H.ry = ry; H.rw = rw; H.rh = rh; H.roiUsed = roiUsed;
     memset(H.bins, 0, sizeof H.bins);
@@ -1749,6 +1764,18 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     size_t below = 0, above = 0, cnt = 0, values = 0;
     double sum[4] = {}, sum2[4] = {};
     size_t n[4] = {};
+    // One bin decision for both layouts below. Unzoomed, the end bins fold
+    // everything past them (they mean "and beyond"); zoomed, a value off the
+    // grid is counted as outside and binned nowhere.
+    auto put = [&](int s, double t) {
+        if (zoomed) {
+            if (t < 0)         H.outLoN++;
+            else if (t >= 256) H.outHiN++;
+            else               H.bins[s][(int)t]++;
+            return;
+        }
+        H.bins[s][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
+    };
     for (int y0 = 0; y0 < rh; y0 += (int)step)
         for (int y = y0; y < y0 + cell && y < rh; y++)
             for (int x = 0; x < rw; x++) {
@@ -1757,8 +1784,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                     float v = src[0];
                     if (std::isfinite(v)) {
                         int s = cfaChannelAt(*im, rx + x, ry + y);
-                        double t = ((double)v - binOrigin) / binW;
-                        H.bins[s][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
+                        put(s, ((double)v - binOrigin) / binW);
                         if (v < H.black) below++;
                         else if (v >= H.white) above++;
                         sum[s] += v; sum2[s] += (double)v * v; n[s]++;
@@ -1768,8 +1794,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
                     for (int c = 0; c < H.nSeries; c++) {
                         float v = src[c];
                         if (!std::isfinite(v)) continue;
-                        double t = ((double)v - binOrigin) / binW;
-                        H.bins[c][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
+                        put(c, ((double)v - binOrigin) / binW);
                         if (v < H.black) below++;
                         else if (v >= H.white) above++;
                         sum[c] += v; sum2[c] += (double)v * v; n[c]++;
@@ -1788,6 +1813,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
         for (int b = 0; b < 256; b++)
             H.maxBin = std::max(H.maxBin, H.bins[s][b]);
     H.sampled = cnt;
+    H.finite = values;
     H.clipLo = values ? (double)below / values : 0;
     H.clipHi = values ? (double)above / values : 0;
 }
@@ -1929,8 +1955,12 @@ struct HistHlRange {
     float lo = 0, hi = 0;
     bool loOpen = false, hiOpen = false;
 };
+// `endsFold` is whether the end bins fold what lies past them - true on the
+// display-range grid, false on a zoomed one (#309), where bin 0 and bin 255
+// are ordinary bins and the pixels past them are counted as outside instead.
+// Only then does touching an end bin open that side.
 static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
-                                  float origin, float w) {
+                                  float origin, float w, bool endsFold = true) {
     HistHlRange r;
     if (!pr.ok || !(w > 0) || !std::isfinite(w) || !std::isfinite(origin)) return r;
     if (fabsf(a.x - b.x) < 4.0f) return r;
@@ -1947,8 +1977,8 @@ static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
     r.b1 = (int)std::clamp(t1, 0.0, 255.0);
     r.lo = (float)((double)origin + (double)r.b0 * (double)w);
     r.hi = (float)((double)origin + (double)(r.b1 + 1) * (double)w);
-    r.loOpen = r.b0 == 0;
-    r.hiOpen = r.b1 == 255;
+    r.loOpen = endsFold && r.b0 == 0;
+    r.hiOpen = endsFold && r.b1 == 255;
     r.ok = true;
     return r;
 }

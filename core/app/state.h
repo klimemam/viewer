@@ -1571,6 +1571,19 @@ struct App {
         double clipLo = 0, clipHi = 0;
         size_t sampled = 0;
         bool roiUsed = false;
+        // The histogram ZOOM (#309) this slot was binned under, and what it
+        // left out. Zoomed, the grid is histBinGrid(zoomLo, zoomHi) instead of
+        // the display range's, and the bins stop folding: a pixel past either
+        // end of the grid is COUNTED here and binned nowhere, because a zoomed
+        // end bar that also meant "and everything beyond" would be the one bar
+        // on the plot that is not the value its x says. So, zoomed,
+        //   sum(bins) + outLoN + outHiN == finite
+        // and unzoomed outLoN/outHiN stay 0 (the end bins fold, as before).
+        // `finite` is the count of finite values sampled, the denominator of
+        // both clip rates, kept so the equation can be checked at all.
+        bool zoomed = false;
+        float zoomLo = 0, zoomHi = 0;
+        size_t outLoN = 0, outHiN = 0, finite = 0;
         double mean[4] = {}, sd[4] = {};      // always-on quick stats (same ROI/sampling)
         const char* seriesNames[4] = {};
     } hist[2];                        // 0 = A (the current frame), 1 = B (compare)
@@ -1588,6 +1601,46 @@ struct App {
     // what makes a CFA overlay readable at all. Presentation only - the bins
     // are computed for every plane either way.
     int histPlane = -1;
+
+    // ---- histogram zoom (#309) -------------------------------------------------
+    // WHAT A PLAIN LEFT-DRAG ON THE PLOT DOES: 0 = zoom, 1 = highlight. Shift
+    // turns a drag into the other one. The switch is drawn on the histogram's
+    // own heading row (`drag: [zoom] [highlight]`), where the gesture is, so the
+    // modifier is never the only way to find the second gesture. prefs.txt
+    // "histdrag".
+    int histDragMode = 0;
+    // `zoom sets display range`: committing a zoom also sets the display range
+    // to it, through setRange - the Range field's own path, so Per stack /
+    // Linked / A/B behave exactly as they do for a typed range. Off, the zoom
+    // writes no range at all. prefs.txt "histzoomrange".
+    bool histZoomSetsRange = false;
+    // The zoom itself. A VIEW of the histogram, not a statement about the
+    // data: Quick stats, the clip rates and the highlight's counts are not
+    // taken from it. Keyed on what A is - its stack (or, standing alone, the
+    // document), the plane on the axis and the dtype - and dropped the moment
+    // any of the three changes; a frame step inside the stack keeps it, which
+    // is the point (compare the same value window frame by frame). Not saved
+    // in the session.
+    struct HistZoom {
+        bool on = false;
+        // The GRID extent the bins are re-laid on, raw DN: histBinGrid of the
+        // dragged bins, so histBinGrid(lo, hi) hands back exactly this grid
+        // again and the axis, the label and the linked range are one pair.
+        float lo = 0, hi = 0;
+        int seqId = 0;                // > 0: A's stack; 0: the document below
+        uint64_t uid = 0;
+        int plane = -1;
+        std::string dtype;
+        // The linked option's ONE step back. prev = the raw range in force
+        // before the first linked zoom; set = what the zoom wrote. Reset gives
+        // prev back only while the range in force is still `set` (and the Link
+        // scope it was read under is unchanged): anything else means the user
+        // moved the range since, and the zoom does not overwrite them.
+        bool restore = false;
+        bool restoreLink = false;
+        float prevBlack = 0, prevWhite = 0;
+        float setBlack = 0, setWhite = 0;
+    } histZoom;
 
     // ---- value highlight (#68, docs/features/histogram/histogram-select-design.md) -------------
     // Drag a value interval on the histogram's x axis and the pixels that fall

@@ -878,6 +878,8 @@ static void migrateLayoutIni(const std::string& iniPath) {
 // abEqSelftest's reason: it is a function, and it drives the real Statistics
 // panel through real frames.
 #include "selftest/histhl.inc"
+// The histogram zoom (#309), beside the highlight it shares the drag with.
+#include "selftest/histzoom.inc"
 
 // The three numbers of one hovered sample (#292): raw, 表示値 x, 画面値, on the
 // Inspector's Pixel table, the status bar and the texture. Here beside histhl
@@ -1601,6 +1603,9 @@ int main(int argc, char** argv) {
     // the badge SAY. Windowless for the abeq reasons - fixtures in memory, and
     // every assertion is a byte, a count or a string.
     if (g_histHlSelftest) return histHlSelftest();
+    // The histogram zoom (#309): re-binning, the linked range, the drag switch.
+    // Windowless for the histhl reasons.
+    if (g_histZoomSelftest) return histZoomSelftest();
 
     // The hover readout (#292): the Inspector's Pixel table, the status bar and
     // the texture say the same three numbers about one sample. Windowless for

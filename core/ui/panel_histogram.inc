@@ -51,6 +51,14 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b,
     char xl[288];
     const std::string xu = abValueUnit(a->dtype);
     const char* xr = abRangeSaid(b != nullptr);
+    // Zoomed (#309), the bins are NOT on the range named above, so naming it
+    // would be untrue; the axis names the zoom instead, in the plot's unit.
+    char zr[96];
+    if (H.zoomed) {
+        snprintf(zr, sizeof zr, "zoomed %.6g..%.6g %s, not the display range",
+                 (double)H.zoomLo, (double)H.zoomHi, xu.c_str());
+        xr = zr;
+    }
     // The bins are snapped OUTWARD onto a round grid (histBinGrid), so the range
     // the plot actually spans is not the black-white range named above, and the
     // bin width is a quantity the reader needs in order to judge what the shape
@@ -89,7 +97,13 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b,
 // goes stale for the same two reasons and has to say so in the same words.
 static bool abHistSideStale(const ImageDoc* a, const ImageDoc* b, const App::HistState& HB) {
     if (!a || !b) return false;
-    return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a);
+    // ...and a side binned under another zoom (#309) is on another grid, the
+    // same way a side binned on another range is.
+    const App::HistZoom& Z = app.histZoom;
+    const bool zoomDiffers = HB.zoomed != Z.on ||
+                             (Z.on && (HB.zoomLo != Z.lo || HB.zoomHi != Z.hi));
+    return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a) ||
+           zoomDiffers;
 }
 
 // One side of the Statistics panel: A, B, or a lettered slot. It is built ONCE,
@@ -126,6 +140,109 @@ struct HistSide {
 // that the projection's plane selector and this one are one setting.
 static std::string g_histSideProbe;
 
+// ---- the histogram zoom (#309) ----------------------------------------------
+// A drag on the plot re-lays the 256 bins on the dragged values - the bins get
+// FINER, which is what a zoom of a histogram is worth; stretching the old bars
+// would only magnify their width. The state is app.histZoom (state.h says what
+// it is keyed on and why); these are its only writers.
+//
+// What the panel SAID about the zoom on its last frame, for --histzoom-selftest,
+// on g_histSideProbe's pattern: "mode=zoom;" (what a plain drag does),
+// "zoomed=100..356;" while zoomed, "note=..." the sentence on the plot,
+// "marks=black,white;" which display-range lines were drawn, "hl=left|right;"
+// when the highlight lies off the zoomed axis, and "out=A:...;" per side.
+static std::string g_histZoomProbe;
+static void histZoomProbeAdd(const std::string& k, const std::string& v) {
+    g_histZoomProbe += k + "=" + v + ";";
+}
+
+// The range a linked zoom reads and writes: the one setRange writes for `im`.
+static void histZoomRawRange(const ImageDoc& im, float& b, float& w) {
+    if (app.linkRange) { b = app.linkBlack; w = app.linkWhite; }
+    else               { b = im.black;      w = im.white; }
+}
+
+// Is the zoom still about the A on screen? Same stack (a step keeps it), or the
+// same document when A stands alone; same plane; same dtype.
+static bool histZoomKeyHolds(const ImageDoc* im) {
+    const App::HistZoom& Z = app.histZoom;
+    if (!im) return false;
+    const bool sameDoc = im->seqId > 0 ? im->seqId == Z.seqId : (Z.seqId == 0 && im->uid == Z.uid);
+    return sameDoc && app.histPlane == Z.plane && im->dtype == Z.dtype;
+}
+
+// Drop a zoom whose key no longer holds. Not a reset: the range is not given
+// back, because the document it was taken from is no longer the one on screen.
+static void histZoomSync(const ImageDoc* im) {
+    if (app.histZoom.on && !histZoomKeyHolds(im)) app.histZoom = App::HistZoom{};
+}
+
+// NaN NaN when there is no zoom - recomputeHistogramIfNeeded's "none".
+static void histZoomRange(float& lo, float& hi) {
+    lo = hi = std::numeric_limits<float>::quiet_NaN();
+    if (app.histZoom.on) { lo = app.histZoom.lo; hi = app.histZoom.hi; }
+}
+
+// Commit a zoom onto the dragged interval [lo, hi) (already snapped onto the bin
+// grid the drag was made on, whose width is curW). Returns false - and says why
+// - when the range would not bin any finer: an integer histogram at 1 DN/bin
+// has nothing finer to show, and a "zoom" there would only shift the window.
+static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW) {
+    if (!im || !(hi > lo)) return false;
+    float o = 0, w = 0;
+    histBinGrid(im->dtype, lo, hi, o, w);
+    if (!(w < curW)) {
+        char b[160];
+        snprintf(b, sizeof b, "zoom: the bins are already %.6g DN wide - that range "
+                              "would not bin any finer", (double)curW);
+        toast(b, false);
+        return false;
+    }
+    App::HistZoom& Z = app.histZoom;
+    Z.on = true;
+    Z.lo = o;
+    Z.hi = (float)((double)o + 256.0 * (double)w);
+    Z.seqId = im->seqId; Z.uid = im->uid;
+    Z.plane = app.histPlane; Z.dtype = im->dtype;
+    if (app.histZoomSetsRange) {
+        float rb = 0, rw = 0;
+        histZoomRawRange(*im, rb, rw);
+        // The step back is taken from the range in force before the FIRST zoom
+        // of a run - unless the user moved the range since the last one wrote
+        // it, and then from where they put it.
+        if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite) {
+            Z.prevBlack = rb; Z.prevWhite = rw;
+            Z.restoreLink = app.linkRange;
+            Z.restore = true;
+        }
+        setRange(*im, Z.lo, Z.hi);
+        histZoomRawRange(*im, Z.setBlack, Z.setWhite);
+    }
+    return true;
+}
+
+// Reset the zoom (double-click in zoom mode, or `reset zoom`). With the linked
+// option on, the range before the first zoom comes back - but only if the range
+// in force is still the one the zoom wrote; an Auto or a typed range in between
+// is the user's later word and is left alone.
+static void histZoomReset(ImageDoc* im) {
+    App::HistZoom& Z = app.histZoom;
+    if (Z.on && Z.restore && app.histZoomSetsRange && im && Z.restoreLink == app.linkRange) {
+        float rb = 0, rw = 0;
+        histZoomRawRange(*im, rb, rw);
+        if (rb == Z.setBlack && rw == Z.setWhite) setRange(*im, Z.prevBlack, Z.prevWhite);
+    }
+    Z = App::HistZoom{};
+}
+
+// The zoom's drag band: the Temporal box-zoom's blue, so the two zooms in the
+// app look like one gesture, and never the highlight's magenta.
+static ImU32 histZoomInk(int alpha) { return IM_COL32(120, 190, 255, alpha); }
+
+// What a drag does with Shift held or not: the heading row's switch names the
+// plain drag, Shift is the other one.
+static bool histDragZooms(bool shift) { return (app.histDragMode == 0) != shift; }
+
 // ---- value highlight, the plot side (#68, docs/features/histogram/histogram-select-design.md) --
 // The band and the gesture. Both derive their colour from HL_INK rather than
 // spelling magenta again, so §11's "one constant" really is one constant.
@@ -142,6 +259,22 @@ static ImU32 histHlBandInk(int alpha) {
 static void histHlBand(const PlotRect& pr) {
     if (!pr.ok || !app.highlight.on) return;
     const App::HistHighlight& H = app.highlight;
+    // A zoomed axis can leave the whole interval off the plot (#309). A band
+    // pinned 1 px wide at the edge would claim the values are there; say on
+    // which side they are instead.
+    const bool offLeft = H.hi <= pr.xmin, offRight = H.lo >= pr.xmax;
+    if (offLeft || offRight) {
+        ImFont* f = ImGui::GetFont();
+        const bool tri = f && f->FindGlyphNoFallback((ImWchar)(offLeft ? 0x25C0 : 0x25B6));
+        const char* t = offLeft ? (tri ? "\xE2\x97\x80 highlight outside" : "< highlight outside")
+                                : (tri ? "highlight outside \xE2\x96\xB6" : "highlight outside >");
+        const ImVec2 ts = ImGui::CalcTextSize(t);
+        const float y = (pr.p0.y + pr.p1.y - ts.y) * 0.5f;
+        const float x = offLeft ? pr.p0.x + 4 * app.uiScale : pr.p1.x - ts.x - 4 * app.uiScale;
+        ImGui::GetWindowDrawList()->AddText(ImVec2(x, y), histHlBandInk(230), t);
+        histZoomProbeAdd("hl", offLeft ? "left" : "right");
+        return;
+    }
     // An OPEN side runs to the edge of the plot, because that is exactly what
     // the end bar it touched means; a closed one lands on its own value.
     float x0 = H.loOpen ? pr.p0.x : pr.at(H.lo, pr.ymin).x;
@@ -157,17 +290,31 @@ static void histHlBand(const PlotRect& pr) {
     dl->AddRect(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(150));
 }
 
-// Left-drag across the plot arms on RELEASE; double-click clears. Nothing is
-// repainted while the mouse is down - the band follows live and the PAINT
-// happens once, on release, which is the Temporal box-zoom's gesture economy
-// and the reason a 12 Mpx frame is not re-rendered per mouse-move. The vertical
-// extent carries no meaning (y is frequency), so the band is always full
-// height. The histogram has no drag gesture of its own and no zoom, so there is
-// nothing here to collide with.
-static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState& H) {
+// The plot's one drag gesture, which is TWO (#309): zoom and highlight. Which
+// one a plain left-drag is comes from the heading row's `drag: [zoom]
+// [highlight]` switch (app.histDragMode); Shift, held when the button goes
+// down, makes it the other. Decided at the PRESS, so letting go of Shift
+// mid-drag does not turn a highlight into a zoom under the cursor.
+//
+// Both commit on RELEASE. Nothing is re-binned or repainted while the mouse is
+// down - the band follows live and the work happens once, which is the Temporal
+// box-zoom's gesture economy and the reason a 12 Mpx frame is not re-rendered
+// per mouse-move. The vertical extent carries no meaning (y is frequency), so
+// the band is always full height, in blue for a zoom and magenta for a
+// highlight.
+//
+// Double-click undoes what a PLAIN drag does: the zoom in zoom mode, the
+// highlight in highlight mode. The other one has its button on screen
+// (`reset zoom` on the heading row, `clear` on the highlight's footer line).
+//
+// Both are taken against the bin grid on the axis, i.e. the zoomed one while
+// zoomed - so a highlight dragged on a zoomed plot snaps to the fine bins it
+// was drawn on, and its end bins are closed (nothing folds into them there).
+static void histDragGesture(const PlotRect& pr, ImageDoc* im, const App::HistState& H) {
     if (!pr.ok || !im) return;
     static ImVec2 dragA;
     static bool dragging = false;
+    static bool dragZoom = false;
     // WHICH plot the drag began on. Side by side calls this twice per frame
     // with two different rectangles, and a gesture is one gesture: without
     // this, a drag started in the B half was completed by the A half's call
@@ -179,7 +326,8 @@ static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState
     const bool hov = ImGui::IsMouseHoveringRect(pr.p0, pr.p1) &&
                      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        histHlClear();
+        if (app.histDragMode == 0) histZoomReset(im);
+        else                       histHlClear();
         dragging = false;
         return;
     }
@@ -187,20 +335,27 @@ static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState
         dragA = ImGui::GetMousePos();
         dragOn = pr.p0.x;
         dragging = true;
+        dragZoom = histDragZooms(ImGui::GetIO().KeyShift);
     }
     if (dragging && dragOn != pr.p0.x) return;      // the other half's plot
     if (dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const ImVec2 m = ImGui::GetMousePos();
         float x0 = std::clamp(std::min(dragA.x, m.x), pr.p0.x, pr.p1.x);
         float x1 = std::clamp(std::max(dragA.x, m.x), pr.p0.x, pr.p1.x);
-        dl->AddRectFilled(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(40));
-        dl->AddRect(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y), histHlBandInk(150));
+        dl->AddRectFilled(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y),
+                          dragZoom ? histZoomInk(30) : histHlBandInk(40));
+        dl->AddRect(ImVec2(x0, pr.p0.y), ImVec2(x1, pr.p1.y),
+                    dragZoom ? histZoomInk(160) : histHlBandInk(150));
     }
     if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         dragging = false;
         const HistHlRange r = histHlFromDrag(pr, dragA, ImGui::GetMousePos(),
-                                             H.binOrigin, H.binW);
+                                             H.binOrigin, H.binW, !H.zoomed);
         if (!r.ok) return;                    // a click with jitter is not a drag
+        if (dragZoom) {
+            histZoomApply(im, r.lo, r.hi, H.binW);
+            return;
+        }
         // The binding is decided HERE, once, at the moment of the drag - and a
         // document on which "in range" would be ambiguous is declined out loud
         // rather than painted on a guess.
@@ -217,8 +372,12 @@ static void histHlGesture(const PlotRect& pr, ImageDoc* im, const App::HistState
 
 static void drawPanelHistogram() {
     g_histSideProbe.clear();
+    g_histZoomProbe.clear();
     ImageDoc* im = cur();
+    histZoomSync(im);
     if (im && im->w > 0 && im->h > 0) {
+        float zLo, zHi;
+        histZoomRange(zLo, zHi);
         ImageDoc* Bim = abStatsB();
         pumpCompareSlotRestore();
         // The lettered slots resolve exactly as B does, follow-frame included,
@@ -234,21 +393,24 @@ static void drawPanelHistogram() {
         // it, and a growth under them would dangle exactly the way seqInfo()'s
         // pointers into app.seqs did (cc1ee8b) - on MSVC and not here.
         app.histExtra.resize(app.cmpExtra.size());
-        recomputeHistogramIfNeeded(im, app.hist[0]);
+        recomputeHistogramIfNeeded(im, app.hist[0], std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN(), zLo, zHi);
         // Every other side is binned on A's black/white: one x axis, one bin
         // grid, or the curves are not comparable. Sizes may differ freely - the
         // y axis below normalises that away. Skipped while frames are being
         // stepped: an empty slot is always filled, a filled one waits for the
         // stepping to stop and is labelled stale until then. The slots take
         // B's rule unchanged, so N of them cannot turn a held arrow key into N
-        // full passes over N images.
+        // full passes over N images. A zoom is A's grid too, so it reaches
+        // every side the same way.
         if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
-            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im));
+            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im),
+                                       zLo, zHi);
         for (const ResolvedSlot& rs : xslots)
             if (rs.idx < app.histExtra.size() &&
                 (!abStepBusy() || app.histExtra[rs.idx].uid == 0))
                 recomputeHistogramIfNeeded(rs.doc, app.histExtra[rs.idx],
-                                           effBlack(*im), effWhite(*im));
+                                           effBlack(*im), effWhite(*im), zLo, zHi);
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         // ...or B is not A's partner at all: follow-frame found no frame of
@@ -337,6 +499,53 @@ static void drawPanelHistogram() {
             float cbW = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + ImGui::CalcTextSize("log").x;
             ImGui::SameLine(std::max(ImGui::GetContentRegionMax().x - cbW, 0.0f));
             ImGui::Checkbox("log##hist", &app.histLog);
+        }
+        // ---- what a drag on the plot does (#309), on the heading row of the
+        // plot it acts on: a modifier nobody can see is not a way to find the
+        // second gesture. The lit button is the PLAIN drag; Shift gives the
+        // other, and the dim note after them says which that is.
+        {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("drag:");
+            auto modeButton = [&](const char* label, int mode) {
+                ImGui::SameLine();
+                const bool lit = app.histDragMode == mode;
+                if (lit) {
+                    const ImVec4 a = ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive);
+                    ImGui::PushStyleColor(ImGuiCol_Button, a);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, a);
+                }
+                if (ImGui::SmallButton(label) && app.histDragMode != mode) {
+                    app.histDragMode = mode;
+                    savePrefs();
+                }
+                if (lit) ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(mode == 0
+                        ? "Drag on the plot zooms: the 256 bins are laid again on the\n"
+                          "values you dragged, so they get finer. Double-click resets.\n"
+                          "Shift+drag highlights a value range instead."
+                        : "Drag on the plot highlights a value range on the image.\n"
+                          "Double-click clears it. Shift+drag zooms instead.");
+            };
+            modeButton("zoom##histdrag", 0);
+            modeButton("highlight##histdrag", 1);
+            ImGui::SameLine();
+            ImGui::TextDisabled(app.histDragMode == 0 ? "(Shift: highlight)" : "(Shift: zoom)");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("zoom sets display range##hist", &app.histZoomSetsRange))
+                savePrefs();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("On: a zoom also sets the display range to it, exactly as\n"
+                                  "typing it into Range would (Per stack / Linked / A/B rules).\n"
+                                  "Resetting the zoom gives back the range from before the\n"
+                                  "first zoom - unless the range was changed in between.\n"
+                                  "Off: the zoom never touches the display range.");
+            if (app.histZoom.on) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("reset zoom##hist")) histZoomReset(im);
+            }
+            histZoomProbeAdd("mode", app.histDragMode == 0 ? "zoom" : "highlight");
         }
         static const ImU32 CFA_COLS[4] = { IM_COL32(255, 92, 92, 170), IM_COL32(120, 230, 120, 170),
                                            IM_COL32(60, 180, 140, 170), IM_COL32(92, 155, 255, 170) };
@@ -656,12 +865,60 @@ static void drawPanelHistogram() {
             g_histSideProbe += std::string("layout=") + (side ? "side" : "overlay") + ";";
         }
 
+        // ---- the zoom, declared on the plot (#309). A magnified chart that
+        // does not announce itself reads as the whole distribution, so while
+        // zoomed every pane carries the Temporal chart's sentence, top right -
+        // naming the gesture that undoes it in THIS drag mode, because in
+        // highlight mode a double-click clears the highlight instead. And the
+        // display range, where it falls inside the zoom, is marked with a
+        // dashed line at black and at white: with the linked option off the
+        // picture is still drawn on that range, and this is where it sits on
+        // the axis being looked at.
+        bool zoomSaid = false;
+        auto zoomOverlay = [&](const PlotRect& pr) {
+            if (!pr.ok || !H.zoomed) return;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float eb = effBlack(*im), ew = effWhite(*im);
+            std::string marks;
+            const float dash = 4 * app.uiScale;
+            auto mark = [&](float v, const char* name) {
+                if (!(v >= pr.xmin && v <= pr.xmax)) return;
+                const float x = pr.at(v, pr.ymin).x;
+                ImVec2 seg[2] = { ImVec2(x, pr.p0.y), ImVec2(x, pr.p1.y) };
+                addDashedPolyline(dl, seg, 2, IM_COL32(225, 225, 225, 170), 1.0f, dash, dash);
+                const ImVec2 ts = ImGui::CalcTextSize(name);
+                dl->AddText(ImVec2(std::min(x + 3 * app.uiScale, pr.p1.x - ts.x),
+                                   pr.p1.y - ts.y - 2 * app.uiScale),
+                            IM_COL32(225, 225, 225, 200), name);
+                marks += std::string(marks.empty() ? "" : ",") + name;
+            };
+            mark(eb, "black");
+            mark(ew, "white");
+            char zt[128];
+            snprintf(zt, sizeof zt, app.histDragMode == 0
+                                        ? "zoomed %.6g..%.6g - double-click to reset"
+                                        : "zoomed %.6g..%.6g - reset zoom above",
+                     (double)H.zoomLo, (double)H.zoomHi);
+            const ImVec2 ts = ImGui::CalcTextSize(zt);
+            dl->AddText(ImVec2(pr.p1.x - ts.x - 4 * app.uiScale, pr.p0.y + 2 * app.uiScale),
+                        AB_AMBER32, zt);
+            if (!zoomSaid) {
+                zoomSaid = true;
+                char zr[64];
+                snprintf(zr, sizeof zr, "%.6g..%.6g", (double)H.zoomLo, (double)H.zoomHi);
+                histZoomProbeAdd("zoomed", zr);
+                histZoomProbeAdd("note", zt);
+                histZoomProbeAdd("marks", marks);
+            }
+        };
+
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                     false, false, plotH);
             histHlBand(hp);                 // under the curves
             drawAll(hp);
-            histHlGesture(hp, im, H);
+            zoomOverlay(hp);
+            histDragGesture(hp, im, H);
             if (!leg.empty())  slotLegendRow(leg, true);
             else if (Bim)      drawABLegendRow(abDocLabel(im), bLabel, bStale);
         } else {
@@ -691,7 +948,8 @@ static void drawPanelHistogram() {
                                             false, false, plotH);
                     histHlBand(hp);
                     drawPane(hp, i);
-                    histHlGesture(hp, im, H);
+                    zoomOverlay(hp);
+                    histDragGesture(hp, im, H);
                 }
                 ImGui::EndChild();
             }
@@ -721,9 +979,24 @@ static void drawPanelHistogram() {
                 if (i >= 2 && sd.H->img && sd.H->img->dtype != im->dtype)
                     tail += "  [" + sd.H->img->dtype + " vs A " + im->dtype + "]";
             } else if (cfaHist) tail = " | R/Gr/Gb/B";
-            ImGui::TextDisabled("%s  %zu px | <black %.2f%%  >white %.2f%%%s",
+            // Zoomed (#309), what fell off the grid, counted the way the clip
+            // rates are - a share of this side's finite sampled values - and
+            // beside them, because it is the same kind of statement about the
+            // plot: these pixels exist and no bar shows them.
+            std::string out;
+            if (sd.H->zoomed) {
+                const double fin = (double)std::max<size_t>(sd.H->finite, 1);
+                char ob[160];
+                snprintf(ob, sizeof ob, " | outside zoom <%.6g %.2f%%  >=%.6g %.2f%%",
+                         (double)sd.H->zoomLo, (double)sd.H->outLoN / fin * 100.0,
+                         (double)sd.H->zoomHi, (double)sd.H->outHiN / fin * 100.0);
+                out = ob;
+                histZoomProbeAdd("out", sd.letter + ":" + out.substr(3));
+            }
+            ImGui::TextDisabled("%s  %zu px | <black %.2f%%  >white %.2f%%%s%s",
                                 sd.letter.c_str(), sd.H->sampled,
-                                sd.H->clipLo * 100.0, sd.H->clipHi * 100.0, tail.c_str());
+                                sd.H->clipLo * 100.0, sd.H->clipHi * 100.0, out.c_str(),
+                                tail.c_str());
             if (sd.stale) {   // never inside the disabled string: it must stand out
                 ImGui::SameLine(0.0f, ImGui::GetFontSize() * 0.5f);
                 ImGui::TextColored(AB_AMBER, "%s", AB_STALE_TOKEN);
