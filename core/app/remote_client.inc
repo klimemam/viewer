@@ -538,6 +538,7 @@ static void pumpRemoteFetch() {
             S.w = d.w; S.h = d.h; S.ch = d.ch;
             S.data = std::move(d.data);
             S.vmin = d.vmin; S.vmax = d.vmax;
+            S.measured = true;        // minMaxOf on the worker (#321 §6)
             S.f32loss = d.f32loss;    // measured on the worker; see RFetchDone
             doc->syncMirrors();
             // §6.2: the same url+frame may already be resident (the same remote
@@ -591,6 +592,7 @@ static void pumpRemoteFetch() {
         S.remoteStep = 1;
         S.remoteErr.clear();
         S.vmin = d.vmin; S.vmax = d.vmax;        // measured on the worker
+        S.measured = true;
         S.f32loss = d.f32loss;    // ...and so was this: the preview's census was
                                   // over the decimated samples, and these are
                                   // different pixels. Replaced wholesale with

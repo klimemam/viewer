@@ -62,7 +62,16 @@ static ImageDoc* resolveBAt(const ImageDoc* a, bool& diverged) {
         ImageDoc* b = nullptr;
         for (const auto& d : app.images)
             if (d->uid == app.compareBUid) { b = d.get(); break; }
-        if (!b) { app.compareBUid = 0; return nullptr; }      // B was closed
+        if (!b) {
+            // B was closed (or replaced without handing its seat on). The name
+            // goes too: the fallback below exists for a session's B, which has
+            // no uid yet, and left armed here it re-latched B onto the FIRST
+            // doc of that name - in a capture series that is a frame of another
+            // stack, A's own included, and the union then spanned A with itself
+            // until the files were reopened (#321 §6 suspect 4).
+            app.compareBUid = 0; app.compareB.clear(); app.compareBSeq = -1;
+            return nullptr;
+        }
         return followFrame(b, a, diverged);
     }
     if (app.compareB.empty()) return nullptr;
@@ -75,6 +84,15 @@ static ImageDoc* resolveBAt(const ImageDoc* a, bool& diverged) {
         return d.get();
     }
     return nullptr;
+}
+// A doc replaced IN PLACE (a new uid in the same slot: restore full frame, a
+// raw reinterpret) keeps the compare seats it held - B, the remembered B, a
+// slot - instead of losing them to the uid change.
+static void carryCompareSeats(uint64_t oldUid, uint64_t newUid) {
+    if (!oldUid || oldUid == newUid) return;
+    if (app.compareBUid == oldUid) app.compareBUid = newUid;
+    if (app.lastCompareBUid == oldUid) app.lastCompareBUid = newUid;
+    for (uint64_t& u : app.cmpExtra) if (u == oldUid) u = newUid;
 }
 static ImageDoc* resolveB() {
     bool div = false;
@@ -226,6 +244,14 @@ static bool abProjOverlayable(const App::ProjState& A, const App::ProjState& B) 
 static bool g_abNoThrottle = false;
 // True while frames are being stepped continuously. The B slots skip their
 // recompute then; whoever draws B must say "stale" (docs/features/compare/ab-stats-plan.md 1).
+// Is a frame still owed for the A/B step throttle at time t? Up to the deadline
+// the throttle holds B's statistics; a frame AFTER it is the one that refreshes
+// them. A frame drawn just before the deadline still finds the throttle on, so
+// without the tail the refresh waited for the next mouse move - the Histogram's
+// B side stayed on the frame before the union, and "union did nothing" was what
+// the panel said (#321 §6 suspect 5).
+static constexpr double AB_STEP_TAIL = 0.05;
+static bool abStepRefreshOwed(double t) { return t < app.abStepBusyUntil + AB_STEP_TAIL; }
 static bool abStepBusy() {
     return !g_abNoThrottle && app.abStepBusyUntil > nowSec();
 }
@@ -849,6 +875,7 @@ static void computeMinMax(ImageDoc& im) {
     float mn = 0, mx = 1;
     minMaxOf(im.px(), mn, mx);
     im.src->vmin = mn; im.src->vmax = mx;   // the source's truth...
+    im.src->measured = true;
     im.vmin = mn; im.vmax = mx;             // ...and the doc's mirror of it
     // The cached "Auto %" answer was measured from the pixels this just
     // re-measured, so it no longer describes them (#248). Only THIS doc is

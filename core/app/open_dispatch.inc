@@ -1394,6 +1394,7 @@ static bool reloadLand(const std::shared_ptr<FrameSource>& src, const ReloadSpec
         src->data = std::move(nd->src->data);
         src->w = N.w; src->h = N.h; src->ch = N.ch;
         src->dtype = N.dtype; src->vmin = N.vmin; src->vmax = N.vmax;
+        src->measured = N.measured;
         src->srcW = N.srcW; src->srcH = N.srcH; src->cropX = N.cropX; src->cropY = N.cropY;
         src->npyShape = N.npyShape;   // the DISK's new shape: §3.3's menu must
                                       // offer what the file now permits.

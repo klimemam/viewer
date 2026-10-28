@@ -275,6 +275,15 @@ struct FrameSource {
     int w = 0, h = 0, ch = 1;
     std::string dtype;
     float vmin = 0, vmax = 1;         // data min/max
+    // ...and whether those two numbers were MEASURED from `data` (#321 §6).
+    // 0..1 is the default AND a perfectly good measurement, so the numbers
+    // cannot say it themselves: a source nobody measured used to enter the A/B
+    // union as 0..1 - invisible for u16 (the union collapsed to A's range),
+    // fatal for a 0.3..0.6 float (the union snapped to 0..1) - and reopening
+    // the file, which measures, "fixed" it. Set by computeMinMax and by the
+    // landings that copy a worker's measurement; the union refuses a side
+    // without it, and says so.
+    bool measured = false;
     // What holding these pixels as float32 COST, measured by whichever decoder
     // narrowed them (rp::F32Loss, core/remote_proto.h). Zeroed for every dtype
     // float32 holds exactly, which is all of them but u32 / i32 / f64 - so an

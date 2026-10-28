@@ -1799,6 +1799,89 @@
             app.cmpExtra = saveExtra; app.current = saveCurrent;
         }
 
+        {   // ---- P25 / P26 / P27: why the union could look switched off (#321 §6)
+            const int saveCmpR = app.compareRangeMode, saveRule = app.rangeRule;
+            const bool saveLink = app.linkRange;
+            const auto saveCmpMode = app.compareMode;
+            const bool saveFollow = app.compareFollowFrame;
+            const uint64_t saveBUid = app.compareBUid, saveLastB = app.lastCompareBUid;
+            const std::string saveBName = app.compareB;
+            const int saveBSeq = app.compareBSeq;
+            const std::vector<uint64_t> saveExtra = app.cmpExtra;
+            const int saveCurrent = app.current;
+            const size_t imgWas = app.images.size();
+            auto A = mkRamp("same.npy", 0.3f, 0.6f, 0, 0.0f);
+            auto B = mkRamp("same.npy", 0.35f, 0.5f, 0, 0.0f);
+            auto C = mkRamp("same.npy", 0.1f, 0.9f, 0, 0.0f);
+            A->seqId = 4290; B->seqId = 4291; C->seqId = 4292;
+            A->black = 0.3f; A->white = 0.6f;
+            ImageDoc* pA = A.get(); ImageDoc* pB = B.get(); ImageDoc* pC = C.get();
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(A));
+            pool.push_back(std::move(B));
+            pool.push_back(std::move(C));
+            std::swap(app.images, pool);
+            app.linkRange = false;
+            app.rangeRule = RR_OneRange;
+            app.compareRangeMode = 2;
+            app.compareFollowFrame = false;
+            app.cmpExtra.clear();
+            app.current = 0;
+            setCompareB(pB);
+            app.compareMode = App::CmpSplit;
+            auto ok = [&](const char* tag, bool c, const char* what) {
+                fprintf(stderr, "rangeselftest: %s %s %s\n", tag, what, c ? "ok" : "WRONG");
+                if (!c) bad++;
+            };
+            // ---- P25: a side nobody measured does not enter the union ----
+            ok("P25", effBlack(*pA) == 0.3f && effWhite(*pA) == 0.6f, "fixture: B inside A, the union is 0.3..0.6");
+            pB->src->vmin = 0.0f; pB->src->vmax = 1.0f; pB->src->measured = false;   // the default
+            pB->syncMirrors();
+            const RangeWords w25 = rangeWords(*pA, comparedSides());
+            fprintf(stderr, "rangeselftest: P25 words \"%s\" amber %d | A drawn %.6g..%.6g\n",
+                    w25.said.c_str(), w25.amber ? 1 : 0, effBlack(*pA), effWhite(*pA));
+            ok("P25", effBlack(*pA) == 0.3f && effWhite(*pA) == 0.6f &&
+                      effBlack(*pB) == 0.3f && effWhite(*pB) == 0.6f,
+               "an unmeasured B: every side at A's range, not a union over B's 0..1 default");
+            ok("P25", w25.amber && w25.said == "union over A, B — B not measured, showing A's range",
+               "...and the words say \"B not measured, showing A's range\", in amber");
+            computeMinMax(*pB);
+            ok("P25", pB->src->measured && rangeWords(*pA, comparedSides()).said == "union over A, B (min-max)",
+               "measured: the union again");
+            // ---- P26: new pixels on B move A to the new union ----
+            pA->texBlack = effBlack(*pA); pA->texWhite = effWhite(*pA);   // A's texture, built
+            for (float& v : pB->src->data) v += 1.0f;                      // B reloaded: 1.35..1.5
+            float mn = 0, mx = 0;
+            minMaxOf(pB->src->data, mn, mx);
+            pB->src->vmin = mn; pB->src->vmax = mx; pB->src->measured = true;
+            pB->syncMirrors();                                             // the reload walk
+            ok("P26", effBlack(*pA) == 0.3f && effWhite(*pA) == mx && pA->texWhite != effWhite(*pA),
+               "B's source re-measured: A follows the new union, and A's texture no longer matches it");
+            // ---- P27: a B that is gone does not come back as another of its name ----
+            uint64_t bu = pB->uid;
+            const uint64_t nu = app.nextUid++;
+            carryCompareSeats(bu, nu);
+            ok("P27", app.compareBUid == nu && app.lastCompareBUid == nu, "a doc replaced in place keeps the B seat");
+            pB->uid = nu;
+            std::unique_ptr<ImageDoc> gone = std::move(app.images[1]);     // B closed
+            app.images.erase(app.images.begin() + 1);
+            ImageDoc* r1 = resolveB();
+            ImageDoc* r2 = resolveB();
+            ok("P27", r1 == nullptr && r2 == nullptr && app.compareB.empty(),
+               "B closed: no B - not the next doc that happens to share its name");
+            (void)pC;
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas) {
+                fprintf(stderr, "rangeselftest: P25 app.images %zu -> %zu  NOT RESTORED\n", imgWas, app.images.size());
+                bad++;
+            }
+            app.compareRangeMode = saveCmpR; app.rangeRule = saveRule; app.linkRange = saveLink;
+            app.compareMode = saveCmpMode; app.compareFollowFrame = saveFollow;
+            app.compareBUid = saveBUid; app.lastCompareBUid = saveLastB;
+            app.compareB = saveBName; app.compareBSeq = saveBSeq;
+            app.cmpExtra = saveExtra; app.current = saveCurrent;
+        }
+
         {   // ---- S1b: the frame exception travels in the session -------------
             // `framerange <seqIndex> <black> <white>`, one line per frame that
             // keeps its own, after its stack's image line. A frame-axis .npy is

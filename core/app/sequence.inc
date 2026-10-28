@@ -772,7 +772,9 @@ static void pumpSequence() {
                                       // and the reload walk covers only
                                       // app.images - the landing itself adopts
                                       // the source's CURRENT geometry
-        if (doc->vmax <= doc->vmin) computeMinMax(*doc);   // worker normally did this
+        // the worker normally did this; asked by the flag, not by the numbers -
+        // an unmeasured source reads 0..1, which looks measured (#321 §6)
+        if (!doc->src->measured) computeMinMax(*doc);
         if (ref) {
             doc->black = ref->black; doc->white = ref->white;
             doc->cfa = ref->cfa; doc->cfaPattern = ref->cfaPattern;

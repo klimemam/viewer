@@ -2558,8 +2558,11 @@ static bool g_watchSuppressed = false;
                     // the A/B step throttle is a DEADLINE, not an event: without
                     // a frame after it expires, B's statistics stay stale until
                     // the user happens to move the mouse (the input wake tail is
-                    // 0.25 s, the throttle 0.30, and low-bandwidth has no tail)
-                    frameT0 < app.abStepBusyUntil ||
+                    // 0.25 s, the throttle 0.30, and low-bandwidth has no tail).
+                    // ...and ONE frame past it, which abStepRefreshOwed adds:
+                    // the last frame before the deadline still sees the
+                    // throttle on, and none was owed after it (#321 §6)
+                    abStepRefreshOwed(frameT0) ||
                     // auto blink alternates on a timer, so it needs frames with
                     // no input at all - same case as a background load
                     (app.compareMode == App::CmpFlip && app.flipAuto);
@@ -2682,7 +2685,7 @@ static bool g_watchSuppressed = false;
                 // a session's series wait for their stacks, then need one frame
                 working |= !app.seriesRestore.empty() || !app.seqLevelLegacy.empty();
                 working |= !app.seriesPending.empty();   // ...and so do the picker's
-                working |= nowSec() < app.abStepBusyUntil;   // B refresh pending
+                working |= abStepRefreshOwed(nowSec());      // B refresh pending
                 // a tree node whose LIST is still out: its "(listing...)" row
                 // has to become children without waiting for the mouse to move
                 working |= rbAnyTreePending();

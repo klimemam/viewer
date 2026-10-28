@@ -506,6 +506,15 @@ static void ownRangeOf(const ImageDoc& im, float& lo, float& hi) {
     lo = im.black; hi = im.white;
     if (!im.rangeOwn && app.rangeRule == RR_EachFrame) ownFitCached(const_cast<ImageDoc&>(im), lo, hi);
 }
+// The sides of `v` whose min/max nobody measured, by letter ("B", "B, C");
+// empty when the union can be taken (#321 §6 suspect 1).
+static std::string viewSideLetter(const ViewSides& v, int i);   // below
+static std::string unionUnmeasured(const ViewSides& v) {
+    std::string s;
+    for (int i = 0; i < v.n; i++)
+        if (!v.side[i]->src->measured) s += (s.empty() ? "" : ", ") + viewSideLetter(v, i);
+    return s;
+}
 // The black-white `im` is drawn at in view `v`: Link range, then the compare
 // range mode 0..3, then the document's own range (ownRangeOf) - one decision,
 // which the screen (effBlack/effWhite, displayMapOf) and every export reach.
@@ -527,6 +536,10 @@ static void displayRangeFor(const ImageDoc& im, const ViewSides& v, float& lo, f
         // included) re-fits each side.
         ownFitCached(*self, l, h);
     } else {
+        // A union over a side nobody measured is a union over its 0..1
+        // default, and it cannot be told from a real one by the numbers. So it
+        // is not taken: every side shows A's range, and rangeWords says why.
+        if (!unionUnmeasured(v).empty()) { ownRangeOf(*v.side[0], lo, hi); return; }
         l = v.side[0]->vmin;                  // union of the CONTENT, not of the
         h = v.side[0]->vmax;                  // stretches
         for (int i = 1; i < v.n; i++) {
@@ -535,6 +548,8 @@ static void displayRangeFor(const ImageDoc& im, const ViewSides& v, float& lo, f
         }
     }
     if (h > l) { lo = l; hi = h; }
+    // (h <= l cannot come out of a measurement - minMaxOf widens a flat frame
+    // by one - so the doc's own range here is a guard, not a rule.)
 }
 static float effBlack(const ImageDoc& im) {
     float lo, hi;
@@ -579,7 +594,8 @@ static std::vector<std::string> viewHeldSides(const ViewSides& v) {
 //           follow-frame could not move (viewHeldSides).
 //   warn  - what the reader must not miss, drawn amber: the sides are on
 //           different scales.
-struct RangeWords { std::string said, warn; std::vector<std::string> held; };
+//   amber - the whole line is a warning (the union could not be taken).
+struct RangeWords { std::string said, warn; std::vector<std::string> held; bool amber = false; };
 static ImageDoc* rangeRefDoc(ImageDoc& im);                       // below
 static bool rangeFitLit(ImageDoc& ref, float eb, float ew);       // below
 static std::string fmtVal(float v, const std::string& dtype);    // main.cpp
@@ -596,8 +612,19 @@ static RangeWords rangeWords(const ImageDoc& im, const ViewSides& v) {
     if (self >= 0 && app.compareRangeMode == 2) {
         r.said = "union over ";
         for (int i = 0; i < v.n; i++) r.said += (i ? ", " : "") + viewSideLetter(v, i);
+        const std::string unmeasured = unionUnmeasured(v);
+        if (!unmeasured.empty()) {             // displayRangeFor fell back: say it
+            r.said += " \u2014 " + unmeasured + " not measured, showing A's range";
+            r.amber = true;
+            return r;
+        }
         r.said += " (min-max)";
         r.held = viewHeldSides(v);
+        // a decimated preview's min/max is of every Nth pixel, not the frame's:
+        // the export refuses such a union (viewRefusalFor), the screen says it
+        for (int i = 0; i < v.n; i++)
+            if (v.side[i]->preview || v.side[i]->src->remoteStep > 1)
+                r.warn += " \u00b7 " + viewSideLetter(v, i) + " is a preview";
         return r;
     }
     if (self >= 0 && app.compareRangeMode == 3) {
@@ -1521,6 +1548,7 @@ static InForce inForceOf(const ImageDoc& im) {
     f.text = fmtVal(lo, im.dtype) + " .. " + fmtVal(hi, im.dtype) + "   " + w.said;
     for (const std::string& h : w.held) f.text += "; " + h;
     f.warn = w.warn;
+    f.amber = w.amber;
     return f;
 }
 // What a fit button reads under the rule in force (#321 §3.2): under "each
