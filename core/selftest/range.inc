@@ -634,14 +634,15 @@
             app.rangeRule = saveScope;
         }
 
-        {   // ---- P8: switching TO "Per stack" re-shares --------------------
-            // This is the reported bug itself (#248 (a)). "Auto per frame"
-            // REWRITES each frame's stored black/white as you step - main.cpp
-            // 1393 records that as known and deliberate - so a stack that has
-            // been stepped in mode 0 holds per-frame values. applyRangeMode
-            // used to only raise the scope flag, and those stored per-frame
-            // values then reappeared on every step: 「Per stack にしても一枚毎
-            // に Auto されてしまう」. The frame on screen is the reference.
+        {   // ---- P8: switching TO "one range" re-shares --------------------
+            // This was the reported bug itself (#248 (a)): "Auto per frame"
+            // used to REWRITE each frame's stored black/white as you stepped,
+            // so a stack stepped in that mode held per-frame values, and
+            // raising the scope flag alone let them reappear on every step:
+            // 「Per stack にしても一枚毎に Auto されてしまう」. Since #321 the
+            // per-frame rule writes nothing, but a stack can still hold
+            // per-frame values (an old session, the fixture below), and going
+            // back to one range must spread the frame on screen's fit.
             const bool saveLink = app.linkRange;
             const int  saveScope = app.rangeRule;
             const size_t imgWas = app.images.size();
