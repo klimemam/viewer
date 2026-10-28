@@ -90,7 +90,7 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
     f << "rangescope " << app.rangeRule << "\n";
-    // What "Auto per frame" re-fits to, and the Med fit's three parameters
+    // Which fit "each frame / each side fits itself" draws with, and the Med fit's three parameters
     // (#252) - one line, because they are one setting: the flavour is useless
     // without the target it aims at. No settings.jsonc key: this is where you
     // left the panel, not how the program should start.

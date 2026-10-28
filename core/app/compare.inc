@@ -1139,36 +1139,26 @@ static void medianFit(ImageDoc& im, float& lo, float& hi) {
     lo = black; hi = white;
 }
 
-// ONE answer to "what does re-fitting this frame mean right now" (#252), for
-// the two places that re-fit in "Auto per frame": selectImage, when a frame
-// arrives on screen, and applyRangeMode, when the mode itself is chosen. They
-// used to both call autoRange, so the mode had exactly one meaning; now it has
-// three and they must not be able to disagree about which.
+// ONE answer to "what is this frame's fit right now" (#252): min..max, the
+// 0.1-99.9% cut or median->target, as app.autoFlavor names. It writes nothing.
+// "Each frame fits itself" and "each side fits itself" (#301) both DRAW a frame
+// at exactly this fit without touching its black/white (#321 I3: the per-frame
+// rule used to write it into every frame it stepped onto), and one function
+// answering for both is what keeps the two from disagreeing.
 //
-// Only ever reached with linkRange OFF (both callers guard on it), so the
-// pooled linked branches inside the fits below never run per frame - which
-// matters: linked Auto % / Med read every open pixel.
-//
-// The answer itself is fitByFlavor, which writes nothing: "A/B: each side fits
-// itself" (#301) DISPLAYS each compared side at exactly this fit without
-// touching the side's own black/white, and one function answering for both
-// is what keeps the per-frame re-fit and that display from disagreeing.
+// Only ever reached with linkRange OFF (displayRangeFor answers the linked
+// pair first), so the pooled linked branches inside the fits below never run
+// per frame - which matters: linked Auto % / Med read every open pixel.
 static void fitByFlavor(ImageDoc& im, float& lo, float& hi) {
     lo = im.vmin; hi = im.vmax;                  // AF_MinMax, i.e. autoRange
     if (app.autoFlavor == AF_Pct)         percentileRangeCached(im, lo, hi);
     else if (app.autoFlavor == AF_Median) medianFit(im, lo, hi);
 }
-static void refitByFlavor(ImageDoc& im) {
-    float lo = 0, hi = 0;
-    fitByFlavor(im, lo, hi);
-    im.black = lo; im.white = hi;
-}
-// fitByFlavor's answer for one compared side, kept on the doc (see fitValid in
-// ImageDoc for why the caches under it are not enough on their own). Read by
-// displayRangeFor for every compared side on every UI frame. Same precondition
-// as refitByFlavor: linkRange OFF - displayRangeFor answers the linked pair
-// before the compare mode is consulted - so the pooled linked fits never run
-// here.
+// fitByFlavor's answer for one doc, kept on the doc (see fitValid in ImageDoc
+// for why the caches under it are not enough on their own). Read by
+// displayRangeFor for every frame drawn at its fit, on every UI frame. Same
+// precondition as fitByFlavor: linkRange OFF, so the pooled linked fits never
+// run here.
 // Min-max is not cached: it is two cached numbers already, and reading them
 // live keeps a vmin/vmax written by hand honest without an invalidation.
 static void ownFitCached(ImageDoc& im, float& lo, float& hi) {

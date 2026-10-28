@@ -16,32 +16,20 @@ static std::string abValueUnit(const std::string&) {
 // ...and WHOSE range that value is plotted against. It has to name the range
 // actually in force: with the union default the x axis spans A and B together,
 // and an axis that still says "A's black-white range" is simply telling the
-// reader something untrue about the picture in front of them.
-// Mode 0 is not an exception. Each side keeps its own STRETCH, but the two
-// histograms are still binned on A's black/white - one bin grid, or the curves
-// are not comparable at all (see recomputeHistogramIfNeeded) - so naming A's
-// range there stays true.
-static const char* abRangeSaid(bool haveB) {
-    // linkRange wins over all of it, and does so BEFORE any of this is consulted:
-    // effBlack/effWhite return the linked pair and never reach the A/B mode, so the
-    // axis spans the range shared by every open image - widened by stacks that
-    // have nothing to do with the comparison. The Inspector already knows this
-    // (it HIDES the A/B combo while the scope is "everything"), but the View >
-    // Compare menu still sets the mode and the default is 2 regardless, so all
-    // three combinations came out labelled with a range that was not in force.
-    if (app.linkRange) return "linked range, all open images";
-    // Slots past B widen the union (displayRangeFor spans every compared pane), so
-    // "A and B combined" undersells what the axis covers the moment C joins.
-    // The letters count only while compare is on - a seat is not a comparison.
-    const bool slots = app.compareMode != App::CmpOff && !compareExtras().empty();
-    if (!haveB && !slots) return "black-white range";
-    if (app.compareRangeMode == 2)
-        return slots ? "combined range, all compared images"
-                     : "A and B combined range";
-    // Each side is DRAWN at its own fit (#301), but the curves still share one
-    // bin grid - A's range in force, which in this mode is A's own fit.
-    if (app.compareRangeMode == 3) return "A's own fit, each side fitted to itself";
-    return "A's black-white range";
+// reader something untrue about the picture in front of them. The words are
+// rangeWords' (#321 I4) - the head of the Inspector's `in force` line - so the
+// axis and the panel cannot name two different ranges; linkRange, the compare
+// rule and "each keeps its own" are all decided there, in that order.
+static std::string rangeSaidFor(const ImageDoc* a) {
+    if (!a) return "black-white range";
+    return rangeWordsHead(rangeWords(*a, rangeReadsView() ? comparedSides() : ViewSides()));
+}
+// The screen's A, for the plots that only know whether B is there. The
+// pointer is to a buffer kept until the next call: one snprintf at a time.
+static const char* abRangeSaid(bool /*haveB*/) {
+    static std::string said;
+    said = rangeSaidFor(cur());
+    return said.c_str();
 }
 
 // The histogram's x axis label, built in one place so --range-selftest can
@@ -50,7 +38,8 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b,
                                 const App::HistState& H) {
     char xl[288];
     const std::string xu = abValueUnit(a->dtype);
-    const char* xr = abRangeSaid(b != nullptr);
+    const std::string said = rangeSaidFor(a);
+    const char* xr = said.c_str();
     // Zoomed (#309), the bins are NOT on the range named above, so naming it
     // would be untrue; the axis names the zoom instead, in the plot's unit.
     char zr[96];

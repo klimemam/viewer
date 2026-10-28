@@ -1928,9 +1928,10 @@ static bool g_watchSuppressed = false;
             // arrows: horizontal = time (frames), vertical = stacks. These six
             // are the Browse panel's row navigation too, so they yield to it
             // exactly as Ctrl+F does - otherwise one Down both steps the browse
-            // cursor AND moves the main view to the next STACK, and with
-            // rangeScope = per frame that second effect REWRITES the stored
-            // black/white of an image the user never navigated to.
+            // cursor AND moves the main view to the next STACK, an image the
+            // user never navigated to (with the old per-frame range mode that
+            // also rewrote its stored black/white; #321 made that rule display
+            // only).
             bool navKey = ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
                           ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
                           ImGui::IsKeyPressed(ImGuiKey_DownArrow) ||
@@ -3857,9 +3858,9 @@ static bool g_watchSuppressed = false;
                 // End for its rows and the main loop's shortcut table binds the
                 // same six for stack and frame navigation. Neither claims key
                 // ownership, so before the focus gate one Down BOTH stepped the
-                // browse cursor and ran gotoStack(1) on the main view - and
-                // with rangeScope = per frame that rewrote the stored
-                // black/white of an image the user never navigated to.
+                // browse cursor and ran gotoStack(1) on the main view - an
+                // image the user never navigated to (whose stored black/white
+                // the old per-frame range mode then rewrote, before #321).
                 // Both of the summary claims below rest on evidence one named
                 // action collects ("blur", "popupcheck"). A --browse-keys list
                 // that does not contain that action is not making the claim, so

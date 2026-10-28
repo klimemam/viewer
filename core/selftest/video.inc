@@ -502,13 +502,14 @@ static int videoSelftest() {
         // point available - the PNG export's OWN BYTES - so a second rendering
         // path could not slip between them unnoticed.
         //
-        // "Auto per frame" is chosen because it is the mode with WORK to do:
-        // the export must re-fit each frame to its own min..max, exactly as
-        // selectImage does on a step. The fixture makes that visible - with the
+        // "Each frame fits itself" is chosen because it is the rule with WORK
+        // to do: every frame is drawn at its own min..max, exactly as the
+        // screen draws it after a step - and, since #321, without the stored
+        // range being written (I3). The fixture makes that visible - with the
         // frames' loaded 0..1 range, frames 2 and 3 are saturated white, so a
-        // missing re-fit is a uniform picture rather than a subtle shift, and
-        // the anti-vacuity check below is precisely that.
-        app.rangeRule = 0;                 // Auto per frame
+        // missing fit is a uniform picture rather than a subtle shift, and the
+        // anti-vacuity check below is precisely that.
+        app.rangeRule = RR_EachFrame;
         app.linkRange = false;
         const int seq = mkSeq("v253_perframe");
         const int i0 = mk("v6_0.npy", seq, 0, 1.0f, 0.0f);   // 0..47
@@ -527,9 +528,10 @@ static int videoSelftest() {
         bool ranges = fr.size() == 3;
         for (size_t k = 0; k < fr.size() && ranges; k++) {
             const ImageDoc& d = *app.images[fr[k]];
-            if (d.black != d.vmin || d.white != d.vmax) ranges = false;
+            if (effBlack(d) != d.vmin || effWhite(d) != d.vmax) ranges = false;
+            if (d.black == d.vmin && d.white == d.vmax) ranges = false;   // drawn, not written
         }
-        check(ranges, "V6 every frame was re-fitted to its OWN min..max, as a step would");
+        check(ranges, "V6 every frame is drawn at its OWN min..max, and no stored range was written");
         if (A.ok && A.frames.size() == 3) {
             // ANTI-VACUITY: frame 2 under the loaded 0..1 range is uniformly
             // white. Its being a gradient is the proof that the re-fit reached
@@ -578,7 +580,7 @@ static int videoSelftest() {
         // min..max and the anti-vacuity half could not be told from a no-op.)
         const int saveFlav = app.autoFlavor, saveBM = app.medBlackMode;
         const float saveTgt = app.medTarget;
-        app.rangeRule = 0;
+        app.rangeRule = RR_EachFrame;
         app.linkRange = false;
         app.autoFlavor = AF_Median;
         app.medBlackMode = MB_Min;
@@ -597,12 +599,13 @@ static int videoSelftest() {
             ImageDoc& d = *app.images[fr[k]];
             float lo = 0, hi = 0;
             medianFit(d, lo, hi);
-            fprintf(stderr, "videoselftest: V6b frame %zu holds %.6g..%.6g | median fit %.6g..%.6g | "
-                            "min..max %.6g..%.6g\n", k + 1, d.black, d.white, lo, hi, d.vmin, d.vmax);
-            if (d.black != lo || d.white != hi) same = false;
-            if (d.black == d.vmin && d.white == d.vmax) notMinMax = false;
+            const float eb = effBlack(d), ew = effWhite(d);
+            fprintf(stderr, "videoselftest: V6b frame %zu drawn at %.6g..%.6g | median fit %.6g..%.6g | "
+                            "min..max %.6g..%.6g\n", k + 1, eb, ew, lo, hi, d.vmin, d.vmax);
+            if (eb != lo || ew != hi) same = false;
+            if (eb == d.vmin && ew == d.vmax) notMinMax = false;
         }
-        check(same, "V6b every frame was re-fitted by the flavour in force (median->target)");
+        check(same, "V6b every frame is drawn at the flavour in force (median->target)");
         check(notMinMax, "V6b ...which is not its min..max (anti-vacuity)");
         std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
         closeAll();
@@ -738,22 +741,31 @@ static int videoSelftest() {
         // main's rule for one side of the screen, derived by hand from the
         // mode and drawn with compare OFF at exactly that range, so nothing
         // of the view code decides it
+        // the range a doc wears alone (#321): its fit under "each frame fits
+        // itself", else its stored numbers
+        auto handOwn = [&](ImageDoc* d, float& lo, float& hi) {
+            lo = d->black; hi = d->white;
+            if (!d->rangeOwn && app.rangeRule == RR_EachFrame) fitByFlavor(*d, lo, hi);
+        };
         auto handBytes = [&](ImageDoc* S, int k) {
             float lo = 0, hi = 0;
             switch (app.compareRangeMode) {
-                case 1: lo = A_(k)->black; hi = A_(k)->white; break;
+                case 1: handOwn(A_(k), lo, hi); break;
                 case 2: lo = std::min({ A_(k)->vmin, B_(k)->vmin, C_(k)->vmin });
                         hi = std::max({ A_(k)->vmax, B_(k)->vmax, C_(k)->vmax }); break;
                 case 3: fitByFlavor(*S, lo, hi); break;
-                default: lo = S->black; hi = S->white; break;
+                default: handOwn(S, lo, hi); break;
             }
             const float sb0 = S->black, sw0 = S->white;
             const auto cm = app.compareMode;
+            const int rr = app.rangeRule;
             app.compareMode = App::CmpOff;
+            app.rangeRule = RR_OneRange;       // S alone, drawn at exactly lo..hi
             S->black = lo; S->white = hi;
             std::vector<uint8_t> px = screenOf(S);
             S->black = sb0; S->white = sw0;
             app.compareMode = cm;
+            app.rangeRule = rr;
             return px;
         };
         auto fnv = [](uint64_t h, const std::vector<uint8_t>& b) {
@@ -763,18 +775,17 @@ static int videoSelftest() {
         static const char* MODE[4] = { "own", "A's", "union", "each-fits" };
         static const char* FLV[3] = { "min-max", "pct", "median" };
         static const char* SCOPE_FLV[3] = { "min-max", "0.1-99.9%", "median->target" };
-        static const char* AB_FIT[3] = { "min-max", "0.1-99.9%", "median" };
-        // the range note a video announces, in the controls' words
+        // the range note a video announces, in rangeWords' words (#321 I4)
         auto wantNote = [&](int scope, int mode, int fl) {
-            const std::string sc = scope == 0 ? std::string("Auto per frame (") + SCOPE_FLV[fl] + ")"
-                                              : std::string("Per stack (default)");
+            const std::string sc = scope == 0 ? std::string("each frame fits itself (") + SCOPE_FLV[fl] + ")"
+                                              : std::string("one range for the stack");
             switch (mode) {
-                case 1: return "range: A/B: every side uses A's range - A's is " + sc +
+                case 1: return std::string("range: A's range for every side") +
                                (scope == 0 ? ", per frame" : "");
-                case 2: return std::string("range: A/B: auto over every side (union), per frame");
-                case 3: return std::string("range: A/B: each side fits itself (") + AB_FIT[fl] +
+                case 2: return std::string("range: union over A, B, C (min-max), per frame");
+                case 3: return std::string("range: each side fits itself (") + SCOPE_FLV[fl] +
                                "), per frame";
-                default: return "range: A/B: each keeps its own - " + sc;
+                default: return "range: " + sc;
             }
         };
 
@@ -825,7 +836,7 @@ static int videoSelftest() {
         }
         check(combos == 24 && allMatch,
               "V7 video frame k == the screen after selectImage(frame k), 24 combinations");
-        check(allScreen, "V7 the screen's bytes, every side, are main's rule (hand range)");
+        check(allScreen, "V7 the screen's bytes, every side, are the rule's (hand range)");
         check(anyDiffers, "V7 ...and frame 0's view would have drawn some frame differently (anti-vacuity)");
         check(notes, "V7 the video toast names the range in the controls' words, per frame");
 
@@ -866,8 +877,8 @@ static int videoSelftest() {
 
         // ---- Link range -----------------------------------------------------
         app.linkRange = true; app.linkBlack = -7.0f; app.linkWhite = 95.0f;
-        check(aStackMatches("link", "range: Linked across all images", 3),
-              "V7 Link range: video frame k == the screen, and it says \"Linked across all images\"");
+        check(aStackMatches("link", "range: one range over all open images", 3),
+              "V7 Link range: video frame k == the screen, and it says \"one range over all open images\"");
         app.linkRange = false;
 
         // ---- B's stack, exported: each B_k in its on-screen role ------------
@@ -973,7 +984,7 @@ static int videoSelftest() {
             snprintf(num, sizeof num, " = %.6g..%.6g",
                      std::min({ A_(0)->vmin, B_(0)->vmin, C_(0)->vmin }),
                      std::max({ A_(0)->vmax, B_(0)->vmax, C_(0)->vmax }));
-            check(has(said, (std::string("range: A/B: auto over every side (union) - drawn as B") + num).c_str()),
+            check(has(said, (std::string("range: union over A, B, C (min-max) - drawn as B") + num).c_str()),
                   "V7 ...and its toast names the union, the role and the numbers");
             // dot by dot announces exactly exportRangeNote(cur(), comparedSides())
             const std::string dot = exportRangeNote(*cur(), comparedSides(), false);
@@ -981,16 +992,16 @@ static int videoSelftest() {
                      std::min({ A_(1)->vmin, B_(1)->vmin, C_(1)->vmin }),
                      std::max({ A_(1)->vmax, B_(1)->vmax, C_(1)->vmax }));
             fprintf(stderr, "videoselftest: V7 dot by dot of A_2 says: %s\n", dot.c_str());
-            check(dot == std::string("range: A/B: auto over every side (union)") + num,
-                  "V7 dot by dot: \"range: A/B: auto over every side (union) = lo..hi\"");
+            check(dot == std::string("range: union over A, B, C (min-max)") + num,
+                  "V7 dot by dot: \"range: union over A, B, C (min-max) = lo..hi\"");
             app.compareRangeMode = 0;
             check(exportRangeNote(*cur(), comparedSides(), false).rfind(
-                      "range: A/B: each keeps its own - Per stack (default) = ", 0) == 0,
-                  "V7 ...\"A/B: each keeps its own - Per stack (default)\" in mode 0");
+                      "range: one range for the stack · each side keeps its own", 0) == 0,
+                  "V7 ...\"one range for the stack · each side keeps its own\" in mode 0");
             app.linkRange = true;
             check(exportRangeNote(*cur(), comparedSides(), false).rfind(
-                      "range: Linked across all images = ", 0) == 0,
-                  "V7 ...\"Linked across all images\" under Link range");
+                      "range: one range over all open images = ", 0) == 0,
+                  "V7 ...\"one range over all open images\" under Link range");
             app.linkRange = false;
         }
 
@@ -1323,7 +1334,7 @@ static int videoSelftest() {
                 if (!has(note, M.says)) { notes = false; fprintf(stderr, "videoselftest: V8 %s note: %s\n", tag, note.c_str()); }
                 if (M.slotC && M.mode != App::CmpSplit && !has(note, "C not shown")) notes = false;
                 if (M.slotC && M.mode == App::CmpSplit && !has(note, "padded with black to 64x40 (C 40x24)")) notes = false;
-                if (M.mode != App::CmpDiff && rmode == 2 && !has(note, "range: A/B: auto over every side (union) = ")) notes = false;
+                if (M.mode != App::CmpDiff && rmode == 2 && !has(note, "range: union over A, B")) notes = false;
                 if (M.mode == App::CmpDiff && has(note, "letters")) notes = false;   // claims none
             }
             // the video: frame k == composeCompareRGBA(exportFrameViewFor(A_k))
@@ -1333,7 +1344,7 @@ static int videoSelftest() {
             if (!(vw == wantW && vh == 40)) sizes = false;
             // the union is worked out again for every frame, and the video says so
             if (!has(said, M.says) ||
-                (M.mode != App::CmpDiff && rmode == 2 && !has(said, "(union), per frame"))) {
+                (M.mode != App::CmpDiff && rmode == 2 && !has(said, "(min-max), per frame"))) {
                 notes = false;
                 fprintf(stderr, "videoselftest: V8 %s video said: %s\n", tag, said.c_str());
             }

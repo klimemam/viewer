@@ -1517,23 +1517,10 @@ static void selectImage(int idx) {
     }
     app.current = idx;
     ImageDoc* d = app.images[idx].get();
-    // Value-range scope. The stack default (frames inherit the reference
-    // frame's range so they compare directly) is only ONE of three sensible
-    // policies, and it silently defeated Auto while stepping frames:
-    //   0 per frame  - every frame shows its own min..max
-    //   1 per stack  - the inherited behavior (default, unchanged)
-    //   2 everything - the range follows you across stacks too
-    if (prev && d != prev) {
-        // linked mode overlays one range non-destructively (effBlack/effWhite),
-        // so only auto-per-frame touches the image's own numbers here
-        // ...and it re-fits to the frame's OWN numbers, which is what the
-        // mode is called and what its tooltip promises. This used to be
-        // defaultRange, whose load-time magnets snapped every step back to
-        // 0..1 / type fullscale (issue #245). WHICH fit - min..max, the
-        // 0.1-99.9% cut or the median->target one - is app.autoFlavor's
-        // answer, and refitByFlavor is the one place that answers it (#252).
-        if (app.rangeRule == RR_EachFrame && !app.linkRange && !d->rangeOwn) { refitByFlavor(*d); d->texDirty = true; }
-    }
+    // (A step writes no display range. "Each frame fits itself" used to
+    // re-fit the frame stepped onto by WRITING its black/white here; it is a
+    // display rule now - displayRangeFor draws each frame at its fit - so the
+    // stack's stored numbers stay one range however you step (#321 I3).)
     // Within a stack, stepping frames never changes the picture's ON-SCREEN
     // size (#250). app.view is ONE view shared by the whole stack, while the
     // stack's frames can sit at two resolution LEVELS at once: a remote frame

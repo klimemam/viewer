@@ -400,12 +400,12 @@
                 app.compareRangeMode = 2;
                 std::string said = abRangeSaid(true);
                 fprintf(stderr, "tileselftest: T11 label with slot C: '%s'\n", said.c_str());
-                check(said.find("compared images") != std::string::npos,
+                check(said == std::string("union over A, B, C (min-max)"),
                       "T11 the union label names the slots, not just A and B");
                 app.cmpExtra.clear();
                 said = abRangeSaid(true);
-                check(said == std::string("A and B combined range"),
-                      "T11 ...and stays 'A and B' when only A and B compare");
+                check(said == std::string("union over A, B (min-max)"),
+                      "T11 ...and says 'A, B' when only A and B compare");
             }
             app.compareFollowFrame = saveFollow;
         }
