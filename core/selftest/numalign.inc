@@ -22,8 +22,14 @@
 //       and "8" in a proportional table occupy the same slots
 //   N6  the TSV row is byte-identical to the one main printed, whatever the
 //       decimals setting and whatever the columns decided
-//   N7  a word (nan) ends at the column's point; the column width covers the
-//       header, the words and the block
+//   N7  a word (nan) ends at the column's point; a word too wide for that
+//       (1.5e+15, -1.5e+15, FLT_MAX among small plain values) is in the
+//       column's width and never runs past its right edge
+//   N8  no nonzero value prints as zero: every nonzero value keeps two
+//       significant digits (12.3 / 0.0004, 1000 / -0.0003, 2000 / 0.48), one
+//       that rounds to nothing at 6 decimals is a word, and zero is never "-0"
+//   N9  while a cell of the column is pending, the shape decided from both
+//       sides is kept; once both have landed it is decided again
 //
 // NOGL and fixture-free. app.projDecimals is borrowed and put back.
 if (g_numAlignSelftest) {
@@ -228,6 +234,77 @@ if (g_numAlignSelftest) {
         check(feq(c.width, std::max(numBlockWidth(c.shape, M), M.textW("sigma (frame) %"))) &&
               c.width >= M.textW("computing..."),
               "N7 the column width covers the block, its header and its words");
+        // words that numFixed makes of huge values, among small plain ones: the
+        // column has to be as wide as the widest, and the layout textNumAligned
+        // right-aligns in it has to end inside it - "1.5e+15" was drawn "1"
+        const std::vector<double> big = { 1.5, 2.25, 1.5e15, -1.5e15, (double)FLT_MAX };
+        NumColState sb;
+        const NumCol cb = numColDecide(sb, K, big, -1, 0, 0, 0, M);
+        bool fits = true;
+        std::string words;
+        for (double v : big) {
+            const std::string t = numFixed(v, cb.shape.dec);
+            const NumLayout l = numLayout(t, "", cb.shape, M);
+            const float wd = M.textW(t);
+            if (!numIsPlain(t)) words += t + " ";
+            for (const NumPiece& p : l.pieces)
+                fits &= p.x >= 0 && p.x + M.textW(p.s) <= l.width + 1e-4f;
+            fits &= l.width <= cb.width + 1e-4f && wd <= cb.width + 1e-4f;
+        }
+        fprintf(stderr, "numalignselftest: N7 words '%s' column width %.1f\n", words.c_str(),
+                cb.width);
+        check(words == "1.5e+15 -1.5e+15 3.40282e+38 ", "N7 fixture: three of the five are words");
+        check(fits, "N7 ...and every one of them is inside the column, none clipped");
+        const NumCol cb2 = numColDecide(sb, K, { 1.5, 2.25 }, -1, 0, 0, 0, M);
+        check(feq(cb2.width, cb.width), "N7 a word's width stays until the key changes");
+    }
+
+    // ---- N8 ---------------------------------------------------------------
+    {
+        auto spell = [&](std::vector<double> v) {
+            NumColState s8;
+            const NumCol c8 = numColDecide(s8, K, v, -1, 0, 0, 0, M);
+            std::string out;
+            for (double x : v) out += numFixed(x, c8.shape.dec) + " ";
+            return out;
+        };
+        const std::string a1 = spell({ 12.3, 0.0004 }), a2 = spell({ 1000, -0.0003 }),
+                          a3 = spell({ 2000, 0.48 }), a4 = spell({ 1, 3e-7 });
+        fprintf(stderr, "numalignselftest: N8 '%s' '%s' '%s' '%s'\n", a1.c_str(), a2.c_str(),
+                a3.c_str(), a4.c_str());
+        check(a1 == "12.30000 0.00040 ", "N8 12.3 over 0.0004: 0.00040, not 0.00");
+        check(a2 == "1000.00000 -0.00030 ", "N8 1000 over -0.0003: -0.00030, not -0");
+        check(a3 == "2000.00 0.48 ", "N8 2000 over 0.48: 0.48, not 0");
+        check(a4 == "1.000000 3.0e-07 ", "N8 a value that rounds to nothing at 6 decimals is a word");
+        check(numFixed(-0.0, 3) == "0.000" && numFixed(-0.0, 0) == "0" &&
+              numFixed(-0.0001, 2) == "-1.0e-04",
+              "N8 zero is never -0, and a tiny negative is a word, not -0.00");
+        NumColState h;
+        const int d0 = numColDecide(h, K, { 12.3, 0.04 }, -1, 0, 0, 0, M).shape.dec;   // 3
+        const int d1 = numColDecide(h, K, { 12.3, 0.4 }, -1, 0, 0, 0, M).shape.dec;    // 2: held 3
+        check(d0 == 3 && d1 == 3, "N8 ...and the hysteresis holds on the two-digit rule too");
+    }
+
+    // ---- N9 ---------------------------------------------------------------
+    {
+        NumColState st;
+        // both sides landed: A 5.47, B 0.547 - 3 decimals (A's four digits)
+        const NumShape both = numColDecide(st, K, { 5.47, 0.547 }, -1, 0, 0, 0, M).shape;
+        // A goes pending (its frame pass is on the worker): only B is in the set,
+        // and B alone would ask for 4
+        const NumShape part = numColDecide(st, K, { 0.547 }, -1, 0, M.textW("computing..."), 0,
+                                           M, true).shape;
+        // A lands at another magnitude: decided from both again (4, at once)
+        const NumShape landed = numColDecide(st, K, { 0.00547, 0.547 }, -1, 0, 0, 0, M).shape;
+        fprintf(stderr, "numalignselftest: N9 dec/intW both %d/%d pending %d/%d landed %d/%d\n",
+                both.dec, both.intW, part.dec, part.intW, landed.dec, landed.intW);
+        check(both.dec == 3 && part.dec == both.dec && part.intW == both.intW,
+              "N9 a pending side leaves the column's shape as both sides decided it");
+        check(landed.dec == 4 && landed.intW == 1,
+              "N9 ...and once both have landed the column is decided from both");
+        NumColState fr;
+        const NumShape first = numColDecide(fr, K, { 0.547 }, -1, 0, 0, 0, M, true).shape;
+        check(first.dec == 4, "N9 with no shape to keep, a pending column is decided from what it has");
     }
 
     fprintf(stderr, "numalignselftest: %s\n", ok ? "PASS" : "FAIL");

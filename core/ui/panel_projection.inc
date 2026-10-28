@@ -1733,8 +1733,10 @@ static void drawPanelProjection() {
             ImGui::SetTooltip("every column prints ONE number of decimals and lines up\n"
                               "on the point, every side and plane in it included.\n"
                               "auto: the decimals that give the column's largest value\n"
-                              "four significant digits, kept when a frame step would\n"
-                              "make it one fewer. 0-6: every column uses that many.\n"
+                              "four significant digits and every other nonzero value\n"
+                              "two (at most 6), kept when a frame step would make it\n"
+                              "one fewer. 0-6: every column uses that many. A nonzero\n"
+                              "value too small for them is written like 3.0e-07.\n"
                               "Copy table (TSV) is full precision either way.");
         ImGui::SameLine();
         if (ImGui::Checkbox("all", &app.projAllRow)) app.prefsDirty = true;
@@ -1912,6 +1914,7 @@ static void drawPanelProjection() {
         for (int k = 0; k < nNum; k++) {
             std::vector<double> vals;
             float markW = 0, wordW = 0;
+            bool pending = false;   // a side's every-pixel pass has not landed yet
             for (const ProjTableRow& r : rows) {
                 const ProjCell& c = r.c[(size_t)k];
                 if (c.kind == ProjCell::Num) {
@@ -1919,11 +1922,12 @@ static void drawPanelProjection() {
                     if (c.clamped) markW = std::max(markW, m.textW("*"));
                 } else {
                     wordW = std::max(wordW, m.textW(projCellWord(c)));
+                    pending |= c.kind == ProjCell::Pending;
                 }
             }
             NumColState& st = g_projNumCols[std::string(table) + "/" + heads[k]];
             NumCol col = numColDecide(st, numKey, vals, app.projDecimals, markW, wordW,
-                                      m.textW(heads[k]), m);
+                                      m.textW(heads[k]), m, pending);
             col.probe = heads[k];
             out.push_back(col);
         }

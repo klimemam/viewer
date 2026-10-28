@@ -382,10 +382,19 @@ static float numBlockWidth(const NumShape& c, const NumMetrics& m) {
 // The display spelling of one value at a column's decimals. A value %.*f would
 // spell with sixteen or more integer digits (or not at all: nan, inf) is given
 // as %.6g, and numLayout sets anything that is not plain digits as a word.
+// A value that is NOT zero is never printed as zero: one that rounds to nothing
+// at these decimals is given as a word with two significant digits (%.1e), and
+// zero itself is never "-0" - both are a wrong reading, not a rounding.
 static std::string numFixed(double v, int dec) {
     char b[64];
-    if (!std::isfinite(v) || std::fabs(v) >= 1e15) snprintf(b, sizeof b, "%.6g", v);
-    else snprintf(b, sizeof b, "%.*f", std::clamp(dec, 0, 6), v);
+    if (v == 0) v = 0.0;                                   // -0.0 -> 0.0
+    if (!std::isfinite(v) || std::fabs(v) >= 1e15) {
+        snprintf(b, sizeof b, "%.6g", v);
+        return b;
+    }
+    snprintf(b, sizeof b, "%.*f", std::clamp(dec, 0, 6), v);
+    if (v != 0 && std::string(b).find_first_of("123456789") == std::string::npos)
+        snprintf(b, sizeof b, "%.1e", v);
     return b;
 }
 static bool numIsPlain(const std::string& s) {
@@ -401,8 +410,14 @@ static NumLayout numLayout(const std::string& num, const std::string& mark,
         L.pieces.push_back({ g, slotX, slotX + (adv - m.textW(g)) * 0.5f });
     };
     if (!numIsPlain(num)) {
-        // a word - "nan", "inf", "1e+15": it ends where the integer parts end
-        const float x = std::max(0.0f, L.pointX - m.textW(num));
+        // a word - "nan", "inf", "1.5e+15", "3.0e-07": it ends where the
+        // integer parts end when it fits there, else at the block's right edge,
+        // and a word wider than the block widens the layout (numColDecide has
+        // put its width into the column's) - it is never clipped
+        const float w = m.textW(num);
+        float x = L.pointX - w;
+        if (x < 0) x = std::max(0.0f, L.width - w);
+        L.width = std::max(L.width, x + w);
         L.pieces.push_back({ num, x, x });
     } else {
         const size_t dot = num.find('.');
@@ -435,6 +450,20 @@ static int numAutoDecimals(double maxAbs) {
     const int e = (int)std::floor(std::log10(maxAbs));
     return std::clamp(3 - e, 0, 6);
 }
+// ...and enough that EVERY nonzero value of the column keeps two significant
+// digits: A = 12.3 over B = 0.0004 is 12.30000 over 0.00040, never 12.30 over
+// 0.00. Still capped at 6 - below that numFixed spells the value as a word.
+static int numColumnDecimals(const std::vector<double>& vals) {
+    double mx = 0;
+    for (double v : vals) if (std::isfinite(v)) mx = std::max(mx, std::fabs(v));
+    int dec = numAutoDecimals(mx);
+    for (double v : vals) {
+        if (!std::isfinite(v) || v == 0) continue;
+        const int e = (int)std::floor(std::log10(std::fabs(v)));
+        dec = std::max(dec, std::clamp(1 - e, 0, 6));
+    }
+    return std::min(dec, 6);
+}
 // The hysteresis, for decimals and for integer width alike: ONE step down is
 // held - a value crossing 10.00 and back while frames are stepped would
 // otherwise move the whole column every frame - and anything else is taken at
@@ -455,28 +484,38 @@ struct NumColState {
     bool set = false;
     std::string key;
     NumShape shape;
-    float wordW = 0;     // the widest "-" / "computing..." the column has had
+    float wordW = 0;     // the widest word the column has had: "-", "computing...", 1.5e+15
 };
 // fixedDec >= 0 is the decimals setting's fixed choice and is used as it is;
 // < 0 decides them from the values. markW: the width of the widest mark any
 // row of the column carries now (0 for none). wordW: of the widest non-number
-// cell. The mark slot and the word width only grow until the key changes - a
-// "computing..." that comes and goes with every step is the same wobble.
+// cell; the values numFixed spells as words are added here. The mark slot and
+// the word width only grow until the key changes - a "computing..." that
+// comes and goes with every step is the same wobble.
+//
+// pending: some cell of the column is still being computed (the #283 worker),
+// so `vals` is a PART of the column - one side's numbers without the other's.
+// The shape is kept as it was rather than decided from the part, or the "."
+// would move twice: once when a side goes pending and again when it lands.
+// Only the integer width may grow then, so nothing is clipped.
 static NumCol numColDecide(NumColState& st, const std::string& key,
                            const std::vector<double>& vals, int fixedDec,
-                           float markW, float wordW, float headW, const NumMetrics& m) {
+                           float markW, float wordW, float headW, const NumMetrics& m,
+                           bool pending = false) {
     const std::string k = key + "|dec=" + std::to_string(fixedDec < 0 ? -1 : fixedDec);
     const bool fresh = !st.set || st.key != k;
-    double mx = 0;
-    for (double v : vals) if (std::isfinite(v)) mx = std::max(mx, std::fabs(v));
-    int dec = fixedDec >= 0 ? std::clamp(fixedDec, 0, 6) : numAutoDecimals(mx);
-    if (!fresh && fixedDec < 0) dec = numHold(st.shape.dec, dec);
+    const bool hold = !fresh && pending;
+    int dec = fixedDec >= 0 ? std::clamp(fixedDec, 0, 6) : numColumnDecimals(vals);
+    if (hold) dec = st.shape.dec;
+    else if (!fresh && fixedDec < 0) dec = numHold(st.shape.dec, dec);
     int iw = 1;
     for (double v : vals) {
         const std::string s = numFixed(v, dec);
         if (numIsPlain(s)) iw = std::max(iw, (int)std::min(s.find('.'), s.size()));
+        else               wordW = std::max(wordW, m.textW(s));
     }
-    if (!fresh) iw = numHold(st.shape.intW, iw);
+    if (hold) iw = std::max(iw, st.shape.intW);
+    else if (!fresh) iw = numHold(st.shape.intW, iw);
     st.set = true;
     st.key = k;
     st.shape.dec = dec;
