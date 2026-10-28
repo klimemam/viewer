@@ -154,8 +154,8 @@ static bool g_abEqSelftest = false;
 // memory, and every assertion is a pixel value, a count or a string. See
 // histHlSelftest().
 static bool g_histHlSelftest = false;
-// --histzoom-selftest: the histogram zoom (#309) - a drag re-bins the 256 bins
-// on the dragged values, Shift / the heading switch swaps zoom and highlight,
+// --histzoom-selftest: the histogram zoom (#309) - a drag re-bins the bins on
+// the dragged values (histZoomGrid), Shift / the heading switch swaps zoom and highlight,
 // and the option that makes a zoom set the display range (and its one step
 // back). No window for the --histhl-selftest reasons. See histZoomSelftest().
 static bool g_histZoomSelftest = false;

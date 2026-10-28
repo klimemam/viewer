@@ -2,7 +2,9 @@
 // ---- --histhl-selftest: the value highlight (#68) ---------------------------
 // Drag a value interval on the histogram's x axis; the pixels in it are painted
 // on the image and the count is declared. docs/features/histogram/histogram-select-design.md is
-// the specification and §9 is this file's running order.
+// the specification and §9 is this file's running order. (Its §6 gesture -
+// plain drag, double-click clears - is #309's Shift+drag now; see the note
+// appended there and T15 below.)
 //
 // Windowless, on the abEqSelftest pattern and for the same reason: every claim
 // here is a pixel value, a count or a string, and all of it is CPU on both

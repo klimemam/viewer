@@ -101,7 +101,8 @@ static bool abHistSideStale(const ImageDoc* a, const ImageDoc* b, const App::His
     // same way a side binned on another range is.
     const App::HistZoom& Z = app.histZoom;
     const bool zoomDiffers = HB.zoomed != Z.on ||
-                             (Z.on && (HB.zoomLo != Z.lo || HB.zoomHi != Z.hi));
+                             (Z.on && (HB.binOrigin != Z.gOrigin || HB.binW != Z.gW ||
+                                       HB.nBins != Z.gN));
     return HB.uid != b->uid || HB.black != effBlack(*a) || HB.white != effWhite(*a) ||
            zoomDiffers;
 }
@@ -141,7 +142,7 @@ struct HistSide {
 static std::string g_histSideProbe;
 
 // ---- the histogram zoom (#309) ----------------------------------------------
-// A drag on the plot re-lays the 256 bins on the dragged values - the bins get
+// A drag on the plot re-lays the bins (histZoomGrid) on the dragged values - the bins get
 // FINER, which is what a zoom of a histogram is worth; stretching the old bars
 // would only magnify their width. The state is app.histZoom (state.h says what
 // it is keyed on and why); these are its only writers.
@@ -177,10 +178,19 @@ static void histZoomSync(const ImageDoc* im) {
     if (app.histZoom.on && !histZoomKeyHolds(im)) app.histZoom = App::HistZoom{};
 }
 
-// NaN NaN when there is no zoom - recomputeHistogramIfNeeded's "none".
-static void histZoomRange(float& lo, float& hi) {
-    lo = hi = std::numeric_limits<float>::quiet_NaN();
-    if (app.histZoom.on) { lo = app.histZoom.lo; hi = app.histZoom.hi; }
+// The zoom's grid for recomputeHistogramIfNeeded, or null when there is none.
+// The SAME grid for every side: it was decided once, from A's dtype.
+static const HistGrid* histZoomGridNow(HistGrid& g) {
+    if (!app.histZoom.on) return nullptr;
+    g.origin = app.histZoom.gOrigin; g.w = app.histZoom.gW; g.n = app.histZoom.gN;
+    return &g;
+}
+
+// The document a linked zoom's step back belongs to (see HistZoom::restoreUid).
+static ImageDoc* histZoomRestoreDoc(ImageDoc* im) {
+    if (app.histZoom.restoreLink) return im;
+    for (auto& d : app.images) if (d->uid == app.histZoom.restoreUid) return d.get();
+    return nullptr;
 }
 
 // Commit a zoom onto the dragged interval [lo, hi) (already snapped onto the bin
@@ -205,6 +215,7 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
     }
     App::HistZoom& Z = app.histZoom;
     Z.on = true;
+    Z.gOrigin = o; Z.gW = w; Z.gN = n;
     Z.lo = o;
     Z.hi = (float)((double)o + (double)n * (double)w);
     Z.seqId = im->seqId; Z.uid = im->uid;
@@ -214,10 +225,15 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
         histZoomRawRange(*im, rb, rw);
         // The step back is taken from the range in force before the FIRST zoom
         // of a run - unless the user moved the range since the last one wrote
-        // it, and then from where they put it.
-        if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite) {
+        // it, and then from where they put it. A linked zoom on ANOTHER
+        // document (a frame step in between, outside Link) starts that
+        // document's own step back; the one before keeps the range it was
+        // given, as any range set on a frame you have left does.
+        if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite ||
+            (!app.linkRange && Z.restoreUid != im->uid)) {
             Z.prevBlack = rb; Z.prevWhite = rw;
             Z.restoreLink = app.linkRange;
+            Z.restoreUid = im->uid;
             Z.restore = true;
         }
         setRange(*im, Z.lo, Z.hi);
@@ -227,15 +243,21 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
 }
 
 // Reset the zoom (double-click in zoom mode, or `reset zoom`). With the linked
-// option on, the range before the first zoom comes back - but only if the range
-// in force is still the one the zoom wrote; an Auto or a typed range in between
-// is the user's later word and is left alone.
+// option on, the range before the first zoom comes back - to the DOCUMENT it
+// was taken from (the link range under Link), and only if that range is still
+// the one the zoom wrote; an Auto or a typed range in between is the user's
+// later word and is left alone. A frame step in between does not redirect it:
+// under "Auto per frame" the frame now on screen has its own range, which the
+// zoom never wrote, and the zoomed frame is the one that gets its range back
+// (under "Per stack" restoring it re-shares it over the stack, as setRange
+// always does).
 static void histZoomReset(ImageDoc* im) {
     App::HistZoom& Z = app.histZoom;
-    if (Z.on && Z.restore && app.histZoomSetsRange && im && Z.restoreLink == app.linkRange) {
+    ImageDoc* t = Z.restore ? histZoomRestoreDoc(im) : nullptr;
+    if (Z.on && Z.restore && app.histZoomSetsRange && t && Z.restoreLink == app.linkRange) {
         float rb = 0, rw = 0;
-        histZoomRawRange(*im, rb, rw);
-        if (rb == Z.setBlack && rw == Z.setWhite) setRange(*im, Z.prevBlack, Z.prevWhite);
+        histZoomRawRange(*t, rb, rw);
+        if (rb == Z.setBlack && rw == Z.setWhite) setRange(*t, Z.prevBlack, Z.prevWhite);
     }
     Z = App::HistZoom{};
 }
@@ -261,14 +283,16 @@ static ImU32 histHlBandInk(int alpha) {
 // because there is one axis and the interval belongs to the axis - asking
 // "is this A's selection or B's" is a question the design deletes rather than
 // answers.
-static void histHlBand(const PlotRect& pr) {
+static void histHlBand(const PlotRect& pr, bool zoomed) {
     if (!pr.ok || !app.highlight.on) return;
     const App::HistHighlight& H = app.highlight;
-    // A zoomed axis can leave the whole interval off the plot (#309). A band
-    // pinned 1 px wide at the edge would claim the values are there; say on
-    // which side they are instead.
+    // A ZOOMED axis can leave the whole interval off the plot (#309): a band
+    // pinned 1 px wide at the edge would claim the values are on this narrow
+    // axis, so it says on which side they are instead. Unzoomed nothing
+    // changes - the 1 px band below is how an off-axis selection has always
+    // stayed visible there.
     const bool offLeft = H.hi <= pr.xmin, offRight = H.lo >= pr.xmax;
-    if (offLeft || offRight) {
+    if (zoomed && (offLeft || offRight)) {
         ImFont* f = ImGui::GetFont();
         const bool tri = f && f->FindGlyphNoFallback((ImWchar)(offLeft ? 0x25C0 : 0x25B6));
         const char* t = offLeft ? (tri ? "\xE2\x97\x80 highlight outside" : "< highlight outside")
@@ -381,8 +405,8 @@ static void drawPanelHistogram() {
     ImageDoc* im = cur();
     histZoomSync(im);
     if (im && im->w > 0 && im->h > 0) {
-        float zLo, zHi;
-        histZoomRange(zLo, zHi);
+        HistGrid zg;
+        const HistGrid* zp = histZoomGridNow(zg);
         ImageDoc* Bim = abStatsB();
         pumpCompareSlotRestore();
         // The lettered slots resolve exactly as B does, follow-frame included,
@@ -399,7 +423,7 @@ static void drawPanelHistogram() {
         // pointers into app.seqs did (cc1ee8b) - on MSVC and not here.
         app.histExtra.resize(app.cmpExtra.size());
         recomputeHistogramIfNeeded(im, app.hist[0], std::numeric_limits<float>::quiet_NaN(),
-                                   std::numeric_limits<float>::quiet_NaN(), zLo, zHi);
+                                   std::numeric_limits<float>::quiet_NaN(), zp);
         // Every other side is binned on A's black/white: one x axis, one bin
         // grid, or the curves are not comparable. Sizes may differ freely - the
         // y axis below normalises that away. Skipped while frames are being
@@ -409,13 +433,12 @@ static void drawPanelHistogram() {
         // full passes over N images. A zoom is A's grid too, so it reaches
         // every side the same way.
         if (Bim && (!abStepBusy() || app.hist[1].uid == 0))
-            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im),
-                                       zLo, zHi);
+            recomputeHistogramIfNeeded(Bim, app.hist[1], effBlack(*im), effWhite(*im), zp);
         for (const ResolvedSlot& rs : xslots)
             if (rs.idx < app.histExtra.size() &&
                 (!abStepBusy() || app.histExtra[rs.idx].uid == 0))
                 recomputeHistogramIfNeeded(rs.doc, app.histExtra[rs.idx],
-                                           effBlack(*im), effWhite(*im), zLo, zHi);
+                                           effBlack(*im), effWhite(*im), zp);
         const App::HistState& H = app.hist[0];
         const App::HistState& HB = app.hist[1];
         // ...or B is not A's partner at all: follow-frame found no frame of
@@ -925,7 +948,7 @@ static void drawPanelHistogram() {
         if (!side) {
             PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                     false, false, plotH);
-            histHlBand(hp);                 // under the curves
+            histHlBand(hp, H.zoomed);       // under the curves
             drawAll(hp);
             zoomOverlay(hp);
             histDragGesture(hp, im, H);
@@ -956,7 +979,7 @@ static void drawPanelHistogram() {
                     // identical axis ranges by construction: same xl/yl, same limits
                     PlotRect hp = beginPlot(xl, yl, xLo, xHi, 0.0f, 1.0f,
                                             false, false, plotH);
-                    histHlBand(hp);
+                    histHlBand(hp, H.zoomed);
                     drawPane(hp, i);
                     zoomOverlay(hp);
                     histDragGesture(hp, im, H);

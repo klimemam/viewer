@@ -40,6 +40,7 @@ static int histZoomSelftest() {
     const int scope0 = app.rangeScope;
     const bool follow0 = app.compareFollowFrame;
     const uint64_t drawPass0 = app.drawPass;
+    const int plane0 = app.histPlane;
 
     auto mk = [](const char* nm, int W, int H, int chn, const char* dtype) {
         auto d = std::make_unique<ImageDoc>();
@@ -99,10 +100,9 @@ static int histZoomSelftest() {
     PlotRect gpr;
     auto gestureFrame = [&](ImageDoc* d, ImVec2 at, bool down, bool shift) {
         beginFrame(at, down, shift);
-        float zLo, zHi;
-        histZoomRange(zLo, zHi);
+        HistGrid zg;
         recomputeHistogramIfNeeded(d, app.hist[0], std::numeric_limits<float>::quiet_NaN(),
-                                   std::numeric_limits<float>::quiet_NaN(), zLo, zHi);
+                                   std::numeric_limits<float>::quiet_NaN(), histZoomGridNow(zg));
         gpr = PlotRect{};
         gpr.p0 = ImVec2(60, 120);
         gpr.p1 = ImVec2(860, 420);
@@ -387,6 +387,13 @@ static int histZoomSelftest() {
         histFrame();
         check(probeField(g_histZoomProbe, "hl").empty(),
               "Z4 ...and one inside it gets its band, no mark (anti-vacuity)");
+        // UNZOOMED, an off-axis highlight keeps main's 1 px edge band and no
+        // text: the "outside" mark is a zoom's, and only a zoom's.
+        app.histZoom = App::HistZoom{};
+        histHlArm(5000, 5100, false, false, -1, nullptr);
+        histFrame();
+        check(probeField(g_histZoomProbe, "hl").empty(),
+              "Z4 unzoomed, an off-axis highlight draws no 'outside' text");
         histHlClear();
         app.histZoom = App::HistZoom{};
     }
@@ -526,6 +533,125 @@ static int histZoomSelftest() {
     }
 
     // ======================================================================
+    // Z8 - EVERY SIDE ON A'S GRID, whatever its dtype. The zoom grid is
+    // decided once from A's dtype and handed to B as-is: an f32 B re-deriving
+    // its own grid from the zoom's extent would get 256 bins of 0.25 DN over
+    // 100..164 against A's 41 bins of 1 DN over 100..141, and its curve would
+    // be squeezed by 41/64 onto A's axis while its footer named A's bounds.
+    // ======================================================================
+    {
+        auto A = mk("hz_mix_a8", 16, 16, 1, "u8");
+        auto B = mk("hz_mix_bf", 16, 16, 1, "f32");
+        for (size_t i = 0; i < A->px().size(); i++) { A->px()[i] = (float)i; B->px()[i] = (float)i; }
+        computeMinMax(*A); computeMinMax(*B);
+        A->black = 0; A->white = 255; B->black = 0; B->white = 255;
+        app.images.push_back(std::move(A));
+        app.images.push_back(std::move(B));
+        ImageDoc* a = app.images[app.images.size() - 2].get();
+        ImageDoc* b = app.images.back().get();
+        app.current = (int)app.images.size() - 2;
+        app.histZoom = App::HistZoom{};
+        app.compareMode = App::CmpSplit;
+        setCompareB(b);
+        histFrame();
+        histZoomApply(a, 100.0f, 141.0f, app.hist[0].binW, app.hist[0].nBins);
+        histFrame();
+        const App::HistState& HA = app.hist[0];
+        const App::HistState& HB = app.hist[1];
+        fprintf(stderr, "histzoomselftest: Z8 u8/f32 A %.6g/%.6g/%d  B %.6g/%.6g/%d  B out %zu/%zu\n",
+                (double)HA.binOrigin, (double)HA.binW, HA.nBins,
+                (double)HB.binOrigin, (double)HB.binW, HB.nBins, HB.outLoN, HB.outHiN);
+        check(HA.nBins == 41 && HB.zoomed && HB.binOrigin == HA.binOrigin &&
+              HB.binW == HA.binW && HB.nBins == HA.nBins,
+              "Z8 u8 A / f32 B: B is binned on A's exact grid (origin, width, count)");
+        check(HB.zoomHi == 141.0f && HB.outLoN == 100 && HB.outHiN == 115,
+              "Z8 ...and B's outside counts use A's bounds (<100, >=141)");
+
+        // u16 A / f32 B: 60 bins of 1 DN over 2000..2060 on both.
+        auto A2 = ramp("hz_mix_a16");
+        auto B2 = mk("hz_mix_bf2", 64, 64, 1, "f32");
+        for (size_t i = 0; i < B2->px().size(); i++) B2->px()[i] = (float)i;
+        computeMinMax(*B2); B2->black = 0; B2->white = 4095;
+        app.images.push_back(std::move(A2));
+        app.images.push_back(std::move(B2));
+        ImageDoc* a2 = app.images[app.images.size() - 2].get();
+        ImageDoc* b2 = app.images.back().get();
+        app.current = (int)app.images.size() - 2;
+        app.histZoom = App::HistZoom{};
+        setCompareB(b2);
+        histFrame();
+        histZoomApply(a2, 2000.0f, 2060.0f, app.hist[0].binW, app.hist[0].nBins);
+        histFrame();
+        check(app.hist[0].nBins == 60 && app.hist[1].binOrigin == app.hist[0].binOrigin &&
+              app.hist[1].binW == app.hist[0].binW && app.hist[1].nBins == 60 &&
+              app.hist[1].outLoN == 2000 && app.hist[1].outHiN == 2036,
+              "Z8 u16 A / f32 B: one 60-bin grid, B outside counted at A's bounds");
+        app.compareMode = App::CmpOff;
+        setCompareB(nullptr);
+        app.histZoom = App::HistZoom{};
+
+        // ---- Z9: the grid COVERS the drag, and is a fixed point of itself.
+        // u16 [256, 1024): histBinGrid alone gives 3 DN bins from 255, ending
+        // at 1023 - DN 1023 would be outside a range that contains it.
+        float o = 0, w = 0; int n = 0;
+        histZoomGrid("u16", 256.0f, 1024.0f, o, w, n);
+        const double top = (double)o + (double)n * (double)w;
+        fprintf(stderr, "histzoomselftest: Z9 u16 [256,1024) -> %.6g + %d x %.6g = %.6g\n",
+                (double)o, n, (double)w, top);
+        check(o <= 256.0f && top >= 1024.0, "Z9 u16 [256, 1024): the grid covers DN 1023");
+        auto fixed = [&](const char* dt, float lo, float hi) {
+            float o1 = 0, w1 = 0, o2 = 0, w2 = 0; int n1 = 0, n2 = 0;
+            histZoomGrid(dt, lo, hi, o1, w1, n1);
+            const float t1 = (float)((double)o1 + (double)n1 * (double)w1);
+            histZoomGrid(dt, o1, t1, o2, w2, n2);
+            const bool covers = o1 <= lo && (double)o1 + (double)n1 * (double)w1 >= (double)hi;
+            fprintf(stderr, "histzoomselftest: Z9 %s [%.10g, %.10g) -> %.10g/%.6g/%d -> %.10g/%.6g/%d\n",
+                    dt, (double)lo, (double)hi, (double)o1, (double)w1, n1, (double)o2,
+                    (double)w2, n2);
+            return covers && o1 == o2 && w1 == w2 && n1 == n2;
+        };
+        check(fixed("u16", 256.0f, 1024.0f) && fixed("u8", 100.0f, 141.0f) &&
+              fixed("f32", -3.7f, 11.3f),
+              "Z9 the grid of a grid's own extent is the same grid (u16, u8, f32)");
+        check(fixed("u32", 4000000000.0f, 4000065536.0f) &&
+              fixed("u32", 3000000000.0f, 3000100096.0f),
+              "Z9 ...and for u32 values in the billions");
+    }
+
+    // ======================================================================
+    // Z10 - "Auto per frame" + the linked option + a frame step. The step back
+    // belongs to the DOCUMENT whose range the zoom wrote: reset restores that
+    // frame, and never touches the frame now on screen, whose range is its own.
+    // ======================================================================
+    {
+        auto f0 = ramp("hz_apf_000"); f0->seqId = 93092; f0->seqIndex = 0;
+        auto f1 = ramp("hz_apf_001"); f1->seqId = 93092; f1->seqIndex = 1;
+        f1->black = 10; f1->white = 4000;
+        app.images.push_back(std::move(f0));
+        app.images.push_back(std::move(f1));
+        ImageDoc* d0 = app.images[app.images.size() - 2].get();
+        ImageDoc* d1 = app.images.back().get();
+        app.rangeScope = 0;
+        app.histZoomSetsRange = true;
+        app.current = (int)app.images.size() - 2;
+        app.histZoom = App::HistZoom{};
+        histFrame();
+        histZoomApply(d0, 1024.0f, 2048.0f, app.hist[0].binW, app.hist[0].nBins);
+        check(d0->black == 1024.0f && d0->white == 2048.0f && d1->black == 10.0f,
+              "Z10 fixture: the linked zoom wrote frame 0's range only");
+        app.current = (int)app.images.size() - 1;     // the frame step
+        histFrame();
+        check(app.histZoom.on, "Z10 ...and the step kept the zoom");
+        histZoomReset(d1);                            // reset with frame 1 on screen
+        check(d0->black == 0.0f && d0->white == 4095.0f,
+              "Z10 reset gives the ZOOMED frame its range back");
+        check(d1->black == 10.0f && d1->white == 4000.0f,
+              "Z10 ...and leaves the frame on screen alone");
+        app.histZoomSetsRange = false;
+        app.histZoom = App::HistZoom{};
+    }
+
+    // ======================================================================
     // Z6 - THE TWO PREFERENCES are written, and read back by name.
     // ======================================================================
     {
@@ -554,7 +680,7 @@ static int histZoomSelftest() {
     app.compareMode = App::CmpOff;
     setCompareB(nullptr);
     app.cmpExtra.clear();
-    app.histPlane = -1;
+    app.histPlane = plane0;
     app.toast.clear();
     app.drawPass = drawPass0;
     app.pendingSelect = -1;

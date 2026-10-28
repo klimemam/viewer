@@ -173,7 +173,7 @@ rc=0
 | B8 | Browse の行モデルと picker | `browse` / `localbrowse` / `picker` | grouped / flat、local / peer、file / group / folder という各分類の行 identity と選択対象を混同せず、picker の操作を実際の行に結び付ける |
 | B9 | 表示範囲と false color | `range` / `test_display_falsecolor` | 表示範囲の状態遷移と false-color plugin の出力が、定義済みの値と境界を保つ |
 | B10 | benchmark 中の描画対象を確認する | `benchcov` | 開いた対象パネルが計測フレーム中に実際に描画される。隠れたタブを測定したことにしない |
-| B11 | histogram を拡大する (#309) | `histzoom` | ドラッグした値域に 256 bin を `histBinGrid` で張り直し、bin 合計 + 範囲外 == 有限画素。Shift / 見出しの切り替えで拡大とハイライトが入れ替わる。連動オフでは表示レンジを書かず、オンでは解除で直前に戻す(間に別の操作があれば戻さない)。frame 送りで保ち、別 stack / plane で解除 |
+| B11 | histogram を拡大する (#309) | `histzoom` | ドラッグした値域に bin を `histZoomGrid` で張り直す(整数型で 256 DN 未満は 1 DN/bin を DN の数だけ、それ以外は 256 bin で、グリッドはドラッグ範囲を覆う)。比較の全側が A の同じグリッドで数え、bin 合計 + 範囲外 == 有限画素。Shift / 見出しの切り替えで拡大とハイライトが入れ替わる。連動オフでは表示レンジを書かず、オンでは解除で直前に戻す(間に別の操作があれば戻さない)。frame 送りで保ち、別 stack / plane で解除 |
 
 ## 6. 実機確認
 

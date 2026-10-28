@@ -1578,8 +1578,10 @@ struct App {
         size_t sampled = 0;
         bool roiUsed = false;
         // The histogram ZOOM (#309) this slot was binned under, and what it
-        // left out. Zoomed, the grid is histBinGrid(zoomLo, zoomHi) instead of
-        // the display range's, and the bins stop folding: a pixel past either
+        // left out. Zoomed, the grid is the zoom's (histZoomGrid, decided once
+        // from A's dtype and handed to every side; zoomLo..zoomHi is its
+        // extent) instead of the display range's, and the bins stop folding: a
+        // pixel past either
         // end of the grid is COUNTED here and binned nowhere, because a zoomed
         // end bar that also meant "and everything beyond" would be the one bar
         // on the plot that is not the value its x says. So, zoomed,
@@ -1629,9 +1631,13 @@ struct App {
     // in the session.
     struct HistZoom {
         bool on = false;
-        // The GRID extent the bins are re-laid on, raw DN: histZoomGrid of the
-        // dragged bins, so histZoomGrid(lo, hi) hands back exactly this grid
-        // again and the axis, the label and the linked range are one pair.
+        // The GRID the bins are re-laid on: histZoomGrid of the dragged bins,
+        // decided ONCE at the commit from A's dtype and handed as-is to every
+        // side (B and the slots never re-derive it from their own dtype).
+        // lo..hi is its extent, raw DN - the axis, the label and the linked
+        // range are that one pair.
+        float gOrigin = 0, gW = 0;
+        int gN = 0;
         float lo = 0, hi = 0;
         int seqId = 0;                // > 0: A's stack; 0: the document below
         uint64_t uid = 0;
@@ -1642,8 +1648,13 @@ struct App {
         // prev back only while the range in force is still `set` (and the Link
         // scope it was read under is unchanged): anything else means the user
         // moved the range since, and the zoom does not overwrite them.
+        // restoreUid is the DOCUMENT whose range was read and written (unused
+        // under Link, where the range is the link's). Reset restores that
+        // document and only it - never the frame that happens to be on screen
+        // after a step, whose range under "Auto per frame" is its own.
         bool restore = false;
         bool restoreLink = false;
+        uint64_t restoreUid = 0;
         float prevBlack = 0, prevWhite = 0;
         float setBlack = 0, setWhite = 0;
     } histZoom;
@@ -1651,6 +1662,8 @@ struct App {
     // ---- value highlight (#68, docs/features/histogram/histogram-select-design.md) -------------
     // Drag a value interval on the histogram's x axis and the pixels that fall
     // in it are painted on the image, in one colour, with the count declared.
+    // Since #309 that drag is Shift+drag (or a plain drag with the heading
+    // switch on `highlight`); a plain drag zooms - histDragGesture.
     //
     // AXIS state - not the document's, not an annotation's. The flagship use is
     // "select the tail, then step frames and watch which pixels enter and leave
