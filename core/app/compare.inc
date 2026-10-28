@@ -156,7 +156,8 @@ static ImageDoc* abStatsB() {
     return b;
 }
 
-// Side by side, or overlaid? One answer for every panel (App::abStatsLayout).
+// Side by side, or overlaid? One answer for the Histogram and Projection
+// panels (App::abStatsLayout) - and the ROI table's layout follows it too.
 //
 // Auto mirrors the IMAGE, and the ruling on #60 (2026-08-14) is that it keeps
 // doing so at any N rather than splitting by panel kind: CmpSplit TILES A, B
@@ -169,6 +170,11 @@ static bool abSideBySide() {
     if (app.abStatsLayout == App::AbOverlay) return false;
     if (app.abStatsLayout == App::AbSide) return true;
     return app.compareMode == App::CmpSplit;
+}
+// ...except Temporal, which since #320 answers from its own setting
+// (App::temporalLayout, overlay by default) and never from the one above.
+static bool temporalSideBySide() {
+    return app.temporalLayout == App::TlSide;
 }
 
 // WHICH side the blink is showing this instant, as a side index: 0 = A,

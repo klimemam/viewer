@@ -479,9 +479,11 @@ static void drawMenuBar(GLFWwindow* win) {
             if (ImGui::MenuItem("Swap A and B", "Shift+\\", false, cmpB() != nullptr))
                 swapCompare();
             ImGui::Separator();
-            // ONE setting for every statistics panel: "same arrangement as the
+            // ONE setting for the distribution panels: "same arrangement as the
             // image" is a property of the comparison, not of the histogram.
-            ImGui::TextDisabled("Statistics panels");
+            // Temporal is not one of them since #320 - it has its own line
+            // below, overlay by default.
+            ImGui::TextDisabled("Statistics layout: Histogram / Projection");
             if (ImGui::MenuItem("  Auto (follow the image layout)", nullptr,
                                 app.abStatsLayout == App::AbAuto))
                 app.abStatsLayout = App::AbAuto;
@@ -506,6 +508,19 @@ static void drawMenuBar(GLFWwindow* win) {
                                   "equal width. More slots make each plot narrower;\n"
                                   "below 320 px (logical width) a panel draws the overlay\n"
                                   "instead, without a note on the panel.");
+            // Temporal's own (#320): the same switch as the Temporal panel's
+            // heading, and a preference rather than session state
+            ImGui::TextDisabled("Statistics layout: Temporal");
+            if (ImGui::MenuItem("  Overlay (every side on one time axis)", nullptr,
+                                app.temporalLayout == App::TlOverlay))
+                app.temporalLayout = App::TlOverlay;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The default. Time series are read by comparing the\n"
+                                  "curves on ONE axis, so Temporal overlays whatever the\n"
+                                  "Histogram / Projection layout above says.");
+            if (ImGui::MenuItem("  Side by side (one time plot per slot)##tl", nullptr,
+                                app.temporalLayout == App::TlSide))
+                app.temporalLayout = App::TlSide;
             ImGui::Separator();
             ImGui::TextDisabled("B image");
             // one row per stack (its frame in view), not one per frame: a

@@ -1482,8 +1482,18 @@ struct App {
     // by five with no way to tell which panel is showing what.
     // Auto mirrors the image: CmpSplit puts the images left/right, so the plots
     // go left/right; wipe / blink / diff have ONE image area, so the plots overlay.
+    // Since #320 it governs Histogram and Projection only: Temporal has its own
+    // setting just below.
     enum { AbAuto = 0, AbOverlay = 1, AbSide = 2 };
     int abStatsLayout = AbAuto;
+    // Temporal's layout, its OWN setting (#320, ruled 2026-10-28: "少なくとも
+    // 既定は重ねて表示"). Overlay by default whatever abStatsLayout says - a
+    // time series is read by comparing curves on ONE axis - and Side by side is
+    // still there for the day it is wanted. No Auto: the image arrangement is
+    // not what decides how two time series are best read. A preference, not
+    // session state ("temporallayout", compare.temporalLayout).
+    enum { TlOverlay = 0, TlSide = 1 };
+    int temporalLayout = TlOverlay;
     // Slot 1 of every statistics cache is filled ONLY while compare is on. This
     // records whether it still holds anything, so compare-off invalidates it
     // exactly once and then costs nothing at all.
@@ -2681,11 +2691,24 @@ struct App {
         double fpnCorr[4] = {};
         bool fpnClamped[4] = {};
         std::vector<float> idx, frameMean, frameStd;
+        // The STATE this request was made for, recorded by requestServerTemporal
+        // (#320). B is fired automatically once per (stack, state), and "has
+        // this state been asked already?" is a comparison against these: the
+        // stack's data revision, its mosaic (the interpretation the peer is
+        // told), and the selected region as the local Temporal resolves it -
+        // the ROI is one of the ruling's triggers even though the wire carries
+        // no rect today (rx..rh above record what was actually measured).
+        int keyRev = -1, keyCfa = -1, keyCfaPattern = -1;
+        int keyRx = 0, keyRy = 0, keyRw = 0, keyRh = 0;
+        bool keyPoi = false;
     } srvTemporal;
-    // The same, for the compare B side. NEVER fired automatically: a server
-    // aggregate is a real job on a real machine, and B following A around
-    // would double them silently. The Temporal panel's "Measure B" button is
-    // the only thing that fills this.
+    // The same, for the compare B side. Fired AUTOMATICALLY since #320 (ruled
+    // 2026-10-28, reversing ab-stats-plan §4's "never on its own"): on the
+    // triggers A has - B chosen, B's stack changed, the ROI or the mosaic
+    // changed - and ONCE per (stack, state): never while a request is pending
+    // and never when the slot already holds an answer, or a failure, for that
+    // state. A failure is retried by hand from the line that reports it.
+    // ensureServerTemporalB (core/ui/panel_temporal.inc) is the trigger.
     ServerTemporal srvTemporalB;
     // background loader
     std::thread seqThread;

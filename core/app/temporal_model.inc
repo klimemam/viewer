@@ -1,16 +1,15 @@
 // core/main.cpp から #include される断片。単独ではコンパイルしない。担当: パネル/解析
 // ---------------------------------------------------------------- temporal analysis
-// Built-in (L2): per-frame mean/std over the current ROI plus the temporal /
-// fixed-pattern noise split — the same decomposition EMVA 1288 is built on.
-// The cache slot is a parameter, not app.temporal: slot 0 is A, slot 1 is the
-// compare B side. The body is otherwise unchanged - which is the point, A's
-// numbers must not move because a B exists.
-static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T) {
-    if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
-    std::vector<int> f = framesOfSeq(im->seqId);
-    if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
-    int rx = 0, ry = 0, rw = im->w, rh = im->h;
-    bool roiUsed = false, poi = false;
+// The region Temporal measures over, resolved off the selected annotation:
+// a rect clamped to the image, a POI as a one-pixel rect, otherwise the whole
+// frame. ONE resolution, because two readers ask: the local computation below
+// keys its cache on it, and B's automatic server request (#320) keys "has
+// this state been asked" on it - two copies would let the two disagree about
+// whether the ROI moved.
+static void temporalRegionOf(const ImageDoc* im, int& rx, int& ry, int& rw, int& rh,
+                             bool& roiUsed, bool& poi) {
+    rx = 0; ry = 0; rw = im->w; rh = im->h;
+    roiUsed = false; poi = false;
     if (App::Ann* a = findAnn(app.selectedAnn)) {
         if (a->type == 0) {
             int cx = std::clamp(a->x, 0, im->w), cy = std::clamp(a->y, 0, im->h);
@@ -33,6 +32,20 @@ static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T)
             roiUsed = true; poi = true;
         }
     }
+}
+
+// Built-in (L2): per-frame mean/std over the current ROI plus the temporal /
+// fixed-pattern noise split — the same decomposition EMVA 1288 is built on.
+// The cache slot is a parameter, not app.temporal: slot 0 is A, slot 1 is the
+// compare B side. The body is otherwise unchanged - which is the point, A's
+// numbers must not move because a B exists.
+static void recomputeTemporalIfNeeded(const ImageDoc* im, App::TemporalState& T) {
+    if (!im || im->seqId == 0) { T.valid = false; T.seqId = -1; return; }
+    std::vector<int> f = framesOfSeq(im->seqId);
+    if ((int)f.size() < 2) { T.valid = false; T.seqId = -1; return; }
+    int rx, ry, rw, rh;
+    bool roiUsed, poi;
+    temporalRegionOf(im, rx, ry, rw, rh, roiUsed, poi);
     // keyed on the resolved rect; this pass costs samples x frames, so it must
     // not run for annotation churn or mid-drag. stackRev is the stack's DATA
     // revision: a reload swaps pixels under an unchanged (seqId, frames, ROI,

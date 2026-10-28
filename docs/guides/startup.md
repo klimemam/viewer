@@ -443,7 +443,8 @@ Files パネルでは batch 見出しの下に series が先に並び、メン�
 ### 統計パネルも A/B になります
 
 Histogram / Projection / Temporal は、compare が入っている間 **B も一緒に**出します。
-並べ方は `Compare A/B > Statistics panels` の**1 か所**で決まります(パネルごとの設定ではありません):
+Histogram / Projection の並べ方は `Compare A/B > Statistics layout: Histogram / Projection` の
+**1 か所**で決まります(パネルごとの設定ではありません。Temporal だけは専用の設定 —— 表の後):
 
 | 設定 | 見え方 |
 |---|---|
@@ -455,12 +456,17 @@ Histogram / Projection / Temporal は、compare が入っている間 **B も一
 |---|---|
 | Histogram | 縦軸が**各側の標本数に対する割合 [%]** になります(サイズの違う 2 枚を棒の高さで比べないため)。B は**必ず A と同じビン**で数えます。CFA は plane セレクタで**両側を同時に**絞れます |
 | Projection | 重ねるのは**同じ軸のときだけ**。原点も長さも一致しない profile は、Side by side 設定でなくても左右に落として理由を書きます —— 伸縮して重ねることはしません |
-| Temporal | **A / B / delta A-B / delta [%]** の表になります。B が stack でなければその列に `- (not a stack)`、チャンネル数が違えば delta 列そのものを出しません。frame mean のグラフは A 実線 / B 破線で 1 本の軸に乗ります |
+| Temporal | **A / B / delta A-B / delta [%]** の表になります。B が stack でなければその列に `- (not a stack)`、チャンネル数が違えば delta 列そのものを出しません。frame mean のグラフは既定で全側が 1 本の時間軸に重なります |
+
+Temporal のグラフは**専用の設定**で、既定は **overlay**(上の設定が Auto でも Side by side でも
+重ねる)。**side by side** も選べます —— Temporal パネルの見出しのコンボか
+`Compare A/B > Statistics layout: Temporal`。選んだものは次の起動にも残ります。
 
 フレームを連続で送っている間は **B 側の再計算を止めます**(1 ステップごとに 2 枚ぶん計算すると
 送りが重くなるため)。止めている間は琥珀色の `[stale]` が付き、送るのをやめると追いつきます。
-サーバ集計だけは別で、**B 側は自動では走りません** —— Temporal パネルの `Measure B` を
-押したときだけです(頼んでいないリモートジョブを倍にしないため)。
+B がサーバで集計される stack なら、**B のサーバ集計も A と同じく自動で走ります**(B を決めた・
+B の stack が変わった・ROI やモザイクを変えた、のとき**1 回だけ**。同じ状態では投げ直しません)。
+失敗したときは表の下の失敗の行の `retry` で頼み直せます。
 
 ## まだ出来ないこと
 
