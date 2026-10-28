@@ -249,10 +249,12 @@ static std::string bootstrapScript(bool keepCurrentPeer) {
     // may say otherwise; repoUrlInUse() is empty-means-unset (判断9).
     const std::string repo = repoUrlInUse();
     return
-        // Everything the script says reaches the user: runSshCommand wires the
-        // child's stderr to the PARENT's, so cp's "Text file busy" went to the
-        // viewer's own console and the log the user is shown contained git
-        // output and no cause at all.
+        // Everything the script says reaches the user, IN ORDER: the log the
+        // user is shown is stdout. runSshCommand used to wire the child's
+        // stderr to the viewer's own console, so cp's "Text file busy" went
+        // there and the log held git output and no cause at all; it keeps
+        // stderr now (#324), but apart from stdout and only its gist - the
+        // cause belongs next to the line it explains.
         "exec 2>&1\n"
         "set -e\n"
         "d=$HOME/.viewer\n"
@@ -382,16 +384,48 @@ static std::string peerProbeScript(const std::string& orElse) {
         "fi\n";
 }
 
+// The `UNAME <os> <machine>` line deployPeer's step-1 script prints, read back.
+// A marked line rather than "the first two lines": a chatty shell rc file may
+// print before the script does, and the old reading (is "Linux" ANYWHERE in the
+// output?) is the one that could not tell an empty answer from a strange one.
+static bool parseUnameLine(const std::string& out, std::string& os, std::string& machine) {
+    os.clear(); machine.clear();
+    std::istringstream lines(out);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.compare(0, 6, "UNAME ") != 0) continue;
+        std::istringstream words(line.substr(6));
+        os.clear(); machine.clear();
+        words >> os >> machine;
+    }
+    return !os.empty();
+}
+
 // Install the peer, best method first. Returns a human-readable log either way.
 bool deployPeer(const std::string& host, int port, bool force, std::string& log) {
     std::string out, err;
     // 1. what machine is over there, and is a WORKING peer already in place?
     //    (--help must actually run: a peer that was copied but dies on a glibc
     //    mismatch reported only "connection lost" before this check existed)
-    if (!remote::runSshScript(host, port,
-            "uname -s; uname -m\n" + peerProbeScript("echo NO_PEER"),
-            out, err, 20.0)) {
+    remote::SshRun run;
+    const bool ran = remote::runSshScript(host, port,
+        "echo \"UNAME $(uname -s) $(uname -m)\"\n" + peerProbeScript("echo NO_PEER"),
+        out, err, 20.0, nullptr, &run);
+    // A failure with no exit status is our own (ssh would not start, the 20 s
+    // ran out): the old sentence, and nothing read from a partial answer.
+    if (!ran && run.exitCode < 0) {
         log = "cannot reach " + host + ": " + err;
+        return false;
+    }
+    std::string os, machine;
+    if (!parseUnameLine(out, os, machine)) {
+        // NOTHING RAN, or nothing we asked for came back - and an empty answer
+        // is not an unsupported machine (#324). This said "no prebuilt peer for
+        // this machine:" over an EMPTY uname, for a server ssh had never logged
+        // into (exit 255, "Permission denied (publickey)."). The commands did
+        // not run over there, and ssh's stderr says why.
+        log = remote::sshCouldNotRun(host, port, run.exitCode, run.stderrText,
+                                     "nothing came back, not even uname's answer");
         return false;
     }
     // "it runs" is not "it is current": an old peer answers --help happily and
@@ -406,12 +440,12 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
     if (!force && peerProto == 0 && out.find("NO_PEER") == std::string::npos &&
         out.find("not found") == std::string::npos)
         log = "the installed peer is older than this viewer; replacing it\n";
-    bool isLinux = out.find("Linux") != std::string::npos;
-    bool isDarwin = out.find("Darwin") != std::string::npos;
-    if ((isLinux && out.find("x86_64") == std::string::npos) ||
-        (isDarwin && out.find("arm64") == std::string::npos) ||
-        (!isLinux && !isDarwin)) {
-        log = "no prebuilt peer for this machine:\n" + out +
+    // uname ANSWERED, so this is about the machine and nothing else: the one
+    // case "no prebuilt peer" is the right sentence for.
+    const bool supported = (os == "Linux" && machine == "x86_64") ||
+                           (os == "Darwin" && machine == "arm64");
+    if (!supported) {
+        log = "no prebuilt peer for this machine:\n" + os + " " + machine + "\n"
               "(binaries exist for Linux x86_64 and macOS arm64; build viewer-serve "
               "from source on the server and place it at ~/.viewer/viewer-serve)";
         return false;
@@ -419,7 +453,7 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
 
     // 2. hand it our own copy - no network and no credentials needed on the far
     //    side, which is what a lab compute box usually has
-    std::string local = findLocalPeer(out);
+    std::string local = findLocalPeer(os);
     if (!local.empty()) {
         std::string bytes;
         if (readWholeFile(local, bytes)) {
@@ -478,6 +512,7 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                 // plugins too, so server-side MEASURE has the same analyzers
                 std::filesystem::path pdir = std::filesystem::u8path(local).parent_path() / "plugins";
                 std::error_code ec;
+                std::string pluginNotes;      // a copy that failed is said, not dropped
                 if (std::filesystem::exists(pdir, ec)) {
                     for (auto& e : std::filesystem::directory_iterator(pdir, ec)) {
                         std::string pb;
@@ -489,15 +524,16 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                         // exactly ~/.viewer/plugins) - truncating under the
                         // mapping is a SIGBUS in the peer.
                         std::string pn = e.path().filename().u8string();
-                        remote::runSshCommand(host, port,
-                            "sh -c 'mkdir -p ~/.viewer/plugins && cat > "
-                            "~/.viewer/plugins/" + pn + ".new && "
-                            "mv ~/.viewer/plugins/" + pn + ".new "
-                            "~/.viewer/plugins/" + pn + "'",
-                            pb, o3, e3, 60.0);
+                        if (!remote::runSshCommand(host, port,
+                                "sh -c 'mkdir -p ~/.viewer/plugins && cat > "
+                                "~/.viewer/plugins/" + pn + ".new && "
+                                "mv ~/.viewer/plugins/" + pn + ".new "
+                                "~/.viewer/plugins/" + pn + "'",
+                                pb, o3, e3, 60.0))
+                            pluginNotes += "\nplugin " + pn + " was not copied: " + e3;
                     }
                 }
-                log = "sent the peer from this machine (" + local + ")";
+                log = "sent the peer from this machine (" + local + ")" + pluginNotes;
                 return true;
             }
             log = "could not copy the peer to " + host + ": " + (e2.empty() ? o2 : e2);
@@ -507,10 +543,17 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
 
     // 3. last resort: the server fetches it itself (needs git + network + access)
     std::string o4, e4;
+    remote::SshRun r4;
     if (!remote::runSshScript(host, port, force ? updateScript() : bootstrapScript(),
-                              o4, e4, 90.0)) {
+                              o4, e4, 90.0, nullptr, &r4)) {
+        // The script says why on stdout and then exits 1 ("no git on the
+        // server", "git clone failed ..."): those words are the reason, as they
+        // were when a nonzero exit still counted as success. ssh's own failure,
+        // a timeout and a cancel have no such words, and say e4.
+        const bool scriptSpoke = r4.exitCode > 0 && !r4.sshFailed &&
+                                 o4.find_first_not_of(" \r\n\t") != std::string::npos;
         log += (log.empty() ? "" : "\n") + std::string("server-side install: ") +
-               (e4.empty() ? "failed" : e4);
+               (scriptSpoke ? o4 : e4.empty() ? std::string("failed") : e4);
         if (local.empty())
             log += "\nno local viewer-serve to send either - looked next to " + app.exePath;
         return false;
