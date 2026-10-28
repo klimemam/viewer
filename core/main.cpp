@@ -1703,6 +1703,10 @@ int main(int argc, char** argv) {
     // against a scan written out in the test.
     #include "selftest/projframe.inc"
 
+    // The Projection table's numbers, lined up on the point (issue #313). Beside
+    // projframe.inc: the same table, and the same claim that the TSV is untouched.
+    #include "selftest/numalign.inc"
+
     // The three shipped analyzers that had no value assertion at all (板 304).
     // Beside rowcolsigma.inc because it is the same discipline on the other side
     // of the ABI: analytic fixtures whose answer can be written down.
