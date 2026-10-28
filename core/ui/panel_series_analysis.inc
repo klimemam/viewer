@@ -567,6 +567,9 @@ struct FrameAxis {
     const std::vector<double>* vals = nullptr;   // by seqIndex
     std::string label;                           // ready for beginPlot's x label
     std::string why;
+    // when `why`: the stack HAS the axis (name, unit) but nVals values for
+    // nFrames frames - a different sentence from "no such axis"
+    int nVals = 0, nFrames = 0;
     double at(double seqIndex) const {           // mapping: value i <- seqIndex i
         int i = (int)(seqIndex + 0.5);
         return custom && i >= 0 && i < (int)vals->size() ? (*vals)[i] : seqIndex;
@@ -588,6 +591,10 @@ static FrameAxis frameAxisOf(int seqId, const char* name = nullptr) {
                               "plotted on frame index",
                  ax->name.c_str(), (int)ax->vals.size(), N);
         a.why = b;
+        a.name = ax->name;
+        a.unit = ax->unit;
+        a.nVals = (int)ax->vals.size();
+        a.nFrames = N;
         return a;
     }
     a.custom = true;
