@@ -652,6 +652,84 @@ static int histZoomSelftest() {
     }
 
     // ======================================================================
+    // Z11 - "Per stack" (the default) + the linked option + a frame step +
+    // a second zoom. The range is SHARED over the stack, so the second zoom
+    // on frame 1 continues frame 0's step back, and reset gives the whole
+    // stack the range from before the first zoom.
+    // ======================================================================
+    {
+        auto g0 = ramp("hz_ps_000"); g0->seqId = 93093; g0->seqIndex = 0;
+        auto g1 = ramp("hz_ps_001"); g1->seqId = 93093; g1->seqIndex = 1;
+        app.images.push_back(std::move(g0));
+        app.images.push_back(std::move(g1));
+        ImageDoc* d0 = app.images[app.images.size() - 2].get();
+        ImageDoc* d1 = app.images.back().get();
+        app.rangeScope = 1;
+        app.histZoomSetsRange = true;
+        app.current = (int)app.images.size() - 2;
+        app.histZoom = App::HistZoom{};
+        histFrame();
+        histZoomApply(d0, 1024.0f, 2048.0f, app.hist[0].binW, app.hist[0].nBins);
+        check(d0->black == 1024.0f && d1->black == 1024.0f && d1->white == 2048.0f,
+              "Z11 fixture: the linked zoom on frame 0 is shared to frame 1");
+        app.current = (int)app.images.size() - 1;     // the frame step
+        histFrame();
+        check(histZoomApply(d1, 1200.0f, 1400.0f, app.hist[0].binW, app.hist[0].nBins),
+              "Z11 a second zoom on frame 1 is taken");
+        check(d0->black == app.histZoom.lo && d1->black == app.histZoom.lo,
+              "Z11 ...and shared over the stack");
+        histZoomReset(d1);
+        fprintf(stderr, "histzoomselftest: Z11 after reset f0 %.6g..%.6g f1 %.6g..%.6g\n",
+                (double)d0->black, (double)d0->white, (double)d1->black, (double)d1->white);
+        check(d0->black == 0.0f && d0->white == 4095.0f && d1->black == 0.0f &&
+              d1->white == 4095.0f,
+              "Z11 reset gives the whole stack the range from before the FIRST zoom");
+        app.histZoomSetsRange = false;
+        app.rangeScope = 0;
+        app.histZoom = App::HistZoom{};
+    }
+
+    // ======================================================================
+    // Z12 - THE GRID ALWAYS COVERS, at every width. Every drag a 256-bin axis
+    // allows (bins b0..b1, 32896 of them) on three wide integer axes: u32
+    // 0..2^24-1 (65536 DN bins), full u32 and full i32 (2^24 DN bins). Each
+    // zoom grid must cover [lo, hi) and be its own fixed point. A width found
+    // by a bounded +1 search fails thousands of these.
+    // ======================================================================
+    {
+        struct Ax { const char* dt; float black, white; };
+        const Ax axes[3] = { { "u32", 0.0f, 16777215.0f },
+                             { "u32", 0.0f, 4294967295.0f },
+                             { "i32", -2147483648.0f, 2147483647.0f } };
+        bool allCover = true, allFixed = true;
+        int bad = 0;
+        for (const Ax& ax : axes) {
+            float go = 0, gw = 0;
+            histBinGrid(ax.dt, ax.black, ax.white, go, gw);
+            for (int b0 = 0; b0 < 256; b0++)
+                for (int b1 = b0; b1 < 256; b1++) {
+                    const float lo = (float)((double)go + (double)b0 * (double)gw);
+                    const float hi = (float)((double)go + (double)(b1 + 1) * (double)gw);
+                    float o1 = 0, w1 = 0, o2 = 0, w2 = 0; int n1 = 0, n2 = 0;
+                    histZoomGrid(ax.dt, lo, hi, o1, w1, n1);
+                    const double t1 = (double)o1 + (double)n1 * (double)w1;
+                    const bool cov = (double)o1 <= (double)lo && t1 >= (double)hi;
+                    histZoomGrid(ax.dt, o1, (float)t1, o2, w2, n2);
+                    const bool fix = o1 == o2 && w1 == w2 && n1 == n2;
+                    if ((!cov || !fix) && bad++ < 3)
+                        fprintf(stderr, "histzoomselftest: Z12 %s [%.10g, %.10g) -> %.10g + %d x %.10g"
+                                        " = %.10g (cover %d fixed %d)\n", ax.dt, (double)lo,
+                                (double)hi, (double)o1, n1, (double)w1, t1, (int)cov, (int)fix);
+                    allCover = allCover && cov;
+                    allFixed = allFixed && fix;
+                }
+        }
+        fprintf(stderr, "histzoomselftest: Z12 %d failing drag(s) of 3 x 32896\n", bad);
+        check(allCover, "Z12 every zoom grid on wide u32 / i32 axes covers [lo, hi)");
+        check(allFixed, "Z12 ...and is its own fixed point");
+    }
+
+    // ======================================================================
     // Z6 - THE TWO PREFERENCES are written, and read back by name.
     // ======================================================================
     {

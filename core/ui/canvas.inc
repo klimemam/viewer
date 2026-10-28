@@ -1703,26 +1703,56 @@ static void histZoomGrid(const std::string& dtype, float lo, float hi,
         }
         w = 2.0f;              // 257 DN once rounded outward: one step coarser
     }
-    // Accepted only when the origin and the top are EXACT in float as well as
-    // covering: the grid is stored and drawn in float, and in the billions a
-    // float is a multiple of 256, so an origin like 2999999760 would round to
-    // another number and the grid would no longer be its own fixed point. An
-    // inexact integer width steps up to the next multiple of the float spacing
-    // there (every multiple of it is representable); a float width doubles.
+    // Accepted only when the grid COVERS [lo, hi) and its origin and top are
+    // EXACT in float: the grid is stored and drawn in float, and in the
+    // billions a float is a multiple of 256, so an origin like 2999999760
+    // would round to another number and the grid would no longer be its own
+    // fixed point.
+    //   * short of hi: the width is computed, not searched. The snapped origin
+    //     lies less than one bin below lo, so 255*w >= hi - lo is enough
+    //     whatever the origin lands on - one step, at any width (a +1 search
+    //     cannot reach a wide u32 grid in any bounded number of steps).
+    //   * inexact: an integer width steps up to the next multiple of the float
+    //     spacing there (every multiple of it is representable); a float
+    //     width doubles.
+    // ...and after the loop coverage is CHECKED, widening by doubling until it
+    // holds: this never returns a grid that ends before hi.
     auto exact = [](double v) { return (double)(float)v == v; };
+    auto upF = [](double v) {                  // the smallest float >= v
+        float f = (float)v;
+        if ((double)f < v) f = std::nextafter(f, INFINITY);
+        return f;
+    };
+    auto snap = [&](double ww, double& o) {
+        o = std::floor(L / ww) * ww;
+        if (o > L) o -= ww;
+    };
     for (int guard = 0; guard < 64; guard++) {
-        double o = std::floor(L / (double)w) * (double)w;
-        if (o > L) o -= (double)w;
+        double o = 0;
+        snap((double)w, o);
         const double top = o + 256.0 * (double)w;
-        const bool ex = exact(o) && exact(top);
-        if (top >= Hh && ex) { origin = (float)o; return; }
-        if (!intType)  { w *= 2.0f; continue; }
-        if (top < Hh)  { w += 1.0f; continue; }
+        if (top >= Hh && exact(o) && exact(top)) { origin = (float)o; return; }
+        if (top < Hh) {
+            const double need = std::ceil((Hh - L) / 255.0);
+            w = upF(std::max(need, intType ? (double)w + 1.0 : (double)w * 2.0));
+            if (!intType) {                    // keep a float width a power of two
+                int ex2 = 0;
+                if (frexpf(w, &ex2) != 0.5f) w = ldexpf(1.0f, ex2);
+            }
+            continue;
+        }
+        if (!intType) { w *= 2.0f; continue; }
         const float big = (float)std::max(std::fabs(L), std::fabs(top));
         const double ulp = (double)std::nextafter(big, INFINITY) - (double)big;
-        w = (float)(std::ceil(((double)w + 1.0) / ulp) * ulp);
+        w = upF(std::ceil(((double)w + 1.0) / ulp) * ulp);
     }
-    origin = (float)(std::floor(L / (double)w) * (double)w);
+    double o = 0;
+    snap((double)w, o);
+    for (int guard = 0; guard < 64 && o + 256.0 * (double)w < Hh; guard++) {
+        w *= 2.0f;
+        snap((double)w, o);
+    }
+    origin = (float)o;
 }
 
 // A grid handed to recomputeHistogramIfNeeded: bin b spans

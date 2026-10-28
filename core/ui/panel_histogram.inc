@@ -224,13 +224,22 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
         float rb = 0, rw = 0;
         histZoomRawRange(*im, rb, rw);
         // The step back is taken from the range in force before the FIRST zoom
-        // of a run - unless the user moved the range since the last one wrote
-        // it, and then from where they put it. A linked zoom on ANOTHER
-        // document (a frame step in between, outside Link) starts that
-        // document's own step back; the one before keeps the range it was
-        // given, as any range set on a frame you have left does.
+        // of a run, and a later linked zoom CONTINUES it while the range it
+        // is about to overwrite is still the one the zoom last wrote, read
+        // in the same place: the link range under Link; the same document;
+        // or, under "Per stack", any frame of the same stack - the range is
+        // shared there, so a frame step changes nothing about whose range it
+        // is. A new step back starts when the range in force differs (the
+        // user moved it), or when the range is not the same range at all
+        // (another document under "Auto per frame", another stack): then the
+        // earlier document keeps the range it was given, as any range set on
+        // a frame you have left does.
+        const ImageDoc* was = Z.restore ? histZoomRestoreDoc(im) : nullptr;
+        const bool sameRange = app.linkRange || (was && was->uid == im->uid) ||
+                               (was && app.rangeScope == 1 && im->seqId > 0 &&
+                                was->seqId == im->seqId);
         if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite ||
-            (!app.linkRange && Z.restoreUid != im->uid)) {
+            !sameRange) {
             Z.prevBlack = rb; Z.prevWhite = rw;
             Z.restoreLink = app.linkRange;
             Z.restoreUid = im->uid;

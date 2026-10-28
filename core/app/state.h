@@ -1651,7 +1651,11 @@ struct App {
         // restoreUid is the DOCUMENT whose range was read and written (unused
         // under Link, where the range is the link's). Reset restores that
         // document and only it - never the frame that happens to be on screen
-        // after a step, whose range under "Auto per frame" is its own.
+        // after a step, whose range under "Auto per frame" is its own. A later
+        // linked zoom continues the same step back while the range it would
+        // overwrite is still the one the zoom wrote - on the same document,
+        // under Link, or on any frame of the same stack under "Per stack",
+        // where the range is shared (histZoomApply).
         bool restore = false;
         bool restoreLink = false;
         uint64_t restoreUid = 0;
