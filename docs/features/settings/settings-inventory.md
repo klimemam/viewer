@@ -142,8 +142,8 @@ PR #122 で消え、`docs/guides/manual.md` は既に「ビルドを切り替え
 
 | 行 | 何を決めるか | 数値を動かすか |
 |---|---|---|
-| `linkrange` / `rangescope` | 表示レンジの決め方。`linkrange 1` = `applies to` が `all open`、`rangescope` = stack の rule (`0` each frame fits itself / `1` one range、#321。数値の意味は旧 Auto per frame / Per stack と同じ。`2` は読むと `linkrange 1` に写す) | **動かす** — 各面の黒/白が決まる |
-| `framerange <seqIndex> <black> <white>` | stack の image 行の直後、`frame` で外したフレーム1つにつき1行 (#321)。加算的 (古い viewer は読み飛ばし、そのフレームを stack のレンジで出す)。stack に無いフレームは `LK_LineRejected` (`framerange: frame N not in stack`) | **動かす** — そのフレームの黒/白 |
+| `linkrange` / `rangescope` | 表示レンジの決め方。`linkrange 1` = `applies to` が `all open`、`rangescope` = stack の rule (`0` each frame fits itself / `1` one range、#321。数値の意味は旧 Auto per frame / Per stack と同じ。`2` はどの操作も書かない値で、main は各画像を保存値で描いていたので `1` として読む) | **動かす** — 各面の黒/白が決まる |
+| `framerange <seqIndex> <black> <white>` | stack の image 行の直後、`frame` で外したフレーム1つにつき1行 (#321)。加算的 (古い viewer は読み飛ばし、そのフレームを stack のレンジで出す)。stack に無いフレームは `framerange: frame N not in stack` —— 読み込み中に答えられる stack (1 ファイルの frame 軸) ならセッションの報告に `LK_LineRejected`、フォルダや peer の stack (stack が揃ってから答える) なら toast | **動かす** — そのフレームの黒/白 |
 | `cmpfollow` | B が A のフレーム番号に追従 | **動かす** — どのフレームと比べたか |
 | `cmprange` | A/B の表示レンジの関係。`0` = scope は stack (各自)、`1` A's range / `2` union / `3` each side fits itself | **動かす** |
 | `compare` | 比較モード・wipe/split 位置・diff ゲイン・abs・blink | **一部動かす** (diff 系) |

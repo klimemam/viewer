@@ -2199,7 +2199,10 @@ static std::string reloadStackTail(int seqId, const watch::Rebuild& plan, int ha
             nd->name = baseName(n);
             nd->seqId = seqId;
             nd->batchId = ref->batchId;
-            nd->black = ref->black; nd->white = ref->white;
+            {   // the STACK's range, not an excepted head frame's (#321)
+                const ImageDoc* rr = stackRangeSource(seqId, ref);
+                nd->black = rr->black; nd->white = rr->white;
+            }
             nd->cfa = ref->cfa; nd->cfaPattern = ref->cfaPattern;
             nd->cfaColorize = ref->cfaColorize;
             nd->displayLut = ref->displayLut;

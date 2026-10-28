@@ -1334,7 +1334,8 @@ static int videoSelftest() {
                 if (!has(note, M.says)) { notes = false; fprintf(stderr, "videoselftest: V8 %s note: %s\n", tag, note.c_str()); }
                 if (M.slotC && M.mode != App::CmpSplit && !has(note, "C not shown")) notes = false;
                 if (M.slotC && M.mode == App::CmpSplit && !has(note, "padded with black to 64x40 (C 40x24)")) notes = false;
-                if (M.mode != App::CmpDiff && rmode == 2 && !has(note, "range: union over A, B")) notes = false;
+                if (M.mode != App::CmpDiff && rmode == 2 &&
+                    !(has(note, "range: union over A, B") && has(note, " (min-max) = "))) notes = false;
                 if (M.mode == App::CmpDiff && has(note, "letters")) notes = false;   // claims none
             }
             // the video: frame k == composeCompareRGBA(exportFrameViewFor(A_k))

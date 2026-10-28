@@ -554,7 +554,9 @@ static void pumpRemoteFetch() {
             bool ranged = false;
             for (const auto& q : app.images)
                 if (q->seqId == d.seqId) {
-                    doc->black = q->black; doc->white = q->white;
+                    // the STACK's range, not an excepted frame's (#321)
+                    const ImageDoc* rr = stackRangeSource(d.seqId, q.get());
+                    doc->black = rr->black; doc->white = rr->white;
                     doc->batchId = q->batchId;
                     ranged = true;
                     break;

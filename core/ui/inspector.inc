@@ -1082,7 +1082,8 @@ static void drawInspector() {
                 "spreads that." };
             static const char* RULE_TIP_AB[4] = {
                 nullptr,
-                "Every side at A's numbers - A's stack's range. It does not move while you step A.",
+                "Every side at A's numbers - A's stack's range, or A's own when A keeps one. It does "
+                "not move while you step A.",
                 "Every side re-fits to min/max across every compared side, every step. No side "
                 "clips, none is favoured.",
                 "Every side at its own fit (the fit buttons choose which). The sides are not on "

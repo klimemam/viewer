@@ -459,6 +459,16 @@ static const ImageDoc* stackRangeHolder(int seqId, const ImageDoc* but) {
         if (d.get() != but && d->seqId == seqId && !d->rangeOwn) return d.get();
     return nullptr;
 }
+// The doc a frame JOINING stack `seqId` copies its display range from: the
+// stack's reference `ref`, unless that frame keeps its own range - then a frame
+// that wears the stack's. Every join path asks this (the landing, a Reload's
+// join, a watched frame axis growing, a peer's frame arriving), so an excepted
+// head frame never hands its exception on.
+static const ImageDoc* stackRangeSource(int seqId, const ImageDoc* ref) {
+    if (ref && ref->rangeOwn)
+        if (const ImageDoc* h = stackRangeHolder(seqId, ref)) return h;
+    return ref;
+}
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
 // The compare display range - and "compare" means EVERY pane, not just the
@@ -1260,6 +1270,13 @@ static int rangeScopeOf(const ImageDoc* im) {
 static void setRangeScope(int s, ImageDoc* on) {
     float seenLo = 0, seenHi = 0;
     if (on) { seenLo = effBlack(*on); seenHi = effWhite(*on); }
+    // Which scope the click LEAVES decides what `stack` and `frame` do to an
+    // exception: only leaving `frame` rejoins the stack. Leaving `all open` or
+    // `A+B` goes back to the per-stack view with every excepted frame intact -
+    // the two overlays are display only and promise each stack its numbers
+    // back - and `frame` clicked from there keeps a range the frame already
+    // owns instead of taking the overlay's.
+    const int was = rangeScopeOf(on);
     const bool wasLinked = app.linkRange;
     const bool cmp = comparing();
     if (s != RS_All) app.linkRange = false;
@@ -1268,9 +1285,9 @@ static void setRangeScope(int s, ImageDoc* on) {
         app.compareRangeMode = 0;
     }
     if (s == RS_Frame && on && on->seqId > 0) {
+        if (!on->rangeOwn) { on->black = seenLo; on->white = seenHi; }
         on->rangeOwn = true;
-        on->black = seenLo; on->white = seenHi;
-    } else if (s == RS_Stack && on && on->rangeOwn) {
+    } else if (s == RS_Stack && on && on->rangeOwn && was == RS_Frame) {
         on->rangeOwn = false;
         if (const ImageDoc* h = stackRangeHolder(on->seqId, on)) {
             on->black = h->black; on->white = h->white;
@@ -1578,7 +1595,13 @@ static bool rangeButtonLit(ImageDoc& im, int btn, float eb, float ew) {
 static std::string rangeScopeTail(const ImageDoc* im) {
     switch (rangeScopeOf(im)) {
         case RS_Frame:    return "this frame only";
-        case RS_Compared: return "A's stack (A's range for every side)";
+        case RS_Compared: {
+            const ViewSides v = comparedSides();
+            // a write under A+B reaches A's stack - or A's frame alone when
+            // A keeps its own range (setRange), and the words say which
+            return v.n >= 1 && v.side[0]->rangeOwn ? "A's frame only (A keeps its own range; A's range for every side)"
+                                                   : "A's stack (A's range for every side)";
+        }
         case RS_All:      return "all open images";
         default:          return im && im->seqId > 0 ? "the stack" : "this image";
     }

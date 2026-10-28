@@ -1513,6 +1513,31 @@
             setRangeScope(RS_Stack, f1);
             ok(!f1->rangeOwn && f1->black == 5.0f && f1->white == 6.0f && rangeScopeOf(f1) == RS_Stack,
                "stack: frame 1 rejoins, at the stack's range");
+            // leaving an OVERLAY by `stack` is not leaving the exception: all
+            // open and A+B are display only and give each stack its numbers back
+            setRangeScope(RS_Frame, f1);
+            setRange(*f1, 0.0f, 255.0f);
+            setRangeScope(RS_All, f1);
+            setRange(*f1, 10.0f, 20.0f);                 // the LINK range moves, not the frame's
+            ok(app.linkRange && f1->rangeOwn && app.linkBlack == 10.0f && f1->black == 0.0f,
+               "all open over an excepted frame: the exception is kept underneath");
+            setRangeScope(RS_Frame, f1);
+            ok(!app.linkRange && f1->rangeOwn && f1->black == 0.0f && f1->white == 255.0f,
+               "frame from all open: the frame keeps its OWN range, not the link's");
+            setRangeScope(RS_All, f1);
+            setRangeScope(RS_Stack, f1);
+            ok(!app.linkRange && f1->rangeOwn && f1->black == 0.0f && f1->white == 255.0f &&
+               rangeScopeOf(f1) == RS_Frame,
+               "all open -> stack: the excepted frame is still excepted, at its own range");
+            {   // ...and the View menu's path out of Link range, which is the same call
+                setRangeScope(RS_All, f1);
+                setCompareRule(0);
+                if (app.linkRange) setRangeScope(RS_Stack, f1);
+                ok(!app.linkRange && f1->rangeOwn && f1->black == 0.0f,
+                   "View > Compare A/B > stack (each keeps its own) out of all open keeps the exception");
+            }
+            setRangeScope(RS_Stack, f1);                 // from frame: rejoins
+            ok(!f1->rangeOwn && f1->black == 5.0f, "...and stack FROM frame still rejoins");
             // a single image is its own stack: there is no frame exception to take
             f1->seqId = 0;
             setRangeScope(RS_Frame, f1);
@@ -1739,6 +1764,22 @@
                "...and every side shows its own stack's range");
             setRangeScope(RS_Compared, a0);
             ok("P23", app.compareRangeMode == 2, "A+B: back to the rule last chosen (union)");
+            {   // an excepted A survives A+B -> stack, Inspector and menu alike
+                setRangeScope(RS_Stack, a0);
+                setRangeScope(RS_Frame, a0);
+                a0->black = 60.0f; a0->white = 70.0f;
+                setRangeScope(RS_Compared, a0);
+                setRangeScope(RS_Stack, a0);
+                ok("P23", a0->rangeOwn && a0->black == 60.0f && app.compareRangeMode == 0,
+                   "A+B -> stack (Inspector): an excepted A keeps its own range");
+                setRangeScope(RS_Compared, a0);
+                setCompareRule(0);                              // the View menu's item
+                ok("P23", a0->rangeOwn && a0->black == 60.0f,
+                   "A+B -> stack (View menu): an excepted A keeps its own range");
+                setRangeScope(RS_Stack, a0);                    // from frame: rejoin
+                ok("P23", !a0->rangeOwn && a0->black == 50.0f, "...and stack from frame rejoins");
+                setRangeScope(RS_Compared, a0);
+            }
             {   // a single image offers no frame segment
                 const int sq = a0->seqId; a0->seqId = 0;
                 ok("P23", segs().rfind("stack,", 0) == 0, "a single image: no frame segment");
@@ -1979,8 +2020,12 @@
                     std::ofstream gf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
                     gf << "viewer-session 1\nlinkrange 0 0 1\nrangescope 2\n";
                 }
+                app.rangeRule = RR_EachFrame;
                 loadSession(sess);
-                ok(app.linkRange && app.rangeRule == RR_OneRange, "rangescope 2 reads as all open");
+                // main drew each image at its own saved range under scope 2
+                // (no branch read the value): one range, link off as saved
+                ok(!app.linkRange && app.rangeRule == RR_OneRange,
+                   "rangescope 2 reads as one range, each image at its saved numbers (main's picture)");
                 {
                     std::ofstream gf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
                     gf << "viewer-session 1\nlinkrange 0 0 1\nrangescope 7\n";
@@ -1988,6 +2033,31 @@
                 app.rangeRule = RR_EachFrame;
                 loadSession(sess);
                 ok(!app.linkRange && app.rangeRule == RR_EachFrame, "rangescope 7 is not a rule: the one in force stays");
+                // S1c - the DECLARED difference from main (manual §3a): an old
+                // "Auto per frame" session whose doc on screen carries a range
+                // that is not its fit (typed by hand, or never stepped onto)
+                // opens at the fit. main drew the stored numbers until the
+                // first step; the rule now says what is drawn.
+                {
+                    std::ofstream gf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
+                    gf << "viewer-session 1\nlinkrange 0 0 1\nrangescope 0\nautoflavor 0 0.5 0 0\n";
+                }
+                loadSession(sess);
+                auto hand = mkRamp("s1c", 100.0f, 400.0f, 0, 0.0f);
+                hand->black = 0.0f; hand->white = 255.0f;          // a hand-set range
+                ImageDoc* ph = hand.get();
+                app.images.push_back(std::move(hand));
+                app.current = (int)app.images.size() - 1;
+                std::vector<uint8_t> now, mainPic;
+                renderDocRGBA(*ph, now);
+                app.rangeRule = RR_OneRange;                       // what main drew: the stored numbers
+                renderDocRGBA(*ph, mainPic);
+                app.rangeRule = RR_EachFrame;
+                ok(effBlack(*ph) == ph->vmin && effWhite(*ph) == ph->vmax && now != mainPic &&
+                   ph->black == 0.0f && ph->white == 255.0f,
+                   "S1c (declared) old Auto per frame + a hand range on the doc on screen: drawn at its fit, "
+                   "stored range kept - not main's picture");
+                app.images.pop_back();
             }
             closeAll();
             std::filesystem::remove(pathFromUtf8(sess), tec);

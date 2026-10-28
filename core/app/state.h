@@ -1735,6 +1735,11 @@ struct App {
         uint64_t restoreUid = 0;
         float prevBlack = 0, prevWhite = 0;
         float setBlack = 0, setWhite = 0;
+        // ...and the RULES in force before that first zoom (#321): a linked
+        // zoom is a written range, so under "each frame fits itself", the union
+        // or "each side fits itself" it moves the rule (I2). The picture before
+        // the zoom was drawn by that rule, so the step back gives it back too.
+        int prevRule = 1, prevCmpRule = 2;
     } histZoom;
 
     // ---- value highlight (#68, docs/features/histogram/histogram-select-design.md) -------------

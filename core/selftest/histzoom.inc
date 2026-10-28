@@ -624,7 +624,7 @@ static int histZoomSelftest() {
     // range (#321 I2): the rule moves to "one range" and the whole stack takes
     // the zoom - the rule row moving is what says so. The step back is then
     // the stack's: reset, with the other frame on screen, gives both frames the
-    // range from before the zoom.
+    // range from before the zoom - and gives the RULE back with it.
     // ======================================================================
     {
         auto f0 = ramp("hz_apf_000"); f0->seqId = 93092; f0->seqIndex = 0;
@@ -649,6 +649,11 @@ static int histZoomSelftest() {
         histZoomReset(d1);                            // reset with frame 1 on screen
         check(d0->black == 0.0f && d0->white == 4095.0f && d1->black == 0.0f && d1->white == 4095.0f,
               "Z10 reset gives the stack the range from before the zoom");
+        // ...and the RULE: the picture before the zoom was each frame at its
+        // fit, and that is what comes back (#321 review P2-2)
+        check(app.rangeRule == RR_EachFrame &&
+              effBlack(*d1) == d1->vmin && effWhite(*d1) == d1->vmax,
+              "Z10 ...and the rule: each frame fits itself again, frame 1 drawn at its own fit");
         app.rangeRule = RR_OneRange;
         app.histZoomSetsRange = false;
         app.histZoom = App::HistZoom{};

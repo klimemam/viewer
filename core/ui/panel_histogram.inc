@@ -230,6 +230,7 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
         if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite ||
             !sameRange) {
             Z.prevBlack = rb; Z.prevWhite = rw;
+            Z.prevRule = app.rangeRule; Z.prevCmpRule = app.compareRangeMode;
             Z.restoreLink = app.linkRange;
             Z.restoreUid = im->uid;
             Z.restore = true;
@@ -255,7 +256,16 @@ static void histZoomReset(ImageDoc* im) {
     if (Z.on && Z.restore && app.histZoomSetsRange && t && Z.restoreLink == app.linkRange) {
         float rb = 0, rw = 0;
         histZoomRawRange(*t, rb, rw);
-        if (rb == Z.setBlack && rw == Z.setWhite) setRange(*t, Z.prevBlack, Z.prevWhite);
+        if (rb == Z.setBlack && rw == Z.setWhite) {
+            setRange(*t, Z.prevBlack, Z.prevWhite);
+            // the rule the zoom moved (I2) comes back with the numbers: the
+            // picture before the zoom was that rule's, not the stored range's
+            if (app.rangeRule != Z.prevRule || app.compareRangeMode != Z.prevCmpRule) {
+                app.rangeRule = Z.prevRule;
+                app.compareRangeMode = Z.prevCmpRule;
+                markAllTexDirty();
+            }
+        }
     }
     Z = App::HistZoom{};
 }
@@ -564,9 +574,12 @@ static void drawPanelHistogram() {
                 savePrefs();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("On: a zoom also sets the display range to it, exactly as\n"
-                                  "typing it into Range would (Per stack / Linked / A/B rules).\n"
-                                  "Resetting the zoom gives back the range from before the\n"
-                                  "first zoom - unless the range was changed in between.\n"
+                                  "typing it into Range would: to whoever Range's 'applies to'\n"
+                                  "names, and under a fitting rule (each frame / union / each\n"
+                                  "side) the rule moves to one range / A's range.\n"
+                                  "Resetting the zoom gives back the range - and the rule -\n"
+                                  "from before the first zoom, unless the range was changed\n"
+                                  "in between.\n"
                                   "Off: the zoom never touches the display range.");
             if (app.histZoom.on) {
                 ImGui::SameLine();
