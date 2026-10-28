@@ -273,6 +273,33 @@ static void drawMenuBar(GLFWwindow* win) {
                       "AVI otherwise."
                     : "the current image is not a frame of a stack");
         }
+        {   // The COMPARE VIEW out of the tool (#308): the side-by-side / tiled /
+            // wipe / difference picture composed at 1:1 from the documents, not
+            // read off the window. Enabled while comparing; what cannot be
+            // composed (blink, a preview side, ...) is said in the tooltip.
+            const bool comparing = app.compareMode != App::CmpOff && cur();
+            const std::string why = comparing ? compareViewRefusal() : std::string();
+            auto tip = [&](const char* what) {
+                if (!ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return;
+                if (!comparing) ImGui::SetTooltip("compare is off (View > Compare A/B)");
+                else if (!why.empty()) ImGui::SetTooltip("%s", why.c_str());
+                else ImGui::SetTooltip("%s", what);
+            };
+            if (ImGui::MenuItem("Save compare view as PNG...", nullptr, false, comparing))
+                askCompareViewPng();
+            tip("the compare view as one picture, every side at 1:1 and at the\n"
+                "levels on screen - side by side / tiled, wipe or difference.\n"
+                "No zoom, no overlays: Copy view (as displayed) carries those.");
+            if (ImGui::MenuItem("Export compare view as video...", nullptr, false,
+                                comparing && canExportStackVideo(cur())))
+                askCompareVideoExport();
+            tip(canExportStackVideo(cur())
+                    ? "A steps through its stack, B and the slots follow; frame k\n"
+                      "is the compare view with A on frame k - the PNG above, per frame."
+                    : "A is not a frame of a stack");
+            ImGui::MenuItem("Letters on compare exports (A / B / C)", nullptr,
+                            &app.cmpExportLetters);
+        }
         ImGui::Separator();
         {   // Close follows the layer canon (docs/terminology.md): Ctrl+W closes
             // the STACK when the current frame is in one, the image otherwise.

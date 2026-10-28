@@ -315,53 +315,9 @@ static void drawRawRecipePanel() {
     ImGui::End();
 }
 
-// ---------------- side-by-side tiles: the pane geometry --------------------
-// More than two compare slots means side by side and nothing else. A wipe, a
-// draggable split, a difference and a blink each mean exactly TWO images -
-// there is no honest three-image version of any of them - so those four keep
-// doing what they always did with A and B, and the extras get tiles.
-//
-// This lives out here, free of ImGui and of any frame state, because the
-// geometry IS the feature: --tile-selftest has to be able to assert the
-// rectangles without opening a window (this machine cannot screenshot GL).
-struct TilePane { float x0 = 0, w = 0; };
-
-// A pane narrower than this is not a comparison, it is a sliver: the badge that
-// says WHICH image it holds no longer fits, and two 40 px strips of a sensor
-// cannot be judged against each other. Say so rather than draw them.
-static float tileMinPaneW(float uiScale) { return 110.0f * uiScale; }
-
-// n equal-width panes across [x0, x0+width), separated by a band of 2*gutter -
-// the same band the A/B divider occupies, so the two layouts read as relatives.
-//
-// Equal width is the rule, not a simplification: app.splitFrac exists for A
-// against B, and applied to five panes it would make one of them a sliver.
-// Returns false, and leaves `out` empty, when the panes would be too narrow.
-static bool tileLayout(float x0, float width, int n, float gutter, float minPaneW,
-                       std::vector<TilePane>& out) {
-    out.clear();
-    if (n <= 0) return false;
-    const float paneW = (width - (n - 1) * 2.0f * gutter) / (float)n;
-    if (!(paneW >= minPaneW)) return false;      // written so a NaN fails too
-    out.reserve(n);
-    for (int i = 0; i < n; i++)
-        out.push_back({ x0 + i * (paneW + 2.0f * gutter), paneW });
-    return true;
-}
-
-// The ONE mapping every pane uses. Zoom and centre come from the view, never
-// from the pane: two images of the same scene at different magnifications,
-// side by side, is exactly how a reader compares sharpness or noise between
-// them and reaches a wrong conclusion. A pane that cannot show its image at
-// the shared zoom clips - it is never quietly rescaled.
-static ImVec2 tileMap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, float ix, float iy) {
-    return ImVec2(p0.x + sz.x * 0.5f + (ix - center.x) * zoom,
-                  p0.y + sz.y * 0.5f + (iy - center.y) * zoom);
-}
-static ImVec2 tileUnmap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, ImVec2 sc) {
-    return ImVec2(center.x + (sc.x - p0.x - sz.x * 0.5f) / zoom,
-                  center.y + (sc.y - p0.y - sz.y * 0.5f) / zoom);
-}
+// The pane geometry (TilePane, tileLayout, tileMap, tileUnmap) lives in
+// core/app/export.inc since #308: the compare export lays out and refuses
+// with the SAME functions, so it cannot drift from what this canvas draws.
 
 // Who gets a pane, in slot order: A, then B if compare is armed and has one,
 // then every extra slot. The letter travels WITH the document so a badge can
@@ -370,18 +326,19 @@ static ImVec2 tileUnmap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, ImVec2 
 // is that side's follow-frame divergence: the pane is showing the last frame
 // its stack had, and the badge must say so.
 struct TileSlot { ImageDoc* doc; std::string tag; bool stale = false; };
+// One pane per LETTER, not per document. Two letters resolving to one
+// document get two panes showing the same pixels - which is the point: side by
+// side is where you SEE that they coincide. The list is the screen view's
+// panes (ViewSides::pane, viewSidesFor), the SAME enumeration the compare
+// export lays out (#308), so the file cannot have a pane the canvas lacks or
+// lack one it has. Building the screen's view runs resolveB / resolveSlots,
+// which record the [stale] marks as before.
 static std::vector<TileSlot> tileSlots() {
     std::vector<TileSlot> out;
-    ImageDoc* a = cur();
-    if (!a) return out;
-    out.push_back({ a, "A", false });
-    ImageDoc* b = cmpB();                      // sets g_abFollowDiverged
-    if (b) out.push_back({ b, "B", g_abFollowDiverged });
-    // One pane per LETTER, not per document. Two letters resolving to one
-    // document get two panes showing the same pixels - which is the point:
-    // side by side is where you SEE that they coincide.
-    for (const ResolvedSlot& rs : resolveSlots())
-        out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
+    if (!cur()) return out;
+    const ViewSides v = comparedSides();
+    for (int p = 0; p < v.nPane; p++)
+        out.push_back({ v.pane[p], paneRoleLetter(v.paneRole[p]), v.paneStale[p] });
     return out;
 }
 // Tiling engages only when there is a third slot to show, and ONLY in Split -
@@ -463,7 +420,7 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
-    const float GUTTER = 3.0f * s;
+    const float GUTTER = tileGutter(s);
     // ---- more than two slots: tile them, side by side -------------------------
     // The tiled layout REPLACES the A/B split when it engages (see the `split`
     // line below): the same gesture, one pane per slot, one shared view.
@@ -479,12 +436,7 @@ static void drawCanvas(ImVec2 avail) {
         if (!tiled) {
             // Degrade by SAYING SO. Slivers of five images side by side look
             // like a comparison and cannot be read as one.
-            char m[224];
-            snprintf(m, sizeof m,
-                     "%d compare panes need at least %.0f px each - this canvas is "
-                     "%.0f px. Widen the window, or drop a slot.",
-                     (int)slots.size(), minW, canvasSize.x);
-            tileNarrow = m;
+            tileNarrow = tileNarrowSaid((int)slots.size(), minW, canvasSize.x);
             slots.clear();
         }
     }
@@ -852,6 +804,7 @@ static void drawCanvas(ImVec2 avail) {
                         toast("no file-dialog backend found (install zenity or kdialog)", true);
                     else {
                         app.pngDlgUid = ci->uid;   // the name below is ci's: the pixels must be too
+                        app.pngDlgCompare = false; // one document, not the compare view (#308)
                         app.pngDlgViewAUid = cur() ? cur()->uid : 0;   // ...and the view's (#304)
                         app.pngDlg = std::make_unique<pfd::save_file>("Save image as PNG",
                             baseName(ci->name) + ".png",
@@ -873,6 +826,25 @@ static void drawCanvas(ImVec2 avail) {
                               "FFV1/MKV where ffmpeg is on PATH, uncompressed\n"
                               "AVI otherwise."
                             : "this image is not a frame of a stack");
+                }
+                {   // ...and the COMPARE VIEW (#308), the same two verbs as the
+                    // File menu's: every pane at 1:1, the canvas's layout
+                    const bool comparing = app.compareMode != App::CmpOff && cur();
+                    const std::string why = comparing ? compareViewRefusal() : std::string();
+                    auto tip = [&]() {
+                        if (!ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return;
+                        if (!comparing) ImGui::SetTooltip("compare is off (View > Compare A/B)");
+                        else if (!why.empty()) ImGui::SetTooltip("%s", why.c_str());
+                        else ImGui::SetTooltip("every pane at 1:1, as laid out on the canvas;\n"
+                                               "no zoom, no overlays");
+                    };
+                    if (ImGui::MenuItem("Save compare view as PNG...", nullptr, false, comparing))
+                        askCompareViewPng();
+                    tip();
+                    if (ImGui::MenuItem("Export compare view as video...", nullptr, false,
+                                        comparing && canExportStackVideo(cur())))
+                        askCompareVideoExport();
+                    tip();
                 }
                 const bool inStack = ci && ci->seqId != 0;
                 App::Ann* ra = findAnn(app.selectedAnn);
@@ -1085,7 +1057,9 @@ static void drawCanvas(ImVec2 avail) {
         // hold A + C + D with no B at all, and every pane still has to say
         // which slot and which file it is.
         {
-            const ImU32 colA = IM_COL32(120, 200, 255, 255), colB = IM_COL32(255, 190, 120, 255);
+            // the badge inks: ONE definition (paneBadgeInk), which the compare
+            // export's letters are drawn in too (#308)
+            const ImU32 colA = paneBadgeInk(0, 0, 1), colB = paneBadgeInk(1, 1, 2);
             const float pad = 4.0f * s;
             // Each pane carries the SAME two-line identity the footer below
             // establishes: line 1 = letter + batch (the context, dimmer),
@@ -1133,13 +1107,6 @@ static void drawCanvas(ImVec2 avail) {
                 g_paneBadgeProbe += std::string(tag) + "|" + l1 + "|" + l2 + ";";
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
-            // C, D, E...: one hue each. "Which pane is D" has to be answerable
-            // from the badge alone - A's blue and B's orange stay where they are.
-            static const ImU32 TILE_COLS[6] = {
-                IM_COL32(105, 220, 130, 255), IM_COL32(200, 120, 255, 255),
-                IM_COL32(90, 220, 220, 255),  IM_COL32(255, 150, 200, 255),
-                IM_COL32(180, 200, 90, 255),  IM_COL32(255, 120, 120, 255),
-            };
             // Hold-B outranks the tiles: it deliberately takes the whole canvas,
             // so its badge - not four badges over one full-frame image - is what
             // has to be on screen.
@@ -1149,9 +1116,8 @@ static void drawCanvas(ImVec2 avail) {
             } else if (tiled) {
                 const int nAB = imB ? 2 : 1;                 // how many letters are A/B
                 for (int i = 0; i < (int)slots.size(); i++) {
-                    ImU32 c = slots[i].tag == "A" ? colA
-                            : slots[i].tag == "B" ? colB
-                            : TILE_COLS[std::max(0, i - nAB) % 6];
+                    const ImU32 c = paneBadgeInk(slots[i].tag == "A" ? 0 : slots[i].tag == "B" ? 1 : 2,
+                                                 i, nAB);
                     // a diverged side is the last frame its stack had, not A's
                     // partner - the same [stale] statement the panels make
                     badge(paneP0(i).x + 6 * s, paneP0(i).x + paneSz(i).x, false,

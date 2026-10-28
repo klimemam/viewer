@@ -5903,11 +5903,13 @@ static void pollFileDialog() {           // called once per frame from the main 
         std::string p = app.pngDlg->result();
         if (!p.empty()) {
             if (p.size() < 4 || p.substr(p.size() - 4) != ".png") p += ".png";
-            saveViewPng(p, app.pngDlgUid, app.pngDlgViewAUid);
+            if (app.pngDlgCompare) saveCompareViewPng(p, app.pngDlgViewAUid, &app.pngDlgCmpSpec);   // #308
+            else saveViewPng(p, app.pngDlgUid, app.pngDlgViewAUid);
         }
         app.pngDlg.reset();
         app.pngDlgUid = 0;
         app.pngDlgViewAUid = 0;
+        app.pngDlgCompare = false;
     }
     // ...and the same rule one layer up (#253): the dialog was opened on a
     // STACK, so the frames written are that stack's, named by seqId - not
@@ -5917,11 +5919,14 @@ static void pollFileDialog() {           // called once per frame from the main 
     if (app.videoDlg && app.videoDlg->ready(0)) {
         std::string p = app.videoDlg->result();
         const int seqId = app.videoDlgSeqId;
+        const bool compare = app.videoDlgCompare;   // the compare view of A's stack (#308)
         app.videoDlg.reset();
         app.videoDlgSeqId = 0;
+        app.videoDlgCompare = false;
         if (!p.empty()) {
             if (videoExtOf(p).empty()) p += videoExtFor(app.videoFormat);
-            std::string why = startStackVideoExport(seqId, p, app.videoFps);
+            std::string why = compare ? startCompareVideoExport(p, app.videoFps, &app.videoDlgCmpSpec)
+                                      : startStackVideoExport(seqId, p, app.videoFps);
             if (!why.empty()) toast(why, true);
         }
     }

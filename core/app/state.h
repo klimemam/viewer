@@ -1310,6 +1310,30 @@ struct App {
     // ...and the A it was opened UNDER (#304): the range is the view's, and the
     // view moves if A is stepped while the OS dialog is up. 0 = none.
     uint64_t pngDlgViewAUid = 0;
+    // ...and whether it saves the COMPARE VIEW (#308, saveCompareViewPng) -
+    // every side composed at 1:1 - rather than the one document pngDlgUid names.
+    bool pngDlgCompare = false;
+    // What a compare export draws, captured when it is ASKED for (the dialog
+    // opens, the video starts) and used from then on - so a step, a drag or a
+    // toggle while the OS dialog is up or the video is writing cannot change
+    // the picture, and the announcement stays true (compareSpecNow, #308).
+    struct CompareSpec {
+        int mode = 0;                 // CmpSplit / CmpWipe / CmpDiff / ...
+        int wipeCol = -1;             // wipe: the image column the screen's divider
+                                      // passes through; -1 = no canvas drawn yet
+        float wipeFrac = 0.5f;        // ...the divider's fraction, for the -1 case
+        bool letters = true;
+        float diffGain = 0;           // 0 = auto, worked out per pair
+        bool diffAbs = false;         // renderDiffRGBA reads app.diffAbs: checked, not used
+        float canvasW = 0;            // the canvas width tiling is decided for; 0 = none drawn
+        float uiScale = 1;
+        // what the views are resolved from: a change stops a video
+        uint64_t aUid = 0;
+        uint64_t bUid = 0;
+        std::vector<uint64_t> slots;
+        bool follow = true;
+    };
+    CompareSpec pngDlgCmpSpec;
     // ---- a STACK on its way out as a lossless video (issue #253) -----------
     // The neighbour of pngDlg above and its rule is pngDlgUid's, one layer up:
     // the dialog is opened ON A STACK, and the frames written when it closes
@@ -1317,11 +1341,18 @@ struct App {
     // open and close, and this one survives an OS dialog.
     std::unique_ptr<pfd::save_file> videoDlg;
     int videoDlgSeqId = 0;
+    bool videoDlgCompare = false;     // the compare view of A's stack (#308), not the stack alone
+    CompareSpec videoDlgCmpSpec;      // ...as it was when Choose file was pressed
     // The little modal in front of the save dialog: frame rate and format have
     // to be settled BEFORE the file name, because the format decides the
     // extension the dialog defaults to.
     bool videoAskOpen = false;
     int  videoAskSeqId = 0;
+    bool videoAskCompare = false;     // the modal is asking for a compare video (#308)
+    // The side letters (A / B / C...) burnt into the top-left of each side of
+    // a compare export (#308), in the canvas badge's ink (paneBadgeInk). On
+    // by default; not in the session.
+    bool cmpExportLetters = true;
     float videoFps = 30.0f;           // positive finite; travels in the session
     int   videoFormat = 0;            // 0 = uncompressed AVI, 1 = FFV1/MKV (ffmpeg)
     // The job itself. renderDocRGBA is CPU-only but NOT thread-safe (it holds a
@@ -1344,6 +1375,11 @@ struct App {
         std::vector<std::string> held; // "B held at frame 3", each once, as frames used them
         std::unique_ptr<videowrite::VideoSink> sink;
         bool stop = false;            // Stop: close the file and DELETE it
+        // A COMPARE video (#308): frame k is composeCompareRGBA of the view
+        // A's frame k is on screen in, not the frame alone, drawn by the spec
+        // the export was asked under (mode, wipe column, letters, gain).
+        bool compare = false;
+        CompareSpec cmp;
     } videoExport;
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy
