@@ -684,6 +684,330 @@ static ViewSides exportFrameViewFor(ImageDoc* d, ImageDoc*& stepTo) {
     s.diverged[r] = false;
     return s;
 }
+
+// ---------------------------------------- the COMPARE VIEW, at 1:1 (#308) ---
+// The picture the canvas composes - A | B | C side by side, the wipe, the
+// difference - built from the documents instead of read off the framebuffer,
+// so it does not depend on the window, the zoom or the pan. Every side is
+// drawn by renderDocRGBA(side, &v): the view `v` decides each side's range,
+// exactly as for a single picture (#304), and the value highlight comes with
+// it. composeCompareRGBA is the ONE place the composite is built; the PNG
+// (saveCompareViewPng) and every frame of the compare video (pumpVideoExport)
+// call it, so frame k of the video and the PNG of that view are the same
+// bytes. Overlays (ROI frames, pins, grid) are not burnt in: they are chrome,
+// and "Copy view (as displayed)" is the item that carries them.
+//
+// Layout, per mode (compareLayoutFor):
+//   side by side / tiled - every side of the view, in the canvas's order (A,
+//       B, then the slots in letter order), left to right in one row, each in
+//       a cell the size of the LARGEST side, top-left aligned as the shared
+//       view aligns them on screen; the rest of a smaller side's cell is
+//       black. CMP_SEP_PX columns of neutral grey between cells.
+//   wipe - A and B over one cell (the larger of the two, black where neither
+//       reaches); A left of column round(app.wipeFrac * width), B from it,
+//       and that column is the 1 px divider line. The fraction is the canvas
+//       divider's, applied to the IMAGE width: the export has no pan.
+//   difference - renderDiffRGBA, the function the screen's difference texture
+//       is drawn by, at the scale the screen uses (app.diffGain, or the auto
+//       scale of THIS pair, diffAutoGainOf).
+//   blink - refused: it is two pictures in time, not one.
+// Wipe and difference show A and B only, as on screen; slots are named as
+// "not shown". The letters (app.cmpExportLetters) go top-left of each side,
+// in slotInk, on a black plate - drawn from a built-in 5x7 bitmap, because a
+// windowless export has no font atlas to draw text with.
+static ImU32 slotInk(size_t i);   // fwd: inspector.inc - the letter's ink
+
+static const int CMP_SEP_PX = 2;
+static const uint8_t CMP_SEP_RGB[3]  = { 128, 128, 128 };   // neutral grey
+static const uint8_t CMP_WIPE_RGB[3] = { 255, 255, 255 };   // the canvas's wipe line
+
+struct CompareLayout {
+    int mode = 0;                       // App::CmpSplit / CmpWipe / CmpDiff
+    int w = 0, h = 0;                   // the composite
+    int cellW = 0, cellH = 0;           // split / wipe: the cell every side is placed in
+    int n = 0;                          // sides drawn
+    int at[CMP_SIDES_MAX] = {};         // ...as indices into the view, in drawing order
+    int x0[CMP_SIDES_MAX] = {};         // split: each cell's left column
+    int div = 0;                        // wipe: the divider column; B is drawn right of it
+    bool padded = false;                // a side is smaller than its cell
+    std::string unshown;                // wipe / difference: the letters not drawn
+};
+
+// "" and `L` filled when the view can be composed; the refusal otherwise.
+// Reads the compare mode and the wipe divider; draws nothing, so the menu,
+// the modal and the video's up-front check can ask it for every frame.
+static std::string compareLayoutFor(const ViewSides& v, CompareLayout& L) {
+    L = CompareLayout();
+    L.mode = app.compareMode;
+    if (app.compareMode == App::CmpOff || v.n < 2)
+        return "compare is off - there is no compare view to export";
+    if (app.compareMode == App::CmpFlip)
+        return "blink shows one side at a time, so it is not one picture - switch to "
+               "side by side or wipe (View > Compare A/B), then export";
+    int bAt = -1;
+    for (int i = 1; i < v.n && bAt < 0; i++) if (v.role[i] == 1) bAt = i;
+    if (app.compareMode == App::CmpSplit) {
+        for (int i = 0; i < v.n; i++) L.at[L.n++] = i;
+    } else {
+        const char* mode = app.compareMode == App::CmpWipe ? "wipe" : "difference";
+        if (bAt < 0) return std::string(mode) + " needs a B image - View > Compare A/B > B image";
+        L.at[L.n++] = 0;
+        L.at[L.n++] = bAt;
+        for (int i = 1; i < v.n; i++)
+            if (i != bAt) L.unshown += (L.unshown.empty() ? "" : ", ") + viewSideLetter(v, i);
+    }
+    // Every side DRAWN is drawn dot by dot, so each is refused as a picture
+    // would be; and every side the range is taken over (the union reads the
+    // slots wipe does not draw), as viewRefusalFor says for one picture.
+    for (int k = 0; k < L.n; k++) {
+        const std::string why = exportRefusalFor(v.side[L.at[k]]);
+        if (!why.empty()) return viewSideLetter(v, L.at[k]) + ": " + why;
+    }
+    {
+        const std::string why = viewRefusalFor(v, nullptr);
+        if (!why.empty()) return why;
+    }
+    auto dims = [](const ImageDoc* d) { return std::to_string(d->w) + "x" + std::to_string(d->h); };
+    if (app.compareMode == App::CmpDiff) {
+        const ImageDoc* A = v.side[0];
+        const ImageDoc* B = v.side[bAt];
+        if (A->w != B->w || A->h != B->h)
+            return "difference needs A and B to be the same size (A " + dims(A) + ", B " +
+                   dims(B) + ")";
+        L.w = A->w; L.h = A->h;
+    } else {
+        for (int k = 0; k < L.n; k++) {
+            L.cellW = std::max(L.cellW, v.side[L.at[k]]->w);
+            L.cellH = std::max(L.cellH, v.side[L.at[k]]->h);
+        }
+        for (int k = 0; k < L.n; k++)
+            if (v.side[L.at[k]]->w != L.cellW || v.side[L.at[k]]->h != L.cellH) L.padded = true;
+        if (app.compareMode == App::CmpSplit) {
+            for (int k = 0; k < L.n; k++) L.x0[k] = k * (L.cellW + CMP_SEP_PX);
+            L.w = L.n * L.cellW + (L.n - 1) * CMP_SEP_PX;
+        } else {
+            L.w = L.cellW;
+            L.div = std::clamp((int)lroundf(app.wipeFrac * (float)L.w), 0, L.w);
+        }
+        L.h = L.cellH;
+    }
+    // 512 Mpx, i.e. a 2 GB RGBA buffer: past it the composite is not a picture
+    // anyone opens, and the allocation alone can take the session down.
+    if ((uint64_t)L.w * (uint64_t)L.h > (1ull << 29))
+        return "the compare view would be " + std::to_string(L.w) + "x" + std::to_string(L.h) +
+               " - over 512 Mpx; compare fewer sides";
+    return {};
+}
+
+// The letters, as 5x7 bitmaps: A, B and the slot letters (SLOT_LETTERS ends
+// at P). Row r of glyph g is CMP_GLYPH[g][r], bit 4 the leftmost column.
+static const uint8_t CMP_GLYPH[16][7] = {
+    { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },   // A
+    { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },   // B
+    { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },   // C
+    { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E },   // D
+    { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },   // E
+    { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },   // F
+    { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E },   // G
+    { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },   // H
+    { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },   // I
+    { 0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C },   // J
+    { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },   // K
+    { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },   // L
+    { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },   // M
+    { 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11 },   // N
+    { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },   // O
+    { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },   // P
+};
+// Where the letter of a cell at (x0, 0), cellW x cellH, goes: a plate of
+// 7s x 9s pixels (the 5x7 glyph and a border of s, s the scale) inset by s
+// from the cell's corner. s grows with the cell so the letter stays legible on
+// a large frame: one step per 128 px of the shorter side, at most 8. False
+// when the plate does not fit in the cell - a letter over a neighbour is worse
+// than none.
+struct CmpLabelBox { int x = 0, y = 0, w = 0, h = 0, s = 1; };
+static bool cmpLabelBox(int x0, int cellW, int cellH, CmpLabelBox& b) {
+    b.s = std::clamp(std::min(cellW, cellH) / 128, 1, 8);
+    b.x = x0 + b.s; b.y = b.s; b.w = 7 * b.s; b.h = 9 * b.s;
+    return b.w + 2 * b.s <= cellW && b.h + 2 * b.s <= cellH;
+}
+static void cmpPaintLetter(std::vector<uint8_t>& rgba, int W, int x0, int cellW, int cellH,
+                           const std::string& letter, ImU32 ink) {
+    CmpLabelBox b;
+    if (letter.size() != 1 || letter[0] < 'A' || letter[0] > 'P') return;
+    if (!cmpLabelBox(x0, cellW, cellH, b)) return;
+    const uint8_t* g = CMP_GLYPH[letter[0] - 'A'];
+    const uint8_t ir = (uint8_t)((ink >> IM_COL32_R_SHIFT) & 0xFF);
+    const uint8_t ig = (uint8_t)((ink >> IM_COL32_G_SHIFT) & 0xFF);
+    const uint8_t ib = (uint8_t)((ink >> IM_COL32_B_SHIFT) & 0xFF);
+    for (int y = 0; y < b.h; y++)
+        for (int x = 0; x < b.w; x++) {
+            const int gx = x / b.s - 1, gy = y / b.s - 1;     // the border is plate
+            const bool on = gx >= 0 && gx < 5 && gy >= 0 && gy < 7 && ((g[gy] >> (4 - gx)) & 1);
+            uint8_t* p = &rgba[((size_t)(b.y + y) * W + (b.x + x)) * 4];
+            p[0] = on ? ir : 0; p[1] = on ? ig : 0; p[2] = on ? ib : 0; p[3] = 255;
+        }
+}
+
+// The sentence a compare export is announced with: the mode and the layout,
+// what was padded or not shown, and the range in the controls' words
+// (exportRangeNote, for A - every side is drawn under the same rule). `video`:
+// the range and an auto difference scale are worked out again for every
+// frame, so no numbers. `gain` is the difference's full scale (one picture).
+static std::string compareExportNote(const ViewSides& v, const CompareLayout& L, bool video,
+                                     float gain) {
+    std::string s = "compare: ";
+    char num[96];
+    if (L.mode == App::CmpDiff) {
+        s += app.diffAbs ? "difference |A-B|" : "difference A-B";
+        if (app.diffGain > 0) snprintf(num, sizeof num, ", full scale +-%g (set)", app.diffGain);
+        else if (video) snprintf(num, sizeof num, ", full scale auto (99.9th percentile), per frame");
+        else snprintf(num, sizeof num, ", full scale +-%g (auto)", gain);
+        s += num;
+    } else {
+        std::string order;
+        for (int k = 0; k < L.n; k++) order += (k ? " | " : "") + viewSideLetter(v, L.at[k]);
+        if (L.mode == App::CmpSplit) {
+            snprintf(num, sizeof num, ", 1:1 in %dx%d cells, %d px grey separators",
+                     L.cellW, L.cellH, CMP_SEP_PX);
+            s += (L.n > 2 ? "tiled " : "side by side ") + order + num;
+        } else {
+            snprintf(num, sizeof num, "wipe at %.0f%% (B from column %d of %d, 1 px line)",
+                     app.wipeFrac * 100.0f, L.div, L.w);
+            s += num;
+        }
+        if (L.padded) {
+            std::string small;
+            for (int k = 0; k < L.n; k++) {
+                const ImageDoc* d = v.side[L.at[k]];
+                if (d->w != L.cellW || d->h != L.cellH)
+                    small += (small.empty() ? "" : ", ") + viewSideLetter(v, L.at[k]) + " " +
+                             std::to_string(d->w) + "x" + std::to_string(d->h);
+            }
+            snprintf(num, sizeof num, "%dx%d", L.cellW, L.cellH);
+            s += "; sizes differ - padded with black to " + std::string(num) + " (" + small + ")";
+        }
+    }
+    if (!L.unshown.empty())
+        s += "; " + L.unshown + " not shown (" +
+             (L.mode == App::CmpWipe ? "wipe" : "difference") + " compares A and B)";
+    if (L.mode != App::CmpDiff) {
+        s += "  -  " + exportRangeNote(*v.side[0], v, video);
+        // the numbers a single picture carries are A's; under the two modes
+        // where each side has its own, that has to be said
+        if (!video && !app.linkRange && (app.compareRangeMode == 0 || app.compareRangeMode == 3))
+            s += " (A's; each side at its own)";
+    }
+    s += app.cmpExportLetters ? "  -  letters on" : "  -  no letters";
+    return s;
+}
+
+// Copy a side's rows into the composite at column dx, only the composite
+// columns [c0, c1) - the wipe draws A left of the divider and B right of it.
+static void cmpBlit(std::vector<uint8_t>& dst, int W, const std::vector<uint8_t>& src,
+                    int sw, int sh, int dx, int c0, int c1) {
+    const int x0 = std::max(dx, c0), x1 = std::min(dx + sw, c1);
+    if (x1 <= x0) return;
+    for (int y = 0; y < sh; y++)
+        memcpy(&dst[((size_t)y * W + x0) * 4], &src[((size_t)y * sw + (x0 - dx)) * 4],
+               (size_t)(x1 - x0) * 4);
+}
+
+// The compare view `v` as one RGBA picture, w x h. False, with the refusal in
+// `note`, when it cannot be composed; otherwise `note` is the announcement.
+static bool composeCompareRGBA(const ViewSides& v, std::vector<uint8_t>& rgba, int& w, int& h,
+                               std::string& note) {
+    CompareLayout L;
+    note = compareLayoutFor(v, L);
+    if (!note.empty()) { w = h = 0; rgba.clear(); return false; }
+    w = L.w; h = L.h;
+    if (L.mode == App::CmpDiff) {
+        ImageDoc* A = v.side[L.at[0]];
+        ImageDoc* B = v.side[L.at[1]];
+        const float gain = app.diffGain > 0 ? app.diffGain : diffAutoGainOf(*A, *B);
+        renderDiffRGBA(*A, *B, w, h, std::min(A->ch, B->ch), gain, rgba);
+        note = compareExportNote(v, L, false, gain);
+        return true;
+    }
+    rgba.assign((size_t)w * h * 4, 0);
+    for (size_t p = 0; p < (size_t)w * h; p++) rgba[p * 4 + 3] = 255;   // opaque black
+    static std::vector<uint8_t> side;    // one scratch buffer, as rebuildTexture keeps
+    for (int k = 0; k < L.n; k++) {
+        ImageDoc* d = v.side[L.at[k]];
+        renderDocRGBA(*d, side, &v);
+        if (L.mode == App::CmpSplit) cmpBlit(rgba, w, side, d->w, d->h, L.x0[k], 0, w);
+        else if (k == 0)             cmpBlit(rgba, w, side, d->w, d->h, 0, 0, L.div);
+        else                         cmpBlit(rgba, w, side, d->w, d->h, 0, L.div, w);
+    }
+    auto column = [&](int x, const uint8_t* c) {
+        for (int y = 0; y < h; y++) {
+            uint8_t* p = &rgba[((size_t)y * w + x) * 4];
+            p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = 255;
+        }
+    };
+    if (L.mode == App::CmpSplit) {
+        for (int k = 1; k < L.n; k++)
+            for (int x = L.x0[k] - CMP_SEP_PX; x < L.x0[k]; x++) column(x, CMP_SEP_RGB);
+    } else if (L.div < w) {
+        column(L.div, CMP_WIPE_RGB);
+    }
+    if (app.cmpExportLetters) {
+        for (int k = 0; k < L.n; k++) {
+            const int i = L.at[k];
+            const ImU32 ink = slotInk((size_t)v.role[i]);
+            if (L.mode == App::CmpSplit)
+                cmpPaintLetter(rgba, w, L.x0[k], L.cellW, L.cellH, viewSideLetter(v, i), ink);
+            else if (k == 0)
+                cmpPaintLetter(rgba, w, 0, L.div, L.cellH, viewSideLetter(v, i), ink);
+            else
+                cmpPaintLetter(rgba, w, L.div + 1, w - L.div - 1, L.cellH, viewSideLetter(v, i), ink);
+        }
+    }
+    note = compareExportNote(v, L, false, 0.0f);
+    return true;
+}
+
+// The refusal for the compare view ON SCREEN ("" = it can be exported): the
+// menu items' enabled state and tooltip.
+static std::string compareViewRefusal() {
+    CompareLayout L;
+    return compareLayoutFor(comparedSides(), L);
+}
+
+// File > Save compare view as PNG..., the picture half of #308: the compare
+// view the dialog was opened under (viewAUid, saveViewPng's rule), composed
+// by composeCompareRGBA - the same bytes a compare video writes for that view.
+static void saveCompareViewPng(const std::string& path, uint64_t viewAUid = 0) {
+    ImageDoc* viewA = nullptr;
+    if (viewAUid) for (const auto& d : app.images) if (d->uid == viewAUid) { viewA = d.get(); break; }
+    const ViewSides view = viewA ? viewSidesFor(viewA) : comparedSides();
+    std::vector<uint8_t> rgba; int w = 0, h = 0; std::string note;
+    if (!composeCompareRGBA(view, rgba, w, h, note)) { toast(note, true); return; }
+    std::vector<uint8_t> png = encodePng(rgba, w, h);
+    if (png.empty()) { toast("PNG encode failed", true); return; }
+    std::ofstream f(pathFromUtf8(path), std::ios::binary);
+    if (!f) { toast("cannot write " + path, true); return; }
+    f.write((const char*)png.data(), (std::streamsize)png.size());
+    const std::string hlNote = exportHighlightNote(view.side[0]);
+    fprintf(stderr, "export: %s\n", note.c_str());
+    if (!hlNote.empty()) fprintf(stderr, "export: %s\n", hlNote.c_str());
+    toast("saved " + baseName(path) + "  " + std::to_string(w) + "x" + std::to_string(h) +
+          "  -  " + note + (hlNote.empty() ? "" : "  -  " + hlNote));
+}
+static void askCompareViewPng() {
+    const std::string why = compareViewRefusal();
+    if (!why.empty()) { toast(why, true); return; }
+    if (!pfd::settings::available()) {
+        toast("no file-dialog backend found (install zenity or kdialog)", true);
+        return;
+    }
+    app.pngDlgCompare = true;
+    app.pngDlgUid = 0;
+    app.pngDlgViewAUid = cur()->uid;
+    app.pngDlg = std::make_unique<pfd::save_file>("Save compare view as PNG",
+        baseName(cur()->name) + "_compare.png",
+        std::vector<std::string>{ "PNG (*.png)", "*.png" });
+}
 // WHICH fit "each side fits itself" draws with (#301), set from the radio row
 // under the A/B combo and from the View > Compare A/B menu. It is the SAME
 // variable "Auto per frame" re-fits by - one answer to "which fit", not one per

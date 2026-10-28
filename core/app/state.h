@@ -1310,6 +1310,9 @@ struct App {
     // ...and the A it was opened UNDER (#304): the range is the view's, and the
     // view moves if A is stepped while the OS dialog is up. 0 = none.
     uint64_t pngDlgViewAUid = 0;
+    // ...and whether it saves the COMPARE VIEW (#308, saveCompareViewPng) -
+    // every side composed at 1:1 - rather than the one document pngDlgUid names.
+    bool pngDlgCompare = false;
     // ---- a STACK on its way out as a lossless video (issue #253) -----------
     // The neighbour of pngDlg above and its rule is pngDlgUid's, one layer up:
     // the dialog is opened ON A STACK, and the frames written when it closes
@@ -1317,11 +1320,16 @@ struct App {
     // open and close, and this one survives an OS dialog.
     std::unique_ptr<pfd::save_file> videoDlg;
     int videoDlgSeqId = 0;
+    bool videoDlgCompare = false;     // the compare view of A's stack (#308), not the stack alone
     // The little modal in front of the save dialog: frame rate and format have
     // to be settled BEFORE the file name, because the format decides the
     // extension the dialog defaults to.
     bool videoAskOpen = false;
     int  videoAskSeqId = 0;
+    bool videoAskCompare = false;     // the modal is asking for a compare video (#308)
+    // The side letters (A / B / C...) burnt into the top-left of each side of
+    // a compare export (#308), in slotInk. On by default; not in the session.
+    bool cmpExportLetters = true;
     float videoFps = 30.0f;           // positive finite; travels in the session
     int   videoFormat = 0;            // 0 = uncompressed AVI, 1 = FFV1/MKV (ffmpeg)
     // The job itself. renderDocRGBA is CPU-only but NOT thread-safe (it holds a
@@ -1344,6 +1352,13 @@ struct App {
         std::vector<std::string> held; // "B held at frame 3", each once, as frames used them
         std::unique_ptr<videowrite::VideoSink> sink;
         bool stop = false;            // Stop: close the file and DELETE it
+        // A COMPARE video (#308): frame k is composeCompareRGBA of the view
+        // A's frame k is on screen in, not the frame alone. The layout it was
+        // started under; a change mid-write abandons it rather than switching
+        // the picture halfway through the file.
+        bool compare = false;
+        int cmpMode = 0;
+        float cmpWipeFrac = 0;
     } videoExport;
     // One predicate for "an OS file dialog is pending". pollFileDialog only
     // runs inside a drawn frame, so a dialog missing from the idle loop's busy

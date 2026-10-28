@@ -852,6 +852,7 @@ static void drawCanvas(ImVec2 avail) {
                         toast("no file-dialog backend found (install zenity or kdialog)", true);
                     else {
                         app.pngDlgUid = ci->uid;   // the name below is ci's: the pixels must be too
+                        app.pngDlgCompare = false; // one document, not the compare view (#308)
                         app.pngDlgViewAUid = cur() ? cur()->uid : 0;   // ...and the view's (#304)
                         app.pngDlg = std::make_unique<pfd::save_file>("Save image as PNG",
                             baseName(ci->name) + ".png",

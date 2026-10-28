@@ -74,7 +74,44 @@ static bool canExportStackVideo(const ImageDoc* im) {
 static void askStackVideoExport(int seqId) {
     if (seqId <= 0) return;
     app.videoAskSeqId = seqId;
+    app.videoAskCompare = false;
     app.videoAskOpen = true;
+}
+
+// "" when a w x h, n-frame video can be written to `path`: the extension
+// names the format, and each format's own limit is asked before a byte is
+// written. One answer for the stack video and the compare video.
+static std::string videoPathRefusal(const std::string& path, int w, int h, int n) {
+    const std::string ext = videoExtOf(path);
+    if (ext == ".mkv") {
+        if (videowrite::ffmpegPath().empty()) return videowrite::ffmpegMissingRefusal();
+    } else if (ext == ".avi") {
+        std::string big = videowrite::aviSizeRefusal(w, h, n);
+        if (!big.empty()) return big;
+    } else {
+        return "this export writes .avi (uncompressed RGB24, no dependency) and "
+               ".mkv (FFV1, lossless compression, needs ffmpeg on PATH)" +
+               std::string(ext.empty() ? " - the file name has no extension"
+                                       : " - not \"" + ext + "\"") +
+               ". Name the file with one of those two.";
+    }
+    return {};
+}
+
+// Open the sink the extension names for a job whose size is set, and mark it
+// running: "" on success; on failure the job is cleared and the error returned.
+static std::string openVideoSink(App::VideoExport& J, const std::string& path, double fps) {
+    std::string err;
+    if (videoExtOf(path) == ".mkv") {
+        J.sink = videowrite::openFfv1(path, J.w, J.h, fps, err);
+        J.sinkName = "FFV1/MKV";
+    } else {
+        J.sink = videowrite::openAvi(path, J.w, J.h, fps, err);
+        J.sinkName = "uncompressed AVI";
+    }
+    if (!J.sink) { J = App::VideoExport(); return err; }
+    J.active = true;
+    return {};
 }
 
 // "" when this stack can be written to `path`; the refusal otherwise. Every
@@ -120,21 +157,101 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
                    "write. Frames land at two resolution levels while a remote "
                    "stack streams: wait for the full frames, then export.";
     }
-    const std::string ext = videoExtOf(path);
-    if (ext == ".mkv") {
-        if (videowrite::ffmpegPath().empty()) return videowrite::ffmpegMissingRefusal();
-    } else if (ext == ".avi") {
-        std::string big = videowrite::aviSizeRefusal(w, h, (int)fr.size());
-        if (!big.empty()) return big;
-    } else {
-        return "this export writes .avi (uncompressed RGB24, no dependency) and "
-               ".mkv (FFV1, lossless compression, needs ffmpeg on PATH)" +
-               std::string(ext.empty() ? " - the file name has no extension"
-                                       : " - not \"" + ext + "\"") +
-               ". Name the file with one of those two.";
-    }
+    const std::string why = videoPathRefusal(path, w, h, (int)fr.size());
+    if (!why.empty()) return why;
     if (framesOut) *framesOut = fr;
     return {};
+}
+
+// ---- the compare view, as a video (#308) ------------------------------------
+// Frame k is composeCompareRGBA of the view A's frame k is on screen in -
+// exportFrameViewFor(A_k), i.e. A stepped onto frame k and B and the slots
+// following it - so frame k of the file is the PNG "Save compare view as
+// PNG..." writes with A on frame k. The stack walked is A's: A is the cursor
+// the comparison is stepped by. Same job, same pump, same sinks as a stack
+// video; only what one frame IS differs (App::VideoExport::compare).
+
+// "" with the frames, and the composite size, when the compare view of A's
+// stack can be written; the refusal otherwise. Every frame's layout is asked
+// for up front, without drawing: a side that is a preview at frame 40, or a
+// composite that changes size there, is refused before a byte is written.
+static std::string compareVideoPlan(std::vector<int>& fr, int& w, int& h) {
+    fr.clear(); w = h = 0;
+    if (app.compareMode == App::CmpOff) return "compare is off - there is no compare view to export";
+    ImageDoc* a = cur();
+    if (!a) return "nothing to export";
+    if (!canExportStackVideo(a))
+        return "A is not a frame of a stack - a compare video steps A through its stack; "
+               "for one picture use Save compare view as PNG";
+    fr = framesOfSeq(a->seqId);
+    for (size_t i = 0; i < fr.size(); i++) {
+        ImageDoc* fi = app.images[fr[i]].get();
+        ImageDoc* stepTo = nullptr;
+        CompareLayout L;
+        const std::string why = compareLayoutFor(exportFrameViewFor(fi, stepTo), L);
+        if (!why.empty())
+            return "frame " + std::to_string(fi->seqIndex + 1) + " of " +
+                   std::to_string(fr.size()) + ": " + why;
+        if (i == 0) { w = L.w; h = L.h; }
+        else if (L.w != w || L.h != h)
+            return "the compare view is " + std::to_string(w) + "x" + std::to_string(h) +
+                   " at frame 1 and " + std::to_string(L.w) + "x" + std::to_string(L.h) +
+                   " at frame " + std::to_string(fi->seqIndex + 1) + " - a video has one "
+                   "frame size. Pin sides whose stacks keep one size, then export.";
+    }
+    return {};
+}
+static std::string compareVideoRefusal(const std::string& path, double fps,
+                                       std::vector<int>* framesOut = nullptr,
+                                       int* wOut = nullptr, int* hOut = nullptr) {
+    if (app.videoExport.active)
+        return "a video export is already running - stop it first (Files panel)";
+    if (!(fps > 0.0) || !std::isfinite(fps))
+        return "the frame rate must be a positive number";
+    std::vector<int> fr; int w = 0, h = 0;
+    std::string why = compareVideoPlan(fr, w, h);
+    if (!why.empty()) return why;
+    why = videoPathRefusal(path, w, h, (int)fr.size());
+    if (!why.empty()) return why;
+    if (framesOut) *framesOut = fr;
+    if (wOut) *wOut = w;
+    if (hOut) *hOut = h;
+    return {};
+}
+// File > Export compare view as video...: the fps / format modal first, as
+// for a stack, refused up front when there is nothing it could write.
+static void askCompareVideoExport() {
+    std::vector<int> fr; int w = 0, h = 0;
+    const std::string why = compareVideoPlan(fr, w, h);
+    if (!why.empty()) { toast(why, true); return; }
+    app.videoAskSeqId = cur()->seqId;
+    app.videoAskCompare = true;
+    app.videoAskOpen = true;
+}
+// Start the compare job: "" when it is running, the refusal otherwise.
+static std::string startCompareVideoExport(const std::string& path, double fps) {
+    std::vector<int> fr; int w = 0, h = 0;
+    std::string why = compareVideoRefusal(path, fps, &fr, &w, &h);
+    if (!why.empty()) return why;
+    App::VideoExport& J = app.videoExport;
+    J = App::VideoExport();
+    J.compare = true;
+    J.cmpMode = app.compareMode;
+    J.cmpWipeFrac = app.wipeFrac;
+    J.seqId = cur()->seqId;
+    J.path = path;
+    J.fps = fps;
+    J.w = w;
+    J.h = h;
+    for (int i : fr) J.uids.push_back(app.images[i]->uid);
+    {
+        ImageDoc* stepTo = nullptr;
+        const ViewSides v0 = exportFrameViewFor(app.images[fr.front()].get(), stepTo);
+        CompareLayout L;
+        compareLayoutFor(v0, L);
+        J.rangeNote = compareExportNote(v0, L, true, 0.0f);
+    }
+    return openVideoSink(J, path, fps);
 }
 
 // Start the job. "" when it is running; the refusal otherwise (and then
@@ -157,17 +274,7 @@ static std::string startStackVideoExport(int seqId, const std::string& path, dou
         ImageDoc* stepTo = nullptr;
         J.rangeNote = exportRangeNote(*first, exportFrameViewFor(first, stepTo), true);
     }
-    std::string err;
-    if (videoExtOf(path) == ".mkv") {
-        J.sink = videowrite::openFfv1(path, J.w, J.h, fps, err);
-        J.sinkName = "FFV1/MKV";
-    } else {
-        J.sink = videowrite::openAvi(path, J.w, J.h, fps, err);
-        J.sinkName = "uncompressed AVI";
-    }
-    if (!J.sink) { J = App::VideoExport(); return err; }
-    J.active = true;
-    return {};
+    return openVideoSink(J, path, fps);
 }
 
 // What the Files panel shows while this runs ("" when nothing is running).
@@ -249,8 +356,16 @@ static bool pumpVideoExport() {
     }
     for (const std::string& h : viewHeldSides(view))
         if (std::find(J.held.begin(), J.held.end(), h) == J.held.end()) J.held.push_back(h);
-    if (d->w != J.w || d->h != J.h) {
+    if (!J.compare && (d->w != J.w || d->h != J.h)) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
+        return false;
+    }
+    // A compare video keeps the layout it was started under: a mode switched
+    // or a wipe divider dragged mid-write would change the picture halfway
+    // through the file, which no frame of it could afterwards say.
+    if (J.compare && (app.compareMode != J.cmpMode || app.wipeFrac != J.cmpWipeFrac)) {
+        abandonVideoExport("frame " + std::to_string(J.at + 1) +
+                           ": the compare mode or the wipe divider changed mid-write");
         return false;
     }
     // "Auto per frame" re-fits the frame A steps onto - the same call
@@ -265,7 +380,23 @@ static bool pumpVideoExport() {
     if (app.rangeScope == 0 && !app.linkRange && stepTo) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
-    renderDocRGBA(*d, rgba, &view);
+    if (J.compare) {
+        // the compare view this frame is on screen in, by the one function
+        // that composes it - the PNG of that view is these bytes (#308)
+        int cw = 0, chh = 0;
+        std::string note;
+        if (!composeCompareRGBA(view, rgba, cw, chh, note)) {
+            abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + note);
+            return false;
+        }
+        if (cw != J.w || chh != J.h) {
+            abandonVideoExport("frame " + std::to_string(J.at + 1) +
+                               ": the compare view changed size mid-write");
+            return false;
+        }
+    } else {
+        renderDocRGBA(*d, rgba, &view);
+    }
     const size_t px = (size_t)J.w * J.h;
     rgb.resize(px * 3);
     for (size_t p = 0; p < px; p++) {

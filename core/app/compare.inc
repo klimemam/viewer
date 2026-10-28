@@ -1241,6 +1241,46 @@ static size_t renderDiffRGBA(const ImageDoc& a, const ImageDoc& b, int w, int h,
     return clipped;
 }
 
+// The AUTO full scale of A-B: the 99.9th percentile of |A-B|, rounded up by
+// niceCeil. A pure function of the pair, so the screen (ensureDiffTexture,
+// which caches it in app.diffAutoGain) and an export of a pair that is not on
+// screen (composeCompareRGBA, frame k of a compare video, #308) get the same
+// number from the same code.
+static float diffAutoGainOf(const ImageDoc& a, const ImageDoc& b) {
+    const int w = std::min(a.w, b.w), h = std::min(a.h, b.h);
+    const int ch = std::min(a.ch, b.ch);
+    if (w <= 0 || h <= 0) return 1.0f;
+    std::vector<float> mags;
+    size_t total = (size_t)w * h;
+    size_t step = std::max<size_t>(1, total / 200000);   // bounded sample
+    // ...and the step is forced ODD, which is the f35a79e defect in its
+    // last hiding place. Striding a one-dimensional index and wrapping
+    // it (x = p % w) samples only even columns the moment step and w are
+    // both even - and a sensor width essentially always is. On an RGGB
+    // frame that leaves R and Gb with samples and Gr and B with none, so
+    // this percentile - and with it the whole A/B difference display's
+    // scaling - would be decided by half the sensor. An odd step walks
+    // every column parity, and every row parity with it, because
+    // consecutive samples advance x by an odd amount and wrap.
+    if (step % 2 == 0) step++;
+    mags.reserve(total / step + 1);
+    for (size_t p = 0; p < total; p += step) {
+        int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
+        float m = 0;
+        for (int c = 0; c < ch; c++)
+            m = std::max(m, fabsf(a.sample(x, y, c) - b.sample(x, y, c)));
+        if (std::isfinite(m)) mags.push_back(m);
+    }
+    float g = 1.0f;
+    if (!mags.empty()) {
+        size_t k = (size_t)(mags.size() * 0.999);
+        if (k >= mags.size()) k = mags.size() - 1;
+        std::nth_element(mags.begin(), mags.begin() + k, mags.end());
+        g = mags[k];
+    }
+    return niceCeil(g > 0 ? g : 1.0f);
+}
+
 // A-B as a signed image. Rebuilt only when an input, the scale or the mode
 // changes: at 12 Mpx this is a ~60 ms pass, not something to do per frame.
 static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
@@ -1253,35 +1293,7 @@ static void ensureDiffTexture(const ImageDoc& a, const ImageDoc& b) {
         static uint64_t autoKeyA = 0, autoKeyB = 0; static int autoRevA = -1, autoRevB = -1;
         if (autoKeyA != a.uid || autoKeyB != b.uid || autoRevA != a.dataRev || autoRevB != b.dataRev) {
             autoKeyA = a.uid; autoKeyB = b.uid; autoRevA = a.dataRev; autoRevB = b.dataRev;
-            std::vector<float> mags;
-            size_t total = (size_t)w * h;
-            size_t step = std::max<size_t>(1, total / 200000);   // bounded sample
-            // ...and the step is forced ODD, which is the f35a79e defect in its
-            // last hiding place. Striding a one-dimensional index and wrapping
-            // it (x = p % w) samples only even columns the moment step and w are
-            // both even - and a sensor width essentially always is. On an RGGB
-            // frame that leaves R and Gb with samples and Gr and B with none, so
-            // this percentile - and with it the whole A/B difference display's
-            // scaling - would be decided by half the sensor. An odd step walks
-            // every column parity, and every row parity with it, because
-            // consecutive samples advance x by an odd amount and wrap.
-            if (step % 2 == 0) step++;
-            mags.reserve(total / step + 1);
-            for (size_t p = 0; p < total; p += step) {
-                int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
-                float m = 0;
-                for (int c = 0; c < ch; c++)
-                    m = std::max(m, fabsf(a.sample(x, y, c) - b.sample(x, y, c)));
-                if (std::isfinite(m)) mags.push_back(m);
-            }
-            float g = 1.0f;
-            if (!mags.empty()) {
-                size_t k = (size_t)(mags.size() * 0.999);
-                if (k >= mags.size()) k = mags.size() - 1;
-                std::nth_element(mags.begin(), mags.begin() + k, mags.end());
-                g = mags[k];
-            }
-            app.diffAutoGain = niceCeil(g > 0 ? g : 1.0f);
+            app.diffAutoGain = diffAutoGainOf(a, b);
         }
     }
     float gain = app.diffGain > 0 ? app.diffGain : app.diffAutoGain;
