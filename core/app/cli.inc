@@ -72,6 +72,8 @@ static bool g_numAlignSelftest = false;    // --numalign-selftest: a column of n
                                            // lines up on its decimal point (#313)
 static bool g_sshFailSelftest = false;     // --sshfail-selftest: an ssh that failed
                                            // says so, and why (#324)
+static std::string g_twowinSelftest;       // --twowin-selftest <dir>: a second window on
+                                           // the same host loads the stack (#330)
 static bool g_projFrameSelftest = false;   // --projframe-selftest: the Projection
                                            // frame statistics are over every pixel,
                                            // on a worker, keyed (issue #283)
@@ -785,6 +787,10 @@ static void printUsage() {
         "  --sshfail-selftest          an ssh that failed says so (#324): exit status\n"
         "                              and stderr against a fake ssh, never \"no\n"
         "                              prebuilt peer\" over an empty answer\n"
+        "  --twowin-selftest <dir>     a second window on the same host loads the\n"
+        "                              stack (#330): a relayed tile in seconds, the\n"
+        "                              new-window argv opens the whole remote stack,\n"
+        "                              installs that cannot share a temporary\n"
         "  --projframe-selftest        the Projection frame statistics: every pixel\n"
         "                              of the region, on a worker above the sample\n"
         "                              cap, never the previous region's number (#283)\n"
@@ -1065,6 +1071,8 @@ static void parseCli(int argc, char** argv) {
             g_numAlignSelftest = true;             // handled in main()
         } else if (a == "--sshfail-selftest") {
             g_sshFailSelftest = true;              // handled in main()
+        } else if (a == "--twowin-selftest") {
+            g_twowinSelftest = next();             // handled in main()
         } else if (a == "--projframe-selftest") {
             g_projFrameSelftest = true;            // handled in main()
         } else if (a == "--rowcol-sigma-selftest") {
@@ -1233,6 +1241,8 @@ static void parseCli(int argc, char** argv) {
                 std::string err = loadRaw(d);
                 if (!err.empty()) toast(baseName(a) + ": " + err, true);
                 else maybeOfferSequence(app.current);
+            } else if (isUrl) {
+                openUrlFromCommandLine(a);   // --stack always reaches a url too (#330)
             } else {
                 openPath(a);
             }

@@ -1054,7 +1054,11 @@ static bool openNpzMember(ServedFile& n, const std::string& key, uint32_t node,
         // written file would refuse a member that is perfectly good. The bytes
         // are identical either way - the key covers the path and the stat - so
         // the loser of the race simply overwrites with the same content.
-        const std::string tmp = memberPath + ".part" +
+        // The temp is named for THIS process as well as this call (#330): the
+        // two sessions are two peers - two windows of one PC on one host, or
+        // one window's UI and fetch sessions - and an address alone is unique
+        // only inside one address space.
+        const std::string tmp = memberPath + ".part" + std::to_string(servePid()) + "." +
                                 std::to_string((unsigned long long)(uintptr_t)&n);
         // ...and the temp goes away on EVERY exit, saying so if it cannot.
         // PR #285's discipline, which this door was next to and did not have:

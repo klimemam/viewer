@@ -307,9 +307,12 @@ static std::string bootstrapScript(bool keepCurrentPeer) {
         // running binary O_WRONLY|O_TRUNC and fails with ETXTBSY - which
         // `set -e` then turns into an update that reports the wrong reason.
         // Step 2 of deployPeer already does .new + chmod + mv for this reason.
-        "cp \"$src/viewer-serve\" \"$d/viewer-serve.new\"\n"
-        "chmod +x \"$d/viewer-serve.new\"\n"
-        "mv \"$d/viewer-serve.new\" \"$d/viewer-serve\"\n"
+        // ...and the temporary is THIS shell's ($$), as there (#330): two
+        // windows installing at once wrote one shared viewer-serve.new.
+        "t=\"$d/viewer-serve.new.$$\"\n"
+        "cp \"$src/viewer-serve\" \"$t\"\n"
+        "chmod +x \"$t\"\n"
+        "mv \"$t\" \"$d/viewer-serve\"\n"
         // The plugins are already safe as they stand: rm -rf UNLINKS them, which
         // a live peer's mapping survives, and cp -r then creates new inodes.
         // Only an in-place TRUNCATE would be a SIGBUS in the peer - which is
@@ -382,6 +385,33 @@ static std::string peerProbeScript(const std::string& orElse) {
         "  ;; esac\n"
         "  " + (orElse.empty() ? std::string(":") : orElse) + "\n"
         "fi\n";
+}
+
+// The remote command that installs the bytes on its stdin as the peer: write
+// a temporary, make it executable, rename it over ~/.viewer/viewer-serve. The
+// rename is what keeps a RUNNING peer alive (its inode is left alone; see
+// bootstrapScript), and the temporary is named for THIS shell (#330): two
+// windows of this PC connecting to one host for the first time - or both
+// finding the peer stale after an update - each ran this at once and both
+// wrote ~/.viewer/viewer-serve.new. One `cat >` truncated what the other was
+// writing, the first `mv` took the file from under the second (whose chmod
+// then failed), and the first one's check that the peer RUNS could meet a
+// binary still open for writing (ETXTBSY) - "could not install the peer" in
+// one window or both, and no stack in either. A temporary that fails on the
+// way is removed rather than left to pile up under a new name each time.
+static std::string peerInstallCommand() {
+    return "sh -c 'mkdir -p \"$HOME/.viewer\" && t=\"$HOME/.viewer/viewer-serve.new.$$\" && "
+           "{ cat > \"$t\" && chmod +x \"$t\" && mv \"$t\" \"$HOME/.viewer/viewer-serve\" || "
+           "{ rm -f \"$t\"; exit 1; }; } && echo VIEWER_SERVE_OK'";
+}
+// ...and one plugin, the same way: `cat >` in place would truncate a .so a live
+// peer has mapped (serve.cpp dlopens exactly ~/.viewer/plugins), and a shared
+// `<name>.new` is the collision one function up.
+static std::string pluginInstallCommand(const std::string& pn) {
+    return "sh -c 'mkdir -p \"$HOME/.viewer/plugins\" && "
+           "t=\"$HOME/.viewer/plugins/" + pn + ".new.$$\" && "
+           "{ cat > \"$t\" && mv \"$t\" \"$HOME/.viewer/plugins/" + pn + "\" || "
+           "{ rm -f \"$t\"; exit 1; }; }'";
 }
 
 // The `UNAME <os> <machine>` line deployPeer's step-1 script prints, read back.
@@ -458,11 +488,8 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
         std::string bytes;
         if (readWholeFile(local, bytes)) {
             std::string o2, e2;
-            bool ok = remote::runSshCommand(host, port,
-                "sh -c 'mkdir -p ~/.viewer && cat > ~/.viewer/viewer-serve.new && "
-                "chmod +x ~/.viewer/viewer-serve.new && "
-                "mv ~/.viewer/viewer-serve.new ~/.viewer/viewer-serve && echo VIEWER_SERVE_OK'",
-                bytes, o2, e2, 120.0);
+            bool ok = remote::runSshCommand(host, port, peerInstallCommand(),
+                                            bytes, o2, e2, 120.0);
             if (ok && o2.find("VIEWER_SERVE_OK") != std::string::npos) {
                 // PROVE it runs before calling this a success: a binary built on
                 // a newer distro dies on glibc with nothing but "connection
@@ -524,12 +551,8 @@ bool deployPeer(const std::string& host, int port, bool force, std::string& log)
                         // exactly ~/.viewer/plugins) - truncating under the
                         // mapping is a SIGBUS in the peer.
                         std::string pn = e.path().filename().u8string();
-                        if (!remote::runSshCommand(host, port,
-                                "sh -c 'mkdir -p ~/.viewer/plugins && cat > "
-                                "~/.viewer/plugins/" + pn + ".new && "
-                                "mv ~/.viewer/plugins/" + pn + ".new "
-                                "~/.viewer/plugins/" + pn + "'",
-                                pb, o3, e3, 60.0))
+                        if (!remote::runSshCommand(host, port, pluginInstallCommand(pn),
+                                                   pb, o3, e3, 60.0))
                             pluginNotes += "\nplugin " + pn + " was not copied: " + e3;
                     }
                 }
@@ -5268,6 +5291,47 @@ static bool remoteSequenceSiblings(const std::string& url,
     err = base + ": " + (host.empty() ? std::string(PEER_HERE) : host) +
           " lists no sibling group for it in " + dir;
     return false;
+}
+
+// A url on the COMMAND LINE, under --stack always: the frame, and then the
+// stack around it (#330). This is the door "Open in new window" on a remote
+// stack goes through - newWindowArgv hands the child the head frame's url and
+// `--stack always`, the same two words that regroup a LOCAL stack - and the
+// child opened the one frame and nothing else: openRemote opens a file, and
+// the sibling offer (maybeOfferSequence) walks this disk, where a url has no
+// siblings. So the second window showed frame 0 of a stack the first window
+// was showing all of, which is "the stack does not load".
+//
+// The stack is found the way a session restore finds it, and for the same
+// reason: the head is already open, so the peer's own listing of its folder
+// names the siblings (remoteSequenceSiblings) and attachRemoteStack builds the
+// stack around the frame that is on screen. ask and never are left alone - the
+// ask prompt is a LOCAL stack's question (seqAskFiles are paths on this disk),
+// and never means never.
+static void openUrlFromCommandLine(const std::string& url) {
+    const size_t before = app.images.size();
+    openPath(url);
+    if (app.seqLoadMode != 1 || app.images.size() <= before) return;
+    ImageDoc* head = app.images.back().get();
+    // a frame-axis file is its own stack already, and a url that went to the
+    // local door (local:// on a format only this process reads) is the local
+    // loader's to group
+    if (head->seqId != 0 || head->src->remoteUrl.empty()) return;
+    std::vector<std::string> files;
+    std::string name, why;
+    if (!remoteSequenceSiblings(head->src->remoteUrl, files, name, why) || files.size() < 2) {
+        // A frame with no numbered siblings is the ordinary case and opens as
+        // the frame, exactly as a lone local file does under --stack always.
+        // The reason still goes to Messages: an unreachable listing is not a
+        // lone frame, and nothing on screen would otherwise say which it was.
+        if (!why.empty()) logMsg("--stack always: " + why);
+        return;
+    }
+    std::string host, rpath;
+    int port = 0;
+    remote::parseUrl(head->src->remoteUrl, host, rpath, &port);
+    if (attachRemoteStack(head, host, files, name, port, 0) != 0)
+        toast("loading stack: " + name + " (" + std::to_string(files.size()) + " files)");
 }
 
 // "Open as frame average" from Browse: open the stack exactly as "Open as
