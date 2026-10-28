@@ -1016,15 +1016,15 @@ static std::string compareExportNote(const ViewSides& v, const CompareLayout& L,
             s += num;
         }
         if (L.padded) {
-            std::string small;
+            std::string undersized;
             for (int k = 0; k < L.n; k++) {
                 const ImageDoc* d = v.pane[L.at[k]];
                 if (d->w != L.cellW || d->h != L.cellH)
-                    small += (small.empty() ? "" : ", ") + paneRoleLetter(v.paneRole[L.at[k]]) + " " +
+                    undersized += (undersized.empty() ? "" : ", ") + paneRoleLetter(v.paneRole[L.at[k]]) + " " +
                              std::to_string(d->w) + "x" + std::to_string(d->h);
             }
             snprintf(num, sizeof num, "%dx%d", L.cellW, L.cellH);
-            s += "; sizes differ - padded with black to " + std::string(num) + " (" + small + ")";
+            s += "; sizes differ - padded with black to " + std::string(num) + " (" + undersized + ")";
         }
     }
     if (!L.unshown.empty())
