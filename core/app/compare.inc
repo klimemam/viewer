@@ -541,6 +541,22 @@ static bool slotFollowDiverged(size_t i) {
 // load settles. Same shape as the B fallback below it.
 static void pumpCompareSlotRestore() {
     if (app.cmpSlotRestore.empty()) return;
+    // A session holds at most one want per letter. A hand-edited one with more
+    // `cmpslot` lines than SLOT_LETTERS has letters would push uids no letter
+    // names (slotName answers "?") and past ViewSides' fixed places: those
+    // wants are dropped, and the drop is SAID, naming each.
+    const size_t cap = strlen(SLOT_LETTERS);
+    if (app.cmpExtra.size() + app.cmpSlotRestore.size() > cap) {
+        const size_t keep = app.cmpExtra.size() >= cap ? 0 : cap - app.cmpExtra.size();
+        std::string dropped;
+        for (size_t i = keep; i < app.cmpSlotRestore.size(); i++)
+            dropped += (dropped.empty() ? "" : ", ") + baseName(app.cmpSlotRestore[i].path) +
+                       (app.cmpSlotRestore[i].frame >= 0
+                            ? " frame " + std::to_string(app.cmpSlotRestore[i].frame + 1) : std::string());
+        app.cmpSlotRestore.resize(keep);
+        logMsg("session: more compare slots than letters (" + std::to_string(cap) +
+               ", C to P) - not restored: " + dropped, true);
+    }
     for (size_t i = 0; i < app.cmpSlotRestore.size();) {
         const auto& w = app.cmpSlotRestore[i];
         ImageDoc* hit = nullptr;
@@ -558,7 +574,7 @@ static void pumpCompareSlotRestore() {
         if (!hit) { i++; continue; }
         bool dup = false;
         for (uint64_t u : app.cmpExtra) if (u == hit->uid) dup = true;
-        if (!dup) app.cmpExtra.push_back(hit->uid);
+        if (!dup && app.cmpExtra.size() < cap) app.cmpExtra.push_back(hit->uid);
         app.cmpSlotRestore.erase(app.cmpSlotRestore.begin() + i);
     }
 }

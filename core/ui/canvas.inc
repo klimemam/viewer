@@ -315,53 +315,9 @@ static void drawRawRecipePanel() {
     ImGui::End();
 }
 
-// ---------------- side-by-side tiles: the pane geometry --------------------
-// More than two compare slots means side by side and nothing else. A wipe, a
-// draggable split, a difference and a blink each mean exactly TWO images -
-// there is no honest three-image version of any of them - so those four keep
-// doing what they always did with A and B, and the extras get tiles.
-//
-// This lives out here, free of ImGui and of any frame state, because the
-// geometry IS the feature: --tile-selftest has to be able to assert the
-// rectangles without opening a window (this machine cannot screenshot GL).
-struct TilePane { float x0 = 0, w = 0; };
-
-// A pane narrower than this is not a comparison, it is a sliver: the badge that
-// says WHICH image it holds no longer fits, and two 40 px strips of a sensor
-// cannot be judged against each other. Say so rather than draw them.
-static float tileMinPaneW(float uiScale) { return 110.0f * uiScale; }
-
-// n equal-width panes across [x0, x0+width), separated by a band of 2*gutter -
-// the same band the A/B divider occupies, so the two layouts read as relatives.
-//
-// Equal width is the rule, not a simplification: app.splitFrac exists for A
-// against B, and applied to five panes it would make one of them a sliver.
-// Returns false, and leaves `out` empty, when the panes would be too narrow.
-static bool tileLayout(float x0, float width, int n, float gutter, float minPaneW,
-                       std::vector<TilePane>& out) {
-    out.clear();
-    if (n <= 0) return false;
-    const float paneW = (width - (n - 1) * 2.0f * gutter) / (float)n;
-    if (!(paneW >= minPaneW)) return false;      // written so a NaN fails too
-    out.reserve(n);
-    for (int i = 0; i < n; i++)
-        out.push_back({ x0 + i * (paneW + 2.0f * gutter), paneW });
-    return true;
-}
-
-// The ONE mapping every pane uses. Zoom and centre come from the view, never
-// from the pane: two images of the same scene at different magnifications,
-// side by side, is exactly how a reader compares sharpness or noise between
-// them and reaches a wrong conclusion. A pane that cannot show its image at
-// the shared zoom clips - it is never quietly rescaled.
-static ImVec2 tileMap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, float ix, float iy) {
-    return ImVec2(p0.x + sz.x * 0.5f + (ix - center.x) * zoom,
-                  p0.y + sz.y * 0.5f + (iy - center.y) * zoom);
-}
-static ImVec2 tileUnmap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, ImVec2 sc) {
-    return ImVec2(center.x + (sc.x - p0.x - sz.x * 0.5f) / zoom,
-                  center.y + (sc.y - p0.y - sz.y * 0.5f) / zoom);
-}
+// The pane geometry (TilePane, tileLayout, tileMap, tileUnmap) lives in
+// core/app/export.inc since #308: the compare export lays out and refuses
+// with the SAME functions, so it cannot drift from what this canvas draws.
 
 // Who gets a pane, in slot order: A, then B if compare is armed and has one,
 // then every extra slot. The letter travels WITH the document so a badge can
@@ -464,7 +420,7 @@ static void drawCanvas(ImVec2 avail) {
     // eye compares by saccade. Wipe: one pane, B clipped to the right of a
     // draggable divider, so the eye compares by edge. Both share app.view.
     ImageDoc* imB = cmpB();
-    const float GUTTER = 3.0f * s;
+    const float GUTTER = tileGutter(s);
     // ---- more than two slots: tile them, side by side -------------------------
     // The tiled layout REPLACES the A/B split when it engages (see the `split`
     // line below): the same gesture, one pane per slot, one shared view.
@@ -480,12 +436,7 @@ static void drawCanvas(ImVec2 avail) {
         if (!tiled) {
             // Degrade by SAYING SO. Slivers of five images side by side look
             // like a comparison and cannot be read as one.
-            char m[224];
-            snprintf(m, sizeof m,
-                     "%d compare panes need at least %.0f px each - this canvas is "
-                     "%.0f px. Widen the window, or drop a slot.",
-                     (int)slots.size(), minW, canvasSize.x);
-            tileNarrow = m;
+            tileNarrow = tileNarrowSaid((int)slots.size(), minW, canvasSize.x);
             slots.clear();
         }
     }

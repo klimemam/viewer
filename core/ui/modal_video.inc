@@ -25,9 +25,11 @@ static void drawVideoExportModal() {
     int w = 0, h = 0;
     std::string planWhy;
     if (compare) {
-        // A is the cursor: the stack is whichever A stands in NOW
-        planWhy = compareVideoPlan(fr, w, h);
-        if (cur()) seqId = cur()->seqId;
+        // the A (and wipe column, gain...) the export was asked under;
+        // the letters follow the checkbox below until the file is chosen
+        app.videoDlgCmpSpec.letters = app.cmpExportLetters;
+        planWhy = compareVideoPlan(app.videoDlgCmpSpec, fr, w, h);
+        if (ImageDoc* a = compareSpecA(app.videoDlgCmpSpec)) seqId = a->seqId;
     } else {
         fr = framesOfSeq(seqId);
         if (!fr.empty()) { w = app.images[fr.front()]->w; h = app.images[fr.front()]->h; }

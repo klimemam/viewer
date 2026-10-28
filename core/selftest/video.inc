@@ -1120,6 +1120,26 @@ static int videoSelftest() {
         const int saveBSeq = app.compareBSeq;
         const float saveWipe = app.wipeFrac, saveDiffGain = app.diffGain;
         const bool saveDiffAbs = app.diffAbs, saveLetters = app.cmpExportLetters;
+        float saveRect[4]; for (int i = 0; i < 4; i++) saveRect[i] = g_canvasRect[i];
+        const int saveRectFrame = g_canvasRectFrame;
+        const ImVec2 saveCenter = app.view.center;
+        const float saveZoom = app.view.zoom, saveUi = app.uiScale;
+        // A canvas as drawCanvas records it, and a view that is NOT a fit: the
+        // image sits right of the canvas centre at 3x, so the wipe divider's
+        // image column is nothing like wipeFrac x width.
+        g_canvasRect[0] = 100; g_canvasRect[1] = 50; g_canvasRect[2] = 400; g_canvasRect[3] = 300;
+        g_canvasRectFrame = 1;
+        app.view.center = ImVec2(20.0f, 20.0f);
+        app.view.zoom = 3.0f;
+        app.uiScale = 1.0f;
+        // the column the SCREEN's divider passes through: drawCanvas's wipeX,
+        // through the canvas's own inverse transform
+        auto screenWipeCol = [&](int w) {
+            const ImVec2 P0(g_canvasRect[0], g_canvasRect[1]), SZ(g_canvasRect[2], g_canvasRect[3]);
+            const float ix = tileUnmap(P0, SZ, app.view.center, app.view.zoom,
+                                       ImVec2(P0.x + SZ.x * app.wipeFrac, P0.y)).x;
+            return std::clamp((int)lroundf(ix), 0, w);
+        };
         auto mk8 = [&](const char* nm, int seq, int idx, int w, int h, float gain, float bias) {
             auto d = std::make_unique<ImageDoc>();
             d->name = nm;
@@ -1215,11 +1235,12 @@ static int videoSelftest() {
                     if (okc && k) okc = colIs(got, w, h, x0 - 2, 128) && colIs(got, w, h, x0 - 1, 128);
                 }
             } else if (app.compareMode == App::CmpWipe) {
-                const int div = (int)lroundf(app.wipeFrac * (float)cw);
+                const int div = screenWipeCol(cw);
+                const bool line = div > 0 && div < cw;      // off the picture: no line
                 okc = w == cw && h == chh;
                 if (okc) { renderDocRGBA(*drawn[0], s, &v); okc = cellIs(got, w, 0, cw, chh, s, drawn[0]->w, drawn[0]->h, 0, div); }
-                if (okc) { renderDocRGBA(*drawn[1], s, &v); okc = cellIs(got, w, 0, cw, chh, s, drawn[1]->w, drawn[1]->h, div + 1, w); }
-                if (okc) okc = colIs(got, w, h, div, 255);
+                if (okc) { renderDocRGBA(*drawn[1], s, &v); okc = cellIs(got, w, 0, cw, chh, s, drawn[1]->w, drawn[1]->h, div + (line ? 1 : 0), w); }
+                if (okc && line) okc = colIs(got, w, h, div, 255);
             } else {
                 const float g = app.diffGain > 0 ? app.diffGain : diffAutoGainOf(*drawn[0], *drawn[1]);
                 renderDiffRGBA(*drawn[0], *drawn[1], drawn[0]->w, drawn[0]->h, 1, g, s);
@@ -1255,8 +1276,10 @@ static int videoSelftest() {
         const Mode8 MODES[] = {
             { "split",  App::CmpSplit, false, 0.5f,  "compare: side by side A | B, 1:1 in 64x40 cells" },
             { "tiled",  App::CmpSplit, true,  0.5f,  "compare: tiled A | B | C, 1:1 in 64x40 cells" },
-            { "wipe25", App::CmpWipe,  true,  0.25f, "compare: wipe at 25% (B from column 16 of 64" },
-            { "wipe70", App::CmpWipe,  false, 0.7f,  "compare: wipe at 70% (B from column 45 of 64" },
+            // divider at canvas x 200 / 380: image x 20 + (200 - 300) / 3 = -13.3
+            // -> 0 (the screen shows only B), and 20 + (380 - 300) / 3 = 46.7 -> 47
+            { "wipe25", App::CmpWipe,  true,  0.25f, "compare: wipe: B from column 0 of 64, where the screen's divider is (all B)" },
+            { "wipe70", App::CmpWipe,  false, 0.7f,  "compare: wipe: B from column 47 of 64, where the screen's divider is (1 px line)" },
             { "diff",   App::CmpDiff,  true,  0.5f,  "compare: difference A-B, full scale " },
         };
         bool specScreen = true, specOff = true, videoIsCompose = true, videoIsPng = true,
@@ -1301,6 +1324,7 @@ static int videoSelftest() {
                 if (M.slotC && M.mode != App::CmpSplit && !has(note, "C not shown")) notes = false;
                 if (M.slotC && M.mode == App::CmpSplit && !has(note, "padded with black to 64x40 (C 40x24)")) notes = false;
                 if (M.mode != App::CmpDiff && rmode == 2 && !has(note, "range: A/B: auto over every side (union) = ")) notes = false;
+                if (M.mode == App::CmpDiff && has(note, "letters")) notes = false;   // claims none
             }
             // the video: frame k == composeCompareRGBA(exportFrameViewFor(A_k))
             std::vector<std::vector<uint8_t>> fr; int vw = 0, vh = 0; std::string said;
@@ -1403,7 +1427,7 @@ static int videoSelftest() {
             // own, so the export does too - while the range union counts the
             // document once
             app.compareMode = App::CmpSplit; app.compareRangeMode = 2; app.compareFollowFrame = true;
-            app.cmpExtra.assign(1, B_(0)->uid);
+            app.cmpExtra.assign(1, B_(1)->uid);     // C pinned to B's frame 2, following
             resetRanges();
             selectImage(fa[0]);
             const ViewSides v = comparedSides();
@@ -1447,8 +1471,182 @@ static int videoSelftest() {
             setCompareB(B_(0));
             app.compareMode = App::CmpSplit;
             check(composeCompareRGBA(comparedSides(), g, w, h, note), "V8 ...and side by side composes (anti-vacuity)");
+            // compare on with nobody to compare with is not "compare is off"
+            setCompareB(nullptr);
+            app.cmpExtra.clear();
+            check(!composeCompareRGBA(comparedSides(), g, w, h, note) &&
+                      has(note, "nothing to compare with (no B, no slots)"),
+                  "V8 compare on with no B and no slot: \"nothing to compare with (no B, no slots)\"");
+            setCompareB(B_(0));
+        }
+        {   // a canvas too narrow for the tiles: the canvas declines them, so the export does
+            app.compareMode = App::CmpSplit; app.compareRangeMode = 0;
+            app.cmpExtra.assign(1, C_(0)->uid);
+            selectImage(fa[0]);
+            g_canvasRect[2] = 300;                   // 3 x 110 px + two 6 px bands > 300
+            std::vector<uint8_t> g; int w = 0, h = 0; std::string note;
+            const bool c = composeCompareRGBA(comparedSides(), g, w, h, note);
+            const std::string path = tmpFile("viewer_video_v8n.avi");
+            const std::string why = startCompareVideoExport(path, 30.0);
+            fprintf(stderr, "videoselftest: V8 narrow -> \"%s\"\n", note.c_str());
+            check(!c && note == tileNarrowSaid(3, 110.0f, 300.0f) &&
+                      has(note, "3 compare panes need at least 110 px each - this canvas is 300 px"),
+                  "V8 a canvas too narrow for 3 tiles: refused in the canvas's own words");
+            check(has(why, "3 compare panes need") && !std::filesystem::exists(pathFromUtf8(path)),
+                  "V8 ...and so is the video, before a byte is written");
+            app.cmpExtra.clear();
+            check(composeCompareRGBA(comparedSides(), g, w, h, note),
+                  "V8 ...while A | B, which the canvas never tiles, composes there (anti-vacuity)");
+            g_canvasRect[2] = 400;
+        }
+        {   // the spec is taken when the export is ASKED for (#308 review)
+            app.compareMode = App::CmpWipe; app.wipeFrac = 0.7f; app.compareRangeMode = 0;
+            app.cmpExtra.clear();
+            selectImage(fa[0]);
+            // video: the modal opens on A's stack with the divider at column 47 ...
+            askCompareVideoExport();
+            app.videoAskOpen = false; app.videoAskCompare = false;
+            const App::CompareSpec asked = app.videoDlgCmpSpec;
+            // ... then, while the OS dialog is up, A moves to another stack and
+            // the view is panned
+            app.view.center = ImVec2(40.0f, 20.0f);
+            selectImage(fc[1]);
+            std::vector<std::vector<uint8_t>> fr; int vw = 0, vh = 0; std::string said;
+            const std::string path = tmpFile("viewer_video_v8r.avi");
+            const std::string why = startCompareVideoExport(path, 30.0, &app.videoDlgCmpSpec);
+            const int jobSeq = app.videoExport.seqId;
+            vw = app.videoExport.w; vh = app.videoExport.h;
+            bool ran = why.empty() && runToEnd();
+            std::vector<uint8_t> bytes; readFileBytes(path, bytes);
+            Avi Av = parseAvi(bytes);
+            bool same = ran && Av.ok && Av.frames.size() == 3 && jobSeq == sa && asked.wipeCol == 47;
+            for (int k = 0; k < 3 && same; k++) {
+                std::vector<uint8_t> rgb = aviFrameToRGB(bytes, Av.frames[k].first, vw, vh), want;
+                int w = 0, h = 0; std::string note;
+                composeCompareRGBA(viewSidesFor(A_(k)), want, w, h, note, &asked);
+                for (size_t q = 0; q < (size_t)w * h && same; q++)
+                    for (int c = 0; c < 3; c++) if (rgb[q * 3 + c] != want[q * 4 + c]) same = false;
+                if (same && !isRGB(&want[(size_t)47 * 4], 255, 255, 255)) same = false;   // the line
+            }
+            std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+            check(same, "V8 video: A's stack and the divider column as asked, though A moved and the view panned");
+            // PNG: the spec of the dialog's opening, not of the save
+            selectImage(fa[0]);
+            app.view.center = ImVec2(20.0f, 20.0f);
+            const App::CompareSpec atOpen = compareSpecNow();
+            app.view.center = ImVec2(40.0f, 20.0f);
+            app.cmpExportLetters = true;
+            const std::string png = tmpFile("viewer_video_v8r.png");
+            saveCompareViewPng(png, A_(0)->uid, &atOpen);
+            std::vector<uint8_t> got; readFileBytes(png, got);
+            std::filesystem::remove(pathFromUtf8(png), ec);
+            std::vector<uint8_t> want, now; int w = 0, h = 0; std::string note;
+            composeCompareRGBA(viewSidesFor(A_(0)), want, w, h, note, &atOpen);
+            composeCompareRGBA(viewSidesFor(A_(0)), now, w, h, note);
+            check(!got.empty() && got == encodePng(want, w, h) && want != now,
+                  "V8 PNG: drawn by the spec the dialog opened under, not the one at save time");
+            app.cmpExportLetters = false;
+            app.view.center = ImVec2(20.0f, 20.0f);
+        }
+        {   // ---- a change while the video is being written --------------------
+            // Drawn by the spec (letters, gain): carries on, and every frame and
+            // the toast are the spec's. Resolved from the app (B, a slot, |A-B|):
+            // stops, and the partial file goes. A's stack: the frames are the
+            // ones snapshotted, wherever A goes.
+            const std::string path = tmpFile("viewer_video_v8m.avi");
+            auto midWrite = [&](const std::function<void()>& change, std::vector<std::vector<uint8_t>>& fr,
+                                std::string& said, App::CompareSpec& S) {
+                fr.clear();
+                selectImage(fa[0]);
+                S = compareSpecNow();
+                if (!startCompareVideoExport(path, 30.0).empty()) return false;
+                const int w = app.videoExport.w, h = app.videoExport.h;
+                pumpVideoExport();                    // frame 1 is written
+                change();
+                runToEnd();
+                said = app.toast;
+                std::vector<uint8_t> bytes;
+                if (!readFileBytes(path, bytes)) return false;   // deleted
+                Avi Av = parseAvi(bytes);
+                for (auto& f : Av.frames) {
+                    std::vector<uint8_t> rgb = aviFrameToRGB(bytes, f.first, w, h), rgba((size_t)w * h * 4, 255);
+                    for (size_t q = 0; q < (size_t)w * h; q++)
+                        for (int c = 0; c < 3; c++) rgba[q * 4 + c] = rgb[q * 3 + c];
+                    fr.push_back(rgba);
+                }
+                std::error_code ec; std::filesystem::remove(pathFromUtf8(path), ec);
+                return Av.ok;
+            };
+            auto framesAreSpec = [&](const std::vector<std::vector<uint8_t>>& fr, const App::CompareSpec& S) {
+                if (fr.size() != 3) return false;
+                for (int k = 0; k < 3; k++) {
+                    std::vector<uint8_t> want; int w = 0, h = 0; std::string note;
+                    composeCompareRGBA(viewSidesFor(A_(k)), want, w, h, note, &S);
+                    if (fr[k] != want) return false;
+                }
+                return true;
+            };
+            std::vector<std::vector<uint8_t>> fr; std::string said; App::CompareSpec S;
+            app.compareRangeMode = 0; app.cmpExtra.clear(); setCompareB(B_(0));
+            // letters, snapshotted
+            app.compareMode = App::CmpSplit; app.cmpExportLetters = false;
+            bool okL = midWrite([&] { app.cmpExportLetters = true; }, fr, said, S) && framesAreSpec(fr, S) &&
+                       has(said, "no letters");
+            app.cmpExportLetters = false;
+            check(okL, "V8 mid-write: letters toggled -> every frame and the toast are the spec's (no letters)");
+            // the difference's gain, snapshotted
+            app.compareMode = App::CmpDiff; app.diffGain = 50.0f;
+            bool okG = midWrite([&] { app.diffGain = 5.0f; }, fr, said, S) && framesAreSpec(fr, S) &&
+                       has(said, "full scale +-50 (set)");
+            check(okG, "V8 mid-write: diff gain 50 -> 5 -> the video stays at +-50, and says so");
+            // |A-B|: renderDiffRGBA reads it, so it stops the job
+            bool gone = !midWrite([&] { app.diffAbs = true; }, fr, said, S) && !app.videoExport.active &&
+                        has(said, "changed mid-write") && has(said, "deleted");
+            app.diffAbs = false; app.diffGain = 0;
+            check(gone, "V8 mid-write: |A-B| toggled -> stopped, the partial file deleted");
+            // B
+            app.compareMode = App::CmpSplit;
+            gone = !midWrite([&] { setCompareB(C_(0)); }, fr, said, S) && has(said, "changed mid-write");
+            setCompareB(B_(0));
+            check(gone, "V8 mid-write: B re-pinned -> stopped, the partial file deleted");
+            // a slot
+            gone = !midWrite([&] { app.cmpExtra.push_back(C_(0)->uid); }, fr, said, S) &&
+                   has(said, "changed mid-write");
+            app.cmpExtra.clear();
+            check(gone, "V8 mid-write: a slot added -> stopped, the partial file deleted");
+            // A's stack: a frame lands in it and A walks off to another stack
+            bool okA = midWrite([&] {
+                mk8("v8a_3.npy", sa, 3, 64, 40, 1.0f, 30.0f);
+                selectImage(fc[2]);
+            }, fr, said, S) && framesAreSpec(fr, S);
+            check(okA, "V8 mid-write: A's stack grows and A moves away -> the 3 frames asked for, unchanged");
+        }
+        {   // a hand-edited session with more cmpslot lines than letters
+            const size_t cap = strlen(SLOT_LETTERS);
+            app.cmpExtra.clear();
+            app.cmpSlotRestore.clear();
+            for (int i = 0; i < (int)cap + 2; i++) {
+                char n[32]; snprintf(n, sizeof n, "v8slot_%02d.npy", i);
+                const int at = mk8(n, 0, 0, 8, 8, 1.0f, (float)i);
+                app.images[at]->seqId = 0;
+                app.images[at]->src->path = n;
+                app.cmpSlotRestore.push_back({ -1, n, std::string() });
+            }
+            pumpCompareSlotRestore();
+            const std::string said = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
+            fprintf(stderr, "videoselftest: V8 restore cap -> \"%s\"\n", said.c_str());
+            char last2[96];
+            snprintf(last2, sizeof last2, "not restored: v8slot_%02d.npy, v8slot_%02d.npy", (int)cap, (int)cap + 1);
+            check(app.cmpExtra.size() == cap && app.cmpSlotRestore.empty() && has(said, last2),
+                  "V8 session restore: 16 cmpslot wants -> 14 slots (C to P), the 2 dropped named in Messages");
+            app.cmpExtra.clear();
         }
         closeAll();
+        for (int i = 0; i < 4; i++) g_canvasRect[i] = saveRect[i];
+        g_canvasRectFrame = saveRectFrame;
+        app.view.center = saveCenter;
+        app.view.zoom = saveZoom;
+        app.uiScale = saveUi;
         app.cmpExtra = saveExtra;
         app.compareBUid = saveBUid;
         app.lastCompareBUid = saveLastB;

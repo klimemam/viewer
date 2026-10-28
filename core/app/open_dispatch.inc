@@ -5820,7 +5820,7 @@ static void pollFileDialog() {           // called once per frame from the main 
         std::string p = app.pngDlg->result();
         if (!p.empty()) {
             if (p.size() < 4 || p.substr(p.size() - 4) != ".png") p += ".png";
-            if (app.pngDlgCompare) saveCompareViewPng(p, app.pngDlgViewAUid);   // #308
+            if (app.pngDlgCompare) saveCompareViewPng(p, app.pngDlgViewAUid, &app.pngDlgCmpSpec);   // #308
             else saveViewPng(p, app.pngDlgUid, app.pngDlgViewAUid);
         }
         app.pngDlg.reset();
@@ -5842,7 +5842,7 @@ static void pollFileDialog() {           // called once per frame from the main 
         app.videoDlgCompare = false;
         if (!p.empty()) {
             if (videoExtOf(p).empty()) p += videoExtFor(app.videoFormat);
-            std::string why = compare ? startCompareVideoExport(p, app.videoFps)
+            std::string why = compare ? startCompareVideoExport(p, app.videoFps, &app.videoDlgCmpSpec)
                                       : startStackVideoExport(seqId, p, app.videoFps);
             if (!why.empty()) toast(why, true);
         }

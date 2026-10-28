@@ -165,30 +165,39 @@ static std::string stackVideoRefusal(int seqId, const std::string& path,
 
 // ---- the compare view, as a video (#308) ------------------------------------
 // Frame k is composeCompareRGBA of the view A's frame k is on screen in -
-// exportFrameViewFor(A_k), i.e. A stepped onto frame k and B and the slots
-// following it - so frame k of the file is the PNG "Save compare view as
-// PNG..." writes with A on frame k. The stack walked is A's: A is the cursor
-// the comparison is stepped by. Same job, same pump, same sinks as a stack
-// video; only what one frame IS differs (App::VideoExport::compare).
+// viewSidesFor(A_k), i.e. A stepped onto frame k and B and the slots following
+// it (exportFrameViewFor's rule for A's own stack) - so frame k of the file is
+// the PNG "Save compare view as PNG..." writes with A on frame k. The stack
+// walked is the stack of the A the export was ASKED under (CompareSpec::aUid),
+// not whatever is current when the OS dialog closes, and every frame is drawn
+// by that spec. Same job, same pump, same sinks as a stack video; only what
+// one frame IS differs (App::VideoExport::compare).
+
+// The A a spec was taken under, or null when it has closed since.
+static ImageDoc* compareSpecA(const App::CompareSpec& S) {
+    for (const auto& d : app.images) if (d->uid == S.aUid) return d.get();
+    return nullptr;
+}
 
 // "" with the frames, and the composite size, when the compare view of A's
-// stack can be written; the refusal otherwise. Every frame's layout is asked
-// for up front, without drawing: a side that is a preview at frame 40, or a
-// composite that changes size there, is refused before a byte is written.
-static std::string compareVideoPlan(std::vector<int>& fr, int& w, int& h) {
+// stack can be written under `S`; the refusal otherwise. Every frame's layout
+// is asked for up front, without drawing: a side that is a preview at frame
+// 40, or a composite that changes size there, is refused before a byte is
+// written.
+static std::string compareVideoPlan(const App::CompareSpec& S, std::vector<int>& fr, int& w, int& h) {
     fr.clear(); w = h = 0;
-    if (app.compareMode == App::CmpOff) return "compare is off - there is no compare view to export";
-    ImageDoc* a = cur();
-    if (!a) return "nothing to export";
+    if (S.mode == App::CmpOff || app.compareMode == App::CmpOff)
+        return "compare is off - there is no compare view to export";
+    ImageDoc* a = compareSpecA(S);
+    if (!a) return S.aUid ? "the A this export was asked for has been closed" : "nothing to export";
     if (!canExportStackVideo(a))
         return "A is not a frame of a stack - a compare video steps A through its stack; "
                "for one picture use Save compare view as PNG";
     fr = framesOfSeq(a->seqId);
     for (size_t i = 0; i < fr.size(); i++) {
         ImageDoc* fi = app.images[fr[i]].get();
-        ImageDoc* stepTo = nullptr;
         CompareLayout L;
-        const std::string why = compareLayoutFor(exportFrameViewFor(fi, stepTo), L);
+        const std::string why = compareLayoutFor(viewSidesFor(fi), L, S);
         if (!why.empty())
             return "frame " + std::to_string(fi->seqIndex + 1) + " of " +
                    std::to_string(fr.size()) + ": " + why;
@@ -202,6 +211,7 @@ static std::string compareVideoPlan(std::vector<int>& fr, int& w, int& h) {
     return {};
 }
 static std::string compareVideoRefusal(const std::string& path, double fps,
+                                       const App::CompareSpec& S,
                                        std::vector<int>* framesOut = nullptr,
                                        int* wOut = nullptr, int* hOut = nullptr) {
     if (app.videoExport.active)
@@ -209,7 +219,7 @@ static std::string compareVideoRefusal(const std::string& path, double fps,
     if (!(fps > 0.0) || !std::isfinite(fps))
         return "the frame rate must be a positive number";
     std::vector<int> fr; int w = 0, h = 0;
-    std::string why = compareVideoPlan(fr, w, h);
+    std::string why = compareVideoPlan(S, fr, w, h);
     if (!why.empty()) return why;
     why = videoPathRefusal(path, w, h, (int)fr.size());
     if (!why.empty()) return why;
@@ -219,37 +229,42 @@ static std::string compareVideoRefusal(const std::string& path, double fps,
     return {};
 }
 // File > Export compare view as video...: the fps / format modal first, as
-// for a stack, refused up front when there is nothing it could write.
+// for a stack, refused up front when there is nothing it could write. The
+// spec - A, the wipe column, the letters, the gain - is taken HERE, when the
+// export is asked for; the modal and the save dialog that follow it, and the
+// job itself, use it (open_dispatch.inc hands it to startCompareVideoExport).
 static void askCompareVideoExport() {
+    app.videoDlgCmpSpec = compareSpecNow();
     std::vector<int> fr; int w = 0, h = 0;
-    const std::string why = compareVideoPlan(fr, w, h);
+    const std::string why = compareVideoPlan(app.videoDlgCmpSpec, fr, w, h);
     if (!why.empty()) { toast(why, true); return; }
-    app.videoAskSeqId = cur()->seqId;
+    app.videoAskSeqId = compareSpecA(app.videoDlgCmpSpec)->seqId;
     app.videoAskCompare = true;
     app.videoAskOpen = true;
 }
-// Start the compare job: "" when it is running, the refusal otherwise.
-static std::string startCompareVideoExport(const std::string& path, double fps) {
+// Start the compare job under `spec` (null = compareSpecNow()): "" when it is
+// running, the refusal otherwise.
+static std::string startCompareVideoExport(const std::string& path, double fps,
+                                           const App::CompareSpec* spec = nullptr) {
+    const App::CompareSpec S = spec ? *spec : compareSpecNow();
     std::vector<int> fr; int w = 0, h = 0;
-    std::string why = compareVideoRefusal(path, fps, &fr, &w, &h);
+    std::string why = compareVideoRefusal(path, fps, S, &fr, &w, &h);
     if (!why.empty()) return why;
     App::VideoExport& J = app.videoExport;
     J = App::VideoExport();
     J.compare = true;
-    J.cmpMode = app.compareMode;
-    J.cmpWipeFrac = app.wipeFrac;
-    J.seqId = cur()->seqId;
+    J.cmp = S;
+    J.seqId = compareSpecA(S)->seqId;
     J.path = path;
     J.fps = fps;
     J.w = w;
     J.h = h;
     for (int i : fr) J.uids.push_back(app.images[i]->uid);
     {
-        ImageDoc* stepTo = nullptr;
-        const ViewSides v0 = exportFrameViewFor(app.images[fr.front()].get(), stepTo);
+        const ViewSides v0 = viewSidesFor(app.images[fr.front()].get());
         CompareLayout L;
-        compareLayoutFor(v0, L);
-        J.rangeNote = compareExportNote(v0, L, true, 0.0f);
+        compareLayoutFor(v0, L, S);
+        J.rangeNote = compareExportNote(v0, L, true, 0.0f, S);
     }
     return openVideoSink(J, path, fps);
 }
@@ -348,7 +363,9 @@ static bool pumpVideoExport() {
     // and the slots followed to theirs. Its sides can turn into previews
     // mid-write too, and a side held at its pinned frame is said at the end.
     ImageDoc* stepTo = nullptr;
-    const ViewSides view = exportFrameViewFor(d, stepTo);
+    // a compare video's frame is A_k's own view (A is the spec's, not cur())
+    const ViewSides view = J.compare ? viewSidesFor(d) : exportFrameViewFor(d, stepTo);
+    if (J.compare) stepTo = d;
     why = viewRefusalFor(view, d);
     if (!why.empty()) {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + why);
@@ -360,12 +377,16 @@ static bool pumpVideoExport() {
         abandonVideoExport("frame " + std::to_string(J.at + 1) + " changed size mid-write");
         return false;
     }
-    // A compare video keeps the layout it was started under: a mode switched
-    // or a wipe divider dragged mid-write would change the picture halfway
-    // through the file, which no frame of it could afterwards say.
-    if (J.compare && (app.compareMode != J.cmpMode || app.wipeFrac != J.cmpWipeFrac)) {
-        abandonVideoExport("frame " + std::to_string(J.at + 1) +
-                           ": the compare mode or the wipe divider changed mid-write");
+    // A compare video draws by the spec it was started under (mode, wipe
+    // column, letters, gain), so a toggle or a drag mid-write changes nothing.
+    // What the VIEWS resolve from cannot be snapshotted that way - B, the
+    // slots, follow-frame - nor can |A-B| (renderDiffRGBA reads the flag): a
+    // change to any of them would change the picture halfway through the
+    // file, so it stops the job and the partial file goes.
+    if (J.compare && (app.compareBUid != J.cmp.bUid || app.cmpExtra != J.cmp.slots ||
+                      app.compareFollowFrame != J.cmp.follow || app.diffAbs != J.cmp.diffAbs)) {
+        abandonVideoExport("frame " + std::to_string(J.at + 1) + ": B, a compare slot, "
+                           "follow-frame or the difference's |A-B| changed mid-write");
         return false;
     }
     // "Auto per frame" re-fits the frame A steps onto - the same call
@@ -385,7 +406,7 @@ static bool pumpVideoExport() {
         // that composes it - the PNG of that view is these bytes (#308)
         int cw = 0, chh = 0;
         std::string note;
-        if (!composeCompareRGBA(view, rgba, cw, chh, note)) {
+        if (!composeCompareRGBA(view, rgba, cw, chh, note, &J.cmp)) {
             abandonVideoExport("frame " + std::to_string(J.at + 1) + ": " + note);
             return false;
         }
