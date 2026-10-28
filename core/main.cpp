@@ -562,7 +562,9 @@ static void applyWindowIcon(GLFWwindow* w, bool remote) {
 
 static void dropCallback(GLFWwindow*, int count, const char** paths) {
     wakeUi(4);
-    for (int i = 0; i < count; i++) openPath(paths[i]);
+    // One drop is one selection: the session-first rule of an open dialog's
+    // selection applies to it unchanged (openSelection, #307).
+    openSelection(std::vector<std::string>(paths, paths + count));
 }
 static void installWakeCallbacks(GLFWwindow* win) {
     // installed BEFORE ImGui's backend, which chains to these

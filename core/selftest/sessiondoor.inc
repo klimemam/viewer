@@ -265,6 +265,39 @@
             t0 = nowSec();
             while (nowSec() - t0 < 10.0 && recentSessionState(1) < 0)
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+            // A probe stuck on a dead share: reopening must not start another.
+            // The stand-in blocks until the test lets it go.
+            static std::atomic<bool> hold{false};
+            static std::atomic<int> slowCalls{0};
+            hold = true;
+            slowCalls = 0;
+            g_recentProbeExists = [](const std::string&) {
+                slowCalls++;
+                while (hold.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return true;
+            };
+            const int l1 = g_recentProbeLaunches;
+            recentSessionsMenuFrame(2000);                     // an opening: starts the slow one
+            t0 = nowSec();
+            while (nowSec() - t0 < 10.0 && slowCalls.load() == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(g_recentProbeLaunches == l1 + 1 && slowCalls.load() >= 1,
+                  "D7 a slow probe is running");
+            for (int open = 0; open < 5; open++) recentSessionsMenuFrame(2010 + 10 * open);
+            check(g_recentProbeLaunches == l1 + 1,
+                  "D7 reopening while it runs starts no second probe");
+            check(recentSessionState(0) == -1, "D7 ...and its rows are not known meanwhile");
+            hold = false;
+            t0 = nowSec();
+            while (nowSec() - t0 < 10.0 && recentSessionState(1) < 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            recentSessionsMenuFrame(2100);                     // finished: the next opening probes
+            check(g_recentProbeLaunches == l1 + 2, "D7 once it has finished, the next opening probes");
+            t0 = nowSec();
+            while (nowSec() - t0 < 10.0 && recentSessionState(1) < 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            g_recentProbeExists = recentSessionExists;
             g_recentProbeLastFrame = -2;
             app.sessionRecents.clear();
         }
@@ -331,16 +364,54 @@
                 closeAll();
                 std::vector<std::string> pick = order == 0
                     ? std::vector<std::string>{ other, sp } : std::vector<std::string>{ sp, other };
-                openDialogSelection(pick);
+                openSelection(pick);
                 check(app.images.size() == 2 && has(head) && has(other),
                       order == 0 ? "D10 image then session: the session, the image on top"
                                  : "D10 session then image: the same result");
             }
             const size_t before = app.images.size();
-            openDialogSelection({ sp, scratch + "/b/named.vsession" });
+            openSelection({ sp, scratch + "/b/named.vsession" });
             check(app.images.size() == before &&
                   app.toast.find("2 sessions selected") != std::string::npos,
                   "D10 two sessions at once: neither opens, the toast says why");
+
+            // ON THE WORKER (the path a person gets): the pictures land frames
+            // after the session, each saying "loaded x" - and the selection's own
+            // sentence must be what is left on screen once the last has landed.
+            const bool asyncWas = g_forceAsyncOpen;
+            g_forceAsyncOpen = true;
+            auto pumpAll = [&]() {
+                double t0 = nowSec();
+                while (nowSec() - t0 < 60.0) {
+                    pumpOpenJob();
+                    if (!app.openJob && app.openQueue.empty() && !g_selSummaryPending) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            const std::string third = g_sessionDoorSelftest + "/02/frame_000.npy";
+            closeAll();
+            const int starts0 = g_openStarts;
+            openSelection({ other, sp, third });
+            pumpAll();
+            check(g_openStarts > starts0 && app.images.size() == 3 && has(head) &&
+                      has(other) && has(third),
+                  "D10 async: the session, then both images on the worker");
+            check(app.toast.find("session restored: door.vsession") != std::string::npos,
+                  "D10 async: the restored sentence is what stays on screen");
+            closeAll();
+            openSelection({ third, sp, scratch + "/b/named.vsession", other });
+            pumpAll();
+            check(app.images.size() == 2 && app.toastErr &&
+                      app.toast.find("2 sessions selected") != std::string::npos,
+                  "D10 async: the two-session refusal outlives the images' landings");
+            g_forceAsyncOpen = asyncWas;
+
+            // A DROP is one selection too: GLFW's callback, called as GLFW would.
+            closeAll();
+            const char* dropped[] = { other.c_str(), sp.c_str() };
+            dropCallback(nullptr, 2, dropped);
+            check(app.images.size() == 2 && has(head) && has(other),
+                  "D10 a drop of image then session: the session, the image on top");
             closeAll();
             app.sessionRecents.clear();
         }
