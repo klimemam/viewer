@@ -1652,6 +1652,9 @@ static const size_t SESSION_RECENT_MAX = 8;
 // backslashes, a drop's forward slashes, a different case) is ONE row, not two
 // - on Windows, where those ARE one file. On POSIX a backslash is an ordinary
 // character of a name and case is significant, so nothing is folded there.
+// macOS included: its default volume ignores case, but case-sensitive APFS
+// volumes exist, and folding there could merge two different files into one
+// row - where not folding costs at most a second row for one file.
 static std::string sessionRecentKey(const std::string& p) {
     std::string s = p;
 #if defined(_WIN32)
@@ -1749,9 +1752,15 @@ static bool recentSessionExists(const std::string& p) {
 // yet is drawn as present (no "(missing)", clickable - a click on a file that
 // turns out to be gone gets openPath's own refusal, which names it).
 //
-// The worker owns nothing but its shared RecentProbe, so a probe still stuck on
-// a dead share when the menu closes, or when the next one starts, is simply
-// left to finish into a record nobody reads.
+// AT MOST ONE PROBE IN FLIGHT. A probe stuck on a dead share is not joined and
+// not replaced: an opening that finds one still running starts none and keeps
+// drawing from it (its rows answer "not known" until it finishes), so opening
+// and closing the menu against a dead share cannot pile threads up.
+//
+// AT EXIT the worker is detached and is never waited for. It owns nothing but
+// its shared RecentProbe and touches no App state, so the process ending while
+// it is blocked inside stat() - which the OS then simply terminates - loses
+// nothing and cannot hold the shutdown up.
 struct RecentProbe {
     std::vector<std::string> paths;  // the list as it was when the menu opened
     std::vector<char> exists;        // filled by the worker, read after `done`
@@ -1760,6 +1769,9 @@ struct RecentProbe {
 static std::shared_ptr<RecentProbe> g_recentProbe;
 static int g_recentProbeLastFrame = -2;   // the last frame the submenu was open in
 static int g_recentProbeLaunches = 0;     // how many probes were started (selftest)
+// What the worker asks of each row. A pointer so the selftest can stand in a
+// SLOW one (a dead share, on demand); the product never changes it.
+static bool (*g_recentProbeExists)(const std::string&) = recentSessionExists;
 
 // Called by the submenu on every frame it is open, with ImGui's frame number.
 // A frame that does not directly follow the last open one is a new opening, and
@@ -1768,14 +1780,17 @@ static void recentSessionsMenuFrame(int frame) {
     const bool opening = frame != g_recentProbeLastFrame + 1;
     g_recentProbeLastFrame = frame;
     if (!opening) return;
+    if (g_recentProbe && !g_recentProbe->done.load(std::memory_order_acquire))
+        return;                           // one is still out there: reuse it
     auto pr = std::make_shared<RecentProbe>();
     pr->paths = app.sessionRecents;
     pr->exists.assign(pr->paths.size(), 1);
     g_recentProbe = pr;
     g_recentProbeLaunches++;
-    std::thread([pr]() {
+    bool (*probe)(const std::string&) = g_recentProbeExists;
+    std::thread([pr, probe]() {
         for (size_t i = 0; i < pr->paths.size(); i++)
-            pr->exists[i] = recentSessionExists(pr->paths[i]) ? 1 : 0;
+            pr->exists[i] = probe(pr->paths[i]) ? 1 : 0;
         pr->done.store(true, std::memory_order_release);
     }).detach();
 }
@@ -1790,7 +1805,7 @@ static int recentSessionState(size_t i) {
     return pr->exists[i];
 }
 // openPath's own test for its .vsession branch, as a name: the open dialog's
-// selection is ordered by it (openDialogSelection), so the two cannot disagree.
+// selection is ordered by it (openSelection), so the two cannot disagree.
 static bool isSessionFileName(const std::string& p) {
     static const char suf[] = ".vsession";
     const size_t n = sizeof suf - 1;

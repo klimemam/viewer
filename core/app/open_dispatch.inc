@@ -5519,8 +5519,34 @@ static void startNextQueuedOpen() {
 // itself - there is no live output to tail, because the phase and the clock are
 // the whole of what a read has to say. The landing happens here, on the UI
 // thread, when the worker has finished.
+// A SELECTION'S OWN SENTENCE (#307). One selection - an open dialog's, or one
+// drop - can hold a session and pictures. The session is restored on this
+// thread and says so (restored / what did not come back / a refusal), and then
+// every picture that lands says "loaded x" - later, from the worker, after the
+// sentence that mattered. The toast is one slot, so the last landing would
+// erase it. So the selection's sentence is held here and put back up when the
+// last open of the queue has landed, and only then. Shown again WITHOUT a
+// second Messages entry: it is the same event, already logged once.
+static std::string g_selSummary;
+static bool g_selSummaryErr = false;
+static bool g_selSummaryPending = false;
+static void reshowToast(const std::string& msg, bool err) {
+    app.toast = msg;
+    app.toastErr = err;
+    app.toastUntil = ImGui::GetCurrentContext() ? ImGui::GetTime() + (err ? 6.0 : 2.5) : 0.0;
+}
+static void postSelectionSummaryIfLanded() {
+    if (!g_selSummaryPending || app.openJob || !app.openQueue.empty()) return;
+    g_selSummaryPending = false;
+    reshowToast(g_selSummary, g_selSummaryErr);
+}
+
 static void pumpOpenJob() {
-    if (!app.openJob) { startNextQueuedOpen(); return; }
+    if (!app.openJob) {
+        startNextQueuedOpen();
+        postSelectionSummaryIfLanded();   // the frame AFTER the last landing
+        return;
+    }
     App::OpenJob* j = app.openJob.get();
     if (!j->done.load()) { g_openPumps++; return; }
     j->th.join();
@@ -5788,25 +5814,41 @@ static void launchOpenDialog(const OpenDialogSpec& s) {
 static void openFileDialog() { launchOpenDialog(openFileDialogSpec()); }
 static void openSessionDialog() { launchOpenDialog(openSessionDialogSpec()); }
 
-// What an open dialog's selection does, in a fixed order whatever order the OS
-// returned the names in. With "Images and sessions" as Open...'s first filter
-// a selection can hold both, and a session REPLACES what is open - so handing
-// the names to openPath as they came would close images just opened when the
-// session happened to come later, and keep them when it came first.
+// What ONE SELECTION does - an open dialog's result or one drag & drop - in a
+// fixed order whatever order the OS handed the names over in. A selection can
+// hold sessions and pictures, and a session REPLACES what is open - so opening
+// the names as they came would close pictures just opened when the session
+// happened to come later, and keep them when it came first.
 //
 // The rule: the session opens FIRST and everything else opens on top of it.
 // More than one session in one selection has no order that means anything
 // (each replaces the last), so none of them is opened, the toast says why, and
-// the rest of the selection still opens.
-static void openDialogSelection(const std::vector<std::string>& picked) {
+// the rest of the selection still opens. Whatever the session part had to say
+// is the selection's sentence, and it is the one left on screen (see
+// g_selSummary above): now, when the pictures opened on this thread, or when
+// the last of them has landed, when they went to the worker.
+static void openSelection(const std::vector<std::string>& picked) {
     std::vector<std::string> sessions, rest;
     for (const std::string& p : picked)
         (isSessionFileName(p) ? sessions : rest).push_back(p);
-    if (sessions.size() == 1) openPath(sessions[0]);
+    std::string summary;
+    bool summaryErr = false;
+    if (sessions.size() == 1) {
+        openPath(sessions[0]);
+        summary = app.toast;              // restored / the loss sentence / why it failed
+        summaryErr = app.toastErr;
+    } else if (sessions.size() > 1) {
+        summary = std::to_string(sessions.size()) + " sessions selected - a session replaces "
+                  "what is open, so open one at a time; none of them was opened";
+        summaryErr = true;
+        toast(summary, true);
+    }
     for (const std::string& p : rest) openPath(p);
-    if (sessions.size() > 1)
-        toast(std::to_string(sessions.size()) + " sessions selected - a session replaces "
-              "what is open, so open one at a time; none of them was opened", true);
+    if (summary.empty() || rest.empty()) return;   // nothing said after it
+    g_selSummary = summary;
+    g_selSummaryErr = summaryErr;
+    g_selSummaryPending = true;
+    postSelectionSummaryIfLanded();       // at once when nothing went to the worker
 }
 // The Save Session dialog's answer: saveSession's extension rule applied HERE
 // first, so Recent Sessions names the file that was written ("run3" typed into
@@ -5859,7 +5901,7 @@ static void openFolder(const std::string& path);   // defined with the sequence 
 
 static void pollFileDialog() {           // called once per frame from the main loop
     if (app.openDlg && app.openDlg->ready(0)) {
-        openDialogSelection(app.openDlg->result());
+        openSelection(app.openDlg->result());
         app.openDlg.reset();
     }
     if (app.saveDlg && app.saveDlg->ready(0)) {
