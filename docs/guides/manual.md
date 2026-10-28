@@ -563,20 +563,21 @@ File > **Export stack as video (displayed levels)...**(キャンバスの右ク�
 - **解像度はフレームの実寸**です(キャンバスのズームではありません)
 - **各フレームは、それが画面に出るときと同じレンジ**で描きます。A の stack なら
   「A をフレーム n に送ったときの画面」—— B とスロットも follow-frame でそれぞれの
-  フレーム n に追従した上でのレンジです。`auto over every side (union)` なら A・B・C… の
+  フレーム n に追従した上でのレンジです。`union` なら A・B・C… の
   フレーム n の和集合、`each side fits itself` なら A のフレーム n 自身のフィット、
-  `every side uses A's range` なら A のフレーム n の黒点/白点(表は [§3b](#3b-ab-比較ワイプ--並べて--差分))。
+  `A's range` なら A のフレーム n のレンジ(表は [§3a](#3a-表示レンジ黒点--白点))。
   B やスロットに**フレーム n が無い**(stack が短い)ときは、画面と同じく固定されたフレーム
-  (`[stale]` の絵)を使います。**Per stack / Linked なら全フレーム同じ**、**Auto per frame
-  ならフレーム送りと同じ再フィット**を1枚ずつ掛けてから描きます
+  (`[stale]` の絵)を使います。**stack の one range / all open なら全フレーム同じ**、
+  **each frame fits itself なら各フレーム自身の fit**で描きます(`frame` で外したフレームは
+  そのレンジ)
 - **B やスロットが持っている stack を書き出すと、各フレームはその役割のまま**描かれます ——
   follow-frame が A をそのフレームの番号に合わせたときの画面の B / C の絵です
   (follow-frame がオフなら A はそのままで、そのフレームを B / C に置いたときの絵)。
   比較に入っていない stack は自分のレンジです
 - 使ったレンジは**ファイルに焼かず、文で言います**: 書き終えた toast・Messages・stderr に
-  `range: A/B: auto over every side (union), per frame` /
-  `range: A/B: every side uses A's range - A's is Auto per frame (min-max), per frame` /
-  `range: Per stack (default)` のような、Range と A/B のコンボと同じ言葉の1句が付きます。
+  `range: union over A, B, C (min-max), per frame` /
+  `range: A's range for every side, per frame` /
+  `range: one range for the stack` のような、Inspector の in force 行と同じ言葉の1句が付きます。
   B / C として描いたなら `- drawn as B`、固定フレームを使ったなら `; B held at frame 1`
   も付きます。PNG / dot by dot ではこれに ` = 下端..上端` の数値が続きます
 - 形式は**拡張子で決まります**。`.mkv` = **FFV1**(可逆圧縮。`ffmpeg` が PATH に
@@ -633,7 +634,7 @@ File > **Save compare view as PNG...** と **Export compare view as video...**
   フレームによって合成の大きさが変わるときも断ります
 - **何を描くかは、書き出しを頼んだ時点で決まります**(PNG はダイアログを開いたとき、動画は Export compare view as video... を選んだとき): A・モード・ワイプの列・文字・差分のスケール。ダイアログが開いている間や書き出し中に A を動かしても、パンしても、文字や差分のスケールを変えても、絵と toast はその時点のままです。B・スロット・follow-frame・差分の |A-B| が書き出し中に変わったときは、途中から絵が変わってしまうので止め、書きかけのファイルを消します
 - 書き終えた toast には、モード・配置・余白・使ったレンジが1行で出ます:
-  `compare: tiled A | B | C, 1:1 in 64x40 cells, 2 px grey separators; sizes differ - padded with black to 64x40 (C 40x24)  -  range: A/B: auto over every side (union), per frame  -  letters on`
+  `compare: tiled A | B | C, 1:1 in 64x40 cells, 2 px grey separators; sizes differ - padded with black to 64x40 (C 40x24)  -  range: union over A, B, C (min-max), per frame  -  letters on`
 
 ### 2.3e 1枚をクリップボードへ —— **「dot by dot」と「表示どおり」は別物です**
 
@@ -651,8 +652,8 @@ File > **Save compare view as PNG...** と **Export compare view as video...**
 | preview(間引き)中 | **断ります**(1:1 を名乗れないので) | **コピーして、preview だと言います** |
 
 - **dot by dot / PNG 保存 / 動画書き出しは同じ写像**(`renderDocRGBA`)を通ります。
-  表示レンジ(A/B 比較中の `A/B:` の設定を含め、画面と同じ。使ったレンジは toast の
-  `range: ...` が言います)・ガンマ・カラーマップ・CFA colorize・値域ハイライトは焼き込み、
+  表示レンジ(A/B 比較中の `A+B` の規則を含め、画面と同じ。使ったレンジは toast の
+  `range: ...` が in force 行と同じ言葉で言います)・ガンマ・カラーマップ・CFA colorize・値域ハイライトは焼き込み、
   **補間だけは決してしません**。画質のレポートで**ノイズそのものが主題**のとき、
   拡大されたスクリーンショットはそのノイズを作りもし消しもするからです
 - **表示どおりは、その写像を通れません。** 2ペイン・仕切り線・4種のオーバーレイが
@@ -850,7 +851,7 @@ median は Auto % と同じ 65536 bin のヒストグラム(fraction 0.5)から�
 数値欄・black の選択を変えても**その場では再フィットしません** —— 適用するのは
 `Med` ボタンです(点灯は比較で決まるので、変えた瞬間にランプが消えます)。
 
-`Range` モード(link)が **Linked across all images** のときは、3つとも
+`applies to` が **`all open`** のときは、3つとも
 **開いている全画像**に対して答えます。Auto は全画像の min/max、Auto % と Med は
 全画像の画素を**1つのヒストグラムに合算**してから分位・median を取ります
 (分位は画像ごとに取って平均できません)。Med の black も合算後の min /
@@ -859,54 +860,110 @@ median は Auto % と同じ 65536 bin のヒストグラム(fraction 0.5)から�
 パーセンタイルは 65536 bin のヒストグラムで求めます(1パス・メモリ一定)。
 有限画素が無い、min==max など答えが出せない場合は **min–max に落ちます**。
 
-**Range モードは5通り**(同じ場所のコンボ):
+### 誰に効くか・どう決めるか(#321)
 
-| モード | 意味 |
+Range 節は**読む順に**並んでいます: **誰に効くか(`applies to`)→ どう決めるか(`rule`)→
+いま効いているもの(`in force`)→ 数値 → ボタン**。`applies to` と `rule` の段は
+ラジオです(クリックで確定)。
+
+```
+ applies to   [ frame ] [■stack■] [ all open ]
+              10lx/frame_000‥023  (24 frames)
+ rule         [■one range■] [ each frame fits itself ]
+ in force     0 .. 4095    one range for the stack · fit of frame 5
+```
+
+**`applies to` —— 誰が 1 つのレンジを共有するか**
+
+| 段 | 意味 |
 |---|---|
-| **Auto per frame (min–max)** | フレームを送るたびに、**そのフレーム自身の min–max** に合わせ直します |
-| **Auto per frame (0.1–99.9%)** | 同じく、**そのフレーム自身の 0.1–99.9%** に合わせ直します |
-| **Auto per frame (median→target)** | 同じく、**そのフレーム自身の median が `target` に来る**ように合わせ直します |
-| **Per stack**(既定) | stack のフレームは基準フレームのレンジを共有し、そのまま比較できます |
-| **Linked across all images** | 1つの表示レンジを全画像に重ねます。表示だけで、各画像は自分のレンジを保持し、link を外すと戻ります |
+| `frame` | **このフレームだけ**の例外。押した瞬間の見え方をそのフレームのレンジにして stack から外し、`stack` を押すまで保ちます。段は琥珀色、フッタの名前の後に琥珀の ` [own range]`。単独画像には出ません(1枚の stack と同じなので) |
+| `stack`(既定) | stack の全フレームが 1 つのレンジを共有します。**単独画像は 1 枚の stack**です |
+| `A+B`(`A+B+C`…) | **比較中だけ**出る段。比較中の全側 (A・B・スロット)。表示だけで、各 stack の数値は保たれ、比較を終えると戻ります |
+| `all open` | 1 つの表示レンジを開いている全画像に重ねます(旧 Linked)。表示だけで、外すと各 stack のレンジが戻ります |
 
-`Auto per frame` の3つは**上のボタン列の3つの fit と同じもの**です。「フレームごとに
-合わせ直す」だけでは *何に* 合わせるかが決まらないので、コンボが答えを名乗ります
-(既定は min–max = 従来の挙動)。選んだ flavor と Med のパラメータは
-**セッションに保存**されます。
+名前行が「誰か」を名指しします(`<stack>  (24 frames)` / 琥珀の
+`frame 7 of <stack> — its own range` / `A <stackA> · B <stackB>` / `3 open images`)。
+同じ stack に `frame` で外したフレームがあると、`2 frames of this stack keep their own range [rejoin all]`
+が出ます。
 
-`Auto per frame` は**読み込み時の既定値とは別物**です。読み込み時は「8 / 16bit の整数型は型の
-フルスケール(u8→0..255 等。符号付きの `i8` / `i16` は 0 から正の最大まで —— §2.3b)、
-0 付近の float は 0..1」という慣習が効きますが、
-`Auto per frame` はその慣習を通しません —— 任意単位で 0.3–0.6 のような float の
-stack が、送るたびに 0..1 に吸着して**モードが効いていないように見えていた**のを
-直しました(#245)。読み込み時の既定値そのものは変えていません。
+**`rule` —— そのレンジをどう決めるか**
 
-`Per stack` の共有は**読み込み時だけの話ではありません**(#248)。
+| applies to | rule | 意味 |
+|---|---|---|
+| stack | **`one range`**(既定) | stack 全体で 1 つの黒点/白点 —— 下の数値です |
+| stack | `each frame fits itself` | 各フレームが**自分の fit**(min-max / 0.1-99.9% / median->target。下の 3 つの fit ボタンで選ぶ)で描かれます。**表示だけ**で、stack の保存値は書き換えません。旧 `Auto per frame` |
+| A+B | `A's range` | 全側が A の数値(A の stack のレンジ)。A を送っても動きません |
+| A+B | **`union`**(比較の既定) | 全側を、比較中の全側の min/max の和集合に、送るたびに合わせ直します。どの側も飽和せず、どれも贔屓されません |
+| A+B | `each side fits itself` | 各側が自分の fit で描かれます(fit ボタンで選ぶ)。側ごとに目盛りが違うことを in force 行が琥珀で言います |
+| frame / all open | `one range` のみ | |
 
-- **Auto / Auto % / 0-1 / 0-255 / 0-65535 / 数値入力のどれで書き換えても、
-  同じ stack の全フレームに入ります。**1枚だけ合わせて他が置いていかれることは
-  ありません(単独画像と `Auto per frame` は従来どおり、そのフレームだけ)
-- **`Per stack` に切り替えた瞬間に、いま画面に出ているフレームのレンジを
-  stack 全体へ配り直します。**`Auto per frame` で送ると各フレームの保存レンジは
-  そのフレーム自身の値に書き換わるので、戻したときに配り直さないと
-  「Per stack にしても一枚毎に Auto される」ように見えていました
-- stack を読み込んだ**最初の数枚**も、先頭フレームのレンジを継ぎます
-  (以前は最初のバッチ内の最大4枚が各自のレンジで出ていました)
+`rule` は**全体で 1 つ**です(stack ごとではありません)。`each frame fits itself` から
+`one range` に戻すと、**画面のフレームの今の fit を stack のレンジとして配ります**
+(目の前の絵が配りたい絵)。比較中に `stack` を押すと比較の規則は
+「各側が自分の stack のレンジ」になり、`A+B` を押すと最後に選んだ規則(既定 union)に戻ります。
 
-**6つのボタンは、いまのレンジと一致するものが点灯します。**押した記憶ではなく
-**そのつどの比較**なので、セッションから復元したレンジも手打ちの値も同じ規則で
-判定されます。ラジオボタンではないので、データがちょうど 0..1 なら
-`Auto` と `0-1` が**両方**点きます(どちらも本当のことなので)。どれとも一致しなければ
-全部消灯 = 手で決めたレンジ、という意味です。例外は `i8` / `i16` の初期値(0..127 /
-0..32767、§2.3b)で、実測 min–max がたまたま同じでない限りどのボタンとも一致しないので、
-開いた直後から全消灯です。`Linked` のときの `Auto %` と `Med` は、答えを出すのに
-全画像の全画素を読む必要があるため点灯しません。
+**書き込みは効いている相手へ行きます。** 数値欄・6 つのボタン・ヒストグラムの
+`zoom sets display range`・セッションの数値は全部 1 本の経路で、
+`frame` ならそのフレームだけ、`stack` なら stack 全体(外したフレームは除く)、
+`A+B` なら A の stack、`all open` なら重ねているレンジに入ります。
 
-**`Per stack` では、比較の相手は「そのレンジを配ったフレーム」です**(#254)。
-共有レンジは基準フレームの fit なので、画面のフレーム自身と比べると当然一致せず、
-コマを送った瞬間に `Auto` が消えていました(「Stack で Auto の設定が外れる」)。
-レンジは共有されたままで、外れていたのは表示のほうです。基準フレームを閉じると
-比べる相手が無くなるので、3つの fit は消灯します(固定値の3つはそのまま答えます)。
+**固定値は「1 つのレンジが欲しい」という宣言です。** `each frame fits itself` /
+`union` / `each side fits itself` のときに数値を打つか `0-1` / `0-255` / `0-65535` を押すと、
+rule が `one range` / `A's range` に移り(段の点灯が動き、toast も言います)、その値が
+効きます。以前は union 中に `0-255` を押しても数値だけ書かれて画面は変わりませんでした。
+`each … fits itself` のときの `Auto` / `Auto %` / `Med` は **fit の選択**です(押した方が点灯)。
+
+**`in force` —— いま画面に効いているもの**: `<下端> .. <上端>   <規則の言葉>`。
+
+| 状態 | 言葉 |
+|---|---|
+| stack · one range | `one range for the stack`(基準フレームの fit なら ` · fit of frame 5`) |
+| stack · each frame | `each frame fits itself (min-max)` |
+| frame | `this frame only` |
+| A+B · A's range | `A's range for every side` |
+| A+B · union | `union over A, B, C (min-max)`(固定フレームがあれば `; B held at frame 1`、間引き表示の側があれば ` · B is a preview`) |
+| A+B · each side | `each side fits itself (0.1-99.9%)` + 琥珀 `sides on different scales` |
+| 比較中に stack | `one range for the stack · each side keeps its own` + 値が違えば琥珀 `A 0-4095 / B 0-8191` |
+| all open | `one range over all open images` |
+| union が取れない | 琥珀で `union over A, B — B not measured, showing A's range`(min/max を測っていない側を和集合に入れず、全側を A のレンジで描きます) |
+
+**同じ言葉がヒストグラムの x 軸(先頭の句)・書き出しの注記(`range: <言葉> = 下端..上端`)・
+動画の toast にも出ます**(1 つの関数が言います)。数値から推定しないので、union が
+たまたま A の min-max と同じでも `union` と言います。
+
+`each frame fits itself` は**読み込み時の既定値とは別物**です。読み込み時は「8 / 16bit の
+整数型は型のフルスケール(u8→0..255 等。符号付きの `i8` / `i16` は 0 から正の最大まで —— §2.3b)、
+0 付近の float は 0..1」という慣習が効きますが、fit はその慣習を通しません —— 任意単位で
+0.3–0.6 のような float の stack が送るたびに 0..1 に吸着して**効いていないように見えていた**のを
+直しました(#245)。選んだ fit と Med のパラメータは**セッションに保存**されます。
+
+stack を読み込んだ**最初の数枚**も、先頭フレームのレンジを継ぎます
+(以前は最初のバッチ内の最大4枚が各自のレンジで出ていました、#248)。
+
+**`frame` で外したレンジはセッションに保存されます**(`framerange <フレーム> <黒点> <白点>`、
+stack の行の直後に 1 フレーム 1 行)。復元時、そのフレームが stack に無ければ
+セッションの報告に `framerange: frame N not in stack` と出ます。古い viewer はこの行を読み飛ばし、
+そのフレームを stack のレンジで出します。
+
+**6つのボタンのランプ**:
+
+| rule | Auto / Auto % / Med | 0-1 / 0-255 / 0-65535 |
+|---|---|---|
+| one range(stack / frame / A's range) | **いまのレンジと一致するものが点灯**(比較で判定。下記) | 数値が一致すれば点灯 |
+| each frame / each side fits itself | **選んでいる fit が点灯** | 消灯(押すと rule が移る) |
+| union | `Auto` が点灯(union は全側の min-max なので)、`Auto %` / `Med` は押せません(tooltip が `each side fits itself` を案内) | 消灯(押すと `A's range` に移る) |
+| all open | `Auto` は比較、`Auto %` / `Med` は消灯(答えに全画像の全画素が要るため) | 数値が一致すれば点灯 |
+
+one range での点灯は押した記憶ではなく**そのつどの比較**なので、セッションから
+復元したレンジも手打ちの値も同じ規則で判定されます。ラジオボタンではないので、データが
+ちょうど 0..1 なら `Auto` と `0-1` が**両方**点きます。どれとも一致しなければ全部消灯 = 手で
+決めたレンジです。例外は `i8` / `i16` の初期値(0..127 / 0..32767、§2.3b)で、開いた直後から
+全消灯です。**stack の比較の相手は「そのレンジを配ったフレーム」です**(#254)。共有レンジは
+基準フレームの fit なので、画面のフレーム自身と比べると一致せず、コマを送った瞬間に `Auto` が
+消えていました。in force 行はそのフレームを `fit of frame 5` と名指しします。基準フレームを
+閉じると比べる相手が無くなるので、3つの fit は消灯します(固定値の3つはそのまま答えます)。
+`frame` で外したフレームは自分と比べます。
 
 ## 3b. A/B 比較(ワイプ / 並べて / 差分)
 
@@ -958,19 +1015,16 @@ B は **Files で対象行を右クリック > Set as compare B**(実体を指�
   ワイプでは読めない「その画素でいくつ違うのか」はここで読みます。
   差分は**両者のうち広い型**で表示します(u16 と f32 の比較で小数が消えないように)
 - A と B でサイズ・dtype が違う場合は Inspector に注意が出ます
-- **表示レンジの関係**(Inspector の `A/B:` コンボ、または View > Compare A/B > Display range):
-
-  | 設定 | 何をするか |
-  |---|---|
-  | **`auto over every side (union)`(既定)** | 比較中の全側 (A・B・スロット) を **min/max の和集合**に合わせ直す。どの側も飽和せず、どの側も贔屓されない。**フレームを送るたびに引き直します** |
-  | `every side uses A's range` | 1つのレンジ、A のもの。A を送っても動きません。他の letter を「A に対して」測っているときはこれ |
-  | `each keeps its own` | それぞれの黒点/白点のまま。露出が大きく違う2枚の**形**だけを比べる場合。値が違って見えることを画面が警告します |
-  | `each side fits itself` | 比較中の全側がそれぞれ**自分のデータ**にフィットしたレンジで描かれる。フィットの方式はこのモードを選んだ直下の `fit:` 行(`min-max` / `0.1-99.9%` / `median`、View メニューでは `fit: ...` の 3 項目)で選びます。これは `Auto per frame` の方式と同じ 1 つの設定で、`median` は Range ボタン下の target / black を使います。**各側が自分のフレームを送るたびに引き直します**。側ごとに目盛りが違うことを画面が警告します |
-
-  既定が union なのは、`every side uses A's range` だと露出違いの B が飽和して(実測 `>white 99.69%`)
+- **表示レンジの関係**は Inspector の **Range 節**で決めます([§3a](#3a-表示レンジ黒点--白点)):
+  `applies to` の `A+B` 段と、その `rule`(`A's range` / `union` / `each side fits itself`)。
+  `stack` 段にすると各側が自分の stack のレンジです(露出が大きく違う2枚の**形**だけを
+  比べる場合。値が違えば in force 行が琥珀で言います)。View > Compare A/B > Display range にも
+  同じ4つ(`stack (each keeps its own)` / `A's range` / `union` / `each side fits itself`、
+  fit は `fit: min-max` / `fit: 0.1-99.9%` / `fit: median->target`)があります。
+  既定が union なのは、`A's range` だと露出違いの B が飽和して(実測 `>white 99.69%`)
   ヒストグラムが右端の1本になってしまうためです(union では同じデータで `0.02%`)。
   いずれも**表示だけ**で、各画像の黒点/白点そのものは書き換えません。
-  `View > Link range` を入れている間はそちらが優先です。
+  `applies to` が `all open` の間はそちらが優先です。
   **書き出しにも効きます**: PNG・dot by dot は画面と同じレンジ(PNG は保存ダイアログを
   開いたときの画面)、stack の動画はフレームごとに、そのフレームが画面に出るときのレンジです
   ([§2.3d](#23d-stack-を-lossless-動画に書き出す表示レベルのまま))
@@ -1387,12 +1441,13 @@ ROIs / Temporal に detrend のチェックボックスは付けません — �
   あれば、その側の端に `◀ highlight outside` / `highlight outside ▶` と出ます
 - **`zoom sets display range`**(見出し行のチェック、既定オフ、prefs.txt の
   `histzoomrange`): オンだと拡大の確定で表示レンジもその範囲にします。Range の
-  数値入力と同じ経路なので、Per stack / Linked / A/B の規則にそのまま従います
-  (Linked なら link のレンジが動きます)。解除すると**最初の拡大の直前の
+  数値入力と同じ経路なので、Range の `applies to` にそのまま従います
+  (`all open` なら重ねているレンジ、`frame` ならそのフレームだけ)。拡大は書き込みなので、
+  rule が `each frame fits itself` / `union` / `each side fits itself` なら確定で
+  `one range` / `A's range` に移ります(§3a)。解除すると**最初の拡大の直前の
   レンジ**に戻ります。ただしその間に Auto や数値入力でレンジを変えていたら、
-  戻さずに拡大だけ解除します。Per stack では frame を送ってから重ねて拡大しても
-  同じ「直前」に戻ります(レンジは stack で共有)。Auto per frame では拡大した
-  frame のレンジだけを戻し、いま画面にある別の frame のレンジには触れません。
+  戻さずに拡大だけ解除します。stack では frame を送ってから重ねて拡大しても
+  同じ「直前」に戻ります(レンジは stack で共有)。
   オフのときは表示レンジに一切触れません
 
 ### 5.3b 値域ハイライト — この値の画素はどこにいるか

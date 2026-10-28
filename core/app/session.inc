@@ -3741,7 +3741,15 @@ static std::string loadSession(const std::string& path,
         else if (key == "current") ls >> wantCurrent;
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
-        else if (key == "rangescope") { ls >> app.rangeRule; }
+        // the stack's rule (#321): 0 each frame fits itself, 1 one range - the
+        // numbers "Auto per frame" / "Per stack" always wrote. 2 was the old
+        // "everything" scope, which is the all-open overlay now; anything else
+        // is not a rule and leaves the one in force.
+        else if (key == "rangescope") {
+            int r = -1; ls >> r;
+            if (r == RR_EachFrame || r == RR_OneRange) app.rangeRule = r;
+            else if (r == 2) { app.rangeRule = RR_OneRange; app.linkRange = true; }
+        }
         // Each half checked on its own, and each left alone when the file
         // cannot answer for it: a session written by a newer build (or hand
         // -edited) must not be able to set a target of 0, which divides, or a

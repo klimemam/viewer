@@ -142,9 +142,10 @@ PR #122 で消え、`docs/guides/manual.md` は既に「ビルドを切り替え
 
 | 行 | 何を決めるか | 数値を動かすか |
 |---|---|---|
-| `linkrange` / `rangescope` | 表示レンジの決め方 (毎フレーム自動 / stack 毎 / 全画像連動) | **動かす** — 各面の黒/白が決まる |
+| `linkrange` / `rangescope` | 表示レンジの決め方。`linkrange 1` = `applies to` が `all open`、`rangescope` = stack の rule (`0` each frame fits itself / `1` one range、#321。数値の意味は旧 Auto per frame / Per stack と同じ。`2` は読むと `linkrange 1` に写す) | **動かす** — 各面の黒/白が決まる |
+| `framerange <seqIndex> <black> <white>` | stack の image 行の直後、`frame` で外したフレーム1つにつき1行 (#321)。加算的 (古い viewer は読み飛ばし、そのフレームを stack のレンジで出す)。stack に無いフレームは `LK_LineRejected` (`framerange: frame N not in stack`) | **動かす** — そのフレームの黒/白 |
 | `cmpfollow` | B が A のフレーム番号に追従 | **動かす** — どのフレームと比べたか |
-| `cmprange` | A/B の表示レンジの関係 (各自 / A に合わせる / union) | **動かす** |
+| `cmprange` | A/B の表示レンジの関係。`0` = scope は stack (各自)、`1` A's range / `2` union / `3` each side fits itself | **動かす** |
 | `compare` | 比較モード・wipe/split 位置・diff ゲイン・abs・blink | **一部動かす** (diff 系) |
 | `analysis` | 選択中のアナライザ・自動再実行・参照線 | **動かす** (アナライザ選択) |
 | `seriespanel` | フィット法・窓・表示プレーン・SNR 単位 | **動かす** |
@@ -279,7 +280,7 @@ F10 は特に読む値打ちがある —— **設定にしないと決めた記
 | Series Analysis | 5 | 3 (`fitMethod` / `winMode` / `winLo,winHi`) + 部分 1 |
 | Set Analysis | 1 | 0 (`g_setPanel.tablePlane` は file-static でセッションにも入らない) |
 | Compare (A/B) | 7 | 4 (`diffAbs` / `diffGain` / `compareFollowFrame` / `compareRangeMode`) |
-| Inspector | 1 | 1 (`rangeScope` + `linkRange`) |
+| Inspector | 1 | 1 (`rangeRule` + `linkRange`、per-doc の `rangeOwn` はセッションの `framerange`) |
 | Browse | 1 | 0 (**ソート列と向きはどこにも保存されない** —— 起動のたびに Name 昇順に戻る) |
 | **計** | **43** | **11** (+ 部分 4) |
 
@@ -350,7 +351,7 @@ prefs.txt にある 25 キーの Preferences パネルを作っても、#50 の�
 |---|---|---|---|
 | **application / preference** | `membudget`、`seqload`、raw の既定 10、detrend の既定 (F5)、有効数字 (F3)、ビン数 (F4) | theme、compact、gamma、grid、frame、`rbnatural`、クリック挙動 (F1) | `remoteexe`、`procpolicy`、`pythonexe`、リーダ探索パス (F7)、`EDITOR` |
 | **panel / preference** | `projMode`、`fitMethod`、`winMode` | Browse の flat/tree/sort、`histLog`、パネル開閉 | — |
-| **document** | `cfa`、`npyread`、`rangeScope` | ROI の可視、表示レンジの値 | — |
+| **document** | `cfa`、`npyread`、`rangeRule` | ROI の可視、表示レンジの値 (`rangeOwn` 含む) | — |
 | **invocation** | — | `--zoom`、`--center` | `--serve`、`--no-window`、`--*-selftest` |
 
 ### 4.1 measuring 級だけは別扱いが要る

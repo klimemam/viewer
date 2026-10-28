@@ -1965,6 +1965,20 @@
                 fprintf(stderr, "rangeselftest: S1b refused lines %d (%s)\n", r2.count[LK_LineRejected],
                         r2.names[LK_LineRejected].empty() ? "" : r2.names[LK_LineRejected][0].c_str());
                 ok(said, "a framerange for frame 7 of a 3-frame stack: one LK_LineRejected, named");
+                // the old "everything" scope (rangescope 2) is the all-open overlay
+                {
+                    std::ofstream gf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
+                    gf << "viewer-session 1\nlinkrange 0 0 1\nrangescope 2\n";
+                }
+                loadSession(sess);
+                ok(app.linkRange && app.rangeRule == RR_OneRange, "rangescope 2 reads as all open");
+                {
+                    std::ofstream gf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
+                    gf << "viewer-session 1\nlinkrange 0 0 1\nrangescope 7\n";
+                }
+                app.rangeRule = RR_EachFrame;
+                loadSession(sess);
+                ok(!app.linkRange && app.rangeRule == RR_EachFrame, "rangescope 7 is not a rule: the one in force stays");
             }
             closeAll();
             std::filesystem::remove(pathFromUtf8(sess), tec);

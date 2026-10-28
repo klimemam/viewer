@@ -252,6 +252,13 @@ mode 1 は A の black/white を全文字に配る (`export.inc:201-229`)。文�
   union。** 既存実装の区別をそのまま仕様として固定する。mode 1 は「A の
   基準に照らす」、mode 2 は「誰も欠けない同じ auto」で、別の問いに答えている。
 
+(#321) **mode 0 は rule ではなく scope の選択である**: 「各側が自分の stack の
+レンジ」= Inspector > Range の `applies to` が `stack`。mode 1..3 が `A+B` の
+rule (`A's range` / `union` / `each side fits itself`)。mode 1 の「A の stretch」は
+A が単独で描かれるレンジ (stack が `each frame fits itself` なら A の fit)。
+union は min/max を測っていない側 (`FrameSource::measured`) を入れず、全側を
+A のレンジで描いてそう言う。
+
 ## 6. 段階分け — D1..D6
 
 各段は単独で main に入って CI 緑、単独で意味を持つ。試験はすべて NOGL、
