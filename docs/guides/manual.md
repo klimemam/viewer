@@ -1435,13 +1435,20 @@ Process メニュー。結果は新しい画像としてリストに追加(元�
 
 **開くと、いま開いている画像はすべて閉じられ、セッションの中身に置き換わります**(足し込みでは
 ありません)。確認は出ません —— 閉じる前に残したいものがあれば先に `Ctrl+S` で保存してください。
-置き換えたときは「`session restored: run3.vsession - replaced 4 open image(s)`」と、閉じた
-画像の数を言います。読めないファイル・セッションでないファイルは、何も閉じずにその理由を出します。
+置き換えたときは「`session restored: run3.vsession - replaced 1 stack (50 frames) and 2 images`」と、
+閉じたものを stack と単独の画像に分けて言います。読めないファイル・セッションでないファイルは、
+何も閉じずにその理由を出します。読み込みで戻らなかったものがあるときは、その文
+(`session loaded: … not restored as saved: …`)が画面に残り、`session restored:` の文は Messages
+パネルに入ります。
+
+File > Open... で**セッションと画像を一緒に選んだ**ときは、選んだ順に関係なく**セッションを先に**開き、
+画像はその上に足します。セッションを2つ以上一緒に選ぶと、どれも開かず(互いに置き換え合うだけなので)
+その旨を出します。画像のほうは開きます。
 
 | 道 | 何を開くか | 備考 |
 |---|---|---|
 | **File > Open Session...** | 自分で保存した `.vsession` を1つ | フィルタは `viewer session (*.vsession)` が先頭。最後に保存 / 開いたセッションのフォルダから始まります。ショートカットはありません(`Ctrl+Shift+O` は Open Folder) |
-| **File > Recent Sessions** | 保存・読み込みに成功したセッション、新しい順に最大 8 件 | 消えたファイルは灰色の `(missing)`。`Clear` で一覧を空に。一覧は prefs.txt に残ります(`sessionrecent`) |
+| **File > Recent Sessions** | 保存・読み込みに成功したセッション、新しい順に最大 8 件 | 消えたファイルは灰色の `(missing)`(サブメニューを開くたびに裏で1回だけ確かめるので、届かないネットワーク上のファイルでも UI は止まりません。確かめ終わるまでは普通の行として出ます)。`Clear` で一覧を空に。一覧は prefs.txt に残ります(`sessionrecent`) |
 | **File > Open...** | 画像と同じダイアログから | 先頭のフィルタ「Images and sessions」に `.vsession` も出ます |
 | ドラッグ&ドロップ | ウィンドウへ落とした `.vsession` | |
 | **Browse**(このマシン) | `.vsession` の行をダブルクリック | Browse Folder (Local) のときだけ。サーバ上のセッションは開けません |

@@ -1649,12 +1649,13 @@ static void savePrefs() {
 static const size_t SESSION_RECENT_MAX = 8;
 
 // The comparison form: one file reached through two spellings (a dialog's
-// backslashes, a drop's forward slashes, a different case on Windows) is ONE
-// row, not two.
+// backslashes, a drop's forward slashes, a different case) is ONE row, not two
+// - on Windows, where those ARE one file. On POSIX a backslash is an ordinary
+// character of a name and case is significant, so nothing is folded there.
 static std::string sessionRecentKey(const std::string& p) {
     std::string s = p;
-    std::replace(s.begin(), s.end(), '\\', '/');
 #if defined(_WIN32)
+    std::replace(s.begin(), s.end(), '\\', '/');
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
 #endif
@@ -1726,7 +1727,11 @@ static void clearRecentSessions() {
 // row is drawn disabled, i.e. grey; Clear is how it goes away).
 static std::string recentSessionLabel(const std::string& p, bool exists) {
     std::string s = baseName(p);
+#if defined(_WIN32)
     const size_t slash = p.find_last_of("/\\");
+#else
+    const size_t slash = p.find_last_of('/');
+#endif
     if (slash != std::string::npos && slash > 0) s += "  -  " + p.substr(0, slash);
     if (!exists) s += "  (missing)";
     return s;
@@ -1734,6 +1739,88 @@ static std::string recentSessionLabel(const std::string& p, bool exists) {
 static bool recentSessionExists(const std::string& p) {
     std::error_code ec;
     return std::filesystem::is_regular_file(pathFromUtf8(p), ec);
+}
+
+// "(missing)" without stalling the frame. A remembered session can live on an
+// SMB/NFS share that has gone away, and a stat() against one blocks for as long
+// as the OS takes to give up - seconds - so the submenu must not stat a row per
+// frame. Instead the rows are probed ONCE per opening of the submenu, on a
+// worker, and the menu draws from the result: a row the probe has not answered
+// yet is drawn as present (no "(missing)", clickable - a click on a file that
+// turns out to be gone gets openPath's own refusal, which names it).
+//
+// The worker owns nothing but its shared RecentProbe, so a probe still stuck on
+// a dead share when the menu closes, or when the next one starts, is simply
+// left to finish into a record nobody reads.
+struct RecentProbe {
+    std::vector<std::string> paths;  // the list as it was when the menu opened
+    std::vector<char> exists;        // filled by the worker, read after `done`
+    std::atomic<bool> done{false};
+};
+static std::shared_ptr<RecentProbe> g_recentProbe;
+static int g_recentProbeLastFrame = -2;   // the last frame the submenu was open in
+static int g_recentProbeLaunches = 0;     // how many probes were started (selftest)
+
+// Called by the submenu on every frame it is open, with ImGui's frame number.
+// A frame that does not directly follow the last open one is a new opening, and
+// only that starts a probe.
+static void recentSessionsMenuFrame(int frame) {
+    const bool opening = frame != g_recentProbeLastFrame + 1;
+    g_recentProbeLastFrame = frame;
+    if (!opening) return;
+    auto pr = std::make_shared<RecentProbe>();
+    pr->paths = app.sessionRecents;
+    pr->exists.assign(pr->paths.size(), 1);
+    g_recentProbe = pr;
+    g_recentProbeLaunches++;
+    std::thread([pr]() {
+        for (size_t i = 0; i < pr->paths.size(); i++)
+            pr->exists[i] = recentSessionExists(pr->paths[i]) ? 1 : 0;
+        pr->done.store(true, std::memory_order_release);
+    }).detach();
+}
+// 1 there, 0 missing, -1 not known yet (the probe is running, or the list has
+// changed under it since the menu opened).
+static int recentSessionState(size_t i) {
+    std::shared_ptr<RecentProbe> pr = g_recentProbe;
+    if (!pr || !pr->done.load(std::memory_order_acquire)) return -1;
+    if (i >= pr->paths.size() || i >= app.sessionRecents.size() ||
+        pr->paths[i] != app.sessionRecents[i])
+        return -1;
+    return pr->exists[i];
+}
+// openPath's own test for its .vsession branch, as a name: the open dialog's
+// selection is ordered by it (openDialogSelection), so the two cannot disagree.
+static bool isSessionFileName(const std::string& p) {
+    static const char suf[] = ".vsession";
+    const size_t n = sizeof suf - 1;
+    if (p.size() < n) return false;
+    for (size_t i = 0; i < n; i++)
+        if (std::tolower((unsigned char)p[p.size() - n + i]) != suf[i]) return false;
+    return true;
+}
+// What is open, in the layer canon's words (docs/terminology.md): stacks with
+// their frame count, and the frames that stand alone - "Close Image" calls
+// those images, so this does too. One 50-frame stack is "1 stack (50 frames)",
+// never "50 images". Previews are not opens and are not counted. "" when
+// nothing is open.
+static std::string openContentsPhrase() {
+    std::vector<int> seqs;
+    int stackFrames = 0, images = 0;
+    for (const auto& d : app.images) {
+        if (d->preview) continue;
+        if (d->seqId == 0) { images++; continue; }
+        stackFrames++;
+        if (std::find(seqs.begin(), seqs.end(), d->seqId) == seqs.end()) seqs.push_back(d->seqId);
+    }
+    auto n = [](int k, const char* one, const char* many) {
+        return std::to_string(k) + " " + (k == 1 ? one : many);
+    };
+    std::string s;
+    if (!seqs.empty())
+        s = n((int)seqs.size(), "stack", "stacks") + " (" + n(stackFrames, "frame", "frames") + ")";
+    if (images > 0) s += (s.empty() ? "" : " and ") + n(images, "image", "images");
+    return s;
 }
 // Where File > Open Session... starts: the folder of the last session saved or
 // opened. A folder that has gone since is passed over for the next one; with

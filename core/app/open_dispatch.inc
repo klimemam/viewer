@@ -5670,18 +5670,17 @@ static void openPath(const std::string& path) {
         // closes everything (closeAll) once the file has proved to be a session
         // and before its first line is applied, and it does not ask - a file
         // that cannot be read or is not a session returns before that, with
-        // nothing closed. #307 keeps that behaviour and says it: the count of
-        // what was replaced goes into the sentence that reports the load.
-        int replaced = 0;
-        for (const auto& d : app.images) if (!d->preview) replaced++;
+        // nothing closed. #307 keeps that behaviour and says it: what was
+        // replaced goes into the sentence that reports the load, in the layer
+        // canon's words (docs/terminology.md) - a 50-frame stack is one stack.
+        const std::string replaced = openContentsPhrase();
         SessionReport rep;
         std::string err = loadSession(path, &rep);
         if (!err.empty()) toast(baseName(path) + ": " + err, true);
         else {
             noteRecentSession(path);   // Recent Sessions; the autosave is refused there
             std::string msg = "session restored: " + baseName(path);
-            if (replaced > 0)
-                msg += " - replaced " + std::to_string(replaced) + " open image(s)";
+            if (!replaced.empty()) msg += " - replaced " + replaced;
             // A lossy load has already put its own sentence on screen (what did
             // not come back, by name). That one outranks this one, so it stays,
             // and this goes to the Messages log beside it.
@@ -5788,6 +5787,35 @@ static void launchOpenDialog(const OpenDialogSpec& s) {
 }
 static void openFileDialog() { launchOpenDialog(openFileDialogSpec()); }
 static void openSessionDialog() { launchOpenDialog(openSessionDialogSpec()); }
+
+// What an open dialog's selection does, in a fixed order whatever order the OS
+// returned the names in. With "Images and sessions" as Open...'s first filter
+// a selection can hold both, and a session REPLACES what is open - so handing
+// the names to openPath as they came would close images just opened when the
+// session happened to come later, and keep them when it came first.
+//
+// The rule: the session opens FIRST and everything else opens on top of it.
+// More than one session in one selection has no order that means anything
+// (each replaces the last), so none of them is opened, the toast says why, and
+// the rest of the selection still opens.
+static void openDialogSelection(const std::vector<std::string>& picked) {
+    std::vector<std::string> sessions, rest;
+    for (const std::string& p : picked)
+        (isSessionFileName(p) ? sessions : rest).push_back(p);
+    if (sessions.size() == 1) openPath(sessions[0]);
+    for (const std::string& p : rest) openPath(p);
+    if (sessions.size() > 1)
+        toast(std::to_string(sessions.size()) + " sessions selected - a session replaces "
+              "what is open, so open one at a time; none of them was opened", true);
+}
+// The Save Session dialog's answer: saveSession's extension rule applied HERE
+// first, so Recent Sessions names the file that was written ("run3" typed into
+// the dialog is run3.vsession on disk), and remembered only when it was.
+static void saveSessionDialogResult(std::string p) {
+    if (p.empty()) return;
+    if (p.find('.') == std::string::npos) p += ".vsession";
+    if (saveSession(p)) noteRecentSession(p);
+}
 static void openFolderDialog() {
     if (!pfd::settings::available()) {
         toast("no file-dialog backend found (install zenity or kdialog)", true);
@@ -5831,15 +5859,11 @@ static void openFolder(const std::string& path);   // defined with the sequence 
 
 static void pollFileDialog() {           // called once per frame from the main loop
     if (app.openDlg && app.openDlg->ready(0)) {
-        for (const std::string& p : app.openDlg->result()) openPath(p);
+        openDialogSelection(app.openDlg->result());
         app.openDlg.reset();
     }
     if (app.saveDlg && app.saveDlg->ready(0)) {
-        std::string p = app.saveDlg->result();
-        if (!p.empty()) {
-            if (p.find('.') == std::string::npos) p += ".vsession";   // saveSession's rule, so
-            if (saveSession(p)) noteRecentSession(p);                // Recent names the real file
-        }
+        saveSessionDialogResult(app.saveDlg->result());
         app.saveDlg.reset();
     }
     if (app.csvDlg && app.csvDlg->ready(0)) {

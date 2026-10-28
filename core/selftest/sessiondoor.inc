@@ -52,11 +52,18 @@
             check(v.size() == 2 && v[0] == scratch + "/a/one.vsession" &&
                   v[1] == scratch + "/a/two.vsession",
                   "D1 a file opened again moves to the front, one row");
+#if defined(_WIN32)
+            // Windows only: on POSIX a backslash is part of a name, so a path
+            // spelled with one IS another file and must stay another row.
             std::string back = scratch + "/a/two.vsession";
             std::replace(back.begin(), back.end(), '/', '\\');
             sessionRecentPush(v, back);
             check(v.size() == 2 && v[0] == back,
                   "D1 another spelling of the same file is the same row");
+#else
+            sessionRecentPush(v, scratch + "/a/t\\wo.vsession");
+            check(v.size() == 3, "D1 a backslash in a POSIX name is another file");
+#endif
             v.clear();
             for (int i = 0; i < 11; i++)
                 sessionRecentPush(v, scratch + "/a/s" + std::to_string(i) + ".vsession");
@@ -187,8 +194,8 @@
             drain();
             check(app.images.size() == 1 && key(app.images[0]->src->path) == key(head),
                   "D6 the session was loaded and replaced what was open");
-            check(app.toast.find("session restored: door.vsession") != std::string::npos &&
-                  app.toast.find("replaced 2 open image(s)") != std::string::npos,
+            check(app.toast.find("session restored: door.vsession - replaced 2 images") !=
+                      std::string::npos,
                   "D6 the toast says what it replaced");
             check(app.sessionRecents.size() == 1 && key(app.sessionRecents[0]) == key(sp),
                   "D6 the opened session is the first Recent row");
@@ -210,7 +217,132 @@
             check(app.sessionRecents.size() == 1 && key(app.sessionRecents[0]) == key(sp),
                   "D6 opening the autosave does not enter Recent");
             std::filesystem::remove(pathFromUtf8(ap), ec);
+
+            // What was replaced, in the layer canon's words: a stack is ONE
+            // stack with its frame count, never "N images".
             closeAll();
+            check(openContentsPhrase().empty(), "D6 nothing open is said as nothing");
+            check(loadNpy(head).empty(), "D6 a stack head opens");
+            std::string pat;
+            std::vector<std::string> sib = findSequenceSiblings(head, pat);
+            startSequenceLoad(app.current, sib, pat);
+            drain();
+            const std::string stackWords =
+                "1 stack (" + std::to_string(sib.size()) + " frames)";
+            check(sib.size() >= 3 && openContentsPhrase() == stackWords,
+                  "D6 a whole stack is one stack with its frames");
+            check(loadNpy(g_sessionDoorSelftest + "/02/frame_000.npy").empty() &&
+                  openContentsPhrase() == stackWords + " and 1 image",
+                  "D6 ...and a lone frame beside it is one image");
+            openPath(sp);
+            drain();
+            check(app.toast.find("replaced " + stackWords + " and 1 image") != std::string::npos,
+                  "D6 the toast names the stack, not its frames as images");
+            closeAll();
+        }
+
+        // ---- D7: "(missing)" is probed once per opening, off the frame -------
+        {
+            const std::string here = scratch + "/a/door.vsession";      // D6 wrote it
+            const std::string gone = scratch + "/gone/x.vsession";
+            app.sessionRecents = { here, gone };
+            const int l0 = g_recentProbeLaunches;
+            g_recentProbeLastFrame = -2;
+            for (int f = 1000; f < 1010; f++) recentSessionsMenuFrame(f);   // ten frames open
+            check(g_recentProbeLaunches == l0 + 1, "D7 ten frames of one opening probe once");
+            double t0 = nowSec();
+            while (nowSec() - t0 < 10.0 && recentSessionState(0) < 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            check(recentSessionState(0) == 1 && recentSessionState(1) == 0,
+                  "D7 the probe finds one there and one missing");
+            app.sessionRecents.insert(app.sessionRecents.begin(), scratch + "/b/new.vsession");
+            check(recentSessionState(0) == -1,
+                  "D7 a row the probe never saw is not known (drawn present)");
+            recentSessionsMenuFrame(1010);                     // still the same opening
+            check(g_recentProbeLaunches == l0 + 1, "D7 ...and does not re-probe mid-opening");
+            recentSessionsMenuFrame(1020);                     // closed, then opened again
+            check(g_recentProbeLaunches == l0 + 2, "D7 the next opening probes again");
+            t0 = nowSec();
+            while (nowSec() - t0 < 10.0 && recentSessionState(1) < 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            g_recentProbeLastFrame = -2;
+            app.sessionRecents.clear();
+        }
+
+        // ---- D8: a LOSSY load keeps its own sentence on screen --------------
+        {
+            auto drain = [&]() {
+                double t0 = nowSec();
+                while (nowSec() - t0 < 60.0) {
+                    pumpSequenceAndQueue();
+                    if (!app.seqRunning && app.seqQueue.empty() && !seqReadyPending() &&
+                        app.seqRestore.empty() && app.restoreWait.empty()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            const std::string copy = scratch + "/b/lossy.npy";
+            const std::string lsp = scratch + "/b/lossy.vsession";
+            std::filesystem::copy_file(pathFromUtf8(head), pathFromUtf8(copy),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            closeAll();
+            check(loadNpy(copy).empty() && saveSession(lsp, true),
+                  "D8 a session naming a file that will be gone is written");
+            closeAll();
+            check(loadNpy(other).empty(), "D8 something is open before it");
+            std::filesystem::remove(pathFromUtf8(copy), ec);
+            const size_t logBefore = app.msgLog.size();
+            openPath(lsp);
+            drain();
+            check(app.toast.find("not restored as saved") != std::string::npos && app.toastErr,
+                  "D8 the loss sentence is what stays on screen");
+            bool logged = false;
+            for (size_t i = logBefore; i < app.msgLog.size(); i++)
+                if (app.msgLog[i].text.find("session restored: lossy.vsession - replaced 1 image") !=
+                    std::string::npos)
+                    logged = true;
+            check(logged, "D8 ...and the restored sentence went to Messages");
+            closeAll();
+            app.sessionRecents.clear();
+        }
+
+        // ---- D9: the Save Session dialog's answer -> Recent ------------------
+        {
+            closeAll();
+            check(loadNpy(head).empty(), "D9 a frame to save is open");
+            saveSessionDialogResult(scratch + "/b/named");          // typed without .vsession
+            const std::string written = scratch + "/b/named.vsession";
+            check(recentSessionExists(written), "D9 the dialog's name gains .vsession on disk");
+            check(app.sessionRecents.size() == 1 && key(app.sessionRecents[0]) == key(written),
+                  "D9 ...and Recent names that same file");
+            saveSessionDialogResult("");                            // the dialog was cancelled
+            check(app.sessionRecents.size() == 1, "D9 a cancelled dialog adds nothing");
+            closeAll();
+            app.sessionRecents.clear();
+        }
+
+        // ---- D10: an open selection holding a session and images -----------
+        {
+            auto has = [&](const std::string& p) {
+                for (const auto& d : app.images) if (key(d->src->path) == key(p)) return true;
+                return false;
+            };
+            const std::string sp = scratch + "/a/door.vsession";    // holds `head`
+            for (int order = 0; order < 2; order++) {
+                closeAll();
+                std::vector<std::string> pick = order == 0
+                    ? std::vector<std::string>{ other, sp } : std::vector<std::string>{ sp, other };
+                openDialogSelection(pick);
+                check(app.images.size() == 2 && has(head) && has(other),
+                      order == 0 ? "D10 image then session: the session, the image on top"
+                                 : "D10 session then image: the same result");
+            }
+            const size_t before = app.images.size();
+            openDialogSelection({ sp, scratch + "/b/named.vsession" });
+            check(app.images.size() == before &&
+                  app.toast.find("2 sessions selected") != std::string::npos,
+                  "D10 two sessions at once: neither opens, the toast says why");
+            closeAll();
+            app.sessionRecents.clear();
         }
 
         // ---- put the shared state back -----------------------------------
