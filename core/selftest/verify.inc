@@ -1597,16 +1597,17 @@
             }
             // (c) the matching 1-D member becomes the axis, EXACTLY
             App::SeqInfo* v21si = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
-            bool axOk = v21si && v21si->axisVals.size() == 4 &&
-                        v21si->axisVals[3] == 12345.678901234567 &&
-                        v21si->axisName == "exposure_ms" && v21si->axisUnit == "ms";
+            const App::NamedAxis* v21a = v21si && !v21si->axes.empty() ? &v21si->axes.front()
+                                                                        : nullptr;
+            bool axOk = v21a && v21a->vals.size() == 4 &&
+                        v21a->vals[3] == 12345.678901234567 &&
+                        v21a->name == "exposure_ms" && v21a->unit == "ms";
             fprintf(stderr, "verifyselftest: V21 axis: %d value(s) '%s' [%s], last=%s\n",
-                    v21si ? (int)v21si->axisVals.size() : -1,
-                    v21si ? v21si->axisName.c_str() : "-",
-                    v21si ? v21si->axisUnit.c_str() : "-",
-                    v21si && !v21si->axisVals.empty() ? fmtExact(v21si->axisVals.back()).c_str()
-                                                      : "-");
-            check(axOk, "V21 the matching 1-D member lands in axisVals exactly");
+                    v21a ? (int)v21a->vals.size() : -1,
+                    v21a ? v21a->name.c_str() : "-",
+                    v21a ? v21a->unit.c_str() : "-",
+                    v21a && !v21a->vals.empty() ? fmtExact(v21a->vals.back()).c_str() : "-");
+            check(axOk, "V21 the matching 1-D member lands in the stack's axes exactly");
             // (d) counts BOTH directions, by name, never silent
             std::string v21msg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
             bool said = v21msg.find("exposure_ms") != std::string::npos &&
@@ -1623,9 +1624,9 @@
             bool member = false;
             for (const auto& d : app.images) if (d->src->member == "data") member = true;
             App::SeqInfo* v21r = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
-            bool raxOk = v21r && v21r->axisVals.size() == 4 &&
-                         v21r->axisVals[3] == 12345.678901234567 &&
-                         v21r->axisName == "exposure_ms" && v21r->axisUnit == "ms";
+            const App::NamedAxis* v21ra = v21r ? v21r->axis("exposure_ms") : nullptr;
+            bool raxOk = v21ra && v21r->axes.size() == 1 && v21ra->vals.size() == 4 &&
+                         v21ra->vals[3] == 12345.678901234567 && v21ra->unit == "ms";
             fprintf(stderr, "verifyselftest: V21 after restore: %zu image(s), member=%d, "
                             "axis=%d%s\n", app.images.size(), (int)member, (int)raxOk,
                     v21lerr.empty() ? "" : (" load err: " + v21lerr).c_str());
@@ -1696,9 +1697,9 @@
             npzPickAccept();
             App::SeqInfo* spSi = app.seqs.empty() ? nullptr : seqInfo(app.seqs.front().id);
             std::string spMsg = app.msgLog.empty() ? std::string() : app.msgLog.back().text;
-            fprintf(stderr, "verifyselftest: V21d blank unit: axisVals=%d \"%s\"\n",
-                    spSi ? (int)spSi->axisVals.size() : -1, spMsg.c_str());
-            check(spSi && spSi->axisVals.empty(),
+            fprintf(stderr, "verifyselftest: V21d blank unit: axes=%d \"%s\"\n",
+                    spSi ? (int)spSi->axes.size() : -1, spMsg.c_str());
+            check(spSi && spSi->axes.empty(),
                   "V21d a whitespace unit is refused from the npz path too");
             // ...and the pasted path still refuses it, so the two agree
             {
@@ -2243,7 +2244,7 @@
                         s.members.size() < 2 ? -1 : s.members[1].value);
             }
             for (const auto& sq : app.seqs)
-                if (sq.axisName == "exposure") condOffStacks = false;
+                if (sq.axis("exposure")) condOffStacks = false;
             check(condOk, "V25b the conditions land on the series, with name and unit");
             check(condOffStacks, "V25b the conditions are NOT copied onto the stacks");
 
@@ -2251,9 +2252,9 @@
             // the paste path and the .npz picker write, or the panels see nothing
             bool tsOk = false;
             for (const auto& sq : app.seqs)
-                if (sq.axisVals.size() == 3 && sq.axisName == "time" && sq.axisUnit == "s" &&
-                    sq.axisVals[1] == 0.5)
-                    tsOk = true;
+                if (const App::NamedAxis* t = sq.axis("time"))
+                    if (t->vals.size() == 3 && t->unit == "s" && t->vals[1] == 0.5)
+                        tsOk = true;
             check(tsOk, "V25c timestamps land on the stack as its frame axis");
 
             bool cfaOk = false, noteOk = false;
@@ -2319,6 +2320,52 @@
                 fprintf(stderr, "verifyselftest: V25g broken: err=\"%s\"\n", berr.c_str());
                 check(!berr.empty() && berr.find("__layer_2") != std::string::npos,
                       "V25g a malformed container names the member that is wrong");
+            }
+
+            // V25z (#314): a STACK's per-frame conditions are further named
+            // axes of that stack, after its timestamps - one per condition
+            // that has a value for every frame. The series' own condition
+            // still never lands on a stack (V25b), and a condition that does
+            // not cover every frame is said on the frames, not applied.
+            {
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> km = cm;
+                km.push_back({ "__conditions_values_1",   f64Npy({ 25.0, 30.5, 41.25 }) });
+                km.push_back({ "__conditions_name_1",     strNpy("temperature") });
+                km.push_back({ "__conditions_unit_1",     strNpy("C") });
+                km.push_back({ "__conditions_values_1_1", f64Npy({ 0.0, 6.0, 12.0 }) });
+                km.push_back({ "__conditions_name_1_1",   strNpy("gain") });
+                km.push_back({ "__conditions_unit_1_1",   strNpy("dB") });
+                km.push_back({ "__conditions_values_1_2", f64Npy({ 1.0, 2.0 }) });
+                km.push_back({ "__conditions_name_1_2",   strNpy("short") });
+                km.push_back({ "__conditions_unit_1_2",   strNpy("x") });
+                std::string kpath = (adir / "stackconds.npz").u8string();
+                writeNpz2(kpath, km);
+                closeAll();
+                std::string kerr = loadNpz(kpath);
+                const App::SeqInfo* e1 = nullptr;
+                for (const auto& sq : app.seqs) if (sq.axis("time")) e1 = &sq;
+                std::string names;
+                if (e1) for (const auto& a : e1->axes) names += a.name + "[" + a.unit + "] ";
+                bool said = false;
+                for (const auto& d : app.images)
+                    if (d->note.find("condition \"short\" does not cover every frame") !=
+                        std::string::npos) said = true;
+                fprintf(stderr, "verifyselftest: V25z stack conditions: err=\"%s\" axes=%d "
+                                "%s said=%d\n", kerr.c_str(), e1 ? (int)e1->axes.size() : -1,
+                        names.c_str(), said ? 1 : 0);
+                const App::NamedAxis* te = e1 ? e1->axis("temperature") : nullptr;
+                const App::NamedAxis* ga = e1 ? e1->axis("gain") : nullptr;
+                check(kerr.empty() && e1 && e1->axes.size() == 3 &&
+                      e1->axes[0].name == "time" && e1->axes[1].name == "temperature" &&
+                      e1->axes[2].name == "gain",
+                      "V25z timestamps + two per-frame conditions = three named axes, in order");
+                check(te && te->unit == "C" && te->vals.size() == 3 && te->vals[2] == 41.25 &&
+                      ga && ga->unit == "dB" && ga->vals[1] == 6.0,
+                      "V25z ...each with its own name, unit and values, exactly");
+                bool seriesOff = true;
+                for (const auto& sq : app.seqs) if (sq.axis("exposure")) seriesOff = false;
+                check(seriesOff && said,
+                      "V25z the series' condition stays off the stacks; a short one is said, not applied");
             }
 
             // ---- V25h/V25i: the harness, and the cache around it -------------

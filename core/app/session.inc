@@ -130,6 +130,13 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
     f << "seriespanel " << app.lin.tablePlane << " " << (app.lin.snrDb ? 1 : 0) << " "
       << app.lin.fitMethod << " " << app.lin.winMode << " "
       << app.lin.winLo << " " << app.lin.winHi << "\n";
+    // The Temporal panel's charts (#314), one line each, top to bottom: what
+    // its x is - "default", "frame", or "axis <name>" (the name last: spaces).
+    // Zoom is not saved: it is keyed to a document of this run.
+    for (const App::TemporalChart& c : app.tcharts) {
+        if (c.xKind == App::TemporalChart::XNamed) f << "tchart axis " << c.xName << "\n";
+        else f << "tchart " << (c.xKind == App::TemporalChart::XFrame ? "frame" : "default") << "\n";
+    }
     // "npyaxis" used to sit here: one global reading for a whole session
     // (§3.4). Its successor is the per-image "npyread" line below, so nothing
     // global is written any more. An OLD session's npyaxis is skipped like any
@@ -326,15 +333,20 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
             // name may be user-given ("25C dark") - it must survive the session.
             if (const App::SeqInfo* sqi = seqInfo(d->seqId)) {
                 if (!sqi->name.empty()) f << "seqname " << sqi->name << "\n";
-                // the per-frame x axis, additive keys an older viewer skips.
+                // the per-frame x axes, additive keys an older viewer skips.
                 // Values first and EXACTLY (fmtExact): this is an axis data is
                 // plotted against. Name and unit last on their lines: spaces.
-                if (!sqi->axisVals.empty()) {
+                // One vals/unit/name triple PER AXIS, in the stack's order
+                // (#314): the name line closes the triple, so a file with one
+                // axis is byte-for-byte what a one-axis viewer wrote, and that
+                // viewer reading a many-axis file keeps the last triple.
+                for (const App::NamedAxis& ax : sqi->axes) {
+                    if (ax.vals.empty()) continue;
                     f << "seqaxisvals";
-                    for (double v : sqi->axisVals) f << " " << fmtExact(v);
+                    for (double v : ax.vals) f << " " << fmtExact(v);
                     f << "\n";
-                    f << "seqaxisunit " << sqi->axisUnit << "\n";
-                    f << "seqaxisname " << sqi->axisName << "\n";
+                    f << "seqaxisunit " << ax.unit << "\n";
+                    f << "seqaxisname " << ax.name << "\n";
                 }
             }
         } else {
@@ -3289,6 +3301,15 @@ static std::string loadSession(const std::string& path,
     app.anns.clear();
     app.selectedAnn = 0;
     app.annRev++;
+    // a session without tchart lines (every file before #314) is ONE chart on
+    // the default axis - what such a session always showed
+    app.tcharts.assign(1, App::TemporalChart{});
+    bool tchartsFromFile = false;
+    // the seqaxis triple being read (#314): vals and unit wait here until the
+    // name line closes the axis, which then lands on the stack (or its queued
+    // restore) by NAME - replacing one of that name, adding otherwise
+    App::NamedAxis pendAxis;
+    bool pendAxisOk = false;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
     // The member list a `stackmember` block is accumulating for the NEXT
     // `seqload` line (docs/reference-design.md §5.2, board row 267). Read
@@ -3536,6 +3557,21 @@ static std::string loadSession(const std::string& path,
             if (std::isfinite(lo)) app.lin.winLo = lo;
             if (std::isfinite(hi)) app.lin.winHi = hi;
         }
+        else if (key == "tchart") {        // one Temporal chart (#314)
+            std::string kind;
+            ls >> kind;
+            App::TemporalChart c;
+            if (kind == "frame") c.xKind = App::TemporalChart::XFrame;
+            else if (kind == "axis") {
+                c.xKind = App::TemporalChart::XNamed;
+                c.xName = restOfLine(ls);
+            } else if (kind != "default") {
+                rep.note(LK_LineRejected, "tchart");
+                continue;
+            }
+            if (!tchartsFromFile) { app.tcharts.clear(); tchartsFromFile = true; }
+            if ((int)app.tcharts.size() < App::TemporalChart::kMax) app.tcharts.push_back(c);
+        }
         // "npyaxis" is deliberately NOT parsed any more (§3.4): the flag it
         // restored no longer exists, and an old session's value falls through
         // the chain like any unknown key rather than being half-honoured.
@@ -3677,18 +3713,27 @@ static std::string loadSession(const std::string& path,
                     if (!end || *end != '\0' || !std::isfinite(v)) { bad = true; break; }
                     vals.push_back(v);
                 }
-                if (bad || vals.empty()) {
+                pendAxis = App::NamedAxis{};
+                pendAxisOk = !bad && !vals.empty();
+                if (!pendAxisOk) {
                     fprintf(stderr, "session: seqaxisvals unreadable - x axis dropped\n");
                     rep.note(LK_LineRejected, "seqaxisvals");
-                    if (si2) si2->axisVals.clear(); else sr->axisVals.clear();
-                } else if (si2) si2->axisVals = std::move(vals);
-                else sr->axisVals = std::move(vals);
+                } else pendAxis.vals = std::move(vals);
             } else if (key == "seqaxisunit") {
-                std::string u = restOfLine(ls);
-                if (si2) si2->axisUnit = u; else sr->axisUnit = u;
+                pendAxis.unit = restOfLine(ls);
             } else {
-                std::string n = restOfLine(ls);
-                if (si2) si2->axisName = n; else sr->axisName = n;
+                pendAxis.name = restOfLine(ls);
+                if (pendAxisOk) {
+                    if (si2) si2->putAxis(std::move(pendAxis));
+                    else {
+                        bool put = false;
+                        for (App::NamedAxis& a : sr->axes)
+                            if (a.name == pendAxis.name) { a = pendAxis; put = true; }
+                        if (!put) sr->axes.push_back(pendAxis);
+                    }
+                }
+                pendAxis = App::NamedAxis{};
+                pendAxisOk = false;
             }
         }
         // MIGRATION of the old per-stack level. saveSession has never written
@@ -3960,7 +4005,7 @@ static std::string loadSession(const std::string& path,
                     // stack) carries the display name onto the queued entry the
                     // way it already does for a rescan.
                     app.seqRestore.push_back({ cur()->uid, std::move(explicitFiles),
-                                               std::string(), {}, {}, {}, {}, true });
+                                               std::string(), {}, {}, true });
                 } else if (isRemote) {
                     // A folder stack whose frames live on a peer. Its siblings
                     // are a LISTING, and findSequenceSiblings below walks THIS
@@ -3991,7 +4036,7 @@ static std::string loadSession(const std::string& path,
                     // queued, not started: see App::seqRestore
                     if (files.size() >= 2)
                         app.seqRestore.push_back({ cur()->uid, std::move(files), pat,
-                                                   {}, {}, {}, {} });
+                                                   {}, {} });
                     else
                         // the same silence, on this disk: the folder is gone or
                         // has lost its numbering, and the stack the file asked

@@ -883,6 +883,13 @@ struct VnzNode {
     std::vector<int64_t> rangeShape;
     std::string condName, condUnit, tsName, tsUnit;
     bool hasCond = false, hasTs = false;
+    // A STACK's further per-frame conditions (#314): condVals above is the
+    // first one (__conditions_values_<i> on a stack node), and these are
+    // __conditions_values_<i>_<k> for k = 1, 2, ... in order, each with its
+    // own _name_ / _unit_ keys of the same suffix (.npz carrier only). A
+    // series keeps only condVals (one value per member).
+    struct Cond { std::string name, unit; std::vector<double> vals; };
+    std::vector<Cond> conds;
     // filled while building
     int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
 };
@@ -1641,6 +1648,19 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
             if (f == 0) { nd2.tsVals = std::move(vals); nd2.tsName = nm; nd2.tsUnit = un; nd2.hasTs = true; }
             else        { nd2.condVals = std::move(vals); nd2.condName = nm; nd2.condUnit = un; nd2.hasCond = true; }
         }
+        if (nd2.layer == "stack") {
+            for (int k = 1; k < 1000; k++) {
+                std::string sfx = si + "_" + std::to_string(k);
+                std::string base = "__conditions_values_" + sfx;
+                if (!byName.count(base)) break;
+                std::vector<double> vals; std::vector<int64_t> shp;
+                if (!vnzVec(mem, byName, base, vals, shp, err)) return err;
+                if (shp.size() != 1) return base + " is not a 1-D vector: one value per frame";
+                nd2.conds.push_back({ vnzStr(mem, byName, "__conditions_name_" + sfx),
+                                      vnzStr(mem, byName, "__conditions_unit_" + sfx),
+                                      std::move(vals) });
+            }
+        }
     }
     // Structure, before anything is opened: a tree that cannot hold is refused
     // whole rather than half-built into the session.
@@ -1829,7 +1849,7 @@ static void aSetBindStackByHead(App::ASetRole& r, const std::string& headPath,
     std::string pat;
     std::vector<std::string> sibs = findSequenceSiblings(headPath, pat);
     if (sibs.size() >= 2) {
-        app.seqRestore.push_back({ head->uid, std::move(sibs), pat, {}, {}, {}, {} });
+        app.seqRestore.push_back({ head->uid, std::move(sibs), pat, {}, {} });
         App::ASetBind b;
         b.setId = setId;
         b.roleIdx = roleIdx;
@@ -2278,10 +2298,35 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                     // applied as a label; the values are here and the x-axis
                     // popup is already seeded from them, so typing the unit
                     // finishes the job instead of retyping the measurements.
-                    si->axisName = v.tsName.empty() ? "time" : v.tsName;
-                    si->axisUnit = v.tsUnit;
-                    si->axisVals = v.tsVals;
+                    si->putAxis({ v.tsName.empty() ? "time" : v.tsName, v.tsUnit, v.tsVals });
                 }
+            }
+        }
+        // per-frame conditions ON A STACK (#314): what the operator set per
+        // FRAME of this stack - the stack's further named axes, after the
+        // timestamps. Not the SERIES' conditions (one value per member, §4.5),
+        // which stay on the series and never become a frame axis (V25b). Only
+        // a condition with exactly one value per frame is an axis, and a
+        // condition has to be named (§4.3.2: what was swept is not something
+        // the viewer can guess); anything else is said on the frames and not
+        // applied. The unit may be empty for the timestamps' reason.
+        if (v.layer == "stack" && v.seqId && (v.hasCond || !v.conds.empty())) {
+            App::SeqInfo* si = seqInfo(v.seqId);
+            std::vector<VnzNode::Cond> all;
+            if (v.hasCond) all.push_back({ v.condName, v.condUnit, v.condVals });
+            all.insert(all.end(), v.conds.begin(), v.conds.end());
+            for (const VnzNode::Cond& c : all) {
+                if (!si) break;
+                const char* why = c.name.empty() ? "has no name"
+                                : (int)c.vals.size() != v.docCount
+                                    ? "does not cover every frame" : nullptr;
+                if (why) {
+                    for (int k = 0; k < v.docCount; k++)
+                        app.images[(size_t)v.docFirst + (size_t)k]->note +=
+                            ", condition \"" + c.name + "\" " + why + " - not applied";
+                    continue;
+                }
+                si->putAxis({ c.name, c.unit, c.vals });
             }
         }
         // join the parent series, in declaration order
