@@ -356,7 +356,8 @@ Uniformity / Flat field、Statistics / Sanity)。知らないカテゴリは自�
 テーマ、compact、dragpans、wheelzoom、fitonswitch、seqload、showfps、
 lowbandwidth、membudget、procpolicy、linunit、gamma、grid、frame、
 Browse の表示形 (`rbflat`/`rbtree`/`rbnatural`)、`remoteexe`、`remoteurl`、
-そして繰り返しの `rbookmark` / `rbrecent` (履歴は10件まで)。
+そして繰り返しの `rbookmark` / `rbrecent` (履歴は10件まで) / `sessionrecent`
+(File > Recent Sessions、8件まで、autosave は入れない)。
 パスを含む値は行の残り全部を値として読みます。
 
 **`--secondary` のウィンドウは prefs を読みますが書きません。** 1つのファイルに
@@ -411,6 +412,7 @@ autosave」を選びます。
 | `--picker-selftest <dir>` | picker の5ユースケース (merge、フィルタ、トップフォルダ毎の batch、単一フレーム) |
 | `--close-selftest <dir>` | Ctrl+W の層ごとの意味。取得中に閉じた stack が先読みキューから蘇らないこと |
 | `--batch-selftest <dir>` | batch 移動が stack を丸ごと動かし、Files の並びを乱さず、空 batch を刈り、名前が往復すること |
+| `--sessiondoor-selftest <dir>` | File > Recent Sessions(追加・重複除去・上限 8・`(missing)`・Clear・prefs の往復)、Open... / Open Session... のダイアログのフィルタ順と開始フォルダ、`.vsession` を `openPath` に渡すと読み込んで開いていた画像を置き換え Recent に入ること(autosave は入らない)(#307) |
 | `--scan-selftest <dir>` | リモート Open Folder を実経路 (local peer → rb worker → LIST → グループ化 → picker) で |
 | `--browse-selftest <dir>` | Browse パネルの挙動: grouped↔flat が1つの返信上の純粋なビューであること、ツリーの遅延展開、キャンセル世代、壊れた `.npy` も一覧に出ること |
 | `--browse-keys-selftest <dir>` | キー配送とプレビュー。パネルに focus がある間は主ビューのハンドラが引くこと、ダブルクリックがちょうど1回開くこと |

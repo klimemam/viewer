@@ -48,6 +48,7 @@ static bool g_folderScanSelftest = false; // --folderscan-selftest: the LOCAL sc
 static std::string g_pickerSelftest;    // --picker-selftest <dir>: filter cut + merge, print, exit
 static std::string g_closeSelftest;     // --close-selftest <dir>: close per stack, print, exit
 static std::string g_batchSelftest;     // --batch-selftest <dir>: move-to-batch + session, exit
+static std::string g_sessionDoorSelftest; // --sessiondoor-selftest <dir>: Open Session / Recent (#307)
 static std::string g_rtemporalSelftest; // --rtemporal-selftest <dir>: browser temporal, exit
 static std::string g_localbrowseSelftest; // --localbrowse-selftest <dir>: Browse (local), exit
 static std::string g_fmtgateSelftest;   // --fmtgate-selftest <dir>: which listing asks
@@ -727,6 +728,7 @@ static void printUsage() {
         "                              a scripted default still opens synchronously\n"
         "  --close-selftest <dir>      closing, per stack\n"
         "  --batch-selftest <dir>      move-to-batch + session round trip\n"
+        "  --sessiondoor-selftest <dir> Open Session..., Recent Sessions, Open...'s filters\n"
         "  --verify-selftest <dir>     the corners the others miss (V1-V18)\n"
         "  --aset-selftest <dir>       AnalysisSet: transport, Ref binding, session\n"
         "  --roistats-selftest         the ROI table's numbers and its std/mean column,\n"
@@ -990,6 +992,8 @@ static void parseCli(int argc, char** argv) {
             g_closeSelftest = next();              // handled in main()
         } else if (a == "--batch-selftest") {
             g_batchSelftest = next();              // handled in main()
+        } else if (a == "--sessiondoor-selftest") {
+            g_sessionDoorSelftest = next();        // handled in main()
         } else if (a == "--rtemporal-selftest") {
             g_rtemporalSelftest = next();          // handled in main()
         } else if (a == "--localbrowse-selftest") {

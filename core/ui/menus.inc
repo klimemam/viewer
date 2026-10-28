@@ -216,6 +216,28 @@ static void drawMenuBar(GLFWwindow* win) {
             rbEnqueue(I, std::move(j));
         }
         if (ImGui::MenuItem("Save Session...", SC_MOD "+S", false, !app.images.empty())) saveSessionDialog();
+        // #307: the way back in, beside the way out. No shortcut: the obvious
+        // chord, Ctrl+Shift+O, is Open Folder's, and the menu must not show two
+        // items claiming one chord.
+        if (ImGui::MenuItem("Open Session...")) openSessionDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("load a saved .vsession. It REPLACES what is open:\n"
+                              "every open image is closed first, without asking.");
+        if (ImGui::BeginMenu("Recent Sessions", !app.sessionRecents.empty())) {
+            std::string pick;          // opened after the loop: opening rewrites the list
+            for (size_t i = 0; i < app.sessionRecents.size(); i++) {
+                const std::string& p = app.sessionRecents[i];
+                const bool there = recentSessionExists(p);
+                const std::string label = recentSessionLabel(p, there) + "##rs" + std::to_string(i);
+                if (ImGui::MenuItem(label.c_str(), nullptr, false, there)) pick = p;
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", p.c_str());
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear")) clearRecentSessions();
+            ImGui::EndMenu();
+            if (!pick.empty()) openPath(pick);
+        }
         {   // recovery: the autosave is written on exit, on crash and every 60 s.
             // With instance slots there can be several: scan them ALL, offer
             // the newest one no LIVE window owns, and say which one it is -

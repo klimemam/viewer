@@ -2171,6 +2171,11 @@ struct App {
     // one session.
     std::vector<std::string> rbBookmarks;
     std::vector<std::string> rbRecents;
+    // File > Recent Sessions (#307): the named .vsession files saved or opened,
+    // most recent first, capped at SESSION_RECENT_MAX (core/app/session.inc).
+    // History like rbRecents - prefs.txt carries it, the app writes it - and
+    // never the autosave, which File > Restore last session already opens.
+    std::vector<std::string> sessionRecents;
     using RemoteSearch = browse::RemoteSearch;
     // ==== ONE Browse instance: a view onto ONE place - browse::Instance =====
     // (The struct and its decision record live in browse_state.h now.)
