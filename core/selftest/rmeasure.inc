@@ -527,7 +527,7 @@
             selectStack(seqCur);                       // A <- X, the slot still Y's
             const uint64_t tAb = S2.token;
             const bool armed = abStatsB() != nullptr && S2.seqId == seqOther;
-            ensureAbServerTemporal(cur());             // what the compare branch calls
+            ensureAbServerTemporal(cur(), abStatsB());   // what the compare branch calls
             settle(120.0);
             const App::TemporalState& T4 = localTemporal();
             const AbTemporal A4 = abTemporalOf(cur(), T4, app.srvTemporal);

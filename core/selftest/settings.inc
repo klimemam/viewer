@@ -101,6 +101,8 @@ static int settingsSelftest() {
         // previous group. That is not a hypothetical - it is what this line was
         // added for, on the first run after the key existed.
         app.folderClick = 0;
+        // #320, for folderClick's reason: group S feeds it "side-by-side"
+        app.temporalLayout = App::TlOverlay;
         app.seqLoadMode = 0;
         app.remoteExe.clear();
         app.procPolicy = App::PolAuto;
@@ -1401,10 +1403,13 @@ static int settingsSelftest() {
         // baked from, the way out when this machine's font is somewhere the
         // built-in search does not look. A 31st readable row over 37, with the
         // 4 "later" and 2 "not here" untouched again.
-        check(readable == 31, "W1 ...and 31 of them are editable today");
+        // #320 adds compare.temporalLayout - Temporal's own A/B layout, overlay
+        // by default - and opens the `compare` section: a 32nd readable row
+        // over 38, the 4 "later" and 2 "not here" untouched.
+        check(readable == 32, "W1 ...and 32 of them are editable today");
         check(later == 4 && notHere == 2,
-              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 37");
-        check(rows.size() == 37, "W1 ...over 37 rows, which is the whole table");
+              "W1 ...with 4 'later' and 2 'not here', which is the rest of the 38");
+        check(rows.size() == 38, "W1 ...over 38 rows, which is the whole table");
         // EVERY readable row has a control. This is S1's shape one level up: a
         // key added to the table and forgotten in settingsWidgetFor() would
         // otherwise draw a row with nothing in it.
@@ -1798,6 +1803,57 @@ static int settingsSelftest() {
     }
 
     // ======================================================================
+    //  TL - #320: TEMPORAL'S OWN A/B LAYOUT (compare.temporalLayout)
+    //
+    //  Overlay by default (the ruling: "少なくとも既定は重ねて表示"), side by
+    //  side selectable, and a preference: the file sets it, a third word is
+    //  refused by name, and prefs.txt keeps a GUI change.
+    // ======================================================================
+    {
+        baseline();
+        loadSettingsFrom(missing);
+        const bool defOver = app.temporalLayout == App::TlOverlay &&
+                             settingsCurrentValue(SK_temporalLayout).empty();
+        const SettingsReport tr = loadSettingsFrom(writeFix(
+            "{ \"compare\": { \"temporalLayout\": \"side-by-side\" } }\n"));
+        dumpNotes(tr);
+        const bool fileSide = tr.applied == 1 && tr.rejected == 0 && tr.unknown == 0 &&
+                              app.temporalLayout == App::TlSide;
+        baseline();
+        app.temporalLayout = App::TlSide;            // a value that must SURVIVE
+        const SettingsReport tr3 = loadSettingsFrom(writeFix(
+            "{ \"compare\": { \"temporalLayout\": \"stacked\" } }\n"));
+        dumpNotes(tr3);
+        const bool refused = tr3.rejected == 1 && app.temporalLayout == App::TlSide &&
+                             anyNote(tr3, "\"overlay\"") && anyNote(tr3, "\"side-by-side\"");
+        baseline();
+        loadSettingsFrom(missing);
+        app.temporalLayout = App::TlSide;
+        prefsBaseUpdate(SK_temporalLayout);          // as a GUI change would
+        std::ostringstream tprefs;
+        writePrefsTo(tprefs);
+        int got = -1;
+        {
+            std::istringstream in(tprefs.str());
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                std::string key; ls >> key;
+                if (key == "temporallayout") ls >> got;
+            }
+        }
+        fprintf(stderr, "settingsselftest: TL default overlay+silent=%d, file side=%d, "
+                        "third word refused=%d, prefs temporallayout=%d\n",
+                defOver ? 1 : 0, fileSide ? 1 : 0, refused ? 1 : 0, got);
+        check(defOver, "TL1 Temporal's layout defaults to overlay, and writes nothing");
+        check(fileSide, "TL2 compare.temporalLayout \"side-by-side\" lands");
+        check(refused, "TL3 a third word is refused by name, changing nothing");
+        check(got == 1, "TL4 prefs.txt carries a GUI change, so it survives a restart");
+        baseline();
+        prefsBaseUpdate(SK_temporalLayout);
+    }
+
+    // ======================================================================
     //  G — phase④: THE GUI's CHANGES ARE NOTICED, NOT REPORTED
     //
     //  Three residuals of the 35-row design meet here, and they are one
@@ -2006,12 +2062,13 @@ static int settingsSelftest() {
         fprintf(stderr, "settingsselftest: W6 %d row(s) moved off the default, "
                         "%d came back%s%s\n", moved, reset,
                 stuck.empty() ? "" : "; stuck: ", stuck.c_str());
-        // 31 readable rows (板306 added appearance.fontPath), and every one of
+        // 32 readable rows (板306 added appearance.fontPath, #320
+        // compare.temporalLayout), and every one of
         // them has a sample (S1 feeds them all). `moved` is the anti-vacuity
         // number: a sample equal to the default would make that row's reset
         // meaningless, and W1's own count is what says how many rows there are
         // to move.
-        check(moved == 31 && reset == 31 && stuck.empty(),
+        check(moved == 32 && reset == 32 && stuck.empty(),
               "W6 every readable key is moved off its default by its sample, and resets back");
 
         // W7: the reset is a CHANGE, so it owes what a change owes - this machine's
@@ -2084,7 +2141,10 @@ static int settingsSelftest() {
                                     // cannot say is that the glyphs are baked
                                     // once, so the change waits for the next
                                     // start - plus what an empty value means
-                                    "appearance.fontPath" };
+                                    "appearance.fontPath",
+                                    // #320: what an enum cannot say is that
+                                    // the OTHER layout setting does not reach it
+                                    "compare.temporalLayout" };
         int found = 0;
         for (const char* w : wantNotes)
             for (const PrefRow& r : rows)

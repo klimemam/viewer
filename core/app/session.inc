@@ -1473,6 +1473,7 @@ struct PrefsBase {
     int frameMode = 1;
     bool rbFlat = false, rbTree = false, rbNatural = true;
     int folderClick = 0;                 // board row 136
+    int temporalLayout = 0;              // #320 (App::TlOverlay)
     std::string remoteExe, pythonExe;
     std::vector<std::string> readerPlaces;
     // The two keys that had no prefs.txt line at all until phase④ closed
@@ -1531,6 +1532,7 @@ static void capturePrefsBase() {
     g_prefsBase.rbTree = app.rbTree;
     g_prefsBase.rbNatural = app.rbNatural;
     g_prefsBase.folderClick = app.folderClick;
+    g_prefsBase.temporalLayout = app.temporalLayout;
     g_prefsBase.remoteExe = app.remoteExe;
     g_prefsBase.pythonExe = app.pythonExe;
     g_prefsBase.readerPlaces = app.readerPlaces;
@@ -1577,6 +1579,8 @@ static void writePrefsTo(std::ostream& f) {
     // so there is no lower layer for a live value to leak over.
     f << "histdrag " << app.histDragMode << "\n";
     f << "histzoomrange " << (app.histZoomSetsRange ? 1 : 0) << "\n";
+    // #320, written unconditionally for folderclick's reason above.
+    f << "temporallayout " << P.temporalLayout << "\n";
     // The window: logical size, raw position, then the maximized flag (see
     // fitSavedWindow). Written only once a real window has reported a geometry,
     // so a run that never samples one - every scripted run - hands back exactly
@@ -2020,6 +2024,10 @@ static void loadPrefs() {
         // else gets the default rather than a guess.
         else if (key == "histdrag")    { ls >> v; if (v == 0 || v == 1) app.histDragMode = v; }
         else if (key == "histzoomrange") { ls >> v; app.histZoomSetsRange = v != 0; }
+        // #320, validated like folderclick: 0 overlay, 1 side by side, and
+        // anything else is the default. A prefs file from before the key has no
+        // line, so an upgrading user gets overlay - the ruling's default.
+        else if (key == "temporallayout") { ls >> v; if (v == 0 || v == 1) app.temporalLayout = v; }
         // THE KEYS WHOSE VALUE IS THE REST OF THE LINE, because a path may
         // contain spaces. This list is the gate: a key missing from it never
         // reaches the chain below, however carefully that chain handles it.

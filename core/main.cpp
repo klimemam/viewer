@@ -1986,6 +1986,11 @@ static bool g_watchSuppressed = false;
         drawMenuBar(win);
         // before any panel draws: the B cache slots exist only while compare does
         abStatsFrame();
+        // B's server aggregate, once per (stack, state), whether or not the
+        // Temporal panel is open - A's is fired at the open the same way (#320).
+        // cmpB and not abStatsB: a remote B with no frame here yet is exactly
+        // the stack the server answers for.
+        ensureServerTemporalB(cmpB());
         // ...and before any panel draws, because it closes documents (§3.3)
         pumpReRead();
 
@@ -2332,9 +2337,11 @@ static bool g_watchSuppressed = false;
                         ImGui::EndCombo();
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Histogram / Projection / Temporal layout for this\n"
-                                          "comparison. Auto follows the image: split -> side by\n"
-                                          "side, wipe / blink / difference -> overlay.");
+                        ImGui::SetTooltip("Histogram / Projection layout for this comparison.\n"
+                                          "Auto follows the image: split -> side by side,\n"
+                                          "wipe / blink / difference -> overlay.\n"
+                                          "Temporal has its own (overlay by default): on the\n"
+                                          "Temporal panel's heading, or View > Compare A/B.");
                 }
             }
             if (app.showFps) {

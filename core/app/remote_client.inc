@@ -763,7 +763,7 @@ static void pumpMeasure() {
     }
     for (auto& d : batch) {
         app.mPending--;
-        // the A slot or the explicitly-measured B slot, by token
+        // the A slot or the compare B slot, by token
         App::ServerTemporal* Sp = nullptr;
         if (app.srvTemporal.token && d.token == app.srvTemporal.token) Sp = &app.srvTemporal;
         else if (app.srvTemporalB.token && d.token == app.srvTemporalB.token)

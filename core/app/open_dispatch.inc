@@ -698,12 +698,42 @@ static uint64_t g_measureToken = 1;
 // Fire the server-side temporal aggregate for a remote stack, if policy allows.
 // The result feeds the Temporal panel with a [server, N frames] tag, in seconds,
 // without waiting for any frame transfer.
-// `into` is the slot the answer lands in: app.srvTemporal for A (automatic),
-// app.srvTemporalB for the compare side (button only - see the struct).
-static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
+// The state a server aggregate is asked FOR (ServerTemporal::key*): the
+// stack's data revision, its mosaic, and the selected region as the local
+// Temporal resolves it on the stack's first resident frame. Filled into the
+// slot by the request and recomputed by ensureServerTemporalB to ask "is the
+// slot already this state's?".
+static void serverTemporalStateOf(const App::SeqInfo& si, App::ServerTemporal& K) {
+    K.keyRev = si.stackRev;
+    K.keyCfa = si.cfaType;
+    K.keyCfaPattern = si.cfaPattern;
+    K.keyRx = K.keyRy = K.keyRw = K.keyRh = 0;
+    K.keyPoi = false;
+    const std::vector<int> f = framesOfSeq(si.id);
+    if (!f.empty()) {
+        bool roi = false;
+        temporalRegionOf(app.images[(size_t)f.front()].get(), K.keyRx, K.keyRy,
+                         K.keyRw, K.keyRh, roi, K.keyPoi);
+        // no ROI = the whole frame, spelled 0x0 whether or not a frame is here
+        // yet: a remote B whose first frame lands is not a new state
+        if (!roi) K.keyRx = K.keyRy = K.keyRw = K.keyRh = 0;
+    }
+}
+static bool serverTemporalSameState(const App::ServerTemporal& a,
+                                    const App::ServerTemporal& b) {
+    return a.keyRev == b.keyRev && a.keyCfa == b.keyCfa &&
+           a.keyCfaPattern == b.keyCfaPattern && a.keyRx == b.keyRx &&
+           a.keyRy == b.keyRy && a.keyRw == b.keyRw && a.keyRh == b.keyRh &&
+           a.keyPoi == b.keyPoi;
+}
+
+// The slot half of a request: reset it, stamp the stack and its state, mark it
+// pending. Returns the stack when the request is to go out, null when this
+// stack is not measured on the server (and then the slot is untouched).
+static App::SeqInfo* serverTemporalArm(int seqId, App::ServerTemporal& S) {
     App::SeqInfo* si = nullptr;
     for (auto& s : app.seqs) if (s.id == seqId) { si = &s; break; }
-    if (!si || !serverComputes(*si)) return;
+    if (!si || !serverComputes(*si)) return nullptr;
     S = App::ServerTemporal{};
     S.seqId = seqId;
     S.token = g_measureToken++;
@@ -713,6 +743,16 @@ static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
     // local side's ROI state.
     S.rx = S.ry = S.rw = S.rh = 0;
     S.roiUsed = false;
+    serverTemporalStateOf(*si, S);
+    return si;
+}
+
+// `into` is the slot the answer lands in: app.srvTemporal for A,
+// app.srvTemporalB for the compare side. Both are automatic since #320; B's
+// once-per-state rule lives in ensureServerTemporalB.
+static void requestServerTemporal(int seqId, App::ServerTemporal& S) {
+    App::SeqInfo* si = serverTemporalArm(seqId, S);
+    if (!si) return;
     App::MJob j;
     j.token = S.token;
     j.op = rp::MOP_TEMPORAL_STATS;
@@ -781,6 +821,38 @@ static void maybeRequestServerTemporal(int seqId) {
 static void ensureServerTemporalFor(int seqId) {
     if (app.srvTemporal.seqId == seqId) return;      // it is already this one's
     requestServerTemporal(seqId, app.srvTemporal);   // ...and it refuses non-server stacks
+}
+
+// The B slot follows the COMPARE PARTNER, automatically (#320, ruled
+// 2026-10-28 - it was a "Measure B" button before, on ab-stats-plan §4's
+// "a B that followed A around would double every remote job"). The ruling
+// answers that worry with a rule rather than a button: ONE request per
+// (stack, state). The triggers are the ones A has - B chosen, B's stack
+// changed, the ROI or the mosaic changed - and each of them is a change of
+// the key this compares, so one comparison covers all of them:
+//   - a request is out for this stack: wait for it (never a second one);
+//   - the slot holds an answer OR A FAILURE for this exact state: keep it - a
+//     failure is retried by hand from the line that reports it, because a peer
+//     that refused once refuses again, and re-sending every frame would be a
+//     storm;
+//   - an ROI being dragged: wait for it to land, as the local cache does.
+// Called every frame from the main loop (before any panel draws) and by the
+// Temporal panel; the comparison is what makes calling it often free.
+// The request goes through a pointer so the selftest can count requests
+// without a peer.
+static void (*g_serverTemporalBRequest)(int, App::ServerTemporal&) = requestServerTemporal;
+static void ensureServerTemporalB(const ImageDoc* Bim) {
+    if (!Bim || Bim->seqId == 0) return;
+    const App::SeqInfo* si = seqInfo(Bim->seqId);
+    if (!si || !serverComputes(*si)) return;
+    App::ServerTemporal& S = app.srvTemporalB;
+    if (S.seqId == Bim->seqId) {
+        if (S.pending || app.annBusy) return;
+        App::ServerTemporal now;
+        serverTemporalStateOf(*si, now);
+        if (serverTemporalSameState(S, now)) return;
+    }
+    g_serverTemporalBRequest(Bim->seqId, S);
 }
 
 // The Inspector changed a frame's mosaic. The stack it belongs to carries that

@@ -941,7 +941,7 @@ B は **Files で対象行を右クリック > Set as compare B**(実体を指�
 - `\` が効かない配列のキーボードのために **`C` でも同じ操作**ができます
 - ROI / POI / ピクセルグリッドは**両側に同じものが描かれます**(座標は A 基準)
 - **ROIs パネルもスロットを読みます。ROI は1組のまま**で、数値だけがスロットぶん増えます:
-  - **並べて表示のとき**(または View > Compare A/B > Statistics layout = side by side):
+  - **並べて表示のとき**(または View > Compare A/B > Statistics layout: Histogram / Projection = side by side):
     1 ROI = 1行のまま、**スロットごとに mean / std / `std / mean [%]` / min / max の
     列グループ**が右へ並びます。列の上にスロットの文字がそのスロットの色で乗ります。
     名前・region・可視チェック・削除は**左に固定**されたままなので、列が画面幅を
@@ -996,9 +996,10 @@ B は **Files で対象行を右クリック > Set as compare B**(実体を指�
 
 ## 3c. A/B の統計(Histogram / Projection / Temporal)
 
-compare が入っている間、この3パネルは **B も一緒に**出します。並べ方は
-`View > Compare A/B > Statistics panels` の**1か所**で決まります —— パネルごとの設定では
-ありません(「画像と同じ並べ方」は比較の性質であって、ヒストグラムの性質ではないため)。
+compare が入っている間、この3パネルは **B も一緒に**出します。Histogram と Projection の
+並べ方は `View > Compare A/B > Statistics layout: Histogram / Projection` の**1か所**で決まります
+—— パネルごとの設定ではありません(「画像と同じ並べ方」は比較の性質であって、ヒストグラムの
+性質ではないため)。**Temporal だけは別の設定**で、既定は**重ね描き**です(下の表の後)。
 
 | 設定 | 見え方 |
 |---|---|
@@ -1010,11 +1011,22 @@ compare が入っている間、この3パネルは **B も一緒に**出しま�
 |---|---|
 | **Histogram** | 縦軸が**各側の標本数に対する割合 [%]** に変わります(サイズの違う2枚を棒の高さで比べないため)。B は**必ず A と同じビン**で数えます —— 別々に切ったビンの上に2本の曲線を重ねても比較になりません。x 軸のラベルは**実際に効いているレンジ**を名乗ります(`A and B combined range` / `A's black-white range`)。CFA は plane セレクタで**両側を同時に**絞れます |
 | **Projection** | 重ねるのは**同じ軸のときだけ**。原点も長さも一致しない profile は、Side by side を選んでいなくても左右に落として理由を書きます —— 伸ばして重ねたら、データに無い対応関係を捏造することになるからです |
-| **Temporal** | **A / B / delta A-B / delta [%]** の表になります。B が stack でなければその列に `- (not a stack)`、チャンネル数が違えば delta 列そのものを出しません。dtype が違えば「両方 DN だが記憶クラスは別」と警告。frame mean のグラフは A 実線 / B 破線で1本の軸に乗ります |
+| **Temporal** | **A / B / delta A-B / delta [%]** の表になります。B が stack でなければその列に `- (not a stack)`、チャンネル数が違えば delta 列そのものを出しません。dtype が違えば「両方 DN だが記憶クラスは別」と警告。frame mean のグラフは**既定で全側が1本の時間軸に重なります**(下) |
+
+**Temporal のグラフの並べ方は Temporal 専用の設定**です。既定は **overlay**(全側の曲線を1本の
+時間軸に重ねる —— 時系列は同じ軸の上で比べて読むため)で、上の Histogram / Projection の設定が
+Auto でも Side by side でも重なります。**side by side**(1側1プロット)も選べます。切り替えは
+Temporal パネルの見出しのコンボ(`overlay` / `side by side`)、または
+`View > Compare A/B > Statistics layout: Temporal`。選んだものは次の起動にも残ります
+(prefs、settings.jsonc では `compare.temporalLayout`)。
 
 フレームを連続で送っている間は **B 側の再計算を止めます**(1ステップごとに2枚ぶん計算すると
 送りが重くなるため)。止めている間は琥珀色の `[stale]` が付き、送るのをやめると追いつきます。
-**サーバ集計だけは自動では走りません** —— Temporal パネルの `Measure B` を押したときだけです。
+**B がサーバで集計される stack なら、B のサーバ集計も A と同じく自動で走ります** —— B を
+決めたとき・B の stack が変わったとき・ROI やモザイクを変えたときに**1回だけ**。同じ状態では
+投げ直しません(実行中も、結果があるときも)。サーバが断ったときは表の下に
+`B: server measurement failed - …` の行が出て、その行の **`retry`** で頼み直せます
+(断った peer は何度でも断るので、自動では投げ直しません)。
 
 ## 4. アノテーション(ROI / POI)
 
@@ -1678,6 +1690,11 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
   ファイルが無い / フォントに CJK が無い場合は、設定を読む時点ではなく
   **フォントを読む時点で**名指しします(§8c)
 
+- `compare.temporalLayout` は compare 中の **Temporal のグラフの並べ方**。
+  `"overlay"`(既定 —— 全側を1本の時間軸に重ねる)か `"side-by-side"`(1側1プロット)。
+  Histogram / Projection の並べ方(セッションに残る `View > Compare A/B` の設定)とは
+  **別の設定**で、そちらを変えてもこちらは動きません(§3c)。ほかの語は行・列で断ります
+
 読むキーのうち `loading.rawRecipes` だけは**オブジェクトの配列**です(§2.2b)。
 1件が読めなくても**その1件だけ**を名指しで断り、残りのレシピは読み込みます。
 
@@ -1687,7 +1704,7 @@ viewer --settings-template > "%APPDATA%/viewer/settings.jsonc"
 
 ### 8b. Preferences パネル
 
-`File > Preferences...` は設定表37行を並べます。Read 31行には現在値と、
+`File > Preferences...` は設定表38行を並べます。Read 32行には現在値と、
 **どの層が決めたか** (`default` / `this machine` /
 `settings.jsonc:<line>` / `command line` / `session (.vsession)`) が出ます。session の
 出所は `.vsession` が復元する表示ガンマとピクセルグリッドの2行だけです。

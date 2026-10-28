@@ -1483,6 +1483,26 @@ static TChartAx tchartResolve(const App::TemporalChart& c,
     return r;
 }
 
+// Temporal's own layout (#320), on the compare heading: overlay - the default -
+// or side by side. The same setting as View > Compare A/B > Statistics layout:
+// Temporal, and independent of the Histogram / Projection one.
+static void temporalLayoutSwitch() {
+    static const char* TL[2] = { "overlay", "side by side" };
+    const int curL = app.temporalLayout == App::TlSide ? 1 : 0;
+    ImGui::SetNextItemWidth(ImGui::CalcTextSize(TL[1]).x + ImGui::GetFrameHeight() * 1.4f);
+    if (ImGui::BeginCombo("##tlayout", TL[curL])) {
+        for (int i = 0; i < 2; i++)
+            if (ImGui::Selectable(TL[i], curL == i))
+                app.temporalLayout = i ? App::TlSide : App::TlOverlay;
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Temporal layout: overlay puts every side's curve on one\n"
+                          "time axis (the default); side by side gives each side its\n"
+                          "own plot. Temporal's own setting - the Histogram /\n"
+                          "Projection layout does not change it.");
+}
+
 // The A/B temporal view: rows are quantities, columns are A | B | delta | delta%.
 // (docs/features/compare/ab-stats-plan.md 4.) The sign is A-B, matching the difference image.
 static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
@@ -1492,6 +1512,12 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     recomputeTemporalIfNeeded(Bim, app.temporal[1]);
     AbTemporal A = abTemporalOf(im, app.temporal[0], app.srvTemporal);
     AbTemporal B = abTemporalOf(Bim, app.temporal[1], app.srvTemporalB);
+    // B's server aggregate came back refused: say so, with the way to ask again
+    // on the same line - nothing re-sends it on its own (ensureServerTemporalB)
+    const App::ServerTemporal& SB = app.srvTemporalB;
+    const bool bSrvFailed = SB.seqId == Bim->seqId && SB.token != 0 && !SB.pending && !SB.valid;
+    const std::string bSrvWhy = SB.err.empty() ? std::string("no reason given")
+                                               : SB.err.substr(0, SB.err.find('\n'));
     // The extra slots (C, D, E...). They ride on the CHART only: the table's
     // axis is A | B | delta, and a delta has exactly two operands - the numeric
     // side already gives every slot its own row in the Projection table, and
@@ -1551,22 +1577,11 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
         tchartAddButton(tchartChoices(hd),
                         sa && !sa->axes.empty() ? sa->axes.front().name : std::string());
     }
-    // B's server aggregate is never fired automatically - one explicit press,
-    // one remote job (docs/features/compare/ab-stats-plan.md 4).
-    if (const App::SeqInfo* sb = seqInfo(Bim->seqId))
-        if (serverComputes(*sb)) {
-            ImGui::SameLine();
-            bool busy = app.srvTemporalB.pending && app.srvTemporalB.seqId == Bim->seqId;
-            ImGui::BeginDisabled(busy);
-            if (ImGui::SmallButton(busy ? "Measuring B..." : "Measure B"))
-                requestServerTemporal(Bim->seqId, app.srvTemporalB);
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Run the server-side aggregate over B's stack.\n"
-                                  "It is never started on its own: B follows A, and\n"
-                                  "an automatic B measurement would double every\n"
-                                  "remote job you did not ask for.");
-        }
+    // (no "Measure B" here any more: B's server aggregate runs on its own,
+    // once per state - ensureServerTemporalB, #320. A failure is retried from
+    // the line that reports it, below the table.)
+    ImGui::SameLine();
+    temporalLayoutSwitch();
     ImGui::Separator();
 
     char hA[64], hB[64];
@@ -1642,6 +1657,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (!sameRegion) notices++;
     else if (!canDelta && im->ch != Bim->ch) notices++;
     if (A.fromServer || B.fromServer) notices++;
+    if (bSrvFailed) notices++;
     // the charts' floor: per chart, its x: row + plot + its three rows of axis
     // chrome + its notices; and one legend row for the panel
     // (and, above the last, the spread lines each chart prints under itself)
@@ -1791,6 +1807,17 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
     if (A.fromServer || B.fromServer)
         ImGui::TextDisabled("source: A %s, B %s", A.fromServer ? "server" : "local",
                             B.fromServer ? "server" : "local");
+    if (bSrvFailed) {
+        ImGui::TextColored(AB_AMBER, "B: server measurement failed - %s", bSrvWhy.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("retry##srvB"))
+            requestServerTemporal(Bim->seqId, app.srvTemporalB);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Ask the server for B's aggregate again. It is not\n"
+                              "re-sent on its own: a peer that refused once would\n"
+                              "refuse every frame. B's column shows the frames\n"
+                              "that are here meanwhile.");
+    }
 
     // ---- per-frame mean over time: one curve per compare slot, per chart ----
     // What each slot puts on the chart and, when it puts nothing there, WHY.
@@ -1933,7 +1960,7 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
 
     const ImGuiStyle& st = ImGui::GetStyle();
     const float minSide = AB_MIN_SIDE * app.uiScale;
-    bool side = abSideBySide();
+    bool side = temporalSideBySide();   // Temporal's own setting (#320)
     // side by side generalises to however many slots have a curve; the fallback
     // threshold is per PANEL, which is what AB_MIN_SIDE has always measured
     float perPanel = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x * (nHas - 1))
@@ -2073,11 +2100,12 @@ static void drawTemporalAB(ImageDoc* im, ImageDoc* Bim) {
 // local numbers over the frames that happen to be RESIDENT - a different
 // quantity, printed in the same table as B's, with nothing saying so.
 //
-// B is not asked for. There is one slot and it cannot hold both sides at once;
-// that is an existing constraint of the A slot, and widening it is a design
-// question rather than a thing to settle inside a fix for this one.
-static void ensureAbServerTemporal(const ImageDoc* im) {
+// B has its own slot (app.srvTemporalB) and asks through ensureServerTemporalB,
+// once per (stack, state) - #320. The main loop asks for it every frame; asking
+// here as well keeps "drawing is the gate" true for both sides.
+static void ensureAbServerTemporal(const ImageDoc* im, const ImageDoc* Bim) {
     if (im && im->seqId != 0) ensureServerTemporalFor(im->seqId);
+    ensureServerTemporalB(Bim);
 }
 
 static void drawPanelTemporal() {
@@ -2094,7 +2122,7 @@ static void drawPanelTemporal() {
     // lone-frame A used to leave the whole panel blank while B, a full stack
     // with a perfectly good time axis, went unplotted.
     if (ImageDoc* Bim = abStatsB()) {
-        ensureAbServerTemporal(im);   // ...this branch returns before the ask below
+        ensureAbServerTemporal(im, Bim);   // ...this branch returns before the ask below
         drawTemporalAB(im, Bim);
         return;
     }
