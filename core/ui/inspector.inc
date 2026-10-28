@@ -330,23 +330,6 @@ static void textNum(const char* fmt, double v) {
     if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w));
     ImGui::TextUnformatted(buf);
 }
-// One value cell of the profile-statistics table. The whole point of the
-// setting is that a COLUMN is uniform, so the format is decided in one place
-// rather than at each of the twenty call sites.
-static void textStat(double v) {
-    // 16, not 8. What goes in here is "%.", an int, and "f" - and an int is up
-    // to eleven characters ("-2147483648"), which is fourteen plus the NUL. The
-    // buffer only fitted because projDecimals is clamped to 0..6, and that clamp
-    // is written in two OTHER files (the session reader and the panel's combo),
-    // so this line was correct at a distance: nothing here says the value is
-    // small, and the compiler cannot see the promise. Sizing it for the whole
-    // range of the type moves the guarantee to where the write is, and no value
-    // an int can hold truncates the format now. -Wformat-truncation= found it.
-    char fmt[16];
-    if (app.projDecimals < 0) snprintf(fmt, sizeof fmt, "%%.6g");
-    else                      snprintf(fmt, sizeof fmt, "%%.%df", app.projDecimals);
-    textNum(fmt, v);
-}
 static void textNumStr(const std::string& s) {
     float w = ImGui::CalcTextSize(s.c_str()).x;
     float avail = ImGui::GetContentRegionAvail().x;
@@ -355,6 +338,186 @@ static void textNumStr(const std::string& s) {
 }
 // content width for a full-precision number; the table adds CellPadding itself
 static float numColW() { return ImGui::CalcTextSize("-0.00000e+00").x; }
+
+// ---- a column of numbers that lines up on the decimal point (issue #313) ----
+// textNumStr puts the END of each string at the right edge, so the "." of
+// 1.23457 and of 12.3457 sit one digit apart, a clamp "*" pushes its row's
+// digits left by a star, and a font whose digits are not all one width (the
+// CJK faces merged into the atlas need not be) lets "1" and "8" drift too.
+// Stepping frames on a comparison made each of those visible as a column that
+// wobbles. Three rules, in one place:
+//   1. the integer part ends, and the fraction starts, at the column's point x;
+//   2. every number of a column is printed with the SAME decimals (NumShape);
+//   3. digits and the sign advance by the width of "0", the point by ".".
+// A mark after the number (the clamp "*") sits in its own slot right of the
+// fraction, so it never moves a digit.
+//
+// The layout is a pure function of the strings and a table of glyph widths, so
+// --numalign-selftest asserts the x of every glyph without a window or a font;
+// textNumAligned only hands the pieces to the draw list.
+struct NumMetrics {
+    float digit = 0;     // the advance of every digit and of the sign: the width of "0"
+    float point = 0;     // the advance of "."
+    std::function<float(const std::string&)> textW;   // any other run: a mark, a word
+};
+// What a whole column agrees on.
+struct NumShape {
+    int dec = 0;         // decimals every number of the column is printed with
+    int intW = 1;        // characters the integer part reserves, sign included
+    float sfxW = 0;      // the slot right of the fraction for a mark like "*"
+};
+// One glyph (or one run of ordinary text) to draw. slotX is where its advance
+// starts, x where the glyph is drawn - centred in the slot, so a narrow "1" in
+// a proportional font sits under the middle of an "8" rather than its left edge.
+struct NumPiece { std::string s; float slotX = 0; float x = 0; };
+struct NumLayout {
+    std::vector<NumPiece> pieces;
+    float pointX = 0;    // the integer part's right edge: where "." is drawn
+    float width = 0;     // the block: integer part, point, fraction and mark slot
+    int fracDigits = 0;  // digits this number printed after the point
+};
+static float numBlockWidth(const NumShape& c, const NumMetrics& m) {
+    return c.intW * m.digit + (c.dec > 0 ? m.point + c.dec * m.digit : 0.0f) + c.sfxW;
+}
+// The display spelling of one value at a column's decimals. A value %.*f would
+// spell with sixteen or more integer digits (or not at all: nan, inf) is given
+// as %.6g, and numLayout sets anything that is not plain digits as a word.
+static std::string numFixed(double v, int dec) {
+    char b[64];
+    if (!std::isfinite(v) || std::fabs(v) >= 1e15) snprintf(b, sizeof b, "%.6g", v);
+    else snprintf(b, sizeof b, "%.*f", std::clamp(dec, 0, 6), v);
+    return b;
+}
+static bool numIsPlain(const std::string& s) {
+    return !s.empty() && s.find_first_not_of("-0123456789.") == std::string::npos;
+}
+static NumLayout numLayout(const std::string& num, const std::string& mark,
+                           const NumShape& c, const NumMetrics& m) {
+    NumLayout L;
+    L.pointX = c.intW * m.digit;
+    L.width = numBlockWidth(c, m);
+    auto glyph = [&](char ch, float slotX, float adv) {
+        const std::string g(1, ch);
+        L.pieces.push_back({ g, slotX, slotX + (adv - m.textW(g)) * 0.5f });
+    };
+    if (!numIsPlain(num)) {
+        // a word - "nan", "inf", "1e+15": it ends where the integer parts end
+        const float x = std::max(0.0f, L.pointX - m.textW(num));
+        L.pieces.push_back({ num, x, x });
+    } else {
+        const size_t dot = num.find('.');
+        const std::string ip = num.substr(0, dot);
+        float x = L.pointX - (float)ip.size() * m.digit;   // right-aligned on the point
+        for (char ch : ip) { glyph(ch, x, m.digit); x += m.digit; }
+        if (dot != std::string::npos) {
+            glyph('.', L.pointX, m.point);
+            x = L.pointX + m.point;                          // left-aligned after it
+            for (size_t k = dot + 1; k < num.size(); k++) {
+                glyph(num[k], x, m.digit);
+                x += m.digit;
+                L.fracDigits++;
+            }
+        }
+    }
+    if (!mark.empty()) {
+        // the mark's slot is the column's, not this number's: after the column's
+        // last decimal, whatever this value printed
+        const float x = L.pointX + (c.dec > 0 ? m.point + c.dec * m.digit : 0.0f);
+        L.pieces.push_back({ mark, x, x });
+    }
+    return L;
+}
+// Decimals that give the column's LARGEST magnitude four significant digits:
+// 1234 -> 0, 12.34 -> 2, 0.1234 -> 4, never more than 6. Zero (or nothing
+// finite) is given 3, the spelling 0.000 of four digits.
+static int numAutoDecimals(double maxAbs) {
+    if (!(maxAbs > 0) || !std::isfinite(maxAbs)) return 3;
+    const int e = (int)std::floor(std::log10(maxAbs));
+    return std::clamp(3 - e, 0, 6);
+}
+// The hysteresis, for decimals and for integer width alike: ONE step down is
+// held - a value crossing 10.00 and back while frames are stepped would
+// otherwise move the whole column every frame - and anything else is taken at
+// once. Growing at once is never a loss (no digit is dropped, no number is
+// clipped); two steps down is a change of magnitude, not a wobble.
+static int numHold(int cur, int next) { return next == cur - 1 ? cur : next; }
+
+// What one column is drawn with this frame.
+struct NumCol {
+    NumShape shape;
+    float width = 0;          // the column's content width: block, header and words
+    const char* probe = "";   // its name in g_numAlignProbe
+};
+// What a column remembers between frames. `key` names the comparison it was
+// decided for (the sides, their stacks and planes, the decimals setting); a
+// different key starts it again from the values in front of it.
+struct NumColState {
+    bool set = false;
+    std::string key;
+    NumShape shape;
+    float wordW = 0;     // the widest "-" / "computing..." the column has had
+};
+// fixedDec >= 0 is the decimals setting's fixed choice and is used as it is;
+// < 0 decides them from the values. markW: the width of the widest mark any
+// row of the column carries now (0 for none). wordW: of the widest non-number
+// cell. The mark slot and the word width only grow until the key changes - a
+// "computing..." that comes and goes with every step is the same wobble.
+static NumCol numColDecide(NumColState& st, const std::string& key,
+                           const std::vector<double>& vals, int fixedDec,
+                           float markW, float wordW, float headW, const NumMetrics& m) {
+    const std::string k = key + "|dec=" + std::to_string(fixedDec < 0 ? -1 : fixedDec);
+    const bool fresh = !st.set || st.key != k;
+    double mx = 0;
+    for (double v : vals) if (std::isfinite(v)) mx = std::max(mx, std::fabs(v));
+    int dec = fixedDec >= 0 ? std::clamp(fixedDec, 0, 6) : numAutoDecimals(mx);
+    if (!fresh && fixedDec < 0) dec = numHold(st.shape.dec, dec);
+    int iw = 1;
+    for (double v : vals) {
+        const std::string s = numFixed(v, dec);
+        if (numIsPlain(s)) iw = std::max(iw, (int)std::min(s.find('.'), s.size()));
+    }
+    if (!fresh) iw = numHold(st.shape.intW, iw);
+    st.set = true;
+    st.key = k;
+    st.shape.dec = dec;
+    st.shape.intW = iw;
+    st.shape.sfxW = fresh ? markW : std::max(st.shape.sfxW, markW);
+    st.wordW = fresh ? wordW : std::max(st.wordW, wordW);
+    NumCol c;
+    c.shape = st.shape;
+    c.width = std::max({ numBlockWidth(st.shape, m), st.wordW, headW });
+    return c;
+}
+static NumMetrics numMetricsNow() {
+    NumMetrics m;
+    m.digit = ImGui::CalcTextSize("0").x;
+    m.point = ImGui::CalcTextSize(".").x;
+    m.textW = [](const std::string& s) { return ImGui::CalcTextSize(s.c_str()).x; };
+    return m;
+}
+// Every number textNumAligned drew since the last clear, in screen x - for the
+// selftests that hold a real panel's column to the rule. The Projection panel
+// clears it at its top, being the panel that draws through it.
+struct NumAlignProbe { std::string col, text; float pointX = 0; int fracDigits = 0; };
+static std::vector<NumAlignProbe> g_numAlignProbe;
+// The block sits at the column's right edge (so a column wider than its
+// numbers, for its header, still reads as a right-aligned column) and is one
+// item the width of the column, so IsItemHovered works on it as on a Text.
+static void textNumAligned(const NumCol& col, double v, const char* mark = "") {
+    const NumMetrics m = numMetricsNow();
+    const NumLayout L = numLayout(numFixed(v, col.shape.dec), mark ? mark : "", col.shape, m);
+    ImGuiWindow* w = ImGui::GetCurrentWindow();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float x0 = p.x + std::max(0.0f, col.width - L.width);
+    const float y = p.y + w->DC.CurrLineTextBaseOffset;
+    const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
+    for (const NumPiece& pc : L.pieces)
+        w->DrawList->AddText(ImVec2(x0 + pc.x, y), ink, pc.s.c_str());
+    std::string text;
+    for (const NumPiece& pc : L.pieces) text += pc.s;
+    g_numAlignProbe.push_back({ col.probe, text, x0 + L.pointX, L.fracDigits });
+    ImGui::Dummy(ImVec2(col.width, ImGui::GetTextLineHeight()));
+}
 
 // What the channels of a ch-channel document are CALLED, at least four entries
 // long whatever ch is, so a caller that indexes 0..3 cannot walk off it.

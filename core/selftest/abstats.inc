@@ -4246,6 +4246,101 @@
                 app.proj[1] = App::ProjState{};
             }
 
+            // ======================================================================
+            // C32 - THE TABLE'S NUMBERS LINE UP ON THE POINT (issue #313). B is A
+            // at a hundredth of the level, so every value column holds numbers two
+            // orders of magnitude apart - "510.2" over "5.1". Drawn for real, both
+            // layouts: each column's "." is at ONE screen x for every row of it,
+            // every number carries the column's decimals, and stepping B to a
+            // frame whose numbers differ in the fourth digit moves no point.
+            // numalign.inc holds the rule itself; this holds the PANEL to it.
+            // ======================================================================
+            {
+                auto mkNum = [&](const char* nm, float scale) {
+                    auto d = mkFrame(nm, 16, 16, 0, 1);
+                    // a checkerboard on top, so the residual (RN) is not zero and
+                    // the HFPN/RN and VFPN/RN columns have numbers to align too
+                    for (int y = 0; y < 16; y++)
+                        for (int x = 0; x < 16; x++)
+                            d->px()[(size_t)y * 16 + x] =
+                                scale * (500.0f + (float)(x % 89) + (float)(y % 7) +
+                                         (((x ^ y) & 1) ? 3.0f : -3.0f));
+                    computeMinMax(*d);
+                    return d;
+                };
+                app.images.clear();
+                app.images.push_back(mkNum("na_A", 1.0f));
+                app.images.push_back(mkNum("na_B", 0.01f));
+                app.current = 0;
+                app.proj[0] = App::ProjState{};
+                app.proj[1] = App::ProjState{};
+                app.compareMode = App::CmpWipe;
+                app.abStepBusyUntil = 0;
+                setCompareB(app.images[1].get());
+                // per column: is every "." at one x, with one count of decimals?
+                std::map<std::string, float> pointAt;
+                auto columnsAligned = [&](const char* tag, size_t wantCols, bool keepPoints) {
+                    std::map<std::string, std::vector<const NumAlignProbe*>> by;
+                    for (const NumAlignProbe& p : g_numAlignProbe) by[p.col].push_back(&p);
+                    bool all = by.size() == wantCols;
+                    for (const auto& kv : by) {
+                        const NumAlignProbe& p0 = *kv.second[0];
+                        bool same = kv.second.size() >= 2;
+                        std::string line;
+                        for (const NumAlignProbe* p : kv.second) {
+                            same &= fabsf(p->pointX - p0.pointX) < 0.01f &&
+                                    p->fracDigits == p0.fracDigits;
+                            line += " " + p->text;
+                        }
+                        fprintf(stderr, "abstatsselftest: C32 %s %-14s x=%.2f dec=%d:%s\n", tag,
+                                kv.first.c_str(), p0.pointX, p0.fracDigits, line.c_str());
+                        all &= same;
+                        if (keepPoints) pointAt[kv.first] = p0.pointX;
+                    }
+                    return all;
+                };
+                auto lengthsDiffer = [&](const char* col) {
+                    std::set<size_t> lens;
+                    for (const NumAlignProbe& p : g_numAlignProbe)
+                        if (p.col == col) lens.insert(p.text.size());
+                    return lens.size() >= 2;
+                };
+                draw();
+                {
+                    const std::string pr = field(g_projSideProbe, "planerows=");
+                    fprintf(stderr, "abstatsselftest: C32 rows '%s'\n", pr.c_str());
+                    check(std::count(pr.begin(), pr.end(), '@') == 2 &&
+                          pr.find("@A") != std::string::npos && pr.find("@B") != std::string::npos,
+                          "C32 fixture: one plane on each of two sides, wide table");
+                }
+                check(columnsAligned("wide", 12, true),
+                      "C32 wide: every column's '.' at one x, one count of decimals");
+                check(lengthsDiffer("mean"),
+                      "C32 ...over numbers of different lengths (510.2 over 5.1) - not vacuous");
+                // a step: B's next frame differs in the fourth digit, the shape holds
+                {
+                    ImageDoc* b = app.images[1].get();
+                    for (float& v : b->px()) v *= 1.0007f;
+                    b->dataRev++;
+                    computeMinMax(*b);
+                }
+                app.abStepBusyUntil = 0;
+                const std::map<std::string, float> before = pointAt;
+                draw();
+                bool still = columnsAligned("stepped", 12, true);
+                for (const auto& kv : before)
+                    still &= pointAt.count(kv.first) && fabsf(pointAt[kv.first] - kv.second) < 0.01f;
+                check(still, "C32 a frame step that moves the fourth digit moves no '.'");
+                app.projStatLayout = 2;                      // per axis
+                draw();
+                check(columnsAligned("per-axis", 7, false),
+                      "C32 per axis: every column's '.' at one x, one count of decimals");
+                app.projStatLayout = 1;
+                app.compareMode = App::CmpOff;
+                setCompareB(nullptr);
+                app.proj[1] = App::ProjState{};
+            }
+
             // ---- everything borrowed, put back ------------------------------------
             app.anns.clear();
             app.nextAnnId = 1;

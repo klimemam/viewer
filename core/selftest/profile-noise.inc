@@ -224,10 +224,14 @@ if (g_profileNoiseSelftest) {
     check(projNoiseValue(P, 0, true) == hExpected && projNoiseValue(P, 0, false) == vExpected &&
           projNoiseStatus(P, 0).find("6x8 plane pixels, full ROI") != std::string::npos,
           "P7 clipboard ratios use unrounded values and report full plane geometry");
+    // the table's cell is the unrounded ratio, spelled by its column (#313)
+    const int keepDecimals = app.projDecimals;
     app.projDecimals = 2;
-    check(projNoiseValue(P, 0, true, true) == "1.25" &&
-          projNoiseValue(P, 0, false, true) == "0.73" && projNoiseValue(P, 0, true) == hExpected,
+    check(numFixed(projNoiseCell(P, 0, true).v, app.projDecimals) == "1.25" &&
+          numFixed(projNoiseCell(P, 0, false).v, app.projDecimals) == "0.73" &&
+          projNoiseValue(P, 0, true) == hExpected,
           "P7 display decimals do not reduce clipboard precision");
+    app.projDecimals = keepDecimals;
     check(projNoiseValue(P, 4, true) == "-" &&
           projNoiseStatus(P, 4) == "unavailable: pooled planes",
           "P7 pooled all is unavailable without accessing a nonexistent plane");

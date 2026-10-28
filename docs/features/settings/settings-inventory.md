@@ -241,7 +241,7 @@ peer の導入元を変えるためにビルドし直す理由が無い (判断1
 |---|---|---|---|---|---|
 | F1 | **フォルダのクリック挙動** (List で1クリック / Tree で名前展開・ダブルで移動) | 固定 | `core/browse/panel.cpp` `rbActivateRow` | 板 row 136、ユーザー発言「preference で指定できるようにしてもいいね、preference が実装されたときに」 | 操作のみ |
 | F2 | **一覧の並び順の既定** (自然順 / 辞書順) | 自然順 (**決着済み**) | `rbNameCmp` / `rbSortShown` | 板 row 157 | **動かす** — 一覧の順が stack の順と食い違うと σ_t の意味が嘘になる。だから**既定を変えた** |
-| F3 | **数値の有効数字** | 書式リテラル 14 種が散在、書式関数 3 つ | `textNum` / `fmtVal` / `textStat` ほか 11 ファイル | 板 row 98 / `todo-open.md` 項目23。4択の3番が literally「アプリ全体の設定」 | 表示と**コピー** (TSV は表示桁を無視する、が読み手が写す数字は表示側) |
+| F3 | **数値の有効数字** | 書式リテラル 14 種が散在、書式関数 3 つ | `textNum` / `fmtVal` / `numColDecide`(Projection の表、#313)ほか 11 ファイル | 板 row 98 / `todo-open.md` 項目23。4択の3番が literally「アプリ全体の設定」 | 表示と**コピー** (TSV は表示桁を無視する、が読み手が写す数字は表示側) |
 | F4 | **ヒストグラムのビン数** | **256、[black,white] の等分** | `core/ui/canvas.inc` `recomputeHistogramIfNeeded` | `todo-open.md` 項目9「基本的には整数もしくは2のべき乗」 | **動かす** — clip 数と櫛状アーティファクトが変わる |
 | F5 | **detrend の既定とカットオフ** | 既定「なし (raw)」、ON 時は多項式2次・減算・プレーン別 | `core/app/detrend.inc` | flat-field-stats.md 判断6/7 | **動かす** — PRNU も σ_fpn もカットオフの関数 |
 | F6 | **表示レンジの既定 0..65535** | 16bit 固定 | 表示レンジの初期化 | `manual.md:243`「12/14bit の RAW は暗く見えます」、板 row 190 の未了 | 表示のみ (ただし毎回手作業を強いる) |

@@ -1493,6 +1493,10 @@ viewer_selftest(rowcol-sigma NOGL --rowcol-sigma-selftest)
 # "computing..." until the answer for the SAME region lands. NOGL and
 # fixture-free for rowcol-sigma's reasons.
 viewer_selftest(projframe   NOGL --projframe-selftest)
+# A column of numbers lines up on its decimal point (issue #313): the pure
+# layout and the column's decimals with their hysteresis, against a glyph-width
+# table written out in the test - no font, no window, so NOGL.
+viewer_selftest(numalign    NOGL --numalign-selftest)
 # The VALUES of the three shipped analyzers that had none (板 304 / inventory
 # §4.2). Same NOGL reasoning and the same dlls as selftest.bundled - which fixes
 # their keys and version - on fixtures whose answer is closed form instead.
