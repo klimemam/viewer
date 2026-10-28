@@ -1509,6 +1509,9 @@ viewer_selftest(projframe   NOGL --projframe-selftest)
 # layout and the column's decimals with their hysteresis, against a glyph-width
 # table written out in the test - no font, no window, so NOGL.
 viewer_selftest(numalign    NOGL --numalign-selftest)
+# An ssh that failed says so (issue #324): exit status and stderr read, against
+# this binary started as `--fake-ssh` - no server, no network, so NOGL.
+viewer_selftest(sshfail     NOGL --sshfail-selftest)
 # The VALUES of the three shipped analyzers that had none (板 304 / inventory
 # §4.2). Same NOGL reasoning and the same dlls as selftest.bundled - which fixes
 # their keys and version - on fixtures whose answer is closed form instead.
