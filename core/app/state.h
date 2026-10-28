@@ -2345,7 +2345,8 @@ struct App {
     // File > Recent Sessions (#307): the named .vsession files saved or opened,
     // most recent first, capped at SESSION_RECENT_MAX (core/app/session.inc).
     // History like rbRecents - prefs.txt carries it, the app writes it - and
-    // never the autosave, which File > Restore last session already opens.
+    // never the autosave, which a start opens by itself and the menu offers in
+    // a row of its own above these (#319).
     std::vector<std::string> sessionRecents;
     using RemoteSearch = browse::RemoteSearch;
     // ==== ONE Browse instance: a view onto ONE place - browse::Instance =====

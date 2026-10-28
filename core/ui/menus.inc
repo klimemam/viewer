@@ -223,11 +223,25 @@ static void drawMenuBar(GLFWwindow* win) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("load a saved .vsession. It REPLACES what is open:\n"
                               "every open image is closed first, without asking.");
-        if (ImGui::BeginMenu("Recent Sessions", !app.sessionRecents.empty())) {
+        // #319: the start already opened the last autosave, so the way back to
+        // it is no longer an item of its own - it heads Recent Sessions, for a
+        // start that skipped it (--no-session) or replaced it since. The scan
+        // is the config dir's handful of slot files, local by construction.
+        const LastAutosaveRow lastAuto = lastAutosaveRow(viewerConfigDir(), currentPid());
+        if (ImGui::BeginMenu("Recent Sessions",
+                             !lastAuto.path.empty() || !app.sessionRecents.empty())) {
             // Existence is probed once per opening, on a worker - never a stat
             // per row per frame (a dead network share would freeze the UI).
             recentSessionsMenuFrame(ImGui::GetFrameCount());
             std::string pick;          // opened after the loop: opening rewrites the list
+            if (!lastAuto.path.empty()) {
+                if (ImGui::MenuItem((lastAuto.label + "##rsauto").c_str())) pick = lastAuto.path;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s\nthe autosave: written on exit, on a crash and every\n"
+                                      "60 s. Opening it REPLACES what is open.",
+                                      lastAuto.path.c_str());
+                if (!app.sessionRecents.empty()) ImGui::Separator();
+            }
             for (size_t i = 0; i < app.sessionRecents.size(); i++) {
                 const std::string& p = app.sessionRecents[i];
                 const bool there = recentSessionState(i) != 0;   // not known yet = present
@@ -236,22 +250,12 @@ static void drawMenuBar(GLFWwindow* win) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("%s", p.c_str());
             }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Clear")) clearRecentSessions();
+            if (!app.sessionRecents.empty()) {
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear")) clearRecentSessions();
+            }
             ImGui::EndMenu();
             if (!pick.empty()) openPath(pick);
-        }
-        {   // recovery: the autosave is written on exit, on crash and every 60 s.
-            // With instance slots there can be several: scan them ALL, offer
-            // the newest one no LIVE window owns, and say which one it is -
-            // "last session" alone no longer names a single file.
-            std::string offerName;
-            std::string ap = recoveryOfferIn(viewerConfigDir(), currentPid(), &offerName);
-            bool has = !ap.empty();
-            std::string label = has ? "Restore last session (" + offerName + ")"
-                                    : std::string("Restore last session");
-            if (ImGui::MenuItem(label.c_str(), nullptr, false, has)) openPath(ap);
-            if (has && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ap.c_str());
         }
         {   // A whole STACK out of the tool, at the levels on screen (#253).
             // Here rather than only in the canvas export block because its
