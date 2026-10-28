@@ -545,7 +545,8 @@ static int settingsSelftest() {
         check(u.find("VIEWER_SERVE_OK; exit 0") == std::string::npos,
               "L8 the forced update keeps no early-out");
         check(u.find("git clone") != std::string::npos &&
-              u.find("chmod +x \"$d/viewer-serve.new\"") != std::string::npos,
+              u.find("chmod +x \"$t\"") != std::string::npos &&
+              u.find("mv \"$t\" \"$d/viewer-serve\"") != std::string::npos,
               "L8 ...and is otherwise the same script (it still installs)");
         // THE HANDOFF TO CI, on stdout (every assertion above goes to stderr,
         // so the two never mix). It is here and not behind a --print-bootstrap

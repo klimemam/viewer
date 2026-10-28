@@ -893,8 +893,8 @@ enable_testing()
 # --browse-keys-selftest - so on a headless Linux box they need a display. Each
 # test gets its own server via `xvfb-run -a` rather than sharing one, so a
 # server that dies takes one test with it instead of the rest of the run.
-# Eight of the tests below do; the other 45 take the --no-window startup path and
-# need neither a display nor this launcher.
+# The ones marked NOGL take the --no-window startup path instead and need
+# neither a display nor this launcher.
 set(VIEWER_TEST_LAUNCHER "")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_program(XVFB_RUN xvfb-run)
@@ -1512,6 +1512,10 @@ viewer_selftest(numalign    NOGL --numalign-selftest)
 # An ssh that failed says so (issue #324): exit status and stderr read, against
 # this binary started as `--fake-ssh` - no server, no network, so NOGL.
 viewer_selftest(sshfail     NOGL --sshfail-selftest)
+# A second window on the same host loads the stack (issue #330): a tile relayed
+# in small writes, the new-window argv opened through parseCli against a local
+# peer, and the install temporaries - fake ssh and local:// only, so NOGL.
+viewer_selftest(twowin      NOGL --twowin-selftest tools/testdata)
 # The VALUES of the three shipped analyzers that had none (板 304 / inventory
 # §4.2). Same NOGL reasoning and the same dlls as selftest.bundled - which fixes
 # their keys and version - on fixtures whose answer is closed form instead.

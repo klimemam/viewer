@@ -413,6 +413,7 @@ autosave」を選びます。
 | `--close-selftest <dir>` | Ctrl+W の層ごとの意味。取得中に閉じた stack が先読みキューから蘇らないこと |
 | `--batch-selftest <dir>` | batch 移動が stack を丸ごと動かし、Files の並びを乱さず、空 batch を刈り、名前が往復すること |
 | `--startup-selftest <dir>` | 起動時に前回の autosave を開く判断(`startupRestoreDecide`)の全ケース —— scripted / `--no-session` / 開くものの指定 / autosave 無し・空 —— と、parseCli がそれを正しく報せること、0 byte の autosave を候補にしないこと、壊れた autosave は Messages に 1 行で空起動、`--no-session` は autosave を消さないこと、File > Recent Sessions 先頭の `Last autosave (<時刻>)` 行と `Restore last session` が無いこと、そして**この selftest 自身の起動が何も開かなかったこと**(#319) |
+| `--twowin-selftest <dir>` | 同じホストにつないだ 2 つ目の窓で stack が読めること(#330): 小さな write で中継する fake ssh(`relay`)越しに 4 MB の tile が数秒で正しい画素で届く、リモート stack の「Open in new window」の argv を parseCli に渡すと stack が丸ごと開く(`--stack never` は 1 枚、単独のファイルは単独)、peer / plugin / git からの install が一時ファイルをシェルごとの名前(`.$$`)で書く(POSIX では旧い固定名を塞いだまま実際に install する) |
 | `--sessiondoor-selftest <dir>` | File > Recent Sessions(追加・重複除去・上限 8・`(missing)`・Clear・prefs の往復)、Open... / Open Session... のダイアログのフィルタ順と開始フォルダ、`.vsession` を `openPath` に渡すと読み込んで開いていた画像を置き換え Recent に入ること(autosave は入らない)(#307) |
 | `--scan-selftest <dir>` | リモート Open Folder を実経路 (local peer → rb worker → LIST → グループ化 → picker) で |
 | `--browse-selftest <dir>` | Browse パネルの挙動: grouped↔flat が1つの返信上の純粋なビューであること、ツリーの遅延展開、キャンセル世代、壊れた `.npy` も一覧に出ること |

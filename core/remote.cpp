@@ -3,7 +3,9 @@
 #include "remote_proto.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "miniz.h"
@@ -114,7 +116,15 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     HANDLE childIn = nullptr, childOut = nullptr;
     if (!CreatePipe(&childIn, &p.inW, &sa, 0))
         return fail("cannot create pipes", osErrorText(GetLastError()));
-    if (!CreatePipe(&p.outR, &childOut, &sa, 0)) {
+    // The child's stdout gets a buffer it can run ahead into (#330). With the
+    // default (a few KB) a relaying writer - wsl.exe, an ssh handing over small
+    // channel packets - fills it, and pipeRead's sliced loop then finds nothing
+    // waiting and sleeps 20 ms per refill: measured 3.6 s for a 1 MB frame
+    // through such a relay, against 0.07 s with this buffer, so a stack
+    // "did not load" for minutes. POSIX pipes are not affected: poll() wakes
+    // the moment data arrives, it does not sleep out a slice.
+    const DWORD kChildOutBuffer = 1u << 20;
+    if (!CreatePipe(&p.outR, &childOut, &sa, kChildOutBuffer)) {
         std::string os = osErrorText(GetLastError());
         CloseHandle(childIn); CloseHandle(p.inW); p.inW = nullptr;
         return fail("cannot create pipes", os);
@@ -587,6 +597,10 @@ bool runSshScript(const std::string& host, int port, const std::string& script,
 //   chatty   256 KB of stderr BEFORE a line of stdout, exit 3 - hangs a reader
 //            that drains stdout first
 //   explains a script that says why on stdout and exits 1
+//   relay    the command RUNS - here, as a child - and its stdout is passed on
+//            in writes of at most 4 KB, the way a relaying transport (wsl.exe,
+//            an ssh whose channel hands over small packets) delivers a peer's
+//            reply: what --twowin-selftest fetches a big tile through (#330)
 // Anything else is an ssh that cannot resolve the name (exit 255).
 #if defined(_WIN32)
 static void fakeWrite(DWORD which, const std::string& s) {
@@ -630,15 +644,67 @@ static void fakeDrainStdin() {
 #define FAKE_ERR STDERR_FILENO
 #endif
 
+// `relay`: start the command, hand our stdin to it on a thread, and pass its
+// stdout on in small writes until it closes. The exit status is the child's.
+static int fakeRelay(const std::vector<std::string>& cmd) {
+    if (cmd.empty()) return 255;
+    Pipe p;
+    std::string err;
+    if (!spawn(p, cmd, err)) {
+        fakeWrite(FAKE_ERR, err + "\n");
+        return 127;
+    }
+    std::thread in([&p] {
+        char b[4096];
+        for (;;) {
+#if defined(_WIN32)
+            DWORD got = 0;
+            if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), b, sizeof b, &got, nullptr) || !got) break;
+#else
+            ssize_t got = read(STDIN_FILENO, b, sizeof b);
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) break;
+#endif
+            if (!pipeWrite(p, b, (size_t)got)) break;
+        }
+        closeWriteEnd(p);                 // our stdin ended: so does the child's
+    });
+    in.detach();                          // a read of our stdin cannot be interrupted
+    const size_t kRelayChunk = 4096;
+    std::vector<char> b(kRelayChunk);
+    for (;;) {
+#if defined(_WIN32)
+        DWORD got = 0;
+        if (!ReadFile(p.outR, b.data(), (DWORD)b.size(), &got, nullptr) || !got) break;
+#else
+        ssize_t got = read(p.outR, b.data(), b.size());
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+#endif
+        fakeWrite(FAKE_OUT, std::string(b.data(), (size_t)got));
+        // ...a little after one another, as a relay's packets arrive: without
+        // the gap this relay refills faster than any reader looks, and hides
+        // the very thing it is here to show. A spin, not a sleep - a Windows
+        // sleep is a timer tick (~16 ms), which would make the gap the test.
+        const auto gapEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+        while (std::chrono::steady_clock::now() < gapEnd) {}
+    }
+    const int code = pipeWaitExit(p, nowSeconds() + 10.0, nullptr);
+    return code < 0 ? 255 : code;
+}
+
 int runFakeSsh(int argc, char** argv) {
     std::string host;
+    std::vector<std::string> cmd;         // what ssh would run over there
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--fake-ssh") continue;
         if ((a == "-o" || a == "-p") && i + 1 < argc) { i++; continue; }
         host = a;                         // the first word that is not an option
+        for (int j = i + 1; j < argc; j++) cmd.push_back(argv[j]);
         break;
     }
+    if (host == "relay") return fakeRelay(cmd);
     if (host == "auth") {
         fakeWrite(FAKE_ERR, "hish@auth: Permission denied (publickey).\r\n");
         return 255;

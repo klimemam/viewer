@@ -1746,6 +1746,13 @@ int main(int argc, char** argv) {
     // drives deployPeer, which open_dispatch.inc defines well above.
     #include "selftest/sshfail.inc"
 
+    // A second window on the same host loads the stack (issue #330): the
+    // relayed fetch, the new-window argv opened through parseCli, and the
+    // install temporaries. After sshfail.inc for the fake ssh it shares, and
+    // here for what it calls: openRemoteStack, newWindowArgv, deployPeer's
+    // install commands.
+    #include "selftest/twowin.inc"
+
     // The three shipped analyzers that had no value assertion at all (板 304).
     // Beside rowcolsigma.inc because it is the same discipline on the other side
     // of the ABI: analytic fixtures whose answer can be written down.

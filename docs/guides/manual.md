@@ -711,7 +711,10 @@ File > **Save compare view as PNG...** と **Export compare view as video...**
 - **ヘッダを持つ形式では、Browse から開いたリモートのフォルダも同じで、断り文も同じです**
 - **読み込むかの選択**: 既定は毎回確認。`File > Stack loading` で
   「毎回確認 / 常に読む / 読まない」を切替、モーダルの「remember my choice」でも設定される。
-  CLI は `--stack ask|always|never`
+  CLI は `--stack ask|always|never`。コマンドラインに渡した `ssh://` / `local://` の url にも
+  `--stack always` は効きます —— そのファイルを開いたあと、peer のフォルダ一覧から連番兄弟を
+  1つの stack にします(リモート stack の「Open in new window」は子の窓をこの形で起動します。#330)。
+  url に `ask` は効かず、その1枚だけが開きます
 - **バックグラウンド**: 読み込み中も操作可能。Files パネルに進捗と Stop ボタン。
   **メモリ予算**に達すると自動停止します
 - **メモリ予算**: 既定は**物理メモリの 60%**(最低 2 GB)。`File > Stack loading > Memory budget`

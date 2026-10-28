@@ -171,9 +171,12 @@ install_peer() {
   # under the mapping is a SIGBUS in that process. Unlinking is free: the
   # running peer keeps the inode, and therefore the code, it started with -
   # the same reason bootstrapScript does .new + mv on the far side.
-  cp "$src" "$d/viewer-serve.new"
-  chmod +x "$d/viewer-serve.new"
-  mv "$d/viewer-serve.new" "$d/viewer-serve"
+  # The temporary is this shell's own, as the viewer's are (#330): a viewer
+  # installing at the same moment must not write into the same file.
+  t="$d/viewer-serve.new.$$"
+  cp "$src" "$t"
+  chmod +x "$t"
+  mv "$t" "$d/viewer-serve"
   echo "~/.viewer/viewer-serve <- $src"
   # The plugins travel with it: server-side MEASURE dlopens ~/.viewer/plugins,
   # so a peer updated without them analyses with the old analyzers.
@@ -182,8 +185,8 @@ install_peer() {
   for f in "$DIR"/plugins/*; do
     [ -f "$f" ] || continue
     b=$(basename "$f")
-    cp "$f" "$d/plugins/$b.new"
-    mv "$d/plugins/$b.new" "$d/plugins/$b"
+    cp "$f" "$d/plugins/$b.new.$$"
+    mv "$d/plugins/$b.new.$$" "$d/plugins/$b"
   done
   echo "~/.viewer/plugins/   <- $DIR/plugins/"
   # ...and whatever is no longer shipped GOES. This is not tidiness: the peer
