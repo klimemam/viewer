@@ -1230,7 +1230,9 @@ static std::vector<std::string> tchartChoices(const std::vector<const ImageDoc*>
         if (!d || d->seqId == 0) continue;
         if (const App::SeqInfo* si = seqInfo(d->seqId))
             for (const App::NamedAxis& a : si->axes)
-                if (!a.vals.empty() && std::find(out.begin(), out.end(), a.name) == out.end())
+                if (!a.vals.empty() &&
+                    std::none_of(out.begin(), out.end(), [&](const std::string& o) {
+                        return App::SeqInfo::sameName(o, a.name); }))
                     out.push_back(a.name);
     }
     return out;
@@ -1245,8 +1247,9 @@ static void tchartAdd(const std::vector<std::string>& choices, const std::string
     for (const std::string& n : choices) {
         bool shown = false;
         for (const App::TemporalChart& t : app.tcharts)
-            if ((t.xKind == App::TemporalChart::XNamed && t.xName == n) ||
-                (t.xKind == App::TemporalChart::XDefault && defName == n)) shown = true;
+            if ((t.xKind == App::TemporalChart::XNamed && App::SeqInfo::sameName(t.xName, n)) ||
+                (t.xKind == App::TemporalChart::XDefault && App::SeqInfo::sameName(defName, n)))
+                shown = true;
         if (!shown) { c.xKind = App::TemporalChart::XNamed; c.xName = n; break; }
     }
     app.tcharts.push_back(c);
@@ -1427,7 +1430,7 @@ static TChartAx tchartResolve(const App::TemporalChart& c,
         if (!has[i] || !r.axs[i].custom) continue;
         any = true;
         if (ref < 0) ref = (int)i;
-        else if (r.axs[i].name != r.axs[(size_t)ref].name ||
+        else if (!App::SeqInfo::sameName(r.axs[i].name, r.axs[(size_t)ref].name) ||
                  r.axs[i].unit != r.axs[(size_t)ref].unit) conflict = true;
     }
     if (!any) {

@@ -642,6 +642,18 @@
                 // back to the two axes the rest of this test was written against
                 lerr = restore(sess);
             }
+            // ...and ONE default chart - what every older session means - writes
+            // no tchart line at all, so such a session is the file an older
+            // viewer wrote
+            {
+                app.tcharts.assign(1, App::TemporalChart{});
+                saveSession(sess, true);
+                std::ifstream in(std::filesystem::u8path(sess), std::ios::binary);
+                std::string txt((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+                check(!txt.empty() && txt.find("\ntchart") == std::string::npos,
+                      "E8 one default chart writes no tchart line");
+            }
             app.tcharts = chartsBefore;
             std::filesystem::remove(std::filesystem::u8path(sess), ec);
         }

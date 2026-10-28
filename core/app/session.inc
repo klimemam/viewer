@@ -133,7 +133,13 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
     // The Temporal panel's charts (#314), one line each, top to bottom: what
     // its x is - "default", "frame", or "axis <name>" (the name last: spaces).
     // Zoom is not saved: it is keyed to a document of this run.
+    // Nothing is written for the one default chart every session without
+    // these lines already means - so a session that never touched the charts
+    // is the file an older viewer wrote, line for line.
+    const bool oneDefault = app.tcharts.size() == 1 &&
+                            app.tcharts[0].xKind == App::TemporalChart::XDefault;
     for (const App::TemporalChart& c : app.tcharts) {
+        if (oneDefault) break;
         if (c.xKind == App::TemporalChart::XNamed) f << "tchart axis " << c.xName << "\n";
         else f << "tchart " << (c.xKind == App::TemporalChart::XFrame ? "frame" : "default") << "\n";
     }
@@ -3310,6 +3316,13 @@ static std::string loadSession(const std::string& path,
     // restore) by NAME - replacing one of that name, adding otherwise
     App::NamedAxis pendAxis;
     bool pendAxisOk = false;
+    // A stack whose image line carries seqaxis lines gets the SESSION's axes,
+    // in the session's order, INSTEAD of what its file declared: the file was
+    // re-read before these lines (a .vnz's timestamps / covariates land on
+    // open), and merging would bring back an axis the user removed and move
+    // the default (axes[0]) to the file's. A stack with no seqaxis lines keeps
+    // the file's axes. These are the stacks already cleared for it.
+    std::vector<int> axesFromSession;
     std::vector<std::string> failures;   // reported as one summary, not one toast each
     // The member list a `stackmember` block is accumulating for the NEXT
     // `seqload` line (docs/reference-design.md §5.2, board row 267). Read
@@ -3724,11 +3737,19 @@ static std::string loadSession(const std::string& path,
             } else {
                 pendAxis.name = restOfLine(ls);
                 if (pendAxisOk) {
-                    if (si2) si2->putAxis(std::move(pendAxis));
-                    else {
+                    if (si2) {
+                        if (std::find(axesFromSession.begin(), axesFromSession.end(),
+                                      si2->id) == axesFromSession.end()) {
+                            si2->axes.clear();
+                            axesFromSession.push_back(si2->id);
+                        }
+                        si2->putAxis(std::move(pendAxis));
+                    } else {
                         bool put = false;
                         for (App::NamedAxis& a : sr->axes)
-                            if (a.name == pendAxis.name) { a = pendAxis; put = true; }
+                            if (App::SeqInfo::sameName(a.name, pendAxis.name)) {
+                                a = pendAxis; put = true;
+                            }
                         if (!put) sr->axes.push_back(pendAxis);
                     }
                 }

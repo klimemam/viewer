@@ -883,13 +883,19 @@ struct VnzNode {
     std::vector<int64_t> rangeShape;
     std::string condName, condUnit, tsName, tsUnit;
     bool hasCond = false, hasTs = false;
-    // A STACK's further per-frame conditions (#314): condVals above is the
-    // first one (__conditions_values_<i> on a stack node), and these are
-    // __conditions_values_<i>_<k> for k = 1, 2, ... in order, each with its
-    // own _name_ / _unit_ keys of the same suffix (.npz carrier only). A
-    // series keeps only condVals (one value per member).
-    struct Cond { std::string name, unit; std::vector<double> vals; };
-    std::vector<Cond> conds;
+    // A STACK's covariates (#314, input-adapters.md §4.5): quantities
+    // OBSERVED per frame while the setting stayed the same (temperature,
+    // illuminance drift) - never a setting that changed, which is a series.
+    // __covariates_values_<i> is (F,) for one or (F, K) for K, with
+    // __covariates_name_<i> / _unit_<i> a 0-D string for one and a K-long
+    // string array for K. Kept AS DECLARED (covVals in storage order,
+    // covFortran says which); vnzCovariates turns them into one per column,
+    // or says why it cannot. Each one becomes a named x axis of the stack and
+    // nothing else: no statistic and no stack identity reads them.
+    std::vector<double> covVals;
+    std::vector<int64_t> covShape;
+    bool covFortran = false, hasCov = false;
+    std::vector<std::string> covNames, covUnits;
     // filled while building
     int seqId = 0, seriesId = 0, docFirst = -1, docCount = 0, memberSeen = 0;
 };
@@ -969,7 +975,8 @@ static bool vnzNum(const VnzMemberFetch& mem,
 
 static bool vnzVec(const VnzMemberFetch& mem,
                    const std::map<std::string, size_t>& byName, const std::string& name,
-                   std::vector<double>& out, std::vector<int64_t>& shape, std::string& err) {
+                   std::vector<double>& out, std::vector<int64_t>& shape, std::string& err,
+                   bool* fortran = nullptr) {
     std::vector<uint8_t> buf; NpyHead H;
     if (!vnzRead(mem, byName, name, buf, H, err)) return false;
     if (H.esize == 0) { err = name + " is not numeric"; return false; }
@@ -985,7 +992,78 @@ static bool vnzVec(const VnzMemberFetch& mem,
     // plotted and exported, so they never pass through float on the way in.
     for (size_t i = 0; i < n; i++) out.push_back(npyElem(buf, H, i));
     shape = H.shape;
+    if (fortran) *fortran = H.fortran;
     return true;
+}
+
+// A string member as a LIST: a 0-D string is one element, a 1-D string array
+// is its elements in order (#314: one name per covariate column). false = no
+// such member, or not a string of rank 0 / 1.
+static bool vnzStrs(const VnzMemberFetch& mem,
+                    const std::map<std::string, size_t>& byName, const std::string& name,
+                    std::vector<std::string>& out) {
+    out.clear();
+    std::vector<uint8_t> buf; NpyHead H; std::string e;
+    if (!byName.count(name) || !vnzRead(mem, byName, name, buf, H, e)) return false;
+    if (H.code.empty() || (H.code[0] != 'U' && H.code[0] != 'S') || H.shape.size() > 1)
+        return false;
+    size_t item = 0;
+    for (size_t i = 1; i < H.code.size(); i++)
+        if (H.code[i] >= '0' && H.code[i] <= '9') item = item * 10 + (size_t)(H.code[i] - '0');
+    if (H.code[0] == 'U') item *= 4;
+    const size_t n = H.shape.empty() ? 1 : (size_t)std::max<int64_t>(H.shape[0], 0);
+    for (size_t k = 0; k < n; k++) {
+        if (k && !item) break;
+        NpyHead Hk = H;
+        Hk.dataOff = H.dataOff + k * item;
+        if (Hk.dataOff > buf.size()) break;
+        out.push_back(npzTextValue(buf, Hk));
+    }
+    return true;
+}
+
+// One named column per declared covariate, each `frames` long - or the
+// sentence saying why these covariates cannot be applied (the caller notes it
+// on the frames and applies none of them).
+struct VnzCovariate { std::string name, unit; std::vector<double> vals; };
+static std::string vnzCovariates(const VnzNode& v, int i, int64_t frames,
+                                 std::vector<VnzCovariate>& out) {
+    out.clear();
+    const int64_t K = v.covShape.size() == 2 ? v.covShape[1] : 1;
+    const int64_t R = v.covShape.size() == 2 && v.covShape[0] >= 0 ? v.covShape[0]
+                    : K > 0 ? (int64_t)v.covVals.size() / K : 0;
+    char b[256];
+    if (K < 1 || R * K != (int64_t)v.covVals.size()) {
+        snprintf(b, sizeof b, "__covariates_values_%d: %lld value(s) do not fill its "
+                              "declared shape", i, (long long)v.covVals.size());
+        return b;
+    }
+    if (R != frames) {
+        snprintf(b, sizeof b, "__covariates_values_%d has %lld row(s) but the stack has "
+                              "%lld frame(s) - one row per frame, and a partial mapping "
+                              "would lie about the rest", i, (long long)R, (long long)frames);
+        return b;
+    }
+    auto count = [&](const std::vector<std::string>& l, const char* key) -> std::string {
+        if ((int64_t)l.size() == K) return std::string();
+        char c[192];
+        snprintf(c, sizeof c, "__covariates_%s_%d names %d covariate(s) for %lld value "
+                              "column(s)", key, i, (int)l.size(), (long long)K);
+        return c;
+    };
+    std::string e = count(v.covNames, "name");
+    if (e.empty() && !v.covUnits.empty()) e = count(v.covUnits, "unit");
+    if (!e.empty()) return e;
+    for (int64_t k = 0; k < K; k++) {
+        VnzCovariate c;
+        c.name = v.covNames[(size_t)k];
+        c.unit = v.covUnits.empty() ? std::string() : v.covUnits[(size_t)k];
+        c.vals.reserve((size_t)R);
+        for (int64_t r = 0; r < R; r++)
+            c.vals.push_back(v.covVals[(size_t)(v.covFortran ? k * R + r : r * K + k)]);
+        out.push_back(std::move(c));
+    }
+    return std::string();
 }
 
 static int vnzCfaPattern(const std::string& cfa, int& kind) {
@@ -1414,6 +1492,22 @@ static std::string vnsParseHeader(std::istream& f, int& ver, std::vector<VnzNode
         else if (key == "timestamps_unit") v->tsUnit = vnsUnescape(val);
         else if (key == "conditions_name") v->condName = vnsUnescape(val);
         else if (key == "conditions_unit") v->condUnit = vnsUnescape(val);
+        // covariates (#314): the .npz's (F, K) in this header's words - the
+        // values line row-major F*K numbers, K on its own line, and a name /
+        // unit line per column, by column index
+        else if (key == "covariates") { nums(val, v->covVals); v->hasCov = true; }
+        else if (key == "covariates_cols") v->covShape = { -1, std::max(1, atoi(val.c_str())) };
+        else if (key == "covariates_name_at" || key == "covariates_unit_at") {
+            size_t s3 = val.find(' ');
+            int k = atoi(val.c_str());
+            if (k >= 0 && k < 4096) {
+                std::vector<std::string>& l = key == "covariates_name_at" ? v->covNames
+                                                                          : v->covUnits;
+                if ((int)l.size() <= k) l.resize((size_t)k + 1);
+                l[(size_t)k] = s3 == std::string::npos ? std::string()
+                                                       : vnsUnescape(val.substr(s3 + 1));
+            }
+        }
         else if (key == "meta") {
             size_t s3 = val.find(' ');
             if (s3 != std::string::npos)
@@ -1648,18 +1742,17 @@ static std::string loadViewerNpz(const VnzMemberFetch& mem,
             if (f == 0) { nd2.tsVals = std::move(vals); nd2.tsName = nm; nd2.tsUnit = un; nd2.hasTs = true; }
             else        { nd2.condVals = std::move(vals); nd2.condName = nm; nd2.condUnit = un; nd2.hasCond = true; }
         }
-        if (nd2.layer == "stack") {
-            for (int k = 1; k < 1000; k++) {
-                std::string sfx = si + "_" + std::to_string(k);
-                std::string base = "__conditions_values_" + sfx;
-                if (!byName.count(base)) break;
-                std::vector<double> vals; std::vector<int64_t> shp;
-                if (!vnzVec(mem, byName, base, vals, shp, err)) return err;
-                if (shp.size() != 1) return base + " is not a 1-D vector: one value per frame";
-                nd2.conds.push_back({ vnzStr(mem, byName, "__conditions_name_" + sfx),
-                                      vnzStr(mem, byName, "__conditions_unit_" + sfx),
-                                      std::move(vals) });
-            }
+        // covariates (#314): (F,) or (F, K), names / units 0-D or (K,)
+        if (byName.count("__covariates_values_" + si)) {
+            const std::string base = "__covariates_values_" + si;
+            if (!vnzVec(mem, byName, base, nd2.covVals, nd2.covShape, err, &nd2.covFortran))
+                return err;
+            if (nd2.covShape.size() != 1 && nd2.covShape.size() != 2)
+                return base + " is not (F,) or (F, K): one row per frame, one column per "
+                              "covariate";
+            vnzStrs(mem, byName, "__covariates_name_" + si, nd2.covNames);
+            vnzStrs(mem, byName, "__covariates_unit_" + si, nd2.covUnits);
+            nd2.hasCov = true;
         }
     }
     // Structure, before anything is opened: a tree that cannot hold is refused
@@ -2302,28 +2395,32 @@ static std::string vnzBuild(std::vector<VnzNode>& nodes, int n, const std::strin
                 }
             }
         }
-        // per-frame conditions ON A STACK (#314): what the operator set per
-        // FRAME of this stack - the stack's further named axes, after the
-        // timestamps. Not the SERIES' conditions (one value per member, §4.5),
-        // which stay on the series and never become a frame axis (V25b). Only
-        // a condition with exactly one value per frame is an axis, and a
-        // condition has to be named (§4.3.2: what was swept is not something
-        // the viewer can guess); anything else is said on the frames and not
-        // applied. The unit may be empty for the timestamps' reason.
-        if (v.layer == "stack" && v.seqId && (v.hasCond || !v.conds.empty())) {
-            App::SeqInfo* si = seqInfo(v.seqId);
-            std::vector<VnzNode::Cond> all;
-            if (v.hasCond) all.push_back({ v.condName, v.condUnit, v.condVals });
-            all.insert(all.end(), v.conds.begin(), v.conds.end());
-            for (const VnzNode::Cond& c : all) {
-                if (!si) break;
-                const char* why = c.name.empty() ? "has no name"
-                                : (int)c.vals.size() != v.docCount
-                                    ? "does not cover every frame" : nullptr;
-                if (why) {
-                    for (int k = 0; k < v.docCount; k++)
-                        app.images[(size_t)v.docFirst + (size_t)k]->note +=
-                            ", condition \"" + c.name + "\" " + why + " - not applied";
+        // covariates (#314, §4.5): further named axes of the stack, after its
+        // timestamps - quantities observed per frame, never a changed setting
+        // (that is a series, and a series' conditions never land here: V25b).
+        // A shape that does not fit, or names / units that do not match the
+        // columns, is said on the frames and none of it applied; a column
+        // without a name is not an axis. A name the stack already has (the
+        // timestamps' "time", say) is said and the covariate not applied - two
+        // axes cannot answer to one name.
+        if (v.hasCov) {
+            auto say = [&](const std::string& s) {
+                for (int k = 0; k < v.docCount; k++)
+                    app.images[(size_t)v.docFirst + (size_t)k]->note += ", " + s;
+            };
+            App::SeqInfo* si = v.layer == "stack" && v.seqId ? seqInfo(v.seqId) : nullptr;
+            std::vector<VnzCovariate> cov;
+            const std::string cerr = !si ? std::string("covariates belong to a stack - not applied")
+                                         : vnzCovariates(v, i, v.docCount, cov);
+            if (!cerr.empty()) say(cerr + (si ? " - not applied" : ""));
+            for (const VnzCovariate& c : cov) {
+                if (App::SeqInfo::trimName(c.name).empty()) {
+                    say("a covariate has no name - not applied");
+                    continue;
+                }
+                if (si->axis(c.name)) {
+                    say("covariate \"" + c.name + "\" has the name of an axis this stack "
+                        "already has - not applied");
                     continue;
                 }
                 si->putAxis({ c.name, c.unit, c.vals });

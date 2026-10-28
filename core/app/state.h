@@ -1826,24 +1826,41 @@ struct App {
         // is no second spelling of "the stack's axis".
         //
         // Where they come from (docs/guides/manual.md §5.2b): a .vnz stack's
-        // timestamps, its per-frame conditions, the x axis... dialog and the
+        // timestamps, its covariates, the x axis... dialog and the
         // .npz picker (both through applyFrameAxisVals), and the session.
         std::vector<NamedAxis> axes;
+        // "The same name" is the same name to a reader: surrounding blanks do
+        // not count and neither does letter case ("Time" and "time " are one
+        // axis). Names are stored trimmed, with the case they arrived in.
+        static std::string trimName(const std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+        }
+        static bool sameName(const std::string& x, const std::string& y) {
+            const std::string a = trimName(x), b = trimName(y);
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); i++)
+                if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+                    return false;
+            return true;
+        }
         const NamedAxis* axis(const std::string& n) const {
-            for (const NamedAxis& a : axes) if (a.name == n) return &a;
+            for (const NamedAxis& a : axes) if (sameName(a.name, n)) return &a;
             return nullptr;
         }
         // add, or replace the axis of the same name IN PLACE (its position -
         // and so which one is the default - does not move). true = replaced.
         bool putAxis(NamedAxis a) {
+            a.name = trimName(a.name);
             for (NamedAxis& b : axes)
-                if (b.name == a.name) { b = std::move(a); return true; }
+                if (sameName(b.name, a.name)) { b = std::move(a); return true; }
             axes.push_back(std::move(a));
             return false;
         }
         bool dropAxis(const std::string& n) {
             for (size_t i = 0; i < axes.size(); i++)
-                if (axes[i].name == n) { axes.erase(axes.begin() + (long)i); return true; }
+                if (sameName(axes[i].name, n)) { axes.erase(axes.begin() + (long)i); return true; }
             return false;
         }
         // Empty on every stack that was OPENED. Filled only on a stack this

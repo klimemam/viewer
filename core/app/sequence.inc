@@ -1312,7 +1312,12 @@ static void pumpSequenceAndQueue() {
                 if (app.images[i]->seqId != 0)
                     if (App::SeqInfo* si2 = seqInfo(app.images[i]->seqId)) {
                         if (!r.name.empty()) si2->name = r.name;
-                        for (App::NamedAxis& a : r.axes) si2->putAxis(std::move(a));
+                        // the session's axes REPLACE whatever the rescan found
+                        // (loadSession: axesFromSession says why)
+                        if (!r.axes.empty()) {
+                            si2->axes.clear();
+                            for (App::NamedAxis& a : r.axes) si2->putAxis(std::move(a));
+                        }
                     }
                 break;
             }

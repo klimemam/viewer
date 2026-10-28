@@ -43,6 +43,11 @@ condition themselves (4.5).
     __cfa_<i> __range_<i>                    written when given
     __timestamps_values_<i> __timestamps_name_<i> __timestamps_unit_<i>
     __conditions_values_<i> __conditions_name_<i> __conditions_unit_<i>
+    __covariates_values_<i> __covariates_name_<i> __covariates_unit_<i>
+                               a stack's covariates (4.5), written when given:
+                               ONE as values (F,) with a 0-D name and unit, K as
+                               values (F, K) with name / unit 1-D string arrays
+                               of length K, one per column
     __meta_<k>                 root node meta, JSON encoded value
     __meta_<i>_<k>             meta of node i > 0, JSON encoded value
 
@@ -258,6 +263,12 @@ def to_viewer_dtype(where, what, arr, notes):
 
 # ------------------------------------------------------------------ node tree
 
+class _NamedValues(object):
+    """A Values-shaped (values, name, unit), for a covariate whose name is its key."""
+    def __init__(self, values, name, unit):
+        self.values, self.name, self.unit = values, name, unit
+
+
 class Node(object):
     def __init__(self, layer, parent):
         self.layer = layer
@@ -270,6 +281,7 @@ class Node(object):
         self.range = None
         self.timestamps = None          # (values, name, unit)
         self.conditions = None
+        self.covariates = None          # [(values, name, unit), ...] (4.5)
         self.meta = {}
         self.notes = []                 # what the harness had to add
         self.role = ""                  # a set child: the role it plays (ras 4)
@@ -379,7 +391,45 @@ class Build(object):
         self.common(node, obj, where)
         if layer == "stack":
             self.axis(node, obj, "timestamps", "Stack", node.pixels.shape[0], "frame")
+            self.covariates(node, obj, node.pixels.shape[0])
         return idx
+
+    def covariates(self, node, obj, frames):
+        """A stack's covariates (4.5): each named, one value per frame."""
+        raw = getattr(obj, "covariates", None)
+        if raw is None:
+            return
+        if isinstance(raw, dict):                                   # key = name
+            items = []
+            for key, one in raw.items():
+                values, _, unit = values_of("Stack (covariate %s)" % key, "covariates", one)
+                items.append(_NamedValues(values, str(key), unit))
+        else:
+            items = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        if not items:
+            raise AdapterError("Stack: covariates is an empty sequence")
+        got = []
+        for k, one in enumerate(items):
+            where = "Stack (covariate %d)" % k
+            values, name, unit = values_of(where, "covariates", one)
+            arr = to_numpy(where, "covariates", values, node.notes).astype("float64")
+            if arr.ndim != 1 or arr.shape[0] != frames:
+                raise AdapterError("%s: covariates has shape %s but there are %d frame(s) "
+                                   "-- one value per frame" % (where, arr.shape, frames))
+            if not name:
+                raise AdapterError("%s: covariates has no name -- say what was observed, "
+                                   'e.g. Values(t_c, "temperature", "C")' % where)
+            if not unit.strip():                                    # 4.3.2
+                self.skipped.append("covariate %s has no unit" % name)
+                node.notes.append("covariate %s has no unit (values kept, not applied)"
+                                  % name)
+                unit = ""
+            got.append((arr, name, unit))
+        names = [g[1].strip().lower() for g in got]
+        if len(set(names)) != len(names):
+            raise AdapterError("Stack: two covariates share a name (%s)"
+                               % ", ".join(g[1] for g in got))
+        node.covariates = got
 
     def series(self, obj, parent, where):
         idx, node = self.add("series", parent)
@@ -648,6 +698,16 @@ def stream_out(fh, nodes):
             _stream_line(fh, "%s_unit %d %s" % (field, i, _esc(unit)))
             _stream_line(fh, "%s %d %d %s"
                          % (field, i, v.size, " ".join(repr(float(x)) for x in v)))
+        if nd.covariates:
+            # the npz's (F, K) in this header's words: K on its own line, a
+            # name / unit line per column, the values row-major on one line
+            cv = np.column_stack([g[0] for g in nd.covariates]).reshape(-1)
+            _stream_line(fh, "covariates_cols %d %d" % (i, len(nd.covariates)))
+            for k, g in enumerate(nd.covariates):
+                _stream_line(fh, "covariates_name_at %d %d %s" % (i, k, _esc(g[1])))
+                _stream_line(fh, "covariates_unit_at %d %d %s" % (i, k, _esc(g[2])))
+            _stream_line(fh, "covariates %d %d %s"
+                         % (i, cv.size, " ".join(repr(float(x)) for x in cv)))
         for k, val in nd.meta.items():
             _stream_line(fh, "meta %d %s %s"
                          % (i, meta_key("", str(k)),
@@ -705,6 +765,18 @@ def write_npz(path, nodes):
             out["__%s_values_%d" % (field, i)] = values
             out["__%s_name_%d" % (field, i)] = np.array(name)
             out["__%s_unit_%d" % (field, i)] = np.array(unit)
+        if nd.covariates:
+            # one member per node: (F,) + 0-D strings for one covariate,
+            # (F, K) + K-long string arrays for K (4.5)
+            cov = nd.covariates
+            if len(cov) == 1:
+                out["__covariates_values_%d" % i] = cov[0][0]
+                out["__covariates_name_%d" % i] = np.array(cov[0][1])
+                out["__covariates_unit_%d" % i] = np.array(cov[0][2])
+            else:
+                out["__covariates_values_%d" % i] = np.column_stack([g[0] for g in cov])
+                out["__covariates_name_%d" % i] = np.array([g[1] for g in cov])
+                out["__covariates_unit_%d" % i] = np.array([g[2] for g in cov])
         prefix = "__meta_" if i == 0 else "__meta_%d_" % i
         for k, v in nd.meta.items():
             out[meta_key(prefix, str(k))] = np.array(json.dumps(v, sort_keys=True,
