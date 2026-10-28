@@ -69,7 +69,7 @@ static std::string abHistXLabel(const ImageDoc* a, const ImageDoc* b,
     if (H.binW > 0)
         snprintf(gr, sizeof gr, "  |  bins %.6g..%.6g %s, %.6g %s/bin",
                  (double)H.binOrigin,
-                 (double)H.binOrigin + 256.0 * (double)H.binW,
+                 (double)H.binOrigin + (double)H.nBins * (double)H.binW,
                  xu.c_str(), (double)H.binW, xu.c_str());
     if (b && b->dtype != a->dtype)
         snprintf(xl, sizeof xl, "pixel value (%s, %s - bins every side)"
@@ -184,24 +184,29 @@ static void histZoomRange(float& lo, float& hi) {
 }
 
 // Commit a zoom onto the dragged interval [lo, hi) (already snapped onto the bin
-// grid the drag was made on, whose width is curW). Returns false - and says why
-// - when the range would not bin any finer: an integer histogram at 1 DN/bin
-// has nothing finer to show, and a "zoom" there would only shift the window.
-static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW) {
+// grid the drag was made on: curW wide, curN bins). Returns false - and says
+// why - in the two cases a zoom has nothing to show:
+//   * an integer range narrower than 2 DN: one bin of 1 DN is not a histogram;
+//   * a grid no narrower than the axis already on screen - dragging (nearly)
+//     the whole axis, where the "zoom" would only shift the window.
+static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN = 256) {
     if (!im || !(hi > lo)) return false;
     float o = 0, w = 0;
-    histBinGrid(im->dtype, lo, hi, o, w);
-    if (!(w < curW)) {
-        char b[160];
-        snprintf(b, sizeof b, "zoom: the bins are already %.6g DN wide - that range "
-                              "would not bin any finer", (double)curW);
-        toast(b, false);
+    int n = 256;
+    histZoomGrid(im->dtype, lo, hi, o, w, n);
+    const char* no = nullptr;
+    if (n < 2) no = "zoom: drag at least 2 DN - 1 DN per bin is as fine as an "
+                    "integer histogram gets";
+    else if (!((double)n * (double)w < (double)curN * (double)curW))
+        no = "zoom: that range is no narrower than the axis already on screen";
+    if (no) {
+        toast(no, false);
         return false;
     }
     App::HistZoom& Z = app.histZoom;
     Z.on = true;
     Z.lo = o;
-    Z.hi = (float)((double)o + 256.0 * (double)w);
+    Z.hi = (float)((double)o + (double)n * (double)w);
     Z.seqId = im->seqId; Z.uid = im->uid;
     Z.plane = app.histPlane; Z.dtype = im->dtype;
     if (app.histZoomSetsRange) {
@@ -350,10 +355,10 @@ static void histDragGesture(const PlotRect& pr, ImageDoc* im, const App::HistSta
     if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         dragging = false;
         const HistHlRange r = histHlFromDrag(pr, dragA, ImGui::GetMousePos(),
-                                             H.binOrigin, H.binW, !H.zoomed);
+                                             H.binOrigin, H.binW, !H.zoomed, H.nBins);
         if (!r.ok) return;                    // a click with jitter is not a drag
         if (dragZoom) {
-            histZoomApply(im, r.lo, r.hi, H.binW);
+            histZoomApply(im, r.lo, r.hi, H.binW, H.nBins);
             return;
         }
         // The binding is decided HERE, once, at the moment of the drag - and a
@@ -522,8 +527,9 @@ static void drawPanelHistogram() {
                 if (lit) ImGui::PopStyleColor(2);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip(mode == 0
-                        ? "Drag on the plot zooms: the 256 bins are laid again on the\n"
-                          "values you dragged, so they get finer. Double-click resets.\n"
+                        ? "Drag on the plot zooms: the bins are laid again on the values\n"
+                          "you dragged, so they get finer (down to 1 DN per bin for\n"
+                          "integer data). Double-click resets.\n"
                           "Shift+drag highlights a value range instead."
                         : "Drag on the plot highlights a value range on the image.\n"
                           "Double-click clears it. Shift+drag zooms instead.");
@@ -678,7 +684,7 @@ static void drawPanelHistogram() {
         const std::string xlBuf = abHistXLabel(im, Bim, H);
         const char* xl = xlBuf.c_str();
         // The x axis is the BIN GRID, not the black-white range. plotSeries
-        // places bin b positionally, at b/256 of the rect, so the rect has to
+        // places bin b positionally, at b/nBins of the rect, so the rect has to
         // span exactly what the bins span - and since the grid snaps outward
         // (histBinGrid) those two are no longer the same numbers. Drawn against
         // black..white the whole staircase would be stretched onto a narrower
@@ -686,13 +692,13 @@ static void drawPanelHistogram() {
         // binned on A's grid, so one pair of limits serves all of them.
         const float xLo = H.binW > 0 ? H.binOrigin : effBlack(*im);
         const float xHi = H.binW > 0
-                            ? (float)((double)H.binOrigin + 256.0 * (double)H.binW)
+                            ? (float)((double)H.binOrigin + (double)H.nBins * (double)H.binW)
                             : effWhite(*im);
 
         // one curve, one way to draw it: filled bars, solid outline, dashed
         // outline. The staircase is built once and reused by all three.
-        auto plotSeries = [&](const PlotRect& pr, const uint32_t bins[256], double sc,
-                              ImU32 col, int style,            // 0 fill, 1 solid, 2 dashed
+        auto plotSeries = [&](const PlotRect& pr, const uint32_t bins[256], int nBins,
+                              double sc, ImU32 col, int style,  // 0 fill, 1 solid, 2 dashed
                               float w = 1.4f) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             float pw = pr.p1.x - pr.p0.x, ph = pr.p1.y - pr.p0.y;
@@ -701,20 +707,24 @@ static void drawPanelHistogram() {
                 double f = app.histLog ? (logTop > 0 ? log1p(u) / logTop : 0.0) : u / yTop;
                 return pr.p1.y - (float)std::clamp(f, 0.0, 1.0) * ph;
             };
+            // the side's own nBins, not 256: a zoomed integer grid can use
+            // fewer slots, and the rect spans exactly the slots in use.
+            const int nb = std::clamp(nBins, 1, 256);
+            const float fn = (float)nb;
             if (style == 0) {
-                for (int b = 0; b < 256; b++) {
+                for (int b = 0; b < nb; b++) {
                     if (!bins[b]) continue;
-                    float bx0 = pr.p0.x + (float)b / 256.0f * pw;
+                    float bx0 = pr.p0.x + (float)b / fn * pw;
                     dl->AddRectFilled(ImVec2(bx0, yOf(bins[b])),
-                                      ImVec2(bx0 + pw / 256.0f + 0.5f, pr.p1.y), col);
+                                      ImVec2(bx0 + pw / fn + 0.5f, pr.p1.y), col);
                 }
                 return;
             }
             std::vector<ImVec2> pts;
             pts.reserve(512);
-            for (int b = 0; b < 256; b++) {
-                float bx0 = pr.p0.x + (float)b / 256.0f * pw;
-                float bx1 = pr.p0.x + (float)(b + 1) / 256.0f * pw;
+            for (int b = 0; b < nb; b++) {
+                float bx0 = pr.p0.x + (float)b / fn * pw;
+                float bx1 = pr.p0.x + (float)(b + 1) / fn * pw;
                 float y = yOf(bins[b]);
                 pts.push_back(ImVec2(bx0, y));
                 pts.push_back(ImVec2(bx1, y));
@@ -781,7 +791,7 @@ static void drawPanelHistogram() {
                 else if (H.nSeries == 1) col = i == 0 ? IM_COL32(200, 205, 210, 200) : AB_B_INK;
                 else                     col = i == 0 ? RGB_COLS[a]
                                                       : abLiftInk(RGB_COLS[a], 0.45f);
-                plotSeries(pr, sd.H->bins[s], norm ? sd.sc : 1.0, col,
+                plotSeries(pr, sd.H->bins[s], sd.H->nBins, norm ? sd.sc : 1.0, col,
                            i == 0 && !outlineA ? 0 : 1,
                            abCurveW(1.4f, emphOn && (int)i == emphIdx));
             }

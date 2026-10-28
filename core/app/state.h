@@ -1563,6 +1563,12 @@ struct App {
         // whole number of DN and no bin swallows one more integer value than
         // its neighbour. bin b spans [binOrigin + b*binW, binOrigin + (b+1)*binW).
         float binOrigin = 0, binW = 0;
+        // How many of the 256 slots the grid USES. 256 everywhere except a
+        // zoomed integer grid narrower than 256 DN (#309), which is binned at
+        // 1 DN/bin with one bin per DN of the zoom - so the axis is exactly the
+        // dragged range instead of a 256 DN window around it. The grid is
+        // [binOrigin, binOrigin + nBins*binW); slots past nBins stay 0.
+        int nBins = 256;
         int rx = -1, ry = -1, rw = -1, rh = -1;   // resolved ROI, not annRev
         int cfa = -1, cfaPattern = -1;
         int nSeries = 0;
@@ -1623,8 +1629,8 @@ struct App {
     // in the session.
     struct HistZoom {
         bool on = false;
-        // The GRID extent the bins are re-laid on, raw DN: histBinGrid of the
-        // dragged bins, so histBinGrid(lo, hi) hands back exactly this grid
+        // The GRID extent the bins are re-laid on, raw DN: histZoomGrid of the
+        // dragged bins, so histZoomGrid(lo, hi) hands back exactly this grid
         // again and the axis, the label and the linked range are one pair.
         float lo = 0, hi = 0;
         int seqId = 0;                // > 0: A's stack; 0: the document below

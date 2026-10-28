@@ -1671,6 +1671,26 @@ static void histBinGrid(const std::string& dtype, float black, float white,
     if (origin > black) origin -= w;            // rounding must never narrow it
 }
 
+// The grid a histogram ZOOM (#309) is binned on - the one definition, used by
+// the binning, the zoom's own extent and the refusal. histBinGrid's rule, with
+// one exception: an integer zoom whose width rounds to 1 DN/bin gets one bin
+// PER DN of the range instead of 256 of them. 256 bins at the 1 DN floor would
+// span 256 DN whatever was dragged, so an 8-bit image could not be zoomed at
+// all and a 12-bit one never below 256 DN - the dragged range silently became
+// a wider axis. Float keeps 256 bins (its width halves without a floor).
+static void histZoomGrid(const std::string& dtype, float lo, float hi,
+                         float& origin, float& w, int& n) {
+    histBinGrid(dtype, lo, hi, origin, w);
+    n = 256;
+    const bool intType = !dtype.empty() &&
+                         (dtype[0] == 'u' || dtype[0] == 'i' || dtype == "bool");
+    if (intType && w == 1.0f) {
+        origin = std::floor(lo);
+        const double top = std::ceil((double)hi);
+        n = (int)std::clamp(top - (double)origin, 1.0, 256.0);
+    }
+}
+
 // The cache slot is a parameter (slot 0 = A, slot 1 = compare B). Everything
 // below is the previous body with `app.hist` replaced by `H`.
 //
@@ -1699,7 +1719,8 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     // decision made in one place. Snapping below the comparison would miss the
     // cache every frame and re-scan a million pixels.
     float gOrigin = 0, gW = 0;
-    if (zoomed) histBinGrid(im->dtype, zoomLo, zoomHi, gOrigin, gW);
+    int gN = 256;
+    if (zoomed) histZoomGrid(im->dtype, zoomLo, zoomHi, gOrigin, gW, gN);
     else        histBinGrid(im->dtype, wantBlack, wantWhite, gOrigin, gW);
     // Key on the RESOLVED rect, never on annRev: annotation churn (dragging,
     // renaming, toggling visibility) must not re-scan a million pixels.
@@ -1720,7 +1741,7 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     if (app.annBusy && H.uid == im->uid) return;   // mid-drag: keep the last result
     H.img = im; H.uid = im->uid; H.dataRev = im->dataRev;
     H.black = wantBlack; H.white = wantWhite;
-    H.binOrigin = gOrigin; H.binW = gW;
+    H.binOrigin = gOrigin; H.binW = gW; H.nBins = gN;
     H.zoomed = zoomed;
     H.zoomLo = zoomed ? zoomLo : 0.0f; H.zoomHi = zoomed ? zoomHi : 0.0f;
     H.outLoN = H.outHiN = H.finite = 0;
@@ -1769,9 +1790,9 @@ static void recomputeHistogramIfNeeded(ImageDoc* im, App::HistState& H,
     // grid is counted as outside and binned nowhere.
     auto put = [&](int s, double t) {
         if (zoomed) {
-            if (t < 0)         H.outLoN++;
-            else if (t >= 256) H.outHiN++;
-            else               H.bins[s][(int)t]++;
+            if (t < 0)          H.outLoN++;
+            else if (t >= gN)   H.outHiN++;
+            else                H.bins[s][(int)t]++;
             return;
         }
         H.bins[s][t < 0 ? 0 : t >= 256 ? 255 : (int)t]++;
@@ -1959,8 +1980,10 @@ struct HistHlRange {
 // display-range grid, false on a zoomed one (#309), where bin 0 and bin 255
 // are ordinary bins and the pixels past them are counted as outside instead.
 // Only then does touching an end bin open that side.
+// `n` is how many bins the grid uses (HistState::nBins): the last one is n-1.
 static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
-                                  float origin, float w, bool endsFold = true) {
+                                  float origin, float w, bool endsFold = true,
+                                  int n = 256) {
     HistHlRange r;
     if (!pr.ok || !(w > 0) || !std::isfinite(w) || !std::isfinite(origin)) return r;
     if (fabsf(a.x - b.x) < 4.0f) return r;
@@ -1973,12 +1996,13 @@ static HistHlRange histHlFromDrag(const PlotRect& pr, ImVec2 a, ImVec2 b,
     // exists to make exact.
     const double t0 = std::floor(((double)xa - (double)origin) / (double)w);
     const double t1 = std::floor(((double)xb - (double)origin) / (double)w);
-    r.b0 = (int)std::clamp(t0, 0.0, 255.0);
-    r.b1 = (int)std::clamp(t1, 0.0, 255.0);
+    n = std::clamp(n, 1, 256);
+    r.b0 = (int)std::clamp(t0, 0.0, (double)(n - 1));
+    r.b1 = (int)std::clamp(t1, 0.0, (double)(n - 1));
     r.lo = (float)((double)origin + (double)r.b0 * (double)w);
     r.hi = (float)((double)origin + (double)(r.b1 + 1) * (double)w);
     r.loOpen = endsFold && r.b0 == 0;
-    r.hiOpen = endsFold && r.b1 == 255;
+    r.hiOpen = endsFold && r.b1 == n - 1;
     r.ok = true;
     return r;
 }

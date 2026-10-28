@@ -107,7 +107,8 @@ static int histZoomSelftest() {
         gpr.p0 = ImVec2(60, 120);
         gpr.p1 = ImVec2(860, 420);
         gpr.xmin = app.hist[0].binOrigin;
-        gpr.xmax = (float)((double)app.hist[0].binOrigin + 256.0 * (double)app.hist[0].binW);
+        gpr.xmax = (float)((double)app.hist[0].binOrigin +
+                           (double)app.hist[0].nBins * (double)app.hist[0].binW);
         gpr.ymin = 0; gpr.ymax = 1; gpr.ok = true;
         histDragGesture(gpr, d, app.hist[0]);
         endFrame();
@@ -130,7 +131,8 @@ static int histZoomSelftest() {
     auto expectDrag = [&](ImageDoc* d, float x0, float x1) {
         gestureFrame(d, ImVec2(1500, 990), false, false);      // settle gpr / hist[0]
         return histHlFromDrag(gpr, ImVec2(x0, 300), ImVec2(x1, 300),
-                              app.hist[0].binOrigin, app.hist[0].binW, !app.hist[0].zoomed);
+                              app.hist[0].binOrigin, app.hist[0].binW, !app.hist[0].zoomed,
+                              app.hist[0].nBins);
     };
 
     closeAll();
@@ -169,12 +171,13 @@ static int histZoomSelftest() {
         histFrame();
         const App::HistState& H = app.hist[0];
         float o = 0, w = 0;
-        histBinGrid(d->dtype, app.histZoom.lo, app.histZoom.hi, o, w);
-        fprintf(stderr, "histzoomselftest: Z1 grid origin=%.9g w=%.9g (histBinGrid %.9g %.9g) "
-                        "out %zu/%zu finite %zu\n", (double)H.binOrigin, (double)H.binW,
-                (double)o, (double)w, H.outLoN, H.outHiN, H.finite);
-        check(H.zoomed && H.binOrigin == o && H.binW == w,
-              "Z1 binOrigin / binW are histBinGrid(lo, hi) of the zoom");
+        int zn = 0;
+        histZoomGrid(d->dtype, app.histZoom.lo, app.histZoom.hi, o, w, zn);
+        fprintf(stderr, "histzoomselftest: Z1 grid origin=%.9g w=%.9g n=%d (histZoomGrid %.9g %.9g %d) "
+                        "out %zu/%zu finite %zu\n", (double)H.binOrigin, (double)H.binW, H.nBins,
+                (double)o, (double)w, zn, H.outLoN, H.outHiN, H.finite);
+        check(H.zoomed && H.binOrigin == o && H.binW == w && H.nBins == zn && zn == 256,
+              "Z1 binOrigin / binW / nBins are histZoomGrid(lo, hi) of the zoom");
         check(H.binW == 4.0f && H.binOrigin == 1024.0f,
               "Z1 ...which is 4 DN bins from 1024 (hand-derived): finer, not stretched");
         size_t sum = 0;
@@ -213,11 +216,14 @@ static int histZoomSelftest() {
         check(probeField(g_histZoomProbe, "marks") == "black,white",
               "Z1 a display range inside the zoom is marked at black and white");
         d->black = 0; d->white = 4095; d->texDirty = true;
-        // The integer floor: at 1 DN/bin nothing bins finer, and that is said.
+        // The integer floor: a range under 2 DN has no histogram to show.
         app.toast.clear();
-        check(!histZoomApply(d, 1024.0f, 1100.0f, 1.0f),
-              "Z1 a zoom that cannot bin finer than 1 DN is refused");
-        check(has(app.toast.c_str(), "already 1 DN wide"), "Z1 ...out loud");
+        check(!histZoomApply(d, 1024.0f, 1025.0f, 1.0f),
+              "Z1 an integer zoom narrower than 2 DN is refused");
+        check(has(app.toast.c_str(), "drag at least 2 DN"), "Z1 ...out loud");
+        app.toast.clear();
+        check(!histZoomApply(d, 0.0f, 4096.0f, 16.0f),
+              "Z1 a zoom onto the whole axis is refused too (it would only shift it)");
         check(app.histZoom.on && app.histZoom.lo == 1024.0f,
               "Z1 ...and the zoom in force is left as it was");
         histZoomReset(d);
@@ -433,6 +439,89 @@ static int histZoomSelftest() {
               "Z5 ...and the footer still says A's share");
         app.compareMode = App::CmpOff;
         setCompareB(nullptr);
+        app.histZoom = App::HistZoom{};
+    }
+
+    // ======================================================================
+    // Z7 - INTEGER ZOOMS NARROWER THAN 256 DN get one bin PER DN, so the axis
+    // is exactly the dragged range. Without this an 8-bit image could not be
+    // zoomed at all (its axis is already 1 DN/bin) and a 12-bit one never
+    // below a 256 DN window.
+    // u8 fixture: 16x16 holding each value 0..255 once, displayed 0..255, so
+    // the display grid is 256 bins of 1 DN from 0. The zoom 100..140 (DN 100
+    // through 140, the half-open [100, 141)) is 41 bins of 1 DN, 100 values
+    // below them and 115 (141..255) above.
+    // ======================================================================
+    {
+        auto u8 = mk("hz_u8", 16, 16, 1, "u8");
+        for (size_t i = 0; i < u8->px().size(); i++) u8->px()[i] = (float)i;
+        computeMinMax(*u8);
+        u8->black = 0; u8->white = 255; u8->texDirty = true;
+        app.images.push_back(std::move(u8));
+        ImageDoc* d = app.images.back().get();
+        app.current = (int)app.images.size() - 1;
+        app.histZoom = App::HistZoom{};
+        histHlClear();
+        histFrame();
+        check(app.hist[0].binW == 1.0f && app.hist[0].nBins == 256 && app.hist[0].binOrigin == 0.0f,
+              "Z7 fixture: the u8 axis is already 256 bins of 1 DN");
+        check(histZoomApply(d, 100.0f, 141.0f, app.hist[0].binW, app.hist[0].nBins),
+              "Z7 an 8-bit image zooms (it used to be refused)");
+        histFrame();
+        const App::HistState& H = app.hist[0];
+        size_t sum = 0;
+        bool every1 = true;
+        for (int b = 0; b < H.nBins; b++) { sum += H.bins[0][b]; every1 = every1 && H.bins[0][b] == 1; }
+        bool restEmpty = true;
+        for (int b = H.nBins; b < 256; b++) restEmpty = restEmpty && H.bins[0][b] == 0;
+        fprintf(stderr, "histzoomselftest: Z7 u8 zoom origin=%.6g w=%.6g n=%d out %zu/%zu "
+                        "finite %zu\n", (double)H.binOrigin, (double)H.binW, H.nBins,
+                H.outLoN, H.outHiN, H.finite);
+        check(H.zoomed && H.nBins == 41 && H.binW == 1.0f && H.binOrigin == 100.0f,
+              "Z7 zoom 100..140 is 41 bins of 1 DN from 100");
+        check(app.histZoom.lo == 100.0f && app.histZoom.hi == 141.0f,
+              "Z7 ...and the zoom IS the dragged range, not a 256 DN window");
+        check(every1 && restEmpty, "Z7 each DN in its own bin, no slot past the 41st used");
+        check(H.outLoN == 100 && H.outHiN == 115 && sum + H.outLoN + H.outHiN == H.finite &&
+              H.finite == 256,
+              "Z7 bins + outside == every finite value (41 + 100 + 115)");
+        check(probeField(g_histZoomProbe, "zoomed") == "100..141" &&
+              has(abHistXLabel(d, nullptr, H).c_str(), "bins 100..141 DN, 1 DN/bin"),
+              "Z7 the note and the axis span exactly 100..141");
+        // A highlight dragged inside the 41-bin axis lands on whole DN, closed.
+        HistHlRange e = expectDrag(d, 300, 900);    // past the right edge: last bin
+        dragOnce(d, 300, 900, true);
+        fprintf(stderr, "histzoomselftest: Z7 highlight %.6g..%.6g open %d/%d (bins %d..%d)\n",
+                (double)app.highlight.lo, (double)app.highlight.hi, (int)app.highlight.loOpen,
+                (int)app.highlight.hiOpen, e.b0, e.b1);
+        check(app.highlight.on && app.highlight.lo == e.lo && app.highlight.hi == 141.0f &&
+              e.b1 == 40 && !app.highlight.hiOpen &&
+              app.highlight.lo == std::floor(app.highlight.lo) && app.highlight.lo > 100.0f,
+              "Z7 a highlight on the zoomed axis is on DN boundaries, closed at 141");
+        histHlClear();
+        // The linked option sets exactly the dragged range.
+        histZoomReset(d);
+        app.histZoomSetsRange = true;
+        histZoomApply(d, 100.0f, 141.0f, 1.0f, 256);
+        check(d->black == 100.0f && d->white == 141.0f,
+              "Z7 linked: the display range becomes 100..141");
+        histZoomReset(d);
+        check(d->black == 0.0f && d->white == 255.0f, "Z7 linked: ...and comes back");
+        app.histZoomSetsRange = false;
+
+        // 12-bit: a 60 DN zoom on the 0..4095 ramp is 60 bins of 1 DN.
+        app.current = 0;                          // Z1's u16 0..4095 ramp
+        ImageDoc* r = app.images[0].get();
+        histFrame();
+        check(histZoomApply(r, 2000.0f, 2060.0f, app.hist[0].binW, app.hist[0].nBins),
+              "Z7 12-bit: a 60 DN zoom is taken");
+        histFrame();
+        const App::HistState& R = app.hist[0];
+        size_t rs = 0;
+        for (int b = 0; b < R.nBins; b++) rs += R.bins[0][b];
+        check(R.nBins == 60 && R.binW == 1.0f && R.binOrigin == 2000.0f && rs == 60 &&
+              R.outLoN == 2000 && R.outHiN == 2036 && rs + R.outLoN + R.outHiN == R.finite,
+              "Z7 12-bit: 60 bins of 1 DN from 2000, bins + outside == 4096");
         app.histZoom = App::HistZoom{};
     }
 
