@@ -196,7 +196,7 @@ static int videoSelftest() {
     };
 
     // ---- borrowed, and given back at the end -------------------------------
-    const int   saveScope = app.rangeScope;
+    const int   saveScope = app.rangeRule;
     const bool  saveLink  = app.linkRange;
     const int   saveCmpR  = app.compareRangeMode;
     const float saveFps   = app.videoFps;
@@ -207,7 +207,7 @@ static int videoSelftest() {
     {   // ---- V1: the container, read back --------------------------------
         // Per-stack mode with a range set by hand, so every expected byte below
         // comes from renderDocRGBA on numbers this test chose.
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         const int seq = mkSeq("v253_struct");
         const int i0 = mk("v1_0.npy", seq, 0, 1.0f, 0.0f);
         mk("v1_1.npy", seq, 1, 1.0f, 8.0f);
@@ -285,7 +285,7 @@ static int videoSelftest() {
         // A half-written video that plays for one of its three frames is worse
         // than no file: only the file survives to be looked at later, and it
         // says nothing about having been interrupted.
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         const int seq = mkSeq("v253_stop");
         const int i0 = mk("v2_0.npy", seq, 0, 1.0f, 0.0f);
         mk("v2_1.npy", seq, 1, 1.0f, 8.0f);
@@ -342,7 +342,7 @@ static int videoSelftest() {
         // so that this is NOTICEABLE rather than undefined: a uid that no
         // longer resolves is a frame that went away, and the job stops and
         // deletes instead of writing whatever moved into that slot.
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         const int seq = mkSeq("v253_closed");
         const int i0 = mk("v2c_0.npy", seq, 0, 1.0f, 0.0f);
         mk("v2c_1.npy", seq, 1, 1.0f, 8.0f);
@@ -367,7 +367,7 @@ static int videoSelftest() {
         // picture is a file that can never afterwards explain itself. The
         // refusal is exportRefusalFor's own words, so the two surfaces cannot
         // drift apart.
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         const int seq = mkSeq("v253_preview");
         const int i0 = mk("v3_0.npy", seq, 0, 1.0f, 0.0f);
         const int i1 = mk("v3_1.npy", seq, 1, 1.0f, 8.0f);
@@ -413,7 +413,7 @@ static int videoSelftest() {
         // Not a skip when ffmpeg is absent (#253): the absent case is FORCED by
         // pointing PATH at a directory that holds no ffmpeg, so the refusal is
         // asserted on every runner. PATH is put back immediately after.
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         const int seq = mkSeq("v253_ffmpeg");
         const int i0 = mk("v5_0.npy", seq, 0, 1.0f, 0.0f);
         mk("v5_1.npy", seq, 1, 1.0f, 8.0f);
@@ -508,7 +508,7 @@ static int videoSelftest() {
         // frames' loaded 0..1 range, frames 2 and 3 are saturated white, so a
         // missing re-fit is a uniform picture rather than a subtle shift, and
         // the anti-vacuity check below is precisely that.
-        app.rangeScope = 0;                 // Auto per frame
+        app.rangeRule = 0;                 // Auto per frame
         app.linkRange = false;
         const int seq = mkSeq("v253_perframe");
         const int i0 = mk("v6_0.npy", seq, 0, 1.0f, 0.0f);   // 0..47
@@ -578,7 +578,7 @@ static int videoSelftest() {
         // min..max and the anti-vacuity half could not be told from a no-op.)
         const int saveFlav = app.autoFlavor, saveBM = app.medBlackMode;
         const float saveTgt = app.medTarget;
-        app.rangeScope = 0;
+        app.rangeRule = 0;
         app.linkRange = false;
         app.autoFlavor = AF_Median;
         app.medBlackMode = MB_Min;
@@ -785,7 +785,7 @@ static int videoSelftest() {
         for (int scope = 0; scope <= 1; scope++)
         for (int mode = 0; mode <= 3; mode++)
         for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
-            app.rangeScope = scope; app.compareRangeMode = mode; app.autoFlavor = fl;
+            app.rangeRule = scope; app.compareRangeMode = mode; app.autoFlavor = fl;
             resetRanges();
             selectImage(fa[0]);
             std::vector<std::vector<uint8_t>> fr; std::string said;
@@ -835,7 +835,7 @@ static int videoSelftest() {
             bool all = true, said = true;
             for (int scope = 0; scope <= 1; scope++)
             for (int mode = 0; mode <= 3; mode++) {
-                app.rangeScope = scope; app.compareRangeMode = mode;
+                app.rangeRule = scope; app.compareRangeMode = mode;
                 resetRanges();
                 selectImage(fa[0]);
                 std::vector<std::vector<uint8_t>> fr; std::string s;
@@ -878,7 +878,7 @@ static int videoSelftest() {
             const std::string tag = std::string("drawn as ") + letter;
             for (int scope = 0; scope <= 1; scope++)
             for (int mode = 0; mode <= 3; mode++) {
-                app.rangeScope = scope; app.compareRangeMode = mode;
+                app.rangeRule = scope; app.compareRangeMode = mode;
                 resetRanges();
                 selectImage(fa[0]);
                 std::vector<std::vector<uint8_t>> fr; std::string s;
@@ -901,7 +901,7 @@ static int videoSelftest() {
             app.compareFollowFrame = false;
             bool all = true;
             for (int mode = 0; mode <= 3; mode++) {
-                app.rangeScope = 1; app.compareRangeMode = mode;
+                app.rangeRule = 1; app.compareRangeMode = mode;
                 resetRanges();
                 selectImage(fa[1]);
                 std::vector<std::vector<uint8_t>> fr; std::string s;
@@ -920,7 +920,7 @@ static int videoSelftest() {
             bool all = true;
             for (int scope = 0; scope <= 1; scope++)
             for (int mode = 0; mode <= 3; mode++) {
-                app.rangeScope = scope; app.compareRangeMode = mode;
+                app.rangeRule = scope; app.compareRangeMode = mode;
                 resetRanges();
                 selectImage(fa[0]);
                 std::vector<std::vector<uint8_t>> fr; std::string s;
@@ -936,7 +936,7 @@ static int videoSelftest() {
         }
 
         {   // ---- union: B's frame 2 changes -> the video's frame 2 changes ----
-            app.rangeScope = 0; app.compareRangeMode = 2; app.autoFlavor = AF_MinMax;
+            app.rangeRule = 0; app.compareRangeMode = 2; app.autoFlavor = AF_MinMax;
             ImageDoc* B1 = B_(1);
             const std::vector<float> keep = B1->src->data;
             for (float& x : B1->src->data) x *= 3.0f;
@@ -951,7 +951,7 @@ static int videoSelftest() {
         }
 
         {   // ---- the PNG: the view the dialog was opened under, and its note ---
-            app.rangeScope = 1; app.compareRangeMode = 2; app.autoFlavor = AF_MinMax;
+            app.rangeRule = 1; app.compareRangeMode = 2; app.autoFlavor = AF_MinMax;
             resetRanges();
             selectImage(fa[0]);
             const uint64_t viewA = cur()->uid;           // what the dialog captures
@@ -995,7 +995,7 @@ static int videoSelftest() {
         }
 
         {   // ---- a side the union is taken over is a preview: refused, named --
-            app.rangeScope = 1;
+            app.rangeRule = 1;
             const std::string path = tmpFile("viewer_video_v7c.avi");
             ImageDoc* B2 = B_(2);
             ImageDoc* C1 = C_(1);
@@ -1065,7 +1065,7 @@ static int videoSelftest() {
             bool m = true, said = true;
             for (int scope = 0; scope <= 1; scope++)
             for (int mode = 0; mode <= 3; mode++) {
-                app.rangeScope = scope; app.compareRangeMode = mode;
+                app.rangeRule = scope; app.compareRangeMode = mode;
                 resetRanges();
                 selectImage(fa4[0]);
                 std::vector<std::vector<uint8_t>> fr; std::string s;
@@ -1082,7 +1082,7 @@ static int videoSelftest() {
             }
             check(m, "V7 ...and frame 4 == the screen, B and C held, every mode x scope");
             check(said, "V7 ...and the union's toast says \"B held at frame 1\" (only the union's)");
-            app.rangeScope = 1; app.compareRangeMode = 2;
+            app.rangeRule = 1; app.compareRangeMode = 2;
             selectImage(fa4[3]);
             check(has(exportRangeNote(*cur(), comparedSides(), false), "; B held at frame 1"),
                   "V7 ...and so does a picture of frame 4");
@@ -1177,7 +1177,7 @@ static int videoSelftest() {
                 }
         };
         app.linkRange = false;
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         app.cmpExportLetters = false;
         app.diffGain = 0; app.diffAbs = false;
         selectImage(fa[0]);
@@ -1661,7 +1661,7 @@ static int videoSelftest() {
     }
 
     // The home is shared: give back every mode this test borrowed.
-    app.rangeScope       = saveScope;
+    app.rangeRule       = saveScope;
     app.linkRange        = saveLink;
     app.compareRangeMode = saveCmpR;
     app.videoFps         = saveFps;

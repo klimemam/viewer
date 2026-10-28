@@ -449,11 +449,7 @@ static void drawMenuBar(GLFWwindow* win) {
                                              "  each side fits itself" };
                 ImGui::TextDisabled("Display range");
                 for (int r = 0; r < 4; r++)
-                    if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) {
-                        app.compareRangeMode = r;
-                        if (ImageDoc* bb = cmpB()) bb->texDirty = true;
-                        if (cur()) cur()->texDirty = true;
-                    }
+                    if (ImGui::MenuItem(RN[r], nullptr, app.compareRangeMode == r)) setCompareRule(r);
                 // ...and, under the mode that asks it, WHICH fit (#301): the
                 // same three the Inspector's radio row offers, through the same
                 // setter.
@@ -462,7 +458,7 @@ static void drawMenuBar(GLFWwindow* win) {
                                                   "      fit: median" };
                     for (int f = AF_MinMax; f <= AF_Median; f++)
                         if (ImGui::MenuItem(FIT[f], nullptr, app.autoFlavor == f))
-                            setEachSideFlavor(f);
+                            setFlavor(f);
                 }
             }
             if (ImGui::IsItemHovered())

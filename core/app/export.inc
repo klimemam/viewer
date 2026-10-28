@@ -435,54 +435,29 @@ static App::SeqInfo* seqInfo(int id);   // fwd (defined with the stacks, in
 // decides who gets written to - a doc that somehow carried a negative id would
 // otherwise be fused with every other one, and that is not a mistake worth
 // leaving room for.
+// A frame that keeps its own range (ImageDoc::rangeOwn, #321) is the stack's
+// exception: it neither gives its numbers to the stack nor takes the stack's.
 static void shareStackRange(const ImageDoc& from) {
-    if (from.seqId <= 0) return;
+    if (from.seqId <= 0 || from.rangeOwn) return;
     // ...and the stack REMEMBERS whose fit it is wearing (#254). The Range row
     // answers by comparison, so on every frame but this one the shared numbers
     // no longer match that frame's own min/max and the lit button went dark on
     // the first step - the range was still shared, the display was not.
     if (App::SeqInfo* si = seqInfo(from.seqId)) si->rangeRefUid = from.uid;
     for (auto& d : app.images)
-        if (d.get() != &from && d->seqId == from.seqId) {
+        if (d.get() != &from && d->seqId == from.seqId && !d->rangeOwn) {
             d->black = from.black; d->white = from.white;
             d->texDirty = true;
         }
 }
-// The Range panel's one mode control (0 auto per frame / 1 per stack /
-// 2 linked). It lives here, not inside the combo, because choosing a mode has
-// to act on the frame ALREADY on screen: the per-frame policy is otherwise
-// applied only by selectImage, on a frame change, and the mode read as dead
-// until the first step (report 2026-08-03).
-// `flavor` is what "Auto per frame" means from now on (AutoFlavor, #252), or
-// -1 for "leave it as it is" - which is what the two modes that are not per
-// frame pass, and what every caller that predates the flavours means. The
-// combo's five entries are (mode, flavor) pairs; nothing else about the
-// contract moved.
-static void applyRangeMode(int mode, ImageDoc* on, int flavor = -1) {
-    bool wasLinked = app.linkRange;
-    if (flavor >= AF_MinMax && flavor <= AF_Median) app.autoFlavor = flavor;
-    app.linkRange = mode == 2;
-    app.rangeScope = mode == 0 ? 0 : 1;
-    if (on) {
-        if (app.linkRange && !wasLinked) {     // seed from what is on screen
-            app.linkBlack = on->black; app.linkWhite = on->white;
-        }
-        // the frame's OWN fit, not defaultRange: same reason as in selectImage
-        // (#245). WHICH fit is app.autoFlavor's answer, and refitByFlavor is
-        // the one place that answers it (#252).
-        if (mode == 0 && !app.linkRange) { refitByFlavor(*on); on->texDirty = true; }
-        // ...and switching TO "per stack" has to RE-share, for the same reason
-        // the mode has to act on the frame already on screen. Stepping in mode
-        // 0 rewrote every frame's stored range to its own min..max (main.cpp
-        // 1393 records that as known), so the stack arrives here holding
-        // per-frame values and merely raising the scope flag changes nothing
-        // you can see: the stored per-frame values simply reappear on the next
-        // step, which is the report's 「Per stack にしても一枚毎に Auto」
-        // (#248). The frame ON SCREEN is the reference - least surprise: the
-        // picture in front of you is the one you meant to spread.
-        if (mode == 1) shareStackRange(*on);
-    }
-    if (app.linkRange != wasLinked) markAllTexDirty();
+// The frame of `seqId` that holds the stack's range: any frame that does not
+// keep its own, other than `but`. Null when there is none (a single image, or
+// every other frame keeps its own).
+static const ImageDoc* stackRangeHolder(int seqId, const ImageDoc* but) {
+    if (seqId <= 0) return nullptr;
+    for (const auto& d : app.images)
+        if (d.get() != but && d->seqId == seqId && !d->rangeOwn) return d.get();
+    return nullptr;
 }
 // Linking is an overlay, never a rewrite: each image keeps its own range, so
 // unlinking restores exactly what every image had before.
@@ -590,7 +565,7 @@ static std::string exportRangeNote(const ImageDoc& im, const ViewSides& v, bool 
     static const char* SCOPE_FLAVOR[3] = { "min-max", "0.1-99.9%", "median->target" };
     static const char* AB_FIT[3] = { "min-max", "0.1-99.9%", "median" };
     const int fl = std::clamp(app.autoFlavor, (int)AF_MinMax, (int)AF_Median);
-    const bool perFrameScope = !app.linkRange && app.rangeScope == 0;
+    const bool perFrameScope = !app.linkRange && app.rangeRule == 0;
     const std::string scope = app.linkRange ? std::string("Linked across all images")
                             : perFrameScope ? std::string("Auto per frame (") + SCOPE_FLAVOR[fl] + ")"
                                             : std::string("Per stack (default)");
@@ -1164,37 +1139,127 @@ static void askCompareViewPng() {
         baseName(cur()->name) + "_compare.png",
         std::vector<std::string>{ "PNG (*.png)", "*.png" });
 }
-// WHICH fit "each side fits itself" draws with (#301), set from the radio row
-// under the A/B combo and from the View > Compare A/B menu. It is the SAME
-// variable "Auto per frame" re-fits by - one answer to "which fit", not one per
-// feature - so under Auto per frame the frame on screen re-fits exactly as it
-// does when the flavour is picked in the Range combo (applyRangeMode). Under
-// Per stack that variable has no other control at all, and without this the
-// mode could only ever show min-max. The per-side cache is keyed on the
-// flavour, so every compared side re-fits on its next draw; the dirty marks
-// only make the textures follow on this frame.
-static void setEachSideFlavor(int fl) {
-    if (fl < AF_MinMax || fl > AF_Median) return;
-    if (!app.linkRange && app.rangeScope == 0 && cur()) applyRangeMode(0, cur(), fl);
-    else app.autoFlavor = fl;
-    const ViewSides v = comparedSides();
-    for (int i = 0; i < v.n; i++) v.side[i]->texDirty = true;
+// ---- the Range setters (#321) ----------------------------------------------
+// The scope (who shares one range) and the rule (how it is decided) are chosen
+// through these and nothing else - the Inspector, the View menu and the tests
+// all call them, so a mode is never a side effect of a combo.
+
+// Is a comparison on screen at all - the `A+B` scope exists only then.
+static bool comparing() { return comparedSides().n >= 2; }
+
+// The scope the `applies to` row lights for `im` (the doc on screen).
+static int rangeScopeOf(const ImageDoc* im) {
+    if (app.linkRange) return RS_All;
+    if (app.compareRangeMode != 0 && comparing()) return RS_Compared;
+    if (im && im->rangeOwn && im->seqId > 0) return RS_Frame;
+    return RS_Stack;
 }
 
+// Choose who shares one range. `on` is the doc on screen.
+//   frame    - `on` alone keeps the range it is drawn at now
+//   stack    - `on` rejoins its stack's range; compare goes to "each keeps its own"
+//   compared - every compared side, at the compare rule last chosen
+//   all      - one range overlays every open image, seeded from what is on screen
+static void setRangeScope(int s, ImageDoc* on) {
+    float seenLo = 0, seenHi = 0;
+    if (on) { seenLo = effBlack(*on); seenHi = effWhite(*on); }
+    const bool wasLinked = app.linkRange;
+    const bool cmp = comparing();
+    if (s != RS_All) app.linkRange = false;
+    if ((s == RS_Frame || s == RS_Stack) && cmp && app.compareRangeMode != 0) {
+        app.compareRuleLast = app.compareRangeMode;
+        app.compareRangeMode = 0;
+    }
+    if (s == RS_Frame && on && on->seqId > 0) {
+        on->rangeOwn = true;
+        on->black = seenLo; on->white = seenHi;
+    } else if (s == RS_Stack && on && on->rangeOwn) {
+        on->rangeOwn = false;
+        if (const ImageDoc* h = stackRangeHolder(on->seqId, on)) {
+            on->black = h->black; on->white = h->white;
+        }
+    } else if (s == RS_Compared && cmp) {
+        app.compareRangeMode = std::clamp(app.compareRuleLast, 1, 3);
+    } else if (s == RS_All) {
+        if (!wasLinked) { app.linkBlack = seenLo; app.linkWhite = seenHi; }
+        app.linkRange = true;
+    }
+    markAllTexDirty();
+}
+
+// Choose the stack's rule. Going to "one range" adopts the fit of the frame on
+// screen as the stack's range: the picture in front of you is the one you
+// meant to spread (#248's P8 ruling). A frame that keeps its own range is not
+// the stack, so it spreads nothing.
+static void setRangeRule(int r, ImageDoc* on) {
+    if (r != RR_EachFrame && r != RR_OneRange) return;
+    if (r == app.rangeRule) return;
+    app.rangeRule = r;
+    if (on && !on->rangeOwn && !app.linkRange) {
+        if (r == RR_EachFrame) refitByFlavor(*on);
+        else shareStackRange(*on);
+    }
+    markAllTexDirty();
+}
+
+// Choose the compare rule: 0 "each keeps its own" (the scope is then the
+// stack), 1 A's range, 2 union, 3 each side fits itself.
+static void setCompareRule(int m) {
+    if (m < 0 || m > 3) return;
+    if (m >= 1) app.compareRuleLast = m;
+    app.compareRangeMode = m;
+    markAllTexDirty();
+}
+
+// WHICH fit "each frame fits itself" and "each side fits itself" draw with
+// (#252, #301): one variable for both, chosen by the fit buttons under those
+// rules, the "fit:" items of View > Compare A/B, and the session.
+static void setFlavor(int fl) {
+    if (fl < AF_MinMax || fl > AF_Median) return;
+    app.autoFlavor = fl;
+    ImageDoc* on = cur();
+    if (on && !app.linkRange && app.rangeRule == RR_EachFrame && !on->rangeOwn) refitByFlavor(*on);
+    markAllTexDirty();
+}
+
+// Every write of a display range - the number field, all six buttons, the
+// Histogram's zoom link, the tests - arrives here, and goes to the scope in
+// force (I1): all open -> the link range; frame -> that frame alone; A+B ->
+// A's stack; stack -> the stack, minus its frames that keep their own.
+// A fixed number is a declaration that ONE range is wanted (I2): under "each
+// frame fits itself" the rule moves to "one range", under the union or "each
+// side fits itself" to A's range - otherwise the number is written and the
+// screen goes on drawing the fit, which is the trap #321 closes. The move is
+// said, because the rule row changing under you would otherwise be silent.
 static void setRange(ImageDoc& im, float black, float white) {
     if (!(white > black)) return;
     if (app.linkRange) {
         app.linkBlack = black; app.linkWhite = white;
         markAllTexDirty();            // shared value changed: every image re-renders
-    } else {
-        im.black = black; im.white = white; im.texDirty = true;
-        // ONE path for the number field and all five buttons - they all arrive
-        // here - so "Per stack" holds for every one of them (#248). Without
-        // this, pressing Auto in per-stack mode fitted the frame on screen and
-        // left its siblings on their old numbers, i.e. the mode read as a
-        // load-time accident rather than a policy.
-        if (app.rangeScope == 1) shareStackRange(im);
+        return;
     }
+    ImageDoc* t = &im;
+    const ViewSides v = comparedSides();
+    if (app.compareRangeMode != 0 && sideOfView(im, v)) {
+        if (app.compareRangeMode != 1) {
+            toast(std::string("A/B range: ") +
+                  (app.compareRangeMode == 2 ? "union" : "each side fits itself") +
+                  " -> A's range (a typed or fixed range is one range)", false);
+            app.compareRangeMode = 1;
+            app.compareRuleLast = 1;
+        }
+        t = v.side[0];
+        for (int i = 0; i < v.n; i++) v.side[i]->texDirty = true;
+    }
+    t->black = black; t->white = white; t->texDirty = true;
+    if (t->rangeOwn) return;          // this frame only
+    if (app.rangeRule == RR_EachFrame) {
+        toast("range rule: each frame fits itself -> one range "
+              "(a typed or fixed range is one range for the stack)", false);
+        app.rangeRule = RR_OneRange;
+        markAllTexDirty();
+    }
+    shareStackRange(*t);
 }
 
 // ---- which Range button is the range currently in force? (#248) ------------
@@ -1226,7 +1291,7 @@ enum RangeButton { RB_Auto = 0, RB_AutoPct, RB_Median, RB_0_1, RB_0_255, RB_0_65
 // fits itself" (#301) shows every compared side at ITS OWN fit, so that side's
 // own pixels are what the row has to compare against.
 static ImageDoc* rangeRefDoc(ImageDoc& im) {
-    if (app.linkRange || app.rangeScope != 1 || im.seqId <= 0) return &im;
+    if (app.linkRange || app.rangeRule != RR_OneRange || im.seqId <= 0 || im.rangeOwn) return &im;
     if (app.compareRangeMode == 3 && comparedSideOf(im)) return &im;
     App::SeqInfo* si = seqInfo(im.seqId);
     if (!si || si->rangeRefUid == 0) return nullptr;

@@ -95,7 +95,7 @@
             app.compareRangeMode = save;
         }
         for (int m = 0; m < 3; m++) {
-            app.rangeScope = m == 0 ? 0 : 1;
+            app.rangeRule = m == 0 ? 0 : 1;
             app.linkRange = m == 2;
             if (app.linkRange) { app.linkBlack = app.images[fa[0]]->vmin;
                                  app.linkWhite = app.images[fa[0]]->vmax; }
@@ -132,19 +132,19 @@
         // 画像がかわらず、コマ送りすると反映される").
         {
             app.linkRange = false;
-            app.rangeScope = 1;                       // per stack
+            app.rangeRule = 1;                       // per stack
             selectImage(fa[1]);                       // a frame that inherited
             ImageDoc* d = cur();
             d->black = d->vmin - 1000; d->white = d->vmax + 1000;   // clearly not its own fit
             float wasB = d->black, wasW = d->white;
-            applyRangeMode(0, d);              // exactly what the combo calls
+            setRangeRule(RR_EachFrame, d);     // exactly what the rule row calls
             bool refit = d->black != wasB || d->white != wasW;
             fprintf(stderr, "rangeselftest: auto-per-frame applied on the spot: "
                             "%.6g..%.6g -> %.6g..%.6g (frame data %.6g..%.6g) %s\n",
                     wasB, wasW, d->black, d->white, d->vmin, d->vmax,
                     refit ? "ok" : "WRONG");
             if (!refit) bad++;
-            app.rangeScope = 1;
+            app.rangeRule = 1;
         }
 
         // ---- P17: "A/B: each side fits itself" (#301) ----------------------
@@ -177,7 +177,7 @@
                 std::vector<int> g0 = framesOfSeq(app.seqs[0].id), g1 = framesOfSeq(app.seqs[1].id),
                                  g2 = framesOfSeq(app.seqs[2].id);
                 app.linkRange = false;
-                app.rangeScope = 1;                    // per stack: the default
+                app.rangeRule = 1;                    // per stack: the default
                 app.compareFollowFrame = true;
                 selectImage(g0[0]);
                 app.cmpExtra.clear();
@@ -216,17 +216,17 @@
                 const int saveBlackMode = app.medBlackMode;
                 if (A && B && C) {
                     // The flavour is picked through the mode's own selector
-                    // (setEachSideFlavor - what the radio row under the A/B combo
+                    // (setFlavor - what the radio row under the A/B combo
                     // and the View menu items call), and every side must move
                     // with it: the selector exists so "each side at Auto %" can
                     // be chosen at all under Per stack.
                     app.compareRangeMode = 3;
-                    setEachSideFlavor(AF_Median);           // start away from min-max
+                    setFlavor(AF_Median);           // start away from min-max
                     float prevLo[3] = {}, prevHi[3] = {};
                     {   int k = 0;
                         for (ImageDoc* d : { A, B, C }) { prevLo[k] = effBlack(*d); prevHi[k] = effWhite(*d); k++; } }
                     for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
-                        setEachSideFlavor(fl);
+                        setFlavor(fl);
                         bool each = true, lamps = true, moved = true;
                         float w[3] = {};
                         int k = 0;
@@ -284,7 +284,7 @@
                     // New pixels on one side (computeMinMax is where reload, crop
                     // and detrend arrive): that side re-fits, from the new pixels.
                     {
-                        setEachSideFlavor(AF_Pct);
+                        setFlavor(AF_Pct);
                         const float wasLo = effBlack(*B);
                         const std::vector<float> keep = B->px();
                         for (float& v : B->px()) v += 100.0f;
@@ -307,7 +307,7 @@
                     ok(uni, "mode 2 again: every side back on the union");
                     // step: follow-frame moves B and C onto A's new frame number
                     app.compareRangeMode = 3;
-                    setEachSideFlavor(AF_Pct);
+                    setFlavor(AF_Pct);
                     const float wasB = effWhite(*B), wasC = effWhite(*C);
                     selectImage(g0[1]);
                     std::vector<ImageDoc*> ex2 = compareExtras();
@@ -330,7 +330,7 @@
                         // Per stack, on frames that are NOT the frame whose range
                         // the stack shares: the lamp must still compare each side
                         // against its own pixels, because that is the range in force.
-                        bool lamps = app.rangeScope == 1;
+                        bool lamps = app.rangeRule == 1;
                         for (ImageDoc* d : { B2, C2 })
                             lamps = lamps && rangeButtonMatches(*d, RB_AutoPct, effBlack(*d), effWhite(*d));
                         ok(lamps, "step, Per stack: Auto % lit on B and C at their own new fit");
@@ -499,11 +499,12 @@
             // arbitrary-unit frame running 0.3..0.6 therefore came back as
             // 0..1 on every step and the mode looked dead (#245).
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope;
+            const int  saveScope = app.rangeRule;
             auto d = mkRamp("apf", 0.3f, 0.6f, 0, 0.0f);
             d->black = -5; d->white = 5;                  // clearly not its own fit
             app.linkRange = false;
-            applyRangeMode(0, d.get());                   // what the combo calls
+            app.rangeRule = RR_OneRange;
+            setRangeRule(RR_EachFrame, d.get());          // what the rule row calls
             const float gotB = d->black, gotW = d->white;
             bool own = fabsf(gotB - d->vmin) < 1e-6f && fabsf(gotW - d->vmax) < 1e-6f;
             // anti-vacuity: this fixture really does trip the load-time magnet,
@@ -516,7 +517,7 @@
                     d->black, d->white, magnet ? "(the magnet, still there)" : "ANTI-VACUITY LOST");
             if (!own || !magnet) bad++;
             app.linkRange = saveLink;
-            app.rangeScope = saveScope;
+            app.rangeRule = saveScope;
         }
 
         {   // ---- P6: and the frame-step path is wired to the same fit ------
@@ -525,9 +526,9 @@
             // this is a wiring check (the regression is caught by P5) - it
             // asserts the frame stepped ONTO holds its OWN numbers.
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope;
+            const int  saveScope = app.rangeRule;
             app.linkRange = false;
-            app.rangeScope = 0;
+            app.rangeRule = 0;
             selectImage(fa[0]);
             selectImage(fa[1]);
             ImageDoc* f = cur();
@@ -538,7 +539,7 @@
                     f ? f->vmin : 0.f, f ? f->vmax : 0.f, own ? "ok" : "WRONG");
             if (!own) bad++;
             app.linkRange = saveLink;
-            app.rangeScope = saveScope;
+            app.rangeRule = saveScope;
         }
         // ==================================================================
         // #248 - "Per stack" as a policy that is HELD, not a load-time
@@ -554,7 +555,7 @@
             // (#248 (b)); the mode only ever looked right because frames
             // INHERIT at landing and nothing had disturbed them yet.
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope;
+            const int  saveScope = app.rangeRule;
             const size_t imgWas = app.images.size();
             auto A3 = mkRamp("ps_A", 0.3f, 0.6f, 0, 0.0f);   // data 0.3..0.6
             auto B3 = mkRamp("ps_B", 2.0f, 3.0f, 0, 0.0f);   // data 2..3
@@ -571,7 +572,7 @@
             pool.push_back(std::move(B3));
             std::swap(app.images, pool);
             app.linkRange = false;
-            app.rangeScope = 1;                              // per stack
+            app.rangeRule = 1;                              // per stack
             setRange(*pA, 0.3f, 0.6f);                       // what "Auto" on A presses
             bool shared = pB->black == 0.3f && pB->white == 0.6f && pB->texDirty;
             fprintf(stderr, "rangeselftest: P7 per-stack setRange | A %.6g..%.6g -> "
@@ -579,17 +580,22 @@
                     pA->black, pA->white, pB->black, pB->white, shared ? "ok" : "WRONG");
             if (!shared) bad++;
 
-            // ...and "auto per frame" must NOT spread: the sibling keeps what
-            // it had, and is not even marked for redraw.
-            app.rangeScope = 0;
+            // ...and under "each frame fits itself" a written range is a
+            // declaration of ONE range (#321 I2): the rule moves to one range
+            // and the number reaches the whole stack. (It used to touch A
+            // alone, and the next step drew the fit over it.)
+            app.rangeRule = RR_EachFrame;
             pB->texDirty = false;
             setRange(*pA, 0.0f, 255.0f);
-            bool alone = pB->black == 0.3f && pB->white == 0.6f && !pB->texDirty &&
-                         pA->black == 0.0f && pA->white == 255.0f;
-            fprintf(stderr, "rangeselftest: P7 scope 0 touches A only | A %.6g..%.6g "
-                            "sibling %.6g..%.6g (expect 0.3..0.6, untouched) %s\n",
-                    pA->black, pA->white, pB->black, pB->white, alone ? "ok" : "WRONG");
-            if (!alone) bad++;
+            bool declared = app.rangeRule == RR_OneRange && pB->black == 0.0f &&
+                            pB->white == 255.0f && pB->texDirty &&
+                            pA->black == 0.0f && pA->white == 255.0f;
+            fprintf(stderr, "rangeselftest: P7 each-frame + a typed range -> one range for the stack | "
+                            "A %.6g..%.6g sibling %.6g..%.6g rule %d (expect 0..255 both, rule 1) %s\n",
+                    pA->black, pA->white, pB->black, pB->white, app.rangeRule,
+                    declared ? "ok" : "WRONG");
+            if (!declared) bad++;
+            pB->black = 0.3f; pB->white = 0.6f;
 
             // ...and a standalone image is not a stack. Only a POSITIVE seqId
             // names one ("0 = standalone, >0 = frame of that sequence"), and
@@ -598,7 +604,7 @@
             // negative pass is the same claim for an id that should never
             // exist - a doc carrying one must not be treated as a stack of all
             // the others.
-            app.rangeScope = 1;
+            app.rangeRule = 1;
             bool single = true;
             for (int id : { 0, -1 }) {
                 pA->seqId = id; pB->seqId = id;
@@ -619,7 +625,7 @@
                 bad++;
             }
             app.linkRange = saveLink;
-            app.rangeScope = saveScope;
+            app.rangeRule = saveScope;
         }
 
         {   // ---- P8: switching TO "Per stack" re-shares --------------------
@@ -631,7 +637,7 @@
             // values then reappeared on every step: 「Per stack にしても一枚毎
             // に Auto されてしまう」. The frame on screen is the reference.
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope;
+            const int  saveScope = app.rangeRule;
             const size_t imgWas = app.images.size();
             auto A4 = mkRamp("ms_A", 0.3f, 0.6f, 0, 0.0f);
             auto B4 = mkRamp("ms_B", 2.0f, 3.0f, 0, 0.0f);
@@ -647,9 +653,9 @@
             pool.push_back(std::move(B4));
             std::swap(app.images, pool);
             app.linkRange = false;
-            app.rangeScope = 0;                        // coming FROM auto-per-frame
-            applyRangeMode(1, pA);                     // exactly what the combo calls
-            bool reshared = app.rangeScope == 1 && !app.linkRange &&
+            app.rangeRule = 0;                        // coming FROM auto-per-frame
+            setRangeRule(RR_OneRange, pA);             // exactly what the rule row calls
+            bool reshared = app.rangeRule == 1 && !app.linkRange &&
                             pB->black == 0.3f && pB->white == 0.6f && pB->texDirty &&
                             pA->black == 0.3f && pA->white == 0.6f;
             fprintf(stderr, "rangeselftest: P8 mode 0 -> 1 re-shares | A %.6g..%.6g "
@@ -663,7 +669,7 @@
                 bad++;
             }
             app.linkRange = saveLink;
-            app.rangeScope = saveScope;
+            app.rangeRule = saveScope;
         }
 
         {   // ---- P9: the first batch of a new stack has no seam ------------
@@ -938,7 +944,7 @@
             // answers on this fixture, so P13 would fail outright if the
             // flavour were ignored and minmax applied.
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope, saveFlav = app.autoFlavor;
+            const int  saveScope = app.rangeRule, saveFlav = app.autoFlavor;
             const int  saveBM = app.medBlackMode;
             const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
             app.linkRange = false;
@@ -946,7 +952,12 @@
             auto d = mkRamp("flav", 0.3f, 0.6f, 0, 0.0f);
             // black = 0 typed, median 0.45, target 0.5 -> 0 .. 0.9
             d->black = -5; d->white = 5;                   // clearly not any fit
-            applyRangeMode(0, d.get(), AF_Median);         // what the combo calls
+            auto eachFrameAt = [&](int fl) {               // what the rule row + fit buttons call
+                app.rangeRule = RR_OneRange;
+                app.autoFlavor = fl;
+                setRangeRule(RR_EachFrame, d.get());
+            };
+            eachFrameAt(AF_Median);
             bool medFit = app.autoFlavor == AF_Median &&
                           d->black == 0.0f && fabsf(d->white - 0.9f) < 1e-3f;
             fprintf(stderr, "rangeselftest: P13 flavor median %.6g..%.6g (expect 0..0.9) %s\n",
@@ -956,7 +967,7 @@
             // unchanged. These two must not be the same numbers, or the test
             // above proves nothing.
             d->black = -5; d->white = 5;
-            applyRangeMode(0, d.get(), AF_MinMax);
+            eachFrameAt(AF_MinMax);
             bool mmFit = app.autoFlavor == AF_MinMax &&
                          d->black == d->vmin && d->white == d->vmax;
             bool distinct = !(d->vmin == 0.0f && fabsf(d->vmax - 0.9f) < 1e-3f);
@@ -967,7 +978,7 @@
             if (!mmFit || !distinct) bad++;
             // ...and the pct flavor is wired too, to its own cached answer
             d->black = -5; d->white = 5;
-            applyRangeMode(0, d.get(), AF_Pct);
+            eachFrameAt(AF_Pct);
             float qlo = 0, qhi = 0;
             percentileRange(*d, 0.001f, 0.999f, qlo, qhi);
             bool pctFit = d->black == qlo && d->white == qhi && qlo > d->vmin;
@@ -978,7 +989,7 @@
             // ...and the OTHER re-fit site: stepping a frame (P6's shape).
             // selectImage is where the mode is applied while you work, and it
             // has to read the same flavor the combo just set.
-            app.rangeScope = 0;
+            app.rangeRule = 0;
             app.autoFlavor = AF_Median;
             selectImage(fa[0]);
             selectImage(fa[1]);
@@ -994,17 +1005,17 @@
                     f ? f->vmin : 0.f, f ? f->vmax : 0.f,
                     stepped ? "ok" : "WRONG", notMinMax ? "ok" : "ANTI-VACUITY LOST");
             if (!stepped || !notMinMax) bad++;
-            app.linkRange = saveLink; app.rangeScope = saveScope; app.autoFlavor = saveFlav;
+            app.linkRange = saveLink; app.rangeRule = saveScope; app.autoFlavor = saveFlav;
             app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
         }
 
         {   // ---- P14: the Med lamp, and the session round trip -------------
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope, saveFlav = app.autoFlavor;
+            const int  saveScope = app.rangeRule, saveFlav = app.autoFlavor;
             const int  saveBM = app.medBlackMode;
             const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
             app.linkRange = false;
-            app.rangeScope = 0;                    // a lone fixture is not a stack
+            app.rangeRule = 0;                    // a lone fixture is not a stack
             app.medBlackMode = MB_Min; app.medTarget = 0.5f; app.medBlackValue = 0.0f;
             auto d = mkRamp("medbtn", 0.3f, 0.6f, 0, 0.0f);
             float lo = 0, hi = 0;
@@ -1096,7 +1107,7 @@
                         imgWas, app.images.size());
                 bad++;
             }
-            app.linkRange = saveLink; app.rangeScope = saveScope; app.autoFlavor = saveFlav;
+            app.linkRange = saveLink; app.rangeRule = saveScope; app.autoFlavor = saveFlav;
             app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
         }
 
@@ -1110,7 +1121,7 @@
             // frame ON SCREEN, so on the next frame they were nobody's fit and
             // the lamp went out. The range was never lost; the display was.
             const bool saveLink = app.linkRange;
-            const int  saveScope = app.rangeScope;
+            const int  saveScope = app.rangeRule;
             const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
             auto A5 = mkRamp("ref_A", 0.3f, 0.6f, 0, 0.0f);   // data 0.3..0.6
             auto B5 = mkRamp("ref_B", 2.0f, 3.0f, 0, 0.0f);   // data 2..3
@@ -1125,7 +1136,7 @@
             si.id = 4245; si.name = "ref";    // seqInfo is where the reference is kept
             app.seqs.push_back(si);
             app.linkRange = false;
-            app.rangeScope = 1;                        // per stack
+            app.rangeRule = 1;                        // per stack
             setRange(*pA, pA->vmin, pA->vmax);         // what "Auto" on A presses
             bool spread = pB->black == 0.3f && pB->white == 0.6f;
             bool litA = rangeButtonMatches(*pA, RB_Auto, pA->black, pA->white);
@@ -1141,7 +1152,7 @@
             if (!spread || !litA || !litB || !notBs) bad++;
             // "Auto per frame" is unchanged: there the frame on screen IS the
             // subject, and the sibling's inherited range is not its own fit.
-            app.rangeScope = 0;
+            app.rangeRule = 0;
             bool perFrame = !rangeButtonMatches(*pB, RB_Auto, pB->black, pB->white) &&
                             rangeButtonMatches(*pB, RB_Auto, pB->vmin, pB->vmax);
             fprintf(stderr, "rangeselftest: P15 auto-per-frame asks the frame itself: %s\n",
@@ -1149,7 +1160,7 @@
             if (!perFrame) bad++;
             // ...and a reference that is gone is not silently replaced by the
             // frame on screen: no comparison to make, no claim to publish.
-            app.rangeScope = 1;
+            app.rangeRule = 1;
             if (App::SeqInfo* s = seqInfo(4245)) s->rangeRefUid = app.nextUid + 999;
             bool darkGone = !rangeButtonMatches(*pB, RB_Auto, pB->black, pB->white) &&
                             !rangeButtonMatches(*pB, RB_Median, pB->black, pB->white);
@@ -1169,7 +1180,7 @@
                 bad++;
             }
             app.linkRange = saveLink;
-            app.rangeScope = saveScope;
+            app.rangeRule = saveScope;
         }
 
         // ==================================================================
@@ -1250,8 +1261,354 @@
             if (!magnet) bad++;
         }
 
+        // ==================================================================
+        // #321 S1 - every OLD range setting a session can carry comes back
+        // drawing the SAME screen bytes. The redesign renamed the scope into a
+        // rule and stopped "each frame fits itself" from writing stored
+        // numbers; neither may change a single byte of what an existing
+        // session shows. The table below was RECORDED on main 1801384f, before
+        // any of #321, by this very block (FNV-1a 64 over renderDocRGBA of A
+        // then B, in the screen's view) - so a red row is a byte the redesign
+        // moved.
+        // The fixture is what main leaves behind in use: under "Auto per frame"
+        // a frame that has been on screen holds its own fit (selectImage wrote
+        // it there), so A's and B's stored numbers are their fits for that
+        // setting; under "Per stack" they hold the stack's one range. A frame
+        // main never put on screen held its stack's inherited numbers under
+        // Auto per frame - a history the new model no longer has (it draws
+        // every frame at its fit), and that difference is the point of #321's
+        // I3, not a regression this table should hide; it is not a row here.
+        // ==================================================================
+        {
+            static const uint64_t S1_WANT[] = {
+                // compare off: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0xfd51611bc598bfe4ull, 0xe285ef5068831792ull, 0x0a7b8660233b9ab4ull,
+                0x512381965dfbf738ull, 0x512381965dfbf738ull, 0x512381965dfbf738ull,
+                0x35e3bf6297cde2b2ull, 0x35e3bf6297cde2b2ull, 0x35e3bf6297cde2b2ull,
+                0x35e3bf6297cde2b2ull, 0x35e3bf6297cde2b2ull, 0x35e3bf6297cde2b2ull,
+                // cmprange 0: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x61fe3bb558d7c089ull, 0x2f6629b19b91e702ull, 0x6381e4bfb0f6e931ull,
+                0xfdba2f998ee13630ull, 0xfdba2f998ee13630ull, 0xfdba2f998ee13630ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                // cmprange 1: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x5262214215abc756ull, 0xc38f47fc101a1792ull, 0x2de41701f5da9ab4ull,
+                0x64d0238827aaf738ull, 0x64d0238827aaf738ull, 0x64d0238827aaf738ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                // cmprange 2: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x24863570b5253d5eull, 0x24863570b5253d5eull, 0x24863570b5253d5eull,
+                0x24863570b5253d5eull, 0x24863570b5253d5eull, 0x24863570b5253d5eull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                // cmprange 3: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x61fe3bb558d7c089ull, 0x2f6629b19b91e702ull, 0x6381e4bfb0f6e931ull,
+                0x61fe3bb558d7c089ull, 0x2f6629b19b91e702ull, 0x6381e4bfb0f6e931ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                // cmpshare 0: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x61fe3bb558d7c089ull, 0x2f6629b19b91e702ull, 0x6381e4bfb0f6e931ull,
+                0xfdba2f998ee13630ull, 0xfdba2f998ee13630ull, 0xfdba2f998ee13630ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                // cmpshare 1: link 0 (scope 0 fl 0..2, scope 1 fl 0..2), link 1 (same)
+                0x5262214215abc756ull, 0xc38f47fc101a1792ull, 0x2de41701f5da9ab4ull,
+                0x64d0238827aaf738ull, 0x64d0238827aaf738ull, 0x64d0238827aaf738ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+                0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull, 0x24108d5b2be4e2b2ull,
+            };
+            const size_t nWant = sizeof S1_WANT / sizeof S1_WANT[0];
+            const bool recording = nWant == 1 && S1_WANT[0] == 0;
+            const bool saveLink = app.linkRange;
+            const float saveLB = app.linkBlack, saveLW = app.linkWhite;
+            const int saveScope = app.rangeRule, saveFlav = app.autoFlavor, saveCmpR = app.compareRangeMode;
+            const int saveBM = app.medBlackMode;
+            const float saveTgt = app.medTarget, saveBV = app.medBlackValue;
+            const auto saveCmpMode = app.compareMode;
+            const bool saveFollow = app.compareFollowFrame;
+            const uint64_t saveBUid = app.compareBUid, saveLastB = app.lastCompareBUid;
+            const std::string saveBName = app.compareB;
+            const int saveBSeq = app.compareBSeq;
+            const std::vector<uint64_t> saveExtra = app.cmpExtra;
+            const int saveCurrent = app.current;
+            const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
+            std::vector<std::unique_ptr<ImageDoc>> held;
+            std::swap(app.images, held);          // loadSession closes every open
+            // the stacks are COPIED out (the table has no swap) and put back
+            const std::vector<App::SeqInfo> heldSeqs(app.seqs.begin(), app.seqs.end());
+            app.seqs.clear();
+            std::error_code tec;
+            const std::string sess = (std::filesystem::temp_directory_path(tec) /
+                                      "viewer_rangeselftest_s1.vsession").u8string();
+            static const char* CMP[6] = { "cmprange 0", "cmprange 1", "cmprange 2", "cmprange 3",
+                                          "cmpshare 0", "cmpshare 1" };
+            auto fnv = [](uint64_t h, const std::vector<uint8_t>& b) {
+                for (uint8_t c : b) { h ^= c; h *= 1099511628211ull; }
+                return h;
+            };
+            size_t row = 0;
+            int s1bad = 0;
+            std::string record;
+            // compare off (cmp -1: A alone) and on (the six compare lines)
+            for (int cmp = -1; cmp < 6; cmp++)
+                for (int link = 0; link < 2; link++)
+                    for (int scope = 0; scope < 2; scope++)
+                        for (int fl = AF_MinMax; fl <= AF_Median; fl++) {
+                            {
+                                std::ofstream sf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
+                                sf << "viewer-session 1\n";
+                                sf << "linkrange " << link << " 300 800\n";
+                                sf << "rangescope " << scope << "\n";
+                                sf << "autoflavor " << fl << " 0.25 1 0\n";
+                                if (cmp >= 0) sf << CMP[cmp] << "\n";
+                            }
+                            const std::string err = loadSession(sess);
+                            // the fixture, AFTER the load (which closes every open)
+                            auto A0 = mkRamp("s1_A0", 100.0f, 400.0f, 4, 2000.0f);
+                            auto A1 = mkRamp("s1_A1", 150.0f, 900.0f, 0, 0.0f);
+                            auto B0 = mkRamp("s1_B0", 1000.0f, 1600.0f, 4, 5000.0f);
+                            A0->seqId = 4250; A0->seqIndex = 0;
+                            A1->seqId = 4250; A1->seqIndex = 1;
+                            B0->seqId = 4251; B0->seqIndex = 0;
+                            if (scope == 0) {               // what main's step left there
+                                float lo = 0, hi = 0;
+                                fitByFlavor(*A0, lo, hi); A0->black = lo; A0->white = hi;
+                                fitByFlavor(*B0, lo, hi); B0->black = lo; B0->white = hi;
+                                A1->black = A0->black; A1->white = A0->white;
+                            } else {
+                                A0->black = 200.0f; A0->white = 700.0f;
+                                A1->black = 200.0f; A1->white = 700.0f;
+                                B0->black = 900.0f; B0->white = 1700.0f;
+                            }
+                            ImageDoc* pA = A0.get(); ImageDoc* pB = B0.get();
+                            app.images.push_back(std::move(A0));
+                            app.images.push_back(std::move(A1));
+                            app.images.push_back(std::move(B0));
+                            App::SeqInfo sa; sa.id = 4250; sa.name = "s1a"; app.seqs.push_back(sa);
+                            App::SeqInfo sb; sb.id = 4251; sb.name = "s1b"; app.seqs.push_back(sb);
+                            app.current = 0;
+                            app.cmpExtra.clear();
+                            app.compareFollowFrame = false;
+                            if (cmp >= 0) { setCompareB(pB); app.compareMode = App::CmpSplit; }
+                            else          { setCompareB(nullptr); app.compareMode = App::CmpOff; }
+                            const ViewSides v = comparedSides();
+                            uint64_t h = 1469598103934665603ull;
+                            std::vector<uint8_t> rgba;
+                            renderDocRGBA(*pA, rgba, &v); h = fnv(h, rgba);
+                            if (cmp >= 0) { renderDocRGBA(*pB, rgba, &v); h = fnv(h, rgba); }
+                            const bool have = !recording && row < nWant;
+                            const bool same = have && S1_WANT[row] == h;
+                            fprintf(stderr, "rangeselftest: S1 %-11s link %d rangescope %d flavor %d | "
+                                            "err=\"%s\" sides %d | %016llx %s\n",
+                                    cmp < 0 ? "compare-off" : CMP[cmp], link, scope, fl, err.c_str(), v.n,
+                                    (unsigned long long)h,
+                                    !have ? "RECORD" : same ? "ok" : "WRONG (a byte moved)");
+                            char rec[32];
+                            snprintf(rec, sizeof rec, "0x%016llxull,", (unsigned long long)h);
+                            record += rec;
+                            record += (row % 4 == 3) ? "\n" : " ";
+                            if (!same || !err.empty() || v.n != (cmp >= 0 ? 2 : 1)) s1bad++;
+                            row++;
+                            app.images.clear();
+                            app.seqs.clear();
+                        }
+            if (recording) fprintf(stderr, "rangeselftest: S1 RECORD\n%s\n", record.c_str());
+            if (row != nWant && !recording) {
+                fprintf(stderr, "rangeselftest: S1 %zu rows, table has %zu  WRONG\n", row, nWant);
+                s1bad++;
+            }
+            if (s1bad) bad++;
+            std::filesystem::remove(pathFromUtf8(sess), tec);
+            std::swap(app.images, held);
+            app.seqs.clear();
+            for (const App::SeqInfo& si : heldSeqs) app.seqs.push_back(si);
+            app.linkRange = saveLink; app.linkBlack = saveLB; app.linkWhite = saveLW;
+            app.rangeRule = saveScope; app.autoFlavor = saveFlav; app.compareRangeMode = saveCmpR;
+            app.medBlackMode = saveBM; app.medTarget = saveTgt; app.medBlackValue = saveBV;
+            app.compareMode = saveCmpMode; app.compareFollowFrame = saveFollow;
+            app.compareBUid = saveBUid; app.lastCompareBUid = saveLastB;
+            app.compareB = saveBName; app.compareBSeq = saveBSeq;
+            app.cmpExtra = saveExtra; app.current = saveCurrent;
+            if (app.images.size() != imgWas || app.seqs.size() != seqWas) {
+                fprintf(stderr, "rangeselftest: S1 app.images %zu -> %zu, seqs %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size(), seqWas, app.seqs.size());
+                bad++;
+            }
+        }
+
+        // ==================================================================
+        // #321 - the Range scope: who shares one range. A frame of a stack can
+        // keep a range of its own (the `frame` scope, an explicit exception);
+        // every write goes to the scope in force (I1), and a fixed range under
+        // a fitting rule is a declaration of one range (I2).
+        // In-memory fixtures in a SWAPPED app.images (the P4 discipline).
+        // ==================================================================
+        {   // ---- P19: the frame exception ----------------------------------
+            const bool saveLink = app.linkRange;
+            const int saveRule = app.rangeRule, saveCmpR = app.compareRangeMode;
+            const auto saveCmpMode = app.compareMode;
+            const int saveCurrent = app.current;
+            const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
+            auto F0 = mkRamp("fx_0", 0.3f, 0.6f, 0, 0.0f);
+            auto F1 = mkRamp("fx_1", 2.0f, 3.0f, 0, 0.0f);
+            auto F2 = mkRamp("fx_2", 5.0f, 9.0f, 0, 0.0f);
+            F0->seqId = 4260; F0->seqIndex = 0;
+            F1->seqId = 4260; F1->seqIndex = 1;
+            F2->seqId = 4260; F2->seqIndex = 2;
+            ImageDoc* f0 = F0.get(); ImageDoc* f1 = F1.get(); ImageDoc* f2 = F2.get();
+            std::vector<std::unique_ptr<ImageDoc>> pool;
+            pool.push_back(std::move(F0));
+            pool.push_back(std::move(F1));
+            pool.push_back(std::move(F2));
+            std::swap(app.images, pool);
+            App::SeqInfo si; si.id = 4260; si.name = "fx";
+            app.seqs.push_back(si);
+            app.linkRange = false;
+            app.rangeRule = RR_OneRange;
+            app.compareMode = App::CmpOff;
+            app.current = 1;
+            auto ok = [&](bool c, const char* what) {
+                fprintf(stderr, "rangeselftest: P19 %s %s\n", what, c ? "ok" : "WRONG");
+                if (!c) bad++;
+            };
+            setRange(*f0, 1.0f, 2.0f);
+            ok(f1->black == 1.0f && f2->white == 2.0f, "fixture: one range for the stack, 1..2");
+            ok(rangeScopeOf(f1) == RS_Stack, "the default scope is the stack");
+            setRangeScope(RS_Frame, f1);
+            ok(f1->rangeOwn && f1->black == 1.0f && f1->white == 2.0f && rangeScopeOf(f1) == RS_Frame,
+               "frame: frame 1 keeps the range it was drawn at, and the scope says frame");
+            f0->texDirty = f2->texDirty = false;
+            setRange(*f1, 0.0f, 255.0f);
+            ok(f1->black == 0.0f && f1->white == 255.0f && effBlack(*f1) == 0.0f && effWhite(*f1) == 255.0f,
+               "a write on the excepted frame lands on it, and it is drawn at it");
+            ok(f0->black == 1.0f && f0->white == 2.0f && f2->black == 1.0f && f2->white == 2.0f &&
+               !f0->texDirty && !f2->texDirty,
+               "...and on that frame only: the siblings are not written or redrawn");
+            setRange(*f0, 5.0f, 6.0f);
+            ok(f2->black == 5.0f && f2->white == 6.0f && f1->black == 0.0f && f1->white == 255.0f,
+               "a write on the stack skips the frame that keeps its own");
+            ok(rangeScopeOf(f0) == RS_Stack, "...and a sibling's scope is still the stack");
+            setRangeScope(RS_Stack, f1);
+            ok(!f1->rangeOwn && f1->black == 5.0f && f1->white == 6.0f && rangeScopeOf(f1) == RS_Stack,
+               "stack: frame 1 rejoins, at the stack's range");
+            // a single image is its own stack: there is no frame exception to take
+            f1->seqId = 0;
+            setRangeScope(RS_Frame, f1);
+            ok(!f1->rangeOwn && rangeScopeOf(f1) == RS_Stack, "a single image takes no frame exception");
+            f1->seqId = 4260;
+            for (auto it = app.seqs.begin(); it != app.seqs.end(); ++it)
+                if (it->id == 4260) { app.seqs.erase(it); break; }
+            std::swap(app.images, pool);
+            if (app.images.size() != imgWas || app.seqs.size() != seqWas) {
+                fprintf(stderr, "rangeselftest: P19 app.images %zu -> %zu, seqs %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size(), seqWas, app.seqs.size());
+                bad++;
+            }
+            app.linkRange = saveLink; app.rangeRule = saveRule; app.compareRangeMode = saveCmpR;
+            app.compareMode = saveCmpMode; app.current = saveCurrent;
+        }
+
+        {   // ---- S1b: the frame exception travels in the session -------------
+            // `framerange <seqIndex> <black> <white>`, one line per frame that
+            // keeps its own, after its stack's image line. A frame-axis .npy is
+            // a stack that is whole the moment it is opened, so the line is
+            // answered while the file is read - refusal included, into the
+            // session's report.
+            const bool saveLink = app.linkRange;
+            const int saveRule = app.rangeRule, saveCmpR = app.compareRangeMode;
+            const auto saveCmpMode = app.compareMode;
+            const int saveCurrent = app.current;
+            const size_t imgWas = app.images.size(), seqWas = app.seqs.size();
+            std::vector<std::unique_ptr<ImageDoc>> held;
+            std::swap(app.images, held);
+            const std::vector<App::SeqInfo> heldSeqs(app.seqs.begin(), app.seqs.end());
+            app.seqs.clear();
+            std::error_code tec;
+            const std::filesystem::path tmp = std::filesystem::temp_directory_path(tec);
+            const std::string npy = (tmp / "viewer_rangeselftest_fr.npy").u8string();
+            const std::string sess = (tmp / "viewer_rangeselftest_fr.vsession").u8string();
+            {   // (3, 8, 8) f32, frame f a ramp from 100 + 10 f
+                const int F = 3, W = 8, H = 8;
+                char dict[128];
+                snprintf(dict, sizeof dict,
+                         "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d, %d), }", F, H, W);
+                std::string hdr = dict;
+                hdr.append((64 - (10 + hdr.size() + 1) % 64) % 64, ' ');
+                hdr += '\n';
+                std::ofstream f(pathFromUtf8(npy), std::ios::binary | std::ios::trunc);
+                const uint16_t hl = (uint16_t)hdr.size();
+                f.write("\x93NUMPY\x01\x00", 8);
+                f.write((const char*)&hl, 2);
+                f.write(hdr.data(), (std::streamsize)hdr.size());
+                for (int fr = 0; fr < F; fr++) {
+                    std::vector<float> px((size_t)W * H);
+                    for (size_t k = 0; k < px.size(); k++) px[k] = 100.0f + 10.0f * fr + (float)k;
+                    f.write((const char*)px.data(), (std::streamsize)(px.size() * sizeof(float)));
+                }
+            }
+            auto ok = [&](bool c, const char* what) {
+                fprintf(stderr, "rangeselftest: S1b %s %s\n", what, c ? "ok" : "WRONG");
+                if (!c) bad++;
+            };
+            app.linkRange = false;
+            app.rangeRule = RR_OneRange;
+            app.compareMode = App::CmpOff;
+            const std::string lerr = loadNpy(npy);
+            std::vector<int> fr = cur() && cur()->seqId > 0 ? framesOfSeq(cur()->seqId) : std::vector<int>();
+            ok(lerr.empty() && fr.size() == 3, "fixture: a three-frame stack from one file");
+            if (fr.size() == 3) {
+                setRange(*app.images[fr[0]], 100.0f, 130.0f);
+                selectImage(fr[1]);
+                setRangeScope(RS_Frame, cur());
+                setRange(*cur(), 1.0f, 2.0f);
+                saveSession(sess, true);
+                std::vector<uint8_t> raw;
+                readFileBytes(sess, raw);
+                const std::string text(raw.begin(), raw.end());
+                ok(text.find("\nframerange 1 1 2\n") != std::string::npos, "the session writes \"framerange 1 1 2\"");
+                SessionReport r1;
+                const std::string e1 = loadSession(sess, &r1);
+                std::vector<int> g = cur() && cur()->seqId > 0 ? framesOfSeq(cur()->seqId) : std::vector<int>();
+                bool back = e1.empty() && g.size() == 3 && r1.count[LK_LineRejected] == 0;
+                for (size_t k = 0; back && k < g.size(); k++) {
+                    const ImageDoc* d = app.images[g[k]].get();
+                    back = k == 1 ? (d->rangeOwn && d->black == 1.0f && d->white == 2.0f)
+                                  : (!d->rangeOwn && d->black == 100.0f && d->white == 130.0f);
+                }
+                ok(back, "...and reads it back: frame 1 keeps 1..2, frames 0 and 2 share 100..130");
+                // a frame the stack does not have is refused, and said
+                std::string bent = text;
+                const size_t at = bent.find("\nframerange 1 1 2\n");
+                if (at != std::string::npos) bent.insert(at + 1, "framerange 7 3 4\n");
+                {
+                    std::ofstream bf(pathFromUtf8(sess), std::ios::binary | std::ios::trunc);
+                    bf << bent;
+                }
+                SessionReport r2;
+                loadSession(sess, &r2);
+                bool said = r2.count[LK_LineRejected] == 1 && !r2.names[LK_LineRejected].empty() &&
+                            r2.names[LK_LineRejected][0] == "framerange: frame 7 not in stack";
+                fprintf(stderr, "rangeselftest: S1b refused lines %d (%s)\n", r2.count[LK_LineRejected],
+                        r2.names[LK_LineRejected].empty() ? "" : r2.names[LK_LineRejected][0].c_str());
+                ok(said, "a framerange for frame 7 of a 3-frame stack: one LK_LineRejected, named");
+            }
+            closeAll();
+            std::filesystem::remove(pathFromUtf8(sess), tec);
+            std::filesystem::remove(pathFromUtf8(npy), tec);
+            std::swap(app.images, held);
+            app.seqs.clear();
+            for (const App::SeqInfo& s : heldSeqs) app.seqs.push_back(s);
+            if (app.images.size() != imgWas || app.seqs.size() != seqWas) {
+                fprintf(stderr, "rangeselftest: S1b app.images %zu -> %zu, seqs %zu -> %zu  NOT RESTORED\n",
+                        imgWas, app.images.size(), seqWas, app.seqs.size());
+                bad++;
+            }
+            app.linkRange = saveLink; app.rangeRule = saveRule; app.compareRangeMode = saveCmpR;
+            app.compareMode = saveCmpMode; app.current = saveCurrent;
+        }
+
         // the shared home gets the modes it was lent, back
-        app.rangeScope = 1;
+        app.rangeRule = 1;
         app.linkRange = false;
         app.autoFlavor = AF_MinMax;
         app.medTarget = 0.5f;

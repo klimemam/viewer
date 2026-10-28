@@ -398,7 +398,7 @@ static bool pumpVideoExport() {
     // answer and refitByFlavor's alone (#252): a min..max hard-wired here would
     // be a second answer to the one question. Linked and per-stack need
     // nothing: displayRangeFor already answers for the stack.
-    if (app.rangeScope == 0 && !app.linkRange && stepTo) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
+    if (app.rangeRule == RR_EachFrame && !app.linkRange && stepTo && !stepTo->rangeOwn) { refitByFlavor(*stepTo); stepTo->texDirty = true; }
     static std::vector<uint8_t> rgba;    // one scratch buffer, as rebuildTexture keeps
     static std::vector<uint8_t> rgb;
     if (J.compare) {

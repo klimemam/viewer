@@ -756,6 +756,11 @@ struct ImageDoc {
     int w = 0, h = 0, ch = 1;
     float vmin = 0, vmax = 1;         // data min/max
     float black = 0, white = 255;     // display range
+    // This frame keeps a range of its own (#321): the stack's writes skip it,
+    // and it shows black/white whatever the stack's rule is, until the
+    // Inspector's `stack` puts it back. Saved as a `framerange` line. Only a
+    // frame of a stack (seqId > 0) carries it - a single image IS its stack.
+    bool rangeOwn = false;
     // What "Auto %" would answer for THESE pixels, cached lazily (issue #248).
     // The Range row lights the button whose result is the range currently in
     // force, and that question is asked on every UI frame while the percentile
@@ -964,6 +969,20 @@ enum AutoFlavor { AF_MinMax = 0, AF_Pct = 1, AF_Median = 2 };
 // measured vmin, `min 0.1%` the same 0.1 percentile "Auto %" cuts at - which
 // is the one to pick when a dead column or a cold pixel owns vmin.
 enum MedBlackMode { MB_Value = 0, MB_Min = 1, MB_MinPct = 2 };
+// The display range has two questions, asked in this order (#321): WHO shares
+// one range (the scope: a frame, a stack, the compared sides, every open image)
+// and HOW that range is decided (the rule). This is the rule for the stack
+// scope, global like the compare rule beside it (compare-n-design.md §5 R3:
+// "what range is this screen at" has to be one sentence). The values are the
+// session's `rangescope` numbers, unchanged: 0 was "Auto per frame", 1 "Per
+// stack".
+//   EachFrame - every frame is DRAWN at its own fit (app.autoFlavor's); the
+//               stack's stored numbers stay as they are
+//   OneRange  - one black/white for the whole stack, the stored numbers
+enum RangeRule { RR_EachFrame = 0, RR_OneRange = 1 };
+// The scope, as the Inspector's `applies to` row lights it. Not stored: it is
+// read off linkRange, the compare rule and the doc's rangeOwn (rangeScopeOf).
+enum RangeScope { RS_Frame = 0, RS_Stack = 1, RS_Compared = 2, RS_All = 3 };
 
 // A reader's .vstream, read and decoded on the job's own thread (issue #232
 // stage 2). Defined in loader_npz.inc, where the container vocabulary lives;
@@ -2178,8 +2197,13 @@ struct App {
     // default). THE PREFERENCE AS WRITTEN; every walk asks scanDepthBelow()
     // below, which is where the range is enforced and which is the only reader.
     int folderScanDepth = 6;
-    int rangeScope = 1;               // value range: 0 frame, 1 stack, 2 all
-    // What "Auto per frame" (rangeScope 0) re-fits each frame TO (#252).
+    int rangeRule = RR_OneRange;      // RangeRule: the stack's rule (#321)
+    // The compare rule `A+B` goes back to (1..3) when the scope returns there
+    // from `frame` / `stack` (which are compareRangeMode 0). Not saved:
+    // `cmprange` carries the rule in force.
+    int compareRuleLast = 2;
+    // Which fit "each frame fits itself" (rangeRule EachFrame) and "each side
+    // fits itself" draw with (#252, #301) - one answer to "which fit".
     // MinMax is what the mode has always done, and stays the default: a new
     // flavour must not change what an existing session shows.
     int autoFlavor = AF_MinMax;
@@ -2838,6 +2862,12 @@ struct App {
         // one situation - but "the crop this session saved" is not what to say
         // about a crop the operator typed a second ago.
         bool cropFromSession = true;
+        // "framerange": frames of this doc's stack that keep their own range
+        // (#321), applied once the stack has stopped arriving - a frame that
+        // lands later inherits from its stack, and an own range applied first
+        // would be what it inherited.
+        struct OwnRange { int seqIndex; float black, white; };
+        std::vector<OwnRange> ownRanges;
     };
     std::vector<RestoreWait> restoreWait;
     // "Open as frame average" (or sum) on a stack that is not here yet. Browse

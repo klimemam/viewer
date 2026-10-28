@@ -759,6 +759,10 @@ static void pumpSequence() {
     const ImageDoc* ref = nullptr;
     for (const auto& d : app.images)
         if (d->seqId == app.seqLoadingId) { ref = d.get(); break; }
+    // ...and the RANGE comes from a frame that wears the stack's: a frame that
+    // keeps its own (#321) is the stack's exception, not its reference.
+    if (ref && ref->rangeOwn)
+        if (const ImageDoc* h = stackRangeHolder(app.seqLoadingId, ref)) ref = h;
     for (auto& pr : batch) {
         auto& doc = pr.second;
         doc->seqId = app.seqLoadingId;
@@ -1528,7 +1532,7 @@ static void selectImage(int idx) {
         // 0..1 / type fullscale (issue #245). WHICH fit - min..max, the
         // 0.1-99.9% cut or the median->target one - is app.autoFlavor's
         // answer, and refitByFlavor is the one place that answers it (#252).
-        if (app.rangeScope == 0 && !app.linkRange) { refitByFlavor(*d); d->texDirty = true; }
+        if (app.rangeRule == RR_EachFrame && !app.linkRange && !d->rangeOwn) { refitByFlavor(*d); d->texDirty = true; }
     }
     // Within a stack, stepping frames never changes the picture's ON-SCREEN
     // size (#250). app.view is ONE view shared by the whole stack, while the

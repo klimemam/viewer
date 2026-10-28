@@ -76,11 +76,11 @@ static int frameSizeSelftest() {
     // Borrowed, and given back at the end. selectImage's OTHER per-step policy
     // is the range one, and auto-per-frame would re-fit documents this test
     // does not care about; per stack (the default) touches nothing here.
-    const int   saveScope = app.rangeScope;
+    const int   saveScope = app.rangeRule;
     const bool  saveLink  = app.linkRange;
     const float saveZoom  = app.view.zoom;
     const ImVec2 saveCtr  = app.view.center;
-    app.rangeScope = 1;
+    app.rangeRule = 1;
     app.linkRange  = false;
 
     // 64 px frames decimated by 4 -> 16 px previews. Powers of two, so every
@@ -203,7 +203,7 @@ static int frameSizeSelftest() {
     }
 
     // The home is shared: give back every mode and the view itself.
-    app.rangeScope  = saveScope;
+    app.rangeRule  = saveScope;
     app.linkRange   = saveLink;
     app.view.zoom   = saveZoom;
     app.view.center = saveCtr;

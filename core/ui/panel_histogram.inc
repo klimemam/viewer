@@ -236,7 +236,7 @@ static bool histZoomApply(ImageDoc* im, float lo, float hi, float curW, int curN
         // a frame you have left does.
         const ImageDoc* was = Z.restore ? histZoomRestoreDoc(im) : nullptr;
         const bool sameRange = app.linkRange || (was && was->uid == im->uid) ||
-                               (was && app.rangeScope == 1 && im->seqId > 0 &&
+                               (was && app.rangeRule == RR_OneRange && im->seqId > 0 && !im->rangeOwn && !was->rangeOwn &&
                                 was->seqId == im->seqId);
         if (!Z.restore || Z.restoreLink != app.linkRange || rb != Z.setBlack || rw != Z.setWhite ||
             !sameRange) {

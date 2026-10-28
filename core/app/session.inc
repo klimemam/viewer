@@ -28,6 +28,7 @@ static void startSequenceLoad(int imageIdx, const std::vector<std::string>& file
                               const std::string& pattern);
 static void stopSequenceLoader();
 static std::vector<int> framesOfSeq(int seqId);
+static bool seqReadyPending();          // fwd (sequence.inc): framerange waits on it
 static App::SeqInfo* seqInfo(int id);   // never held across an open/close: the
                                         // rule is over its definition, sequence.inc
 static void selectImage(int idx);
@@ -88,7 +89,7 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
     // display state that lives outside the per-image range
     f << "linkrange " << (app.linkRange ? 1 : 0) << " " << app.linkBlack << " "
       << app.linkWhite << "\n";
-    f << "rangescope " << app.rangeScope << "\n";
+    f << "rangescope " << app.rangeRule << "\n";
     // What "Auto per frame" re-fits to, and the Med fit's three parameters
     // (#252) - one line, because they are one setting: the flavour is useless
     // without the target it aims at. No settings.jsonc key: this is where you
@@ -239,7 +240,15 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
         // image line because it decides how that line's file is decoded.
         if (d->src->npyRead != NR_NATIVE) f << "npyread " << d->src->npyRead << "\n";
         f << "lut " << d->displayLut << "\n";
-        f << "image " << d->black << " " << d->white << " ";
+        // A stack's line carries the STACK's range (#321): when the frame this
+        // line is written from keeps its own, the stack's is on a sibling, and
+        // the own range follows as a framerange line like any other.
+        float lineBlack = d->black, lineWhite = d->white;
+        if (d->rangeOwn)
+            if (const ImageDoc* h = stackRangeHolder(d->seqId, d.get())) {
+                lineBlack = h->black; lineWhite = h->white;
+            }
+        f << "image " << lineBlack << " " << lineWhite << " ";
         if (d->src->rawDtype >= 0) {
             int interp = d->src->rawInterp;
             if (RAW_INTERP_CH[interp] == 1)   // 1ch family: honor the CURRENT interpretation
@@ -258,6 +267,16 @@ static void writeSessionTo(std::ostream& f, SessionReport* repOut = nullptr) {
         // names merging on restore is the least surprising failure mode
         for (const auto& b : app.batches)
             if (b.id == d->batchId) { f << "imgbatch " << b.name << "\n"; break; }
+        // The frames of this stack that keep a range of their own (#321), one
+        // line each: "framerange <seqIndex> <black> <white>". ADDITIVE: an
+        // older viewer skips the key and shows those frames at the stack's
+        // range. A single image never writes one - it IS its stack.
+        if (d->seqId > 0)
+            for (int idx : framesOfSeq(d->seqId)) {
+                const ImageDoc* o = app.images[idx].get();
+                if (o->rangeOwn)
+                    f << "framerange " << o->seqIndex << " " << o->black << " " << o->white << "\n";
+            }
         if (d->seqId != 0) {
             f << "seqframe " << d->seqIndex << "\n";   // come back to the same frame
             // A folder sequence must rescan its siblings; an in-file frame axis
@@ -3418,6 +3437,38 @@ static App::RestoreWait& restoreWaitFor(const ImageDoc& im) {
     app.restoreWait.push_back(std::move(w));
     return app.restoreWait.back();
 }
+// Has the stack `im` heads stopped arriving? Its rescan is not queued, not
+// running, and no decoded frame of it is waiting to land. A single image whose
+// rescan is still queued is not settled either: it is about to be a stack.
+static bool ownRangeStackSettled(const ImageDoc& im) {
+    for (const auto& r : app.seqRestore) if (r.uid == im.uid) return false;
+    if (im.seqId == 0) return true;
+    if (app.seqRunning && app.seqLoadingId == im.seqId) return false;
+    return !seqReadyPending();
+}
+// Give frame `k` of `im`'s stack its own range. False = not yet (the stack is
+// still arriving); true = answered, which includes the refusal - a frame that
+// is not in a settled stack is said, into the session's report when the line is
+// still being read (rep), as a toast when it is answered later.
+// While the session is still being read, a single image is never answered: its
+// `seqload` line, which makes it a stack, comes after this one.
+static bool applyOwnRangeNow(const ImageDoc& im, int k, float b, float w, SessionReport* rep) {
+    if (!ownRangeStackSettled(im) || (rep && im.seqId == 0)) return false;
+    ImageDoc* f = nullptr;
+    if (im.seqId > 0)
+        for (int idx : framesOfSeq(im.seqId))
+            if (app.images[idx]->seqIndex == k) { f = app.images[idx].get(); break; }
+    if (!f) {
+        const std::string why = "framerange: frame " + std::to_string(k) + " not in stack";
+        if (rep) rep->note(LK_LineRejected, why);
+        else toast(im.name + ": " + why, true);
+        return true;
+    }
+    f->rangeOwn = true;
+    f->black = b; f->white = w;
+    f->texDirty = true;
+    return true;
+}
 static void parkRestoreWait(const ImageDoc& im, int seqFrame) {
     restoreWaitFor(im).seqFrame = seqFrame;
 }
@@ -3459,6 +3510,14 @@ static void pumpRestoreWaits() {
                       std::to_string(w.seqFrame) + ", and that frame did not come "
                       "back - showing what did", true);
                 w.seqFrame = -1;
+            } else done = false;
+        }
+
+        if (!w.ownRanges.empty()) {
+            if (ownRangeStackSettled(*im) && quiet) {
+                for (const auto& o : w.ownRanges)
+                    applyOwnRangeNow(*im, o.seqIndex, o.black, o.white, nullptr);
+                w.ownRanges.clear();
             } else done = false;
         }
 
@@ -3682,7 +3741,7 @@ static std::string loadSession(const std::string& path,
         else if (key == "current") ls >> wantCurrent;
         else if (key == "linkrange") { int on = 0; ls >> on >> app.linkBlack >> app.linkWhite;
                                        app.linkRange = on != 0; }
-        else if (key == "rangescope") { ls >> app.rangeScope; }
+        else if (key == "rangescope") { ls >> app.rangeRule; }
         // Each half checked on its own, and each left alone when the file
         // cannot answer for it: a session written by a newer build (or hand
         // -edited) must not be able to set a target of 0, which divides, or a
@@ -4102,6 +4161,21 @@ static std::string loadSession(const std::string& path,
         //  ever emitted this key, so no session in existence carries one; a
         //  session that did would be a document changing an application
         //  preference on the way in.)
+        // A frame that keeps its own range (#321). Applied once the stack has
+        // stopped arriving (pumpRestoreWaits): a frame that lands later copies
+        // its stack's range from a frame already here, and an own range applied
+        // first would be what it copied. A stack that is complete NOW (a frame
+        // axis inside one file) is answered here, refusal included.
+        else if (key == "framerange") {
+            int k = -1; float b = 0, w = 0;
+            if (!(ls >> k >> b >> w) || k < 0 || !(w > b) || !std::isfinite(b) || !std::isfinite(w)) {
+                rep.note(LK_LineRejected, "framerange");
+                continue;
+            }
+            if (!lastImageOk || !cur()) continue;
+            if (!applyOwnRangeNow(*cur(), k, b, w, &rep))
+                restoreWaitFor(*cur()).ownRanges.push_back({ k, b, w });
+        }
         else if (key == "seqframe") {   // select the frame this stack was left on
             int want = 0; ls >> want;
             if (lastImageOk && cur() && cur()->seqId != 0) {

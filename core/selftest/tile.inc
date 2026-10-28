@@ -341,7 +341,7 @@
         // slot to one union; "B uses A's" must hand A's range to the slots
         // too (the reference side dictates); per-own stays per-own.
         {
-            app.rangeScope = 1;
+            app.rangeRule = 1;
             app.linkRange = false;
             bool saveFollow = app.compareFollowFrame;
             app.compareFollowFrame = false;   // pin = resolved doc, so the

@@ -516,7 +516,7 @@ static void drawInspector() {
                     for (int f = AF_MinMax; f <= AF_Median; f++) {
                         ImGui::SameLine();
                         if (ImGui::RadioButton(FIT_ITEMS[f], app.autoFlavor == f))
-                            setEachSideFlavor(f);
+                            setFlavor(f);
                         if (ImGui::IsItemHovered())
                             ImGui::SetTooltip("The fit every side is drawn at. The same choice as\n"
                                               "Auto per frame's: median uses the target and black\n"
@@ -885,7 +885,7 @@ static void drawInspector() {
             // auto WHAT is the question the user has to answer anyway, and a
             // combo that names the answer needs no second widget to explain it.
             int mode = app.linkRange ? 4
-                     : app.rangeScope == 0 ? std::min(std::max(app.autoFlavor, 0), 2)
+                     : app.rangeRule == 0 ? std::min(std::max(app.autoFlavor, 0), 2)
                                            : 3;
             ImGui::SetNextItemWidth(-1);
             if (ImGui::Combo("##rangemode", &mode,
@@ -894,8 +894,10 @@ static void drawInspector() {
                              "Auto per frame (median->target)\0"
                              "Per stack (default)\0"
                              "Linked across all images\0")) {
-                if (mode <= 2) applyRangeMode(0, im, mode);
-                else           applyRangeMode(mode - 2, im);   // 3 -> 1, 4 -> 2
+                if (mode <= 3 && app.linkRange) { app.linkRange = false; markAllTexDirty(); }
+                if (mode <= 2)       { setFlavor(mode); setRangeRule(RR_EachFrame, im); }
+                else if (mode == 3)  setRangeRule(RR_OneRange, im);
+                else                 setRangeScope(RS_All, im);
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Auto per frame: every frame re-fits as you step -\n"
