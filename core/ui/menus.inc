@@ -506,8 +506,8 @@ static void drawMenuBar(GLFWwindow* win) {
                 ImGui::SetTooltip("One plot per side, all of equal width and always in\n"
                                   "slot order: shapes can only be compared on plots of\n"
                                   "equal width. More slots make each plot narrower;\n"
-                                  "below 320 px (logical width) a panel draws the overlay\n"
-                                  "instead, without a note on the panel.");
+                                  "when one plot would be under 320 px (logical width) the\n"
+                                  "panel draws the overlay instead, without a note on it.");
             // Temporal's own (#320): the same switch as the Temporal panel's
             // heading, and a preference rather than session state
             ImGui::TextDisabled("Statistics layout: Temporal");
