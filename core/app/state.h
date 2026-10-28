@@ -1328,7 +1328,8 @@ struct App {
     int  videoAskSeqId = 0;
     bool videoAskCompare = false;     // the modal is asking for a compare video (#308)
     // The side letters (A / B / C...) burnt into the top-left of each side of
-    // a compare export (#308), in slotInk. On by default; not in the session.
+    // a compare export (#308), in the canvas badge's ink (paneBadgeInk). On
+    // by default; not in the session.
     bool cmpExportLetters = true;
     float videoFps = 30.0f;           // positive finite; travels in the session
     int   videoFormat = 0;            // 0 = uncompressed AVI, 1 = FFV1/MKV (ffmpeg)

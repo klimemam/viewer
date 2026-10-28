@@ -370,18 +370,19 @@ static ImVec2 tileUnmap(ImVec2 p0, ImVec2 sz, ImVec2 center, float zoom, ImVec2 
 // is that side's follow-frame divergence: the pane is showing the last frame
 // its stack had, and the badge must say so.
 struct TileSlot { ImageDoc* doc; std::string tag; bool stale = false; };
+// One pane per LETTER, not per document. Two letters resolving to one
+// document get two panes showing the same pixels - which is the point: side by
+// side is where you SEE that they coincide. The list is the screen view's
+// panes (ViewSides::pane, viewSidesFor), the SAME enumeration the compare
+// export lays out (#308), so the file cannot have a pane the canvas lacks or
+// lack one it has. Building the screen's view runs resolveB / resolveSlots,
+// which record the [stale] marks as before.
 static std::vector<TileSlot> tileSlots() {
     std::vector<TileSlot> out;
-    ImageDoc* a = cur();
-    if (!a) return out;
-    out.push_back({ a, "A", false });
-    ImageDoc* b = cmpB();                      // sets g_abFollowDiverged
-    if (b) out.push_back({ b, "B", g_abFollowDiverged });
-    // One pane per LETTER, not per document. Two letters resolving to one
-    // document get two panes showing the same pixels - which is the point:
-    // side by side is where you SEE that they coincide.
-    for (const ResolvedSlot& rs : resolveSlots())
-        out.push_back({ rs.doc, slotName(rs.idx), rs.diverged });
+    if (!cur()) return out;
+    const ViewSides v = comparedSides();
+    for (int p = 0; p < v.nPane; p++)
+        out.push_back({ v.pane[p], paneRoleLetter(v.paneRole[p]), v.paneStale[p] });
     return out;
 }
 // Tiling engages only when there is a third slot to show, and ONLY in Split -
@@ -875,6 +876,25 @@ static void drawCanvas(ImVec2 avail) {
                               "AVI otherwise."
                             : "this image is not a frame of a stack");
                 }
+                {   // ...and the COMPARE VIEW (#308), the same two verbs as the
+                    // File menu's: every pane at 1:1, the canvas's layout
+                    const bool comparing = app.compareMode != App::CmpOff && cur();
+                    const std::string why = comparing ? compareViewRefusal() : std::string();
+                    auto tip = [&]() {
+                        if (!ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return;
+                        if (!comparing) ImGui::SetTooltip("compare is off (View > Compare A/B)");
+                        else if (!why.empty()) ImGui::SetTooltip("%s", why.c_str());
+                        else ImGui::SetTooltip("every pane at 1:1, as laid out on the canvas;\n"
+                                               "no zoom, no overlays");
+                    };
+                    if (ImGui::MenuItem("Save compare view as PNG...", nullptr, false, comparing))
+                        askCompareViewPng();
+                    tip();
+                    if (ImGui::MenuItem("Export compare view as video...", nullptr, false,
+                                        comparing && canExportStackVideo(cur())))
+                        askCompareVideoExport();
+                    tip();
+                }
                 const bool inStack = ci && ci->seqId != 0;
                 App::Ann* ra = findAnn(app.selectedAnn);
                 const bool roiOk = ra && ra->type == 0;
@@ -1086,7 +1106,9 @@ static void drawCanvas(ImVec2 avail) {
         // hold A + C + D with no B at all, and every pane still has to say
         // which slot and which file it is.
         {
-            const ImU32 colA = IM_COL32(120, 200, 255, 255), colB = IM_COL32(255, 190, 120, 255);
+            // the badge inks: ONE definition (paneBadgeInk), which the compare
+            // export's letters are drawn in too (#308)
+            const ImU32 colA = paneBadgeInk(0, 0, 1), colB = paneBadgeInk(1, 1, 2);
             const float pad = 4.0f * s;
             // Each pane carries the SAME two-line identity the footer below
             // establishes: line 1 = letter + batch (the context, dimmer),
@@ -1134,13 +1156,6 @@ static void drawCanvas(ImVec2 avail) {
                 g_paneBadgeProbe += std::string(tag) + "|" + l1 + "|" + l2 + ";";
             };
             bool hot = onDivider || (ImGui::IsItemActive() && dk == DK_DIVIDER);
-            // C, D, E...: one hue each. "Which pane is D" has to be answerable
-            // from the badge alone - A's blue and B's orange stay where they are.
-            static const ImU32 TILE_COLS[6] = {
-                IM_COL32(105, 220, 130, 255), IM_COL32(200, 120, 255, 255),
-                IM_COL32(90, 220, 220, 255),  IM_COL32(255, 150, 200, 255),
-                IM_COL32(180, 200, 90, 255),  IM_COL32(255, 120, 120, 255),
-            };
             // Hold-B outranks the tiles: it deliberately takes the whole canvas,
             // so its badge - not four badges over one full-frame image - is what
             // has to be on screen.
@@ -1150,9 +1165,8 @@ static void drawCanvas(ImVec2 avail) {
             } else if (tiled) {
                 const int nAB = imB ? 2 : 1;                 // how many letters are A/B
                 for (int i = 0; i < (int)slots.size(); i++) {
-                    ImU32 c = slots[i].tag == "A" ? colA
-                            : slots[i].tag == "B" ? colB
-                            : TILE_COLS[std::max(0, i - nAB) % 6];
+                    const ImU32 c = paneBadgeInk(slots[i].tag == "A" ? 0 : slots[i].tag == "B" ? 1 : 2,
+                                                 i, nAB);
                     // a diverged side is the last frame its stack had, not A's
                     // partner - the same [stale] statement the panels make
                     badge(paneP0(i).x + 6 * s, paneP0(i).x + paneSz(i).x, false,

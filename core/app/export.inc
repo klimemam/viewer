@@ -680,6 +680,8 @@ static ViewSides exportFrameViewFor(ImageDoc* d, ImageDoc*& stepTo) {
         }
     }
     stepTo = nullptr;
+    for (int p = 0; p < s.nPane; p++)       // ...and the pane holding that role
+        if (s.paneRole[p] == s.role[r]) { s.pane[p] = d; s.paneStale[p] = false; }
     s.side[r] = d;
     s.diverged[r] = false;
     return s;
@@ -711,11 +713,36 @@ static ViewSides exportFrameViewFor(ImageDoc* d, ImageDoc*& stepTo) {
 //       is drawn by, at the scale the screen uses (app.diffGain, or the auto
 //       scale of THIS pair, diffAutoGainOf).
 //   blink - refused: it is two pictures in time, not one.
+// The panes are the view's PANES (ViewSides::pane) - the list tileSlots gives
+// the canvas, one per letter, so a slot on B's document is a pane of its own
+// here as it is there. One row because the canvas tiles in one row:
+// tileLayout returns n panes left to right (TilePane is x0 and a width).
 // Wipe and difference show A and B only, as on screen; slots are named as
-// "not shown". The letters (app.cmpExportLetters) go top-left of each side,
-// in slotInk, on a black plate - drawn from a built-in 5x7 bitmap, because a
+// "not shown". The letters (app.cmpExportLetters) go top-left of each pane,
+// in the canvas badge's ink (paneBadgeInk), on a black plate - drawn from a built-in 5x7 bitmap, because a
 // windowless export has no font atlas to draw text with.
-static ImU32 slotInk(size_t i);   // fwd: inspector.inc - the letter's ink
+
+// The letter of a pane role: "A", "B", or the slot's.
+static std::string paneRoleLetter(int role) {
+    return role == 0 ? std::string("A") : role == 1 ? std::string("B") : slotName((size_t)(role - 2));
+}
+// The ink a pane's letter is drawn in on the CANVAS badge - and so in the
+// compare export, which depicts the canvas. ONE definition: drawCanvas's
+// badges call it, the export's letters call it. `role` 0 = A, 1 = B, 2+ = a
+// slot; a slot's hue follows its PANE position past A (and B, when there is
+// one: nAB = 2, else 1), as the badges always have. (slotInk, the plots' ink
+// for the same letters, is a different palette - A green, B blue.)
+static ImU32 paneBadgeInk(int role, int paneIndex, int nAB) {
+    if (role == 0) return IM_COL32(120, 200, 255, 255);   // A: blue
+    if (role == 1) return IM_COL32(255, 190, 120, 255);   // B: orange
+    // C, D, E...: one hue each - "which pane is D" answered by the badge alone
+    static const ImU32 TILE_COLS[6] = {
+        IM_COL32(105, 220, 130, 255), IM_COL32(200, 120, 255, 255),
+        IM_COL32(90, 220, 220, 255),  IM_COL32(255, 150, 200, 255),
+        IM_COL32(180, 200, 90, 255),  IM_COL32(255, 120, 120, 255),
+    };
+    return TILE_COLS[std::max(0, paneIndex - nAB) % 6];
+}
 
 static const int CMP_SEP_PX = 2;
 static const uint8_t CMP_SEP_RGB[3]  = { 128, 128, 128 };   // neutral grey
@@ -726,7 +753,7 @@ struct CompareLayout {
     int w = 0, h = 0;                   // the composite
     int cellW = 0, cellH = 0;           // split / wipe: the cell every side is placed in
     int n = 0;                          // sides drawn
-    int at[CMP_SIDES_MAX] = {};         // ...as indices into the view, in drawing order
+    int at[CMP_SIDES_MAX] = {};         // ...as indices into v.pane, in drawing order
     int x0[CMP_SIDES_MAX] = {};         // split: each cell's left column
     int div = 0;                        // wipe: the divider column; B is drawn right of it
     bool padded = false;                // a side is smaller than its cell
@@ -739,29 +766,29 @@ struct CompareLayout {
 static std::string compareLayoutFor(const ViewSides& v, CompareLayout& L) {
     L = CompareLayout();
     L.mode = app.compareMode;
-    if (app.compareMode == App::CmpOff || v.n < 2)
+    if (app.compareMode == App::CmpOff || v.n < 2 || v.nPane < 2)
         return "compare is off - there is no compare view to export";
     if (app.compareMode == App::CmpFlip)
         return "blink shows one side at a time, so it is not one picture - switch to "
                "side by side or wipe (View > Compare A/B), then export";
     int bAt = -1;
-    for (int i = 1; i < v.n && bAt < 0; i++) if (v.role[i] == 1) bAt = i;
+    for (int i = 1; i < v.nPane && bAt < 0; i++) if (v.paneRole[i] == 1) bAt = i;
     if (app.compareMode == App::CmpSplit) {
-        for (int i = 0; i < v.n; i++) L.at[L.n++] = i;
+        for (int i = 0; i < v.nPane; i++) L.at[L.n++] = i;
     } else {
         const char* mode = app.compareMode == App::CmpWipe ? "wipe" : "difference";
         if (bAt < 0) return std::string(mode) + " needs a B image - View > Compare A/B > B image";
         L.at[L.n++] = 0;
         L.at[L.n++] = bAt;
-        for (int i = 1; i < v.n; i++)
-            if (i != bAt) L.unshown += (L.unshown.empty() ? "" : ", ") + viewSideLetter(v, i);
+        for (int i = 1; i < v.nPane; i++)
+            if (i != bAt) L.unshown += (L.unshown.empty() ? "" : ", ") + paneRoleLetter(v.paneRole[i]);
     }
     // Every side DRAWN is drawn dot by dot, so each is refused as a picture
     // would be; and every side the range is taken over (the union reads the
     // slots wipe does not draw), as viewRefusalFor says for one picture.
     for (int k = 0; k < L.n; k++) {
-        const std::string why = exportRefusalFor(v.side[L.at[k]]);
-        if (!why.empty()) return viewSideLetter(v, L.at[k]) + ": " + why;
+        const std::string why = exportRefusalFor(v.pane[L.at[k]]);
+        if (!why.empty()) return paneRoleLetter(v.paneRole[L.at[k]]) + ": " + why;
     }
     {
         const std::string why = viewRefusalFor(v, nullptr);
@@ -769,19 +796,19 @@ static std::string compareLayoutFor(const ViewSides& v, CompareLayout& L) {
     }
     auto dims = [](const ImageDoc* d) { return std::to_string(d->w) + "x" + std::to_string(d->h); };
     if (app.compareMode == App::CmpDiff) {
-        const ImageDoc* A = v.side[0];
-        const ImageDoc* B = v.side[bAt];
+        const ImageDoc* A = v.pane[0];
+        const ImageDoc* B = v.pane[bAt];
         if (A->w != B->w || A->h != B->h)
             return "difference needs A and B to be the same size (A " + dims(A) + ", B " +
                    dims(B) + ")";
         L.w = A->w; L.h = A->h;
     } else {
         for (int k = 0; k < L.n; k++) {
-            L.cellW = std::max(L.cellW, v.side[L.at[k]]->w);
-            L.cellH = std::max(L.cellH, v.side[L.at[k]]->h);
+            L.cellW = std::max(L.cellW, v.pane[L.at[k]]->w);
+            L.cellH = std::max(L.cellH, v.pane[L.at[k]]->h);
         }
         for (int k = 0; k < L.n; k++)
-            if (v.side[L.at[k]]->w != L.cellW || v.side[L.at[k]]->h != L.cellH) L.padded = true;
+            if (v.pane[L.at[k]]->w != L.cellW || v.pane[L.at[k]]->h != L.cellH) L.padded = true;
         if (app.compareMode == App::CmpSplit) {
             for (int k = 0; k < L.n; k++) L.x0[k] = k * (L.cellW + CMP_SEP_PX);
             L.w = L.n * L.cellW + (L.n - 1) * CMP_SEP_PX;
@@ -866,7 +893,7 @@ static std::string compareExportNote(const ViewSides& v, const CompareLayout& L,
         s += num;
     } else {
         std::string order;
-        for (int k = 0; k < L.n; k++) order += (k ? " | " : "") + viewSideLetter(v, L.at[k]);
+        for (int k = 0; k < L.n; k++) order += (k ? " | " : "") + paneRoleLetter(v.paneRole[L.at[k]]);
         if (L.mode == App::CmpSplit) {
             snprintf(num, sizeof num, ", 1:1 in %dx%d cells, %d px grey separators",
                      L.cellW, L.cellH, CMP_SEP_PX);
@@ -879,9 +906,9 @@ static std::string compareExportNote(const ViewSides& v, const CompareLayout& L,
         if (L.padded) {
             std::string small;
             for (int k = 0; k < L.n; k++) {
-                const ImageDoc* d = v.side[L.at[k]];
+                const ImageDoc* d = v.pane[L.at[k]];
                 if (d->w != L.cellW || d->h != L.cellH)
-                    small += (small.empty() ? "" : ", ") + viewSideLetter(v, L.at[k]) + " " +
+                    small += (small.empty() ? "" : ", ") + paneRoleLetter(v.paneRole[L.at[k]]) + " " +
                              std::to_string(d->w) + "x" + std::to_string(d->h);
             }
             snprintf(num, sizeof num, "%dx%d", L.cellW, L.cellH);
@@ -922,8 +949,8 @@ static bool composeCompareRGBA(const ViewSides& v, std::vector<uint8_t>& rgba, i
     if (!note.empty()) { w = h = 0; rgba.clear(); return false; }
     w = L.w; h = L.h;
     if (L.mode == App::CmpDiff) {
-        ImageDoc* A = v.side[L.at[0]];
-        ImageDoc* B = v.side[L.at[1]];
+        ImageDoc* A = v.pane[L.at[0]];
+        ImageDoc* B = v.pane[L.at[1]];
         const float gain = app.diffGain > 0 ? app.diffGain : diffAutoGainOf(*A, *B);
         renderDiffRGBA(*A, *B, w, h, std::min(A->ch, B->ch), gain, rgba);
         note = compareExportNote(v, L, false, gain);
@@ -933,7 +960,7 @@ static bool composeCompareRGBA(const ViewSides& v, std::vector<uint8_t>& rgba, i
     for (size_t p = 0; p < (size_t)w * h; p++) rgba[p * 4 + 3] = 255;   // opaque black
     static std::vector<uint8_t> side;    // one scratch buffer, as rebuildTexture keeps
     for (int k = 0; k < L.n; k++) {
-        ImageDoc* d = v.side[L.at[k]];
+        ImageDoc* d = v.pane[L.at[k]];
         renderDocRGBA(*d, side, &v);
         if (L.mode == App::CmpSplit) cmpBlit(rgba, w, side, d->w, d->h, L.x0[k], 0, w);
         else if (k == 0)             cmpBlit(rgba, w, side, d->w, d->h, 0, 0, L.div);
@@ -952,15 +979,18 @@ static bool composeCompareRGBA(const ViewSides& v, std::vector<uint8_t>& rgba, i
         column(L.div, CMP_WIPE_RGB);
     }
     if (app.cmpExportLetters) {
+        int nAB = 1;
+        for (int k = 0; k < L.n; k++) if (v.paneRole[L.at[k]] == 1) nAB = 2;
         for (int k = 0; k < L.n; k++) {
-            const int i = L.at[k];
-            const ImU32 ink = slotInk((size_t)v.role[i]);
+            const int role = v.paneRole[L.at[k]];
+            const ImU32 ink = paneBadgeInk(role, k, nAB);
+            const std::string letter = paneRoleLetter(role);
             if (L.mode == App::CmpSplit)
-                cmpPaintLetter(rgba, w, L.x0[k], L.cellW, L.cellH, viewSideLetter(v, i), ink);
+                cmpPaintLetter(rgba, w, L.x0[k], L.cellW, L.cellH, letter, ink);
             else if (k == 0)
-                cmpPaintLetter(rgba, w, 0, L.div, L.cellH, viewSideLetter(v, i), ink);
+                cmpPaintLetter(rgba, w, 0, L.div, L.cellH, letter, ink);
             else
-                cmpPaintLetter(rgba, w, L.div + 1, w - L.div - 1, L.cellH, viewSideLetter(v, i), ink);
+                cmpPaintLetter(rgba, w, L.div + 1, w - L.div - 1, L.cellH, letter, ink);
         }
     }
     note = compareExportNote(v, L, false, 0.0f);

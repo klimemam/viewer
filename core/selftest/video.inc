@@ -40,7 +40,9 @@
 //                                      puts it (split / tiled / wipe / diff x
 //                                      follow x range mode), video frame k ==
 //                                      compose(exportFrameViewFor(A_k)) == the
-//                                      compare PNG; letters, blink refused.
+//                                      compare PNG; the panes are tileSlots'
+//                                      (a slot on B's document is a pane), the
+//                                      letters in the badge inks, blink refused.
 //
 // Windowless and fixture-free on the histhl/framesize pattern and for the same
 // reasons: every document is analytic and built in memory, and every expected
@@ -1195,8 +1197,10 @@ static int videoSelftest() {
                 return false;
             }
             std::vector<ImageDoc*> drawn;
-            if (app.compareMode == App::CmpSplit) for (int i = 0; i < v.n; i++) drawn.push_back(v.side[i]);
-            else { drawn.push_back(v.side[0]); drawn.push_back(v.side[1]); }
+            // the canvas's panes: one per letter (ViewSides::pane), A and B
+            // only in the two-image modes
+            if (app.compareMode == App::CmpSplit) for (int i = 0; i < v.nPane; i++) drawn.push_back(v.pane[i]);
+            else { drawn.push_back(v.pane[0]); drawn.push_back(v.pane[1]); }
             int cw = 0, chh = 0;
             for (ImageDoc* d : drawn) { cw = std::max(cw, d->w); chh = std::max(chh, d->h); }
             bool okc = true;
@@ -1256,7 +1260,7 @@ static int videoSelftest() {
             { "diff",   App::CmpDiff,  true,  0.5f,  "compare: difference A-B, full scale " },
         };
         bool specScreen = true, specOff = true, videoIsCompose = true, videoIsPng = true,
-             notes = true, sizes = true;
+             notes = true, sizes = true, canvasPanes = true;
         int cases = 0;
         for (int follow = 1; follow >= 0; follow--)
         for (int rmode : { 0, 2 })
@@ -1272,6 +1276,21 @@ static int videoSelftest() {
             char tag[64];
             snprintf(tag, sizeof tag, "%s follow=%d range=%d", M.name, follow, rmode);
             if (!composeIsSpec(comparedSides(), tag)) specScreen = false;
+            // the panes laid out ARE the canvas's: tileSlots' documents and
+            // letters in tileSlots' order, and as many as tileLayout lays out
+            // in its one row (TilePane is an x and a width - no rows)
+            if (M.mode == App::CmpSplit) {
+                const std::vector<TileSlot> ts = tileSlots();
+                const ViewSides vs = comparedSides();
+                std::vector<TilePane> tp;
+                const bool laid = tileLayout(0.0f, 4000.0f, (int)ts.size(), 1.0f, 1.0f, tp);
+                bool same = laid && (int)ts.size() == vs.nPane && tp.size() == ts.size();
+                for (size_t i = 0; same && i < ts.size(); i++) {
+                    same = ts[i].doc == vs.pane[i] && ts[i].tag == paneRoleLetter(vs.paneRole[i]);
+                    if (same && i) same = tp[i].x0 > tp[i - 1].x0;
+                }
+                if (!same) { canvasPanes = false; fprintf(stderr, "videoselftest: V8 %s panes != canvas\n", tag); }
+            }
             // a view NOT on screen: A's frame 3, B and C following (or not)
             if (!composeIsSpec(viewSidesFor(A_(2)), tag)) specOff = false;
             // the composite's note
@@ -1320,6 +1339,7 @@ static int videoSelftest() {
         check(cases == 20 && specScreen,
               "V8 every tile == renderDocRGBA(side, &v); separators, padding, wipe line, diff as specified");
         check(specOff, "V8 ...and for a view not on screen (A's frame 3), drawn in THAT view");
+        check(canvasPanes, "V8 the panes are tileSlots' (same docs, letters, order), one row as tileLayout lays them");
         check(sizes, "V8 the video is 130x40 / 196x40 / 64x40 as the layout says");
         check(videoIsCompose, "V8 video frame k == composeCompareRGBA(exportFrameViewFor(A_k)), 20 cases");
         check(videoIsPng, "V8 ...== the compare PNG with A on frame k, byte for byte");
@@ -1339,7 +1359,7 @@ static int videoSelftest() {
             check(inV2 != inScreen && a0 != b0,
                   "V8 fixture: a side's bytes depend on the view, and A's are not B's (anti-vacuity)");
         }
-        {   // the letters: only inside each plate, in slotInk, the glyph's pixels
+        {   // the letters: only inside each plate, in the canvas badge's ink
             app.compareMode = App::CmpSplit; app.compareRangeMode = 0;
             app.cmpExtra.assign(1, C_(0)->uid);
             selectImage(fa[0]);
@@ -1350,6 +1370,9 @@ static int videoSelftest() {
             app.cmpExportLetters = false;
             // 64x40 cells: scale 1, so each plate is 7x9 at (x0 + 1, 1)
             const int GLYPH_PX[3] = { 18, 20, 13 };      // A, B, C counted by hand
+            // the badge inks, by hand from drawCanvas: A blue, B orange, and the
+            // first slot pane past A and B the first tile hue
+            const uint8_t INK[3][3] = { { 120, 200, 255 }, { 255, 190, 120 }, { 105, 220, 130 } };
             bool outside = true, inks = true;
             int inkN[3] = {};
             for (int y = 0; y < h; y++)
@@ -1361,15 +1384,47 @@ static int videoSelftest() {
                     }
                     const uint8_t* p = px4(on, w, x, y);
                     if (cell < 0) { if (memcmp(p, px4(off, w, x, y), 4) != 0) outside = false; continue; }
-                    const ImU32 ink = slotInk((size_t)cell);
-                    if (isRGB(p, (uint8_t)(ink >> IM_COL32_R_SHIFT), (uint8_t)(ink >> IM_COL32_G_SHIFT),
-                              (uint8_t)(ink >> IM_COL32_B_SHIFT))) inkN[cell]++;
+                    if (isRGB(p, INK[cell][0], INK[cell][1], INK[cell][2])) inkN[cell]++;
                     else if (!isRGB(p, 0, 0, 0)) inks = false;
                 }
             check(outside, "V8 letters on: every pixel outside the three plates is unchanged");
             check(inks && inkN[0] == GLYPH_PX[0] && inkN[1] == GLYPH_PX[1] && inkN[2] == GLYPH_PX[2],
-                  "V8 ...and inside, A / B / C in slotInk on black, 18 / 20 / 13 glyph pixels");
+                  "V8 ...and inside, A / B / C in the canvas badge inks on black, 18 / 20 / 13 glyph pixels");
+            bool badge = true;
+            for (int k = 0; k < 3; k++) {
+                const ImU32 c = paneBadgeInk(k, k, 2);
+                if ((uint8_t)(c >> IM_COL32_R_SHIFT) != INK[k][0] || (uint8_t)(c >> IM_COL32_G_SHIFT) != INK[k][1] ||
+                    (uint8_t)(c >> IM_COL32_B_SHIFT) != INK[k][2]) badge = false;
+            }
+            check(badge, "V8 ...which are paneBadgeInk's, the one definition the canvas badges draw with");
             check(has(note, "letters on"), "V8 ...and the note says the letters are on");
+        }
+        {   // a slot on B's own stack: the canvas draws it as a pane of its
+            // own, so the export does too - while the range union counts the
+            // document once
+            app.compareMode = App::CmpSplit; app.compareRangeMode = 2; app.compareFollowFrame = true;
+            app.cmpExtra.assign(1, B_(0)->uid);
+            resetRanges();
+            selectImage(fa[0]);
+            const ViewSides v = comparedSides();
+            check(v.n == 2 && v.nPane == 3 && v.pane[2] == B_(0) && v.paneRole[2] == 2 &&
+                      tileSlots().size() == 3,
+                  "V8 fixture: C on B's document - two sides for the range, three panes on the canvas");
+            check(composeIsSpec(v, "dup"), "V8 ...and the composite has three panes, C's == B's pixels");
+            std::vector<uint8_t> g; int w = 0, h = 0; std::string note;
+            composeCompareRGBA(v, g, w, h, note);
+            check(w == 3 * 64 + 2 * 2 && has(note, "tiled A | B | C"),
+                  "V8 ...196 px wide, said as \"tiled A | B | C\"");
+            std::vector<std::vector<uint8_t>> fr; int vw = 0, vh = 0; std::string said;
+            bool vid = exportCompare(fr, vw, vh, said, "dup") && fr.size() == 3 && vw == 196;
+            for (int k = 0; k < 3 && vid; k++) {
+                ImageDoc* stepTo = nullptr;
+                std::vector<uint8_t> want;
+                composeCompareRGBA(exportFrameViewFor(A_(k), stepTo), want, w, h, note);
+                vid = fr[k] == want;
+            }
+            check(vid, "V8 ...and the video's frame k has C following B to B_k as a third pane");
+            app.cmpExtra.clear();
         }
         {   // blink: refused, by name, and no file is written
             app.compareMode = App::CmpFlip;

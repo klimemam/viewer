@@ -423,6 +423,16 @@ struct ViewSides {
     int role[CMP_SIDES_MAX] = {};       // 0 = A, 1 = B, 2 + i = slot letter i
     bool diverged[CMP_SIDES_MAX] = {};  // the follow found no frame at A's number
     int n = 0;
+    // The PANES the canvas draws for this view, in its order: A, B if it
+    // resolves, then EVERY slot letter - one pane per letter, so a slot that
+    // resolves onto B's document is a second pane showing the same pixels
+    // (side by side is where you SEE that they coincide). side[] above drops
+    // that duplicate, which the range union does not care about; the picture
+    // does. tileSlots (canvas) and the compare export (#308) both read this.
+    ImageDoc* pane[CMP_SIDES_MAX] = {};
+    int paneRole[CMP_SIDES_MAX] = {};   // 0 = A, 1 = B, 2 + i = slot letter i
+    bool paneStale[CMP_SIDES_MAX] = {};
+    int nPane = 0;
 };
 static ViewSides viewSidesFor(ImageDoc* aAt) {
     ViewSides v;
@@ -437,13 +447,22 @@ static ViewSides viewSidesFor(ImageDoc* aAt) {
         else b = resolveBAt(aAt, bDiv);
     }
     v.side[v.n] = aAt; v.role[v.n] = 0; v.n++;
-    if (b) { v.side[v.n] = b; v.role[v.n] = 1; v.diverged[v.n] = bDiv; v.n++; }
+    v.pane[v.nPane] = aAt; v.paneRole[v.nPane] = 0; v.nPane++;
+    if (b) {
+        v.side[v.n] = b; v.role[v.n] = 1; v.diverged[v.n] = bDiv; v.n++;
+        v.pane[v.nPane] = b; v.paneRole[v.nPane] = 1; v.paneStale[v.nPane] = bDiv; v.nPane++;
+    }
     if (app.compareMode != App::CmpOff && !app.cmpExtra.empty())
-        for (const ResolvedSlot& rs : onScreen ? resolveSlots() : resolveSlotsAt(aAt))
+        for (const ResolvedSlot& rs : onScreen ? resolveSlots() : resolveSlotsAt(aAt)) {
             if (rs.doc != b && v.n < CMP_SIDES_MAX) {
                 v.side[v.n] = rs.doc; v.role[v.n] = 2 + (int)rs.idx;
                 v.diverged[v.n] = rs.diverged; v.n++;
             }
+            if (v.nPane < CMP_SIDES_MAX) {
+                v.pane[v.nPane] = rs.doc; v.paneRole[v.nPane] = 2 + (int)rs.idx;
+                v.paneStale[v.nPane] = rs.diverged; v.nPane++;
+            }
+        }
     return v;
 }
 static std::vector<ImageDoc*> compareExtras() {
