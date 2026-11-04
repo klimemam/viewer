@@ -781,6 +781,34 @@ jobs:
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "binaries:${TARGET}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the download archives as the `latest` release
+        # The binaries branch is for machines that update with git. A person
+        # who just wants the program needs ONE file to download, from a link
+        # that never changes: /releases/latest/download/<name>. So main's
+        # publish also packs each OS as one archive and attaches it to a
+        # release tagged `latest`, which is recreated at this commit every time
+        # (delete + create, so the tag moves and old assets do not pile up).
+        # Only main: a branch build is not "the latest".
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cd out
+          for d in win64 linux-x64 macos-arm64; do
+            cp VERSION.txt "$d/"
+            cp README.md "$d/README-binaries.md"
+          done
+          cp update.cmd win64/
+          cp update.sh linux-x64/; cp update.sh macos-arm64/
+          (cd win64 && zip -qr ../../viewer-win64.zip .)
+          tar czf ../viewer-linux-x64.tar.gz -C linux-x64 .
+          tar czf ../viewer-macos-arm64.tar.gz -C macos-arm64 .
+          cd ..
+          gh release delete latest --cleanup-tag --yes --repo "${GITHUB_REPOSITORY}" || true
+          gh release create latest viewer-win64.zip viewer-linux-x64.tar.gz viewer-macos-arm64.tar.gz \
+            --repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}" --latest \
+            --title "viewer (latest main, ${GITHUB_SHA::8})" \
+            --notes "Built from ${GITHUB_SHA} on $(date -u +%Y-%m-%dT%H:%M:%SZ). Replaced on every push to main. Unzip anywhere and run viewer (viewer.exe on Windows); keep plugins/ next to it."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Sweep binaries branches whose source is gone
         # Every branch build publishes binaries-<branch>, and merged branches
         # get deleted - so the binaries- copies linger forever unless something
