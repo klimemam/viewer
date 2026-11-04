@@ -1,6 +1,7 @@
 // core/videowrite.cpp — the two lossless video sinks (issue #253).
 // 担当: ImageView/export.  See core/videowrite.h for WHY there are two.
 #include "videowrite.h"
+#include "spawn_lock.h"   // starting ffmpeg takes the process's spawn lock (#327)
 
 #include <cmath>
 #include <cstdio>
@@ -338,6 +339,7 @@ private:
     bool spawn(const std::vector<std::string>& argv, std::string& why) {
         SECURITY_ATTRIBUTES sa{};
         sa.nLength = sizeof sa; sa.bInheritHandle = TRUE;
+        std::unique_lock<std::mutex> spawnLk(processSpawnMutex());   // to CloseHandle(rd)
         HANDLE rd = nullptr, wr = nullptr;
         if (!CreatePipe(&rd, &wr, &sa, 1 << 20))
             return fail("cannot create a pipe to ffmpeg", why);
@@ -361,6 +363,7 @@ private:
         BOOL ok = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr,
                                  TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
         CloseHandle(rd);
+        spawnLk.unlock();
         if (!ok) {
             CloseHandle(wr);
             return fail("cannot start ffmpeg", why);
@@ -400,7 +403,10 @@ private:
     bool spawn(const std::vector<std::string>& argv, std::string& why) {
         std::string cmd;
         for (size_t i = 0; i < argv.size(); i++) { if (i) cmd += ' '; cmd += quoteArg(argv[i]); }
-        pipe_ = popen(cmd.c_str(), "w");
+        {
+            std::lock_guard<std::mutex> spawnLk(processSpawnMutex());
+            pipe_ = popen(cmd.c_str(), "w");
+        }
         if (!pipe_) return fail("cannot start ffmpeg", why);
         return true;
     }

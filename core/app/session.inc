@@ -3272,7 +3272,9 @@ static bool spawnDetached(const std::vector<std::string>& av,
     std::vector<char*> args;
     for (const auto& a : av) args.push_back(const_cast<char*>(a.c_str()));
     args.push_back(nullptr);
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());   // spawn_lock.h
     pid_t mid = fork();
+    if (mid > 0) spawnLk.unlock();
     if (mid < 0) return false;
     if (mid == 0) {
         setsid();
