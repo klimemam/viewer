@@ -18,9 +18,21 @@ Windows / Linux / macOS ・ C++17 + Dear ImGui + GLFW ・ GPU 不要 ・ 単体�
 
 ---
 
-## インストール
+## ダウンロード
 
-ビルド済みバイナリが `binaries` ブランチにあります。ビルド環境は要りません。
+| OS | ダウンロード |
+|---|---|
+| Windows (x64) | [viewer-win64.zip](https://github.com/klimemam/viewer/releases/latest/download/viewer-win64.zip) |
+| Linux (x86_64) | [viewer-linux-x64.tar.gz](https://github.com/klimemam/viewer/releases/latest/download/viewer-linux-x64.tar.gz) |
+| macOS (Apple silicon) | [viewer-macos-arm64.tar.gz](https://github.com/klimemam/viewer/releases/latest/download/viewer-macos-arm64.tar.gz) |
+
+展開した場所でそのまま `viewer`(Windows は `viewer.exe`)を起動します。インストーラはありません。
+`plugins/` は実行ファイルの隣に置いたままにしてください。main に push されるたびに作り直される
+最新版です([リリースのページ](https://github.com/klimemam/viewer/releases/latest))。
+
+## インストール(git で更新し続ける場合)
+
+同じビルド済みバイナリが `binaries` ブランチにもあります。ビルド環境は要りません。
 
 ```
 git clone -b binaries --single-branch https://github.com/klimemam/viewer.git viewer-bin
