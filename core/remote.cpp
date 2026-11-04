@@ -1,6 +1,7 @@
 #include "remote.h"
 #include "imagefile.h"    // peerServes: the one table the format gate reads
 #include "remote_proto.h"
+#include "spawn_lock.h"   // every child this process starts is started under it
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +23,7 @@
 #include <sys/wait.h>
 #include <poll.h>      // the timed pipe reads in runSshCommand
 #include <time.h>      // clock_gettime for their deadline
-#include <fcntl.h>     // FD_CLOEXEC on spawn's exec-error pipe
+#include <fcntl.h>     // close-on-exec on every pipe end spawn makes
 #include <errno.h>
 #endif
 
@@ -112,6 +113,10 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
         return false;
     };
 #if defined(_WIN32)
+    // From the first inheritable handle to the close of the child's ends: a
+    // CreateProcess on another thread inside that span would hand ITS child
+    // these pipes (spawn_lock.h).
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());
     SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
     HANDLE childIn = nullptr, childOut = nullptr;
     if (!CreatePipe(&childIn, &p.inW, &sa, 0))
@@ -163,6 +168,7 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     CloseHandle(childIn);
     CloseHandle(childOut);
     if (childErr) CloseHandle(childErr);  // ours open would hold the pipe open forever
+    spawnLk.unlock();
     if (!ok) {
         CloseHandle(p.inW);  p.inW = nullptr;
         CloseHandle(p.outR); p.outR = nullptr;
@@ -173,9 +179,28 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     p.proc = pi.hProcess;
     return true;
 #else
+    // Every end is close-on-exec from birth where the OS can say so in one
+    // call (pipe2), and as the next call where it cannot (macOS), with the
+    // lock held across both and across the fork: a fork on another thread
+    // that slipped between pipe() and fcntl() gave ITS child - a peer that
+    // lives as long as its Session - a copy of these ends, and the read of
+    // execErr below then waited for that stranger to exit (#327,
+    // spawn_lock.h). The child's dup2 onto 0/1/2 makes fresh descriptors
+    // without the flag, so what the peer is meant to keep it keeps.
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());
+    auto cloexecPipe = [](int fds[2]) {
+#if defined(__linux__)
+        return pipe2(fds, O_CLOEXEC);
+#else
+        if (pipe(fds) != 0) return -1;
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+        return 0;
+#endif
+    };
     int toChild[2], fromChild[2], execErr[2];
-    if (pipe(toChild) != 0) return fail("cannot create pipes", osErrorText(errno));
-    if (pipe(fromChild) != 0) {
+    if (cloexecPipe(toChild) != 0) return fail("cannot create pipes", osErrorText(errno));
+    if (cloexecPipe(fromChild) != 0) {
         int e = errno;
         close(toChild[0]); close(toChild[1]);
         return fail("cannot create pipes", osErrorText(e));
@@ -187,16 +212,14 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
     // successful exec closes the write end and the read below returns 0 bytes;
     // a failed exec writes errno into it first. The only way the parent learns
     // the child's errno without a wait that would block on a peer that DID start.
-    if (pipe(execErr) != 0) {
+    if (cloexecPipe(execErr) != 0) {
         int e = errno;
         close(toChild[0]); close(toChild[1]);
         close(fromChild[0]); close(fromChild[1]);
         return fail("cannot create pipes", osErrorText(e));
     }
-    fcntl(execErr[0], F_SETFD, FD_CLOEXEC);
-    fcntl(execErr[1], F_SETFD, FD_CLOEXEC);
     int errPipe[2] = { -1, -1 };
-    if (keepStderr && pipe(errPipe) != 0) {
+    if (keepStderr && cloexecPipe(errPipe) != 0) {
         int e = errno;
         close(toChild[0]); close(toChild[1]);
         close(fromChild[0]); close(fromChild[1]);
@@ -231,13 +254,14 @@ static bool spawn(Pipe& p, const std::vector<std::string>& argv, std::string& er
         _exit(127);
     }
     close(execErr[1]);
+    close(toChild[0]);
+    close(fromChild[1]);
+    if (errPipe[1] >= 0) close(errPipe[1]);   // ours open would hold the pipe open forever
+    spawnLk.unlock();                         // never held across the wait for exec
     int childErrno = 0;
     ssize_t got;
     do { got = read(execErr[0], &childErrno, sizeof childErrno); } while (got < 0 && errno == EINTR);
     close(execErr[0]);
-    close(toChild[0]);
-    close(fromChild[1]);
-    if (errPipe[1] >= 0) close(errPipe[1]);   // ours open would hold the pipe open forever
     if (got == (ssize_t)sizeof childErrno) {
         int st = 0;
         waitpid(pid, &st, 0);             // it _exit(127)ed: reap it now, no zombie

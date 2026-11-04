@@ -167,9 +167,11 @@ static std::string fcMatchJpFont() {
     // `if/else`, not `timeout ... || fc-match ...`: with the `||` a run that
     // actually TIMED OUT (exit 124) would fall through to the untimed call and
     // wait all over again, which is the opposite of the point.
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());   // spawn_lock.h
     FILE* p = popen("if command -v timeout >/dev/null 2>&1; then "
                     "timeout 5 fc-match -f %{file} sans:lang=ja; else "
                     "fc-match -f %{file} sans:lang=ja; fi 2>/dev/null", "r");
+    spawnLk.unlock();
     if (!p) return {};
     char buf[1024] = { 0 };
     const size_t got = fread(buf, 1, sizeof buf - 1, p);

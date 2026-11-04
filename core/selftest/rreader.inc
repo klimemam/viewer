@@ -1630,6 +1630,22 @@
 
         {   // ---- R23: blank-layout typed gate survives worker reconnect -------
             closeAll();
+#if !defined(_WIN32)
+            // #327: the pipe ends this process holds that a child it starts
+            // would INHERIT. Taken before the workers below reconnect, so what
+            // ctest or an earlier block left open is not this block's to judge.
+            auto inheritablePipes = []() {
+                std::vector<int> fds;
+                for (int fd = 3; fd < 1024; fd++) {
+                    struct stat st;
+                    if (fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) continue;
+                    const int fl = fcntl(fd, F_GETFD);
+                    if (fl >= 0 && !(fl & FD_CLOEXEC)) fds.push_back(fd);
+                }
+                return fds;
+            };
+            const std::vector<int> inheritableBefore = inheritablePipes();
+#endif
             const int savedPolicy = app.procPolicy;
             app.procPolicy = App::PolAuto;
             auto settleWorkers = [&](double budget) {
@@ -1698,6 +1714,29 @@
                       has(app.srvTemporal.err, "protocol 14") &&
                       has(app.srvTemporal.err, "typed materialisation axes need 15"),
                   "R23d the separately reconnected v14 MEASURE worker refuses the same subject");
+#if !defined(_WIN32)
+            {
+                // Both workers now hold a live peer each. A pipe end of theirs
+                // without close-on-exec is one the NEXT child started anywhere
+                // in this process carries for its whole life - and while the
+                // fetch and measure workers above reconnected at the same
+                // moment, the measure worker's read of its exec-error pipe
+                // waited for the fetch worker's peer to exit, which it does
+                // only at the stop below: R23d's intermittent FAIL, and the
+                // pair-wise version of it the Timeout.
+                std::vector<int> leaked;
+                for (int fd : inheritablePipes())
+                    if (std::find(inheritableBefore.begin(), inheritableBefore.end(), fd) ==
+                        inheritableBefore.end())
+                        leaked.push_back(fd);
+                std::string list;
+                for (int fd : leaked) list += " " + std::to_string(fd);
+                fprintf(stderr, "rreaderselftest:   R23e inheritable pipe ends since the "
+                                "block began:%s\n", list.empty() ? " none" : list.c_str());
+                check(leaked.empty(),
+                      "R23e no pipe end a worker's peer runs on is inherited by the next child");
+            }
+#endif
 
             stopRemoteFetcher();
             stopMeasureWorker();

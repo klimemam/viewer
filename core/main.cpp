@@ -26,6 +26,7 @@
 #include "version.h"                 // the commit this binary was built from
 #include "remote.h"
 #include "adapter.h"                 // running an input adapter (docs/features/adapters/input-adapters.md §4)
+#include "spawn_lock.h"              // every fork / CreateProcess here takes it (#327)
 #include "imagefile.h"               // PNG / JPEG / TIFF, behind one seam
 #include "remote_proto.h"
 #include "vstream.h"                 // the reader stream's tree check, shared with the peer

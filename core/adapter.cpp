@@ -2,6 +2,7 @@
 // a console window flash, and must never claim a program failed when it never
 // started (docs/features/adapters/input-adapters.md §4.13 - "if Python is missing, say so").
 #include "adapter.h"
+#include "spawn_lock.h"   // the child below is started under it, as remote.cpp's are
 
 #include <algorithm>                 // sort: a folder identity may not depend on walk order
 #include <cstdio>
@@ -137,6 +138,9 @@ Run run(const std::vector<std::string>& argv, const RunOpts& o) {
     std::error_code ec;
 
 #if defined(_WIN32)
+    // The two inheritable handles live from here to the CloseHandle after the
+    // start; another thread's CreateProcess in between would inherit them.
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());
     SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
     HANDLE hOut = CreateFileW(outPath.wstring().c_str(), GENERIC_WRITE,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
@@ -178,6 +182,7 @@ Run run(const std::vector<std::string>& argv, const RunOpts& o) {
                                   cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
     CloseHandle(hOut);
     CloseHandle(hErr);
+    spawnLk.unlock();
     if (!started) {
         DWORD e = GetLastError();
         r.fail = "cannot start " + argv[0] + " (windows error " + std::to_string((unsigned)e) + ")";
@@ -216,7 +221,11 @@ Run run(const std::vector<std::string>& argv, const RunOpts& o) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 #else
+    // Under the lock so it cannot fork into the instant remote.cpp's spawn has
+    // a pipe that is not close-on-exec yet (spawn_lock.h); released at once.
+    std::unique_lock<std::mutex> spawnLk(processSpawnMutex());
     pid_t pid = fork();
+    if (pid > 0) spawnLk.unlock();
     if (pid < 0) { r.fail = "cannot fork"; return r; }
     if (pid == 0) {
         int fo = open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
